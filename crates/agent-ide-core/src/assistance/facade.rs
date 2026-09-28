@@ -257,7 +257,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "new_name": {"type": "string", "minLength": 1, "maxLength": 128, "description": "For rename: the new identifier, applied project-wide."},
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES},
                     "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "With `path`: inclusive 1-based line range to replace."},
-                    "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Full-file form: the source_ref of the context/read this content is based on."},
+                    "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "The source_ref of the ide.read/ide.context this content is based on; required with `path`+`lines`, optional (but validated) with `symbol`."},
                     "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES, "description": "Replacement or inserted code, including the symbol's doc comment and attributes."}
                 }
             }),
@@ -374,8 +374,9 @@ pub enum ParameterError {
     ContextTarget,
     /// `ide.read` needs either `symbol` or both `path` and `lines`.
     ReadTarget,
-    /// `ide.edit` needs `symbol` (with `op`), or `path` with `lines` for a range replace, or the
-    /// full-file form `path` + `source_ref` + `content`.
+    /// `ide.edit` needs `symbol` (with `op`), or `path` with `lines` and `source_ref` for a range
+    /// replace, or the full-file form `path` + `source_ref` + `content`; the forms are exclusive,
+    /// except a redundant `path` naming the symbol's own file.
     EditTarget,
     /// The language runner rejected a semantically unsupported test target.
     TestTargetUnsupported(String),
@@ -412,6 +413,8 @@ pub enum FieldRule {
     Boolean,
     /// The value must be an inclusive 1-based range `start-end` with `start <= end`.
     LineRange,
+    /// The closed method cannot proceed without the `source_ref` of the read its lines came from.
+    RangeEditSourceRef,
 }
 
 impl FieldRule {
@@ -447,6 +450,11 @@ impl FieldRule {
             Self::RequiresProblemsKind => "requires \"kind\":\"problems\"".to_string(),
             Self::Boolean => "must be true or false".to_string(),
             Self::LineRange => "must be an inclusive 1-based range like 120-180".to_string(),
+            Self::RangeEditSourceRef => {
+                "is required for a line-range edit; re-read the lines (ide.read) and retry with \
+                 the new source_ref"
+                    .to_string()
+            }
         }
     }
 }
@@ -478,9 +486,17 @@ impl ParameterError {
                 format!("invalid bounded parameters: \"{field}\" {}", rule.text())
             }
             Self::ContextTarget => CONTEXT_TARGET_MESSAGE.to_string(),
-            Self::ReadTarget => "ide.read needs `symbol`, or `path` with `lines`".to_string(),
-            Self::EditTarget => "ide.edit needs `symbol` with `op`, or `path` with `lines`, or `path` with `source_ref` and `content`".to_string(),
-            Self::TestTargetUnsupported(message) => format!("invalid bounded parameters: {message}; use ide.test with `pattern` or `command`"),
+            Self::ReadTarget => {
+                "ide.read needs either `symbol`, or `path` with `lines` — not both".to_string()
+            }
+            Self::EditTarget => {
+                "ide.edit takes one form: `symbol` with `op`, or `path` with `lines` and \
+                 `source_ref` — not both"
+                    .to_string()
+            }
+            Self::TestTargetUnsupported(message) => format!(
+                "invalid bounded parameters: {message}; use ide.test with `pattern` or `command`"
+            ),
         }
     }
 }
@@ -845,7 +861,14 @@ pub fn validate_call(
             }
             if object.contains_key("symbol") {
                 required_string(object, "symbol", MAX_SYMBOL_PATH_BYTES)?;
-                if object.contains_key("path") || object.contains_key("lines") {
+                // A redundant `path` naming the symbol's own file is accepted and ignored; any
+                // other mix of the two forms is refused as exclusive.
+                let symbol = object["symbol"].as_str().unwrap_or_default();
+                let names_own_file = symbol.split_once('#').is_some_and(|(file, _)| {
+                    object.get("path").and_then(Value::as_str) == Some(file)
+                });
+                if (object.contains_key("path") && !names_own_file) || object.contains_key("lines")
+                {
                     return Err(ParameterError::EditTarget);
                 }
             } else {
@@ -859,6 +882,12 @@ pub fn validate_call(
                 if parse_line_range(required_string(object, "lines", 32)?).is_none() {
                     return Err(invalid_field("lines", FieldRule::LineRange));
                 }
+                // Line numbers are only meaningful for the exact content the caller read, so the
+                // range form always names the observation it came from.
+                if !object.contains_key("source_ref") {
+                    return Err(invalid_field("source_ref", FieldRule::RangeEditSourceRef));
+                }
+                required_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?;
             }
             match op {
                 "replace" | "insert" => {
@@ -2931,7 +2960,75 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             "invalid bounded parameters: ide.context needs either \"path\" or \"kind\":\"problems\""
                 .to_string(),
         ),
+        (
+            validate_call(
+                AssistanceTool::Edit,
+                json!({"operation_id":"o","path":"a.rs","lines":"1-2","content":"x"}),
+            )
+            .unwrap_err(),
+            AssistanceTool::Edit,
+            "invalid bounded parameters: \"source_ref\" is required for a line-range edit; \
+             re-read the lines (ide.read) and retry with the new source_ref"
+                .to_string(),
+        ),
+        (
+            validate_call(
+                AssistanceTool::Read,
+                json!({"symbol":"a.rs#run","path":"a.rs","lines":"1-2"}),
+            )
+            .unwrap_err(),
+            AssistanceTool::Read,
+            "ide.read needs either `symbol`, or `path` with `lines` — not both".to_string(),
+        ),
+        (
+            validate_call(
+                AssistanceTool::Edit,
+                json!({"operation_id":"o","op":"replace","symbol":"a.rs#run","path":"b.rs","content":"x"}),
+            )
+            .unwrap_err(),
+            AssistanceTool::Edit,
+            "ide.edit takes one form: `symbol` with `op`, or `path` with `lines` and \
+             `source_ref` — not both"
+                .to_string(),
+        ),
     ]
+}
+
+/// A line-range edit carrying the read it came from validates; the symbol form's `source_ref`
+/// stays optional and tolerates a redundant `path` naming the symbol's own file.
+#[test]
+fn range_edit_accepts_the_read_it_came_from() {
+    assert!(
+        validate_call(
+            AssistanceTool::Edit,
+            json!({"operation_id":"o","path":"a.rs","lines":"1-2","source_ref":"s","content":"x"})
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Edit,
+            json!({"operation_id":"o","op":"replace","symbol":"a.rs#run","content":"x"})
+        )
+        .is_ok()
+    );
+    assert!(validate_call(
+        AssistanceTool::Edit,
+        json!({"operation_id":"o","op":"replace","symbol":"a.rs#run","source_ref":"s","content":"x"})
+    )
+    .is_ok());
+    // A redundant `path` naming the symbol's own file is accepted and ignored.
+    assert!(validate_call(
+        AssistanceTool::Edit,
+        json!({"operation_id":"o","op":"replace","symbol":"a.rs#run","path":"a.rs","content":"x"})
+    )
+    .is_ok());
+    // `lines` belongs to the path form alone, even beside a symbol whose file is named.
+    assert!(validate_call(
+        AssistanceTool::Edit,
+        json!({"operation_id":"o","op":"replace","symbol":"a.rs#run","path":"a.rs","lines":"1-2","source_ref":"s","content":"x"})
+    )
+    .is_err());
 }
 
 /// Start accepts only absolute, normalized optional working-directory roots.

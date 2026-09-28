@@ -20,7 +20,8 @@ use agent_ide_core::lang::{
     render::clip,
     text::{
         MAX_ATTRIBUTE_CHARS, MAX_NAMED_TESTS, distinct, distinct_files, entry_names, env_value,
-        indent_of, indent_unit, last_content_line, line_at, one_line, read_text, source_lines,
+        has_files_with, indent_of, indent_unit, last_content_line, line_at, one_line, read_text,
+        source_lines,
     },
 };
 
@@ -44,7 +45,9 @@ impl LanguageSupport for TypeScript {
     }
 
     /// Establishes a project from `package.json`, `tsconfig.json`, `tsconfig.*.json` or
-    /// `jsconfig.json` (any one suffices); `None` when none exists. Environment facts:
+    /// `jsconfig.json` (any one suffices); without one, TypeScript files found by the bounded
+    /// presence walk still make a project, with no manifests and no commands; `None` when
+    /// neither exists. Environment facts:
     /// `package_manager` (lockfile, then `packageManager`, else npm), `node` (`.nvmrc`,
     /// `.node-version`, `engines.node`), `tsconfig` (`tsconfig.json`, else the first
     /// `tsconfig.*.json`), `test_runner` (`vitest`, `jest` or `node`) and `formatter`
@@ -70,7 +73,14 @@ impl LanguageSupport for TypeScript {
             manifests.push(PathBuf::from("jsconfig.json"));
         }
         if manifests.is_empty() {
-            return None;
+            return has_files_with(root, &["ts", "tsx", "mts", "cts"]).then(|| LanguageProject {
+                language: LANGUAGE,
+                manifests,
+                environment: Vec::new(),
+                interpreter: None,
+                commands: ProjectCommands::default(),
+                entry_points: Vec::new(),
+            });
         }
         let package: Value =
             serde_json::from_str(&read_text(root, "package.json")).unwrap_or(Value::Null);
@@ -211,6 +221,56 @@ impl LanguageSupport for TypeScript {
             line_count: line_count(source),
             symbols: convert_all(&lines, symbols, &root, None, self.is_test_file(file)),
         }
+    }
+
+    /// Top-level declarations recognized from the text alone, for callers the server cannot
+    /// answer (a file whose `tsconfig.json` lives below the worktree root). Each column-0
+    /// `function`, `class`, `interface`, `type`, `enum`, `namespace` or `const`/`let`/`var`
+    /// declaration, behind any `export`/`default`/`declare`/`async`/`abstract`, spans its indented
+    /// lines and the column-0 `}`/`)`/`]` line closing them; no members, no docs.
+    // ponytail: column-0 line scan, so a keyword at column 0 inside a template literal or block
+    // comment counts; reuse the names lexer if that shows up.
+    fn outline_from_source(&self, file: &Path, source: &str) -> Option<Outline> {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut symbols = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let Some((kind, name)) = top_level_declaration(line) else {
+                continue;
+            };
+            let mut last = index;
+            for (next, text) in lines.iter().enumerate().skip(index + 1) {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                if text.starts_with(char::is_whitespace) {
+                    last = next;
+                    continue;
+                }
+                if text.starts_with(['}', ')', ']']) {
+                    last = next;
+                }
+                break;
+            }
+            let text = lines[index..=last].join("\n");
+            let (end, stop) = scan_signature(&text);
+            let range = LineRange::new(index as u32 + 1, last as u32 + 1);
+            symbols.push(Symbol {
+                path: SymbolPath::new(Some(file.to_path_buf()), vec![name.clone()]),
+                kind,
+                name,
+                range,
+                body: range,
+                signature: render_signature(&text[..end], stop, kind),
+                doc: None,
+                children: Vec::new(),
+            });
+        }
+        Some(Outline {
+            file: file.to_path_buf(),
+            language: LANGUAGE,
+            line_count: line_count(source),
+            symbols,
+        })
     }
 
     /// `Before`/`After` put one blank line between the new code and the anchor, at the anchor's
@@ -706,6 +766,50 @@ fn strip_modifiers(mut text: &str) -> &str {
             return text;
         };
         text = rest;
+    }
+}
+
+/// The kind and name of a column-0 declaration line; `export default function` without a name
+/// is `default`.
+fn top_level_declaration(line: &str) -> Option<(SymbolKind, String)> {
+    if line.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut text = line;
+    let mut default = false;
+    while let Some(rest) = ["export", "default", "declare", "async", "abstract"]
+        .iter()
+        .find_map(|modifier| {
+            text.strip_prefix(modifier)
+                .filter(|rest| rest.starts_with(char::is_whitespace))
+        })
+    {
+        default |= text.starts_with("default");
+        text = rest.trim_start();
+    }
+    let (keyword, rest) = text.split_once(|c: char| c.is_whitespace() || c == '*')?;
+    let kind = match keyword {
+        "function" => SymbolKind::Function,
+        "class" => SymbolKind::Class,
+        "interface" => SymbolKind::Interface,
+        "type" => SymbolKind::TypeAlias,
+        "enum" => SymbolKind::Enum,
+        "namespace" | "module" => SymbolKind::Namespace,
+        "const" if rest.trim_start().starts_with("enum ") => SymbolKind::Enum,
+        "const" => SymbolKind::Constant,
+        "let" | "var" => SymbolKind::Variable,
+        _ => return None,
+    };
+    let rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '*');
+    let rest = rest.strip_prefix("enum ").map_or(rest, str::trim_start);
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '$'))
+        .collect();
+    match (name.is_empty(), default) {
+        (false, _) => Some((kind, name)),
+        (true, true) => Some((kind, "default".to_owned())),
+        (true, false) => None,
     }
 }
 
@@ -2104,6 +2208,78 @@ ok 2 - subtracts
         let empty = scratch("empty");
         assert_eq!(TypeScript.detect(&empty), None);
         fs::remove_dir_all(&empty).unwrap();
+    }
+
+    /// TypeScript files below the root without a root manifest: a project with nothing to run.
+    #[test]
+    fn detect_finds_nested_typescript_without_a_root_manifest() {
+        let root = scratch("nested");
+        put(
+            &root,
+            "frontend/package.json",
+            "{\"scripts\":{\"test\":\"vitest\"}}",
+        );
+        put(&root, "frontend/src/app.tsx", "export {}");
+        let project = TypeScript.detect(&root).unwrap();
+        assert!(project.manifests.is_empty());
+        assert!(project.environment.is_empty());
+        assert_eq!(project.commands, ProjectCommands::default());
+        fs::remove_dir_all(&root).unwrap();
+        let scripts = scratch("scripts-only");
+        put(&scripts, "tools/run.js", "");
+        assert_eq!(TypeScript.detect(&scripts), None);
+        fs::remove_dir_all(&scripts).unwrap();
+    }
+
+    /// Column-0 declarations outline from the text; members, statements and nameless
+    /// destructuring do not.
+    #[test]
+    fn outline_from_source_lists_top_level_declarations() {
+        let source = "import { x } from './x';\n\
+            \n\
+            export default function Layout({ children }: Props) {\n\
+            \x20 return <div className=\"layout\">{children}</div>;\n\
+            }\n\
+            \n\
+            export const Button = (props: P): JSX.Element => (\n\
+            \x20 <button />\n\
+            );\n\
+            const { a } = x;\n\
+            declare const enum Mode { A }\n\
+            export default class {\n\
+            \x20 run() {}\n\
+            }\n\
+            type Props = { children: string };\n\
+            let count = 0;\n\
+            export { Layout };\n";
+        let outline = TypeScript
+            .outline_from_source(Path::new("src/Layout.tsx"), source)
+            .unwrap();
+        let rows: Vec<String> = outline
+            .symbols
+            .iter()
+            .map(|symbol| {
+                format!(
+                    "{} {} {}-{} {}",
+                    symbol.path,
+                    symbol.kind.name(),
+                    symbol.range.start,
+                    symbol.range.end,
+                    symbol.signature
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "src/Layout.tsx#Layout fn 3-5 export default function Layout({ children }: Props)",
+                "src/Layout.tsx#Button const 7-9 export const Button = (props: P) => JSX.Element",
+                "src/Layout.tsx#Mode enum 11-11 declare const enum Mode",
+                "src/Layout.tsx#default class 12-14 export default class",
+                "src/Layout.tsx#Props type 15-15 type Props = {…}",
+                "src/Layout.tsx#count var 16-16 let count = 0",
+            ]
+        );
     }
 
     #[test]

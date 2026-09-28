@@ -87,6 +87,9 @@ struct Job {
     /// Closed failing-stage tag for the terminal error log (T27B); never repository paths or
     /// child output, only fixed tags such as `diff:deadline` or `diff:child_exit:cat-file`.
     failure_detail: Option<String>,
+    /// Set by a symbol or line-range edit whose project formatter moved lines: the reply then
+    /// states the movement so the next line-addressed edit does not reuse stale line numbers.
+    format_note: Option<String>,
     /// `true` once the edit scheduled its project check itself (post-edit diagnostics), so the
     /// reply path must not schedule a second run that would shift the worktree's generation.
     check_scheduled: bool,
@@ -1585,6 +1588,7 @@ impl WorkerHandle {
             stop_reply,
             native_epoch: 0,
             failure_detail: None,
+            format_note: None,
             check_scheduled: false,
             park_until: None,
             stage: None,
@@ -1873,7 +1877,10 @@ impl<'a> Worker<'a> {
                 (text, owns_detail.then_some(result.detail_ref))
             } else {
                 (
-                    format!("tests #{id}: running {} s", job_status.age.as_secs()),
+                    format!(
+                        "tests #{id}: running {} s; poll: ide.test {{\"status\": {id}}}",
+                        job_status.age.as_secs()
+                    ),
                     None,
                 )
             }
@@ -2077,7 +2084,8 @@ impl<'a> Worker<'a> {
                     let selected =
                         selected_count.map_or_else(String::new, |summary| format!(" ({summary})"));
                     let line = format!(
-                        "tests #{id}: started — {}{selected} (budget {} s)",
+                        "tests #{id}: started — {}{selected} (budget {} s); poll: ide.test \
+                         {{\"status\": {id}}}",
                         display_argv(&argv),
                         budget.as_secs()
                     );
@@ -2095,7 +2103,7 @@ impl<'a> Worker<'a> {
                 }
                 StartResult::Running(id, age) => (
                     format!(
-                        "tests #{id}: still running ({} s); ide.test {{\"status\": {id}}}",
+                        "tests #{id}: still running ({} s); poll: ide.test {{\"status\": {id}}}",
                         age.as_secs()
                     ),
                     None,
@@ -3262,10 +3270,17 @@ impl<'a> Worker<'a> {
                 .has_post_source()
                 .then_some(refreshed)
                 .flatten();
+            // The parked stage resumes the same job that formatted the candidate, so its
+            // movement note still belongs to this reply.
+            let note = job
+                .format_note
+                .take()
+                .filter(|_| result.outcome.has_post_source());
             return Ok((
                 PeerReply::Edit {
                     result,
                     diagnostics,
+                    note,
                 },
                 Some(authority),
                 source,
@@ -3290,6 +3305,7 @@ impl<'a> Worker<'a> {
                     PeerReply::Edit {
                         result,
                         diagnostics: EditDiagnostics::Unknown {},
+                        note: None,
                     },
                     authority,
                     None,
@@ -3305,6 +3321,7 @@ impl<'a> Worker<'a> {
                             source_ref: None,
                         },
                         diagnostics: EditDiagnostics::Unknown {},
+                        note: None,
                     },
                     None,
                     None,
@@ -3517,10 +3534,16 @@ impl<'a> Worker<'a> {
         let source = (result.outcome.has_post_source())
             .then_some(refreshed)
             .flatten();
+        // Only a settled write keeps the formatter's line movement meaningful.
+        let note = job
+            .format_note
+            .take()
+            .filter(|_| result.outcome.has_post_source());
         Ok((
             PeerReply::Edit {
                 result,
                 diagnostics,
+                note,
             },
             Some(authority),
             source,
@@ -3658,6 +3681,7 @@ impl<'a> Worker<'a> {
             PeerReply::Edit {
                 result,
                 diagnostics: EditDiagnostics::Unknown {},
+                note: None,
             },
             authority,
             source,
@@ -3844,6 +3868,29 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
         let active = shared
             .active(&request.binding)
             .map_err(InspectFailure::new)?;
+        // A test-run handle (`tests #N`, `tests-N`, `#N`, `N`) is what callers reach for first
+        // after `tests #N: started`; it names a background run, not a retained detail, so answer
+        // with that run's status instead of failing the lookup.
+        if let Some(id) = test_run_handle(&request.reference) {
+            let owner = request.binding.fingerprint();
+            let text = match shared.test_runs.find(id, &owner) {
+                Some(status) => match &status.result {
+                    Some(result) => test_result_text(id, result, status.owner == owner),
+                    None => format!(
+                        "tests #{id}: running {} s; poll: ide.test {{\"status\": {id}}}",
+                        status.age.as_secs()
+                    ),
+                },
+                None => format!("tests #{id}: unknown job; poll: ide.test {{\"status\": {id}}}"),
+            };
+            return Ok(PeerReply::Complete {
+                kind: ResultKind::Test,
+                text,
+                detail_ref: None,
+                truncated: false,
+                continuation: false,
+            });
+        }
         let (
             reply,
             authority,
@@ -3864,16 +3911,32 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 .get(&request.reference)
                 .filter(|detail| detail.binding == request.binding)
                 .ok_or_else(|| {
-                    InspectFailure::stage(FailureCode::InvalidDetail, "inspect:detail_unknown")
+                    InspectFailure::stage(
+                        FailureCode::InvalidDetail,
+                        // A reference this daemon never minted is unknown; one it minted and no
+                        // longer retains (or issued to another binding) has expired.
+                        if never_issued(&request.reference, &shared.nonce, ledger.next) {
+                            "inspect:detail_unknown"
+                        } else {
+                            "inspect:detail_expired"
+                        },
+                    )
                 })?;
             if request
                 .expected
                 .as_ref()
                 .is_some_and(|expected| expected != &detail.selection)
             {
+                // A repeated ide.start under one activation_id whose parameters differ can only
+                // name another root: the enqueue dedup returned the earlier start's reference,
+                // so say what actually happened instead of a generic mismatch.
                 return Err(InspectFailure::stage(
                     FailureCode::InvalidDetail,
-                    "inspect:detail_mismatch",
+                    if detail.selection.0 == AssistanceTool::Start {
+                        "start:activation_conflict"
+                    } else {
+                        "inspect:detail_mismatch"
+                    },
                 ));
             }
             (
@@ -4114,14 +4177,41 @@ fn source_matches(source: &SourceObservation) -> bool {
     }
 }
 
+/// Parses a test-run handle — `tests #N`, `tests-N`, `#N` or `N` — to its run number. A minted
+/// detail reference (`<64-hex>-<n>`) never parses as one, so the alias cannot shadow a detail.
+fn test_run_handle(reference: &str) -> Option<u64> {
+    let rest = reference.strip_prefix("tests").unwrap_or(reference);
+    let rest = rest.trim_start_matches(' ');
+    let rest = rest
+        .strip_prefix('#')
+        .or_else(|| rest.strip_prefix('-'))
+        .unwrap_or(rest);
+    (rest.bytes().all(|byte| byte.is_ascii_digit()) && !rest.is_empty())
+        .then(|| rest.parse::<u64>().ok())
+        .flatten()
+        .filter(|id| *id > 0)
+}
+
+/// Reports whether this daemon could never have minted `reference`: another boot's nonce, a
+/// number beyond the ledger counter, or a shape no minted reference has.
+fn never_issued(reference: &str, nonce: &[u8; 32], next: u64) -> bool {
+    let Some((prefix, number)) = reference.rsplit_once('-') else {
+        return true;
+    };
+    prefix != blake3::Hash::from_bytes(*nonce).to_hex().to_string()
+        || number.bytes().any(|byte| !byte.is_ascii_digit())
+        || number.parse::<u64>().map_or(true, |minted| minted > next)
+}
+
 /// Returns the exact same-binding source eligible to authorize a replacement edit.
 ///
-/// Context and a successful prior Edit are the only source-producing details. A prior Edit must
-/// name this exact reference as its post-read source and retain a source observation for the same
-/// requested path; every other detail, missing observation, mismatched binding, or failed edit is
-/// rejected as stale rather than being used to authorize bytes the caller has not observed. A
-/// Context whose pages are not all delivered yet is likewise rejected: its reference denotes the
-/// full observed source, but the caller has only seen part of it (T16B).
+/// Context, a completed Read and a successful prior Edit are the only source-producing details. A
+/// prior Edit must name this exact reference as its post-read source and retain a source
+/// observation for the same requested path; every other detail, missing observation, mismatched
+/// binding, or failed edit is rejected as stale rather than being used to authorize bytes the
+/// caller has not observed. A Context or Read whose pages are not all delivered yet is likewise
+/// rejected: its reference denotes the full observed source, but the caller has only seen part of
+/// it (T16B).
 fn admitted_edit_source(
     detail: &Detail,
     binding: &BindingRef,
@@ -4129,17 +4219,18 @@ fn admitted_edit_source(
     path: &str,
 ) -> Option<SourceObservation> {
     (detail.binding == *binding
-        // A Context source_ref names the complete observed source, but its pages are the only
-        // view the caller has: while any page is still undelivered the caller has not observed
-        // the whole file, so a full-content replace built on it could silently truncate it (T16B).
+        // A Context or Read source_ref names the complete observed source, but its pages are the
+        // only view the caller has: while any page is still undelivered the caller has not
+        // observed the whole file, so a full-content replace built on it could silently truncate
+        // it (T16B).
         && detail.context_page.is_none()
         && matches!(
             detail.selection.0,
-            AssistanceTool::Context | AssistanceTool::Edit
+            AssistanceTool::Context | AssistanceTool::Read | AssistanceTool::Edit
         )
         && match &detail.reply {
             PeerReply::Complete {
-                kind: ResultKind::Context,
+                kind: ResultKind::Context | ResultKind::Read,
                 ..
             } => true,
             PeerReply::Edit { result, .. } => {
@@ -4316,12 +4407,20 @@ fn errorlog_method(tool: AssistanceTool) -> crate::errorlog::Method {
     }
 }
 
-/// Chooses the first registered language whose project is detected at the worktree root.
-fn detect_test_language(root: &Path) -> Option<crate::lang::Language> {
-    crate::lang::registered()
+/// Projects detected at the worktree root in registration order, those with a root manifest
+/// first: a language present only by its files never shadows one the root declares.
+fn test_projects(root: &Path) -> Vec<(crate::lang::Language, LanguageProject)> {
+    let mut projects: Vec<_> = crate::lang::registered()
         .iter()
-        .copied()
-        .find(|language| language.support().detect(root).is_some())
+        .filter_map(|&language| Some((language, language.support().detect(root)?)))
+        .collect();
+    projects.sort_by_key(|(_, project)| project.manifests.is_empty());
+    projects
+}
+
+/// Chooses the first language of [`test_projects`].
+fn detect_test_language(root: &Path) -> Option<crate::lang::Language> {
+    test_projects(root).first().map(|(language, _)| *language)
 }
 
 /// Resolves a target through the detected runner, returning argv, language, and an optional
@@ -4331,19 +4430,15 @@ fn test_selection(
     root: &Path,
     target: crate::lang::TestTarget,
 ) -> Result<(Vec<String>, crate::lang::Language, Option<String>), crate::lang::LangError> {
-    for &language in crate::lang::registered() {
-        let support = language.support();
-        let Some(project) = support.detect(root) else {
-            continue;
-        };
-        let selection = support.test_selection(&project, &target)?;
-        let count = (!selection.tests.is_empty())
-            .then_some(format!("{} tests selected", selection.tests.len()));
-        return Ok((selection.command, language, count));
-    }
-    Err(crate::lang::LangError::Unsupported(
-        "no supported test runner was detected".to_owned(),
-    ))
+    let Some((language, project)) = test_projects(root).into_iter().next() else {
+        return Err(crate::lang::LangError::Unsupported(
+            "no supported test runner was detected".to_owned(),
+        ));
+    };
+    let selection = language.support().test_selection(&project, &target)?;
+    let count = (!selection.tests.is_empty())
+        .then_some(format!("{} tests selected", selection.tests.len()));
+    Ok((selection.command, language, count))
 }
 
 /// Formats an argv vector for the compact test status line without shell interpretation.
@@ -4696,6 +4791,7 @@ mod stop_retry_tests {
             stop_reply: None,
             native_epoch: 0,
             failure_detail: None,
+            format_note: None,
             check_scheduled: false,
             park_until: None,
             stage: None,
@@ -4757,6 +4853,7 @@ mod stop_retry_tests {
             stop_reply: None,
             native_epoch: 0,
             failure_detail: None,
+            format_note: None,
             check_scheduled: false,
             park_until: None,
             stage: None,
@@ -4854,6 +4951,7 @@ mod stop_retry_tests {
             stop_reply: None,
             native_epoch: 0,
             failure_detail: None,
+            format_note: None,
             check_scheduled: false,
             park_until: None,
             stage: None,
@@ -4894,6 +4992,7 @@ mod stop_retry_tests {
             stop_reply: None,
             native_epoch: 0,
             failure_detail: None,
+            format_note: None,
             check_scheduled: false,
             park_until: None,
             stage: None,
@@ -4977,6 +5076,292 @@ mod stop_retry_tests {
         assert_eq!(
             std::fs::read(fixture.root.join("main.rs")).unwrap(),
             b"fn newest() {}\n"
+        );
+    }
+
+    /// Runs one Read job to completion, retrying while it parks, and retains its completed
+    /// detail with the observation `ide.edit` later names as `source_ref`.
+    async fn read_and_retain(
+        worker: &mut Worker<'_>,
+        root: &std::path::Path,
+        actor: &str,
+        binding: &BindingRef,
+        reference: &str,
+        parameters: Value,
+    ) {
+        let invocation = production_call(worker, actor, &format!("{reference}-call"));
+        let (mut job, _cancel) = tool_job(
+            root,
+            invocation,
+            reference,
+            AssistanceTool::Read,
+            parameters.clone(),
+        );
+        let (reply, authority, source) = loop {
+            match worker.read(&mut job).await {
+                Ok(complete) => break complete,
+                Err(FailureCode::ProviderLoading) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(code) => panic!("read {reference} failed: {code:?}"),
+            }
+        };
+        worker.shared.ledger.lock().unwrap().details.insert(
+            reference.to_owned(),
+            Detail {
+                binding: binding.clone(),
+                reply,
+                selection: (AssistanceTool::Read, selection(&parameters)),
+                authority,
+                source,
+                native_epoch: 0,
+                diff_page: None,
+                diff_page_fresh: false,
+                context_page: None,
+                context_page_fresh: false,
+                diff_provenance: None,
+            },
+        );
+    }
+
+    /// Runs one `ide.edit` job to completion and returns its reply.
+    async fn run_edit(
+        worker: &mut Worker<'_>,
+        root: &std::path::Path,
+        reference: &str,
+        parameters: Value,
+    ) -> PeerReply {
+        let invocation = production_call(worker, "line-actor", reference);
+        let (mut job, _cancel) = tool_job(
+            root,
+            invocation,
+            reference,
+            AssistanceTool::Edit,
+            parameters,
+        );
+        loop {
+            match worker.edit(&mut job).await {
+                Ok((reply, _, _)) => return reply,
+                Err(FailureCode::ProviderLoading) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(code) => panic!("edit {reference} failed: {code:?}"),
+            }
+        }
+    }
+
+    /// A line-range edit applies only on a retained same-path observation whose bytes are still
+    /// current, reports the formatter's line movement, and never writes on a refused base; the
+    /// symbol form validates an explicit `source_ref` the same way and stays optional.
+    #[tokio::test]
+    async fn line_and_symbol_edits_gate_on_a_fresh_retained_source() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("fmt.toml"), "gamma formatter marker\n").unwrap();
+        let source = "sym card\nsym btn\nmark\nend\nend\n";
+        std::fs::write(fixture.root.join("a.gamma"), source).unwrap();
+        git_commit(&fixture.root, "line-edit fixture");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        worker.edits.install_schema().await.unwrap();
+        let (binding, _authority) =
+            activate_worktree(&mut worker, "line-actor", "line-start").await;
+
+        // A completed read of the exact lines is an admitted base, and the formatter's added
+        // line is stated so a later line edit does not reuse the pre-format numbers.
+        read_and_retain(
+            &mut worker,
+            &fixture.root,
+            "line-actor",
+            &binding,
+            "line-read",
+            serde_json::json!({"path":"a.gamma","lines":"2-3"}),
+        )
+        .await;
+        let reply = run_edit(
+            &mut worker,
+            &fixture.root,
+            "line-edit",
+            serde_json::json!({
+                "operation_id":"line-1",
+                "path":"a.gamma",
+                "lines":"2-3",
+                "source_ref":"line-read",
+                "content":"sym btn\nmark,x\n"
+            }),
+        )
+        .await;
+        assert!(
+            matches!(
+                &reply,
+                PeerReply::Edit {
+                    result: EditResult {
+                        outcome: ChangesEditOutcome::Replaced,
+                        source_ref: Some(reference),
+                        ..
+                    },
+                    note: Some(note),
+                    ..
+                } if reference == "line-edit"
+                    && note == "formatted: +1 lines after line 3; use source_ref line-edit for the next edit"
+            ),
+            "{reply:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("a.gamma")).unwrap(),
+            "sym card\nsym btn\nmark\nx\nend\nend\n"
+        );
+
+        // The file changed after the read: the edit is refused with no write at all.
+        std::fs::write(fixture.root.join("a.gamma"), source).unwrap();
+        read_and_retain(
+            &mut worker,
+            &fixture.root,
+            "line-actor",
+            &binding,
+            "stale-read",
+            serde_json::json!({"path":"a.gamma","lines":"2-3"}),
+        )
+        .await;
+        std::fs::write(
+            fixture.root.join("a.gamma"),
+            "sym card\nsym other\nmark\nend\nend\n",
+        )
+        .unwrap();
+        let reply = run_edit(
+            &mut worker,
+            &fixture.root,
+            "stale-edit",
+            serde_json::json!({
+                "operation_id":"line-stale",
+                "path":"a.gamma",
+                "lines":"2-3",
+                "source_ref":"stale-read",
+                "content":"sym btn\nmark\n"
+            }),
+        )
+        .await;
+        assert!(
+            matches!(
+                &reply,
+                PeerReply::Edit {
+                    result: EditResult {
+                        outcome: ChangesEditOutcome::StaleSource,
+                        source_ref: None,
+                        ..
+                    },
+                    note: None,
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("a.gamma")).unwrap(),
+            "sym card\nsym other\nmark\nend\nend\n"
+        );
+
+        // A reference that was never issued is refused the same way, before any write.
+        let reply = run_edit(
+            &mut worker,
+            &fixture.root,
+            "garbled-edit",
+            serde_json::json!({
+                "operation_id":"line-garbled",
+                "path":"a.gamma",
+                "lines":"2-3",
+                "source_ref":"no-such-observation",
+                "content":"sym btn\nmark\n"
+            }),
+        )
+        .await;
+        assert!(
+            matches!(
+                &reply,
+                PeerReply::Edit {
+                    result: EditResult {
+                        outcome: ChangesEditOutcome::StaleSource,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("a.gamma")).unwrap(),
+            "sym card\nsym other\nmark\nend\nend\n"
+        );
+
+        // The symbol form resolves its own range, so its source_ref is optional — but when one
+        // is given it is held to the same retained-and-current rule.
+        std::fs::write(fixture.root.join("a.gamma"), source).unwrap();
+        let reply = run_edit(
+            &mut worker,
+            &fixture.root,
+            "symbol-no-ref",
+            serde_json::json!({
+                "operation_id":"symbol-1",
+                "op":"replace",
+                "symbol":"a.gamma#card/btn",
+                "content":"sym btn\nend\n"
+            }),
+        )
+        .await;
+        assert!(
+            matches!(
+                &reply,
+                PeerReply::Edit {
+                    result: EditResult {
+                        outcome: ChangesEditOutcome::Replaced,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+        let symbol_source = std::fs::read(fixture.root.join("a.gamma")).unwrap();
+        read_and_retain(
+            &mut worker,
+            &fixture.root,
+            "line-actor",
+            &binding,
+            "symbol-read",
+            serde_json::json!({"symbol":"a.gamma#card/btn"}),
+        )
+        .await;
+        let reply = run_edit(
+            &mut worker,
+            &fixture.root,
+            "symbol-bad-ref",
+            serde_json::json!({
+                "operation_id":"symbol-2",
+                "op":"replace",
+                "symbol":"a.gamma#card/btn",
+                "source_ref":"also-not-issued",
+                "content":"sym btn\nend\n"
+            }),
+        )
+        .await;
+        assert!(
+            matches!(
+                &reply,
+                PeerReply::Edit {
+                    result: EditResult {
+                        outcome: ChangesEditOutcome::StaleSource,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+        assert_eq!(
+            std::fs::read(fixture.root.join("a.gamma")).unwrap(),
+            symbol_source
         );
     }
 
@@ -5137,6 +5522,7 @@ mod stop_retry_tests {
             stop_reply: None,
             native_epoch: 0,
             failure_detail: None,
+            format_note: None,
             check_scheduled: false,
             park_until: None,
             stage: None,
@@ -5239,6 +5625,7 @@ mod stop_retry_tests {
                 stop_reply: None,
                 native_epoch: 0,
                 failure_detail: None,
+                format_note: None,
                 check_scheduled: false,
                 park_until: None,
                 stage: None,
@@ -5850,6 +6237,217 @@ mod stop_retry_tests {
         assert_eq!(detail.as_deref(), Some("inspect:detail_unknown"));
     }
 
+    /// Every handle shape an agent reaches for names its run; a minted detail reference never
+    /// does, so the alias cannot shadow a retained detail.
+    #[test]
+    fn test_run_handles_parse_every_shape_but_no_minted_reference() {
+        assert_eq!(test_run_handle("tests #3"), Some(3));
+        assert_eq!(test_run_handle("tests-3"), Some(3));
+        assert_eq!(test_run_handle("#3"), Some(3));
+        assert_eq!(test_run_handle("3"), Some(3));
+        assert_eq!(test_run_handle("tests 3"), Some(3));
+        assert_eq!(test_run_handle("0"), None);
+        assert_eq!(test_run_handle("tests"), None);
+        assert_eq!(test_run_handle("sym-14"), None);
+        assert_eq!(
+            test_run_handle(&format!(
+                "{}-7",
+                blake3::Hash::from_bytes([0_u8; 32]).to_hex()
+            )),
+            None
+        );
+        assert!(never_issued(
+            &format!("{}-7", blake3::Hash::from_bytes([1_u8; 32]).to_hex()),
+            &[0_u8; 32],
+            10
+        ));
+        assert!(!never_issued(
+            &format!("{}-7", blake3::Hash::from_bytes([0_u8; 32]).to_hex()),
+            &[0_u8; 32],
+            10
+        ));
+        // A number this daemon has not minted yet was never issued.
+        assert!(never_issued(
+            &format!("{}-11", blake3::Hash::from_bytes([0_u8; 32]).to_hex()),
+            &[0_u8; 32],
+            10
+        ));
+    }
+
+    /// `ide.inspect` answers a test-run handle with that run's status, and an unknown detail
+    /// reference is split into never-issued and expired.
+    #[tokio::test]
+    async fn inspect_answers_test_handles_and_splits_unknown_from_expired() {
+        crate::lang::testing::install();
+        let gamma = crate::lang::Language::by_id("gamma").expect("test language");
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("main.rs"), "let value = 1;\n").unwrap();
+        git_commit(&fixture.root, "inspect fixture");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, _) = activate_worktree(&mut worker, "inspect-actor", "inspect-start").await;
+        let owner = binding.fingerprint();
+
+        let inspect = |reference: String| async {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            serve_inspection(
+                &worker.workspace,
+                &worker.shared,
+                Inspection {
+                    binding: binding.clone(),
+                    reference,
+                    expected: None,
+                    reply: reply_tx,
+                },
+            )
+            .await;
+            reply_rx.await.unwrap()
+        };
+
+        // A finished run's handle answers with its parsed result.
+        match worker.shared.test_runs.start(
+            fixture.root.clone(),
+            vec!["/bin/echo".into(), "pass".into()],
+            gamma,
+            Duration::from_secs(30),
+            "echo-run-detail".into(),
+            owner,
+        ) {
+            StartResult::Started(id) => assert_eq!(id, 1),
+            StartResult::Running(..) | StartResult::Failed(..) => {
+                panic!("echo run must start")
+            }
+        }
+        let completed = loop {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let reply = inspect("tests #1".into()).await;
+            let PeerReply::Complete { text, .. } = &reply else {
+                panic!("handle alias must answer, got {reply:?}")
+            };
+            if text.contains("1 passed") {
+                break text.clone();
+            }
+        };
+        assert!(
+            completed.starts_with("tests #1: 1 passed, 0 failed")
+                && completed.contains("full output: ide.inspect echo-run-detail"),
+            "{completed}"
+        );
+
+        // A still-running run's handle answers with the running line and the poll hint.
+        let sleep_started = loop {
+            match worker.shared.test_runs.start(
+                fixture.root.clone(),
+                vec!["/bin/sleep".into(), "30".into()],
+                gamma,
+                Duration::from_secs(60),
+                "sleep-run-detail".into(),
+                owner,
+            ) {
+                StartResult::Started(id) => break id,
+                StartResult::Running(..) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                StartResult::Failed(_) => panic!("sleep run must start"),
+            }
+        };
+        assert_eq!(sleep_started, 2);
+        let running = inspect("#2".into()).await;
+        let PeerReply::Complete { text, .. } = &running else {
+            panic!("handle alias must answer, got {running:?}")
+        };
+        assert!(
+            text.starts_with("tests #2: running")
+                && text.ends_with("poll: ide.test {\"status\": 2}"),
+            "{text}"
+        );
+
+        // A number no run ever had answers unknown job, not invalid_detail.
+        let unknown = inspect("tests-9".into()).await;
+        let PeerReply::Complete { text, .. } = &unknown else {
+            panic!("unknown run must answer a status line, got {unknown:?}")
+        };
+        assert_eq!(
+            text,
+            "tests #9: unknown job; poll: ide.test {\"status\": 9}"
+        );
+
+        // A reference this daemon minted but no longer retains reads expired; one it could
+        // never have minted stays unknown.
+        worker.shared.ledger.lock().unwrap().next = 10;
+        let minted = format!(
+            "{}-5",
+            blake3::Hash::from_bytes(worker.shared.nonce).to_hex()
+        );
+        let PeerReply::Error { detail, .. } = inspect(minted).await else {
+            panic!("a dropped reference must fail")
+        };
+        assert_eq!(detail.as_deref(), Some("inspect:detail_expired"));
+        let PeerReply::Error { detail, .. } = inspect("never-retained".into()).await else {
+            panic!("an unminted reference must fail")
+        };
+        assert_eq!(detail.as_deref(), Some("inspect:detail_unknown"));
+    }
+
+    /// A repeated ide.start under one activation_id with a different root reaches the earlier
+    /// start's retained reference; the mismatch names its own stage instead of a generic one.
+    #[tokio::test]
+    async fn repeated_start_with_another_root_names_its_own_stage() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("main.rs"), "let value = 1;\n").unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, authority) =
+            activate_worktree(&mut worker, "conflict-actor", "conflict-start").await;
+        // The enqueue dedup key is (binding, activation_id); the retained detail is the first
+        // start's, and the retried call differs only in its root.
+        let first = serde_json::json!({"activation_id":"same-id"});
+        worker.shared.ledger.lock().unwrap().details.insert(
+            "start-first".into(),
+            Detail {
+                binding: binding.clone(),
+                reply: PeerReply::Complete {
+                    kind: ResultKind::Activation,
+                    text: "activated".into(),
+                    detail_ref: None,
+                    truncated: false,
+                    continuation: false,
+                },
+                selection: (AssistanceTool::Start, selection(&first)),
+                authority: Some(authority),
+                source: None,
+                native_epoch: 0,
+                diff_page: None,
+                diff_page_fresh: false,
+                context_page: None,
+                context_page_fresh: false,
+                diff_provenance: None,
+            },
+        );
+        let retry = serde_json::json!({"activation_id":"same-id","root":"/another/root"});
+        let (reply_tx, reply_rx) = oneshot::channel();
+        serve_inspection(
+            &worker.workspace,
+            &worker.shared,
+            Inspection {
+                binding,
+                reference: "start-first".into(),
+                expected: Some((AssistanceTool::Start, selection(&retry))),
+                reply: reply_tx,
+            },
+        )
+        .await;
+        let PeerReply::Error { code, detail } = reply_rx.await.unwrap() else {
+            panic!("a conflicting activation retry must fail")
+        };
+        assert_eq!(code, FailureCode::InvalidDetail);
+        assert_eq!(detail.as_deref(), Some("start:activation_conflict"));
+    }
+
     /// A small file's Context reply is byte-for-byte unchanged by the chunking path: it fits one
     /// page, so no `context_page` is retained and `continuation` stays `false`, exactly as before
     /// T09B introduced pagination.
@@ -5988,6 +6586,7 @@ mod stop_retry_tests {
                 stop_reply: None,
                 native_epoch: 0,
                 failure_detail: None,
+                format_note: None,
                 check_scheduled: false,
                 park_until: None,
                 stage: None,
@@ -6080,6 +6679,7 @@ mod stop_retry_tests {
                 stop_reply: None,
                 native_epoch: 0,
                 failure_detail: None,
+                format_note: None,
                 check_scheduled: false,
                 park_until: None,
                 stage: None,
@@ -6290,6 +6890,7 @@ mod stop_retry_tests {
                         stop_reply: None,
                         native_epoch: 0,
                         failure_detail: None,
+                        format_note: None,
                         check_scheduled: false,
                         park_until: None,
                         stage: None,

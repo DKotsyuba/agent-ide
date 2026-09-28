@@ -995,18 +995,18 @@ fn host_call(actor: &str, call: &str, name: &str) -> Value {
         "x-codex-turn-metadata":{"private":"not-retained"},"codex/sandbox-state-meta":{"permissionProfile":{"type":"disabled"},"codexLinuxSandboxExe":null,"sandboxCwd":"/private/tmp","useLegacyLandlock":false}}}})
 }
 
-/// The Cargo home the analyzer inherits: the operator's own registry when it exists, otherwise
-/// the private namespace copy, exactly as `RustProfile::command` resolves it.
+/// The Cargo home the analyzer inherits: the operator's real registry when it exists, otherwise
+/// the private namespace copy, exactly as `RustProfile::command` resolves it from the real user
+/// home — never from the daemon's substituted `HOME` or inherited `CARGO_HOME`.
 fn operator_cargo_home(namespace: &Path) -> PathBuf {
-    std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_dir())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join(".cargo"))
-                .filter(|path| path.is_dir())
-        })
-        .unwrap_or_else(|| namespace.join("cargo"))
+    let derived = agent_ide::userhome::user_home()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".cargo");
+    if derived.is_dir() {
+        derived
+    } else {
+        namespace.join("cargo")
+    }
 }
 
 /// Checks a closed host boundary response and proves private launch/input fields were not rendered.
@@ -2119,12 +2119,12 @@ impl ProductFixture {
     }
     /// Starts one configured shipping daemon and waits only for its real private endpoint.
     async fn daemon(&self) -> Child {
-        self.spawn_configured_daemon(None, false, Duration::from_secs(5))
+        self.spawn_configured_daemon(None, false, Duration::from_secs(5), None)
             .await
     }
     /// Starts a configured daemon with a caller-selected bound for cold multi-profile startup.
     async fn daemon_with_startup_timeout(&self, startup_timeout: Duration) -> Child {
-        self.spawn_configured_daemon(None, false, startup_timeout)
+        self.spawn_configured_daemon(None, false, startup_timeout, None)
             .await
     }
     /// Starts the configured daemon with durable telemetry captured at [`Self::telemetry`].
@@ -2133,29 +2133,43 @@ impl ProductFixture {
     /// `AGENT_IDE_TELEMETRY_DATABASE` override — exactly what the managed launcher selects — makes
     /// sanitized telemetry queryable and exportable after a restart.
     async fn daemon_with_durable_telemetry(&self) -> Child {
-        self.spawn_configured_daemon(None, true, Duration::from_secs(5))
+        self.spawn_configured_daemon(None, true, Duration::from_secs(5), None)
+            .await
+    }
+
+    /// Starts the configured daemon with a hostile substituted `HOME` (an empty `.cargo`, the
+    /// shape `agent-run` runtime homes ship): the resolved user home and cargo home must stay
+    /// the operator's.
+    async fn daemon_with_substituted_home(&self, home: &Path) -> Child {
+        self.spawn_configured_daemon(None, false, Duration::from_secs(5), Some(home))
             .await
     }
     /// Starts the configured daemon, optionally with its home (`AGENT_IDE_HOME`, which the product
     /// resolves instead of `$HOME`) redirected into the fixture so its project check caches never
     /// touch the real home directory. Without one it inherits the test-wide `AGENT_IDE_HOME`.
     async fn daemon_with_home(&self, home: Option<&Path>) -> Child {
-        self.spawn_configured_daemon(home, false, Duration::from_secs(5))
+        self.spawn_configured_daemon(home, false, Duration::from_secs(5), None)
             .await
     }
     /// Starts one configured shipping daemon and waits only for its real private endpoint.
     ///
     /// `durable_telemetry` selects the absolute `AGENT_IDE_TELEMETRY_DATABASE` override exactly as
     /// the managed launcher does, keeping capture alive when shutdown removes the runtime directory.
+    /// `substitute_home` replaces the daemon's `HOME` with a hostile directory (the substituted
+    /// homes `agent-run` runtimes ship) while the resolved user home stays the operator's.
     async fn spawn_configured_daemon(
         &self,
         home: Option<&Path>,
         durable_telemetry: bool,
         startup_timeout: Duration,
+        substitute_home: Option<&Path>,
     ) -> Child {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
         if let Some(home) = home {
             command.env(agent_ide::userhome::HOME_OVERRIDE_ENV, home);
+        }
+        if let Some(home) = substitute_home {
+            command.env("HOME", home);
         }
         // Fixture `cargo` runs (`ide.test`) build into a fixture-private target directory, never
         // the one this test binary was built in: cargo caches rustc probe results — failures
@@ -5408,6 +5422,12 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
         start_text.starts_with("tests #1: started — cargo test --workspace --lib (budget 120 s)"),
         "{start_text}"
     );
+    assert_eq!(
+        start_text.trim_end(),
+        "tests #1: started — cargo test --workspace --lib (budget 120 s); poll: ide.test \
+         {\"status\": 1}",
+        "{start_text}"
+    );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     let completed = loop {
         assert!(
@@ -6186,6 +6206,70 @@ async fn product_start_prewarms_the_name_index() {
     daemon.wait().await.unwrap();
 }
 
+/// A use site in a file the TypeScript server cannot outline (its `tsconfig.json` lives in a
+/// subdirectory and falls outside the accepted profile) still becomes its enclosing declaration,
+/// read from the text, and is not expanded through the unavailable call hierarchy.
+#[tokio::test]
+async fn product_graph_names_use_sites_the_server_cannot_outline() {
+    let fixture = ProductFixture::new(json!([accepted_typescript_provider()]));
+    fixture.git(&[
+        "rm",
+        "--quiet",
+        "--",
+        "Cargo.toml",
+        "src/lib.rs",
+        "go.mod",
+        "main.go",
+    ]);
+    std::fs::create_dir_all(fixture.root.join("frontend/src")).unwrap();
+    for (name, text) in [
+        (
+            "frontend/tsconfig.json",
+            "{\"compilerOptions\":{\"jsx\":\"react-jsx\"}}\n",
+        ),
+        ("frontend/src/Layout.css", ".header {\n  color: red;\n}\n"),
+        (
+            "frontend/src/Layout.tsx",
+            "import \"./Layout.css\";\n\nexport default function Layout() {\n  return <header className=\"header\">Top</header>;\n}\n",
+        ),
+    ] {
+        std::fs::write(fixture.root.join(name), text).unwrap();
+    }
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "nested frontend"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "nested").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"nested"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert!(
+        started["text"]
+            .as_str()
+            .unwrap()
+            .contains("\nlanguages: typescript "),
+        "{started}"
+    );
+    let graph = actor
+        .call(
+            &fixture,
+            "ide.graph",
+            json!({"symbol":"frontend/src/Layout.css#.header", "direction":"callers", "depth":2}),
+        )
+        .await;
+    let graph = actor.settle(&fixture, graph).await;
+    assert_eq!(
+        graph["text"].as_str().unwrap_or_default(),
+        "graph: callers of frontend/src/Layout.css#.header (depth 2, 2 nodes, 1 edges)\n\
+         \x20 ⇢ frontend/src/Layout.tsx#Layout  frontend/src/Layout.tsx:3 [typescript]\n",
+        "{graph}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A second worktree of the repository inherits the name index by content: its activation card
 /// reports the index summary at once and its first `.btn` card answers inline.
 #[tokio::test]
@@ -6615,6 +6699,85 @@ async fn configured_product_warm_rust_calls_complete_inline_within_three_seconds
     daemon.wait().await.unwrap();
 }
 
+/// Builds the symbol-test fixture crate with one registry dependency (`serde = "1"`), resolved
+/// offline from the operator's real cargo home into a committed lockfile.
+fn registry_dependency_fixture() -> ProductFixture {
+    let fixture = symbol_test_fixture();
+    std::fs::write(
+        fixture.root.join("Cargo.toml"),
+        "[package]\nname=\"product_fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub struct FileFlag;\nimpl FileFlag { pub fn is_file(&self) -> bool { true } }\n\n#[derive(serde::Serialize)]\npub struct Payload;\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "-A"]);
+    fixture.git(&["commit", "--quiet", "-m", "registry dependency fixture"]);
+    // Resolve serde offline from the operator's real registry into a committed lockfile, so the
+    // analyzer's `cargo metadata` under the substituted HOME never needs the network.
+    let output = std::process::Command::new(toolchain_bin("cargo"))
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(&fixture.root)
+        .env(
+            "HOME",
+            agent_ide::userhome::user_home().unwrap_or_else(std::env::temp_dir),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "offline lockfile generation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.root.join("Cargo.lock").exists(), "lockfile written");
+    fixture
+}
+
+/// The e009 regression, live: a daemon whose `HOME` is a substitute with an empty `.cargo` (the
+/// shape `agent-run` runtime homes ship) still answers the Rust outline, because the analyzer
+/// session resolves the operator's real cargo home for `cargo metadata` exactly as the confined
+/// project check does. Before the fix the empty substitute registry was handed to rust-analyzer,
+/// the workspace loaded with health `error`, and every outline answered provider_unavailable.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment"]
+async fn configured_product_rust_outline_answers_when_home_is_a_substitute_with_empty_cargo() {
+    let fixture = registry_dependency_fixture();
+    let substitute = fixture.base.join("substitute-home");
+    std::fs::create_dir_all(substitute.join(".cargo")).unwrap();
+    let mut daemon = fixture.daemon_with_substituted_home(&substitute).await;
+    let mut actor = ProductActor::new(&fixture, "substitute-home-rust").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"substitute-home-start"}),
+        )
+        .await;
+    assert_eq!(
+        actor.settle(&fixture, started).await["kind"],
+        "activation",
+        "activation under a substituted HOME"
+    );
+    let outline = actor
+        .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+        .await;
+    let outline = actor.settle(&fixture, outline).await;
+    assert_eq!(
+        outline["kind"], "outline",
+        "outline under a substituted HOME with an empty substitute .cargo: {outline}"
+    );
+    let text = outline["text"].as_str().unwrap();
+    assert!(text.contains("FileFlag"), "{outline}");
+    assert!(text.contains("Payload"), "{outline}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Rejects an empty root policy and accepts an explicit start root below an admitted root.
 /// Rejects an empty root policy and accepts an explicit start root below an admitted root.
 #[tokio::test]
 async fn configured_product_start_enforces_allowed_roots_and_accepts_root_argument() {

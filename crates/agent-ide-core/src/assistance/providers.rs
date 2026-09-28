@@ -891,6 +891,14 @@ impl ProviderJob for Job {
     fn set_failure_detail(&mut self, detail: String) {
         self.failure_detail = Some(detail);
     }
+
+    /// Records the failed session stage for the reply: the default `<tool>:<reason>` tag
+    /// composed with the backend-reported stage.
+    fn set_stage_failure(&mut self, code: &FailureCode, stage: &str) {
+        self.failure_detail = Some(crate::telemetry::adapters::stage_with_failure(
+            self.tool, code, stage,
+        ));
+    }
 }
 
 #[cfg(test)]

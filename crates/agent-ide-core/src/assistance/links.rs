@@ -127,8 +127,17 @@ fn display(key: &NameKey) -> String {
     text
 }
 
-/// A definition line shortened to its selector: text before a rule body, clipped.
+/// A definition line shortened to its selector: text before a trailing `/* … */` comment and
+/// before a rule body, clipped.
 fn selector(text: &str) -> String {
+    let text = match text
+        .trim_end()
+        .strip_suffix("*/")
+        .and_then(|rest| rest.rsplit_once("/*"))
+    {
+        Some((before, _)) => before.trim_end(),
+        None => text,
+    };
     let text = if text.ends_with('{') || text.ends_with('}') {
         text.split('{').next().unwrap_or(text).trim_end()
     } else {
@@ -801,5 +810,7 @@ mod tests {
         assert_eq!(sigil_address("."), None);
         assert_eq!(selector(".layout .btn { margin: 0; }"), ".layout .btn");
         assert_eq!(selector("<a class=\"{{ x }}\">"), "<a class=\"{{ x }}\">");
+        assert_eq!(selector("--accent: #f60; /* brand */"), "--accent: #f60;");
+        assert_eq!(selector(".btn { /* base */"), ".btn");
     }
 }

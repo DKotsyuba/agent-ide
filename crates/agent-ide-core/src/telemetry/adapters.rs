@@ -151,6 +151,14 @@ pub(crate) fn default_stage(tool: AssistanceTool, code: &FailureCode) -> String 
     stage_default(tool, reason.as_str())
 }
 
+/// Composes the default `<tool>:<reason>` tag with the backend-reported session stage, the
+/// closed detail shape for a failed provider start or workspace load, e.g.
+/// `outline:provider_unavailable (<language>: workspace load failed)`. The stage names the
+/// failing step only — closed words, no paths or payloads.
+pub(crate) fn stage_with_failure(tool: AssistanceTool, code: &FailureCode, stage: &str) -> String {
+    format!("{} ({stage})", default_stage(tool, code))
+}
+
 /// Converts the closed telemetry method tag into the closed error-log method tag.
 fn errorlog_method(method: ToolMethod) -> crate::errorlog::Method {
     match method {
@@ -442,6 +450,36 @@ mod tests {
         assert_eq!(reply_detail(&bare), None);
     }
 
+    /// A failed provider start or workspace load composes the default tool tag with the closed
+    /// session stage: `<tool>:<reason> (<language>: <stage words>)`, no paths, no payloads.
+    #[test]
+    fn a_failed_session_names_its_stage_after_the_default_tag() {
+        assert_eq!(
+            stage_with_failure(
+                AssistanceTool::Outline,
+                &FailureCode::ProviderUnavailable,
+                "<language>: workspace load failed",
+            ),
+            "outline:provider_unavailable (<language>: workspace load failed)"
+        );
+        assert_eq!(
+            stage_with_failure(
+                AssistanceTool::Symbol,
+                &FailureCode::ProviderUnavailable,
+                "<language>: spawn failed",
+            ),
+            "symbol:provider_unavailable (<language>: spawn failed)"
+        );
+        assert_eq!(
+            stage_with_failure(
+                AssistanceTool::Context,
+                &FailureCode::ProviderUnavailable,
+                "<language>: initialize timeout",
+            ),
+            "context:provider_unavailable (<language>: initialize timeout)"
+        );
+    }
+
     /// Proves adapters mention only the fixed closed event vocabulary in their source module.
     #[test]
     fn adapters_keep_their_public_input_closed() {
@@ -575,6 +613,7 @@ mod tests {
                 delta: "private diagnostic delta".into(),
                 truncated: false,
             },
+            note: None,
         };
         tool_reply(
             &telemetry,

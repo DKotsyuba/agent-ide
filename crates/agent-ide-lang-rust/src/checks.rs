@@ -10,7 +10,6 @@
 //! runner is wired separately from `agent_ide_core::execution`.
 
 use std::collections::HashSet;
-use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -114,8 +113,8 @@ impl RustChecker {
     /// capped at `MAX_OUTPUT_BYTES`. Ambient Cargo variables are ignored; HOME follows the
     /// configured `AGENT_IDE_HOME` override or the password database.
     pub fn cargo_check_spec(&self, request: &CheckRequest) -> RunSpec {
-        let home = real_home();
-        let cargo_home = self.effective_cargo_home(&home);
+        let home = crate::home::real_home();
+        let cargo_home = crate::home::effective_cargo_home(self.cargo_home.as_deref(), &home);
         let rustup_home = derived_rustup_home(&self.toolchain_dir, &home);
         let args: Vec<OsString> = vec![
             "check",
@@ -181,16 +180,6 @@ impl RustChecker {
             max_output_bytes: MAX_OUTPUT_BYTES,
         }
     }
-
-    /// Returns the effective cargo home: the override, else `$HOME/.cargo`.
-    ///
-    /// `home` is injected so the derivation is a pure function of configuration plus the home
-    /// dir, keeping it testable without process environment mutation.
-    fn effective_cargo_home(&self, home: &Path) -> PathBuf {
-        self.cargo_home
-            .clone()
-            .unwrap_or_else(|| home.join(".cargo"))
-    }
 }
 
 /// Returns Cargo's standard Git excludes file as one read root when it exists and is allowed.
@@ -254,13 +243,6 @@ fn ancestor_manifest_roots(
         }
     }
     roots
-}
-
-/// Returns the real user home directory from the password database (never `$HOME`, which a host
-/// may substitute), honoring only the `AGENT_IDE_HOME` override; when neither resolves the system
-/// temp dir is substituted so path construction stays absolute.
-fn real_home() -> PathBuf {
-    agent_ide_core::userhome::user_home().unwrap_or_else(env::temp_dir)
 }
 
 /// Derives the rustup home from the toolchain directory.

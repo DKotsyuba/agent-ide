@@ -221,7 +221,10 @@ language server (`provider_loading`, detail `names:building`).
 **Graph.** `ide.graph` adds cross-language link edges, drawn `⇢`, for symbols of languages with
 name facts. Callers of a symbol that defines names (a style rule) are the enclosing outline symbols of
 their use sites (the file itself when no symbol encloses the site), tagged with their language; a
-callable one continues through the ordinary call hierarchy at the next level. Callees of a symbol
+callable one continues through the ordinary call hierarchy at the next level. When the server
+cannot outline the file (a TypeScript file whose `tsconfig.json` lives below the worktree root),
+the enclosing symbol comes from the language's top-level declarations read from the text, and the
+node is not expanded. Callees of a symbol
 that uses names end in one leaf per name (at most 10, never expanded), located at its first indexed
 definition. Depth, the 60-node and 120-edge ceilings, cycles and test collapsing are unchanged, and
 graphs without link edges are byte-identical:
@@ -264,10 +267,16 @@ Input operations:
 {op: "insert",  symbol: "src/index.ts#ClassImpl",   where: "first"|"last",   content: "…"}
 {op: "delete",  symbol: "src/index.ts#ClassImpl/old"}
 {op: "rename",  symbol: "src/index.ts#ClassImpl/method", new_name: "run"}
-{op: "replace", path: "src/index.ts", lines: "1-12", content: "…"}          // fallback mode
+{op: "replace", path: "src/index.ts", lines: "1-12", source_ref: "sym-14", content: "…"}   // fallback mode
 ```
 
 For a symbol, `content` is the complete symbol including its header. The IDE derives indentation and blank lines from neighboring code. After writing, the project's formatter runs over the candidate (before the write), then the project check (cargo check / pyright / tsc) is scheduled at once and the reply carries the edited file's problems from it. `rename` is performed by the language server across the project.
+
+The line-range form **requires** `source_ref`, and it must name a retained read of the same file (an `ide.read` reply's `source_ref`, a completed paged read, or a prior edit's `source_ref`). The edit applies only while that observation's bytes are still the file's current bytes; anything else is refused as `stale_source` with no write, and the reply says to re-read the lines and retry with the new `source_ref`. The symbol form resolves the symbol again, so its `source_ref` is optional — but when one is given it is validated the same way. When the formatter changes the file's line count, every successful edit reply states the movement as its last line:
+
+```text
+formatted: +3 lines after line 24; use source_ref sym-14 for the next edit
+```
 
 Output (implemented wire form):
 
@@ -275,6 +284,7 @@ Output (implemented wire form):
 edit: replaced; path src/lang/path.rs; source_ref …-3; diagnostics: current_reported (project check 1.8s: 1 errors, 0 warnings in this file)
 src/lang/path.rs:132:9 error [E0308] mismatched types
 Next: use ide.edit with source_ref …-3
+formatted: +3 lines after line 24; use source_ref …-3 for the next edit
 ```
 
 ```text
@@ -301,13 +311,15 @@ Input: `{symbol}` | `{path}` | `{pattern}` | `{command}`, with optional `budget_
 Immediate output:
 
 ```text
-tests #3: started — cargo test --workspace worker::  (4 tests selected, budget 120 s)
+tests #3: started — cargo test --workspace worker::  (4 tests selected, budget 120 s); poll: ide.test {"status": 3}
 ```
 
 The `symbol` form first asks the live language server for the symbol's references, which takes
 seconds on a cold session, so it answers `pending` at once and the started line (or
 `tests: no tests reference …`) arrives through `ide.inspect`; `path`, `pattern` and `command`
-answer inline.
+answer inline. Every start and running line ends with `poll: ide.test {"status": N}`, and
+`ide.inspect` with a test-run handle (`tests #N`, `tests-N`, `#N`, `N`) answers with that run's
+status line, so a handle mistaken for a `detail_ref` still reaches the result.
 
 Status appears in the status block and through `ide.test {status: 3}`:
 
@@ -344,7 +356,7 @@ Output uses the current `file:line:column code message` form, grouped by file an
 
 ### 2.9 Unchanged tools
 
-`ide.inspect {detail_ref, page?}` and `ide.stop {}` remain unchanged. `ide.context` in its current form is retired; its role is divided among `outline`, `symbol`, `read`, and `problems`.
+`ide.inspect {detail_ref, page?}` and `ide.stop {}` remain unchanged, except that an unknown `detail_ref` now says which it is — `this detail_ref was never issued` for a reference this daemon could not have minted, `this detail_ref has expired` for one it minted and no longer retains — and a test-run handle (`tests #N`, `tests-N`, `#N`, `N`) answers with that run's status line instead of failing the lookup. `ide.context` in its current form is retired; its role is divided among `outline`, `symbol`, `read`, and `problems`.
 
 ## 3. `LanguageSupport` contract
 
