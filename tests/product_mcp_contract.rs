@@ -4999,6 +4999,104 @@ async fn product_directory_outline_lists_files_and_rejects_escaping_symlinks() {
     daemon.wait().await.unwrap();
 }
 
+/// Style sheets have no language server: `ide.start` lists them, and outline, read and symbol
+/// answer from the source outline with honest unavailable lines for usages and callers.
+#[tokio::test]
+async fn product_style_sheets_answer_symbol_tools_without_a_server() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(
+        fixture.root.join("styles.css"),
+        "/* buttons */\n.btn {\n  color: var(--brand);\n}\n\n@media (min-width: 40em) {\n  .card .btn { padding: 0; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("theme.scss"),
+        ".btn {\n  &-primary { color: red; }\n}\n",
+    )
+    .unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "style-sheets").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"style-sheets"}),
+        )
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let card = started["text"].as_str().unwrap();
+    assert!(card.contains("css 11 lines in 2 files"), "{card}");
+
+    let outline = actor
+        .call(&fixture, "ide.outline", json!({"path":"styles.css"}))
+        .await;
+    let outline = actor.settle(&fixture, outline).await;
+    assert_eq!(
+        outline["text"],
+        "styles.css  (8 lines, css)\n    2  .btn\n    6  @media (min-width: 40em)\n    7    .card .btn\n  (3 symbols)\n",
+        "{outline}"
+    );
+
+    let symbol = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":"styles.css#.btn"}))
+        .await;
+    let symbol = actor.settle(&fixture, symbol).await;
+    assert_eq!(symbol["kind"], "symbol", "{symbol}");
+    println!("css card:\n{}", symbol["text"].as_str().unwrap());
+    assert_eq!(
+        symbol["text"],
+        "symbol: .btn — symbol, styles.css#.btn (lines 2–4)\nsignature: .btn\n\
+         definition styles.css#.btn  (lines 2–4)\n\
+         usages: unavailable (css has no language server; see links)\n\
+         callers: unavailable (css has no call hierarchy)\n",
+        "{symbol}"
+    );
+
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"symbol":"styles.css#@media (min-width: 40em)/.card .btn"}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let text = read["text"].as_str().unwrap();
+    assert!(
+        text.starts_with(
+            "styles.css#@media (min-width: 40em)/.card .btn  (lines 7)\n7    .card .btn { padding: 0; }\n"
+        ),
+        "{read}"
+    );
+    let nested = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"theme.scss#.btn/&-primary"}),
+        )
+        .await;
+    let nested = actor.settle(&fixture, nested).await;
+    assert!(
+        nested["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("symbol: &-primary — symbol, theme.scss#.btn/&-primary (lines 2)\n"),
+        "{nested}"
+    );
+    let tests = actor
+        .call(&fixture, "ide.test", json!({"path":"styles.css"}))
+        .await;
+    let tests = actor.settle(&fixture, tests).await;
+    assert_eq!(
+        tests["text"], "tests: no tests in styles.css; the file has no tests",
+        "{tests}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A Python request in a binding whose Rust session is live leaves that session running: the
 /// rust-analyzer wrapper is spawned exactly once across `.rs` -> `.py` -> `.rs` requests, and the
 /// second Rust request answers without another readiness wait.

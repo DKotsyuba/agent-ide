@@ -40,6 +40,7 @@ pub mod intelligence {
 pub mod lang {
     pub use agent_ide_core::lang::*;
 
+    pub use agent_ide_lang_css::support as css;
     pub use agent_ide_lang_go::support as go;
     pub use agent_ide_lang_python::support as python;
     pub use agent_ide_lang_rust::support as rust;
@@ -58,9 +59,11 @@ pub mod languages {
     pub const TYPESCRIPT: Language = agent_ide_lang_typescript::LANGUAGE;
     /// The Go language.
     pub const GO: Language = agent_ide_lang_go::LANGUAGE;
+    /// Style sheets: CSS, SCSS, Sass and LESS (no server, no project check).
+    pub const CSS: Language = agent_ide_lang_css::LANGUAGE;
 
     /// Every bundled language in the order replies list them.
-    pub const ALL: [Language; 4] = [RUST, PYTHON, TYPESCRIPT, GO];
+    pub const ALL: [Language; 5] = [RUST, PYTHON, TYPESCRIPT, GO, CSS];
 
     /// Registers every bundled language for this process. Idempotent; call it before parsing a
     /// launcher configuration or mapping any path to a language.

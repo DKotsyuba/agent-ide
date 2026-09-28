@@ -20,6 +20,7 @@ agent-ide-lang-typescript = { path = "crates/agent-ide-lang-typescript" }
 agent-ide-lang-python = { path = "crates/agent-ide-lang-python" }
 agent-ide-lang-rust = { path = "crates/agent-ide-lang-rust" }
 agent-ide-lang-go = { path = "crates/agent-ide-lang-go" }
+agent-ide-lang-css = { path = "crates/agent-ide-lang-css" }
 async-lsp = { version = "0.2.4", default-features = false, features = ["omni-trait", "tokio"] }
 blake3 = "1"
 libc = "0.2"

@@ -1,6 +1,6 @@
 # Language bridge contract (cross-language name facts)
 
-Revision: stage 1. Provider: Agent IDE core. Consumers: language crates (providers) and the core's
+Revision: stage 2. Provider: Agent IDE core. Consumers: language crates (providers) and the core's
 tool integration (planned).
 
 ## Implementation status
@@ -10,11 +10,13 @@ tool integration (planned).
 | `lang::names` contract: namespaces, `NameKey` with domain, `NameFact`, `FactSink`, `NameFacts` trait, `LanguageDescriptor::names` | implemented |
 | `intelligence::names` index: listing, stat sweep, digest confirmation, `verify`, `uncovered`, LRU of worktrees | implemented |
 | Worker glue (`assistance/links.rs`): refresh on the blocking pool, park while building | implemented, not yet called by any tool |
-| Providers for real languages (style sheets, markup, JSX) | planned (stages 2–4) |
+| Style-sheet provider (`agent-ide-lang-css`: CSS, SCSS, Sass, LESS), §7 | implemented |
+| Providers for markup and JSX | planned (stages 3–4) |
 | Bridge data in `ide.symbol` / `ide.graph` / the project card | planned (stages 3–5) |
 
-No tool reply changes because of this stage. Tool behaviour for languages without a provider stays
-byte-identical.
+No tool reply shows bridge data yet. Style sheets answer `ide.outline`, `ide.read`, `ide.symbol`
+and `ide.graph` from their source outline, with usages and callers reported unavailable; replies for
+the server-backed languages are byte-identical.
 
 ## 1. Fact model
 
@@ -130,3 +132,39 @@ independent of discovery order.
 | Build budget | 20 s of sweeping, resumable |
 | Warm refresh target | ≤ 200 ms at 10 000 unchanged files |
 | Fallback walk | 10 000 directories |
+
+## 7. CSS provider
+
+`agent-ide-lang-css` owns `.css`, `.scss`, `.sass` and `.less`. It has no server and no project
+check; the symbol tools outline style sheets from source (rules named by selector text, nested
+rules as children, at-rules as containers).
+
+**Tokenizer.** Hand-written. It skips comments (`/* */`, and `//` in SCSS, Sass and LESS),
+strings, escapes, `url(…)` and interpolation (`#{…}`, `@{…}`), so braces and semicolons inside
+them never count. Indented Sass is first given braces at line ends, so positions stay those of the
+original text.
+
+**Coverage.** `class/v1` define and use, `id/v1` use, `style-variable/v1` define and use.
+
+| Syntax | Fact |
+|---|---|
+| `.x` anywhere in a rule's selector list (`.card .btn` defines both; `:not(.x)` too) | `Define class x`, exact |
+| `#x` in a selector | `Use id x`, exact |
+| `&-x`, `&__x` (SCSS, LESS) under a parent that is exactly one class `.p` | `Define class p-x`, exact |
+| the same under any other parent | `Define class <c>-x` for each class `c` ending a parent selector, `Heuristic("nested suffix")` |
+| `--x: …` declaration | `Define style-variable x`, exact |
+| `var(--x)` (fallbacks included) | `Use style-variable x`, exact |
+| `@extend .x` | `Use class x`, exact |
+
+**Normalization.** Escapes decode (`\:` → `:`, `\/` → `/`, hex escapes); case is kept; sigils are
+dropped. Attribute selectors (`[href="#x"]`) and at-rule preludes (`@media …`) are not read.
+
+**Reduced coverage, not skips.** A name touching interpolation (`.btn-#{$size}`, `.x-@{v}`) yields
+no fact; the rest of the file is still indexed.
+
+**Domains.** Classes in `*.module.css` / `*.module.scss` (any `*.module.*` style sheet) get the
+file's worktree-relative path as their domain, so they never join global class names. Their ids and
+style variables stay global.
+
+**Skips.** `*.min.*` files and files whose average line exceeds 2 000 bytes are
+`Skipped("minified")`.
