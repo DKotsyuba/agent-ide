@@ -41,11 +41,11 @@ jobs:
           echo "AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER=$npm_root/typescript-language-server/lib/cli.mjs" >> "$GITHUB_ENV"
           echo "AGENT_IDE_TSSERVER=$npm_root/typescript/lib/tsserver.js" >> "$GITHUB_ENV"
       - name: Run complete quality gates
-        # Go and gopls are outside the v0.4.5 release scope: the runner installs no Go toolchain,
+        # Go and gopls are outside the v0.5.0 release scope: the runner installs no Go toolchain,
         # so the workspace gate skips exactly the three real-gopls toolchain contracts by name and
         # still runs every other workspace test.
         run: |
-          cargo fmt --check
+          cargo fmt --all --check
           cargo test --locked --workspace -- --test-threads=1 --skip real_gopls_production_context_tracks_exact_observed_bytes --skip shared_gopls_isolates_divergent_worktrees_and_detaches_one_view --skip dropping_live_gopls_owner_closes_its_owned_listener
           cargo clippy --locked --workspace --all-targets -- -D warnings
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps

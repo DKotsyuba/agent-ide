@@ -12,14 +12,14 @@ use serde_json::Value;
 /// Keeps the Rust package and both plugin manifests on the exact release version.
 #[test]
 fn release_versions_are_synchronized() {
-    assert!(include_str!("../Cargo.toml").contains("version = \"0.4.5\""));
-    assert!(include_str!("../Cargo.lock").contains("name = \"agent-ide\"\nversion = \"0.4.5\""));
+    assert!(include_str!("../Cargo.toml").contains("version = \"0.5.0\""));
+    assert!(include_str!("../Cargo.lock").contains("name = \"agent-ide\"\nversion = \"0.5.0\""));
     for manifest in [
         include_str!("../.codex-plugin/plugin.json"),
         include_str!("../.claude-plugin/plugin.json"),
     ] {
         let manifest: Value = serde_json::from_str(manifest).unwrap();
-        assert_eq!(manifest["version"], "0.4.5");
+        assert_eq!(manifest["version"], "0.5.0");
     }
 }
 
@@ -57,7 +57,7 @@ fn release_workflow_requires_complete_gates_before_publication() {
         "pyright@1.1.413",
         "typescript-language-server@6.0.0",
         "typescript@5.9.3",
-        "cargo fmt --check",
+        "cargo fmt --all --check",
         "cargo test --locked --workspace -- --test-threads=1 --skip real_gopls_production_context_tracks_exact_observed_bytes --skip shared_gopls_isolates_divergent_worktrees_and_detaches_one_view --skip dropping_live_gopls_owner_closes_its_owned_listener",
         "cargo clippy --locked --workspace --all-targets -- -D warnings",
         "cargo doc --locked --workspace --no-deps",
@@ -190,7 +190,7 @@ fn claude_marketplace_installs_the_root_plugin() {
         serde_json::from_str(include_str!("../.claude-plugin/marketplace.json")).unwrap();
     assert_eq!(claude["plugins"][0]["name"], "agent-ide");
     assert_eq!(claude["plugins"][0]["source"], "./");
-    assert_eq!(claude["plugins"][0]["version"], "0.4.5");
+    assert_eq!(claude["plugins"][0]["version"], "0.5.0");
 }
 
 /// Distinguishes temporary install prefixes across scenarios inside one test-process run.

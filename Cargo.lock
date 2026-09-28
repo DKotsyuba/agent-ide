@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-ide"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "agent-ide-core",
  "agent-ide-lang-go",
@@ -26,7 +26,7 @@ dependencies = [
 
 [[package]]
 name = "agent-ide-core"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "async-lsp",
  "blake3",
@@ -43,7 +43,7 @@ dependencies = [
 
 [[package]]
 name = "agent-ide-lang-go"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "agent-ide-core",
  "async-lsp",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "agent-ide-lang-python"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "agent-ide-core",
  "async-lsp",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "agent-ide-lang-rust"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "agent-ide-core",
  "async-lsp",
@@ -79,7 +79,7 @@ dependencies = [
 
 [[package]]
 name = "agent-ide-lang-typescript"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "agent-ide-core",
  "async-lsp",
