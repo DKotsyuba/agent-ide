@@ -1,6 +1,6 @@
 {
   "schema": "agent-ide.macos-acceptance.v1",
-  "revision": "52240cd3a921a76737d44f3f009da99c7bac9f22",
+  "revision": "721e6b44c980f7b32b8059ab829ef529384f0904",
   "route": "product",
   "status": "product_pass",
   "platform": {"os": "macos", "version": "27.0", "architecture": "arm64"},

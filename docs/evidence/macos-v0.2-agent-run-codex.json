@@ -1,10 +1,10 @@
 {
   "schema": "agent-ide.macos-acceptance.v1",
-  "revision": "52240cd3a921a76737d44f3f009da99c7bac9f22",
+  "revision": "721e6b44c980f7b32b8059ab829ef529384f0904",
   "route": "agent_run_codex",
   "status": "real_pass",
   "platform": {"os": "macos", "version": "27.0", "architecture": "arm64"},
-  "host": {"version": "agent-run-0.17.0+codex-cli-0.156.1"},
+  "host": {"version": "agent-run-0.18.0+codex-cli-0.156.1"},
   "toolchains": {"go": "not_tested", "gopls": "not_tested", "rust": "1.98.1", "rust_analyzer": "1.98.1", "node": "24.4.0", "pyright": "1.1.413", "typescript_language_server": "6.0.0", "typescript": "5.9.3"},
   "scenarios": {"edit_diagnostic_loop": "real_pass", "stale_edit_zero_write": "real_pass", "native_fallback": "real_pass", "telemetry_restart_query_export": "real_pass", "compact_content": "real_pass", "python_provider": "real_pass", "typescript_r3": "real_pass", "divergent_worktrees": "real_pass"},
   "privacy": {"source": false, "prompts": false, "credentials": false, "commands": false, "paths": false, "diagnostic_messages": false, "private_ids": false}
