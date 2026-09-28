@@ -6148,6 +6148,40 @@ mod stop_retry_tests {
         );
     }
 
+    /// A bare name never refreshes the name index of a worktree without files of a language
+    /// with name facts; once such a file exists, the same lookup builds it.
+    #[tokio::test]
+    async fn bare_names_skip_the_index_without_bridged_files() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("b.delta"), "sym card\nend\n").unwrap();
+        git_commit(&fixture.root, "no bridged files");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (_, authority) = activate_worktree(&mut worker, "guard-actor", "guard-start").await;
+        for (call, expect_index) in [("guard-1", false), ("guard-2", true)] {
+            if expect_index {
+                std::fs::write(fixture.root.join("a.alpha"), "@card\n").unwrap();
+            }
+            let invocation = production_call(&worker, "guard-actor", call);
+            let (mut job, _cancel) = tool_job(
+                &fixture.root,
+                invocation,
+                call,
+                AssistanceTool::Symbol,
+                serde_json::json!({"symbol":"card"}),
+            );
+            let _ = worker.symbol(&mut job).await;
+            assert_eq!(
+                worker.names.contains(authority.worktree()),
+                expect_index,
+                "{call}"
+            );
+        }
+    }
+
     /// Every terminal failure carries a stage tag — the exact string the journal records in
     /// `detail` — either the failing path's own tag or the derived `<tool>:<reason>` default.
     /// Drives the four failure shapes the journal audit called out: a bare symbol name on a

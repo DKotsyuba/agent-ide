@@ -200,7 +200,9 @@ usages: 2 indexed in 2 files (src 2, tests 0)
 unavailable for: python
 ```
 
-A bare name is looked up in the index and through every language's workspace symbols. Index-only
+A bare name is looked up in the index and through every language's workspace symbols (the index
+is skipped while the worktree has no index yet and a bounded walk finds no file of a language with
+name facts, so other projects keep their latency). Index-only
 hits answer the name card; hits on both sides answer the ambiguity list, language-server
 candidates first:
 

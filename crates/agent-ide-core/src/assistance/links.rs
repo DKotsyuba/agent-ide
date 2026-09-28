@@ -54,6 +54,16 @@ fn bridged() -> bool {
         .any(|language| language.names().is_some())
 }
 
+/// Whether the bounded presence walk of `root` finds a file of a language with name facts.
+fn bridged_files_present(root: &Path) -> bool {
+    let extensions: Vec<&str> = crate::lang::registered()
+        .iter()
+        .filter(|language| language.names().is_some())
+        .flat_map(|language| language.descriptor().extensions.iter().copied())
+        .collect();
+    crate::lang::text::has_files_with(root, &extensions)
+}
+
 /// `sigil + name` of a key, with its domain when scoped.
 fn display(key: &NameKey) -> String {
     let mut text = format!("{}{}", key.namespace.sigil().unwrap_or(""), key.name);
@@ -375,7 +385,10 @@ impl Worker<'_> {
     }
 
     /// Indexed keys spelled `name` (in `only`, when given); empty when no registered language
-    /// states name facts, without touching the index.
+    /// states name facts, without touching the index. A plain bare name (`only` is `None`) also
+    /// skips the index while no index of the worktree exists and the bounded presence walk finds
+    /// no file of a language with name facts, so projects without such files keep their
+    /// bare-name latency.
     ///
     /// # Errors
     ///
@@ -391,6 +404,12 @@ impl Worker<'_> {
             return Ok(Vec::new());
         }
         let authority = self.authority(binding).await?;
+        if only.is_none()
+            && !self.names.contains(authority.worktree())
+            && !bridged_files_present(authority.worktree().worktree_path())
+        {
+            return Ok(Vec::new());
+        }
         let (index, _) = self.name_index(job, authority.worktree()).await?;
         let name = name.to_owned();
         with_names(index, move |index| index.keys_named(&name, only)).await

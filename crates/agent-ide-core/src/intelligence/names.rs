@@ -596,6 +596,13 @@ pub struct NameIndexes {
 }
 
 impl NameIndexes {
+    /// Whether an index of `worktree` (this incarnation) is held.
+    pub fn contains(&self, worktree: &WorktreeRef) -> bool {
+        self.recent.iter().any(|(held, _)| {
+            held.id() == worktree.id() && held.incarnation() == worktree.incarnation()
+        })
+    }
+
     /// The index of `worktree`, created empty on first use. A recreated worktree (same path, new
     /// incarnation) never reuses its predecessor's index; the least recently used index beyond
     /// [`MAX_WORKTREES`] is dropped.

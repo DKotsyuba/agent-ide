@@ -5288,6 +5288,80 @@ async fn configured_product_links_css_html_and_python_names() {
     daemon.wait().await.unwrap();
 }
 
+/// Index-backed replies read every row's file without registering it against the binding: with
+/// `limits.details` at 9 (the registered-path budget too), cards and name cards whose rows come
+/// from fourteen files, followed by ordinary calls, never answer `capacity`.
+#[tokio::test]
+async fn product_index_reads_stay_outside_the_binding_budget() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    config["limits"]["details"] = json!(9);
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+    std::fs::write(
+        fixture.root.join("styles.css"),
+        ".btn {\n  color: red;\n}\n",
+    )
+    .unwrap();
+    for index in 0..13 {
+        std::fs::write(
+            fixture.root.join(format!("page{index:02}.html")),
+            "<main id=\"main\">\n  <p class=\"btn\">x</p>\n</main>\n",
+        )
+        .unwrap();
+    }
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "web files"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "index-budget").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"index-budget"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    for (tool, arguments, expected) in [
+        (
+            "ide.symbol",
+            json!({"symbol":".btn"}),
+            "13 usages in 13 files",
+        ),
+        (
+            "ide.symbol",
+            json!({"symbol":"styles.css#.btn"}),
+            "usages: 13 indexed in 13 files",
+        ),
+        ("ide.symbol", json!({"symbol":"##main"}), "13 elements"),
+        (
+            "ide.symbol",
+            json!({"symbol":"page00.html#main#main"}),
+            "links: 1 class name used here",
+        ),
+        ("ide.read", json!({"symbol":".btn"}), ".btn {"),
+        ("ide.outline", json!({"path":"page01.html"}), "(1 symbols)"),
+        ("ide.outline", json!({"path":"styles.css"}), ".btn"),
+        (
+            "ide.symbol",
+            json!({"symbol":".btn"}),
+            "13 usages in 13 files",
+        ),
+    ] {
+        let reply = actor.call(&fixture, tool, arguments.clone()).await;
+        let reply = actor.settle(&fixture, reply).await;
+        assert_eq!(reply["state"], "complete", "{tool} {arguments}: {reply}");
+        assert!(
+            reply["text"].as_str().unwrap().contains(expected),
+            "{tool} {arguments}: {reply}"
+        );
+    }
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A Python request in a binding whose Rust session is live leaves that session running: the
 /// rust-analyzer wrapper is spawned exactly once across `.rs` -> `.py` -> `.rs` requests, and the
 /// second Rust request answers without another readiness wait.
