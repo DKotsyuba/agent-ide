@@ -582,6 +582,9 @@ pub struct SymbolCard {
     /// Definition address: `file#symbol (lines a–b)`; read the body separately with `ide.read`.
     pub definition: Option<String>,
     pub usages: Vec<Usage>,
+    /// Printed in place of an empty usages list when nothing can answer references
+    /// (`unavailable (<language> has no language server; see links)`).
+    pub usages_note: Option<String>,
     /// Printed in place of an empty callers list when the language server has no call
     /// hierarchy (`unavailable (<server> has no call hierarchy)`).
     pub callers_note: Option<String>,
@@ -654,6 +657,8 @@ pub fn symbol_card_text(card: &SymbolCard) -> String {
                 None => out.push_str(&format!("  … {hidden} more\n")),
             }
         }
+    } else if let Some(note) = &card.usages_note {
+        out.push_str(&format!("usages: {note}\n"));
     } else if card.report_empty_usages {
         out.push_str("usages: 0 in 0 files (src 0, tests 0)\n");
     }

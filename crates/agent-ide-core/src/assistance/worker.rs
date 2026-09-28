@@ -5990,6 +5990,132 @@ mod stop_retry_tests {
         }
     }
 
+    /// Builds one symbol-tool job for `tool` with `parameters` under a live binding.
+    fn tool_job(
+        root: &std::path::Path,
+        invocation: ValidatedInvocation,
+        reference: &str,
+        tool: AssistanceTool,
+        parameters: Value,
+    ) -> (Job, watch::Sender<bool>) {
+        let (cancel_sender, cancel) = watch::channel(false);
+        (
+            Job {
+                reference: reference.into(),
+                invocation,
+                tool,
+                parameters,
+                target: production_target(root),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+                cancel,
+                stop_reply: None,
+                native_epoch: 0,
+                failure_detail: None,
+                check_scheduled: false,
+                park_until: None,
+                stage: None,
+            },
+            cancel_sender,
+        )
+    }
+
+    /// A language no server owns but that outlines from source answers outline, read, symbol
+    /// and graph from that outline, with usages and callers reported unavailable by its own id; a
+    /// language with neither keeps the provider-unavailable refusal.
+    #[tokio::test]
+    async fn serverless_language_answers_symbol_tools_from_its_source_outline() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        std::fs::write(
+            fixture.root.join("a.gamma"),
+            "sym card\n  sym btn\n  x\n  end\nend\n",
+        )
+        .unwrap();
+        std::fs::write(fixture.root.join("b.delta"), "sym card\nend\n").unwrap();
+        git_commit(&fixture.root, "serverless fixture");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        activate_worktree(&mut worker, "serverless-actor", "serverless-start").await;
+        let mut calls = 0;
+        let mut run = async |tool: AssistanceTool, parameters: Value| {
+            calls += 1;
+            let invocation = production_call(
+                &worker,
+                "serverless-actor",
+                &format!("serverless-call-{calls}"),
+            );
+            let (mut job, _cancel) =
+                tool_job(&fixture.root, invocation, "serverless", tool, parameters);
+            let result = match tool {
+                AssistanceTool::Outline => worker.outline(&mut job).await,
+                AssistanceTool::Read => worker.read(&mut job).await,
+                AssistanceTool::Symbol => worker.symbol(&mut job).await,
+                _ => worker.graph(&mut job).await,
+            };
+            match result.map(|(reply, _, _)| reply) {
+                Ok(PeerReply::Complete { text, .. }) => Ok(text),
+                Ok(other) => panic!("not a complete reply: {other:?}"),
+                Err(code) => Err(code),
+            }
+        };
+        assert_eq!(
+            run(
+                AssistanceTool::Outline,
+                serde_json::json!({"path":"a.gamma"})
+            )
+            .await,
+            Ok(
+                "a.gamma  (5 lines, gamma)\n    1  sym card\n    2    sym btn\n  (2 symbols)\n"
+                    .into()
+            )
+        );
+        let read = run(
+            AssistanceTool::Read,
+            serde_json::json!({"symbol":"a.gamma#card/btn"}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            read.starts_with("a.gamma#card/btn  (lines 2–4)\n2    sym btn\n3    x\n4    end\n"),
+            "{read}"
+        );
+        assert_eq!(
+            run(
+                AssistanceTool::Symbol,
+                serde_json::json!({"symbol":"a.gamma#card/btn"})
+            )
+            .await,
+            Ok(
+                "symbol: btn — symbol, a.gamma#card/btn (lines 2–4)\nsignature: sym btn\n\
+                definition a.gamma#card/btn  (lines 2–4)\n\
+                usages: unavailable (gamma has no language server; see links)\n\
+                callers: unavailable (gamma has no call hierarchy)\n"
+                    .into()
+            )
+        );
+        assert_eq!(
+            run(
+                AssistanceTool::Graph,
+                serde_json::json!({"symbol":"a.gamma#card"})
+            )
+            .await,
+            Ok(
+                "graph: callers/callees unavailable for gamma (gamma has no call hierarchy)\n"
+                    .into()
+            )
+        );
+        assert_eq!(
+            run(
+                AssistanceTool::Outline,
+                serde_json::json!({"path":"b.delta"})
+            )
+            .await,
+            Err(FailureCode::ProviderUnavailable)
+        );
+    }
+
     /// Every terminal failure carries a stage tag — the exact string the journal records in
     /// `detail` — either the failing path's own tag or the derived `<tool>:<reason>` default.
     /// Drives the four failure shapes the journal audit called out: a bare symbol name on a

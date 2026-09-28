@@ -269,7 +269,6 @@ impl Worker<'_> {
         }
         .ok_or(FailureCode::UnknownSymbol)?;
         let source = observed_text(&observed, &bytes)?;
-        let byte_offset = name_offset(source, &found)?;
         let mut card = SymbolCard {
             heading: format!(
                 "{} — {}, {} (lines {})",
@@ -283,7 +282,19 @@ impl Worker<'_> {
             definition: Some(format!("{}  (lines {})", found.path, found.range)),
             ..Default::default()
         };
-        {
+        if self.session_server(observed.path()).is_none() {
+            // Outlined from source: nothing answers hover, references or call hierarchy.
+            let language = outline.language;
+            if want_usages {
+                card.usages_note = Some(format!(
+                    "unavailable ({language} has no language server; see links)"
+                ));
+            }
+            if callers_depth > 0 {
+                card.callers_note = Some(format!("unavailable ({language} has no call hierarchy)"));
+            }
+        } else {
+            let byte_offset = name_offset(source, &found)?;
             let live = self.live_session_for(job, &observed).await?;
             if let Ok(Some(hover)) = live.session.hover(&observed, &bytes, byte_offset).await {
                 // The server's hover carries the resolved signature; prefer it over the one-line
@@ -437,15 +448,19 @@ impl Worker<'_> {
         .ok_or(FailureCode::UnknownSymbol)?;
         // A server whose call hierarchy answers nothing for constructors and partial answers for
         // everything else would make the walk below render a misleading graph; answer the fact.
-        if let Some(server) = self
-            .session_server(observed.path())
-            .filter(|server| !server.call_hierarchy())
-        {
+        // A file no server owns (outlined from source) has no call hierarchy at all.
+        let without_hierarchy = match self.session_server(observed.path()) {
+            None => Some((outline.language.name(), "")),
+            Some(server) if !server.call_hierarchy() => {
+                Some((server.name(), "; use ide.symbol usages"))
+            }
+            Some(_) => None,
+        };
+        if let Some((owner, hint)) = without_hierarchy {
             let language = Lang::for_path(observed.path()).map_or("", Lang::name);
             let authority = self.finish_symbol_job(job, &binding, &observed).await?;
             let text = format!(
-                "graph: callers/callees unavailable for {language} ({} has no call hierarchy); use ide.symbol usages\n",
-                server.name()
+                "graph: callers/callees unavailable for {language} ({owner} has no call hierarchy){hint}\n"
             );
             let (reply, page) =
                 ContextPageState::new(text, 0, false, ResultKind::Graph).next(&job.reference)?;
@@ -622,7 +637,8 @@ impl Worker<'_> {
     }
 
     /// Document symbols of one observed file through the live session, normalized by the
-    /// language module. Returns the outline and the worktree root for path rendering.
+    /// language module, or the language's source outline when no server owns the file. Returns
+    /// the outline and the worktree root for path rendering.
     async fn outline_of(
         &mut self,
         job: &mut Job,
@@ -633,6 +649,14 @@ impl Worker<'_> {
         let support = language.support();
         let source = observed_text(observed, bytes)?.to_owned();
         let worktree_root = observed.worktree().worktree_path().to_path_buf();
+        if self.session_server(observed.path()).is_none() {
+            // No registered server owns the file: a language that outlines from its text still
+            // answers; any other keeps the provider-unavailable refusal.
+            return support
+                .outline_from_source(observed.path(), &source)
+                .map(|outline| (outline, worktree_root))
+                .ok_or(FailureCode::ProviderUnavailable);
+        }
         let live = self.live_session_for(job, observed).await?;
         let symbols = live
             .session

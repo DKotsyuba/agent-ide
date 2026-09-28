@@ -649,6 +649,15 @@ pub trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// Outline computed from the text alone, for a language without a language server; `None`
+    /// (the default) keeps outlines server-backed. When no registered server owns the file's
+    /// extension, the symbol tools outline, read and describe the file from this and report
+    /// usages and callers as unavailable.
+    fn outline_from_source(&self, file: &Path, source: &str) -> Option<Outline> {
+        let _ = (file, source);
+        None
+    }
+
     /// Whether tests live only in files [`LanguageSupport::is_test_file`] accepts, so a path
     /// target that is not a test file can be answered "no tests" without running anything.
     /// Defaults to `false`: tests may sit next to the code they test.
@@ -718,7 +727,8 @@ pub fn kind_of(kind: lsp::SymbolKind) -> SymbolKind {
 /// They carry identity, ordering, extensions and a root-marker presence rule but no real
 /// language behaviour, so core tests never depend on a bundled language. `ALPHA`, `BETA` and
 /// `GAMMA` have project checks (present when `<id>.toml` exists at the worktree root) and tiny
-/// token-based name-fact providers; `DELTA` has neither. Their identifiers sort in that order.
+/// token-based name-fact providers; `GAMMA` also outlines from source (it has no server, like
+/// every test language); `DELTA` has neither. Their identifiers sort in that order.
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
@@ -794,6 +804,48 @@ pub(crate) mod testing {
                 .next()?
                 .strip_prefix("#!doc ")
                 .map(str::to_owned)
+        }
+        /// Gamma alone outlines from its text: `sym <name>` opens a symbol, `end` closes the
+        /// innermost open one.
+        fn outline_from_source(&self, file: &Path, source: &str) -> Option<Outline> {
+            if self.0 != "gamma" {
+                return None;
+            }
+            let mut open: Vec<Symbol> = Vec::new();
+            let mut symbols = Vec::new();
+            for (index, line) in source.lines().enumerate() {
+                let number = index as u32 + 1;
+                if let Some(name) = line.trim().strip_prefix("sym ") {
+                    let mut segments: Vec<String> =
+                        open.iter().map(|symbol| symbol.name.clone()).collect();
+                    segments.push(name.to_owned());
+                    open.push(Symbol {
+                        path: SymbolPath::new(Some(file.to_path_buf()), segments),
+                        kind: SymbolKind::Other,
+                        name: name.to_owned(),
+                        range: LineRange::new(number, number),
+                        body: LineRange::new(number, number),
+                        signature: line.trim().to_owned(),
+                        doc: None,
+                        children: Vec::new(),
+                    });
+                } else if line.trim() == "end"
+                    && let Some(mut done) = open.pop()
+                {
+                    done.range = LineRange::new(done.range.start, number);
+                    done.body = done.range;
+                    match open.last_mut() {
+                        Some(parent) => parent.children.push(done),
+                        None => symbols.push(done),
+                    }
+                }
+            }
+            Some(Outline {
+                file: file.to_path_buf(),
+                language: self.language(),
+                line_count: line_count(source),
+                symbols,
+            })
         }
         /// No formatter.
         fn format_command(&self, _project: &LanguageProject, _file: &Path) -> Option<Vec<String>> {
