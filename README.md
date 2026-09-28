@@ -108,13 +108,15 @@ args = ["mcp", "--auto-launcher-template", "/absolute/path/to/launcher.json"]
 ```
 
 Auto mode selects Claude whenever `CLAUDE_PROJECT_DIR` is present, including invalid values that
-must fail open as Claude rather than fall through. When the variable is absent, the host is not
-recognized (no host supplies Codex MCP metadata implicitly), so the MCP runs the Claude-compatible
-contract with its current directory as the captured candidate: hooks resolve through the Claude
-`claude-hook` rendezvous, a call carrying no supported host metadata answers
-`unavailable: host_binding (host_unrecognized)`, and the first `ide.start {root}` inside
-`allowed_roots` re-roots the session to that project exactly like a moved Claude session. Codex
-keeps its explicit `--launcher-template` entrypoint below.
+must fail open as Claude rather than fall through. An absent variable needs positive non-Codex
+evidence before it may leave the Codex contract: a `ZCODE_*` startup variable selects the
+Claude-compatible contract (the ZCode desktop host's hooks are `claude-hook`), with the current
+directory as the captured candidate — hooks resolve through the Claude rendezvous, a call carrying
+no supported host metadata answers `unavailable: host_binding (host_unrecognized)`, and the first
+`ide.start {root}` inside `allowed_roots` re-roots the session like a moved Claude session.
+Everything else — Codex startup markers, and no evidence at all — keeps the previous Codex
+default, so agent-run's Codex children and existing Codex hosts are unchanged; the explicit host
+flags below remain supported.
 
 Build locally with `cargo build --locked --bin agent-ide`. The standard Codex setup is one
 machine-local entry in `~/.codex/config.toml` (replace both absolute paths):

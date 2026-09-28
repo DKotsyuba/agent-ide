@@ -85,13 +85,17 @@ normally. A root below no allowed root is never re-rooted to; the daemon's own
 `outside_allowed_roots` error answers. A re-root that cannot attach answers
 `unavailable: host_binding (project_moved: bound to <path>, asked <path>)`.
 
-`agent-ide mcp --auto-launcher-template` selects the same Claude-compatible contract when
-`CLAUDE_PROJECT_DIR` is absent, because no host supplies Codex MCP metadata implicitly: the
-candidate is the canonicalized process directory (outside `allowed_roots` for an app-managed
-workspace), hooks ride the Claude rendezvous of the re-rooted project, and a call whose `_meta`
-names no supported host contract answers `unavailable: host_binding (host_unrecognized)` — an
-unrecognized host must forward Claude Code's per-call `_meta` (`claudecode/toolUseId`) for
-invocations to correlate. Codex keeps its explicit `--launcher-template` entrypoint.
+`agent-ide mcp --auto-launcher-template` selects the same Claude-compatible contract only on
+positive non-Codex evidence: a `ZCODE_*` startup variable (verified on a live ZCode MCP child,
+which carries no `CLAUDE_PROJECT_DIR` and no `CODEX_*`). The candidate is then the canonicalized
+process directory (outside `allowed_roots` for an app-managed workspace), hooks ride the Claude
+rendezvous of the re-rooted project, and a call whose `_meta` names no supported host contract
+answers `unavailable: host_binding (host_unrecognized)` — such a host must forward Claude Code's
+per-call `_meta` (`claudecode/toolUseId`) for invocations to correlate. Everything else keeps the
+previous Codex default: Codex startup markers (`CODEX_THREAD_ID`/`CODEX_TURN_ID`/`CODEX_SESSION_ID`)
+select Codex, and so does no evidence at all, because live Codex children — including agent-run's
+and the codex app-servers — set none of those markers. Codex also keeps its explicit
+`--launcher-template` entrypoint.
 
 The plugin's `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, and `PermissionDenied` handlers run
 the argument-free `agent-ide claude-hook`. That command resolves the hook payload's canonical `cwd`

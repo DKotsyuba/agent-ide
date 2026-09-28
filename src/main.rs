@@ -156,7 +156,8 @@ async fn main() -> ExitCode {
             run_managed_mcp(launcher_template, candidate, host).await
         }
         Ok(Command::AutoManagedMcp { launcher_template }) => {
-            let (host, candidate) = auto_managed_candidate(claude_project_dir);
+            let (host, candidate) =
+                auto_managed_candidate(claude_project_dir, AutoHostEvidence::from_env());
             run_managed_mcp(launcher_template, candidate, host).await
         }
         Ok(Command::ManagedClaudeHook) => {
@@ -530,32 +531,70 @@ enum ManagedHost {
     Codex,
     /// Claude derives its candidate only from startup-captured `CLAUDE_PROJECT_DIR` and uses hooks.
     Claude,
-    /// An unrecognized host (no `CLAUDE_PROJECT_DIR`) whose hooks are the Claude-compatible
+    /// A recognized non-Codex host (no `CLAUDE_PROJECT_DIR`) whose hooks are the Claude-compatible
     /// `claude-hook` contract (ZCode): the Claude flow with the process directory as candidate,
     /// so `ide.start {root}` re-rooting binds it exactly like a moved Claude session.
     ClaudeCompatible,
+}
+
+/// Positive startup-environment evidence auto mode may choose a host from, read once.
+///
+/// The Codex markers are the optional startup variables the host probe already knows
+/// (`examples/host_probe.rs` `STARTUP_ENV`). Live Codex children — including agent-run's — set
+/// none of them, so absence is never Codex evidence. The ZCode markers were verified on a live
+/// ZCode MCP child (`ZCODE_APP_VERSION`, `ZCODE_ENV`, `ZCODE_PROCESS_LABEL`, …, with no
+/// `CLAUDE_PROJECT_DIR` and no `CODEX_*`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AutoHostEvidence {
+    /// Any `CODEX_THREAD_ID`/`CODEX_TURN_ID`/`CODEX_SESSION_ID` startup variable is present.
+    codex: bool,
+    /// Any `ZCODE_*` startup variable is present.
+    zcode: bool,
+}
+
+impl AutoHostEvidence {
+    /// Reads the markers from the process environment once, before any host is chosen.
+    fn from_env() -> Self {
+        let mut evidence = Self::default();
+        for (name, _) in std::env::vars_os() {
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with("ZCODE_") && name.len() > "ZCODE_".len() {
+                evidence.zcode = true;
+            }
+            if matches!(
+                name,
+                "CODEX_THREAD_ID" | "CODEX_TURN_ID" | "CODEX_SESSION_ID"
+            ) {
+                evidence.codex = true;
+            }
+        }
+        evidence
+    }
 }
 
 /// Selects the existing managed host and captures its candidate without fallback between hosts.
 ///
 /// A present `claude_project_dir` always selects Claude, including when canonical validation
 /// fails; the returned error then drives the existing Claude fail-open MCP path. An absent value
-/// selects the Claude-compatible contract with the canonicalized process directory: such a host
-/// never supplies Codex MCP metadata, so its only possible correlation is the Claude-compatible
-/// hook stream, and its project arrives through `ide.start {root}` re-rooting. Codex keeps its
-/// explicit `--launcher-template` entrypoint.
+/// needs positive non-Codex evidence before it may leave the Codex contract: a `ZCODE_*`
+/// startup variable selects the Claude-compatible flow with the canonicalized process directory
+/// (its project arrives through `ide.start {root}` re-rooting). Everything else — recognized
+/// Codex evidence, and no evidence at all — keeps the previous Codex default, so agent-run's
+/// Codex children and every existing auto-mode Codex user are unchanged.
 fn auto_managed_candidate(
     claude_project_dir: Option<OsString>,
+    evidence: AutoHostEvidence,
 ) -> (ManagedHost, std::io::Result<PathBuf>) {
     match claude_project_dir {
         Some(project) => (ManagedHost::Claude, canonical_claude_project(Some(project))),
-        None => match std::env::current_dir() {
+        None if evidence.zcode && !evidence.codex => match std::env::current_dir() {
             Ok(directory) => (
                 ManagedHost::ClaudeCompatible,
                 canonical_claude_project(Some(directory.into_os_string())),
             ),
             Err(error) => (ManagedHost::ClaudeCompatible, Err(error)),
         },
+        None => (ManagedHost::Codex, std::env::current_dir()),
     }
 }
 
@@ -2892,24 +2931,54 @@ mod tests {
         ));
     }
 
-    /// Auto host selection uses only Claude project-variable presence and never cross-falls back.
+    /// Auto host selection uses positive evidence in a fixed order: Claude's project variable,
+    /// Codex markers, then a ZCode marker; no evidence at all keeps the previous Codex default.
     #[test]
     fn auto_managed_candidate_preserves_invalid_claude_selection() {
-        // An absent variable selects the Claude-compatible contract with the canonical process
-        // directory (an unrecognized host's only possible correlation is the Claude hook stream).
-        let (compatible, candidate) = auto_managed_candidate(None);
-        assert_eq!(compatible, ManagedHost::ClaudeCompatible);
+        let no_evidence = AutoHostEvidence::default();
+        let (codex, candidate) = auto_managed_candidate(None, no_evidence);
+        assert_eq!(
+            codex,
+            ManagedHost::Codex,
+            "no evidence keeps the Codex default"
+        );
+        assert!(candidate.is_ok());
+
+        let (codex_evidence, candidate) = auto_managed_candidate(
+            None,
+            AutoHostEvidence {
+                codex: true,
+                zcode: true,
+            },
+        );
+        assert_eq!(
+            codex_evidence,
+            ManagedHost::Codex,
+            "Codex evidence wins over a ZCode marker"
+        );
+        assert!(candidate.is_ok());
+
+        let (zcode, candidate) = auto_managed_candidate(
+            None,
+            AutoHostEvidence {
+                codex: false,
+                zcode: true,
+            },
+        );
+        assert_eq!(zcode, ManagedHost::ClaudeCompatible);
         assert_eq!(
             candidate.unwrap(),
             fs::canonicalize(std::env::current_dir().unwrap()).unwrap()
         );
 
         let project = fs::canonicalize(std::env::temp_dir()).unwrap();
-        let (claude, candidate) = auto_managed_candidate(Some(project.clone().into_os_string()));
+        let (claude, candidate) =
+            auto_managed_candidate(Some(project.clone().into_os_string()), no_evidence);
         assert_eq!(claude, ManagedHost::Claude);
         assert_eq!(candidate.unwrap(), project);
 
-        let (invalid_claude, candidate) = auto_managed_candidate(Some(OsString::from("relative")));
+        let (invalid_claude, candidate) =
+            auto_managed_candidate(Some(OsString::from("relative")), no_evidence);
         assert_eq!(invalid_claude, ManagedHost::Claude);
         assert!(candidate.is_err());
     }

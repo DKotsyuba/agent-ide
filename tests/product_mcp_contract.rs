@@ -197,18 +197,33 @@ impl Mcp {
         mcp
     }
 
-    /// Starts the auto-mode MCP exactly as a host with no recognized environment does: no
-    /// `CLAUDE_PROJECT_DIR`, current directory as the captured candidate (ZCode's shape).
-    async fn start_managed_auto(template: &Path, cwd: &Path) -> Self {
+    /// Starts the auto-mode MCP with caller-selected startup evidence: a Claude child sets
+    /// `CLAUDE_PROJECT_DIR` itself, a ZCode child carries `ZCODE_*` variables, and a Codex child
+    /// (agent-run's, the codex app-servers) carries neither.
+    async fn start_managed_auto_with(
+        template: &Path,
+        cwd: &Path,
+        evidence: &[(&str, &str)],
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
         command
             .env("TOKIO_WORKER_THREADS", "1")
             .env_remove("CLAUDE_PROJECT_DIR")
             .env_remove("AGENT_IDE_HOST_ATTACHMENT")
             .env_remove("AGENT_IDE_MANAGED_CODEX_ATTACHMENT")
+            .env_remove("ZCODE_APP_VERSION")
+            .env_remove("ZCODE_ENV")
+            .env_remove("ZCODE_PROCESS_LABEL")
+            .env_remove("CODEX_THREAD_ID")
+            .env_remove("CODEX_TURN_ID")
+            .env_remove("CODEX_SESSION_ID")
             .args(["mcp", "--auto-launcher-template"])
             .arg(template)
-            .current_dir(cwd)
+            .current_dir(cwd);
+        for (name, value) in evidence {
+            command.env(name, value);
+        }
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -226,6 +241,21 @@ impl Mcp {
         mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
             .await;
         mcp
+    }
+
+    /// Starts the auto-mode MCP as the live ZCode child runs: `ZCODE_*` evidence, no
+    /// `CLAUDE_PROJECT_DIR`, the workspace directory as the captured candidate.
+    async fn start_managed_auto(template: &Path, cwd: &Path) -> Self {
+        Self::start_managed_auto_with(
+            template,
+            cwd,
+            &[
+                ("ZCODE_APP_VERSION", "3.14.3"),
+                ("ZCODE_ENV", "production"),
+                ("ZCODE_PROCESS_LABEL", "local-1"),
+            ],
+        )
+        .await
     }
 
     /// Writes and flushes one JSON protocol message without awaiting a response.
@@ -4110,6 +4140,47 @@ async fn managed_claude_moved_session_reroots_into_an_allowed_root() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// Auto mode keeps the Codex contract for Codex children: with Codex startup evidence, and with
+/// no evidence at all (agent-run's children and the codex app-servers carry neither `CODEX_*` nor
+/// `CLAUDE_PROJECT_DIR`), the managed Codex binding activates exactly as before.
+#[tokio::test]
+async fn managed_auto_codex_children_keep_the_codex_contract() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let before = managed_runtime_paths();
+    let state = fixture.state();
+    let cases: &[(&str, &[(&str, &str)])] = &[
+        (
+            "codex startup evidence",
+            &[("CODEX_SESSION_ID", "sess-auto-codex")],
+        ),
+        ("no evidence at all", &[]),
+    ];
+    for (label, evidence) in cases {
+        let mut mcp = Mcp::start_managed_auto_with(&fixture.config, &fixture.root, evidence).await;
+        let mut next = 10;
+        let started = managed_call(
+            &mut mcp,
+            next,
+            "auto-codex",
+            "ide.start",
+            json!({"activation_id":"auto-codex-start"}),
+            &state,
+        )
+        .await;
+        let started = settle_managed(&mut mcp, &mut next, "auto-codex", &state, started).await;
+        assert_eq!(started["kind"], "activation", "{label}: {started}");
+        mcp.close().await;
+    }
+    // The owned Codex runtime generations were cleaned up on EOF as before.
+    let after = managed_runtime_paths();
+    assert_eq!(
+        after.difference(&before).count(),
+        0,
+        "{before:?} -> {after:?}"
+    );
+}
+
 /// A session that never calls `ide.start` produces hook bookkeeping, not failures: one `info`
 /// skip line per detail per window on each side, and no `warn` hook line at all.
 #[tokio::test]
@@ -4178,11 +4249,12 @@ async fn never_started_session_hook_noise_is_skipped_and_rate_limited() {
     mcp.close().await;
 }
 
-/// An auto-mode MCP whose host is unrecognized (ZCode: no `CLAUDE_PROJECT_DIR`, no host metadata)
-/// is served by the Claude-compatible contract: a meta-less start names `host_unrecognized`, and
-/// `ide.start {root}` re-rooting plus Claude-shaped hooks activate inside the allowed root.
+/// The ZCode host (verified live: `ZCODE_*` startup evidence, no `CLAUDE_PROJECT_DIR`, no host
+/// metadata in `_meta`) is served by the Claude-compatible contract: a meta-less start names
+/// `host_unrecognized`, and `ide.start {root}` re-rooting plus Claude-shaped hooks activate
+/// inside the allowed root.
 #[tokio::test]
-async fn managed_auto_unrecognized_host_reroots_like_claude() {
+async fn managed_auto_zcode_host_reroots_like_claude() {
     let fixture = ProductFixture::new(json!([]));
     let workspace = std::fs::canonicalize(std::env::temp_dir())
         .unwrap()
