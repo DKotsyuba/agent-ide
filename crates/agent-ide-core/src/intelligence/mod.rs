@@ -9,6 +9,8 @@ pub(crate) mod wire;
 
 /// Exact-file and exact-symbol context with bounded lexical fallback.
 pub mod context;
+/// Repository-level index of cross-language name facts, one per worktree incarnation.
+pub mod names;
 /// The language-server seam: static server descriptions, per-worker backends and their host.
 pub mod server;
 /// Production async-lsp sessions over borrowed Execution-owned protocol pipes.

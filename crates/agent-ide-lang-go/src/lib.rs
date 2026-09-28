@@ -20,6 +20,7 @@ pub static DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
     support: &support::GoSupport,
     checks: None,
     server: Some(&backend::GoplsServer),
+    names: None,
 };
 
 /// The Go language handle.

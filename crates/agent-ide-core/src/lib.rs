@@ -2,8 +2,8 @@
 //!
 //! Everything here is keyed on registered languages (see [`lang::install`]); no module
 //! names a language. Language crates implement [`lang::LanguageSupport`],
-//! [`checks::LanguageChecks`] and [`intelligence::server::LanguageServer`] and the
-//! application registers them at startup.
+//! [`checks::LanguageChecks`], [`intelligence::server::LanguageServer`] and
+//! [`lang::names::NameFacts`] and the application registers them at startup.
 
 /// Owns the process-local daemon and private Unix IPC boundary.
 pub mod app;

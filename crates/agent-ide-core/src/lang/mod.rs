@@ -20,6 +20,8 @@ use async_lsp::lsp_types as lsp;
 /// Line and brace helpers shared by the support modules of brace-delimited languages.
 pub mod brace;
 pub mod edits;
+/// Cross-language name facts: namespaces, facts, the fact sink and the `NameFacts` seam.
+pub mod names;
 pub mod path;
 pub mod render;
 /// Line, indentation and project-fact helpers shared by language support modules.
@@ -56,6 +58,8 @@ pub struct LanguageDescriptor {
     pub checks: Option<&'static dyn crate::checks::LanguageChecks>,
     /// Language-server integration, when the language has one.
     pub server: Option<&'static dyn crate::intelligence::server::LanguageServer>,
+    /// Cross-language name facts, when the language states any.
+    pub names: Option<&'static dyn names::NameFacts>,
 }
 
 /// A registered language: a cheap copyable handle to its [`LanguageDescriptor`].
@@ -125,6 +129,11 @@ impl Language {
     /// The language's server integration, if any.
     pub fn server(self) -> Option<&'static dyn crate::intelligence::server::LanguageServer> {
         self.0.server
+    }
+
+    /// The language's cross-language name facts, if any.
+    pub fn names(self) -> Option<&'static dyn names::NameFacts> {
+        self.0.names
     }
 
     /// Selects the registered language owning `path`'s extension; `None` for files no registered
@@ -708,8 +717,8 @@ pub fn kind_of(kind: lsp::SymbolKind) -> SymbolKind {
 ///
 /// They carry identity, ordering, extensions and a root-marker presence rule but no real
 /// language behaviour, so core tests never depend on a bundled language. `ALPHA`, `BETA` and
-/// `GAMMA` have project checks (present when `<id>.toml` exists at the worktree root); `DELTA`
-/// has none. Their identifiers sort in that order.
+/// `GAMMA` have project checks (present when `<id>.toml` exists at the worktree root) and tiny
+/// token-based name-fact providers; `DELTA` has neither. Their identifiers sort in that order.
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
@@ -821,6 +830,113 @@ pub(crate) mod testing {
         }
     }
 
+    use super::names::{
+        Certainty, FactSink, FileVerdict, NameFact, NameFacts, NameKey, Namespace,
+        NamespaceCoverage, Role, ns,
+    };
+
+    /// Name-fact stub whose whitespace-separated tokens are facts: alpha defines class names
+    /// (`@x`, `@x/domain`) and element ids (`#x`); beta uses class names exactly (`use:x`,
+    /// `use:x/domain`) and heuristically (`~x`); gamma uses element ids (`#x`). A file whose first
+    /// line is `#!skip` is skipped as generated.
+    struct Names(&'static str);
+
+    /// Coverage of the alpha stub.
+    const ALPHA_COVERAGE: &[NamespaceCoverage] = &[
+        NamespaceCoverage {
+            namespace: ns::CLASS,
+            defines: true,
+            uses: false,
+        },
+        NamespaceCoverage {
+            namespace: ns::ELEMENT_ID,
+            defines: true,
+            uses: false,
+        },
+    ];
+    /// Coverage of the beta stub.
+    const BETA_COVERAGE: &[NamespaceCoverage] = &[NamespaceCoverage {
+        namespace: ns::CLASS,
+        defines: false,
+        uses: true,
+    }];
+    /// Coverage of the gamma stub.
+    const GAMMA_COVERAGE: &[NamespaceCoverage] = &[NamespaceCoverage {
+        namespace: ns::ELEMENT_ID,
+        defines: false,
+        uses: true,
+    }];
+
+    impl Names {
+        /// Reads one token as `(namespace, role, certainty, name/domain)` per the stub's syntax.
+        fn token<'a>(&self, token: &'a str) -> Option<(Namespace, Role, Certainty, &'a str)> {
+            match self.0 {
+                "alpha" => token
+                    .strip_prefix('@')
+                    .map(|rest| (ns::CLASS, Role::Define, Certainty::Exact, rest))
+                    .or_else(|| {
+                        token
+                            .strip_prefix('#')
+                            .map(|rest| (ns::ELEMENT_ID, Role::Define, Certainty::Exact, rest))
+                    }),
+                "beta" => token
+                    .strip_prefix("use:")
+                    .map(|rest| (ns::CLASS, Role::Use, Certainty::Exact, rest))
+                    .or_else(|| {
+                        token
+                            .strip_prefix('~')
+                            .map(|rest| (ns::CLASS, Role::Use, Certainty::Heuristic("tilde"), rest))
+                    }),
+                _ => token
+                    .strip_prefix('#')
+                    .map(|rest| (ns::ELEMENT_ID, Role::Use, Certainty::Exact, rest)),
+            }
+        }
+    }
+
+    impl NameFacts for Names {
+        /// The stub's fixed coverage.
+        fn coverage(&self) -> &'static [NamespaceCoverage] {
+            match self.0 {
+                "alpha" => ALPHA_COVERAGE,
+                "beta" => BETA_COVERAGE,
+                _ => GAMMA_COVERAGE,
+            }
+        }
+        /// One fact per recognized token, positioned at the token's first byte.
+        fn extract(&self, _file: &Path, source: &str, sink: &mut FactSink) -> FileVerdict {
+            if source.starts_with("#!skip") {
+                return FileVerdict::Skipped("generated");
+            }
+            for (index, line) in source.lines().enumerate() {
+                let mut at = 0;
+                for token in line.split(' ') {
+                    let column = at + 1;
+                    at += token.len() + 1;
+                    let Some((namespace, role, certainty, rest)) = self.token(token) else {
+                        continue;
+                    };
+                    let (name, domain) = rest.split_once('/').unwrap_or((rest, ""));
+                    let fact = NameFact {
+                        key: NameKey {
+                            namespace,
+                            domain: domain.into(),
+                            name: name.into(),
+                        },
+                        role,
+                        line: index as u32 + 1,
+                        column: column as u32,
+                        certainty,
+                    };
+                    if !sink.push(fact) {
+                        return FileVerdict::Indexed;
+                    }
+                }
+            }
+            FileVerdict::Indexed
+        }
+    }
+
     /// Descriptor of the first checked test language.
     static ALPHA_DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
         id: "alpha",
@@ -831,6 +947,7 @@ pub(crate) mod testing {
         support: &Support("alpha"),
         checks: Some(&Checks("alpha.toml")),
         server: None,
+        names: Some(&Names("alpha")),
     };
     /// Descriptor of the second checked test language.
     static BETA_DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
@@ -842,6 +959,7 @@ pub(crate) mod testing {
         support: &Support("beta"),
         checks: Some(&Checks("beta.toml")),
         server: None,
+        names: Some(&Names("beta")),
     };
     /// Descriptor of the third checked test language.
     static GAMMA_DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
@@ -853,6 +971,7 @@ pub(crate) mod testing {
         support: &Support("gamma"),
         checks: Some(&Checks("gamma.toml")),
         server: None,
+        names: Some(&Names("gamma")),
     };
     /// Descriptor of the unchecked test language.
     static DELTA_DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
@@ -864,6 +983,7 @@ pub(crate) mod testing {
         support: &Support("delta"),
         checks: None,
         server: None,
+        names: None,
     };
 
     /// First checked test language.

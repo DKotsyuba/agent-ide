@@ -31,6 +31,8 @@ use crate::{
         store::WorkspaceStore,
     },
 };
+#[path = "links.rs"]
+mod links;
 #[path = "providers.rs"]
 mod providers;
 #[path = "snapshots.rs"]
@@ -1080,6 +1082,7 @@ impl WorkerHandle {
                 uncertain_snapshots: Vec::new(),
                 runtime,
                 providers: providers::Providers::new(),
+                names: Default::default(),
                 telemetry,
             }
             .run(receiver)
@@ -1704,6 +1707,8 @@ struct Worker<'a> {
     runtime: std::path::PathBuf,
     /// Exact provider/backend/view ownership and generations.
     providers: providers::Providers,
+    /// Cross-language name indexes of the worktrees this daemon's bindings use (LRU of four).
+    names: crate::intelligence::names::NameIndexes,
     /// Optional closed telemetry sink shared by Assistance producer boundaries.
     telemetry: Option<Telemetry>,
 }
@@ -4692,6 +4697,7 @@ mod stop_retry_tests {
             uncertain_snapshots: Vec::new(),
             runtime,
             providers: providers::Providers::new(),
+            names: Default::default(),
             telemetry: None,
         }
     }

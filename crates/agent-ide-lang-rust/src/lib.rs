@@ -21,6 +21,7 @@ pub static DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
     support: &support::RustSupport,
     checks: Some(&checks::RustChecks),
     server: Some(&backend::RustServer),
+    names: None,
 };
 
 /// The Rust language handle.

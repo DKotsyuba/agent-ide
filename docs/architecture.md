@@ -86,23 +86,33 @@ is the product version in each of them.
 `agent-ide-core`'s unit tests `language_free::core_sources_name_no_language` and
 `language_free::crate_dependencies_point_only_into_the_core` enforce both rules in the normal
 `cargo test --workspace` gate. Core unit tests that need languages use the neutral test languages
-in `lang::testing` (`alpha`, `beta`, `gamma` with checks, `delta` without).
+in `lang::testing` (`alpha`, `beta`, `gamma` with checks and name-fact stubs, `delta` with
+neither).
 
 ### How a language plugs in
 
 A language is one static `LanguageDescriptor` (id, display name, file extensions, the manifest
 the `ide.start` description names, home tool directories for the formatter `PATH`) that points at
-up to three trait implementations:
+up to four trait implementations:
 
 | Trait | Seam | What the language provides |
 |---|---|---|
 | `lang::LanguageSupport` | symbol tools | project detection and commands, outline normalization from document symbols, insertion sites, test-file conventions, test selection and output parsing, formatters, module docs, test naming and toolchain pinning |
 | `checks::LanguageChecks` + `checks::CheckConfig` | project problem feed | presence rule, the `project_checks.<id>` launcher section, the confined `Checker`, doctor probes, an optional sibling-cache seed |
 | `intelligence::server::LanguageServer` + `ServerBackend`, and `intelligence::session::SessionProfile` | semantic context and live sessions | the launcher `settings` identifier and extra declaration fields, cache layout, routing extensions, capabilities (call hierarchy, empty-reference answers), the per-worker backend that starts, reuses and reaps servers, and the per-session protocol knobs (configuration, identity check, readiness notification, diagnostics quirks, `didOpen` language id) |
+| `lang::names::NameFacts` | cross-language name facts (the language bridge) | the namespaces it may define and use (`coverage`), and a pure per-file `extract` of `(namespace, domain, name)` facts into the core's `FactSink` |
 
 The core reaches all of them through the handle (`language.support()`, `language.checks()`,
-`language.server()`); lookups by path or identifier (`Language::for_path`, `Language::by_id`) and
+`language.server()`, `language.names()`); lookups by path or identifier (`Language::for_path`, `Language::by_id`) and
 the order replies list languages come from the registration order.
+
+The fourth seam, `names`, lets languages that cannot see each other agree on shared names. A class
+defined by a style rule and used by markup or code, an element id, a style variable: each language
+emits define/use facts in core-owned namespaces (`lang::names::ns`), and the core's index
+(`intelligence::names`) joins them by `(namespace, domain, name)` across the worktree. Extraction is
+a pure function of one file's text — no filesystem, server or subprocess — and a language without a
+provider is reported as uncovered, never as "zero uses". See
+[the language bridge contract](contracts/language-bridge.md).
 
 ### Adding a language (recipe)
 
@@ -139,6 +149,7 @@ check, `agent-ide-lang-python` when it does.
        support: &support::<Name>Support,
        checks: None,
        server: None,
+       names: None,
    };
    pub const LANGUAGE: Language = Language::of(&DESCRIPTOR);
    ```

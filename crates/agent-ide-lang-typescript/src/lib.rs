@@ -21,6 +21,7 @@ pub static DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
     support: &support::TypeScript,
     checks: Some(&checks::TypeScriptChecks),
     server: Some(&backend::TypeScriptServer),
+    names: None,
 };
 
 /// The TypeScript language handle.

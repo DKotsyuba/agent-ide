@@ -21,6 +21,7 @@ pub static DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
     support: &support::Python,
     checks: Some(&checks::PythonChecks),
     server: Some(&backend::PyrightServer),
+    names: None,
 };
 
 /// The Python language handle.

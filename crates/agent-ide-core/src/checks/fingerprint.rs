@@ -37,6 +37,38 @@ const MISSING_FILE_MARKER: u64 = u64::MAX;
 /// thread so a path list larger than the pipe buffer cannot deadlock the child while this thread
 /// waits for its exit.
 pub fn git_worktree_fingerprint(worktree: &Path) -> Option<u64> {
+    let listed = git_listed_paths(worktree)?;
+    let mut hasher = blake3::Hasher::new();
+    for path in listed
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        hasher.update(path);
+        hasher.update(&[0]);
+        let full = worktree.join(OsStr::from_bytes(path));
+        match std::fs::metadata(&full) {
+            Ok(metadata) => {
+                hasher.update(&metadata.len().to_le_bytes());
+                let mtime_ns = i128::from(metadata.mtime()) * 1_000_000_000
+                    + i128::from(metadata.mtime_nsec());
+                hasher.update(&(mtime_ns as u64).to_le_bytes());
+            }
+            Err(_) => {
+                hasher.update(&MISSING_FILE_MARKER.to_le_bytes());
+            }
+        }
+    }
+    let digest = hasher.finalize();
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&digest.as_bytes()[..8]);
+    Some(u64::from_le_bytes(prefix))
+}
+
+/// `git ls-files -z --cached --others --exclude-standard` of `worktree`: every tracked and
+/// untracked, non-ignored path as NUL-separated bytes, or `None` when `worktree` has no `.git`
+/// entry, the child fails, or it exceeds `GIT_BUDGET`. Shared by the fingerprint and the
+/// cross-language name index so both see the same candidate files.
+pub(crate) fn git_listed_paths(worktree: &Path) -> Option<Vec<u8>> {
     if !worktree.join(".git").exists() {
         return None;
     }
@@ -80,33 +112,7 @@ pub fn git_worktree_fingerprint(worktree: &Path) -> Option<u64> {
         let _ = child.wait();
     }
     let listed = reader.join().ok()??;
-    if !exited_cleanly {
-        return None;
-    }
-    let mut hasher = blake3::Hasher::new();
-    for path in listed
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-    {
-        hasher.update(path);
-        hasher.update(&[0]);
-        let full = worktree.join(OsStr::from_bytes(path));
-        match std::fs::metadata(&full) {
-            Ok(metadata) => {
-                hasher.update(&metadata.len().to_le_bytes());
-                let mtime_ns = i128::from(metadata.mtime()) * 1_000_000_000
-                    + i128::from(metadata.mtime_nsec());
-                hasher.update(&(mtime_ns as u64).to_le_bytes());
-            }
-            Err(_) => {
-                hasher.update(&MISSING_FILE_MARKER.to_le_bytes());
-            }
-        }
-    }
-    let digest = hasher.finalize();
-    let mut prefix = [0u8; 8];
-    prefix.copy_from_slice(&digest.as_bytes()[..8]);
-    Some(u64::from_le_bytes(prefix))
+    exited_cleanly.then_some(listed)
 }
 
 #[cfg(test)]

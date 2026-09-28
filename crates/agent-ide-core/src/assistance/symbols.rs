@@ -988,15 +988,7 @@ pub(super) enum Located {
 
 /// Directories the session-anchor walk never enters: VCS internals, virtual environments,
 /// dependency installs and build output. None of them open a language session.
-const ANCHOR_SKIPPED_DIRECTORIES: [&str; 7] = [
-    ".git",
-    ".hg",
-    ".venv",
-    "venv",
-    "node_modules",
-    "target",
-    "dist",
-];
+const ANCHOR_SKIPPED_DIRECTORIES: [&str; 7] = crate::intelligence::names::SKIPPED_DIRECTORIES;
 /// Maximum directories the bounded session-anchor walk visits.
 const ANCHOR_MAX_DIRECTORIES: usize = 64;
 /// Source files kept per language for the bare-name outline scan that covers providers whose
