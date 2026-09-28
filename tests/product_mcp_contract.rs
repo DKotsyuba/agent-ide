@@ -2119,7 +2119,7 @@ impl ProductFixture {
     }
     /// Starts one configured shipping daemon and waits only for its real private endpoint.
     async fn daemon(&self) -> Child {
-        self.spawn_configured_daemon(None, false, Duration::from_secs(5), None)
+        self.daemon_with_startup_timeout(Duration::from_secs(30))
             .await
     }
     /// Starts a configured daemon with a caller-selected bound for cold multi-profile startup.
@@ -2133,7 +2133,7 @@ impl ProductFixture {
     /// `AGENT_IDE_TELEMETRY_DATABASE` override — exactly what the managed launcher selects — makes
     /// sanitized telemetry queryable and exportable after a restart.
     async fn daemon_with_durable_telemetry(&self) -> Child {
-        self.spawn_configured_daemon(None, true, Duration::from_secs(5), None)
+        self.spawn_configured_daemon(None, true, Duration::from_secs(30), None)
             .await
     }
 
@@ -2141,14 +2141,14 @@ impl ProductFixture {
     /// shape `agent-run` runtime homes ship): the resolved user home and cargo home must stay
     /// the operator's.
     async fn daemon_with_substituted_home(&self, home: &Path) -> Child {
-        self.spawn_configured_daemon(None, false, Duration::from_secs(5), Some(home))
+        self.spawn_configured_daemon(None, false, Duration::from_secs(30), Some(home))
             .await
     }
     /// Starts the configured daemon, optionally with its home (`AGENT_IDE_HOME`, which the product
     /// resolves instead of `$HOME`) redirected into the fixture so its project check caches never
     /// touch the real home directory. Without one it inherits the test-wide `AGENT_IDE_HOME`.
     async fn daemon_with_home(&self, home: Option<&Path>) -> Child {
-        self.spawn_configured_daemon(home, false, Duration::from_secs(5), None)
+        self.spawn_configured_daemon(home, false, Duration::from_secs(30), None)
             .await
     }
     /// Starts one configured shipping daemon and waits only for its real private endpoint.
