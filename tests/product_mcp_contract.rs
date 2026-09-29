@@ -4674,6 +4674,68 @@ async fn a_pending_edit_under_a_capped_check_of_other_files_settles_unknown() {
     daemon.wait().await.unwrap();
 }
 
+/// A Rust file no `mod` declaration reaches is never compiled by `cargo check`, so a check that
+/// named no problem in it answers `not_analysed`, never `current_clean`; a declared file stays clean.
+#[tokio::test]
+async fn an_edit_to_an_undeclared_rust_module_is_not_analysed() {
+    let fixture = ProductFixture::new(json!([]));
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "orphan-edit").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"orphan-edit"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let mut edit = async |path: &str, operation: &str, content: &str| {
+        let context = actor
+            .call(&fixture, "ide.context", json!({"path":path}))
+            .await;
+        let context = actor.settle(&fixture, context).await;
+        let edit = actor
+            .call(
+                &fixture,
+                "ide.edit",
+                json!({"operation_id":operation,"path":path,
+                       "source_ref":context["detail_ref"],"content":content}),
+            )
+            .await;
+        actor.settle(&fixture, edit).await
+    };
+    let orphan = edit("src/orphan.rs", "orphan-create", "pub fn orphan() {}\n").await;
+    assert_eq!(orphan["result"]["outcome"], "created", "{orphan}");
+    assert_eq!(orphan["diagnostics"]["state"], "not_analysed", "{orphan}");
+    assert_eq!(
+        orphan["diagnostics"]["reason"],
+        "rust check did not compile this file — not declared with `mod`",
+        "{orphan}"
+    );
+    let declared = edit(
+        "src/lib.rs",
+        "orphan-declare",
+        "pub mod orphan;\npub fn value() -> i32 { 7 }\n",
+    )
+    .await;
+    assert_eq!(
+        declared["diagnostics"]["state"], "current_clean",
+        "{declared}"
+    );
+    let orphan = edit(
+        "src/orphan.rs",
+        "orphan-again",
+        "pub fn orphan() -> u8 { 1 }\n",
+    )
+    .await;
+    assert_eq!(orphan["diagnostics"]["state"], "current_clean", "{orphan}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A session that never calls `ide.start` produces hook bookkeeping, not failures: one `info`
 /// skip line per detail per window on each side, and no `warn` hook line at all.
 #[tokio::test]

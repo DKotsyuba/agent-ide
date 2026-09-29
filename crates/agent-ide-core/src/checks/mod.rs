@@ -62,6 +62,16 @@ pub trait LanguageChecks: Send + Sync + 'static {
         None
     }
 
+    /// Why this language's project check does not analyse the worktree-relative `path` — for
+    /// example a source file no build target reaches — or `None` (the default) when it may. An
+    /// edit whose completed check named no problem in such a file answers `not_analysed` with this
+    /// reason instead of `current_clean`. The answer is a pure function of the worktree's files;
+    /// a wrong `Some` costs one redundant notice, never a false clean.
+    fn not_analysed(&self, worktree: &Path, path: &Path) -> Option<&'static str> {
+        let _ = (worktree, path);
+        None
+    }
+
     /// Decodes this language's closed `project_checks` launcher section. A shape error is the
     /// launcher's `Invalid`; path rules are checked later by [`CheckConfig::validate`].
     fn parse_config(

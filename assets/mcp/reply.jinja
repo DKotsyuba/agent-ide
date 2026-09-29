@@ -114,6 +114,8 @@ Next: use ide.edit with source_ref {{ result.source_ref }}
 edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: current_clean. Next: use ide.diff
 {%- elif diagnostics.state == "unknown" -%}
 edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: unknown. Next: use ide.context
+{%- elif diagnostics.state == "not_analysed" -%}
+edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: not_analysed ({{ diagnostics.reason }}); declare it, then edit again
 {%- elif diagnostics.state == "pending" -%}
 edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: pending. Next: use ide.inspect with detail_ref {{ diagnostics.detail_ref }}
 {%- endif -%}

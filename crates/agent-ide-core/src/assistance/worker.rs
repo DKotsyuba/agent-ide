@@ -3690,6 +3690,14 @@ impl<'a> Worker<'a> {
             // file's problems may be among the dropped ones, so it is neither clean nor reported.
             if truncated {
                 EditDiagnostics::Unknown {}
+            } else if let Some(reason) = language
+                .checks()
+                .and_then(|checks| checks.not_analysed(worktree, std::path::Path::new(wanted)))
+            {
+                // Naming no problem in a file the check never compiled proves nothing about it.
+                EditDiagnostics::NotAnalysed {
+                    reason: reason.to_owned(),
+                }
             } else {
                 EditDiagnostics::CurrentClean {}
             }

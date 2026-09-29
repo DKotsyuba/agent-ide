@@ -291,7 +291,7 @@ formatted: +3 lines after line 24; use source_ref …-3 for the next edit
 edit: replaced; path src/lang/path.rs; source_ref …-4; diagnostics: current_clean. Next: use ide.diff
 ```
 
-`current_clean` is only ever derived from a completed project check that named no problem in the file; a language server's empty publish is not taken as proof. A provider report for the exact post-edit version (an error rust-analyzer or tsserver found on its own) is kept as it arrives instantly. The reply waits at most 90 s for the check, then says `diagnostics: unknown` and the result reaches the next `<agent-ide>` block or `ide.context`. The `rerun tests:` hint arrives with `ide.test` (§2.6).
+`current_clean` is only ever derived from a completed project check that named no problem in the file; a language server's empty publish is not taken as proof. When the check could not have analysed the file — for Rust, a file no `mod` declaration reaches from a build target — the reply says ``diagnostics: not_analysed (rust check did not compile this file — not declared with `mod`); declare it, then edit again`` instead: the closed diagnostics vocabulary is `current_reported`, `current_clean`, `not_analysed`, `unknown`, `pending`, and `not_analysed` is never clean. Python and TypeScript files are always treated as analysed (an unimported file can still read `current_clean`). A provider report for the exact post-edit version (an error rust-analyzer or tsserver found on its own) is kept as it arrives instantly. The reply waits at most 90 s for the check, then says `diagnostics: unknown` and the result reaches the next `<agent-ide>` block or `ide.context`. The `rerun tests:` hint arrives with `ide.test` (§2.6).
 
 For `rename`:
 
