@@ -70,7 +70,7 @@ tests #3: running 42 s — cargo test worker::
 </agent-ide>
 ```
 
-When the worktree's checked-out branch or detached commit changed outside the IDE since the session's previous call (another process ran `git checkout`/`switch`), the next plate leads with one line, delivered once: `git: HEAD moved 4e2e2e2 → 9daac64 (claude/a → claude/b) outside Agent IDE; earlier indexed answers may be stale`. A commit on the same branch is not reported. It is a notice only: nothing is invalidated or restarted.
+When the worktree's checked-out branch or detached commit changed outside the IDE (another process ran `git checkout`/`switch`), the plate of the first call that probes HEAD afterwards leads with one line, delivered once. HEAD is probed when the session starts and then by a completed call at most once per 30 s, so the line can trail the switch by up to 30 s of calls: `git: HEAD moved 4e2e2e2 → 9daac64 (claude/a → claude/b) outside Agent IDE; earlier indexed answers may be stale`. A commit on the same branch is not reported. It is a notice only: nothing is invalidated or restarted.
 
 ### Ceilings and pages
 
