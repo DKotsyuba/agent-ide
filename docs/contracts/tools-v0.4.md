@@ -358,7 +358,7 @@ Output uses the current `file:line:column code message` form, grouped by file an
 
 ### 2.9 Unchanged tools
 
-`ide.inspect {detail_ref, page?}` and `ide.stop {}` remain unchanged, except that an unknown `detail_ref` now says which it is — `this detail_ref was never issued` for a reference this daemon could not have minted, `this detail_ref has expired` for one it minted and no longer retains — and a test-run handle (`tests #N`, `tests-N`, `#N`, `N`) answers with that run's status line instead of failing the lookup. `ide.context` in its current form is retired; its role is divided among `outline`, `symbol`, `read`, and `problems`.
+`ide.inspect {detail_ref, page?}` and `ide.stop {}` remain unchanged, except that an unknown `detail_ref` now says which it is — `this detail_ref was never issued` for a reference this daemon could not have minted, `this detail_ref has expired` for one it minted and no longer retains — and a test-run handle (`tests #N`, `tests-N`, `#N`, `N`) answers with that run's status line instead of failing the lookup. A test-run handle keeps answering read-only for the run's retained lifetime (up to 10 minutes) even after `ide.stop`, without the `full output` line; every other `detail_ref` ends with the session, and a retained run's output detail is never evicted while the session lasts. `ide.context` in its current form is retired; its role is divided among `outline`, `symbol`, `read`, and `problems`.
 
 ## 3. `LanguageSupport` contract
 

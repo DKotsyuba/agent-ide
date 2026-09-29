@@ -123,6 +123,16 @@ impl BindingRef {
         }
     }
 
+    /// Returns this binding's host, actor and channel with no generation: the owner of a read that
+    /// outlives one generation (a test run's status after `ide.stop`). Generations start at one, so
+    /// the identity is never active and every admission or liveness check refuses it.
+    pub(crate) fn channel_identity(&self) -> Self {
+        Self {
+            generation: 0,
+            ..self.clone()
+        }
+    }
+
     /// Returns a stable opaque persistence key without exposing actor/channel fields or minting proof.
     /// The domain and length framing preserve distinct actor, channel, and generation identities.
     pub(crate) fn fingerprint(&self) -> [u8; 32] {
@@ -450,7 +460,7 @@ impl HostBindingGuard {
         candidate: CandidateInvocation,
         channel: ChannelSessionRef,
     ) -> BindingStatus {
-        self.validate_managed_codex(candidate, channel, true)
+        self.validate_managed_codex(candidate, channel, Admission::Establish)
     }
 
     /// Validates one ordinary Codex invocation on an active managed-MCP actor/channel binding.
@@ -463,7 +473,18 @@ impl HostBindingGuard {
         candidate: CandidateInvocation,
         channel: ChannelSessionRef,
     ) -> BindingStatus {
-        self.validate_managed_codex(candidate, channel, false)
+        self.validate_managed_codex(candidate, channel, Admission::Active)
+    }
+
+    /// Validates one read-only managed Codex call exactly like
+    /// [`Self::validate_managed_codex_active`], except that a stopped or absent generation answers
+    /// the actor/channel identity (see [`Self::validate_read_only`]).
+    pub fn validate_managed_codex_read_only(
+        &mut self,
+        candidate: CandidateInvocation,
+        channel: ChannelSessionRef,
+    ) -> BindingStatus {
+        self.validate_managed_codex(candidate, channel, Admission::ReadOnly)
     }
 
     /// Applies the shared bounded binding and replay rules to one direct managed Codex call.
@@ -478,7 +499,7 @@ impl HostBindingGuard {
         &mut self,
         candidate: CandidateInvocation,
         channel: ChannelSessionRef,
-        establish: bool,
+        admission: Admission,
     ) -> BindingStatus {
         let invocation = (candidate.clone(), channel.clone());
         if candidate.host != HostKind::Codex
@@ -494,7 +515,8 @@ impl HostBindingGuard {
         let binding_key = (candidate.host, candidate.actor_id.clone(), channel.clone());
         let (binding, created_binding) = match self.bindings.get(&binding_key).cloned() {
             Some(binding) => (binding, false),
-            None if establish => {
+            None if admission == Admission::ReadOnly => (identity(&candidate, channel), false),
+            None if admission == Admission::Establish => {
                 if self.bindings.len() >= MAX_BINDINGS {
                     return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
                 }
@@ -639,6 +661,31 @@ impl HostBindingGuard {
         candidate: CandidateInvocation,
         channel: ChannelSessionRef,
     ) -> BindingStatus {
+        self.validate_ordinary(candidate, channel, Admission::Active)
+    }
+
+    /// Validates one read-only call that may outlive its binding — `ide.inspect` of a test-run
+    /// handle, whose status and parsed result are already owned by this actor and channel.
+    ///
+    /// Every correlation, replay and settling rule of [`Self::validate_active`] applies; only the
+    /// generation requirement is waived: a stopped or absent generation answers the actor/channel
+    /// identity (`BindingRef::channel_identity`), which is never active and so admits nothing
+    /// that consumes liveness.
+    pub fn validate_read_only(
+        &mut self,
+        candidate: CandidateInvocation,
+        channel: ChannelSessionRef,
+    ) -> BindingStatus {
+        self.validate_ordinary(candidate, channel, Admission::ReadOnly)
+    }
+
+    /// Applies the ordinary-call rules; `admission` decides what an inactive generation answers.
+    fn validate_ordinary(
+        &mut self,
+        candidate: CandidateInvocation,
+        channel: ChannelSessionRef,
+        admission: Admission,
+    ) -> BindingStatus {
         let invocation = (candidate.clone(), channel.clone());
         if self.replay_disposition(&candidate, &channel).is_some()
             || self.settling.contains_key(&invocation)
@@ -654,11 +701,16 @@ impl HostBindingGuard {
             }
             return BindingStatus::Unavailable(BindingUnavailable::MissingPre);
         }
-        let Some(binding) = self
+        let binding = self
             .bindings
-            .get(&(candidate.host, candidate.actor_id.clone(), channel))
-            .cloned()
-        else {
+            .get(&(candidate.host, candidate.actor_id.clone(), channel.clone()))
+            .filter(|binding| !self.stopping.contains(*binding))
+            .cloned();
+        let binding = match binding {
+            None if admission == Admission::ReadOnly => Some(identity(&candidate, channel)),
+            binding => binding,
+        };
+        let Some(binding) = binding else {
             if self
                 .record_replay(&invocation, ReplayDisposition::Rejected)
                 .is_err()
@@ -667,11 +719,6 @@ impl HostBindingGuard {
             }
             return BindingStatus::Unavailable(BindingUnavailable::InactiveBinding);
         };
-        if self.stopping.contains(&binding) {
-            self.record_replay(&invocation, ReplayDisposition::Rejected)
-                .expect("the checked replay scope has capacity");
-            return BindingStatus::Unavailable(BindingUnavailable::InactiveBinding);
-        }
         self.settling.insert(invocation, binding.clone());
         BindingStatus::Validated(validated(candidate, binding, false))
     }
@@ -1026,6 +1073,19 @@ impl HostBindingGuard {
         }
     }
 
+    /// Validates a read-only Claude MCP call (see [`Self::validate_read_only`]) after recovering
+    /// its exact registered pre-hook actor.
+    pub fn validate_read_only_claude(
+        &mut self,
+        call_id: &str,
+        channel: ChannelSessionRef,
+    ) -> BindingStatus {
+        match self.recover_claude_candidate(call_id, &channel) {
+            Ok(candidate) => self.validate_read_only(candidate, channel),
+            Err(error) => BindingStatus::Unavailable(error),
+        }
+    }
+
     /// Checks whether one immutable binding generation remains active at this exact boundary.
     pub fn check_active(&self, binding: &BindingRef) -> Result<(), BindingUnavailable> {
         let key = (
@@ -1163,6 +1223,27 @@ impl HostBindingGuard {
                         .any(|record| matches!(record.disposition, ReplayDisposition::Completed))
                 })
             })
+    }
+}
+
+/// Which generations one ordinary or managed call admits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Admission {
+    /// An explicit start that may create a generation.
+    Establish,
+    /// An ordinary call that requires the current active generation.
+    Active,
+    /// A read-only call that falls back to the actor/channel identity when no generation is active.
+    ReadOnly,
+}
+
+/// Returns the never-active actor/channel identity of one validated candidate.
+fn identity(candidate: &CandidateInvocation, channel: ChannelSessionRef) -> BindingRef {
+    BindingRef {
+        host: candidate.host,
+        actor_id: candidate.actor_id.clone(),
+        channel,
+        generation: 0,
     }
 }
 

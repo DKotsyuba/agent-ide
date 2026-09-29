@@ -1,13 +1,14 @@
 //! Explicit, daemon-owned background test jobs and their bounded runner output.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
+use super::host_binding::BindingRef;
 use crate::lang::{Language, TestReport};
 
 /// Maximum combined stdout and stderr retained for `ide.inspect`.
@@ -43,6 +44,11 @@ struct Job {
     root: PathBuf,
     /// Binding that owns the original output detail reference.
     owner: [u8; 32],
+    /// Actor/channel identity of that binding; a run-handle lookup answers it across generations,
+    /// so the status outlives `ide.stop`.
+    channel: [u8; 32],
+    /// Detail reference retained for this run's paged output while the run is retained.
+    detail_ref: String,
     /// Monotonic start time used for status ages.
     started: tokio::time::Instant,
     /// Absent while active, present after exit, spawn failure, or budget expiry.
@@ -124,7 +130,7 @@ impl TestRuns {
         language: Language,
         budget: Duration,
         detail_ref: String,
-        owner: [u8; 32],
+        owner: &BindingRef,
     ) -> StartResult {
         let mut state = match self.0.lock() {
             Ok(state) => state,
@@ -148,7 +154,9 @@ impl TestRuns {
             id,
             Job {
                 root: root.clone(),
-                owner,
+                owner: owner.fingerprint(),
+                channel: owner.channel_identity().fingerprint(),
+                detail_ref: detail_ref.clone(),
                 started,
                 result: None,
                 completed_at: None,
@@ -186,11 +194,16 @@ impl TestRuns {
         })
     }
 
-    /// Returns one daemon-global job's status for its starting binding, without a worktree: the
-    /// handle an agent invented for `ide.inspect` (`tests #N`) names a run, not a detail.
-    pub fn find(&self, id: u64, owner: &[u8; 32]) -> Option<JobStatus> {
+    /// Returns one daemon-global job's status for any generation of its starting actor and
+    /// channel, without a worktree: the handle an agent invented for `ide.inspect` (`tests #N`)
+    /// names a run, not a detail, and still answers after that actor's `ide.stop`.
+    pub fn find(&self, id: u64, caller: &BindingRef) -> Option<JobStatus> {
+        let channel = caller.channel_identity().fingerprint();
         let mut state = self.0.lock().ok()?;
-        let job = state.jobs.get_mut(&id).filter(|job| &job.owner == owner)?;
+        let job = state
+            .jobs
+            .get_mut(&id)
+            .filter(|job| job.channel == channel)?;
         if job.result.is_some() {
             job.observed = true;
         }
@@ -305,6 +318,21 @@ impl TestRuns {
             job.observed = true;
         }
         true
+    }
+
+    /// Returns the output detail references of every retained run; the worker never evicts them,
+    /// so a run's full output stays readable while its result does.
+    pub fn detail_refs(&self) -> BTreeSet<String> {
+        self.0.lock().map_or_else(
+            |_| BTreeSet::new(),
+            |state| {
+                state
+                    .jobs
+                    .values()
+                    .map(|job| job.detail_ref.clone())
+                    .collect()
+            },
+        )
     }
 
     /// Reports whether any daemon-owned test child is still running.
@@ -601,7 +629,7 @@ mod runner_tests {
                 crate::lang::testing::ALPHA,
                 Duration::from_secs(3),
                 "r1".into(),
-                [1; 32]
+                &BindingRef::fixture("actor-1", "channel-1", 1)
             ),
             StartResult::Started(1)
         ));
@@ -612,7 +640,7 @@ mod runner_tests {
                 crate::lang::testing::ALPHA,
                 Duration::from_secs(3),
                 "r2".into(),
-                [2; 32]
+                &BindingRef::fixture("actor-2", "channel-2", 1)
             ),
             StartResult::Running(1, _)
         ));

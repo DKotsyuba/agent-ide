@@ -5650,6 +5650,66 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     daemon.wait().await.unwrap();
 }
 
+/// After `ide.stop` a test-run handle still answers the run's status through `ide.inspect`, without
+/// a plate or the dropped `full output` detail; every other reference ends with the session.
+#[tokio::test]
+async fn configured_product_test_handle_answers_after_stop() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "status-after-stop").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"after-stop"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let run = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c","printf 'running 1 test\\ntest demo ... ok\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\\n'"]}),
+        )
+        .await;
+    let run_ref = run["detail_ref"].as_str().unwrap().to_owned();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the run did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = actor.call(&fixture, "ide.test", json!({"status":1})).await;
+        if status["text"]
+            .as_str()
+            .unwrap()
+            .contains("1 passed, 0 failed")
+        {
+            break;
+        }
+    }
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    let handle = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":"tests #1"}))
+        .await;
+    assert_eq!(handle["state"], "complete", "{handle}");
+    let text = handle["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("tests #1: 1 passed, 0 failed") && !text.contains("full output"),
+        "{handle}"
+    );
+    assert!(carried_status(&handle).is_none(), "{handle}");
+    let detail = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":run_ref}))
+        .await;
+    assert_eq!(detail["state"], "unavailable", "{detail}");
+    let context = actor
+        .call(&fixture, "ide.context", json!({"path":"src/lib.rs"}))
+        .await;
+    assert_eq!(context["state"], "unavailable", "{context}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A finished run's output is paged into its detail once; every later status lookup still answers
 /// the status line, never `capacity`.
 #[tokio::test]

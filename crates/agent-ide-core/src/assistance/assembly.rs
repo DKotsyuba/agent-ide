@@ -612,6 +612,18 @@ impl ProductDispatcher {
                         }
                     }
                 }
+                // A test-run handle read by `ide.inspect` only answers that run's status, already
+                // owned by this actor and channel, so it stays readable after `ide.stop`; every
+                // other call still needs the active generation.
+                let read_only = method.method() == AssistanceMethod::Inspect
+                    && call.parameters()["detail_ref"]
+                        .as_str()
+                        .and_then(super::worker::test_run_handle)
+                        .is_some();
+                let stopped = |invocation: &super::host_binding::ValidatedInvocation| {
+                    read_only
+                        && invocation.binding_ref() == &invocation.binding_ref().channel_identity()
+                };
                 let invocation = {
                     let mut bindings = self.bindings.lock().ok()?;
                     let status = match host {
@@ -622,10 +634,15 @@ impl ProductDispatcher {
                             }
                             if self.managed_codex && method.method() == AssistanceMethod::Start {
                                 bindings.establish_managed_codex_start(candidate, channel.clone())
+                            } else if self.managed_codex && read_only {
+                                bindings
+                                    .validate_managed_codex_read_only(candidate, channel.clone())
                             } else if self.managed_codex {
                                 bindings.validate_managed_codex_active(candidate, channel.clone())
                             } else if method.method() == AssistanceMethod::Start {
                                 bindings.establish_start(candidate, channel.clone())
+                            } else if read_only {
+                                bindings.validate_read_only(candidate, channel.clone())
                             } else {
                                 bindings.validate_active(candidate, channel.clone())
                             }
@@ -639,6 +656,8 @@ impl ProductDispatcher {
                                 bindings.reactivate_start_claude(&call_id, channel.clone())
                             } else if method.method() == AssistanceMethod::Start {
                                 bindings.establish_start_claude(&call_id, channel.clone())
+                            } else if read_only {
+                                bindings.validate_read_only_claude(&call_id, channel.clone())
                             } else {
                                 bindings.validate_active_claude(&call_id, channel.clone())
                             }
@@ -665,11 +684,14 @@ impl ProductDispatcher {
                     };
                     if method.method() == AssistanceMethod::Stop {
                         bindings.stop_binding(invocation.binding_ref()).ok()?;
-                    } else {
+                    } else if !stopped(&invocation) {
                         bindings.consume_active(invocation.binding_ref()).ok()?;
                     }
                     invocation
                 };
+                // Only a read-only call answers a stopped generation: its reply stays plate-free
+                // and touches no worktree state, like `ide.stop`'s own.
+                let stopped = stopped(&invocation);
                 let Some(worker) = &self.worker else {
                     return Some(if method.method() == AssistanceMethod::Stop {
                         PeerReply::HostStopped {}
@@ -681,6 +703,7 @@ impl ProductDispatcher {
                     });
                 };
                 if self.managed_codex
+                    && !stopped
                     && matches!(
                         method.method(),
                         AssistanceMethod::Context
@@ -747,6 +770,7 @@ impl ProductDispatcher {
                 // so a plate the native post already delivered is never repeated here.
                 if host.feed_delivery().allows_replies()
                     && method.method() != AssistanceMethod::Stop
+                    && !stopped
                 {
                     let test_status = test_status_snapshot(&reply);
                     if let Some(feed) = worker.project_feed() {
