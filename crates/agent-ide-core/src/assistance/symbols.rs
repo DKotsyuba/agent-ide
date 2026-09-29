@@ -38,16 +38,17 @@ impl Worker<'_> {
             None => resolved.cloned().ok_or(FailureCode::UnknownSymbol)?,
         };
         let (observed, bytes) = self.observe(&binding, file).await?;
-        let (outline, root, _) = self.outline_of(job, &observed, &bytes).await?;
+        let (outline, root, lexical) = self.outline_of(job, &observed, &bytes).await?;
         let found = if symbol.file().is_some() {
             outline
                 .find(&symbol)
                 .cloned()
-                .ok_or(FailureCode::UnknownSymbol)?
+                .ok_or_else(|| missing_symbol(job, lexical))?
         } else {
             let name = symbol.name().ok_or(FailureCode::UnknownSymbol)?;
             match outline.named(name).as_slice() {
                 [found] => (*found).clone(),
+                [] => return Err(missing_symbol(job, lexical)),
                 _ => return Err(FailureCode::UnknownSymbol),
             }
         };
@@ -199,7 +200,9 @@ impl Worker<'_> {
                     .to_path_buf();
                 let (observed, bytes) = self.observe(&binding, file.clone()).await?;
                 let (outline, _, from_text) = self.outline_of(job, &observed, &bytes).await?;
-                let found = outline.find(&symbol).ok_or(FailureCode::UnknownSymbol)?;
+                let found = outline
+                    .find(&symbol)
+                    .ok_or_else(|| missing_symbol(job, from_text))?;
                 lexical = from_text
                     .then(|| self.lexical_note(observed.path()))
                     .flatten();
@@ -316,7 +319,7 @@ impl Worker<'_> {
             }
         };
         let (observed, bytes) = self.observe(&binding, file.clone()).await?;
-        let (outline, worktree_root, _) = self.outline_of(job, &observed, &bytes).await?;
+        let (outline, worktree_root, lexical) = self.outline_of(job, &observed, &bytes).await?;
         let found = match symbol.file() {
             Some(_) => outline.find(&symbol).cloned(),
             None => {
@@ -335,7 +338,7 @@ impl Worker<'_> {
                 }
             }
         }
-        .ok_or(FailureCode::UnknownSymbol)?;
+        .ok_or_else(|| missing_symbol(job, lexical))?;
         let source = observed_text(&observed, &bytes)?;
         let mut card = SymbolCard {
             heading: format!(
@@ -534,7 +537,7 @@ impl Worker<'_> {
             },
         };
         let (observed, bytes) = self.observe(&binding, file.clone()).await?;
-        let (outline, worktree_root, _) = self.outline_of(job, &observed, &bytes).await?;
+        let (outline, worktree_root, lexical) = self.outline_of(job, &observed, &bytes).await?;
         let found = match symbol.file() {
             Some(_) => outline.find(&symbol).cloned(),
             None => {
@@ -558,7 +561,7 @@ impl Worker<'_> {
                 }
             }
         }
-        .ok_or(FailureCode::UnknownSymbol)?;
+        .ok_or_else(|| missing_symbol(job, lexical))?;
         // A server whose call hierarchy answers nothing for constructors and partial answers for
         // everything else would make the walk below render a misleading graph; answer the fact.
         let depth = job
@@ -888,10 +891,13 @@ impl Worker<'_> {
 
     /// Document symbols of one observed file through the live session, normalized by the
     /// language module, or the language's source outline when no server owns the file. While a
-    /// registered server is still loading (a cold workspace load), the source outline answers at
-    /// once instead of parking; an uncertain file keeps waiting for the server. Returns the
+    /// registered server is still loading (a cold workspace load), a language that opted in
+    /// ([`LanguageSupport::outline_while_loading`](crate::lang::LanguageSupport::outline_while_loading))
+    /// answers from its source outline at once instead of parking; a file it cannot outline,
+    /// and every other language, keeps the loading answer and its parking retry. Returns the
     /// outline, the worktree root for path rendering, and whether the outline came from the text
-    /// alone while that server loads (replies then say so in one compact line).
+    /// alone while that server loads (replies then say so in one compact line, and an address
+    /// it does not contain waits for the server — see [`missing_symbol`]).
     async fn outline_of(
         &mut self,
         job: &mut Job,
@@ -912,15 +918,18 @@ impl Worker<'_> {
         }
         let live = match self.live_session_for(job, observed).await {
             Ok(live) => live,
-            Err(FailureCode::ProviderLoading) => {
-                // The registered server is loading: a language that outlines from its text
-                // answers now and the caller's reply marks the outline lexical; a file that
-                // does not scan cleanly keeps the parking retry exactly as before.
-                job.park_until = None;
-                return support
-                    .outline_from_source(observed.path(), &source)
-                    .map(|outline| (outline, worktree_root, true))
-                    .ok_or(FailureCode::ProviderLoading);
+            Err(FailureCode::ProviderLoading) if support.outline_while_loading() => {
+                // The registered server is loading: the source outline answers now (the park
+                // `live_session_for` set is lifted) and the caller's reply marks it lexical; a
+                // file that does not scan cleanly keeps the park, exactly as before.
+                let parked = job.park_until.take();
+                return match support.outline_from_source(observed.path(), &source) {
+                    Some(outline) => Ok((outline, worktree_root, true)),
+                    None => {
+                        job.park_until = parked;
+                        Err(FailureCode::ProviderLoading)
+                    }
+                };
             }
             Err(other) => return Err(other),
         };
@@ -1086,8 +1095,10 @@ impl Worker<'_> {
     }
 
     /// The outline of `file` read without registering it against the binding (a graph node's
-    /// file) and whether the server answered it, falling back to the language's text outline
-    /// when the server cannot answer, or `None` when it cannot be read or outlined.
+    /// file) and whether the server answered it (`false` for a text outline, including the
+    /// lexical one answered while the server loads, so no call-hierarchy walk starts from it),
+    /// falling back to the language's text outline when the server cannot answer, or `None`
+    /// when it cannot be read or outlined.
     async fn scanned_outline(
         &mut self,
         job: &mut Job,
@@ -1105,7 +1116,8 @@ impl Worker<'_> {
         )
         .ok()?;
         match self.outline_of(job, &observed, read.contents()).await {
-            Ok((outline, _, _)) => Some((outline, true)),
+            // A lexical outline (the server still loading) is not the server's answer.
+            Ok((outline, _, lexical)) => Some((outline, !lexical)),
             // The server could not outline it (its project config lives below the worktree
             // root): the language's text outline still names the enclosing declaration.
             Err(_) => Lang::for_path(file)?
@@ -1465,6 +1477,20 @@ fn collect_language_files(
     files
 }
 
+/// The failure for an address the job's outline does not contain (`lexical`: whether that
+/// outline came from the text while the file's server loads). A server outline proves the symbol
+/// absent: `unknown_symbol`. A lexical outline cannot — an item it names differently or does not
+/// report may still exist — so the call waits for the server exactly as while any symbol tool
+/// waits for it: parked for a retry, or `provider_loading` at once for an edit (see
+/// [`park_while_loading`](super::providers::park_while_loading)).
+pub(super) fn missing_symbol(job: &mut Job, lexical: bool) -> FailureCode {
+    if !lexical {
+        return FailureCode::UnknownSymbol;
+    }
+    super::providers::park_while_loading(job);
+    FailureCode::ProviderLoading
+}
+
 /// Byte offset of the symbol's name on its declaration line, for position-based requests.
 fn name_offset(source: &str, symbol: &lang::Symbol) -> Result<usize, FailureCode> {
     let mut offset = 0usize;
@@ -1591,8 +1617,8 @@ impl Worker<'_> {
                     .to_path_buf();
                 let (observed, bytes) = self.observe(&binding, file.clone()).await?;
                 let source = observed_text(&observed, &bytes)?.to_owned();
-                let (outline, _, lexical) = self.outline_of(job, &observed, &bytes).await?;
-                let lexical = lexical
+                let (outline, _, from_text) = self.outline_of(job, &observed, &bytes).await?;
+                let lexical = from_text
                     .then(|| self.lexical_note(observed.path()))
                     .flatten();
                 let splice = match op.as_str() {
@@ -1608,13 +1634,15 @@ impl Worker<'_> {
                         let site = support
                             .insert_site(&source, &outline, &symbol, where_)
                             .map_err(|error| match error {
-                                lang::LangError::UnknownSymbol(_) => FailureCode::UnknownSymbol,
+                                lang::LangError::UnknownSymbol(_) => missing_symbol(job, from_text),
                                 _ => FailureCode::Internal,
                             })?;
                         Splice::Insert(site)
                     }
                     _ => {
-                        let found = outline.find(&symbol).ok_or(FailureCode::UnknownSymbol)?;
+                        let found = outline
+                            .find(&symbol)
+                            .ok_or_else(|| missing_symbol(job, from_text))?;
                         Splice::Replace(found.range)
                     }
                 };
@@ -1892,16 +1920,26 @@ impl Worker<'_> {
             .ok_or(FailureCode::UnknownSymbol)?
             .to_path_buf();
         let (observed, bytes) = self.observe(&binding, file.clone()).await?;
-        let (outline, worktree_root, _) = self.outline_of(job, &observed, &bytes).await?;
+        // Rename is server-only: while the server loads, park and retry before the address is
+        // resolved, so a lexical outline never answers for it (not even `unknown_symbol`).
+        // Parked by hand: `live_session_for` never parks an edit.
+        match self.live_session_for(job, &observed).await {
+            Ok(_) => {}
+            Err(FailureCode::ProviderLoading) => {
+                job.park_until = Some(tokio::time::Instant::now() + Duration::from_millis(300));
+                return Err(FailureCode::ProviderLoading);
+            }
+            Err(other) => return Err(other),
+        }
+        let (outline, worktree_root, lexical) = self.outline_of(job, &observed, &bytes).await?;
         let found = outline
             .find(&symbol)
             .cloned()
-            .ok_or(FailureCode::UnknownSymbol)?;
+            .ok_or_else(|| missing_symbol(job, lexical))?;
         let source = observed_text(&observed, &bytes)?;
         let byte_offset = name_offset(source, &found)?;
         let (edit, encoding) = {
-            // Rename is server-only: while the server loads, park and retry instead of failing
-            // fast, exactly as it did before the lexical outline let edits answer while cold.
+            // The server may have gone back to loading since the check above.
             let live = match self.live_session_for(job, &observed).await {
                 Ok(live) => live,
                 Err(FailureCode::ProviderLoading) => {

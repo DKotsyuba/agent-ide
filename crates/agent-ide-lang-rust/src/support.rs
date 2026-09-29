@@ -183,6 +183,12 @@ impl LanguageSupport for RustSupport {
         crate::lexical::lexical_outline(file, source)
     }
 
+    /// Always `true`: the lexical outline above meets the equality obligation, so outline, read
+    /// and symbol edits answer while rust-analyzer loads.
+    fn outline_while_loading(&self) -> bool {
+        true
+    }
+
     /// Computes the insertion point; see `place` for the shared rules. A container is any kind
     /// that [`SymbolKind::is_container`] accepts plus a test module (`mod tests`), which is
     /// [`SymbolKind::Test`]; members of an empty container are indented four spaces deeper.

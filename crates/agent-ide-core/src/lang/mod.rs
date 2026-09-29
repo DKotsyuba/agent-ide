@@ -685,10 +685,27 @@ pub trait LanguageSupport: Send + Sync {
     /// When no registered server owns the file's extension, the symbol tools outline, read and
     /// describe the file from this and report usages and callers as unavailable. A language with
     /// a server may still answer: graph use-site nodes and name-card addresses use it where the
-    /// server is not asked or cannot answer.
+    /// server is not asked or cannot answer, and — only when
+    /// [`LanguageSupport::outline_while_loading`] opts in — outline, read and symbol edits use it
+    /// while that server is still loading.
     fn outline_from_source(&self, file: &Path, source: &str) -> Option<Outline> {
         let _ = (file, source);
         None
+    }
+
+    /// Whether [`LanguageSupport::outline_from_source`] answers `ide.outline`, `ide.read` and
+    /// symbol-addressed `ide.edit` while the language's registered server is still loading;
+    /// `false` (the default) keeps those calls waiting for the server.
+    ///
+    /// Opting in is an obligation, because a symbol edit splices by the outline's ranges: every
+    /// `Some` outline it returns for a text must equal what [`LanguageSupport::normalize`] makes
+    /// of the server's document symbols for the same text — the same addresses, kinds, ranges,
+    /// bodies, signatures, docs, children and order — and a text it cannot outline with that
+    /// guarantee must answer `None`, which keeps the call waiting for the server. An address the
+    /// source outline does not contain is not proven absent: the call waits for the server
+    /// instead of answering `unknown_symbol`.
+    fn outline_while_loading(&self) -> bool {
+        false
     }
 
     /// Whether tests live only in files [`LanguageSupport::is_test_file`] accepts, so a path

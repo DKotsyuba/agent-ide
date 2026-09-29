@@ -386,15 +386,7 @@ impl Worker<'_> {
         match readiness {
             Ok(()) => {}
             Err(ReadinessError::Loading) => {
-                // Post-edit provider data is optional: do not restart a write whose receipt must settle.
-                if job.tool != AssistanceTool::Edit
-                    && job
-                        .deadline
-                        .saturating_duration_since(tokio::time::Instant::now())
-                        > Duration::from_secs(1)
-                {
-                    job.park_until = Some(tokio::time::Instant::now() + Duration::from_millis(300));
-                }
+                park_while_loading(job);
                 return Err(FailureCode::ProviderLoading);
             }
             Err(ReadinessError::WorkspaceError) => return Err(FailureCode::ProviderUnavailable),
@@ -561,6 +553,20 @@ pub(super) struct CacheRequest {
     /// Whether this namespace is the one shared native namespace several concurrently active
     /// worktrees legitimately hold at once rather than a single-owner worktree namespace.
     pub(super) shared: bool,
+}
+
+/// Parks `job` for a retry in 300 ms because its language server is still loading; the caller
+/// then answers `provider_loading`, which the worker turns into a requeue instead of a reply.
+/// An edit is never parked (post-edit provider data is optional, and a write whose receipt must
+/// settle is not restarted), nor a job whose deadline is a second away or less: both answer
+/// `provider_loading` at once.
+pub(super) fn park_while_loading(job: &mut Job) {
+    let now = tokio::time::Instant::now();
+    if job.tool != AssistanceTool::Edit
+        && job.deadline.saturating_duration_since(now) > Duration::from_secs(1)
+    {
+        job.park_until = Some(now + Duration::from_millis(300));
+    }
 }
 
 /// Retains every requested namespace as one transaction over `caches`, returning the retained keys.
