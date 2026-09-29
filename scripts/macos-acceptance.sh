@@ -71,17 +71,12 @@ require_directory() {
     }
 }
 
-# Removes only the two worktrees and temporary directory created by this process.
+# Removes only the temporary directory created by this process.
 #
-# Missing or partially created worktrees are ignored so setup failures remain recoverable. The
-# repository root and temporary paths are resolved before this function is installed as a trap.
+# The private clone and both of its worktrees live inside it, so the repository root never keeps a
+# worktree entry and a partially created setup is removed the same way. The temporary path is
+# resolved before this function is installed as a trap.
 cleanup() {
-    if [ -n "$ACCEPTANCE_LEFT" ] && [ -d "$ACCEPTANCE_LEFT" ]; then
-        /usr/bin/git -C "$ACCEPTANCE_ROOT" worktree remove --force "$ACCEPTANCE_LEFT" >/dev/null 2>&1 || :
-    fi
-    if [ -n "$ACCEPTANCE_RIGHT" ] && [ -d "$ACCEPTANCE_RIGHT" ]; then
-        /usr/bin/git -C "$ACCEPTANCE_ROOT" worktree remove --force "$ACCEPTANCE_RIGHT" >/dev/null 2>&1 || :
-    fi
     if [ -n "$ACCEPTANCE_TMP" ] && [ -d "$ACCEPTANCE_TMP" ]; then
         rm -rf -- "$ACCEPTANCE_TMP"
     fi
@@ -366,9 +361,15 @@ fi
 ACCEPTANCE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/agent-ide-acceptance.XXXXXX")
 ACCEPTANCE_LEFT="$ACCEPTANCE_TMP/left"
 ACCEPTANCE_RIGHT="$ACCEPTANCE_TMP/right"
+ACCEPTANCE_REPO="$ACCEPTANCE_TMP/repo"
 trap cleanup EXIT HUP INT TERM
-/usr/bin/git -C "$ACCEPTANCE_ROOT" worktree add --quiet --detach "$ACCEPTANCE_LEFT" "$ACCEPTANCE_REVISION"
-/usr/bin/git -C "$ACCEPTANCE_ROOT" worktree add --quiet --detach "$ACCEPTANCE_RIGHT" "$ACCEPTANCE_REVISION"
+# The fixture worktrees belong to a private clone, not to the checkout under test: the managed
+# Claude daemon rendezvous is keyed by the git common directory, so worktrees of the operator's
+# repository would attach to a live session's already-running (possibly older) daemon instead of
+# starting the candidate's own.
+/usr/bin/git clone --quiet --shared --no-checkout "$ACCEPTANCE_ROOT" "$ACCEPTANCE_REPO"
+/usr/bin/git -C "$ACCEPTANCE_REPO" worktree add --quiet --detach "$ACCEPTANCE_LEFT" "$ACCEPTANCE_REVISION"
+/usr/bin/git -C "$ACCEPTANCE_REPO" worktree add --quiet --detach "$ACCEPTANCE_RIGHT" "$ACCEPTANCE_REVISION"
 create_fixture "$ACCEPTANCE_LEFT" left
 create_fixture "$ACCEPTANCE_RIGHT" right
 [ "$(/usr/bin/git -C "$ACCEPTANCE_LEFT" rev-parse HEAD)" != "$(/usr/bin/git -C "$ACCEPTANCE_RIGHT" rev-parse HEAD)" ]

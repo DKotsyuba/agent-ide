@@ -93,8 +93,20 @@ fn runner_covers_all_cells_without_embedding_private_run_identifiers() {
     assert!(runner.contains("ACCEPTANCE_GO_VERSION=not_tested"));
     assert!(runner.contains("ACCEPTANCE_GOPLS_VERSION=not_tested"));
     assert!(!runner.contains("AGENT_IDE_GO"));
-    assert!(runner.contains("worktree add --quiet --detach \"$ACCEPTANCE_LEFT\""));
-    assert!(runner.contains("worktree add --quiet --detach \"$ACCEPTANCE_RIGHT\""));
+    // The fixture worktrees come from a private clone, so the managed Claude rendezvous (keyed by
+    // the git common directory) never attaches to a live session's daemon.
+    assert!(runner.contains(
+        "git clone --quiet --shared --no-checkout \"$ACCEPTANCE_ROOT\" \"$ACCEPTANCE_REPO\""
+    ));
+    assert!(
+        runner
+            .contains("-C \"$ACCEPTANCE_REPO\" worktree add --quiet --detach \"$ACCEPTANCE_LEFT\"")
+    );
+    assert!(
+        runner.contains(
+            "-C \"$ACCEPTANCE_REPO\" worktree add --quiet --detach \"$ACCEPTANCE_RIGHT\""
+        )
+    );
     assert!(runner.contains("ACCEPTANCE_MAX_EVIDENCE_BYTES=16384"));
     for forbidden in ["run_id", "session_id", "thread_id", "transcript"] {
         assert!(!runner.contains(forbidden));
