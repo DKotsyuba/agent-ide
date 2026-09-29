@@ -5134,7 +5134,9 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
 
     let mut diff_ref = String::new();
     for mode in ["head", "staged", "unstaged"] {
-        let diff = actor.call(&fixture, "ide.diff", json!({"mode":mode})).await;
+        let diff = actor
+            .call(&fixture, "ide.diff", json!({"mode":mode,"provenance":true}))
+            .await;
         let diff = actor.settle(&fixture, diff).await;
         assert_eq!(diff["kind"], "diff", "{diff}");
         let text = diff["text"].as_str().unwrap();
@@ -5306,7 +5308,9 @@ async fn configured_product_later_binding_diffs_path_edited_under_earlier_grant(
         second_epoch > first_epoch,
         "{first_epoch} -> {second_epoch}"
     );
-    let diff = second.call(&fixture, "ide.diff", json!({})).await;
+    let diff = second
+        .call(&fixture, "ide.diff", json!({"provenance":true}))
+        .await;
     let diff = second.settle(&fixture, diff).await;
     assert_eq!(diff["kind"], "diff", "{diff}");
     let text = diff["text"].as_str().unwrap();
@@ -5381,12 +5385,159 @@ async fn configured_product_clean_tree_diff_completes_over_large_metadata_and_ig
         )
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
-    let diff = actor.call(&fixture, "ide.diff", json!({})).await;
+    let diff = actor
+        .call(&fixture, "ide.diff", json!({"provenance":true}))
+        .await;
     let diff = actor.settle(&fixture, diff).await;
     assert_eq!(diff["kind"], "diff", "{diff}");
     let text = diff["text"].as_str().unwrap();
     assert!(text.contains("tracked: 0; untracked: 0"), "{text}");
     assert!(!text.contains("untracked_path"), "{text}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// The default `ide.diff` reply is the compact §2.7 form: one summary line with the mode, file
+/// count and add/remove totals, `file:`/hunk lines, and no hash-bearing or bookkeeping field —
+/// never the 17-line provenance header (W4/W9).
+#[tokio::test]
+async fn diff_default_reply_is_compact_and_hash_free() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(fixture.root.join("a.txt"), "line1\n").unwrap();
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "compact baseline"]);
+    std::fs::write(fixture.root.join("a.txt"), "line1\nline2\n").unwrap();
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "diff-compact").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"diff-compact"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let diff = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let diff = actor.settle(&fixture, diff).await;
+    assert_eq!(diff["kind"], "diff", "{diff}");
+    let text = diff["text"].as_str().unwrap();
+    assert_eq!(
+        text,
+        "diff (head): 1 files, +1 \u{2212}0\nfile: \"a.txt\"\n@@ -1 +1,2 @@\n line1\n+line2\n",
+        "{text}"
+    );
+    for field in [
+        "authority_epoch",
+        "worktree_id",
+        "worktree_incarnation",
+        "operation_reference",
+        "capture_generation",
+        "comparison_left",
+        "comparison_right",
+        "baseline_reference",
+        "baseline_coverage",
+        "baseline_window",
+        "tracked_path",
+        "state:",
+        "coverage:",
+        "freshness:",
+    ] {
+        assert!(
+            !text.contains(field),
+            "{field} leaked into the compact reply: {text}"
+        );
+    }
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// `provenance: true` returns today's exact hash-bearing header instead of the compact default,
+/// for the same underlying capture (W9).
+#[tokio::test]
+async fn diff_provenance_flag_returns_the_exact_header() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(fixture.root.join("a.txt"), "line1\n").unwrap();
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "provenance baseline"]);
+    std::fs::write(fixture.root.join("a.txt"), "line1\nline2\n").unwrap();
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "diff-provenance").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"diff-provenance"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let diff = actor
+        .call(
+            &fixture,
+            "ide.diff",
+            json!({"mode":"head","provenance":true}),
+        )
+        .await;
+    let diff = actor.settle(&fixture, diff).await;
+    assert_eq!(diff["kind"], "diff", "{diff}");
+    let text = diff["text"].as_str().unwrap();
+    assert!(text.contains("mode: Head"), "{text}");
+    assert!(text.contains("state: Ready"), "{text}");
+    assert!(text.contains("coverage: Complete"), "{text}");
+    assert!(!text.contains("authority_epoch: 0"), "{text}");
+    assert!(!text.contains("worktree_id: \n"), "{text}");
+    assert_eq!(text.matches("comparison_left: ").count(), 1);
+    assert!(text.contains("tracked_path: \"a.txt\""), "{text}");
+    assert!(
+        text.contains("file: \"a.txt\"\n@@ -1 +1,2 @@\n line1\n+line2\n"),
+        "{text}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// An untracked symlink to a directory outside the worktree does not refuse the whole diff: the
+/// entry stays a listed name — never read, its target never disclosed — and the diff completes.
+#[tokio::test]
+async fn diff_with_an_untracked_symlink_lists_it_and_completes() {
+    let fixture = ProductFixture::new(json!([]));
+    std::os::unix::fs::symlink(
+        fixture.base.join("outside-node-modules"),
+        fixture.root.join("node_modules"),
+    )
+    .unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "symlink-diff").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"symlink-diff"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let diff = actor
+        .call(&fixture, "ide.diff", json!({"mode":"unstaged"}))
+        .await;
+    let diff = actor.settle(&fixture, diff).await;
+    assert_eq!(diff["kind"], "diff", "{diff}");
+    let text = diff["text"].as_str().unwrap();
+    assert!(
+        text.contains("node_modules") && !text.contains("outside-node-modules"),
+        "the entry is listed by name only, its target never disclosed: {text}"
+    );
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
     actor.mcp.close().await;
@@ -10099,8 +10250,14 @@ async fn diff_pagination_delivers_every_whole_hunk_once_with_truthful_freshness(
     // Close the gate only after activation, so the snapshot Git of the diff below blocks and its
     // first reply is forced to be pending rather than an already composed page.
     std::fs::write(&gate, b"closed").unwrap();
+    // `provenance: true` keeps this test on the exact hash-bearing header it exercises below;
+    // the compact default is covered by its own `diff_default_reply_is_compact_and_hash_free`.
     let first_call = actor
-        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .call(
+            &fixture,
+            "ide.diff",
+            json!({"mode":"head","provenance":true}),
+        )
         .await;
     assert_eq!(first_call["state"], "pending", "{first_call}");
     let reference = first_call["detail_ref"].as_str().unwrap().to_owned();
@@ -10174,7 +10331,11 @@ async fn diff_pagination_delivers_every_whole_hunk_once_with_truthful_freshness(
     // A retained page is an immutable capture: an out-of-band edit with no native hook must make a
     // later retrieval fail closed instead of delivering evidence presented as current.
     let reopened = actor
-        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .call(
+            &fixture,
+            "ide.diff",
+            json!({"mode":"head","provenance":true}),
+        )
         .await;
     let reopened = actor.settle(&fixture, reopened).await;
     assert_eq!(reopened["kind"], "diff", "{reopened}");
@@ -10202,9 +10363,11 @@ async fn diff_pagination_delivers_every_whole_hunk_once_with_truthful_freshness(
         "{after_edit_retry}"
     );
 
-    // The production snapshot runner correlates each captured path with its durable observation:
-    // a registered path edited without any reconciliation must fail the capture rather than being
-    // silently captured as if the recorded revision still described it.
+    // The production snapshot runner correlates each captured path with its durable observation.
+    // A registered path edited without any reconciliation no longer fails the whole call (W4): the
+    // single-pass plain `git diff` fallback answers instead, explicitly marked as unable to prove
+    // exactness — so it is never silently captured as if the stale recorded revision still
+    // described it.
     let observed = actor
         .call(&fixture, "ide.context", json!({"path":"tracked.txt"}))
         .await;
@@ -10215,8 +10378,13 @@ async fn diff_pagination_delivers_every_whole_hunk_once_with_truthful_freshness(
         .call(&fixture, "ide.diff", json!({"mode":"head"}))
         .await;
     let mismatched = actor.settle(&fixture, mismatched).await;
-    assert_eq!(mismatched["state"], "error", "{mismatched}");
-    assert_eq!(mismatched["code"], "source_unavailable", "{mismatched}");
+    assert_eq!(mismatched["kind"], "diff", "{mismatched}");
+    assert!(
+        mismatched["text"].as_str().unwrap().contains(
+            "exact capture unavailable: snapshot unstable or a file changed since it was observed"
+        ),
+        "{mismatched}"
+    );
 
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
@@ -10293,7 +10461,11 @@ async fn codex_diff_large_repository_is_empty_then_changed_then_explicitly_cappe
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     let clean = actor
-        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .call(
+            &fixture,
+            "ide.diff",
+            json!({"mode":"head","provenance":true}),
+        )
         .await;
     let clean = actor.settle(&fixture, clean).await;
     assert_eq!(clean["kind"], "diff", "{clean}");
@@ -10630,8 +10802,14 @@ async fn claude_diff_pagination_delivers_every_hunk_across_repeated_inspect() {
     let (started, _) = actor.settle_claude(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
 
+    // `provenance: true` keeps this test on the exact header it inspects via `page_field` below;
+    // the compact default is covered by its own `diff_default_reply_is_compact_and_hash_free`.
     let first_call = actor
-        .call_claude(&fixture, "ide.diff", json!({"mode":"head"}))
+        .call_claude(
+            &fixture,
+            "ide.diff",
+            json!({"mode":"head","provenance":true}),
+        )
         .await;
     let (page1, _) = actor.settle_claude(&fixture, first_call).await;
     assert_eq!(page1["kind"], "diff", "{page1}");
@@ -11111,7 +11289,9 @@ async fn claude_later_binding_diffs_path_edited_under_earlier_grant() {
         second_epoch > first_epoch,
         "{first_epoch} -> {second_epoch}"
     );
-    let pending = second.call_claude(&fixture, "ide.diff", json!({})).await;
+    let pending = second
+        .call_claude(&fixture, "ide.diff", json!({"provenance":true}))
+        .await;
     let (diff, _) = second.settle_claude(&fixture, pending).await;
     assert_eq!(diff["kind"], "diff", "{diff}");
     let text = diff["text"].as_str().unwrap();
@@ -11237,11 +11417,23 @@ async fn configured_product_claude_returns_context_diff_and_feedback() {
     );
     assert!(feedback.is_empty());
 
+    // `provenance: true` keeps this test on the exact header carrying `baseline_coverage`,
+    // `baseline_window` and `tracked_path`; the compact default is covered by its own
+    // `diff_default_reply_is_compact_and_hash_free`.
     let pending = actor
-        .call_claude(&fixture, "ide.diff", json!({"mode":"head"}))
+        .call_claude(
+            &fixture,
+            "ide.diff",
+            json!({"mode":"head","provenance":true}),
+        )
         .await;
     let (diff, _) = actor
-        .settle_claude_via(&fixture, pending, "ide.diff", json!({"mode":"head"}))
+        .settle_claude_via(
+            &fixture,
+            pending,
+            "ide.diff",
+            json!({"mode":"head","provenance":true}),
+        )
         .await;
     assert_eq!(diff["kind"], "diff", "{diff}");
     let diff_text = diff["text"].as_str().unwrap();

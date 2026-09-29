@@ -357,6 +357,20 @@ fn context_paths_offsets_and_diff_modes_are_closed() {
     for mode in [json!("HEAD~1"), json!("arbitrary"), json!(null)] {
         assert!(validate_call(AssistanceTool::Diff, json!({"mode":mode})).is_err());
     }
+    // `provenance` defaults to false (the compact reply) and only accepts a boolean.
+    assert_eq!(
+        validate_call(AssistanceTool::Diff, json!({}))
+            .unwrap()
+            .parameters()["provenance"],
+        false
+    );
+    assert_eq!(
+        validate_call(AssistanceTool::Diff, json!({"provenance":true}))
+            .unwrap()
+            .parameters()["provenance"],
+        true
+    );
+    assert!(validate_call(AssistanceTool::Diff, json!({"provenance":"true"})).is_err());
 }
 
 /// Accepts the bounded problems arguments without a path and keeps every v0.2 context rejection

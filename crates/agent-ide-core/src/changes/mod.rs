@@ -1,6 +1,6 @@
 //! Bounded diff composition for Workspace raw Git evidence in Changes v0.1.
 
-use std::path::PathBuf;
+use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::PathBuf};
 
 use crate::workspace::git::{
     BaselineCoverage, BaselineWindow, DiffMode, GitComparison, GitScope, GitStatus, PathStatus,
@@ -346,6 +346,10 @@ pub struct DiffResult {
     overflow_hunks: usize,
     /// Sum of bytes in omitted complete hunks.
     overflow_bytes: usize,
+    /// Total added lines across every hunk in the whole diff, independent of pagination.
+    additions: usize,
+    /// Total removed lines across every hunk in the whole diff, independent of pagination.
+    deletions: usize,
     /// Selected tracked paths, including additions/deletions and mode-only changes with no hunks.
     tracked: Vec<PathStatus>,
     /// Separately listed raw untracked paths, never treated as baseline content.
@@ -441,6 +445,16 @@ impl DiffResult {
         self.overflow_bytes
     }
 
+    /// Returns total added lines across the whole diff, independent of pagination.
+    pub const fn additions(&self) -> usize {
+        self.additions
+    }
+
+    /// Returns total removed lines across the whole diff, independent of pagination.
+    pub const fn deletions(&self) -> usize {
+        self.deletions
+    }
+
     /// Returns owner-scoped cursor and operation reference for bounded detail expansion.
     pub fn detail_cursor(&self) -> Option<&DiffDetailCursor> {
         self.detail_cursor.as_ref()
@@ -472,6 +486,58 @@ pub fn expand_diff(
     budget: DiffSelectionBudget,
 ) -> DiffResult {
     compose_diff_at(expected_scope, comparison, evidence, Some(cursor), budget)
+}
+
+/// Composes a degraded, single-pass `DiffResult` directly from plain `git diff` stdout, used only
+/// when the exact two-pass snapshot capture proved unstable. No comparison identities and no
+/// untracked or conflict data — a plain `git diff` reports neither — so `freshness` stays
+/// [`DiffFreshness::Unknown`] and `provenance` stays empty; the caller marks the rendered text as
+/// a plain-diff fallback and never offers `ide.inspect` continuation for it.
+pub fn compose_plain_diff(
+    expected_scope: &GitScope,
+    stdout: &[u8],
+    budget: DiffSelectionBudget,
+) -> DiffResult {
+    let parsed = parse_plain_diff(stdout);
+    let (selected_hunks, overflow_hunks, overflow_bytes, _cursor) =
+        select_hunks(parsed.hunks, budget);
+    let state = if parsed.malformed {
+        DiffResultState::Incomplete
+    } else {
+        DiffResultState::Ready
+    };
+    let coverage = if parsed.malformed || overflow_hunks > 0 {
+        DiffCoverage::Partial
+    } else {
+        DiffCoverage::Complete
+    };
+    DiffResult {
+        state,
+        freshness: DiffFreshness::Unknown,
+        coverage,
+        scope_mode: expected_scope.mode(),
+        authority_epoch: expected_scope.authority_epoch(),
+        worktree_id: expected_scope.worktree().id().to_owned(),
+        identities: DiffComparisonIdentities::new(&[], &[]),
+        status_counts: DiffStatusCounts {
+            tracked: parsed.files,
+            conflicted: 0,
+            untracked: 0,
+            ignored: 0,
+        },
+        selected_hunks,
+        truncated_output: false,
+        overflow_hunks,
+        overflow_bytes,
+        additions: parsed.additions,
+        deletions: parsed.deletions,
+        tracked: Vec::new(),
+        untracked: Vec::new(),
+        conflicts: Vec::new(),
+        ignored: Vec::new(),
+        detail_cursor: None,
+        provenance: DiffProvenance::new(None, None, None, None, None, None),
+    }
 }
 
 /// Applies common scope/cursor validation before parsing or selecting any hunk payload.
@@ -521,6 +587,8 @@ fn compose_diff_at(
             truncated_output: false,
             overflow_hunks: 0,
             overflow_bytes: 0,
+            additions: 0,
+            deletions: 0,
             tracked: Vec::new(),
             untracked: Vec::new(),
             conflicts: Vec::new(),
@@ -597,6 +665,8 @@ fn compose_diff_at(
         truncated_output,
         overflow_hunks,
         overflow_bytes,
+        additions: parsed.additions,
+        deletions: parsed.deletions,
         tracked: evidence
             .paths()
             .iter()
@@ -687,6 +757,27 @@ struct ParsedDiff {
     malformed: bool,
     /// Whether parser saw one or more binary summary lines.
     has_binary: bool,
+    /// Total added lines across every parsed hunk, independent of later budget selection.
+    additions: usize,
+    /// Total removed lines across every parsed hunk, independent of later budget selection.
+    deletions: usize,
+}
+
+/// Counts `+`/`-` content lines in one hunk body (every line after its `@@ … @@` header).
+fn count_hunk_delta(body: &[u8]) -> (usize, usize) {
+    let mut additions = 0;
+    let mut deletions = 0;
+    let mut cursor = 0;
+    while cursor < body.len() {
+        let end = next_line_end(body, cursor);
+        match body[cursor..end].first() {
+            Some(b'+') => additions += 1,
+            Some(b'-') => deletions += 1,
+            _ => {}
+        }
+        cursor = end;
+    }
+    (additions, deletions)
 }
 
 /// Parses each bounded patch with its explicit path; headers are transport details, never identities.
@@ -695,6 +786,8 @@ fn parse_snapshot_hunks(snapshot: &GitSnapshot) -> ParsedDiff {
         hunks: Vec::new(),
         malformed: false,
         has_binary: false,
+        additions: 0,
+        deletions: 0,
     };
     for evidence in snapshot.paths() {
         let stdout = evidence.patch();
@@ -725,6 +818,9 @@ fn parse_snapshot_hunks(snapshot: &GitSnapshot) -> ParsedDiff {
                     }
                     next = next_end;
                 }
+                let (additions, deletions) = count_hunk_delta(&stdout[end..next]);
+                parsed.additions += additions;
+                parsed.deletions += deletions;
                 parsed.hunks.push(RawHunk {
                     original_index: parsed.hunks.len(),
                     path: path.clone(),
@@ -748,6 +844,104 @@ fn parse_snapshot_hunks(snapshot: &GitSnapshot) -> ParsedDiff {
         }
     }
     parsed
+}
+
+/// Parsed raw multi-file plain `git diff` stdout: unlike [`parse_snapshot_hunks`], no per-path
+/// Workspace evidence exists yet, so the path for every hunk comes from its own `diff --git`
+/// header line.
+struct ParsedPlainDiff {
+    /// All full hunks successfully parsed from stdout.
+    hunks: Vec<RawHunk>,
+    /// Number of distinct files named by a `diff --git` header, independent of hunk selection.
+    files: usize,
+    /// Total added lines across every hunk.
+    additions: usize,
+    /// Total removed lines across every hunk.
+    deletions: usize,
+    /// Whether the parser saw a hunk body line with an unexpected first byte.
+    malformed: bool,
+}
+
+/// Splits raw single-pass `git diff` stdout into hunks attributed by their own `diff --git`
+/// header, the only per-file identity this degraded capture has. Lines outside a hunk body are
+/// otherwise skipped without being flagged malformed: this parser is deliberately more permissive
+/// than [`parse_snapshot_hunks`], since it never has the two-pass capture's completeness proof.
+fn parse_plain_diff(stdout: &[u8]) -> ParsedPlainDiff {
+    let mut parsed = ParsedPlainDiff {
+        hunks: Vec::new(),
+        files: 0,
+        additions: 0,
+        deletions: 0,
+        malformed: false,
+    };
+    let mut current: Option<PathBuf> = None;
+    let mut cursor = 0;
+    while cursor < stdout.len() {
+        let end = next_line_end(stdout, cursor);
+        let line = &stdout[cursor..end];
+        if let Some(path) = parse_diff_git_header(line) {
+            current = Some(path);
+            parsed.files += 1;
+            cursor = end;
+        } else if line.starts_with(b"@@ ") {
+            let Some(path) = current.clone() else {
+                parsed.malformed = true;
+                cursor = end;
+                continue;
+            };
+            let start = cursor;
+            let mut next = end;
+            while next < stdout.len() {
+                let next_end = next_line_end(stdout, next);
+                let candidate = &stdout[next..next_end];
+                if candidate.starts_with(b"@@ ") || candidate.starts_with(b"diff --git ") {
+                    break;
+                }
+                if !matches!(candidate.first(), Some(b'+' | b'-' | b' ' | b'\\')) {
+                    parsed.malformed = true;
+                }
+                next = next_end;
+            }
+            let (additions, deletions) = count_hunk_delta(&stdout[end..next]);
+            parsed.additions += additions;
+            parsed.deletions += deletions;
+            parsed.hunks.push(RawHunk {
+                original_index: parsed.hunks.len(),
+                path,
+                patch: stdout[start..next].to_vec(),
+                binary: false,
+            });
+            cursor = next;
+        } else if line.starts_with(b"Binary files ") || line.starts_with(b"Binary file ") {
+            if let Some(path) = current.clone() {
+                parsed.hunks.push(RawHunk {
+                    original_index: parsed.hunks.len(),
+                    path,
+                    patch: Vec::new(),
+                    binary: true,
+                });
+            }
+            cursor = end;
+        } else {
+            cursor = end;
+        }
+    }
+    parsed
+}
+
+/// Extracts the current (`b/`) path from one `diff --git a/<old> b/<new>` header line, splitting
+/// at the first ` b/` boundary. A path containing that exact four-byte sequence is misattributed;
+/// this is an accepted simplification of a degraded fallback that never claims exactness.
+fn parse_diff_git_header(line: &[u8]) -> Option<PathBuf> {
+    let rest = line.strip_prefix(b"diff --git a/")?;
+    let marker = b" b/";
+    let position = rest
+        .windows(marker.len())
+        .position(|window| window == marker)?;
+    let path = rest[position + marker.len()..]
+        .strip_suffix(b"\n")
+        .unwrap_or(&rest[position + marker.len()..]);
+    Some(PathBuf::from(OsStr::from_bytes(path)))
 }
 
 /// Returns the byte index after the next line terminator.
