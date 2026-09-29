@@ -411,7 +411,7 @@ verify_l5() {
     require_record_text l5 "pub fn get" A_L5_OUTLINE_GET
     require_record_text l5 "symbol: get — method" A_L5_SYMBOL_HEADING
     require_record_text l5 "acceptance-fixture/tests/counter.rs" A_L5_SYMBOL_USAGE
-    require_record_text l5 "edit: replaced" A_L5_EDIT_REPLACED
+    require_record_text l5 "edit: inserted" A_L5_EDIT_INSERTED
     require_record_text l5 "pub fn doubled" A_L5_READ_DOUBLED
     verify_symbol_tools_left_clean "$LEFT" A_L5_LEFT_CLEAN \
         || fail A_L5_LEFT_CLEAN "left fixture crate not clean or not compiling after l5"

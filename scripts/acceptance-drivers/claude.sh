@@ -320,7 +320,7 @@ verify_l5() {
     require_transcript_text "$t" "pub fn get" A_L5_OUTLINE_GET || return 1
     require_transcript_text "$t" "symbol: get — method" A_L5_SYMBOL_HEADING || return 1
     require_transcript_text "$t" "acceptance-fixture/tests/counter.rs" A_L5_SYMBOL_USAGE || return 1
-    require_transcript_text "$t" "edit: replaced" A_L5_EDIT_REPLACED || return 1
+    require_transcript_text "$t" "edit: inserted" A_L5_EDIT_INSERTED || return 1
     require_transcript_text "$t" "diagnostics:" A_L5_EDIT_DIAGNOSTICS || return 1
     require_transcript_text "$t" "pub fn doubled" A_L5_READ_DOUBLED || return 1
     verify_symbol_tools_left_clean "$LEFT" A_L5_LEFT_CLEAN || return 1
