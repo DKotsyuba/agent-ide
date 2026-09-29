@@ -1,0 +1,492 @@
+[
+ {
+  "name": "Host",
+  "kind": 23,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 0,
+    "character": 0
+   },
+   "end": {
+    "line": 0,
+    "character": 16
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 0,
+    "character": 11
+   },
+   "end": {
+    "line": 0,
+    "character": 15
+   }
+  }
+ },
+ {
+  "name": "host",
+  "detail": "fn(flag: bool) -> usize",
+  "kind": 12,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 2,
+    "character": 0
+   },
+   "end": {
+    "line": 29,
+    "character": 1
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 2,
+    "character": 7
+   },
+   "end": {
+    "line": 2,
+    "character": 11
+   }
+  },
+  "children": [
+   {
+    "name": "in_arm",
+    "detail": "fn()",
+    "kind": 12,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 5,
+      "character": 12
+     },
+     "end": {
+      "line": 5,
+      "character": 26
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 5,
+      "character": 15
+     },
+     "end": {
+      "line": 5,
+      "character": 21
+     }
+    }
+   },
+   {
+    "name": "InAsync",
+    "kind": 23,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 11,
+      "character": 8
+     },
+     "end": {
+      "line": 11,
+      "character": 23
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 11,
+      "character": 15
+     },
+     "end": {
+      "line": 11,
+      "character": 22
+     }
+    }
+   },
+   {
+    "name": "N",
+    "detail": "usize",
+    "kind": 14,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 14,
+      "character": 8
+     },
+     "end": {
+      "line": 14,
+      "character": 27
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 14,
+      "character": 14
+     },
+     "end": {
+      "line": 14,
+      "character": 15
+     }
+    }
+   },
+   {
+    "name": "in_unsafe",
+    "detail": "fn()",
+    "kind": 12,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 18,
+      "character": 8
+     },
+     "end": {
+      "line": 18,
+      "character": 25
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 18,
+      "character": 11
+     },
+     "end": {
+      "line": 18,
+      "character": 20
+     }
+    }
+   },
+   {
+    "name": "InLoop",
+    "kind": 10,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 21,
+      "character": 8
+     },
+     "end": {
+      "line": 21,
+      "character": 22
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 21,
+      "character": 13
+     },
+     "end": {
+      "line": 21,
+      "character": 19
+     }
+    }
+   },
+   {
+    "name": "IN_CLOSURE",
+    "detail": "u8",
+    "kind": 14,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 25,
+      "character": 8
+     },
+     "end": {
+      "line": 25,
+      "character": 34
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 25,
+      "character": 15
+     },
+     "end": {
+      "line": 25,
+      "character": 25
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "impl Host",
+  "kind": 19,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 31,
+    "character": 0
+   },
+   "end": {
+    "line": 37,
+    "character": 1
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 31,
+    "character": 5
+   },
+   "end": {
+    "line": 31,
+    "character": 9
+   }
+  },
+  "children": [
+   {
+    "name": "hidden_in_impl",
+    "detail": "fn()",
+    "kind": 12,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 33,
+      "character": 8
+     },
+     "end": {
+      "line": 33,
+      "character": 30
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 33,
+      "character": 11
+     },
+     "end": {
+      "line": 33,
+      "character": 25
+     }
+    }
+   },
+   {
+    "name": "visible",
+    "detail": "fn()",
+    "kind": 12,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 36,
+      "character": 4
+     },
+     "end": {
+      "line": 36,
+      "character": 23
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 36,
+      "character": 11
+     },
+     "end": {
+      "line": 36,
+      "character": 18
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "Sized2",
+  "kind": 23,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 39,
+    "character": 0
+   },
+   "end": {
+    "line": 46,
+    "character": 1
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 39,
+    "character": 11
+   },
+   "end": {
+    "line": 39,
+    "character": 17
+   }
+  },
+  "children": [
+   {
+    "name": "field",
+    "detail": "[u8; { fn in_field_type() -> usize { 1 } in_field_type() }]",
+    "kind": 8,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 40,
+      "character": 4
+     },
+     "end": {
+      "line": 45,
+      "character": 6
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 40,
+      "character": 8
+     },
+     "end": {
+      "line": 40,
+      "character": 13
+     }
+    },
+    "children": [
+     {
+      "name": "in_field_type",
+      "detail": "fn() -> usize",
+      "kind": 12,
+      "tags": [],
+      "deprecated": false,
+      "range": {
+       "start": {
+        "line": 41,
+        "character": 8
+       },
+       "end": {
+        "line": 43,
+        "character": 9
+       }
+      },
+      "selectionRange": {
+       "start": {
+        "line": 41,
+        "character": 11
+       },
+       "end": {
+        "line": 41,
+        "character": 24
+       }
+      }
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "name": "Discriminants",
+  "kind": 10,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 48,
+    "character": 0
+   },
+   "end": {
+    "line": 54,
+    "character": 1
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 48,
+    "character": 9
+   },
+   "end": {
+    "line": 48,
+    "character": 22
+   }
+  },
+  "children": [
+   {
+    "name": "First",
+    "kind": 22,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 49,
+      "character": 4
+     },
+     "end": {
+      "line": 52,
+      "character": 5
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 49,
+      "character": 4
+     },
+     "end": {
+      "line": 49,
+      "character": 9
+     }
+    },
+    "children": [
+     {
+      "name": "BASE",
+      "detail": "isize",
+      "kind": 14,
+      "tags": [],
+      "deprecated": false,
+      "range": {
+       "start": {
+        "line": 50,
+        "character": 8
+       },
+       "end": {
+        "line": 50,
+        "character": 30
+       }
+      },
+      "selectionRange": {
+       "start": {
+        "line": 50,
+        "character": 14
+       },
+       "end": {
+        "line": 50,
+        "character": 18
+       }
+      }
+     }
+    ]
+   },
+   {
+    "name": "Second",
+    "kind": 22,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 53,
+      "character": 4
+     },
+     "end": {
+      "line": 53,
+      "character": 10
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 53,
+      "character": 4
+     },
+     "end": {
+      "line": 53,
+      "character": 10
+     }
+    }
+   }
+  ]
+ }
+]

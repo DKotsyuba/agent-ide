@@ -1,1234 +1,712 @@
-//! Lexical outline of one Rust source file: the addresses, ranges, kinds, signatures and docs the
-//! server path ([`crate::support::RustSupport::normalize`]) derives from rust-analyzer, computed
-//! from the text alone so symbol-addressed tools answer while the analyzer is still loading.
+//! Lexical outline of one Rust source file: the outline the server path
+//! ([`crate::support::RustSupport::normalize`]) makes of rust-analyzer's document symbols,
+//! computed from the text alone so symbol-addressed tools answer while the analyzer is still
+//! loading.
 //!
-//! The scanner walks the code-only form of the file ([`crate::module_graph::blanked_code`]:
-//! comments and string or char literal contents blanked, offsets and line numbers unchanged), so
-//! braces, `;` and keywords inside strings or comments are never syntax. Items nest exactly as
-//! rust-analyzer reports them: struct fields and enum variants are children, functions inside an
-//! impl or trait are methods, nested items inside a function body or a named `const`/`static`
-//! initializer are its children, and items inside a `const _ = { … }` initializer are hoisted to
-//! the enclosing level (which is what the server does with the underscore constant itself
-//! absent).
+//! The text is parsed by `syn`, a complete Rust parser, and every symbol rust-analyzer's file
+//! structure reports is rebuilt as the `DocumentSymbol` the server would send — name, LSP kind,
+//! node range, selection range and children in source order — then handed to the same
+//! `normalize` that converts the server's answer, so naming, kind refinement, test detection,
+//! headers, signatures and docs are one code path for both. The symbols rust-analyzer reports:
 //!
-//! Ranges start where rust-analyzer's item node starts: at the first outer attribute (found on
-//! the code-only form, so brackets inside attribute strings are not syntax), widened upward by
-//! the same `///`/attribute header rule the server path applies. rust-analyzer also attaches
-//! leading comments to the item node (a `//` or `/* */` line above it, a trailing comment on the
-//! line above, a `///` block across a blank line); the scanner does not reproduce that rule, so
-//! such a file is refused instead (the one exception is a `//!` inner doc line, which the server
-//! never attaches).
+//! * functions (methods when they take `self`), structs, unions, enums, their variants, named
+//!   fields, traits, modules, type aliases, constants, statics and `macro_rules!` definitions, at
+//!   any depth — inside function bodies, closures, blocks, initializers, types, impl and trait
+//!   bodies — each a child of the nearest enclosing symbol;
+//! * impl blocks, labelled `impl Type`, `impl Trait for Type` or `impl !Trait for Type` from the
+//!   verbatim source text of the trait path and the self type, selected at the self type;
+//! * no symbol for `const _`: the items inside its initializer belong to the enclosing symbol;
+//! * no symbol for macro invocations, `use` or `extern crate`, nor for items a macro would expand
+//!   to (document symbols are syntax only).
 //!
-//! Refusal over guessing: whatever the scanner cannot reproduce with the server's exact answer
-//! makes the whole outline `None` and the file keeps waiting for the server — unbalanced braces,
-//! an unrecognized token at item position, a macro invocation at item position (its body may
-//! expand to items the text does not show), an `extern { … }` block (the server reports the block
-//! as a symbol of its own), a `// region:` comment (the server reports it as a symbol), comment
-//! text on the nearest non-blank line above an item, a blank line inside an item's header, and
-//! two same-named same-kind siblings where either header carries a `cfg`/`cfg_attr` attribute
-//! (which branch is live is semantic). The corpus under `tests/fixtures/lexical` pins this
-//! against recorded rust-analyzer answers: every file there is either equal to the server
-//! path's outline or refused.
+//! A node range runs from the item's first outer attribute or doc comment (syn keeps doc
+//! comments as attributes, rust-analyzer as attached trivia) to its last token, so a field or a
+//! variant ends before its comma; the selection range is the name.
+//!
+//! Refusal over guessing: whatever the parse cannot reproduce with the server's exact answer
+//! makes the whole outline `None`, and the file keeps waiting for the server —
+//!
+//! * text syn does not parse: rust-analyzer recovers from a syntax error with a tree no parser
+//!   here reproduces; also a shebang line, syntax syn keeps only as verbatim tokens (unstable
+//!   forms, a macro 2.0 definition), a trait alias, and an `extern` block (the server reports
+//!   the block itself as a symbol);
+//! * nesting the recursive parser could not take within its stack ([`too_nested`]): brackets
+//!   deeper than [`MAX_DEPTH`] or an operator chain above [`MAX_NESTING`]; and more than
+//!   [`MAX_SYMBOLS`] symbols;
+//! * whitespace rustc does not accept in code (a no-break space, …), which the parser skips;
+//! * a `// region:` comment, which the server reports as a symbol;
+//! * comments rust-analyzer attaches to an item's node but a parser drops: comment text on the
+//!   nearest non-blank line above the item's first token (a `//!` inner doc line excepted, which
+//!   is never attached), or a blank line between the item's first attribute or doc comment and
+//!   its first token;
+//! * two same-named same-kind siblings where either carries a `cfg`/`cfg_attr` attribute.
+//!
+//! The corpus under `tests/fixtures/lexical` pins this against recorded rust-analyzer answers:
+//! every file there is either equal to the server path's outline or refused. The recordings come
+//! from the rust-analyzer build named in `tests/fixtures/lexical/VERSION`; after a rust-analyzer
+//! upgrade they are recorded again (`record.mjs`) and the corpus test decides whether the
+//! outline still agrees.
+//!
+//! The parse runs on a short-lived thread with a stack of its own ([`PARSE_STACK`]): how deep it
+//! may recurse does not depend on the caller's stack or the build profile, a parser panic refuses
+//! instead of unwinding into the caller, and `proc-macro2`'s thread-local span table (which keeps
+//! the text of every source parsed on a thread) is freed with the thread.
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use agent_ide_core::lang::brace::{
-    collapse_whitespace, declaration_line, line_at, signature, source_lines,
-};
-use agent_ide_core::lang::{LineRange, Outline, Symbol, SymbolKind, SymbolPath, line_count};
+use agent_ide_core::lang::brace::{line_at, source_lines};
+use agent_ide_core::lang::{LanguageSupport, Outline, Symbol, SymbolKind};
+use async_lsp::lsp_types as lsp;
+use proc_macro2::{Delimiter, LineColumn, Spacing, Span, TokenStream, TokenTree};
+use quote::ToTokens;
+use syn::visit::{self, Visit};
 
-use crate::LANGUAGE;
 use crate::module_graph::blanked_code;
-use crate::support::{attr_path, doc_of, header_start, impl_segment, is_cfg_test, is_test_attr};
+use crate::support::{RustSupport, attr_path};
 
-/// Item keywords the scanner understands; everything else at item position is a refusal.
-const ITEM_KEYWORDS: [&str; 13] = [
-    "fn",
-    "struct",
-    "enum",
-    "trait",
-    "impl",
-    "mod",
-    "const",
-    "static",
-    "type",
-    "union",
-    "macro_rules",
-    "use",
-    "extern",
-];
+/// Deepest `(…)`/`[…]`/`{…}` nesting the parser is given; deeper text is refused before the
+/// recursive-descent parser (and the recursive walk, conversion and drop after it) could exhaust
+/// its stack.
+const MAX_DEPTH: usize = 128;
 
-/// How the tokens after an item's modifiers continue: a block body, or a `;`-terminated leaf.
-enum Continuation {
-    /// The offset of the `{` that opens the body (not consumed).
-    Body(usize),
-    /// A `;` ended the item; its line, already consumed.
-    Semi(u32),
-    /// The text ended first; the scan is already marked uncertain.
-    Eof,
-}
+/// Largest nesting estimate ([`too_nested`]) the parser is given; far above hand-written code,
+/// far below what [`PARSE_STACK`] holds in an unoptimized build.
+const MAX_NESTING: usize = 1024;
 
-/// Builds the lexical outline of `source`, or `None` when it does not scan cleanly (see the
-/// module docs). Pure function of the text; no filesystem, server or subprocess.
+/// Stack of the parse thread, in bytes: address space reserved per outline, touched only as deep
+/// as the parse recurses.
+const PARSE_STACK: usize = 64 << 20;
+
+/// Most symbols one outline may carry; a larger file waits for the server.
+const MAX_SYMBOLS: usize = 20_000;
+
+/// Builds the lexical outline of `file` (the path the outline and its symbol paths carry) from
+/// its text `source`, or `None` when the text is refused (see the module docs). Pure function of
+/// the text: no filesystem, server or subprocess; it blocks the caller while one short-lived
+/// parse thread runs (about 50 ms for a 570 KB file in a release build).
 pub(crate) fn lexical_outline(file: &Path, source: &str) -> Option<Outline> {
-    // rust-analyzer reports every `// region: name` comment as a symbol of its own, which the
-    // code-only form cannot see; any mention refuses (a string that contains it too).
+    // rust-analyzer reports every `// region: name` comment as a symbol of its own, which a
+    // parser drops; any mention refuses (a string that contains it too).
     if source.contains("// region:") {
         return None;
     }
-    // Line starts in the same coordinate space as the scanner's cursor: character offsets,
-    // so a multi-byte character earlier in the file shifts no line number.
-    let mut line_starts = vec![0usize];
-    for (index, character) in source.chars().enumerate() {
-        if character == '\n' {
-            line_starts.push(index + 1);
-        }
+    let symbols = document_symbols(source)?;
+    let outline = RustSupport.normalize(file, source, symbols);
+    let lines = source_lines(source);
+    let mut duplicate = cfg_duplicate(&outline.symbols, &lines);
+    for symbol in &outline.symbols {
+        symbol.walk(&mut |symbol| duplicate |= cfg_duplicate(&symbol.children, &lines));
     }
-    let source_chars: Vec<char> = source.chars().collect();
-    let mut scanner = Scanner {
-        lines: source_lines(source),
-        text: blanked_code(&source_chars),
-        source: source_chars,
-        line_starts,
-        at: 0,
-        uncertain: false,
-    };
-    let root = SymbolPath::new(Some(file.to_path_buf()), Vec::new());
-    let symbols = scanner.scan_file(&root);
-    (!scanner.uncertain).then(|| Outline {
-        file: file.to_path_buf(),
-        language: LANGUAGE,
-        line_count: line_count(source),
-        symbols,
+    (!duplicate).then_some(outline)
+}
+
+/// rust-analyzer's `textDocument/documentSymbol` answer for `source` rebuilt from a `syn` parse,
+/// or `None` when the text is refused (see the module docs). Positions are 0-based lines and
+/// character columns; only the lines and the selection line are consumed downstream.
+///
+/// The parse runs on a thread of its own with a [`PARSE_STACK`]-byte stack, so how deep it may
+/// recurse does not depend on the caller's stack or on the build profile, and its thread-local
+/// span table dies with it. A thread that cannot be started, or a parser panic, refuses.
+fn document_symbols(source: &str) -> Option<Vec<lsp::DocumentSymbol>> {
+    let chars: Vec<char> = source.chars().collect();
+    let code = blanked_code(&chars);
+    // Whitespace the parser here skips (`char::is_whitespace`) but rustc and rust-analyzer do
+    // not (a no-break space, …) is an error token to the server, never a separator.
+    if code
+        .iter()
+        .any(|&character| character.is_whitespace() && !rust_whitespace(character))
+    {
+        return None;
+    }
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("rust-lexical-outline".to_owned())
+            .stack_size(PARSE_STACK)
+            .spawn_scoped(scope, || parsed_symbols(source, &chars, &code))
+            .ok()?
+            .join()
+            .ok()?
     })
 }
 
-/// One parsed item handed to [`Scanner::symbol`]: where it starts, how it is addressed, and
-/// where it ends.
-struct Parsed {
-    /// Cursor offset of the item's first outer attribute, or of `decl_at` when it has none:
-    /// where rust-analyzer's item node starts when no comment is attached to it.
-    first_at: usize,
-    /// Cursor offset of the item's first token after its attributes (visibility or keyword).
-    decl_at: usize,
-    /// Path segment: the item's name, or an impl's server-style header.
-    name: String,
-    /// Kind before test/method refinement.
-    kind: SymbolKind,
-    /// Line the item ends on.
-    end: u32,
-    /// Nested symbols.
-    children: Vec<Symbol>,
-}
-
-/// One pass over the blanked text. `at` is the cursor; every method that consumes tokens
-/// advances it, and anything unexpected sets [`Scanner::uncertain`].
-struct Scanner<'a> {
-    /// Real source lines, for headers, signatures and docs.
-    lines: Vec<&'a str>,
-    /// Code-only form of the source; offsets match the source exactly.
-    text: Vec<char>,
-    /// Real source characters (same offsets as `text`), for the comment text it blanks.
-    source: Vec<char>,
-    /// Offset of each line's first character (line 1 starts at 0).
-    line_starts: Vec<usize>,
-    /// Cursor.
-    at: usize,
-    /// Whether anything was seen that makes the outline a guess; the caller returns `None`.
-    uncertain: bool,
-}
-
-impl<'a> Scanner<'a> {
-    /// The 1-based line `at` sits on.
-    fn line_of(&self, at: usize) -> u32 {
-        self.line_starts.partition_point(|&start| start <= at) as u32
+/// The body of [`document_symbols`] on the parse thread: tokenizes `source` (whose characters
+/// are `chars` and code-only form `code`), refuses nesting the parser could not take within its
+/// stack ([`too_nested`]), parses and walks it.
+fn parsed_symbols(source: &str, chars: &[char], code: &[char]) -> Option<Vec<lsp::DocumentSymbol>> {
+    let tokens: TokenStream = source.parse().ok()?;
+    if too_nested(tokens.clone()) {
+        return None;
     }
-
-    /// The text between `from` (inclusive) and `to` (exclusive), whitespace collapsed.
-    fn word(&self, from: usize, to: usize) -> String {
-        collapse_whitespace(
-            &self.text[from.min(to)..to.min(self.text.len())]
-                .iter()
-                .collect::<String>(),
-        )
-    }
-
-    /// The code character under the cursor, `None` at the end of the text.
-    fn peek(&self) -> Option<char> {
-        self.text.get(self.at).copied()
-    }
-
-    /// The code character at offset `at`, `None` past the end of the text.
-    fn char_at(&self, at: usize) -> Option<char> {
-        self.text.get(at).copied()
-    }
-
-    /// The code character just before offset `at`, `None` at the start of the text.
-    fn char_before(&self, at: usize) -> Option<char> {
-        at.checked_sub(1).and_then(|at| self.char_at(at))
-    }
-
-    /// First offset at or after `at` that is not whitespace.
-    fn ws_end(&self, at: usize) -> usize {
-        let mut at = at;
-        while matches!(self.char_at(at), Some(' ' | '\n' | '\t' | '\r')) {
-            at += 1;
-        }
-        at
-    }
-
-    /// Moves the cursor past whitespace (blanked comments and literals included).
-    fn skip_ws(&mut self) {
-        self.at = self.ws_end(self.at);
-    }
-
-    /// Marks the scan uncertain.
-    fn refuse(&mut self) {
-        self.uncertain = true;
-    }
-
-    /// `(start, end)` of the identifier at `at` (a raw `r#ident` included), `None` otherwise.
-    fn ident_span(&self, at: usize) -> Option<(usize, usize)> {
-        let ident_char =
-            |character: Option<char>| character.is_some_and(|c| c.is_alphanumeric() || c == '_');
-        if !ident_char(self.char_at(at)) {
-            return None;
-        }
-        let start = at;
-        let mut end = at;
-        if self.char_at(end) == Some('r')
-            && self.char_at(end + 1) == Some('#')
-            && ident_char(self.char_at(end + 2))
-        {
-            end += 2;
-        }
-        while ident_char(self.char_at(end)) {
-            end += 1;
-        }
-        (end > start).then_some((start, end))
-    }
-
-    /// The identifier at the cursor, consumed, `None` when none starts there.
-    fn read_ident(&mut self) -> Option<String> {
-        let (start, end) = self.ident_span(self.at)?;
-        let word = self.word(start, end);
-        self.at = end;
-        Some(word)
-    }
-
-    /// Offset just past the balanced tree whose opener is at `at`, `None` when it never closes.
-    fn tree_end(&self, at: usize) -> Option<usize> {
-        let close = match self.char_at(at) {
-            Some('(') => ')',
-            Some('[') => ']',
-            Some('{') => '}',
-            _ => return None,
-        };
-        let open = self.text[at];
-        let mut depth = 0usize;
-        let mut at = at;
-        while at < self.text.len() {
-            if self.text[at] == open {
-                depth += 1;
-            } else if self.text[at] == close {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(at + 1);
-                }
-            }
-            at += 1;
-        }
-        None
-    }
-
-    /// Skips the balanced tree at the cursor and returns the offset of its closing delimiter; an
-    /// unterminated tree marks the scan uncertain and consumes the rest of the text.
-    fn skip_tree(&mut self) -> Option<usize> {
-        let Some(end) = self.tree_end(self.at) else {
-            self.refuse();
-            self.at = self.text.len();
-            return None;
-        };
-        let close = end - 1;
-        self.at = end;
-        Some(close)
-    }
-
-    /// Skips the outer (or, after `#!`, inner) attribute at the cursor. An outer attribute's
-    /// offset is recorded in `first` unless an earlier attribute of the same item already is, so
-    /// the item's range starts at its first attribute; an inner one records nothing.
-    fn skip_attribute(&mut self, first: &mut Option<usize>) {
-        if self.char_at(self.at + 1) == Some('!') && self.char_at(self.at + 2) == Some('[') {
-            self.at += 2;
-        } else if self.char_at(self.at + 1) == Some('[') {
-            first.get_or_insert(self.at);
-            self.at += 1;
-        } else {
-            self.refuse();
-            self.at += 1;
-            return;
-        }
-        self.skip_tree();
-    }
-
-    /// The item keyword the tokens at `at` start, and the offset just past its modifiers, once
-    /// visibility and `unsafe`/`async`/`extern` prefixes are stepped over. `const` is a modifier
-    /// only before another function modifier, `extern` before `fn`/`crate` (a blanked string
-    /// literal in `extern "C" fn` is invisible); `extern` directly before `{` is an extern block,
-    /// answered as the keyword `extern`. `None` when the tokens are not an item.
-    fn item_keyword(&self, at: usize) -> Option<(&'static str, usize)> {
-        let mut at = at;
-        let mut after_extern = false;
-        loop {
-            at = self.ws_end(at);
-            let (start, end) = self.ident_span(at)?;
-            let word = self.word(start, end);
-            match word.as_str() {
-                "pub" => {
-                    at = end;
-                    let paren = self.ws_end(at);
-                    if self.char_at(paren) == Some('(') {
-                        at = self.tree_end(paren)?;
-                    }
-                    after_extern = false;
-                }
-                "unsafe" | "async" | "default" | "auto" => {
-                    at = end;
-                    after_extern = false;
-                }
-                "extern" => {
-                    if self.char_at(self.ws_end(end)) == Some('{') {
-                        return Some(("extern", end));
-                    }
-                    at = end;
-                    after_extern = true;
-                }
-                "const" => {
-                    let after = self.ws_end(end);
-                    if let Some((_, next_end)) = self.ident_span(after)
-                        && matches!(
-                            self.word(after, next_end).as_str(),
-                            "fn" | "unsafe" | "async" | "extern"
-                        )
-                    {
-                        at = end;
-                        after_extern = false;
-                    } else {
-                        return Some(("const", end));
-                    }
-                }
-                "crate" if after_extern => return Some(("extern_crate", end)),
-                other => {
-                    return ITEM_KEYWORDS
-                        .iter()
-                        .find(|keyword| **keyword == other)
-                        .map(|keyword| (*keyword, end));
-                }
-            }
-        }
-    }
-
-    /// Whether an identifier at the cursor is directly followed by `!` (a macro call).
-    fn macro_call_ahead(&self) -> bool {
-        match self.ident_span(self.at) {
-            Some((_, end)) => self.char_at(self.ws_end(end)) == Some('!'),
-            None => false,
-        }
-    }
-
-    /// Skips a macro invocation at the cursor: identifier, `!`, and its token tree if any.
-    fn skip_macro_call(&mut self) {
-        if self.read_ident().is_none() {
-            self.at += 1;
-            return;
-        }
-        self.skip_ws();
-        if self.peek() == Some('!') {
-            self.at += 1;
-            self.skip_ws();
-            if matches!(self.peek(), Some('(' | '[' | '{')) {
-                self.skip_tree();
-            }
-        }
-    }
-
-    /// Consumes one unrecognized token (an identifier or a single character), guaranteeing
-    /// progress.
-    fn skip_token(&mut self) {
-        if self.ident_span(self.at).is_some() {
-            self.read_ident();
-        } else {
-            self.at += 1;
-        }
-    }
-
-    /// Scans from the cursor for the body opener or the `;` that ends the item, skipping
-    /// balanced `(...)`/`[...]` groups on the way (arguments, array types, bounds) and every
-    /// `{…}` inside `<…>` generics (a const argument such as `ArrayVec<u8, { 4 * 1024 }>` or a
-    /// const-generic default); a `>` right after `-` or `=` (`Fn() -> u8`) closes nothing. A `;`
-    /// inside unclosed generics refuses.
-    fn scan_to_body(&mut self) -> Continuation {
-        let mut angles = 0usize;
-        loop {
-            self.skip_ws();
-            match self.peek() {
-                Some('(' | '[') => {
-                    self.skip_tree();
-                }
-                Some('<') => {
-                    angles += 1;
-                    self.at += 1;
-                }
-                Some('>') => {
-                    if !matches!(self.char_before(self.at), Some('-' | '=')) {
-                        angles = angles.saturating_sub(1);
-                    }
-                    self.at += 1;
-                }
-                Some('{') if angles > 0 => {
-                    self.skip_tree();
-                }
-                Some('{') => return Continuation::Body(self.at),
-                Some(';') => {
-                    if angles > 0 {
-                        self.refuse();
-                    }
-                    let line = self.line_of(self.at);
-                    self.at += 1;
-                    return Continuation::Semi(line);
-                }
-                Some(_) => self.at += 1,
-                None => {
-                    self.refuse();
-                    return Continuation::Eof;
-                }
-            }
-        }
-    }
-
-    /// Scans to the `;` that ends a leaf item (`use`, `const`, `static`, `type`), skipping
-    /// balanced groups so initializer blocks and use trees never end it early; returns the `;`
-    /// line.
-    fn scan_to_semi(&mut self) -> u32 {
-        loop {
-            match self.peek() {
-                Some('(' | '[' | '{') => {
-                    self.skip_tree();
-                }
-                Some(';') => {
-                    let line = self.line_of(self.at);
-                    self.at += 1;
-                    return line;
-                }
-                Some(_) => self.at += 1,
-                None => {
-                    self.refuse();
-                    return self.line_of(self.text.len().saturating_sub(1));
-                }
-            }
-        }
-    }
-
-    /// Scans the file's top level in item mode; a stray `}` marks the scan uncertain.
-    fn scan_file(&mut self, root: &SymbolPath) -> Vec<Symbol> {
-        let mut symbols = Vec::new();
-        let mut attributes = None;
-        loop {
-            self.skip_ws();
-            match self.peek() {
-                None => break,
-                Some('}') => {
-                    self.refuse();
-                    self.at += 1;
-                }
-                Some('#') => self.skip_attribute(&mut attributes),
-                Some(_) => {
-                    if self.item_keyword(self.at).is_some() {
-                        let first = attributes.take();
-                        symbols.extend(self.parse_item(root, None, first));
-                    } else if self.macro_call_ahead() {
-                        // A macro invocation at item position may expand to items the text does
-                        // not show; the file keeps waiting for the server instead of guessing.
-                        self.refuse();
-                        self.skip_macro_call();
-                    } else {
-                        self.refuse();
-                        self.skip_token();
-                    }
-                }
-            }
-        }
-        self.uncertain |= cfg_duplicate(&symbols, &self.lines);
-        symbols
-    }
-
-    /// Scans one container body from its opening `{` (consumed) to the matching `}` (consumed),
-    /// returning its symbols and the closing line. `statements` selects function-body mode,
-    /// where arbitrary statement tokens are skipped silently; otherwise every position must be
-    /// an item, and anything else marks the scan uncertain.
-    fn scan_items(
-        &mut self,
-        owner: &SymbolPath,
-        owner_kind: Option<SymbolKind>,
-        statements: bool,
-    ) -> (Vec<Symbol>, u32) {
-        self.at += 1; // the opening `{`
-        let mut symbols = Vec::new();
-        let mut close = self.line_of(self.at.max(1));
-        let mut statement_start = true;
-        let mut attributes = None;
-        loop {
-            self.skip_ws();
-            match self.peek() {
-                None => {
-                    self.refuse();
-                    break;
-                }
-                Some('}') => {
-                    close = self.line_of(self.at);
-                    self.at += 1;
-                    break;
-                }
-                Some('#') => self.skip_attribute(&mut attributes),
-                Some(_) => {
-                    if !statements {
-                        if self.item_keyword(self.at).is_some() {
-                            let first = attributes.take();
-                            symbols.extend(self.parse_item(owner, owner_kind, first));
-                        } else if self.macro_call_ahead() {
-                            self.refuse();
-                            self.skip_macro_call();
-                        } else {
-                            self.refuse();
-                            self.skip_token();
-                        }
-                    } else if statement_start && self.item_keyword(self.at).is_some() {
-                        let first = attributes.take();
-                        symbols.extend(self.parse_item(owner, owner_kind, first));
-                        statement_start = true;
-                    } else {
-                        // An attribute on a statement or expression belongs to no item.
-                        attributes = None;
-                        if statement_start && self.macro_call_ahead() {
-                            self.skip_macro_call();
-                            statement_start = true;
-                        } else {
-                            statement_start =
-                                self.consume_statement_token(&mut symbols, owner, owner_kind);
-                        }
-                    }
-                }
-            }
-        }
-        self.uncertain |= cfg_duplicate(&symbols, &self.lines);
-        (symbols, close)
-    }
-
-    /// Consumes one statement token, recursing into `{…}` blocks (their items join this
-    /// function's children, as the server reports them) and treating `identifier !` as a macro
-    /// call whose tree is skipped. Returns whether the next token starts a statement.
-    fn consume_statement_token(
-        &mut self,
-        symbols: &mut Vec<Symbol>,
-        owner: &SymbolPath,
-        owner_kind: Option<SymbolKind>,
-    ) -> bool {
-        if self.ident_span(self.at).is_some() {
-            self.read_ident();
-            self.skip_ws();
-            if self.peek() == Some('!') {
-                self.at += 1;
-                self.skip_ws();
-                if matches!(self.peek(), Some('(' | '[' | '{')) {
-                    self.skip_tree();
-                }
-                return true;
-            }
-            return false;
-        }
-        match self.peek() {
-            Some(';') => {
-                self.at += 1;
-                true
-            }
-            Some('{') => {
-                let (nested, _) = self.scan_items(owner, owner_kind, true);
-                symbols.extend(nested);
-                true
-            }
-            Some(_) => {
-                self.at += 1;
-                false
-            }
-            None => false,
-        }
-    }
-
-    /// Parses the item at the cursor (whose modifiers and keyword [`Scanner::item_keyword`]
-    /// accepts) as a child of `owner`; `attributes` is the offset of its first outer attribute,
-    /// if any. Returns nothing for items that are not symbols (`use`, `extern crate`), for an
-    /// extern block (which refuses) and the hoisted items of a `const _ = { … }` initializer.
-    fn parse_item(
-        &mut self,
-        owner: &SymbolPath,
-        owner_kind: Option<SymbolKind>,
-        attributes: Option<usize>,
-    ) -> Vec<Symbol> {
-        let decl_at = self.at;
-        let first_at = attributes.unwrap_or(decl_at);
-        let Some((keyword, after_modifiers)) = self.item_keyword(decl_at) else {
-            return Vec::new();
-        };
-        self.at = after_modifiers;
-        match keyword {
-            "use" | "extern_crate" => {
-                self.scan_to_semi();
-                Vec::new()
-            }
-            "extern" => {
-                // An `extern "abi" { … }` block: the server reports the block itself as a symbol
-                // (`extern "C"`) with its items as children, which the scanner does not
-                // reproduce, so the file keeps waiting for the server.
-                self.refuse();
-                self.skip_ws();
-                if self.peek() == Some('{') {
-                    self.skip_tree();
-                }
-                Vec::new()
-            }
-            "macro_rules" => {
-                self.skip_ws();
-                if self.peek() == Some('!') {
-                    self.at += 1;
-                    self.skip_ws();
-                }
-                let Some(name) = self.read_ident() else {
-                    self.refuse();
-                    return Vec::new();
-                };
-                let end = match self.scan_to_body() {
-                    Continuation::Body(open) => {
-                        let close = self.skip_tree().unwrap_or(open);
-                        self.line_of(close)
-                    }
-                    Continuation::Semi(line) => line,
-                    Continuation::Eof => return Vec::new(),
-                };
-                vec![self.symbol(
-                    owner,
-                    owner_kind,
-                    Parsed {
-                        first_at,
-                        decl_at,
-                        name,
-                        kind: SymbolKind::Function,
-                        end,
-                        children: Vec::new(),
-                    },
-                )]
-            }
-            "const" | "static" => {
-                self.skip_ws();
-                if keyword == "static" && self.word_equals("mut") {
-                    self.read_ident();
-                    self.skip_ws();
-                }
-                let Some(name) = self.read_ident() else {
-                    self.refuse();
-                    return Vec::new();
-                };
-                if keyword == "const" && name == "_" {
-                    // The server reports no symbol for the underscore constant and hoists the
-                    // items inside its initializer blocks to the enclosing level.
-                    return self.scan_initializer(owner, owner_kind).0;
-                }
-                let (children, end) =
-                    self.scan_initializer(&owner.child(&name), Some(SymbolKind::Constant));
-                vec![self.symbol(
-                    owner,
-                    owner_kind,
-                    Parsed {
-                        first_at,
-                        decl_at,
-                        name,
-                        kind: SymbolKind::Constant,
-                        end,
-                        children,
-                    },
-                )]
-            }
-            "type" => {
-                self.skip_ws();
-                let Some(name) = self.read_ident() else {
-                    self.refuse();
-                    return Vec::new();
-                };
-                let end = self.scan_to_semi();
-                vec![self.symbol(
-                    owner,
-                    owner_kind,
-                    Parsed {
-                        first_at,
-                        decl_at,
-                        name,
-                        kind: SymbolKind::TypeAlias,
-                        end,
-                        children: Vec::new(),
-                    },
-                )]
-            }
-            "mod" => {
-                self.skip_ws();
-                let Some(name) = self.read_ident() else {
-                    self.refuse();
-                    return Vec::new();
-                };
-                let (end, children) = match self.scan_to_body() {
-                    Continuation::Body(_) => {
-                        let path = owner.child(&name);
-                        let (children, close) =
-                            self.scan_items(&path, Some(SymbolKind::Module), false);
-                        (close, children)
-                    }
-                    Continuation::Semi(line) => (line, Vec::new()),
-                    Continuation::Eof => return Vec::new(),
-                };
-                vec![self.symbol(
-                    owner,
-                    owner_kind,
-                    Parsed {
-                        first_at,
-                        decl_at,
-                        name,
-                        kind: SymbolKind::Module,
-                        end,
-                        children,
-                    },
-                )]
-            }
-            "trait" => {
-                self.skip_ws();
-                let Some(name) = self.read_ident() else {
-                    self.refuse();
-                    return Vec::new();
-                };
-                let (end, children) = match self.scan_to_body() {
-                    Continuation::Body(_) => {
-                        let path = owner.child(&name);
-                        let (children, close) =
-                            self.scan_items(&path, Some(SymbolKind::Trait), false);
-                        (close, children)
-                    }
-                    Continuation::Semi(line) => (line, Vec::new()),
-                    Continuation::Eof => return Vec::new(),
-                };
-                vec![self.symbol(
-                    owner,
-                    owner_kind,
-                    Parsed {
-                        first_at,
-                        decl_at,
-                        name,
-                        kind: SymbolKind::Trait,
-                        end,
-                        children,
-                    },
-                )]
-            }
-            "impl" => {
-                let (name, end, children) = match self.scan_to_body() {
-                    Continuation::Body(open) => {
-                        let name = impl_segment(&self.impl_header(decl_at, open));
-                        let path = owner.child(&name);
-                        let (children, close) =
-                            self.scan_items(&path, Some(SymbolKind::Impl), false);
-                        (name, close, children)
-                    }
-                    Continuation::Semi(line) => (String::new(), line, Vec::new()),
-                    Continuation::Eof => return Vec::new(),
-                };
-                if name.is_empty() {
-                    return Vec::new();
-                }
-                vec![self.symbol(
-                    owner,
-                    owner_kind,
-                    Parsed {
-                        first_at,
-                        decl_at,
-                        name,
-                        kind: SymbolKind::Impl,
-                        end,
-                        children,
-                    },
-                )]
-            }
-            "fn" => {
-                self.skip_ws();
-                // A raw identifier keeps its `r#` (`fn r#match`), as the server names it.
-                let Some(name) = self.read_ident() else {
-                    self.refuse();
-                    return Vec::new();
-                };
-                let (end, children) = match self.scan_to_body() {
-                    Continuation::Body(_) => {
-                        let path = owner.child(&name);
-                        let (children, close) =
-                            self.scan_items(&path, Some(SymbolKind::Function), true);
-                        (close, children)
-                    }
-                    Continuation::Semi(line) => (line, Vec::new()),
-                    Continuation::Eof => return Vec::new(),
-                };
-                vec![self.symbol(
-                    owner,
-                    owner_kind,
-                    Parsed {
-                        first_at,
-                        decl_at,
-                        name,
-                        kind: SymbolKind::Function,
-                        end,
-                        children,
-                    },
-                )]
-            }
-            "struct" | "union" => {
-                self.skip_ws();
-                let Some(name) = self.read_ident() else {
-                    self.refuse();
-                    return Vec::new();
-                };
-                let (end, children) = match self.scan_to_body() {
-                    Continuation::Body(_) => {
-                        let path = owner.child(&name);
-                        let (children, close) = self.scan_fields(&path);
-                        (close, children)
-                    }
-                    Continuation::Semi(line) => (line, Vec::new()),
-                    Continuation::Eof => return Vec::new(),
-                };
-                vec![self.symbol(
-                    owner,
-                    owner_kind,
-                    Parsed {
-                        first_at,
-                        decl_at,
-                        name,
-                        kind: SymbolKind::Struct,
-                        end,
-                        children,
-                    },
-                )]
-            }
-            "enum" => {
-                self.skip_ws();
-                let Some(name) = self.read_ident() else {
-                    self.refuse();
-                    return Vec::new();
-                };
-                let (end, children) = match self.scan_to_body() {
-                    Continuation::Body(_) => {
-                        let path = owner.child(&name);
-                        let (children, close) = self.scan_variants(&path);
-                        (close, children)
-                    }
-                    Continuation::Semi(line) => (line, Vec::new()),
-                    Continuation::Eof => return Vec::new(),
-                };
-                vec![self.symbol(
-                    owner,
-                    owner_kind,
-                    Parsed {
-                        first_at,
-                        decl_at,
-                        name,
-                        kind: SymbolKind::Enum,
-                        end,
-                        children,
-                    },
-                )]
-            }
-            _ => Vec::new(),
-        }
-    }
-
-    /// Scans the field list of a struct, union or record variant from its opening `{`
-    /// (consumed) to the matching `}` (consumed); returns the fields and the closing line.
-    fn scan_fields(&mut self, owner: &SymbolPath) -> (Vec<Symbol>, u32) {
-        self.at += 1; // the opening `{`
-        let mut fields = Vec::new();
-        let mut close = self.line_of(self.at.max(1));
-        let mut attributes = None;
-        loop {
-            self.skip_ws();
-            match self.peek() {
-                None => {
-                    self.refuse();
-                    break;
-                }
-                Some('}') => {
-                    close = self.line_of(self.at);
-                    self.at += 1;
-                    break;
-                }
-                Some('#') => self.skip_attribute(&mut attributes),
-                Some(_) => {
-                    let decl_at = self.at;
-                    let first_at = attributes.take().unwrap_or(decl_at);
-                    if self.word_equals("pub") {
-                        self.at = self.ws_end(self.at + 3);
-                        if self.peek() == Some('(') {
-                            self.skip_tree();
-                        }
-                        self.skip_ws();
-                    }
-                    // A raw identifier keeps its `r#`, as the server names it.
-                    let Some(name) = self.read_ident() else {
-                        self.refuse();
-                        self.skip_token();
-                        continue;
-                    };
-                    let Some(end) = self.scan_member_end() else {
-                        continue;
-                    };
-                    let field = Parsed {
-                        first_at,
-                        decl_at,
-                        name,
-                        kind: SymbolKind::Field,
-                        end,
-                        children: Vec::new(),
-                    };
-                    fields.push(self.symbol(owner, None, field));
-                }
-            }
-        }
-        (fields, close)
-    }
-
-    /// Scans the variant list of an enum from its opening `{` (consumed) to the matching `}`
-    /// (consumed); returns the variants (record variants carry their fields) and the closing line.
-    fn scan_variants(&mut self, owner: &SymbolPath) -> (Vec<Symbol>, u32) {
-        self.at += 1; // the opening `{`
-        let mut variants = Vec::new();
-        let mut close = self.line_of(self.at.max(1));
-        let mut attributes = None;
-        loop {
-            self.skip_ws();
-            match self.peek() {
-                None => {
-                    self.refuse();
-                    break;
-                }
-                Some('}') => {
-                    close = self.line_of(self.at);
-                    self.at += 1;
-                    break;
-                }
-                Some('#') => self.skip_attribute(&mut attributes),
-                Some(_) => {
-                    let decl_at = self.at;
-                    let first_at = attributes.take().unwrap_or(decl_at);
-                    let Some(name) = self.read_ident() else {
-                        self.refuse();
-                        self.skip_token();
-                        continue;
-                    };
-                    self.skip_ws();
-                    let (end, children) = match self.peek() {
-                        Some('(') => {
-                            self.skip_tree();
-                            (self.scan_member_end(), Vec::new())
-                        }
-                        Some('{') => {
-                            let path = owner.child(&name);
-                            let (children, variant_close) = self.scan_fields(&path);
-                            // A record variant may carry a trailing `,` after its `}`.
-                            self.skip_ws();
-                            if self.peek() == Some(',') {
-                                self.at += 1;
-                            }
-                            (Some(variant_close), children)
-                        }
-                        _ => (self.scan_member_end(), Vec::new()),
-                    };
-                    let Some(end) = end else {
-                        continue;
-                    };
-                    variants.push(self.symbol(
-                        owner,
-                        None,
-                        Parsed {
-                            first_at,
-                            decl_at,
-                            name,
-                            kind: SymbolKind::Variant,
-                            end,
-                            children,
-                        },
-                    ));
-                }
-            }
-        }
-        (variants, close)
-    }
-
-    /// The terminator of one struct field or enum variant: the `,` that ends it (consumed), or
-    /// the last code line before the `}` that closes the list (not consumed). `None` when the
-    /// text ends first.
-    ///
-    /// Before a depth-0 `=` the member is a type, whose `<…>` generic arguments may hold commas
-    /// (`HashMap<String, Vec<u8>>`); a `>` right after `-` or `=` (`Fn(u8) -> u8`) closes
-    /// nothing. After it (a discriminant or default value) the member is an expression, where
-    /// `<`/`>` are comparisons or shifts; a turbofish there (`::<`) could hide a comma inside
-    /// generic arguments, so it refuses.
-    fn scan_member_end(&mut self) -> Option<u32> {
-        let mut angles = 0usize;
-        let mut expression = false;
-        loop {
-            self.skip_ws();
-            match self.peek() {
-                Some('(' | '[' | '{') => {
-                    self.skip_tree();
-                }
-                Some('<') if !expression => {
-                    angles += 1;
-                    self.at += 1;
-                }
-                Some('>') if !expression => {
-                    if !matches!(self.char_before(self.at), Some('-' | '=')) {
-                        angles = angles.saturating_sub(1);
-                    }
-                    self.at += 1;
-                }
-                Some('<') if self.char_before(self.at) == Some(':') => {
-                    self.refuse();
-                    self.at += 1;
-                }
-                Some('=') if angles == 0 => {
-                    expression = true;
-                    self.at += 1;
-                }
-                Some(',') if angles == 0 => {
-                    let line = self.line_of(self.at);
-                    self.at += 1;
-                    return Some(line);
-                }
-                Some('}') => {
-                    let mut at = self.at;
-                    while at > 0 && matches!(self.char_at(at - 1), Some(' ' | '\n' | '\t' | '\r')) {
-                        at -= 1;
-                    }
-                    return Some(self.line_of(at.saturating_sub(1)));
-                }
-                Some(_) => self.at += 1,
-                None => {
-                    self.refuse();
-                    return None;
-                }
-            }
-        }
-    }
-
-    /// Scans a `const`/`static` item from after its name to the `;` that ends it (consumed) and
-    /// returns the items declared inside its initializer — as children of `owner`, whose kind is
-    /// `owner_kind`, which is how the server reports them — and the `;` line. `(…)`/`[…]` groups
-    /// are entered rather than skipped, so a block inside a call or an array still yields its
-    /// items, and a `;` inside them (`[0; 2]`) ends nothing. A closing delimiter that opens
-    /// nothing here, or the end of the text, refuses.
-    fn scan_initializer(
-        &mut self,
-        owner: &SymbolPath,
-        owner_kind: Option<SymbolKind>,
-    ) -> (Vec<Symbol>, u32) {
-        let mut items = Vec::new();
-        let mut depth = 0usize;
-        loop {
-            match self.peek() {
-                Some('(' | '[') => {
-                    depth += 1;
-                    self.at += 1;
-                }
-                Some(')' | ']') if depth > 0 => {
-                    depth -= 1;
-                    self.at += 1;
-                }
-                Some('{') => {
-                    let (nested, _) = self.scan_items(owner, owner_kind, true);
-                    items.extend(nested);
-                }
-                Some(';') if depth == 0 => {
-                    let line = self.line_of(self.at);
-                    self.at += 1;
-                    return (items, line);
-                }
-                Some(')' | ']' | '}') | None => {
-                    self.refuse();
-                    return (items, self.line_of(self.at.min(self.text.len())));
-                }
-                Some(_) => self.at += 1,
-            }
-        }
-    }
-
-    /// Whether the identifier at the cursor equals `word`.
-    fn word_equals(&self, word: &str) -> bool {
-        match self.ident_span(self.at) {
-            Some((start, end)) => self.word(start, end) == word,
-            None => false,
-        }
-    }
-
-    /// The impl's declaration as the server names it: leading `unsafe`/`default` modifiers,
-    /// the generic parameter list right after `impl` (whose bounds may contain `->`) and the
-    /// where clause (from the `where` keyword token, spaced or not) are dropped, so
-    /// `impl<T: Clone> Wrap<T> for Guard where T: Debug` names `impl Wrap<T> for Guard`;
-    /// [`impl_segment`] then collapses an inherent impl to its bare type name, the same rule
-    /// the server path normalizes with.
-    fn impl_header(&self, decl_at: usize, body_open: usize) -> String {
-        let mut text = self.word(decl_at, body_open);
-        while let Some(first) = text.split_whitespace().next()
-            && matches!(first, "unsafe" | "default")
-        {
-            text = text[first.len()..].trim_start().to_owned();
-        }
-        let identifier = |character: char| character.is_alphanumeric() || character == '_';
-        let where_clause = text.match_indices("where").map(|(at, _)| at).find(|&at| {
-            !text[..at].ends_with(identifier) && !text[at + "where".len()..].starts_with(identifier)
-        });
-        if let Some(at) = where_clause {
-            text.truncate(at);
-        }
-        match text.strip_prefix("impl") {
-            Some(rest) if rest.trim_start().starts_with('<') => {
-                let generics = rest.trim_start();
-                let after = crate::support::skip_generics(generics);
-                format!("impl {after}")
-            }
-            _ => text,
-        }
-    }
-
-    /// Builds one symbol exactly as the server path normalizes rust-analyzer's answer: the item
-    /// node starts at the first attribute (`first_at`), which stands in for the server's reported
-    /// start; the declaration line and the header are then derived by the same functions, and the
-    /// kind refined by the same rules (test attributes, methods in impls and traits, test
-    /// modules). Marks the scan uncertain when the server's node start may differ — comment text
-    /// on the nearest non-blank line above the range ([`Scanner::comment_above`]) or a blank line
-    /// between the range start and the item keyword.
-    fn symbol(
-        &mut self,
-        owner: &SymbolPath,
-        owner_kind: Option<SymbolKind>,
-        item: Parsed,
-    ) -> Symbol {
-        let Parsed {
-            first_at,
-            decl_at,
-            name,
-            kind,
-            end,
-            children,
-        } = item;
-        let reported = self.line_of(first_at);
-        let keyword = self.line_of(decl_at);
-        let decl = declaration_line(&self.lines, reported, keyword, true);
-        let start = header_start(&self.lines, decl).min(reported);
-        if self.comment_above(first_at, start)
-            || (start..keyword).any(|line| line_at(&self.lines, line).trim().is_empty())
-        {
-            self.refuse();
-        }
-        let header: Vec<&str> = (start..decl)
-            .map(|line| line_at(&self.lines, line).trim())
-            .collect();
-        let kind = match kind {
-            SymbolKind::Function | SymbolKind::Method
-                if header.iter().any(|line| is_test_attr(line)) =>
-            {
-                SymbolKind::Test
-            }
-            SymbolKind::Function | SymbolKind::Method
-                if matches!(owner_kind, Some(SymbolKind::Impl | SymbolKind::Trait)) =>
-            {
-                SymbolKind::Method
-            }
-            SymbolKind::Function | SymbolKind::Method => SymbolKind::Function,
-            SymbolKind::Module
-                if name == "tests" || header.iter().any(|line| is_cfg_test(line)) =>
-            {
-                SymbolKind::Test
-            }
-            other => other,
-        };
-        let body = LineRange::new(decl, end);
-        Symbol {
-            signature: signature(&self.lines, body, true),
-            doc: doc_of(&header),
-            path: owner.child(&name),
-            kind,
-            name,
-            range: LineRange::new(start, end),
-            body,
-            children,
-        }
-    }
-
-    /// Whether comment text sits on the nearest non-blank line above line `start`, between the
-    /// item (whose first token is at `first_at`) and the code before it. rust-analyzer attaches
-    /// such leading comments to the item's node — a `//` or `/* */` line above it, a trailing
-    /// comment on the line above, a `///` block across a blank line — and the scanner does not
-    /// reproduce that rule, so the caller refuses. A `//!` inner doc line is the exception: the
-    /// server never attaches it, nor anything above it.
-    fn comment_above(&self, first_at: usize, start: u32) -> bool {
-        // The text between the last code character before the item and the item is whitespace
-        // and comments only (a literal is code); keep the part on lines above `start`.
-        let gap = self.text[..first_at]
+    let file: syn::File = syn::parse2(tokens).ok()?;
+    let mut line_starts = vec![0usize];
+    line_starts.extend(
+        chars
             .iter()
-            .rposition(|character| !character.is_whitespace())
-            .map_or(0, |at| at + 1);
-        let above = self.line_starts[start as usize - 1];
-        let comments: String = self.source[gap.min(above)..above].iter().collect();
-        comments
-            .lines()
-            .map(str::trim)
-            .rfind(|line| !line.is_empty())
-            .is_some_and(|nearest| !nearest.starts_with("//!"))
+            .enumerate()
+            .filter(|(_, character)| **character == '\n')
+            .map(|(index, _)| index + 1),
+    );
+    let mut walker = Walker {
+        source,
+        lines: source_lines(source),
+        chars,
+        code,
+        line_starts,
+        frames: vec![Vec::new()],
+        symbols: 0,
+        refused: false,
+    };
+    walker.visit_file(&file);
+    if walker.refused {
+        return None;
     }
+    walker.frames.pop()
 }
 
-/// Whether two same-named same-kind siblings carry a `cfg`/`cfg_attr` attribute in either
-/// header: which branch is live is semantic knowledge, so the file refuses to guess. Same-named
-/// siblings without a gate stay (a type and its impl blocks, repeated trait impls), exactly as
-/// the server reports them.
-fn cfg_duplicate(children: &[Symbol], lines: &[&str]) -> bool {
-    for (index, one) in children.iter().enumerate() {
-        for other in &children[index + 1..] {
-            if one.name != other.name || one.kind != other.kind {
-                continue;
-            }
-            let gated = |symbol: &Symbol| {
-                (symbol.range.start..symbol.body.start).any(|line| {
-                    matches!(
-                        attr_path(line_at(lines, line).trim()),
-                        Some("cfg" | "cfg_attr")
-                    )
+/// Whether `character` is whitespace to rustc and rust-analyzer: Unicode `Pattern_White_Space`,
+/// which includes the left-to-right and right-to-left marks and excludes the no-break and other
+/// typographic spaces `char::is_whitespace` accepts.
+fn rust_whitespace(character: char) -> bool {
+    matches!(
+        character,
+        '\t' | '\n'
+            | '\u{b}'
+            | '\u{c}'
+            | '\r'
+            | ' '
+            | '\u{85}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{2028}'
+            | '\u{2029}'
+    )
+}
+
+/// Keywords that nest the syntax tree without a delimiter: prefix expressions (`return x`,
+/// `move || x`), casts, `else if` chains, `let` conditions, `dyn`/`impl` types.
+const NESTING_KEYWORDS: [&str; 12] = [
+    "as", "async", "become", "box", "break", "dyn", "else", "impl", "let", "move", "return",
+    "yield",
+];
+
+/// Whether `tokens` may nest the parser's recursion (and the tree walk and drop after it) deeper
+/// than its stack allows: delimited groups deeper than [`MAX_DEPTH`], or a nesting estimate
+/// above [`MAX_NESTING`]. Measured without recursion — the check must not need the stack it
+/// protects — in one pass over every token.
+///
+/// The estimate is an upper bound on the syntax tree's depth. Syntax nests only through tokens:
+/// a delimited group, an operator (prefix `!`/`-`/`*`/`&`, binary, `.`, `?`, `..`, `@`, `->`,
+/// generic `<`/`>`) or a keyword of [`NESTING_KEYWORDS`]. Within one group those tokens are
+/// counted per segment, a stretch the parser treats as one subtree; segments end at `;`, at `=>`,
+/// at a `,` outside generic arguments (a `<` still open makes the comma part of the stretch),
+/// and after a `{…}` block followed by an item, a statement or an attribute (an identifier other
+/// than `as`/`else`, or `#`). A group's estimate is its enclosing group's plus the count of the
+/// whole segment holding it (the tokens after it nest it too: `(a) + b + c`). The bound is
+/// conservative: a long chain of operators in one expression (hundreds of `else if` arms, a
+/// thousand-term sum) is refused rather than parsed.
+fn too_nested(tokens: TokenStream) -> bool {
+    let mut pending = vec![(tokens, 0usize, 0usize)];
+    while let Some((stream, base, depth)) = pending.pop() {
+        let trees: Vec<TokenTree> = stream.into_iter().collect();
+        let mut segments = vec![0usize];
+        let mut groups = Vec::new();
+        let mut angles = 0usize;
+        for (index, tree) in trees.iter().enumerate() {
+            let next = trees.get(index + 1);
+            let joined = |previous: char| {
+                index.checked_sub(1).is_some_and(|before| {
+                    matches!(&trees[before], TokenTree::Punct(punct)
+                        if punct.as_char() == previous && punct.spacing() == Spacing::Joint)
                 })
             };
-            if gated(one) || gated(other) {
+            let segment = segments.len() - 1;
+            let mut split = false;
+            match tree {
+                TokenTree::Group(group) => {
+                    segments[segment] += 1;
+                    groups.push((group.stream(), segment));
+                    split = group.delimiter() == Delimiter::Brace
+                        && match next {
+                            Some(TokenTree::Ident(ident)) => ident != "as" && ident != "else",
+                            Some(TokenTree::Punct(punct)) => punct.as_char() == '#',
+                            _ => false,
+                        };
+                }
+                TokenTree::Punct(punct) => match punct.as_char() {
+                    ';' => split = true,
+                    ',' => split = angles == 0,
+                    ':' | '#' | '$' | '\'' => {}
+                    // The `=` of `=>`; the `>` splits.
+                    '=' if punct.spacing() == Spacing::Joint
+                        && matches!(next, Some(TokenTree::Punct(arrow)) if arrow.as_char() == '>') =>
+                        {}
+                    '>' if joined('=') => split = true,
+                    '<' => {
+                        angles += 1;
+                        segments[segment] += 1;
+                    }
+                    '>' => {
+                        if !joined('-') {
+                            angles = angles.saturating_sub(1);
+                        }
+                        segments[segment] += 1;
+                    }
+                    _ => segments[segment] += 1,
+                },
+                TokenTree::Ident(ident) => {
+                    if NESTING_KEYWORDS.iter().any(|keyword| ident == keyword) {
+                        segments[segment] += 1;
+                    }
+                }
+                TokenTree::Literal(_) => {}
+            }
+            if split {
+                segments.push(0);
+                angles = 0;
+            }
+        }
+        if segments.iter().any(|count| base + count > MAX_NESTING) {
+            return true;
+        }
+        for (stream, segment) in groups {
+            if depth + 1 > MAX_DEPTH {
                 return true;
             }
+            pending.push((stream, base + segments[segment], depth + 1));
         }
     }
     false
 }
 
+/// Builds the document symbols of one parsed file, one visitor pass in source order.
+struct Walker<'a> {
+    /// The source text, for impl labels sliced verbatim.
+    source: &'a str,
+    /// Source lines, for the blank-line rule.
+    lines: Vec<&'a str>,
+    /// Source characters (span columns and `line_starts` count characters, not bytes).
+    chars: &'a [char],
+    /// Code-only form of the source (comments and literal contents blanked, offsets unchanged),
+    /// to find the last code character before an item.
+    code: &'a [char],
+    /// Character offset of each line's first character (line 1 starts at 0).
+    line_starts: Vec<usize>,
+    /// Symbols collected per open symbol: the file level first, then one frame per symbol whose
+    /// contents are being walked; the innermost frame receives the next finished symbol.
+    frames: Vec<Vec<lsp::DocumentSymbol>>,
+    /// Symbols built so far.
+    symbols: usize,
+    /// Whether anything was seen that makes the outline a guess; the caller returns `None`.
+    refused: bool,
+}
+
+impl Walker<'_> {
+    /// Adds one symbol for `node` to the innermost frame. `name` and `kind` are rust-analyzer's,
+    /// `selection` the span it selects (the name, or an impl's self type); `walk` visits the
+    /// node's contents, whose symbols become its children. The range runs from the node's first
+    /// token to its last; the node is checked for comments the server would attach to it.
+    fn symbol(
+        &mut self,
+        node: &dyn ToTokens,
+        name: String,
+        kind: lsp::SymbolKind,
+        selection: Span,
+        walk: impl FnOnce(&mut Self),
+    ) {
+        let tokens: Vec<TokenTree> = node.to_token_stream().into_iter().collect();
+        let (Some(first), Some(last)) = (tokens.first(), tokens.last()) else {
+            self.refused = true;
+            return;
+        };
+        // The first token after the outer attributes (`#` then `[…]`, doc comments included).
+        let mut index = 0;
+        while matches!(&tokens.get(index), Some(TokenTree::Punct(pound)) if pound.as_char() == '#')
+            && matches!(
+                &tokens.get(index + 1),
+                Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Bracket
+            )
+        {
+            index += 2;
+        }
+        let declaration = tokens.get(index).unwrap_or(first).span().start().line;
+        let (start, end) = (first.span().start(), last.span().end());
+        // Every parsed token has a source position (line 1 or later); a synthesized one would not.
+        if start.line == 0 {
+            self.refused = true;
+            return;
+        }
+        self.check_attached_trivia(start, declaration);
+        self.symbols += 1;
+        self.refused |= self.symbols > MAX_SYMBOLS;
+        self.frames.push(Vec::new());
+        walk(self);
+        let children = self.frames.pop().unwrap_or_default();
+        #[allow(deprecated)] // `deprecated` is a required field of the LSP type.
+        let symbol = lsp::DocumentSymbol {
+            name,
+            detail: None,
+            kind,
+            tags: None,
+            deprecated: None,
+            range: lsp::Range::new(position(start), position(end)),
+            selection_range: lsp::Range::new(
+                position(selection.start()),
+                position(selection.end()),
+            ),
+            children: (!children.is_empty()).then_some(children),
+        };
+        if let Some(frame) = self.frames.last_mut() {
+            frame.push(symbol);
+        }
+    }
+
+    /// Refuses when rust-analyzer may attach comments to the item starting at `start` (its first
+    /// attribute, doc comment or keyword), which a parser does not see: comment text on the
+    /// nearest non-blank line above `start` — between the last code before the item and the
+    /// item — unless it is a `//!` inner doc line (never attached, nor anything above it); or a
+    /// blank line between `start` and the item's first token after its attributes, on line
+    /// `declaration` (rust-analyzer attaches a doc comment across one only when no plain comment
+    /// sits between).
+    fn check_attached_trivia(&mut self, start: LineColumn, declaration: usize) {
+        let line_start = self.line_starts[start.line - 1];
+        let first = line_start + start.column;
+        let gap = self.code[..first]
+            .iter()
+            .rposition(|&character| !rust_whitespace(character))
+            .map_or(0, |at| at + 1);
+        let above: String = self.chars[gap.min(line_start)..line_start].iter().collect();
+        let commented = above
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .is_some_and(|nearest| !nearest.starts_with("//!"));
+        let blank = (start.line..declaration)
+            .any(|line| line_at(&self.lines, line as u32).trim().is_empty());
+        self.refused |= commented || blank;
+    }
+
+    /// The verbatim source text of `node`, from its first token to its last, as rust-analyzer's
+    /// syntax text; `None` for a node without tokens or without a source position.
+    fn text(&self, node: &dyn ToTokens) -> Option<String> {
+        let mut tokens = node.to_token_stream().into_iter();
+        let first = tokens.next()?.span();
+        let last = tokens.last().map_or(first, |token| token.span());
+        self.source
+            .get(first.byte_range().start..last.byte_range().end)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// Adds a function or method symbol for `node` with signature `sig`, named and selected by
+    /// the function's name: rust-analyzer's `METHOD` when it takes `self`, `FUNCTION` otherwise
+    /// (the conversion refines both by owner and test attribute alike). `walk` visits the
+    /// function's contents, as in [`Walker::symbol`].
+    fn function(
+        &mut self,
+        node: &dyn ToTokens,
+        sig: &syn::Signature,
+        walk: impl FnOnce(&mut Self),
+    ) {
+        let kind = if sig.receiver().is_some() {
+            lsp::SymbolKind::METHOD
+        } else {
+            lsp::SymbolKind::FUNCTION
+        };
+        self.symbol(node, sig.ident.to_string(), kind, sig.ident.span(), walk);
+    }
+
+    /// Adds a constant symbol for `node` named and selected by `ident`, whose contents `walk`
+    /// visits; for `const _` there is no symbol and `walk` runs in the enclosing one, so the
+    /// items of the initializer become its children.
+    fn constant(&mut self, node: &dyn ToTokens, ident: &syn::Ident, walk: impl FnOnce(&mut Self)) {
+        if ident == "_" {
+            walk(self);
+        } else {
+            let name = ident.to_string();
+            self.symbol(node, name, lsp::SymbolKind::CONSTANT, ident.span(), walk);
+        }
+    }
+
+    /// Adds a symbol for `node` named and selected by `ident`, with rust-analyzer's `kind`;
+    /// `walk` visits its contents, as in [`Walker::symbol`].
+    fn named(
+        &mut self,
+        node: &dyn ToTokens,
+        ident: &syn::Ident,
+        kind: lsp::SymbolKind,
+        walk: impl FnOnce(&mut Self),
+    ) {
+        self.symbol(node, ident.to_string(), kind, ident.span(), walk);
+    }
+}
+
+/// The LSP position of a span boundary: 0-based line, character column.
+fn position(at: LineColumn) -> lsp::Position {
+    lsp::Position::new(at.line.saturating_sub(1) as u32, at.column as u32)
+}
+
+impl<'ast> Visit<'ast> for Walker<'_> {
+    /// Refuses items the outline cannot reproduce: verbatim (unparsed) items, trait aliases and
+    /// `extern` blocks; walks every other item.
+    fn visit_item(&mut self, node: &'ast syn::Item) {
+        match node {
+            syn::Item::Verbatim(_) | syn::Item::TraitAlias(_) | syn::Item::ForeignMod(_) => {
+                self.refused = true;
+            }
+            _ => visit::visit_item(self, node),
+        }
+    }
+
+    /// Refuses a verbatim impl member; walks every other.
+    fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+        match node {
+            syn::ImplItem::Verbatim(_) => self.refused = true,
+            _ => visit::visit_impl_item(self, node),
+        }
+    }
+
+    /// Refuses a verbatim trait member; walks every other.
+    fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
+        match node {
+            syn::TraitItem::Verbatim(_) => self.refused = true,
+            _ => visit::visit_trait_item(self, node),
+        }
+    }
+
+    /// Refuses a verbatim expression, whose tokens may hold items; walks every other.
+    fn visit_expr(&mut self, node: &'ast syn::Expr) {
+        match node {
+            syn::Expr::Verbatim(_) => self.refused = true,
+            _ => visit::visit_expr(self, node),
+        }
+    }
+
+    /// Refuses a verbatim type; walks every other.
+    fn visit_type(&mut self, node: &'ast syn::Type) {
+        match node {
+            syn::Type::Verbatim(_) => self.refused = true,
+            _ => visit::visit_type(self, node),
+        }
+    }
+
+    /// Refuses a verbatim pattern; walks every other.
+    fn visit_pat(&mut self, node: &'ast syn::Pat) {
+        match node {
+            syn::Pat::Verbatim(_) => self.refused = true,
+            _ => visit::visit_pat(self, node),
+        }
+    }
+
+    /// Refuses a verbatim bound; walks every other.
+    fn visit_type_param_bound(&mut self, node: &'ast syn::TypeParamBound) {
+        match node {
+            syn::TypeParamBound::Verbatim(_) => self.refused = true,
+            _ => visit::visit_type_param_bound(self, node),
+        }
+    }
+
+    /// A function symbol.
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        self.function(node, &node.sig, |walker| visit::visit_item_fn(walker, node));
+    }
+
+    /// A method symbol of an impl.
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        self.function(node, &node.sig, |walker| {
+            visit::visit_impl_item_fn(walker, node)
+        });
+    }
+
+    /// A method symbol of a trait.
+    fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+        self.function(node, &node.sig, |walker| {
+            visit::visit_trait_item_fn(walker, node)
+        });
+    }
+
+    /// A struct symbol; its named fields are its children.
+    fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+        let kind = lsp::SymbolKind::STRUCT;
+        self.named(node, &node.ident, kind, |walker| {
+            visit::visit_item_struct(walker, node)
+        });
+    }
+
+    /// A union symbol, which rust-analyzer reports as a struct.
+    fn visit_item_union(&mut self, node: &'ast syn::ItemUnion) {
+        let kind = lsp::SymbolKind::STRUCT;
+        self.named(node, &node.ident, kind, |walker| {
+            visit::visit_item_union(walker, node)
+        });
+    }
+
+    /// An enum symbol; its variants are its children.
+    fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+        let kind = lsp::SymbolKind::ENUM;
+        self.named(node, &node.ident, kind, |walker| {
+            visit::visit_item_enum(walker, node)
+        });
+    }
+
+    /// An enum variant symbol; a record variant's fields are its children.
+    fn visit_variant(&mut self, node: &'ast syn::Variant) {
+        let kind = lsp::SymbolKind::ENUM_MEMBER;
+        self.named(node, &node.ident, kind, |walker| {
+            visit::visit_variant(walker, node)
+        });
+    }
+
+    /// A named field symbol; a tuple field is no symbol (its type is still walked).
+    fn visit_field(&mut self, node: &'ast syn::Field) {
+        match &node.ident {
+            Some(ident) => self.named(node, ident, lsp::SymbolKind::FIELD, |walker| {
+                visit::visit_field(walker, node)
+            }),
+            None => visit::visit_field(self, node),
+        }
+    }
+
+    /// A trait symbol, which rust-analyzer reports as an interface.
+    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        let kind = lsp::SymbolKind::INTERFACE;
+        self.named(node, &node.ident, kind, |walker| {
+            visit::visit_item_trait(walker, node)
+        });
+    }
+
+    /// A module symbol, inline or `mod name;`.
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        let kind = lsp::SymbolKind::MODULE;
+        self.named(node, &node.ident, kind, |walker| {
+            visit::visit_item_mod(walker, node)
+        });
+    }
+
+    /// A type alias symbol, which rust-analyzer reports as a type parameter.
+    fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
+        let kind = lsp::SymbolKind::TYPE_PARAMETER;
+        self.named(node, &node.ident, kind, |walker| {
+            visit::visit_item_type(walker, node)
+        });
+    }
+
+    /// An associated type symbol of an impl.
+    fn visit_impl_item_type(&mut self, node: &'ast syn::ImplItemType) {
+        let kind = lsp::SymbolKind::TYPE_PARAMETER;
+        self.named(node, &node.ident, kind, |walker| {
+            visit::visit_impl_item_type(walker, node)
+        });
+    }
+
+    /// An associated type symbol of a trait.
+    fn visit_trait_item_type(&mut self, node: &'ast syn::TraitItemType) {
+        let kind = lsp::SymbolKind::TYPE_PARAMETER;
+        self.named(node, &node.ident, kind, |walker| {
+            visit::visit_trait_item_type(walker, node)
+        });
+    }
+
+    /// A constant symbol (none for `const _`).
+    fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
+        self.constant(node, &node.ident, |walker| {
+            visit::visit_item_const(walker, node)
+        });
+    }
+
+    /// An associated constant symbol of an impl (none for `const _`).
+    fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
+        self.constant(node, &node.ident, |walker| {
+            visit::visit_impl_item_const(walker, node)
+        });
+    }
+
+    /// An associated constant symbol of a trait.
+    fn visit_trait_item_const(&mut self, node: &'ast syn::TraitItemConst) {
+        self.constant(node, &node.ident, |walker| {
+            visit::visit_trait_item_const(walker, node)
+        });
+    }
+
+    /// A static symbol, which rust-analyzer reports as a constant.
+    fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
+        let kind = lsp::SymbolKind::CONSTANT;
+        self.named(node, &node.ident, kind, |walker| {
+            visit::visit_item_static(walker, node)
+        });
+    }
+
+    /// A `macro_rules!` definition symbol, which rust-analyzer reports as a function; a macro
+    /// invocation at item position is no symbol.
+    fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
+        match &node.ident {
+            Some(ident) => self.named(node, ident, lsp::SymbolKind::FUNCTION, |walker| {
+                visit::visit_item_macro(walker, node)
+            }),
+            None => visit::visit_item_macro(self, node),
+        }
+    }
+
+    /// An impl symbol labelled as rust-analyzer labels it, `impl Type` or
+    /// `impl Trait for Type` (`!` kept before a negative impl's trait) from the verbatim text of
+    /// the trait path and the self type, and selected at the self type.
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        let target = self.text(&node.self_ty);
+        let label = match (&node.trait_, target) {
+            (None, Some(target)) => Some(format!("impl {target}")),
+            (Some((bang, path, _)), Some(target)) => self.text(path).map(|path| {
+                let bang = if bang.is_some() { "!" } else { "" };
+                format!("impl {bang}{path} for {target}")
+            }),
+            (_, None) => None,
+        };
+        let (Some(label), Some(selection)) = (label, first_span(&node.self_ty)) else {
+            self.refused = true;
+            return;
+        };
+        let kind = lsp::SymbolKind::OBJECT;
+        self.symbol(node, label, kind, selection, |walker| {
+            visit::visit_item_impl(walker, node)
+        });
+    }
+}
+
+/// The span of `node`'s first token, `None` for a node without tokens.
+fn first_span(node: &dyn ToTokens) -> Option<Span> {
+    node.to_token_stream()
+        .into_iter()
+        .next()
+        .map(|token| token.span())
+}
+
+/// Whether two same-named same-kind siblings carry a `cfg`/`cfg_attr` attribute in either
+/// header: which branch is live is semantic knowledge, so the file refuses to guess. Same-named
+/// siblings without a gate stay (a type and its impl blocks, repeated trait impls), exactly as
+/// the server reports them. Linear in the number of siblings.
+fn cfg_duplicate(children: &[Symbol], lines: &[&str]) -> bool {
+    let mut groups: HashMap<(&str, SymbolKind), (usize, bool)> = HashMap::new();
+    for symbol in children {
+        let gated = (symbol.range.start..symbol.body.start).any(|line| {
+            matches!(
+                attr_path(line_at(lines, line).trim()),
+                Some("cfg" | "cfg_attr")
+            )
+        });
+        let group = groups
+            .entry((symbol.name.as_str(), symbol.kind))
+            .or_default();
+        group.0 += 1;
+        group.1 |= gated;
+    }
+    groups.values().any(|&(count, gated)| count > 1 && gated)
+}
+
+/// Unit tests: the recorded corpus against rust-analyzer's answers, the refusal rules, the
+/// nesting bound on a small stack, and the outline shapes the edit path relies on.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::support::RustSupport;
-    use agent_ide_core::lang::{InsertWhere, LanguageSupport};
+    use agent_ide_core::lang::{InsertWhere, LineRange, SymbolPath};
 
     /// The symbol whose children include one whose path ends with `#member`.
     fn owner_of<'a>(outline: &'a Outline, member: &str) -> &'a Symbol {
@@ -1374,12 +852,13 @@ mod tests {
     }
 
     /// The corpus under `tests/fixtures/lexical`: every `<name>.rs` sits next to the live
-    /// rust-analyzer's `textDocument/documentSymbol` answer for it, `<name>.json`, recorded once
-    /// with `record.mjs`. Each file's lexical outline either equals the server path's outline
-    /// ([`RustSupport::normalize`] of the recording) exactly — names, kinds, ranges, bodies,
-    /// signatures, docs, children and order — or is refused; a different outline is never
-    /// allowed. Files named `refused_*` must be refused (their shapes make rust-analyzer's range
-    /// depend on comments or blocks the scanner does not reproduce), every other file must match.
+    /// rust-analyzer's `textDocument/documentSymbol` answer for it, `<name>.json`, recorded with
+    /// `record.mjs` from the build named in `VERSION`. Each file's lexical outline either equals
+    /// the server path's outline ([`RustSupport::normalize`] of the recording) exactly — names,
+    /// kinds, ranges, bodies, signatures, docs, children and order — or is refused; a different
+    /// outline is never allowed. Files named `refused_*` must be refused (a syntax error
+    /// rust-analyzer recovers from, or comments and blocks the parse does not reproduce), every
+    /// other file must match.
     /// The server path is pinned too: every normalized range is the one rust-analyzer reported,
     /// so a header rule shared by both paths cannot widen both the same wrong way.
     #[test]
@@ -1391,7 +870,7 @@ mod tests {
             .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
             .collect();
         sources.sort();
-        assert!(sources.len() >= 10, "corpus: {sources:?}");
+        assert!(sources.len() >= 24, "corpus: {sources:?}");
         let mut exact = 0;
         for path in sources {
             let source = std::fs::read_to_string(&path).expect("corpus source");
@@ -1429,7 +908,7 @@ mod tests {
             assert_eq!(lexical, server, "{}", file.display());
             exact += 1;
         }
-        assert!(exact >= 4, "{exact} exact corpus files");
+        assert!(exact >= 11, "{exact} exact corpus files");
     }
 
     /// Addresses, kinds, ranges, signatures and docs match the server path's answers.
@@ -1615,7 +1094,7 @@ mod tests {
         assert_eq!(at("State/Off/why").signature, "Off");
     }
 
-    /// The outline the scanner builds is the one the edit path places inserts against.
+    /// The lexical outline is the one the edit path places inserts against.
     #[test]
     fn insertion_sites_resolve_over_the_lexical_outline() {
         let outline = outline();
@@ -1650,19 +1129,24 @@ let c = '{';\n    let _ = format!(\"{}\", c);\n    let _ = s.len() + r.len();\n}
         assert!(outline.symbols[0].children.is_empty());
     }
 
-    /// Every refusal rule: an unbalanced brace, an unknown token at item position, a macro
-    /// invocation at item position, and cfg-duplicated items with the same name all answer
-    /// `None`, so the file keeps waiting for the server instead of guessing a range.
+    /// Every refusal rule outside the corpus answers `None`, so the file keeps waiting for the
+    /// server instead of guessing a range: text that does not parse (an unbalanced brace, a
+    /// statement at item position, a shebang), syntax kept only as verbatim tokens (a
+    /// macro 2.0 definition), a trait alias, an extern block, whitespace rustc rejects, and
+    /// cfg-duplicated items with the same name.
     #[test]
     fn unclean_sources_are_refused() {
         let refused = [
             "fn a() {\n",
             "let x = 5;\n",
-            "foo! { fn generated() {} }\n",
-            "item!(x);\n",
+            "mod m {\n    fn only() {}\n",
+            "#!/usr/bin/env run-cargo-script\nfn main() {}\n",
+            "macro m() {}\n",
+            "trait Both = Clone + Send;\n",
+            "extern \"C\" {\n    fn abs(input: i32) -> i32;\n}\n",
+            "fn spaced() {\u{a0}}\n",
             "#[cfg(unix)]\nfn platform() {}\n#[cfg(windows)]\nfn platform() {}\n",
             "#[cfg(test)]\nimpl Guard {}\nimpl Guard {}\n",
-            "mod m {\n    fn only() {}\n",
         ];
         for source in refused {
             assert!(
@@ -1670,6 +1154,47 @@ let c = '{';\n    let _ = format!(\"{}\", c);\n    let _ = s.len() + r.len();\n}
                 "must be refused: {source:?}"
             );
         }
+    }
+
+    /// Pathological nesting — the review's 10 000 nested braces (a 20 KB file), a 10 000-deep
+    /// generic type, a 10 000-long prefix operator chain and a 10 000-term sum whose blocks
+    /// separate every term — is refused before the parser recurses, from a caller whose stack is
+    /// only 256 KiB; ordinary nesting still outlines from that caller, because the parse runs
+    /// on its own stack.
+    #[test]
+    fn pathological_nesting_is_refused_without_overflow() {
+        let deep = 10_000;
+        let refused = [
+            format!("fn f() {{{}{}}}\n", "{".repeat(deep), "}".repeat(deep)),
+            format!(
+                "fn f() {{ let _: {}u8{} = x; }}\n",
+                "Vec<".repeat(deep),
+                ">".repeat(deep)
+            ),
+            format!("fn f() {{ let _ = {}x; }}\n", "!".repeat(deep)),
+            format!("fn f() {{ let _ = 1{}; }}\n", " + {1} as u8".repeat(deep)),
+        ];
+        let nested = format!(
+            "fn f() {{{}\nfn inner() {{}}\n{}}}\n",
+            "{".repeat(100),
+            "}".repeat(100)
+        );
+        let (refused, inner) = std::thread::Builder::new()
+            .stack_size(256 << 10)
+            .spawn(move || {
+                let refused = refused
+                    .iter()
+                    .map(|source| lexical_outline(Path::new("a.rs"), source).is_none())
+                    .collect::<Vec<_>>();
+                let inner = lexical_outline(Path::new("a.rs"), &nested)
+                    .map(|outline| find(&outline, "f/inner").range);
+                (refused, inner)
+            })
+            .expect("small-stack thread")
+            .join()
+            .expect("no overflow");
+        assert_eq!(refused, [true; 4]);
+        assert_eq!(inner, Some(LineRange::new(2, 2)));
     }
 
     /// Same-named siblings without a gate stay, exactly as the server reports them: a type and

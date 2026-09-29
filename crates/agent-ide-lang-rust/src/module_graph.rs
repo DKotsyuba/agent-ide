@@ -250,7 +250,7 @@ pub(crate) fn blanked_code(text: &[char]) -> Vec<char> {
 /// when none starts there. Handles `//` and nested `/* */` comments, escaped `"…"` strings,
 /// raw `r#"…"#` strings (also `br`/`cr`), and `'x'`/`'\…'` char literals; a lifetime or label
 /// (`'a`) is not a literal. An unterminated comment or literal runs to the end of `text`.
-pub(crate) fn blank_end(text: &[char], index: usize) -> Option<usize> {
+fn blank_end(text: &[char], index: usize) -> Option<usize> {
     let at = |offset: usize| text.get(index + offset).copied();
     let identifier = |position: Option<usize>| {
         position

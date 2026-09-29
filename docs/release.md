@@ -202,7 +202,11 @@ The workflow runs the gates, then the product acceptance route
 executable). The toolchains prepared on the runner, and therefore the accepted versions in
 evidence rows, are rust-analyzer 1.98.1 (from the pinned Rust toolchain), pyright 1.1.413,
 typescript-language-server 6.0.0, TypeScript 5.9.3, and Node 24.4.0
-(`.github/workflows/release.yml`). After the smoke test the workflow generates one
+(`.github/workflows/release.yml`). Raising the pinned rust-analyzer also means recording the
+lexical outline corpus again with the new build
+(`node crates/agent-ide-lang-rust/tests/fixtures/lexical/record.mjs "$AGENT_IDE_RUST_ANALYZER"`,
+which writes its version to `VERSION` there) and keeping the corpus test green: the outline Rust
+answers from while rust-analyzer loads must equal that build's document symbols. After the smoke test the workflow generates one
 `SHA256SUMS`, attests build provenance for it (`actions/attest-build-provenance`), and
 publishes the tarball, `install.sh`, and `SHA256SUMS` to the GitHub Release only after every
 required job succeeds. A failed run leaves no public partial release. Tags are immutable;

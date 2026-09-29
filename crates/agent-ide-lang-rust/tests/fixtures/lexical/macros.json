@@ -1,0 +1,191 @@
+[
+ {
+  "name": "make",
+  "kind": 12,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 0,
+    "character": 0
+   },
+   "end": {
+    "line": 4,
+    "character": 1
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 0,
+    "character": 13
+   },
+   "end": {
+    "line": 0,
+    "character": 17
+   }
+  }
+ },
+ {
+  "name": "Holder",
+  "kind": 23,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 14,
+    "character": 0
+   },
+   "end": {
+    "line": 14,
+    "character": 18
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 14,
+    "character": 11
+   },
+   "end": {
+    "line": 14,
+    "character": 17
+   }
+  }
+ },
+ {
+  "name": "impl Holder",
+  "kind": 19,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 16,
+    "character": 0
+   },
+   "end": {
+    "line": 20,
+    "character": 1
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 16,
+    "character": 5
+   },
+   "end": {
+    "line": 16,
+    "character": 11
+   }
+  },
+  "children": [
+   {
+    "name": "real",
+    "detail": "fn()",
+    "kind": 12,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 19,
+      "character": 4
+     },
+     "end": {
+      "line": 19,
+      "character": 20
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 19,
+      "character": 11
+     },
+     "end": {
+      "line": 19,
+      "character": 15
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "Shape",
+  "kind": 11,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 22,
+    "character": 0
+   },
+   "end": {
+    "line": 25,
+    "character": 1
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 22,
+    "character": 10
+   },
+   "end": {
+    "line": 22,
+    "character": 15
+   }
+  },
+  "children": [
+   {
+    "name": "area",
+    "detail": "fn(&self) -> u8",
+    "kind": 6,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 24,
+      "character": 4
+     },
+     "end": {
+      "line": 24,
+      "character": 25
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 24,
+      "character": 7
+     },
+     "end": {
+      "line": 24,
+      "character": 11
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "host",
+  "detail": "fn()",
+  "kind": 12,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 27,
+    "character": 0
+   },
+   "end": {
+    "line": 30,
+    "character": 1
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 27,
+    "character": 7
+   },
+   "end": {
+    "line": 27,
+    "character": 11
+   }
+  }
+ }
+]

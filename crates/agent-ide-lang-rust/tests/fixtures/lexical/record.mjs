@@ -2,9 +2,13 @@
 // (`<name>.rs` -> `<name>.json`), with the capabilities the product session announces
 // (hierarchical document symbols, server status). The lexical corpus test in
 // `src/lexical.rs` compares the lexical outline against these recordings; re-run this after
-// adding or changing a corpus file:
+// adding or changing a corpus file, and after every rust-analyzer upgrade (the recordings are that
+// build's answers, and the corpus test then decides whether the lexical outline still equals
+// them):
 //
 //   node record.mjs "$AGENT_IDE_RUST_ANALYZER"
+//
+// The analyzer's `serverInfo.version` is written to `VERSION` next to the recordings.
 //
 // The files are opened inside a scratch Cargo package in the system temp directory, so the
 // analyzer has a workspace to load; document symbols are syntax-only and do not depend on it.
@@ -93,6 +97,7 @@ for (const name of files) {
   fs.writeFileSync(target, `${JSON.stringify(symbols, null, 1)}\n`);
   console.log(`${name}: ${symbols.length} top-level symbols (rust-analyzer ${version})`);
 }
+fs.writeFileSync(path.join(corpus, 'VERSION'), `${version}\n`);
 await request('shutdown', null);
 send({ method: 'exit' });
 fs.rmSync(root, { recursive: true, force: true });

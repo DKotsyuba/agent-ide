@@ -171,14 +171,15 @@ impl LanguageSupport for RustSupport {
         }
     }
 
-    /// Outline computed from the text alone by the lexical scanner (the `lexical` module), so a
-    /// cold rust-analyzer can still answer `ide.outline`, `ide.read` and symbol-addressed
+    /// Outline computed from the text alone (the `lexical` module parses it with `syn` and
+    /// rebuilds rust-analyzer's document symbols, which this type's `normalize` then converts),
+    /// so a cold rust-analyzer can still answer `ide.outline`, `ide.read` and symbol-addressed
     /// `ide.edit`. It is either the outline the server path would normalize for the same text or
-    /// `None`: whatever the scanner cannot reproduce exactly — comments rust-analyzer may attach
-    /// to an item's range, a macro invocation at item position, an extern block, a `// region:`
-    /// comment, cfg-duplicated items with the same name, unbalanced braces — keeps the file
-    /// server-backed instead of a guessed range. The recorded corpus in
-    /// `tests/fixtures/lexical` checks the equality against rust-analyzer's own answers.
+    /// `None`: whatever the parse cannot reproduce exactly — a syntax error rust-analyzer would
+    /// recover from, comments it may attach to an item's range, an extern block, a `// region:`
+    /// comment, cfg-duplicated items with the same name, pathological nesting — keeps the file
+    /// server-backed instead of a guessed range. The recorded corpus in `tests/fixtures/lexical`
+    /// checks the equality against rust-analyzer's own answers (the build in its `VERSION`).
     fn outline_from_source(&self, file: &Path, source: &str) -> Option<Outline> {
         crate::lexical::lexical_outline(file, source)
     }
@@ -591,7 +592,10 @@ fn convert(
         .collect();
     Symbol {
         signature: signature(lines, body, true),
-        doc: doc_of(&header),
+        doc: first_paragraph(header.iter().filter_map(|line| {
+            line.strip_prefix("///")
+                .filter(|_| !line.starts_with("////"))
+        })),
         path,
         kind,
         name,
@@ -601,19 +605,10 @@ fn convert(
     }
 }
 
-/// First doc paragraph of one symbol's trimmed header lines (`///` only, `////` excluded); the
-/// same extraction the server path and the lexical outline ([`crate::lexical`]) share.
-pub(crate) fn doc_of(header: &[&str]) -> Option<String> {
-    first_paragraph(header.iter().filter_map(|line| {
-        line.strip_prefix("///")
-            .filter(|_| !line.starts_with("////"))
-    }))
-}
-
 /// Path segment of an impl block named `impl …` by the server: the bare type name for an inherent
 /// impl (generic parameters, generic arguments and the module path dropped), the whitespace-
 /// normalized name unchanged for a trait impl (`… for …`) or a name that is not an impl.
-pub(crate) fn impl_segment(name: &str) -> String {
+fn impl_segment(name: &str) -> String {
     let name = collapse_whitespace(name);
     let Some(rest) = name.strip_prefix("impl") else {
         return name;
@@ -632,7 +627,7 @@ pub(crate) fn impl_segment(name: &str) -> String {
 
 /// `text` after its leading balanced `<…>` generic parameter list, or `""` when it never closes.
 /// The `>` of an `->` inside a bound (`impl<F: Fn() -> u8>`) closes nothing.
-pub(crate) fn skip_generics(text: &str) -> &str {
+fn skip_generics(text: &str) -> &str {
     let mut depth = 0usize;
     let mut previous = None;
     for (index, ch) in text.char_indices() {
@@ -651,12 +646,12 @@ pub(crate) fn skip_generics(text: &str) -> &str {
 
 /// Whether a trimmed header line is an attribute whose path ends in `test` (`#[test]`,
 /// `#[tokio::test(flavor = "multi_thread")]`).
-pub(crate) fn is_test_attr(line: &str) -> bool {
+fn is_test_attr(line: &str) -> bool {
     attr_path(line).is_some_and(|path| path == "test" || path.ends_with("::test"))
 }
 
 /// Whether a trimmed header line is a `#[cfg(…)]` naming `test` (not under `not(…)`).
-pub(crate) fn is_cfg_test(line: &str) -> bool {
+fn is_cfg_test(line: &str) -> bool {
     attr_path(line) == Some("cfg")
         && !line.contains("not(")
         && line
@@ -679,7 +674,7 @@ fn is_mod_signature(signature: &str) -> bool {
 
 /// First line of the Rust header above the declaration on 1-based line `decl` (`decl` itself when
 /// there is none): `///` lines and outer attributes, see the module docs.
-pub(crate) fn header_start(lines: &[&str], decl: u32) -> u32 {
+fn header_start(lines: &[&str], decl: u32) -> u32 {
     let mut start = decl;
     let mut line = decl.saturating_sub(1);
     while line >= 1 {

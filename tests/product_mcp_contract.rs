@@ -7841,7 +7841,19 @@ async fn configured_product_rust_outline_answers_when_home_is_a_substitute_with_
 
 /// The lexical corpus files (`crates/agent-ide-lang-rust/tests/fixtures/lexical`) whose lexical
 /// outline must equal the server's; the cross-check copies them in as `src/corpus_<name>.rs`.
-const EXACT_LEXICAL_CORPUS: [&str; 4] = ["attrs", "generics", "items", "module_docs"];
+const EXACT_LEXICAL_CORPUS: [&str; 11] = [
+    "attrs",
+    "block_doc",
+    "comma_next_line",
+    "expressions",
+    "generics",
+    "impl_literals",
+    "items",
+    "macros",
+    "module_docs",
+    "split_header",
+    "whitespace",
+];
 
 /// Builds the lexical cross-check fixture: the symbol-test crate with real repository sources
 /// copied in as modules, so one warm rust-analyzer outlines exactly the shapes the product
