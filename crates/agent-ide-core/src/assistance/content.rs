@@ -693,6 +693,24 @@ mod tests {
         }
     }
 
+    /// A file the project check never analysed says so with the language's reason and the next
+    /// step, never `current_clean`.
+    #[test]
+    fn not_analysed_diagnostics_render_the_reason_and_next_step() {
+        let reply = successful_edit_reply(EditDiagnostics::NotAnalysed {
+            reason: "the check did not compile this file".into(),
+        });
+        let rendered = render(reply, Envelope::TextOnly).unwrap();
+        let text = text_of(&rendered);
+        assert!(
+            text.contains(
+                "diagnostics: not_analysed (the check did not compile this file); declare it, \
+                 then edit again"
+            ) && !text.contains("current_clean"),
+            "{text}"
+        );
+    }
+
     /// Names both content changes and unusable references without claiming which one occurred.
     #[test]
     fn stale_edit_text_explains_why_no_write_occurred() {

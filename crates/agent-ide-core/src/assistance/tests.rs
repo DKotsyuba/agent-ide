@@ -1,13 +1,14 @@
 //! Explicit, daemon-owned background test jobs and their bounded runner output.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
+use super::host_binding::BindingRef;
 use crate::lang::{Language, TestReport};
 
 /// Maximum combined stdout and stderr retained for `ide.inspect`.
@@ -43,6 +44,11 @@ struct Job {
     root: PathBuf,
     /// Binding that owns the original output detail reference.
     owner: [u8; 32],
+    /// Actor/channel identity of that binding; a run-handle lookup answers it across generations,
+    /// so the status outlives `ide.stop`.
+    channel: [u8; 32],
+    /// Detail reference retained for this run's paged output while the run is retained.
+    detail_ref: String,
     /// Monotonic start time used for status ages.
     started: tokio::time::Instant,
     /// Absent while active, present after exit, spawn failure, or budget expiry.
@@ -64,6 +70,8 @@ pub struct RunResult {
     pub elapsed: Duration,
     /// True when the process was killed at its time budget.
     pub stopped: bool,
+    /// Process exit code; absent after a budget kill, a signal, or a spawn failure.
+    pub exit: Option<i32>,
     /// Budget configured for this process.
     pub budget: Duration,
     /// Detail reference retained under the binding that started the process.
@@ -124,7 +132,7 @@ impl TestRuns {
         language: Language,
         budget: Duration,
         detail_ref: String,
-        owner: [u8; 32],
+        owner: &BindingRef,
     ) -> StartResult {
         let mut state = match self.0.lock() {
             Ok(state) => state,
@@ -148,7 +156,9 @@ impl TestRuns {
             id,
             Job {
                 root: root.clone(),
-                owner,
+                owner: owner.fingerprint(),
+                channel: owner.channel_identity().fingerprint(),
+                detail_ref: detail_ref.clone(),
                 started,
                 result: None,
                 completed_at: None,
@@ -186,11 +196,16 @@ impl TestRuns {
         })
     }
 
-    /// Returns one daemon-global job's status for its starting binding, without a worktree: the
-    /// handle an agent invented for `ide.inspect` (`tests #N`) names a run, not a detail.
-    pub fn find(&self, id: u64, owner: &[u8; 32]) -> Option<JobStatus> {
+    /// Returns one daemon-global job's status for any generation of its starting actor and
+    /// channel, without a worktree: the handle an agent invented for `ide.inspect` (`tests #N`)
+    /// names a run, not a detail, and still answers after that actor's `ide.stop`.
+    pub fn find(&self, id: u64, caller: &BindingRef) -> Option<JobStatus> {
+        let channel = caller.channel_identity().fingerprint();
         let mut state = self.0.lock().ok()?;
-        let job = state.jobs.get_mut(&id).filter(|job| &job.owner == owner)?;
+        let job = state
+            .jobs
+            .get_mut(&id)
+            .filter(|job| job.channel == channel)?;
         if job.result.is_some() {
             job.observed = true;
         }
@@ -307,6 +322,21 @@ impl TestRuns {
         true
     }
 
+    /// Returns the output detail references of every retained run; the worker never evicts them,
+    /// so a run's full output stays readable while its result does.
+    pub fn detail_refs(&self) -> BTreeSet<String> {
+        self.0.lock().map_or_else(
+            |_| BTreeSet::new(),
+            |state| {
+                state
+                    .jobs
+                    .values()
+                    .map(|job| job.detail_ref.clone())
+                    .collect()
+            },
+        )
+    }
+
     /// Reports whether any daemon-owned test child is still running.
     pub fn is_busy(&self) -> bool {
         self.0.lock().is_ok_and(|state| {
@@ -339,33 +369,43 @@ fn prune_completed(registry: &Arc<Mutex<State>>, root: &PathBuf) {
 /// Renders one job's current compact status without consuming its delivery state.
 fn render_status_line(id: u64, job: &Job) -> Option<String> {
     Some(match &job.result {
-        Some(result) if result.stopped => format!(
-            "tests #{id}: stopped at budget {} s — {} passed, {} failed so far",
-            result.budget.as_secs(),
-            result.report.passed,
-            result.report.failed
-        ),
-        Some(result)
-            if result.report.passed == 0
-                && result.report.failed == 0
-                && result.report.incomplete =>
-        {
-            format!(
-                "tests #{id}: no summary parsed, {} s — inspect the runner's full output with ide.inspect",
-                result.elapsed.as_secs()
-            )
-        }
-        Some(result) => format!(
-            "tests #{id}: {} passed, {} failed, {} s",
-            result.report.passed,
-            result.report.failed,
-            result.elapsed.as_secs()
-        ),
+        Some(result) => result_line(id, result),
         None => format!(
             "tests #{id}: running {} s; poll: ide.test {{\"status\": {id}}}",
             job.started.elapsed().as_secs()
         ),
     })
+}
+
+/// Renders one settled run's first status line, shared by the status plate and the full result.
+///
+/// A run that counted no test is never shown as `0 passed, 0 failed`: a non-zero exit says the
+/// runner could not run (`no test results (exit N)`), and a missing summary says so.
+pub fn result_line(id: u64, result: &RunResult) -> String {
+    let report = &result.report;
+    let seconds = result.elapsed.as_secs();
+    let counted = report.passed != 0 || report.failed != 0;
+    if result.stopped {
+        format!(
+            "tests #{id}: stopped at budget {} s — {} passed, {} failed so far",
+            result.budget.as_secs(),
+            report.passed,
+            report.failed
+        )
+    } else if let Some(code) = result.exit.filter(|code| *code != 0 && !counted) {
+        format!(
+            "tests #{id}: no test results (exit {code}), {seconds} s — inspect the runner's full output with ide.inspect"
+        )
+    } else if !counted && report.incomplete {
+        format!(
+            "tests #{id}: no summary parsed, {seconds} s — inspect the runner's full output with ide.inspect"
+        )
+    } else {
+        format!(
+            "tests #{id}: {} passed, {} failed, {seconds} s",
+            report.passed, report.failed
+        )
+    }
 }
 
 /// Runs one command with inherited environment, bounded output, a process-group budget kill,
@@ -475,6 +515,7 @@ async fn run_child(
         output,
         elapsed: started.elapsed(),
         stopped,
+        exit: status.and_then(|status| status.code()),
         budget,
         detail_ref: String::new(),
         command: Vec::new(),
@@ -492,6 +533,7 @@ fn failed_run(budget: Duration, output: String) -> RunResult {
         output,
         elapsed: Duration::ZERO,
         stopped: false,
+        exit: None,
         budget,
         detail_ref: String::new(),
         command: Vec::new(),
@@ -589,6 +631,48 @@ mod runner_tests {
         let _ = std::fs::remove_file(pid_file);
     }
 
+    /// A runner that exits non-zero without counting a test (pytest's `no tests ran` from an
+    /// unusable environment, a build error) reads `no test results (exit N)`, never
+    /// `0 passed, 0 failed`; a zero exit keeps the counted line.
+    #[tokio::test]
+    async fn uncounted_nonzero_exit_reads_no_test_results() {
+        let result = run(
+            &std::env::temp_dir(),
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo 'no tests ran in 0.01s'; exit 2".into(),
+            ],
+            crate::lang::testing::ALPHA,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(result.exit, Some(2));
+        let line = result_line(1, &result);
+        assert!(
+            line.starts_with("tests #1: no test results (exit 2), "),
+            "{line}"
+        );
+        let counted_zero = RunResult {
+            report: TestReport::default(),
+            exit: Some(0),
+            ..result.clone()
+        };
+        assert!(
+            result_line(1, &counted_zero).starts_with("tests #1: 0 passed, 0 failed, "),
+            "{}",
+            result_line(1, &counted_zero)
+        );
+        let failed = RunResult {
+            report: TestReport {
+                failed: 1,
+                ..TestReport::default()
+            },
+            ..result
+        };
+        assert!(result_line(1, &failed).starts_with("tests #1: 0 passed, 1 failed, "));
+    }
+
     /// Refuses a second live test job for the same worktree.
     #[tokio::test]
     async fn second_job_is_refused_while_first_runs() {
@@ -601,7 +685,7 @@ mod runner_tests {
                 crate::lang::testing::ALPHA,
                 Duration::from_secs(3),
                 "r1".into(),
-                [1; 32]
+                &BindingRef::fixture("actor-1", "channel-1", 1)
             ),
             StartResult::Started(1)
         ));
@@ -612,7 +696,7 @@ mod runner_tests {
                 crate::lang::testing::ALPHA,
                 Duration::from_secs(3),
                 "r2".into(),
-                [2; 32]
+                &BindingRef::fixture("actor-2", "channel-2", 1)
             ),
             StartResult::Running(1, _)
         ));

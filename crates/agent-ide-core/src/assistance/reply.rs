@@ -256,6 +256,12 @@ pub enum EditDiagnostics {
     },
     /// No matching-generation diagnostic result was established before the edit deadline.
     Unknown {},
+    /// The completed project check named no problem in the file but never analysed it (for
+    /// example a source file no build target reaches); never a clean result.
+    NotAnalysed {
+        /// Bounded language-provided reason, at most 256 UTF-8 bytes.
+        reason: String,
+    },
     /// Matching-generation diagnostic work remains inspectable by the same binding.
     Pending {
         /// Opaque retained reference accepted only by `ide.inspect` under that binding.
@@ -315,6 +321,9 @@ impl EditDiagnostics {
     pub(super) fn valid(&self) -> bool {
         match self {
             Self::CurrentClean {} | Self::Unknown {} => true,
+            Self::NotAnalysed { reason } => {
+                !reason.is_empty() && reason.len() <= 256 && !reason.chars().any(char::is_control)
+            }
             Self::CurrentReported {
                 messages, delta, ..
             } => {

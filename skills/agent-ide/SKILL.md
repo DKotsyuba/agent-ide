@@ -112,7 +112,8 @@ the language server is still loading the workspace: repeat the same call in a fe
    names the operation instead when it was an insert, delete or rename), follow
    its closed diagnostic state: `current_reported` → `ide.edit` with the
    returned `source_ref`; `current_clean` → `ide.diff`; `unknown` diagnostics
-   → `ide.context`. A pending diagnostic still requires `ide.inspect` with its
+   → `ide.context`; `not_analysed` means the project check never compiled the
+   file (a Rust file no `mod` declares) — declare it, then edit again. A pending diagnostic still requires `ide.inspect` with its
    returned `detail_ref`. An `outcome_unknown` *result* is a different unknown
    from `unknown` *diagnostics*: the edit's own effect, not just its
    diagnostics, is unproven, so inspect the named path with native host tools
@@ -163,6 +164,9 @@ counts rise after your edit, call `ide.context` with `{"kind": "problems"}` (opt
 list before continuing. The `typescript` filter covers `.ts`, `.tsx`, `.js`, and `.jsx`.
 An LSP diagnostic push can give only a provisional lower bound for TypeScript/JavaScript;
 claim exact Clean only after a completed configured project check.
+A `git: HEAD moved … outside Agent IDE` line (delivered once) means another process switched the
+worktree's branch: symbol answers you already hold may describe the old branch, so re-read before
+editing from them.
 `check failed (<reason>)`, `environment not found`, `no files analyzed`, `outside allowed roots`
 or `checks disabled` mean the feed has no counts for that language — never treat them as a clean
 result.

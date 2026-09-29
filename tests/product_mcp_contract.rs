@@ -4674,6 +4674,68 @@ async fn a_pending_edit_under_a_capped_check_of_other_files_settles_unknown() {
     daemon.wait().await.unwrap();
 }
 
+/// A Rust file no `mod` declaration reaches is never compiled by `cargo check`, so a check that
+/// named no problem in it answers `not_analysed`, never `current_clean`; a declared file stays clean.
+#[tokio::test]
+async fn an_edit_to_an_undeclared_rust_module_is_not_analysed() {
+    let fixture = ProductFixture::new(json!([]));
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "orphan-edit").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"orphan-edit"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let mut edit = async |path: &str, operation: &str, content: &str| {
+        let context = actor
+            .call(&fixture, "ide.context", json!({"path":path}))
+            .await;
+        let context = actor.settle(&fixture, context).await;
+        let edit = actor
+            .call(
+                &fixture,
+                "ide.edit",
+                json!({"operation_id":operation,"path":path,
+                       "source_ref":context["detail_ref"],"content":content}),
+            )
+            .await;
+        actor.settle(&fixture, edit).await
+    };
+    let orphan = edit("src/orphan.rs", "orphan-create", "pub fn orphan() {}\n").await;
+    assert_eq!(orphan["result"]["outcome"], "created", "{orphan}");
+    assert_eq!(orphan["diagnostics"]["state"], "not_analysed", "{orphan}");
+    assert_eq!(
+        orphan["diagnostics"]["reason"],
+        "rust check did not compile this file — not declared with `mod`",
+        "{orphan}"
+    );
+    let declared = edit(
+        "src/lib.rs",
+        "orphan-declare",
+        "pub mod orphan;\npub fn value() -> i32 { 7 }\n",
+    )
+    .await;
+    assert_eq!(
+        declared["diagnostics"]["state"], "current_clean",
+        "{declared}"
+    );
+    let orphan = edit(
+        "src/orphan.rs",
+        "orphan-again",
+        "pub fn orphan() -> u8 { 1 }\n",
+    )
+    .await;
+    assert_eq!(orphan["diagnostics"]["state"], "current_clean", "{orphan}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A session that never calls `ide.start` produces hook bookkeeping, not failures: one `info`
 /// skip line per detail per window on each side, and no `warn` hook line at all.
 #[tokio::test]
@@ -5645,6 +5707,104 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
         "last output page lost the summary: {page}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A branch another process checks out after activation reaches the next terminal reply's plate
+/// once as a `git: HEAD moved …` line, and is not repeated.
+#[tokio::test]
+async fn a_branch_switched_outside_the_ide_is_noticed_once_on_the_plate() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "head-moved").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"head-moved"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    fixture.git(&["checkout", "--quiet", "-b", "moved-elsewhere"]);
+    let context = actor
+        .call(&fixture, "ide.context", json!({"path":"src/lib.rs"}))
+        .await;
+    let context = actor.settle(&fixture, context).await;
+    let plate = carried_status(&context).unwrap_or_else(|| panic!("{context}"));
+    assert!(
+        plate.starts_with("<agent-ide>\ngit: HEAD moved ")
+            && plate.contains(
+                " → moved-elsewhere) outside Agent IDE; earlier indexed answers may be stale"
+            ),
+        "{plate}"
+    );
+    let again = actor
+        .call(&fixture, "ide.context", json!({"path":"src/lib.rs"}))
+        .await;
+    let again = actor.settle(&fixture, again).await;
+    assert!(
+        carried_status(&again).is_none_or(|plate| !plate.contains("git: HEAD moved")),
+        "{again}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// After `ide.stop` a test-run handle still answers the run's status through `ide.inspect`, without
+/// a plate or the dropped `full output` detail; every other reference ends with the session.
+#[tokio::test]
+async fn configured_product_test_handle_answers_after_stop() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "status-after-stop").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"after-stop"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let run = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c","printf 'running 1 test\\ntest demo ... ok\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\\n'"]}),
+        )
+        .await;
+    let run_ref = run["detail_ref"].as_str().unwrap().to_owned();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the run did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = actor.call(&fixture, "ide.test", json!({"status":1})).await;
+        if status["text"]
+            .as_str()
+            .unwrap()
+            .contains("1 passed, 0 failed")
+        {
+            break;
+        }
+    }
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    let handle = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":"tests #1"}))
+        .await;
+    assert_eq!(handle["state"], "complete", "{handle}");
+    let text = handle["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("tests #1: 1 passed, 0 failed") && !text.contains("full output"),
+        "{handle}"
+    );
+    assert!(carried_status(&handle).is_none(), "{handle}");
+    let detail = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":run_ref}))
+        .await;
+    assert_eq!(detail["state"], "unavailable", "{detail}");
+    let context = actor
+        .call(&fixture, "ide.context", json!({"path":"src/lib.rs"}))
+        .await;
+    assert_eq!(context["state"], "unavailable", "{context}");
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();

@@ -540,6 +540,8 @@ struct Shared {
     project_feed: Option<Arc<ProjectProblemFeed>>,
     /// Explicitly requested background test processes, retained until daemon shutdown.
     test_runs: TestRuns,
+    /// Undelivered one-shot `git: HEAD moved …` plate lines keyed by binding fingerprint.
+    git_notices: Mutex<BTreeMap<[u8; 32], String>>,
 }
 impl Shared {
     /// Acquires a new transient binding use at one exact admission/return boundary.
@@ -961,6 +963,7 @@ impl WorkerHandle {
                 problem_source: None,
                 project_feed: None,
                 test_runs: TestRuns::default(),
+                git_notices: Mutex::new(BTreeMap::new()),
             }),
             inspect,
             receiver: Mutex::new(Some(receiver)),
@@ -1010,6 +1013,19 @@ impl WorkerHandle {
     /// Marks a test status line delivered only if it is still current and fits the reply.
     pub fn mark_test_status_delivered(&self, binding: &[u8; 32], line: &str) -> bool {
         self.shared.test_runs.mark_status_delivered(binding, line)
+    }
+
+    /// Returns the binding's undelivered `git: HEAD moved …` plate line, if any.
+    pub fn git_notice(&self, binding: &[u8; 32]) -> Option<String> {
+        self.shared.git_notices.lock().ok()?.get(binding).cloned()
+    }
+
+    /// Consumes exactly `line` once it was delivered; a newer notice stays due.
+    pub fn consume_git_notice(&self, binding: &[u8; 32], line: &str) -> bool {
+        self.shared.git_notices.lock().is_ok_and(|mut notices| {
+            notices.get(binding).map(String::as_str) == Some(line)
+                && notices.remove(binding).is_some()
+        })
     }
 
     /// Returns the shared slot that holds the telemetry owner once startup has opened it.
@@ -1172,6 +1188,7 @@ impl WorkerHandle {
                 pending_revocations: std::collections::BTreeSet::new(),
                 registered: BTreeMap::new(),
                 baselines: BTreeMap::new(),
+                heads: BTreeMap::new(),
                 source_sequence: 0,
                 uncertain: std::collections::BTreeSet::new(),
                 uncertain_snapshots: Vec::new(),
@@ -1532,6 +1549,7 @@ impl WorkerHandle {
                 self.shared.launcher.limits.details,
                 &binding,
                 tool,
+                &self.shared.test_runs.detail_refs(),
             );
             if ledger.details.len() >= self.shared.launcher.limits.details {
                 return Err(FailureCode::Capacity);
@@ -1658,10 +1676,12 @@ fn edit_operation(parameters: &Value) -> Option<String> {
 /// another binding's work.
 const FAIR_DETAILS_PER_BINDING: usize = 8;
 
-/// `true` exactly when a detail's reply reached a terminal state, so only a future inspection —
-/// never its own still-running job — can consume it. Pending facts are never eviction candidates.
-fn detail_settled(reply: &PeerReply) -> bool {
-    !matches!(reply, PeerReply::Pending { .. })
+/// `true` exactly when a detail may be evicted: its reply reached a terminal state, so only a
+/// future inspection — never its own still-running job — can consume it, and it is not a retained
+/// test run's output (`pinned`), which stays readable while the run's result does. Pending facts
+/// and pinned outputs are never eviction candidates.
+fn detail_evictable(reference: &str, reply: &PeerReply, pinned: &BTreeSet<String>) -> bool {
+    !matches!(reply, PeerReply::Pending { .. }) && !pinned.contains(reference)
 }
 
 /// Extracts the monotonic per-boot counter from one detail reference (`<nonce>-<n>`), which is
@@ -1678,11 +1698,18 @@ fn detail_sequence(reference: &str) -> u64 {
 /// [`FAIR_DETAILS_PER_BINDING`] settled facts: a reply the agent may still inspect is never
 /// taken from it, so a binding below that share frees nothing and the request is refused as
 /// before.
-fn evict_binding_oldest(ledger: &mut Ledger, limit: usize, owner: &BindingRef) -> usize {
+fn evict_binding_oldest(
+    ledger: &mut Ledger,
+    limit: usize,
+    owner: &BindingRef,
+    pinned: &BTreeSet<String>,
+) -> usize {
     let mut candidates: Vec<(u64, String)> = ledger
         .details
         .iter()
-        .filter(|(_, detail)| detail.binding == *owner && detail_settled(&detail.reply))
+        .filter(|(reference, detail)| {
+            detail.binding == *owner && detail_evictable(reference, &detail.reply, pinned)
+        })
         .map(|(reference, _)| (detail_sequence(reference), reference.clone()))
         .collect();
     candidates.sort_unstable();
@@ -1705,7 +1732,8 @@ fn evict_binding_oldest(ledger: &mut Ledger, limit: usize, owner: &BindingRef) -
 /// first every settled detail whose binding is absent from `cancellation` (stopped, or never
 /// completed activation) and can therefore never be inspected again, then the requesting
 /// binding's own oldest settled details, then the oldest settled details of any other binding
-/// holding more than [`FAIR_DETAILS_PER_BINDING`]. Pending facts are never evicted; a ledger
+/// holding more than [`FAIR_DETAILS_PER_BINDING`]. Pending facts and the output details of
+/// retained test runs (`pinned`) are never evicted; a ledger
 /// that stays full after the batch refuses the request as before. One informational journal
 /// line records the whole batch so an operator can see the release happened.
 fn evict_settled_details(
@@ -1713,6 +1741,7 @@ fn evict_settled_details(
     limit: usize,
     requesting: &BindingRef,
     tool: AssistanceTool,
+    pinned: &BTreeSet<String>,
 ) {
     let mut freed = 0usize;
     // (a) Settled facts of bindings no longer active: no future `ide.inspect` under any live
@@ -1720,8 +1749,9 @@ fn evict_settled_details(
     let inactive: Vec<String> = ledger
         .details
         .iter()
-        .filter(|(_, detail)| {
-            detail_settled(&detail.reply) && !ledger.cancellation.contains_key(&detail.binding)
+        .filter(|(reference, detail)| {
+            detail_evictable(reference, &detail.reply, pinned)
+                && !ledger.cancellation.contains_key(&detail.binding)
         })
         .map(|(reference, _)| reference.clone())
         .collect();
@@ -1732,7 +1762,7 @@ fn evict_settled_details(
     if ledger.details.len() >= limit {
         // (b) The requesting binding's own oldest settled facts yield before any other
         // binding's.
-        freed += evict_binding_oldest(ledger, limit, requesting);
+        freed += evict_binding_oldest(ledger, limit, requesting, pinned);
     }
     if ledger.details.len() >= limit {
         // (c) Bindings beyond their fair share give up their oldest settled facts.
@@ -1752,7 +1782,7 @@ fn evict_settled_details(
                 .filter(|detail| detail.binding == binding)
                 .count();
             if held > FAIR_DETAILS_PER_BINDING {
-                freed += evict_binding_oldest(ledger, limit, &binding);
+                freed += evict_binding_oldest(ledger, limit, &binding, pinned);
             }
         }
     }
@@ -1794,6 +1824,8 @@ struct Worker<'a> {
     registered: BTreeMap<BindingRef, std::collections::BTreeSet<std::path::PathBuf>>,
     /// Durable partial activation baselines retained for same-binding diff provenance.
     baselines: BTreeMap<BindingRef, crate::workspace::git::BaselineContext>,
+    /// Checked-out branch or detached commit last seen per binding, first read by its start.
+    heads: BTreeMap<BindingRef, crate::workspace::git::head::HeadState>,
     /// Boot-unique source observation operation sequence.
     source_sequence: u64,
     /// Finite physical-effect admission, shared by discovery, snapshots and language providers.
@@ -2090,7 +2122,7 @@ impl<'a> Worker<'a> {
                 language,
                 budget,
                 job.reference.clone(),
-                binding.fingerprint(),
+                &binding,
             ) {
                 StartResult::Started(id) => {
                     let selected =
@@ -2356,6 +2388,9 @@ impl<'a> Worker<'a> {
                     ..Default::default()
                 },
             );
+        }
+        if let Some(authority) = &authority {
+            self.observe_head(&binding, authority);
         }
         if let Some(feed) = &self.shared.project_feed {
             match (&reply, &authority) {
@@ -3677,6 +3712,14 @@ impl<'a> Worker<'a> {
             // file's problems may be among the dropped ones, so it is neither clean nor reported.
             if truncated {
                 EditDiagnostics::Unknown {}
+            } else if let Some(reason) = language
+                .checks()
+                .and_then(|checks| checks.not_analysed(worktree, std::path::Path::new(wanted)))
+            {
+                // Naming no problem in a file the check never compiled proves nothing about it.
+                EditDiagnostics::NotAnalysed {
+                    reason: reason.to_owned(),
+                }
             } else {
                 EditDiagnostics::CurrentClean {}
             }
@@ -3780,11 +3823,33 @@ impl<'a> Worker<'a> {
         Ok(())
     }
 
+    /// Compares the worktree's checked-out branch or detached commit with the one this binding
+    /// last saw (first read by its start) and leaves one plate notice when it changed outside the
+    /// IDE. Notice only: nothing is invalidated or restarted. Reads two or three small Git files.
+    fn observe_head(&mut self, binding: &BindingRef, authority: &AuthorityStamp) {
+        let Some(now) = crate::workspace::git::head::HeadState::read(
+            authority.worktree().worktree_path(),
+            authority.worktree().git_common_dir(),
+        ) else {
+            return;
+        };
+        if let Some(before) = self.heads.insert(binding.clone(), now.clone())
+            && let Some(notice) = before.moved_notice(&now)
+            && let Ok(mut notices) = self.shared.git_notices.lock()
+        {
+            notices.insert(binding.fingerprint(), notice);
+        }
+    }
+
     /// Releases the binding-owned state that only a committed durable revoke makes safe to clear.
     fn release_binding_state(&mut self, binding: &BindingRef) {
         self.quiesce_worktree_caches(binding);
         self.registered.remove(binding);
         self.baselines.remove(binding);
+        self.heads.remove(binding);
+        if let Ok(mut notices) = self.shared.git_notices.lock() {
+            notices.remove(&binding.fingerprint());
+        }
         if let Ok(mut ledger) = self.shared.ledger.lock() {
             ledger.feedback.remove(binding);
             ledger.delivered.remove(binding);
@@ -3893,15 +3958,14 @@ impl InspectFailure {
 /// reference path, so a newly denied secondary file invalidates its cached page.
 async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, request: Inspection) {
     let result: Result<PeerReply, InspectFailure> = async {
-        let active = shared
-            .active(&request.binding)
-            .map_err(InspectFailure::new)?;
         // A test-run handle (`tests #N`, `tests-N`, `#N`, `N`) is what callers reach for first
         // after `tests #N: started`; it names a background run, not a retained detail, so answer
-        // with that run's status instead of failing the lookup.
+        // with that run's status instead of failing the lookup. The status belongs to the actor
+        // and channel, not one generation, so it answers before the liveness check — also after
+        // `ide.stop`, when the output detail is gone and its `full output` line is left out.
         if let Some(id) = test_run_handle(&request.reference) {
             let owner = request.binding.fingerprint();
-            let text = match shared.test_runs.find(id, &owner) {
+            let text = match shared.test_runs.find(id, &request.binding) {
                 Some(status) => match &status.result {
                     Some(result) => test_result_text(id, result, status.owner == owner),
                     None => format!(
@@ -3919,6 +3983,9 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 continuation: false,
             });
         }
+        let active = shared
+            .active(&request.binding)
+            .map_err(InspectFailure::new)?;
         let (
             reply,
             authority,
@@ -4207,7 +4274,7 @@ fn source_matches(source: &SourceObservation) -> bool {
 
 /// Parses a test-run handle — `tests #N`, `tests-N`, `#N` or `N` — to its run number. A minted
 /// detail reference (`<64-hex>-<n>`) never parses as one, so the alias cannot shadow a detail.
-fn test_run_handle(reference: &str) -> Option<u64> {
+pub(crate) fn test_run_handle(reference: &str) -> Option<u64> {
     let rest = reference.strip_prefix("tests").unwrap_or(reference);
     let rest = rest.trim_start_matches(' ');
     let rest = rest
@@ -4508,30 +4575,7 @@ fn test_text_line(value: &str, max_chars: usize) -> String {
 /// Renders the bounded parsed test result and actionable rerun/detail references.
 fn test_result_text(id: u64, result: &super::tests::RunResult, owns_detail: bool) -> String {
     let report = &result.report;
-    let mut text = if report.passed == 0
-        && report.failed == 0
-        && report.incomplete
-        && !result.stopped
-    {
-        format!(
-            "tests #{id}: no summary parsed, {} s — inspect the runner's full output with ide.inspect",
-            result.elapsed.as_secs()
-        )
-    } else if result.stopped {
-        format!(
-            "tests #{id}: stopped at budget {} s — {} passed, {} failed so far",
-            result.budget.as_secs(),
-            report.passed,
-            report.failed
-        )
-    } else {
-        format!(
-            "tests #{id}: {} passed, {} failed, {} s",
-            report.passed,
-            report.failed,
-            result.elapsed.as_secs()
-        )
-    };
+    let mut text = super::tests::result_line(id, result);
     for failure in report.failures.iter().take(8) {
         text.push_str(&format!("\n  FAIL {}", test_text_line(&failure.name, 160)));
         if let Some((path, line)) = &failure.location {
@@ -4935,6 +4979,7 @@ mod stop_retry_tests {
                 problem_source: None,
                 project_feed: None,
                 test_runs: TestRuns::default(),
+                git_notices: Mutex::new(BTreeMap::new()),
             }),
             workspace,
             observations: WorkspaceStore::new(store),
@@ -4943,6 +4988,7 @@ mod stop_retry_tests {
             pending_revocations: std::collections::BTreeSet::new(),
             registered: BTreeMap::new(),
             baselines: BTreeMap::new(),
+            heads: BTreeMap::new(),
             source_sequence: 0,
             admission: Arc::new(Mutex::new(admission_controller())),
             uncertain: std::collections::BTreeSet::new(),
@@ -5876,6 +5922,48 @@ mod stop_retry_tests {
         assert!(ledger.details.contains_key(&reference));
     }
 
+    /// A retained test run's output detail is never evicted, so its full output stays readable
+    /// between polls: the next-oldest settled detail yields instead.
+    #[tokio::test]
+    async fn retained_test_output_detail_is_never_evicted() {
+        let fixture = Fixture::new();
+        let handle = detail_handle(&fixture.root, 10);
+        let sole = validated_call(&handle.shared.bindings, "sole-actor", "sole-start")
+            .binding_ref()
+            .clone();
+        for n in 1..=10 {
+            let reference = format!("detail-{n}");
+            plant_detail(&handle, &reference, &sole, settled_detail(&reference));
+        }
+        handle
+            .shared
+            .ledger
+            .lock()
+            .unwrap()
+            .cancellation
+            .insert(sole.clone(), watch::channel(false).0);
+        assert!(matches!(
+            handle.shared.test_runs.start(
+                fixture.root.clone(),
+                vec!["/bin/echo".into(), "pass".into()],
+                crate::lang::testing::ALPHA,
+                Duration::from_secs(30),
+                "detail-1".into(),
+                &sole,
+            ),
+            StartResult::Started(_)
+        ));
+        let invocation = validated_call(&handle.shared.bindings, "sole-actor", "sole-next");
+        let reference = enqueue_context(&handle, invocation).unwrap();
+        let ledger = handle.shared.ledger.lock().unwrap();
+        assert!(
+            ledger.details.contains_key("detail-1"),
+            "the test run's output detail must survive"
+        );
+        assert!(!ledger.details.contains_key("detail-2"));
+        assert!(ledger.details.contains_key(&reference));
+    }
+
     /// An explicit stop still clears that binding's details and its cancellation entry.
     #[tokio::test]
     async fn stop_still_clears_the_binding_details() {
@@ -6302,6 +6390,130 @@ mod stop_retry_tests {
         ));
     }
 
+    /// A branch switched outside the IDE leaves one `git:` notice naming both commits and
+    /// branches; once consumed it is not repeated, and the refreshed baseline stays quiet.
+    #[tokio::test]
+    async fn head_moved_outside_the_ide_leaves_one_notice() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("main.rs"), "let value = 1;\n").unwrap();
+        git_commit(&fixture.root, "head fixture");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, authority) = activate_worktree(&mut worker, "head-actor", "head-start").await;
+        let owner = binding.fingerprint();
+        let notice = |worker: &Worker<'_>| {
+            worker
+                .shared
+                .git_notices
+                .lock()
+                .unwrap()
+                .get(&owner)
+                .cloned()
+        };
+        worker.observe_head(&binding, &authority);
+        worker.observe_head(&binding, &authority);
+        assert_eq!(notice(&worker), None, "an unchanged head says nothing");
+        let status = std::process::Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&fixture.root)
+            .args(["checkout", "--quiet", "--detach"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        worker.observe_head(&binding, &authority);
+        let line = notice(&worker).expect("a switched head leaves a notice");
+        assert!(
+            line.starts_with("git: HEAD moved ")
+                && line.contains(
+                    " → detached) outside Agent IDE; earlier indexed answers may be stale"
+                ),
+            "{line}"
+        );
+        worker.shared.git_notices.lock().unwrap().remove(&owner);
+        worker.observe_head(&binding, &authority);
+        assert_eq!(notice(&worker), None, "the refreshed baseline stays quiet");
+    }
+
+    /// After `ide.stop` the actor/channel identity still reads its test run's status through the
+    /// handle — without the dropped `full output` detail — while any other reference is refused.
+    #[tokio::test]
+    async fn test_handle_answers_after_stop_and_other_references_do_not() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("main.rs"), "let value = 1;\n").unwrap();
+        git_commit(&fixture.root, "stop fixture");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, _) = activate_worktree(&mut worker, "stop-actor", "stop-start").await;
+        assert!(matches!(
+            worker.shared.test_runs.start(
+                fixture.root.clone(),
+                vec!["/bin/echo".into(), "pass".into()],
+                crate::lang::testing::ALPHA,
+                Duration::from_secs(30),
+                "run-detail".into(),
+                &binding,
+            ),
+            StartResult::Started(1)
+        ));
+        while worker
+            .shared
+            .test_runs
+            .status_line(&fixture.root)
+            .is_some_and(|line| line.contains("running"))
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        worker
+            .shared
+            .bindings
+            .lock()
+            .unwrap()
+            .stop_binding(&binding)
+            .unwrap();
+        let identity = binding.channel_identity();
+        let inspect = |binding: BindingRef, reference: String| {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let request = Inspection {
+                binding,
+                reference,
+                expected: None,
+                reply: reply_tx,
+            };
+            let (workspace, shared) = (&worker.workspace, &worker.shared);
+            async move {
+                serve_inspection(workspace, shared, request).await;
+                reply_rx.await.unwrap()
+            }
+        };
+        let PeerReply::Complete { text, .. } = inspect(identity.clone(), "tests #1".into()).await
+        else {
+            panic!("a test handle must answer after stop")
+        };
+        assert!(
+            text.starts_with("tests #1: 1 passed, 0 failed") && !text.contains("full output"),
+            "{text}"
+        );
+        // Another actor's identity on the same channel does not see the run.
+        let stranger = BindingRef::fixture("other-actor", "stop-channel", 1).channel_identity();
+        let PeerReply::Complete { text, .. } = inspect(stranger, "tests #1".into()).await else {
+            panic!("an unknown run still answers a status line")
+        };
+        assert!(text.starts_with("tests #1: unknown job"), "{text}");
+        // Any other reference still requires the active generation.
+        assert!(matches!(
+            inspect(identity, "run-detail".into()).await,
+            PeerReply::Error {
+                code: FailureCode::Cancelled,
+                ..
+            }
+        ));
+    }
+
     /// `ide.inspect` answers a test-run handle with that run's status, and an unknown detail
     /// reference is split into never-issued and expired.
     #[tokio::test]
@@ -6316,7 +6528,6 @@ mod stop_retry_tests {
         let mut worker = worker(&store, workspace, fixture.root.clone());
         worker.observations.install_schema().await.unwrap();
         let (binding, _) = activate_worktree(&mut worker, "inspect-actor", "inspect-start").await;
-        let owner = binding.fingerprint();
 
         let inspect = |reference: String| async {
             let (reply_tx, reply_rx) = oneshot::channel();
@@ -6341,7 +6552,7 @@ mod stop_retry_tests {
             gamma,
             Duration::from_secs(30),
             "echo-run-detail".into(),
-            owner,
+            &binding,
         ) {
             StartResult::Started(id) => assert_eq!(id, 1),
             StartResult::Running(..) | StartResult::Failed(..) => {
@@ -6372,7 +6583,7 @@ mod stop_retry_tests {
                 gamma,
                 Duration::from_secs(60),
                 "sleep-run-detail".into(),
-                owner,
+                &binding,
             ) {
                 StartResult::Started(id) => break id,
                 StartResult::Running(..) => {

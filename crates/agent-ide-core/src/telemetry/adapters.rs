@@ -48,7 +48,10 @@ pub fn tool_reply(
             ..
         } => DiagnosticState::Changed,
         PeerReply::Edit {
-            diagnostics: EditDiagnostics::Unknown {} | EditDiagnostics::Pending { .. },
+            diagnostics:
+                EditDiagnostics::Unknown {}
+                | EditDiagnostics::Pending { .. }
+                | EditDiagnostics::NotAnalysed { .. },
             ..
         } => DiagnosticState::Unavailable,
         _ => diagnostics,

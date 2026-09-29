@@ -336,3 +336,67 @@ fn active_native_lifecycles_only_request_a_revocable_registered_path_recheck() {
         BindingStatus::Unavailable(_)
     ));
 }
+
+/// A read-only call (a test-run handle) keeps every correlation rule after `ide.stop` but answers
+/// the never-active actor/channel identity, which no liveness consume or check ever admits, so
+/// the post-stop path cannot reach worktree bytes.
+#[test]
+fn read_only_call_after_stop_answers_an_identity_that_admits_nothing() {
+    let mut guard = HostBindingGuard::default();
+    let channel = channel("channel-a");
+    guard.observe_hook(
+        hook("PreToolUse", "session_id", "actor", "start"),
+        channel.clone(),
+    );
+    let BindingStatus::Validated(started) =
+        guard.establish_start(candidate("actor", "start"), channel.clone())
+    else {
+        panic!("explicit start must validate");
+    };
+    guard.stop_binding(started.binding_ref()).unwrap();
+
+    // Without its pre-hook the read-only call is refused like any ordinary call.
+    assert!(matches!(
+        guard.validate_read_only(candidate("actor", "no-pre"), channel.clone()),
+        BindingStatus::Unavailable(BindingUnavailable::MissingPre)
+    ));
+    guard.observe_hook(
+        hook("PreToolUse", "session_id", "actor", "inspect"),
+        channel.clone(),
+    );
+    let BindingStatus::Validated(read) =
+        guard.validate_read_only(candidate("actor", "inspect"), channel.clone())
+    else {
+        panic!("a read-only call must validate after stop");
+    };
+    assert_ne!(read.binding_ref(), started.binding_ref());
+    assert!(matches!(
+        guard.consume_active(read.binding_ref()),
+        Err(BindingUnavailable::InactiveBinding)
+    ));
+    assert!(matches!(
+        guard.check_active(read.binding_ref()),
+        Err(BindingUnavailable::InactiveBinding)
+    ));
+    // Its post settles it once; the same call identity is then a replay.
+    assert!(matches!(
+        guard.observe_hook(
+            hook("PostToolUse", "session_id", "actor", "inspect"),
+            channel.clone(),
+        ),
+        BindingStatus::Settled(_)
+    ));
+    assert!(matches!(
+        guard.validate_read_only(candidate("actor", "inspect"), channel.clone()),
+        BindingStatus::Unavailable(BindingUnavailable::Replay)
+    ));
+    // An ordinary call after stop is still refused.
+    guard.observe_hook(
+        hook("PreToolUse", "session_id", "actor", "ordinary"),
+        channel.clone(),
+    );
+    assert!(matches!(
+        guard.validate_active(candidate("actor", "ordinary"), channel),
+        BindingStatus::Unavailable(BindingUnavailable::InactiveBinding)
+    ));
+}

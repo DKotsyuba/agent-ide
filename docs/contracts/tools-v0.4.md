@@ -69,6 +69,8 @@ tests #3: running 42 s — cargo test worker::
 </agent-ide>
 ```
 
+When the worktree's checked-out branch or detached commit changed outside the IDE since the session's previous call (another process ran `git checkout`/`switch`), the next plate leads with one line, delivered once: `git: HEAD moved 4e2e2e2 → 9daac64 (claude/a → claude/b) outside Agent IDE; earlier indexed answers may be stale`. A commit on the same branch is not reported. It is a notice only: nothing is invalidated or restarted.
+
 ### Ceilings and pages
 
 - A response is at most 16 KB. Lists are capped at 30 usage lines, 20 caller lines, and 20 diagnostic lines. Any remainder is reported as “N more” with a `detail_ref`.
@@ -291,7 +293,7 @@ formatted: +3 lines after line 24; use source_ref …-3 for the next edit
 edit: replaced; path src/lang/path.rs; source_ref …-4; diagnostics: current_clean. Next: use ide.diff
 ```
 
-`current_clean` is only ever derived from a completed project check that named no problem in the file; a language server's empty publish is not taken as proof. A provider report for the exact post-edit version (an error rust-analyzer or tsserver found on its own) is kept as it arrives instantly. The reply waits at most 90 s for the check, then says `diagnostics: unknown` and the result reaches the next `<agent-ide>` block or `ide.context`. The `rerun tests:` hint arrives with `ide.test` (§2.6).
+`current_clean` is only ever derived from a completed project check that named no problem in the file; a language server's empty publish is not taken as proof. When the check could not have analysed the file — for Rust, a file no `mod` declaration reaches from a build target — the reply says ``diagnostics: not_analysed (rust check did not compile this file — not declared with `mod`); declare it, then edit again`` instead: the closed diagnostics vocabulary is `current_reported`, `current_clean`, `not_analysed`, `unknown`, `pending`, and `not_analysed` is never clean. Python and TypeScript files are always treated as analysed (an unimported file can still read `current_clean`). A provider report for the exact post-edit version (an error rust-analyzer or tsserver found on its own) is kept as it arrives instantly. The reply waits at most 90 s for the check, then says `diagnostics: unknown` and the result reaches the next `<agent-ide>` block or `ide.context`. The `rerun tests:` hint arrives with `ide.test` (§2.6).
 
 For `rename`:
 
@@ -332,6 +334,8 @@ tests #3: 3 passed, 1 failed, 12 s
   rerun: cargo test stop_cancels_queue      full output: ide.inspect test-3
 ```
 
+A run that counted no test is never shown as `0 passed, 0 failed`: a non-zero exit reads `tests #3: no test results (exit 2), 1 s — inspect the runner's full output with ide.inspect` (the runner could not run, e.g. `uv run pytest` without a usable environment), and a zero exit without a parsed summary reads `no summary parsed`.
+
 Run at most one test job at a time per worktree. Stop a run when its budget expires, return its partial result and the command for manual execution, and page full output through `detail_ref`. The IDE never starts tests on its own.
 
 ### 2.7 `ide.diff` — changed files (planned cleanup)
@@ -358,7 +362,7 @@ Output uses the current `file:line:column code message` form, grouped by file an
 
 ### 2.9 Unchanged tools
 
-`ide.inspect {detail_ref, page?}` and `ide.stop {}` remain unchanged, except that an unknown `detail_ref` now says which it is — `this detail_ref was never issued` for a reference this daemon could not have minted, `this detail_ref has expired` for one it minted and no longer retains — and a test-run handle (`tests #N`, `tests-N`, `#N`, `N`) answers with that run's status line instead of failing the lookup. `ide.context` in its current form is retired; its role is divided among `outline`, `symbol`, `read`, and `problems`.
+`ide.inspect {detail_ref, page?}` and `ide.stop {}` remain unchanged, except that an unknown `detail_ref` now says which it is — `this detail_ref was never issued` for a reference this daemon could not have minted, `this detail_ref has expired` for one it minted and no longer retains — and a test-run handle (`tests #N`, `tests-N`, `#N`, `N`) answers with that run's status line instead of failing the lookup. A test-run handle keeps answering read-only for the run's retained lifetime (up to 10 minutes) even after `ide.stop`, without the `full output` line; every other `detail_ref` ends with the session, and a retained run's output detail is never evicted while the session lasts. `ide.context` in its current form is retired; its role is divided among `outline`, `symbol`, `read`, and `problems`.
 
 ## 3. `LanguageSupport` contract
 
