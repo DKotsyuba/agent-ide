@@ -2946,20 +2946,15 @@ impl<'a> Worker<'a> {
         if job.parameters.get("kind").and_then(Value::as_str) == Some("problems") {
             return self.context_problems_job(job, &binding).await;
         }
-        // T163 (W5): a whole-file `path` query duplicates `ide.read`'s bounded region, which
-        // `ide.outline`/`ide.read` now own; only the semantic `byte_offset` query remains.
-        let Some(byte_offset) = job.parameters.get("byte_offset").and_then(Value::as_u64) else {
-            job.failure_detail = Some("context:path_mode".to_owned());
-            return Err(FailureCode::PathContextRetired);
-        };
         let path = job.parameters["path"]
             .as_str()
             .ok_or(FailureCode::SourceUnavailable)?
             .to_owned();
         let (observed, bytes) = self.observe(&binding, path.clone().into()).await?;
-        let query = ContextQuery::Symbol {
+        let byte_offset = job.parameters.get("byte_offset").and_then(Value::as_u64);
+        let query = byte_offset.map_or(ContextQuery::File, |byte_offset| ContextQuery::Symbol {
             byte_offset: byte_offset as usize,
-        };
+        });
         let semantic = if observed.bytes().is_none() {
             Ok(None)
         } else {
@@ -3121,8 +3116,17 @@ impl<'a> Worker<'a> {
                 .map_err(|_| FailureCode::SourceUnavailable)?;
             provenance.insert(relative.to_path_buf());
         }
+        // T163 (W5, revised): the whole-file path mode keeps serving exactly as before for
+        // compatibility (real hosts and the acceptance scripts rely on its source_ref); a
+        // one-line hint steers new callers at the bounded `ide.outline`/`ide.read` alternative
+        // instead of retiring the mode outright.
+        let hint = if byte_offset.is_none() {
+            "hint: ide.outline {\"path\"} gives the skeleton and ide.read {\"path\",\"lines\"} a bounded region; this whole-file view stays for compatibility\n"
+        } else {
+            ""
+        };
         let text = format!(
-            "mode: {mode}\npath: {path}\nsource_state: {:?}\nsource_sequence: {}\nauthority_epoch: {}\ncoverage: complete registered path\nposition_encoding: {:?}\nprovider_generation: {:?}\ndocument_version: {:?}\n{diagnostic_text}\ndefinitions: {}\nreferences: {}\nlexical_matches: {}\n\n{}",
+            "{hint}mode: {mode}\npath: {path}\nsource_state: {:?}\nsource_sequence: {}\nauthority_epoch: {}\ncoverage: complete registered path\nposition_encoding: {:?}\nprovider_generation: {:?}\ndocument_version: {:?}\n{diagnostic_text}\ndefinitions: {}\nreferences: {}\nlexical_matches: {}\n\n{}",
             observed.state(),
             observed.sequence(),
             authority.epoch(),

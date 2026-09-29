@@ -6335,21 +6335,23 @@ async fn product_outline_and_read_report_no_such_file() {
     daemon.wait().await.unwrap();
 }
 
-/// `ide.context {path}` with no `byte_offset` redirects instead of paging the whole file
-/// (T163, W5); `ide.context {kind:"problems"}` and the semantic `byte_offset` query are
+/// `ide.context {path}` with no `byte_offset` keeps serving the whole file exactly as before
+/// (real hosts and the acceptance scripts rely on its `source_ref`), now leading with a one-line
+/// hint toward the bounded `ide.outline`/`ide.read` alternative instead of retiring the mode
+/// (T163, W5, revised). `ide.context {kind:"problems"}` and the semantic `byte_offset` query are
 /// unaffected — covered by `managed_context_problems_then_edit_tracks_content` and the
 /// `mode: semantic` product assertions elsewhere in this file.
 #[tokio::test]
-async fn product_path_only_context_redirects_to_outline_and_read() {
+async fn product_path_only_context_keeps_serving_with_a_hint() {
     let fixture = ProductFixture::new(json!([]));
     std::fs::write(fixture.root.join("tracked.txt"), "hello\n").unwrap();
     let mut daemon = fixture.daemon().await;
-    let mut actor = ProductActor::new(&fixture, "path-context-retired").await;
+    let mut actor = ProductActor::new(&fixture, "path-context-hint").await;
     let started = actor
         .call(
             &fixture,
             "ide.start",
-            json!({"activation_id":"path-context-retired"}),
+            json!({"activation_id":"path-context-hint"}),
         )
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
@@ -6357,7 +6359,20 @@ async fn product_path_only_context_redirects_to_outline_and_read() {
         .call(&fixture, "ide.context", json!({"path":"tracked.txt"}))
         .await;
     let reply = actor.settle(&fixture, reply).await;
-    assert_eq!(reply["code"], "path_context_retired", "{reply}");
+    assert_eq!(reply["kind"], "context", "{reply}");
+    let text = reply["text"].as_str().unwrap_or_default();
+    assert!(
+        text.starts_with("hint: ide.outline {\"path\"} gives the skeleton and ide.read {\"path\",\"lines\"} a bounded region; this whole-file view stays for compatibility\n"),
+        "the first line must hint at the bounded alternative: {text}"
+    );
+    assert!(
+        text.contains("hello"),
+        "the whole file must still be served: {text}"
+    );
+    assert!(
+        reply["detail_ref"].as_str().is_some(),
+        "a usable source_ref must still be minted for ide.edit: {reply}"
+    );
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
 }

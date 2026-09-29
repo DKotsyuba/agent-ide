@@ -138,10 +138,6 @@ pub enum FailureCode {
     /// does not exist. Carries the bounded path exactly as requested (T163 precedent: paths in
     /// the reason are allowed; the stage tag itself stays payload-free).
     NoSuchFile(String),
-    /// `ide.context {path}` with no `byte_offset` duplicated `ide.read`'s bounded region; the
-    /// whole-file mode is retired in favor of `ide.outline`/`ide.read`. The semantic path (with
-    /// `byte_offset`) is unaffected.
-    PathContextRetired,
     /// A language server's project inputs were absent, unsupported, oversized, reordered, or
     /// changed.
     ResolutionUnverified,

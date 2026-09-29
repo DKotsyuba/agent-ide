@@ -286,8 +286,6 @@ pub enum ReasonCode {
     Internal,
     /// [`FailureCode::NoSuchFile`].
     NoSuchFile,
-    /// [`FailureCode::PathContextRetired`].
-    PathContextRetired,
 
     // `checks::UnavailableReason`.
     /// [`UnavailableReason::Disabled`].
@@ -366,7 +364,6 @@ impl ReasonCode {
             Self::Conflict => "conflict",
             Self::Internal => "internal",
             Self::NoSuchFile => "no_such_file",
-            Self::PathContextRetired => "path_context_retired",
             Self::ChecksDisabled => "checks_disabled",
             Self::OutsideRoots => "outside_roots",
             Self::ToolMissing => "tool_missing",
@@ -423,7 +420,6 @@ impl From<FailureCode> for ReasonCode {
             FailureCode::ProviderLoading => Self::ProviderLoading,
             FailureCode::UnknownSymbol => Self::UnknownSymbol,
             FailureCode::NoSuchFile(_) => Self::NoSuchFile,
-            FailureCode::PathContextRetired => Self::PathContextRetired,
             FailureCode::ResolutionUnverified => Self::ResolutionUnverified,
             FailureCode::Cancelled => Self::Cancelled,
             FailureCode::Deadline => Self::Deadline,

@@ -61,8 +61,6 @@ error: source_unavailable{% if resolution_detail %} ({{ resolution_detail }}){% 
 error: outside_allowed_roots{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; the working directory is not below any configured allowed root; start the IDE in an allowed directory or add this one to allowed_roots, otherwise continue with native tools
 {%- elif code == "execution_profile" and cause_tag is defined -%}
 error: execution_profile ({{ cause_tag }}); continue with native tools
-{%- elif code == "path_context_retired" -%}
-error: path_context_retired (context:path_mode); use ide.outline {"path"} for the skeleton or ide.read {"path","lines"} for a region; kind:"problems" is unchanged
 {%- else -%}
 error: {{ code }}{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; continue with native tools
 {%- endif -%}

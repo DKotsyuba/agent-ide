@@ -501,25 +501,6 @@ mod tests {
         );
     }
 
-    /// `ide.context {path}` with no `byte_offset` redirects to `ide.outline`/`ide.read` instead of
-    /// paging the whole file (T163, W5); `kind:"problems"` and the semantic `byte_offset` query
-    /// are unaffected by this failure code and are not exercised here.
-    #[test]
-    fn path_context_retired_redirects_to_outline_and_read() {
-        let rendered = render(
-            PeerReply::Error {
-                code: FailureCode::PathContextRetired,
-                detail: Some("context:path_mode".to_owned()),
-            },
-            Envelope::WithStructured,
-        )
-        .unwrap();
-        assert_eq!(
-            text_of(&rendered),
-            "error: path_context_retired (context:path_mode); use ide.outline {\"path\"} for the skeleton or ide.read {\"path\",\"lines\"} for a region; kind:\"problems\" is unchanged"
-        );
-    }
-
     /// An expired or unknown detail says to repeat the original call.
     #[test]
     fn expired_detail_explains_the_recovery() {
