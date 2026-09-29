@@ -1,0 +1,381 @@
+[
+ {
+  "name": "Packed",
+  "kind": 23,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 0,
+    "character": 0
+   },
+   "end": {
+    "line": 7,
+    "character": 1
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 2,
+    "character": 11
+   },
+   "end": {
+    "line": 2,
+    "character": 17
+   }
+  },
+  "children": [
+   {
+    "name": "first",
+    "detail": "u8",
+    "kind": 8,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 3,
+      "character": 4
+     },
+     "end": {
+      "line": 4,
+      "character": 17
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 4,
+      "character": 8
+     },
+     "end": {
+      "line": 4,
+      "character": 13
+     }
+    }
+   },
+   {
+    "name": "second",
+    "detail": "u8",
+    "kind": 8,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 5,
+      "character": 4
+     },
+     "end": {
+      "line": 6,
+      "character": 18
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 6,
+      "character": 8
+     },
+     "end": {
+      "line": 6,
+      "character": 14
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "legacy",
+  "detail": "fn()",
+  "kind": 12,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 9,
+    "character": 0
+   },
+   "end": {
+    "line": 10,
+    "character": 18
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 10,
+    "character": 7
+   },
+   "end": {
+    "line": 10,
+    "character": 13
+   }
+  }
+ },
+ {
+  "name": "same_line",
+  "detail": "fn()",
+  "kind": 12,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 12,
+    "character": 0
+   },
+   "end": {
+    "line": 12,
+    "character": 31
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 12,
+    "character": 17
+   },
+   "end": {
+    "line": 12,
+    "character": 26
+   }
+  }
+ },
+ {
+  "name": "Error",
+  "kind": 10,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 14,
+    "character": 0
+   },
+   "end": {
+    "line": 23,
+    "character": 1
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 18,
+    "character": 9
+   },
+   "end": {
+    "line": 18,
+    "character": 14
+   }
+  },
+  "children": [
+   {
+    "name": "Index",
+    "kind": 22,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 19,
+      "character": 4
+     },
+     "end": {
+      "line": 20,
+      "character": 23
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 20,
+      "character": 4
+     },
+     "end": {
+      "line": 20,
+      "character": 9
+     }
+    }
+   },
+   {
+    "name": "Closed",
+    "kind": 22,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 21,
+      "character": 4
+     },
+     "end": {
+      "line": 22,
+      "character": 10
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 22,
+      "character": 4
+     },
+     "end": {
+      "line": 22,
+      "character": 10
+     }
+    }
+   }
+  ]
+ },
+ {
+  "name": "documented",
+  "detail": "fn() -> u8",
+  "kind": 12,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 25,
+    "character": 0
+   },
+   "end": {
+    "line": 30,
+    "character": 1
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 28,
+    "character": 7
+   },
+   "end": {
+    "line": 28,
+    "character": 17
+   }
+  }
+ },
+ {
+  "name": "commented_inside",
+  "detail": "fn()",
+  "kind": 12,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 32,
+    "character": 0
+   },
+   "end": {
+    "line": 34,
+    "character": 24
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 34,
+    "character": 3
+   },
+   "end": {
+    "line": 34,
+    "character": 19
+   }
+  }
+ },
+ {
+  "name": "block_inside",
+  "detail": "fn()",
+  "kind": 12,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 36,
+    "character": 0
+   },
+   "end": {
+    "line": 38,
+    "character": 20
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 38,
+    "character": 3
+   },
+   "end": {
+    "line": 38,
+    "character": 15
+   }
+  }
+ },
+ {
+  "name": "tests",
+  "kind": 2,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 40,
+    "character": 0
+   },
+   "end": {
+    "line": 48,
+    "character": 1
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 41,
+    "character": 4
+   },
+   "end": {
+    "line": 41,
+    "character": 9
+   }
+  },
+  "children": [
+   {
+    "name": "regression",
+    "detail": "fn()",
+    "kind": 12,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 42,
+      "character": 4
+     },
+     "end": {
+      "line": 43,
+      "character": 22
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 43,
+      "character": 7
+     },
+     "end": {
+      "line": 43,
+      "character": 17
+     }
+    }
+   },
+   {
+    "name": "panics",
+    "detail": "fn()",
+    "kind": 12,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 45,
+      "character": 4
+     },
+     "end": {
+      "line": 47,
+      "character": 18
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 47,
+      "character": 7
+     },
+     "end": {
+      "line": 47,
+      "character": 13
+     }
+    }
+   }
+  ]
+ }
+]

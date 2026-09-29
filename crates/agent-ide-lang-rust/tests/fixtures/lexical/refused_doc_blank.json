@@ -1,0 +1,55 @@
+[
+ {
+  "name": "First",
+  "kind": 23,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 0,
+    "character": 0
+   },
+   "end": {
+    "line": 0,
+    "character": 17
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 0,
+    "character": 11
+   },
+   "end": {
+    "line": 0,
+    "character": 16
+   }
+  }
+ },
+ {
+  "name": "detached",
+  "detail": "fn()",
+  "kind": 12,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 2,
+    "character": 0
+   },
+   "end": {
+    "line": 4,
+    "character": 20
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 4,
+    "character": 7
+   },
+   "end": {
+    "line": 4,
+    "character": 15
+   }
+  }
+ }
+]

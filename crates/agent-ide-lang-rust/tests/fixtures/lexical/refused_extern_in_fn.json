@@ -1,0 +1,86 @@
+[
+ {
+  "name": "host",
+  "detail": "fn()",
+  "kind": 12,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 0,
+    "character": 0
+   },
+   "end": {
+    "line": 4,
+    "character": 1
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 0,
+    "character": 7
+   },
+   "end": {
+    "line": 0,
+    "character": 11
+   }
+  },
+  "children": [
+   {
+    "name": "extern \"C\"",
+    "kind": 3,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 1,
+      "character": 4
+     },
+     "end": {
+      "line": 3,
+      "character": 5
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 1,
+      "character": 4
+     },
+     "end": {
+      "line": 1,
+      "character": 14
+     }
+    },
+    "children": [
+     {
+      "name": "labs",
+      "detail": "fn(input: i64) -> i64",
+      "kind": 12,
+      "tags": [],
+      "deprecated": false,
+      "range": {
+       "start": {
+        "line": 2,
+        "character": 8
+       },
+       "end": {
+        "line": 2,
+        "character": 35
+       }
+      },
+      "selectionRange": {
+       "start": {
+        "line": 2,
+        "character": 11
+       },
+       "end": {
+        "line": 2,
+        "character": 15
+       }
+      }
+     }
+    ]
+   }
+  ]
+ }
+]

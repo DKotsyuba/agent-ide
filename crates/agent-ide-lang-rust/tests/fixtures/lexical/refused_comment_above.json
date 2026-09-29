@@ -1,0 +1,54 @@
+[
+ {
+  "name": "Raw",
+  "kind": 23,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 0,
+    "character": 0
+   },
+   "end": {
+    "line": 0,
+    "character": 24
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 0,
+    "character": 11
+   },
+   "end": {
+    "line": 0,
+    "character": 14
+   }
+  }
+ },
+ {
+  "name": "impl Send for Raw",
+  "kind": 19,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 2,
+    "character": 0
+   },
+   "end": {
+    "line": 3,
+    "character": 27
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 3,
+    "character": 21
+   },
+   "end": {
+    "line": 3,
+    "character": 24
+   }
+  }
+ }
+]

@@ -171,11 +171,14 @@ impl LanguageSupport for RustSupport {
         }
     }
 
-    /// Outline computed from the text alone by the lexical scanner: the same addresses,
-    /// ranges, kinds, signatures and docs the server path normalizes, so a cold rust-analyzer can
-    /// still answer `ide.outline`, `ide.read` and symbol-addressed `ide.edit`. `None` keeps the
-    /// file server-backed — a source that does not scan cleanly (unbalanced braces, a macro
-    /// invocation at item position, cfg-duplicated items with the same name) is never guessed.
+    /// Outline computed from the text alone by the lexical scanner (the `lexical` module), so a
+    /// cold rust-analyzer can still answer `ide.outline`, `ide.read` and symbol-addressed
+    /// `ide.edit`. It is either the outline the server path would normalize for the same text or
+    /// `None`: whatever the scanner cannot reproduce exactly — comments rust-analyzer may attach
+    /// to an item's range, a macro invocation at item position, an extern block, a `// region:`
+    /// comment, cfg-duplicated items with the same name, unbalanced braces — keeps the file
+    /// server-backed instead of a guessed range. The recorded corpus in
+    /// `tests/fixtures/lexical` checks the equality against rust-analyzer's own answers.
     fn outline_from_source(&self, file: &Path, source: &str) -> Option<Outline> {
         crate::lexical::lexical_outline(file, source)
     }
@@ -614,25 +617,28 @@ pub(crate) fn impl_segment(name: &str) -> String {
     }
     let mut rest = rest.trim_start();
     if rest.starts_with('<') {
-        rest = skip_balanced(rest, '<', '>').trim_start();
+        rest = skip_generics(rest).trim_start();
     }
     let ty = rest.split('<').next().unwrap_or(rest).trim();
     let ty = ty.rsplit("::").next().unwrap_or(ty).trim();
     if ty.is_empty() { name } else { ty.to_owned() }
 }
 
-/// `text` after its leading balanced `open … close` group (the whole text when unbalanced).
-pub(crate) fn skip_balanced(text: &str, open: char, close: char) -> &str {
+/// `text` after its leading balanced `<…>` generic parameter list, or `""` when it never closes.
+/// The `>` of an `->` inside a bound (`impl<F: Fn() -> u8>`) closes nothing.
+pub(crate) fn skip_generics(text: &str) -> &str {
     let mut depth = 0usize;
+    let mut previous = None;
     for (index, ch) in text.char_indices() {
-        if ch == open {
+        if ch == '<' {
             depth += 1;
-        } else if ch == close {
+        } else if ch == '>' && previous != Some('-') {
             depth = depth.saturating_sub(1);
             if depth == 0 {
                 return &text[index + ch.len_utf8()..];
             }
         }
+        previous = Some(ch);
     }
     ""
 }
@@ -688,8 +694,10 @@ pub(crate) fn header_start(lines: &[&str], decl: u32) -> u32 {
 }
 
 /// First line of the outer attribute ending on 1-based line `end`, scanning upward while the
-/// square brackets stay unbalanced; `None` when the lines are not one attribute. Brackets inside
-/// string literals are counted too (ponytail: rare in attributes; tokenize if it ever matters).
+/// square brackets stay unbalanced; `None` when the lines are not one attribute. Brackets are
+/// counted on each line's code only: inside a string, char literal or comment on that line
+/// (`#[error("index outside [0, {1})")]`) they are not syntax. A string literal that spans lines
+/// is blanked only on its first line.
 fn attribute_start(lines: &[&str], end: u32) -> Option<u32> {
     let mut depth = 0i32;
     let mut line = end;
@@ -698,7 +706,9 @@ fn attribute_start(lines: &[&str], end: u32) -> Option<u32> {
         if text.is_empty() {
             return None;
         }
-        depth += text.matches(']').count() as i32 - text.matches('[').count() as i32;
+        let code = crate::module_graph::blanked_code(&text.chars().collect::<Vec<_>>());
+        let count = |bracket: char| code.iter().filter(|&&ch| ch == bracket).count() as i32;
+        depth += count(']') - count('[');
         if depth == 0 {
             return text.starts_with("#[").then_some(line);
         }

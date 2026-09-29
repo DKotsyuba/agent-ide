@@ -1,0 +1,84 @@
+[
+ {
+  "name": "first",
+  "kind": 2,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 2,
+    "character": 0
+   },
+   "end": {
+    "line": 2,
+    "character": 16
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 2,
+    "character": 8
+   },
+   "end": {
+    "line": 2,
+    "character": 13
+   }
+  }
+ },
+ {
+  "name": "second",
+  "detail": "fn()",
+  "kind": 12,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 4,
+    "character": 0
+   },
+   "end": {
+    "line": 7,
+    "character": 1
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 4,
+    "character": 7
+   },
+   "end": {
+    "line": 4,
+    "character": 13
+   }
+  },
+  "children": [
+   {
+    "name": "nested",
+    "detail": "fn()",
+    "kind": 12,
+    "tags": [],
+    "deprecated": false,
+    "range": {
+     "start": {
+      "line": 6,
+      "character": 4
+     },
+     "end": {
+      "line": 6,
+      "character": 18
+     }
+    },
+    "selectionRange": {
+     "start": {
+      "line": 6,
+      "character": 7
+     },
+     "end": {
+      "line": 6,
+      "character": 13
+     }
+    }
+   }
+  ]
+ }
+]
