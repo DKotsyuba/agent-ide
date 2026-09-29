@@ -402,6 +402,63 @@ pub fn outline_text(outline: &Outline) -> String {
     out
 }
 
+/// Renders `outline` limited to `kinds` (closed [`SymbolKind`] names): a symbol shows when its
+/// own kind is selected or a descendant's is, so a container of a selected member still shows for
+/// context. Test modules are always kept whole and collapse exactly as [`outline_text`] collapses
+/// them. `requested` is the caller's raw comma list, printed back in the footer unchanged.
+pub fn filtered_outline_text(outline: &Outline, kinds: &[SymbolKind], requested: &str) -> String {
+    let total = {
+        let mut count = 0usize;
+        let mut tests = 0usize;
+        let mut scratch = String::new();
+        for symbol in &outline.symbols {
+            render_symbol_line(symbol, 0, &mut scratch, &mut count, &mut tests);
+        }
+        count
+    };
+    let mut out = format!(
+        "{}  ({} lines, {})\n",
+        outline.file.display(),
+        outline.line_count,
+        outline.language
+    );
+    let mut count = 0usize;
+    let mut tests = 0usize;
+    for symbol in &outline.symbols {
+        if let Some(kept) = keep_by_kind(symbol, kinds) {
+            render_symbol_line(&kept, 0, &mut out, &mut count, &mut tests);
+        }
+    }
+    out.push_str(&format!(
+        "  ({total} symbols; showing {count} by kinds {requested}"
+    ));
+    if tests > 0 {
+        out.push_str(&format!("; tests collapsed: {tests}"));
+    }
+    out.push_str(")\n");
+    out
+}
+
+/// Keeps `symbol` when its own kind is selected or a descendant's is; test modules are always
+/// kept whole so the filter never disturbs their normal collapse.
+fn keep_by_kind(symbol: &Symbol, kinds: &[SymbolKind]) -> Option<Symbol> {
+    if symbol.kind == SymbolKind::Test {
+        return Some(symbol.clone());
+    }
+    let children: Vec<Symbol> = symbol
+        .children
+        .iter()
+        .filter_map(|child| keep_by_kind(child, kinds))
+        .collect();
+    if kinds.contains(&symbol.kind) || !children.is_empty() {
+        let mut kept = symbol.clone();
+        kept.children = children;
+        Some(kept)
+    } else {
+        None
+    }
+}
+
 /// Renders one bounded directory level, counting regular files recursively inside child folders.
 pub fn directory_outline(root: &Path, directory: &Path) -> std::io::Result<String> {
     use std::fs;
@@ -916,6 +973,30 @@ mod tests {
         assert_eq!(
             text,
             "a.rs  (90 lines, alpha)\n    3  pub fn run()    // Runs it.\n   40  mod tests [2 tests collapsed]\n  (1 symbols; 2 tests collapsed)\n"
+        );
+    }
+
+    #[test]
+    fn filtered_outline_keeps_containers_of_selected_members_and_collapses_tests_unfiltered() {
+        let mut foo = symbol("Foo", SymbolKind::Struct, 1, 10, None);
+        foo.children = vec![
+            symbol("x", SymbolKind::Field, 2, 2, None),
+            symbol("bar", SymbolKind::Method, 3, 5, None),
+        ];
+        let run = symbol("run", SymbolKind::Function, 12, 14, None);
+        let mut tests = symbol("tests", SymbolKind::Test, 16, 20, None);
+        tests.signature = "mod tests".into();
+        tests.children = vec![symbol("it_works", SymbolKind::Test, 17, 19, None)];
+        let outline = Outline {
+            file: PathBuf::from("a.rs"),
+            language: crate::lang::testing::ALPHA,
+            line_count: 20,
+            symbols: vec![foo, run, tests],
+        };
+        let text = filtered_outline_text(&outline, &[SymbolKind::Method], "method");
+        assert_eq!(
+            text,
+            "a.rs  (20 lines, alpha)\n    1  pub fn Foo()\n    3    pub fn bar()\n   16  mod tests [2 tests collapsed]\n  (4 symbols; showing 2 by kinds method; tests collapsed: 2)\n"
         );
     }
 

@@ -471,6 +471,36 @@ mod tests {
         );
     }
 
+    /// A missing `ide.outline`/`ide.read` path names the exact bounded requested path in the
+    /// reason itself, ahead of the payload-free stage tag (T163, W6).
+    #[test]
+    fn no_such_file_names_the_requested_path() {
+        let rendered = render(
+            PeerReply::Error {
+                code: FailureCode::NoSuchFile("src/assistance/host_bindng.rs".to_owned()),
+                detail: Some("outline:no_such_file".to_owned()),
+            },
+            Envelope::WithStructured,
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&rendered),
+            "error: no_such_file: src/assistance/host_bindng.rs (outline:no_such_file); check the path"
+        );
+        let for_read = render(
+            PeerReply::Error {
+                code: FailureCode::NoSuchFile("src/missing.rs".to_owned()),
+                detail: Some("read:no_such_file".to_owned()),
+            },
+            Envelope::WithStructured,
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&for_read),
+            "error: no_such_file: src/missing.rs (read:no_such_file); check the path"
+        );
+    }
+
     /// An expired or unknown detail says to repeat the original call.
     #[test]
     fn expired_detail_explains_the_recovery() {

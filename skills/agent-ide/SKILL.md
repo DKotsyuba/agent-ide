@@ -43,7 +43,9 @@ and cost a fraction of the context:
   files with line counts and the first documentation line, one level deep.
 - `ide.outline {"path":"src/x.rs"}` — the file skeleton: every symbol with its signature,
   doc line and line numbers, members indented, test modules collapsed. Use it before
-  reading any file longer than a screen.
+  reading any file longer than a screen. Add `"kinds":"fn,method"` (comma list over the closed
+  kind vocabulary) to cut a big file down to the kinds you need; a container of a selected
+  member still shows, and the footer states the cut (`showing N by kinds …`).
 - `ide.symbol {"symbol":"src/x.rs#Type/method"}` or `{"symbol":"Name"}` — a symbol card:
   resolved signature, documentation, the definition with line numbers, usages grouped by
   `src`/`tests` with the source line text, `callers`/`callees` (set `"callers":1`) and, with
@@ -104,9 +106,12 @@ the language server is still loading the workspace: repeat the same call in a fe
    operator's configured `allowed_roots`; `outside_allowed_roots` means start the IDE in
    an allowed directory (or ask the operator to extend the list) and otherwise continue
    with native tools. Do not call it again for later edits in the same worktree.
-2. `ide.context` before each relevant edit, using a workspace-relative path.
-   Include `byte_offset` when definitions or references are needed; omitting it
-   requests complete lexical source context only.
+2. Before an edit, prefer `ide.outline` the file (or `ide.symbol` the target) for its skeleton,
+   then `ide.read` the exact symbol or line range you are about to change — its `source_ref` is
+   the bounded reference `ide.edit` needs. `ide.context {path}` with no `byte_offset` still works
+   and still mints a usable `source_ref` (its first line is now a hint toward `ide.outline`/
+   `ide.read`); `ide.context {path, byte_offset}` still answers definitions/references at that
+   exact position when needed.
 3. Prefer `ide.edit` for a supported bounded full-content edit when it is offered
    and its Context contract is satisfied. Native host editing — the model's own
    file-edit tool (Claude's editor, Codex `apply_patch`, etc.) — remains available

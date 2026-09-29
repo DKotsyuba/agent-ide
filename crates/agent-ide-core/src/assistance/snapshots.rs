@@ -770,16 +770,15 @@ impl Worker<'_> {
             Err(error) => {
                 // T27B: the terminal diff failure carries the closed failing stage, so a
                 // sandboxed capture that can never finish is diagnosable from the error log.
-                let failure = runner.failure;
+                let failure = runner.failure.clone();
                 let fallback = match &error {
                     GitError::UnsupportedSnapshotGit => FailureCode::UnsupportedGit,
                     GitError::EvidenceTooLarge => FailureCode::Capacity,
                     _ => FailureCode::SourceUnavailable,
                 };
-                let detail = runner
-                    .detail
-                    .clone()
-                    .unwrap_or_else(|| git_failure_detail(&error, runner.stage, runner.failure));
+                let detail = runner.detail.clone().unwrap_or_else(|| {
+                    git_failure_detail(&error, runner.stage, runner.failure.clone())
+                });
                 drop(runner);
                 job.failure_detail = Some(detail);
                 return Err(failure.unwrap_or(fallback));

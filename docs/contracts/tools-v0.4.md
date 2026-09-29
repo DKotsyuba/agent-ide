@@ -20,7 +20,7 @@ Revision: v0.4. Provider: Agent IDE. Consumers: coding agents and IDE hosts.
 1. **Address symbols**, not lines or offsets. Lines are a fallback mode and are used in read output.
 2. A tool returns information an agent cannot get from `grep` or `cat` in a second: types, documentation, relationships, compiler errors, and project commands.
 3. **Keep responses compact.** Responses contain no internal bookkeeping fields (`authority_epoch`, hashes, generations). Lists have ceilings and report “N more”; retrieve the complete list through `detail_ref`.
-4. Errors use one line with the reason and next step, for example `error: ambiguous_symbol; candidates: …`. Every failure also names its closed stage — `<tool>:<stage>` (`diff:too_large`, `symbol:anchor_missing`) — in parentheses after the reason when one is set, and the same tag lands in the daemon journal's `detail` field; a failure with no specific tag derives `<tool>:<reason>`, so no journal line is ever detail-less. Stage tags carry no payloads, paths, or user text. One reply carries a closed cause the same way (T15B): `unavailable: host_binding (<cause>); continue with native tools`, where `<cause>` is `outside_allowed_roots` (the session's bound project is below no allowed root), `hooks_not_delivered` (this daemon received no hook on the calling channel since it started), `missing_pre`, `replay`, `inactive_binding`, or `project_moved: bound to <path>, asked <path>` — the single cause that names two bounded, home-shortened paths, because telling the agent which directory the session is bound to is the recovery — plus `host_unrecognized` when the caller's `_meta` names no supported host contract, so no invocation can correlate at all. The same tag is the daemon journal's `detail`.
+4. Errors use one line with the reason and next step, for example `error: ambiguous_symbol; candidates: …`. Every failure also names its closed stage — `<tool>:<stage>` (`diff:too_large`, `symbol:anchor_missing`) — in parentheses after the reason when one is set, and the same tag lands in the daemon journal's `detail` field; a failure with no specific tag derives `<tool>:<reason>`, so no journal line is ever detail-less. Stage tags carry no payloads, paths, or user text — except the reason itself, ahead of the stage tag, which may (T163): a missing `ide.outline`/`ide.read` path answers `error: no_such_file: src/assistance/host_bindng.rs (outline:no_such_file); check the path`, naming the exact bounded path the model asked for while its parenthesized stage tag (`outline:no_such_file`, `read:no_such_file`) stays payload-free. One reply carries a closed cause the same way (T15B): `unavailable: host_binding (<cause>); continue with native tools`, where `<cause>` is `outside_allowed_roots` (the session's bound project is below no allowed root), `hooks_not_delivered` (this daemon received no hook on the calling channel since it started), `missing_pre`, `replay`, `inactive_binding`, or `project_moved: bound to <path>, asked <path>` — the single cause that names two bounded, home-shortened paths, because telling the agent which directory the session is bound to is the recovery — plus `host_unrecognized` when the caller's `_meta` names no supported host contract, so no invocation can correlate at all. The same tag is the daemon journal's `detail`.
 5. The language server runs as it would in a human's editor and remains alive for the session.
 6. Every host uses one path: return the result directly when it arrives within about 10 seconds; otherwise return `pending` and use `ide.inspect`.
 
@@ -118,7 +118,16 @@ Errors: `outside_allowed_roots` (as today), `not_a_project` (no manifest is pres
 
 ### 2.2 `ide.outline` — file skeleton (implemented)
 
-Input: `{path, depth?: 1|2|all (default all), bodies: false}`. A `path` naming a directory (trailing slash optional) answers a directory outline instead: subdirectories with file counts, then files with line counts and the first documentation line (`//!` for Rust, the module docstring for Python, the leading comment for TypeScript/JavaScript), one level deep, at most 200 files.
+Input: `{path, depth?: 1|2|all (default all), bodies: false, kinds?: "fn,method,…"}`. A `path` naming a directory (trailing slash optional) answers a directory outline instead: subdirectories with file counts, then files with line counts and the first documentation line (`//!` for Rust, the module docstring for Python, the leading comment for TypeScript/JavaScript), one level deep, at most 200 files.
+
+`kinds` is an optional comma list over the closed `SymbolKind` vocabulary (`module`, `namespace`, `struct`, `enum`, `class`, `interface`, `trait`, `impl`, `type`, `fn`, `method`, `constructor`, `field`, `variant`, `const`, `var`, `test`, `symbol`), for a file too big to read whole (T163): a symbol shows when its own kind is selected or a descendant's is, so a container of a selected member still shows for context, and test modules always collapse exactly as they do unfiltered. Byte paging already bounds the reply; the filter is the agent-controlled cut for a large outline:
+
+```text
+src/assistance/worker.rs  (4700 lines, rust)
+ 906  pub fn establish_start(&mut self, candidate: Candidate, channel: ChannelRef) -> BindingStatus
+ …
+  (262 symbols; showing 31 by kinds fn,method; tests collapsed: 31)
+```
 
 Replies of every tool are delivered inline when the job completes within 8 s (the daemon waits; the MCP bridge allows 10 s for the reply after a fast 1 s connect); a longer job answers `pending` with a `detail_ref` as before.
 
@@ -139,6 +148,8 @@ src/assistance/host_binding.rs  (2292 lines, rust)
 ```
 
 The docstring is the first displayed line. Collapse test modules to a count. For Python, show decorators; for TypeScript, show `export` and overloads on one line.
+
+Errors: `no_such_file` (the requested path does not exist; check the path), `outside_allowed_roots`.
 
 ### 2.3 `ide.symbol` — symbol card and relationships (implemented)
 
@@ -265,6 +276,8 @@ source_ref: sym-14
 
 `source_ref` is the reference currently called `detail_ref` by edit: it binds to the read content. A write using a stale reference is rejected as `stale_source` if the file has changed.
 
+Errors: `no_such_file` (the requested path does not exist; check the path), `unknown_symbol`.
+
 ### 2.5 `ide.edit` — edit a symbol or range (implemented)
 
 Input operations:
@@ -369,6 +382,8 @@ Output uses the current `file:line:column code message` form, grouped by file an
 ### 2.9 Unchanged tools
 
 `ide.inspect {detail_ref, page?}` and `ide.stop {}` remain unchanged, except that an unknown `detail_ref` now says which it is — `this detail_ref was never issued` for a reference this daemon could not have minted, `this detail_ref has expired` for one it minted and no longer retains — and a test-run handle (`tests #N`, `tests-N`, `#N`, `N`) answers with that run's status line instead of failing the lookup. A test-run handle keeps answering read-only for the run's retained lifetime (up to 10 minutes) even after `ide.stop`, without the `full output` line; every other `detail_ref` ends with the session, and a retained run's output detail is never evicted while the session lasts. `ide.context` in its current form is retired; its role is divided among `outline`, `symbol`, `read`, and `problems`.
+
+`ide.context {path}` with no `byte_offset` (T163, W5) still pages the whole file exactly as before, for compatibility with existing hosts and acceptance scripts that mint an edit `source_ref` from it; its first line now leads with a one-line hint toward the bounded alternative: `hint: ide.outline {"path"} gives the skeleton and ide.read {"path","lines"} a bounded region; this whole-file view stays for compatibility`. `ide.context {path, byte_offset}` (the semantic query used by the edit-diagnostics and staleness flow) and `ide.context {kind:"problems"}` are unaffected and carry no hint; prefer `ide.outline`/`ide.read` for new work.
 
 ## 3. `LanguageSupport` contract
 

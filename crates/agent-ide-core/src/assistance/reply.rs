@@ -13,6 +13,8 @@ pub const MAX_FEEDBACK_BYTES: usize = 4 * 1024;
 pub(crate) const MCP_RESERVE: usize = 1024;
 /// Bounds each path a `project_moved` cause names, after home shortening (T15B).
 const MAX_CAUSE_PATH_BYTES: usize = 256;
+/// Bounds the requested path a `no_such_file` failure names in its reason text.
+pub(crate) const MAX_NO_SUCH_FILE_PATH_BYTES: usize = 256;
 
 /// First missing peer without implying workspace authority was granted.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -108,7 +110,7 @@ fn shortened_cause_path(path: &Path) -> String {
 }
 
 /// Closed failures; arbitrary owner or OS error strings never cross the product boundary.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureCode {
     /// Trusted attachment mapping is missing or rejected.
@@ -132,6 +134,10 @@ pub enum FailureCode {
     ProviderLoading,
     /// No symbol matches the requested path or name in the file or project.
     UnknownSymbol,
+    /// The requested path is not a registered source in the authorized worktree scope: the file
+    /// does not exist. Carries the bounded path exactly as requested (T163 precedent: paths in
+    /// the reason are allowed; the stage tag itself stays payload-free).
+    NoSuchFile(String),
     /// A language server's project inputs were absent, unsupported, oversized, reordered, or
     /// changed.
     ResolutionUnverified,

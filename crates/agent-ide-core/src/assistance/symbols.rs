@@ -146,9 +146,21 @@ impl Worker<'_> {
             return Ok((reply, Some(authority), None));
         }
         let (observed, bytes) = self.observe(&binding, path.clone().into()).await?;
+        if let Some(code) = no_such_file(observed.state(), &path) {
+            return Err(code);
+        }
         let (outline, _) = self.outline_of(job, &observed, &bytes).await?;
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
-        let text = render::outline_text(&outline);
+        let text = match job.parameters.get("kinds").and_then(Value::as_str) {
+            Some(requested) => {
+                let kinds: Vec<lang::SymbolKind> = requested
+                    .split(',')
+                    .filter_map(lang::SymbolKind::from_name)
+                    .collect();
+                render::filtered_outline_text(&outline, &kinds, requested)
+            }
+            None => render::outline_text(&outline),
+        };
         let (reply, page) =
             ContextPageState::new(text, 0, false, ResultKind::Outline).next(&job.reference)?;
         self.shared.set_context_page(&job.reference, page);
@@ -199,6 +211,9 @@ impl Worker<'_> {
             }
         };
         let (observed, bytes) = self.observe(&binding, path.clone()).await?;
+        if let Some(code) = no_such_file(observed.state(), &path.to_string_lossy()) {
+            return Err(code);
+        }
         let source = observed_text(&observed, &bytes)?;
         let total = lang::line_count(source);
         if range.start > total {
@@ -419,6 +434,15 @@ impl Worker<'_> {
                 }
             }
             if callees_depth > 0 {
+                // T163 (extra item): re-observe and re-resolve the position immediately before
+                // the request, exactly as `ide.graph`'s callees path does for every node it
+                // queries. The card's other sections (hover, usages, callers) already ran their
+                // own live-session round trips against the job's one shared deadline; reusing
+                // their now-stale `observed`/`byte_offset` here was the one concrete difference
+                // from the graph path, which always resolves its position just-in-time.
+                let (observed, bytes) = self.observe(&binding, file.clone()).await?;
+                let source = observed_text(&observed, &bytes)?;
+                let byte_offset = name_offset(source, &found)?;
                 let live = self.live_session_for(job, &observed).await?;
                 // A requested callees section always answers: a failed request states
                 // unavailability and an answered empty list reports zero, so the card never
@@ -1444,6 +1468,48 @@ fn observed_text<'a>(
         return Err(FailureCode::SourceUnavailable);
     }
     std::str::from_utf8(bytes).map_err(|_| FailureCode::SourceUnavailable)
+}
+
+/// Maps a registered path's observed state to the closed `no_such_file` failure with its bounded
+/// requested path, `None` while the path is present. A missing draft is a legitimate observation,
+/// never a `source_unavailable` collapse (T163).
+fn no_such_file(
+    state: crate::workspace::observation::ObservedState,
+    path: &str,
+) -> Option<FailureCode> {
+    (state == crate::workspace::observation::ObservedState::Missing)
+        .then(|| FailureCode::NoSuchFile(bounded_utf8_prefix(path, MAX_NO_SUCH_FILE_PATH_BYTES)))
+}
+
+#[cfg(test)]
+mod no_such_file_tests {
+    use super::*;
+    use crate::workspace::observation::ObservedState;
+
+    #[test]
+    fn missing_state_names_the_bounded_requested_path() {
+        assert_eq!(
+            no_such_file(ObservedState::Missing, "src/assistance/host_bindng.rs"),
+            Some(FailureCode::NoSuchFile(
+                "src/assistance/host_bindng.rs".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn present_state_names_no_failure() {
+        assert_eq!(no_such_file(ObservedState::Present, "src/lib.rs"), None);
+    }
+
+    #[test]
+    fn an_oversize_path_is_bounded_to_the_reason_limit() {
+        let long = "a".repeat(MAX_NO_SUCH_FILE_PATH_BYTES + 50);
+        let Some(FailureCode::NoSuchFile(bounded)) = no_such_file(ObservedState::Missing, &long)
+        else {
+            panic!("expected NoSuchFile");
+        };
+        assert_eq!(bounded.len(), MAX_NO_SUCH_FILE_PATH_BYTES);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

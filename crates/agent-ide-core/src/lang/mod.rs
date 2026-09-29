@@ -282,6 +282,32 @@ impl SymbolKind {
         }
     }
 
+    /// Parses one closed kind name (`name()`'s exact output); `None` for anything else, including
+    /// case variants.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "module" => Self::Module,
+            "namespace" => Self::Namespace,
+            "struct" => Self::Struct,
+            "enum" => Self::Enum,
+            "class" => Self::Class,
+            "interface" => Self::Interface,
+            "trait" => Self::Trait,
+            "impl" => Self::Impl,
+            "type" => Self::TypeAlias,
+            "fn" => Self::Function,
+            "method" => Self::Method,
+            "constructor" => Self::Constructor,
+            "field" => Self::Field,
+            "variant" => Self::Variant,
+            "const" => Self::Constant,
+            "var" => Self::Variable,
+            "test" => Self::Test,
+            "symbol" => Self::Other,
+            _ => return None,
+        })
+    }
+
     /// Whether the kind owns members that get their own path segment.
     pub const fn is_container(self) -> bool {
         matches!(

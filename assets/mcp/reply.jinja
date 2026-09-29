@@ -41,6 +41,8 @@ pending: use ide.inspect with detail_ref {{ detail_ref }}
 {%- if state == "error" -%}
 {%- if code == "resolution_unverified" -%}
 error: resolution_unverified; {{ resolution_detail if resolution_detail else "the nearest tsconfig.json or jsconfig.json did not prove membership: add the file to `files` or a literal `include` entry and use supported resolution settings" }}; retry ide.context
+{%- elif code.no_such_file is defined -%}
+error: no_such_file: {{ code.no_such_file }}{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; check the path
 {%- elif code is mapping -%}
 error: source_too_large; source is {{ code.source_too_large.size }} bytes, exceeding the {{ code.source_too_large.ceiling }} byte read ceiling; continue with native tools
 {%- elif code == "unknown_symbol" -%}

@@ -36,7 +36,7 @@ async fn typed_failures_and_check_starts_are_logged_without_telemetry() {
         (FailureCode::Capacity, "capacity"),
         (FailureCode::Internal, "internal"),
     ];
-    for (code, _) in failures {
+    for (code, _) in failures.clone() {
         adapters::log_tool_reply(
             AssistanceTool::Inspect,
             &PeerReply::Error { code, detail: None },
