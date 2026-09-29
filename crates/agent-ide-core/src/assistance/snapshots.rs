@@ -12,7 +12,9 @@ use crate::{
         git::{
             BaselineContext, BaselineCoverage, DiffMode, GitError, GitReadIntent, GitReadQuery,
             GitScope, RawGitEvidence,
-            snapshot::{SnapshotIntent, SnapshotRunner, collect_snapshot},
+            snapshot::{
+                SnapshotIntent, SnapshotRunner, collect_snapshot, confine_plain_diff_paths,
+            },
         },
     },
 };
@@ -393,9 +395,10 @@ impl DiffPageState {
 
 /// Runs one single-pass plain `git diff` directly in the worktree as a degraded fallback, used
 /// only when the exact two-pass capture proved unstable, and composes it under `budget`. `None` on
-/// any failure — spawn, wait, a rejected exit, or output `compose_plain_diff` cannot attribute
-/// exactly — so the caller reports the original capture failure instead of a confusing second one
-/// or an understated page.
+/// any failure — spawn, wait, a rejected exit, output `compose_plain_diff` cannot attribute
+/// exactly, or any named path failing the exact capture's per-path confinement
+/// (`confine_plain_diff_paths`) — so the caller reports the original capture failure instead of a
+/// confusing second one, an understated page, or a page for a path the exact capture refuses.
 async fn plain_diff_fallback(
     runner: &mut ProductSnapshotRunner<'_, '_>,
     program: &Path,
@@ -405,7 +408,9 @@ async fn plain_diff_fallback(
     let intent = SnapshotIntent::plain_diff(scope.clone(), program).ok()?;
     let evidence = runner.run_owned(intent.clone()).await.ok()?;
     let stdout = intent.accept(evidence).ok()?;
-    crate::changes::compose_plain_diff(scope, &stdout, budget)
+    crate::changes::compose_plain_diff(scope, &stdout, budget, |paths| {
+        confine_plain_diff_paths(scope, paths).is_ok()
+    })
 }
 
 /// Hex-encodes raw comparison-side identity bytes for safe inclusion in rendered text.
@@ -899,7 +904,8 @@ impl Worker<'_> {
             Ok(evidence) => evidence,
             // W4: the two-pass exact capture retries once and then fails closed on genuine
             // instability (e.g. a concurrent checkout); a single-pass plain `git diff` trades the
-            // exact-capture atomicity guarantee for an answer, always marked as such. Any other
+            // exact-capture atomicity guarantee for an answer, always marked as such, and only
+            // when every path it names passes the exact capture's per-path confinement. Any other
             // capture failure keeps its own explicit, non-degraded error below.
             Err(GitError::UnstableSnapshot) => {
                 let scope = GitScope::from_authority(&authority, mode);

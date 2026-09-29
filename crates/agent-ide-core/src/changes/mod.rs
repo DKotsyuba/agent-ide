@@ -497,15 +497,20 @@ pub fn expand_diff(
 /// `stdout` must come from `SnapshotIntent::plain_diff` (no renames, `a/`/`b/` prefixes). Returns
 /// `None` when any of it cannot be attributed exactly — a `diff --git` header of another shape, a
 /// hunk before any header, or a hunk line with an unexpected first byte — so file and line counts
-/// are never silently understated; the caller then refuses instead of rendering. A `Some` result
-/// is `Ready`, with `Partial` coverage only when `budget` left hunks unselected.
+/// are never silently understated; the caller then refuses instead of rendering. `confine`
+/// receives every named path (selected or not) once, before any hunk is selected, and must return
+/// `false` for any path the exact capture would refuse (Workspace's
+/// `snapshot::confine_plain_diff_paths`); `false` also yields `None`, so no page ever answers
+/// for such a path. A `Some` result is `Ready`, with `Partial` coverage only when `budget` left
+/// hunks unselected.
 pub fn compose_plain_diff(
     expected_scope: &GitScope,
     stdout: &[u8],
     budget: DiffSelectionBudget,
+    confine: impl FnOnce(&[PathBuf]) -> bool,
 ) -> Option<DiffResult> {
     let parsed = parse_plain_diff(stdout);
-    if parsed.malformed {
+    if parsed.malformed || !confine(&parsed.paths) {
         return None;
     }
     let (selected_hunks, overflow_hunks, overflow_bytes, _cursor) =
@@ -524,7 +529,7 @@ pub fn compose_plain_diff(
         worktree_id: expected_scope.worktree().id().to_owned(),
         identities: DiffComparisonIdentities::new(&[], &[]),
         status_counts: DiffStatusCounts {
-            tracked: parsed.files,
+            tracked: parsed.paths.len(),
             conflicted: 0,
             untracked: 0,
             ignored: 0,
@@ -856,8 +861,10 @@ fn parse_snapshot_hunks(snapshot: &GitSnapshot) -> ParsedDiff {
 struct ParsedPlainDiff {
     /// All full hunks successfully parsed from stdout.
     hunks: Vec<RawHunk>,
-    /// Number of distinct files named by a `diff --git` header, independent of hunk selection.
-    files: usize,
+    /// Every file named by a `diff --git` header, in output order, independent of hunk selection;
+    /// its length is the reported file count and each entry is subject to the caller's
+    /// confinement check.
+    paths: Vec<PathBuf>,
     /// Total added lines across every hunk.
     additions: usize,
     /// Total removed lines across every hunk.
@@ -875,7 +882,7 @@ struct ParsedPlainDiff {
 fn parse_plain_diff(stdout: &[u8]) -> ParsedPlainDiff {
     let mut parsed = ParsedPlainDiff {
         hunks: Vec::new(),
-        files: 0,
+        paths: Vec::new(),
         additions: 0,
         deletions: 0,
         malformed: false,
@@ -887,10 +894,9 @@ fn parse_plain_diff(stdout: &[u8]) -> ParsedPlainDiff {
         let line = &stdout[cursor..end];
         if line.starts_with(b"diff --git ") {
             current = parse_diff_git_header(line);
-            if current.is_some() {
-                parsed.files += 1;
-            } else {
-                parsed.malformed = true;
+            match &current {
+                Some(path) => parsed.paths.push(path.clone()),
+                None => parsed.malformed = true,
             }
             cursor = end;
         } else if line.starts_with(b"@@ ") {

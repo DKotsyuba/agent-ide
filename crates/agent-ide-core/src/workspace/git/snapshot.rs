@@ -590,6 +590,35 @@ impl SnapshotIntent {
     }
 }
 
+/// Applies the exact capture's per-path confinement to every path a degraded plain `git diff`
+/// named, so the fallback never answers for a path the exact capture would refuse.
+///
+/// Each path gets the same descriptor-relative, no-follow, root-identity-checked regular-file
+/// open that [`SnapshotSource::capture`] uses, without reading bytes. A missing path is an
+/// accepted deletion; a symlink or non-directory in any component (a tracked directory replaced by
+/// a link), a non-regular final entry (a changed tracked symlink, a gitlink directory, a special
+/// file), an invalid path, or any other native error refuses with
+/// [`GitError::UnsupportedSnapshot`], and a replaced worktree root with
+/// [`GitError::UnstableSnapshot`]. More than [`MAX_SNAPSHOT_PATHS`] paths, or one file over
+/// [`MAX_SNAPSHOT_BLOB_BYTES`], refuses with [`GitError::EvidenceTooLarge`] — the exact capture's
+/// own ceilings. Runs after Git exited, so it classifies the worktree as it is at check time.
+pub fn confine_plain_diff_paths(scope: &GitScope, paths: &[PathBuf]) -> Result<(), GitError> {
+    if paths.len() > MAX_SNAPSHOT_PATHS {
+        return Err(GitError::EvidenceTooLarge);
+    }
+    for path in paths {
+        match crate::workspace::observation::snapshot_source_metadata(scope.worktree(), path) {
+            Ok(metadata) if metadata.len() > MAX_SNAPSHOT_BLOB_BYTES as u64 => {
+                return Err(GitError::EvidenceTooLarge);
+            }
+            Ok(_) | Err(ObservationError::Missing) => {}
+            Err(ObservationError::RootIdentityChanged) => return Err(GitError::UnstableSnapshot),
+            Err(_) => return Err(GitError::UnsupportedSnapshot),
+        }
+    }
+    Ok(())
+}
+
 /// Parses exactly one terminal-LF object name per line, in command argument order.
 fn parse_batch_hashes(output: &[u8], count: usize) -> Result<Vec<GitObjectId>, GitError> {
     let lines: Vec<&[u8]> = output.split(|byte| *byte == b'\n').collect();

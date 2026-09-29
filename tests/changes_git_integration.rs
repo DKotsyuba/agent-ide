@@ -956,7 +956,10 @@ async fn untracked_symlink_and_special_entries_are_listed_by_name_only() {
 /// capture proves unstable.
 #[tokio::test]
 async fn plain_diff_fallback_parses_real_hunks_without_exact_capture() {
-    use agent_ide::{changes::compose_plain_diff, workspace::git::GitScope};
+    use agent_ide::{
+        changes::compose_plain_diff,
+        workspace::git::{GitScope, snapshot::confine_plain_diff_paths},
+    };
 
     let fixture = GitFixture::new();
     fixture.write(b"changed.txt", b"line one\nline two\nline three\n");
@@ -972,7 +975,10 @@ async fn plain_diff_fallback_parses_real_hunks_without_exact_capture() {
     let mut runner = Runner::default();
     let evidence = runner.run(intent.clone()).await.unwrap();
     let stdout = intent.accept(evidence).unwrap();
-    let result = compose_plain_diff(&scope, &stdout, DiffSelectionBudget::default()).unwrap();
+    let result = compose_plain_diff(&scope, &stdout, DiffSelectionBudget::default(), |paths| {
+        confine_plain_diff_paths(&scope, paths).is_ok()
+    })
+    .unwrap();
     assert_eq!(result.counts().tracked(), 1);
     assert_eq!(result.additions(), 2);
     assert_eq!(result.deletions(), 1);
@@ -989,7 +995,10 @@ async fn plain_diff_fallback_parses_real_hunks_without_exact_capture() {
 /// degraded fallback never reports fewer files or lines than the plain diff actually carried.
 #[tokio::test]
 async fn plain_diff_fallback_counts_files_git_quotes() {
-    use agent_ide::{changes::compose_plain_diff, workspace::git::GitScope};
+    use agent_ide::{
+        changes::compose_plain_diff,
+        workspace::git::{GitScope, snapshot::confine_plain_diff_paths},
+    };
 
     let fixture = GitFixture::new();
     fs::create_dir(fixture.root.join("x b")).unwrap();
@@ -1008,8 +1017,11 @@ async fn plain_diff_fallback_counts_files_git_quotes() {
     let mut runner = Runner::default();
     let evidence = runner.run(intent.clone()).await.unwrap();
     let stdout = intent.accept(evidence).unwrap();
-    let result = compose_plain_diff(&scope, &stdout, DiffSelectionBudget::default())
-        .unwrap_or_else(|| panic!("unattributed output:\n{}", String::from_utf8_lossy(&stdout)));
+    // The real confinement must accept every decoded raw name: each is a regular in-root file.
+    let result = compose_plain_diff(&scope, &stdout, DiffSelectionBudget::default(), |paths| {
+        confine_plain_diff_paths(&scope, paths).is_ok()
+    })
+    .unwrap_or_else(|| panic!("unattributed output:\n{}", String::from_utf8_lossy(&stdout)));
     assert_eq!(
         result.counts().tracked(),
         3,
