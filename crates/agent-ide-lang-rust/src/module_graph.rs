@@ -187,7 +187,7 @@ fn declares(file: &Path, name: &str) -> Option<Gate> {
         if rest.is_empty() {
             continue;
         }
-        let item_gate = std::mem::replace(&mut gate, Some(Gate::Always));
+        let item_gate = gate.replace(Gate::Always);
         let Some(declaration) = without_visibility(rest).strip_prefix("mod ") else {
             continue;
         };
