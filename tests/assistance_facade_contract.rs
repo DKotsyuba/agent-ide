@@ -479,11 +479,16 @@ fn edit_arguments_are_closed_and_bounded() {
     let mut extra = valid.clone();
     extra["patch"] = json!("@@");
     assert!(validate_call(AssistanceTool::Edit, extra).is_err());
-    for field in ["operation_id", "path", "source_ref", "content"] {
+    for field in ["operation_id", "path", "content"] {
         let mut missing = valid.clone();
         missing.as_object_mut().unwrap().remove(field);
         assert!(validate_call(AssistanceTool::Edit, missing).is_err());
     }
+    // Without `source_ref` the full-file form is a creation request: the daemon observes the
+    // path itself and refuses it when the file already exists.
+    let mut create = valid.clone();
+    create.as_object_mut().unwrap().remove("source_ref");
+    assert!(validate_call(AssistanceTool::Edit, create).is_ok());
     assert!(
         validate_call(
             AssistanceTool::Edit,

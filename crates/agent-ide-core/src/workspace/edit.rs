@@ -970,6 +970,39 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    /// Proves a creation based on an observed absence never overwrites a file that appeared since:
+    /// one present at resolution and one created natively just before installation both refuse.
+    #[test]
+    fn creation_refuses_a_file_that_appeared_after_the_missing_observation() {
+        let root = temporary("create-race");
+        let authority = authority(&root);
+        let path = PathBuf::from("new.rs");
+        let missing = source_ref(&authority, &path, None);
+        fs::write(root.join(&path), "native").expect("native create before resolve");
+        assert!(matches!(
+            CurrentEditTarget::resolve(&authority, &path, missing.clone()),
+            Err(EditOutcome::StaleSource)
+        ));
+        fs::remove_file(root.join(&path)).expect("remove");
+
+        let target =
+            CurrentEditTarget::resolve(&authority, &path, missing.clone()).expect("missing target");
+        assert_eq!(
+            replace_if_current_with_checkpoint(
+                EditPermit::new("create-race", path.clone()).expect("permit"),
+                target,
+                &missing,
+                b"model",
+                || true,
+                || true,
+                || fs::write(root.join(&path), "native").expect("native create"),
+            ),
+            EditOutcome::StaleSource
+        );
+        assert_eq!(fs::read(root.join(&path)).expect("read"), b"native");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     /// Proves a native write after temporary fsync but before installation is never overwritten.
     #[test]
     fn final_recheck_rejects_native_write_during_private_preparation() {

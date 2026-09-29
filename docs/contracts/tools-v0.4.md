@@ -291,7 +291,11 @@ Input operations:
 {op: "delete",  symbol: "src/index.ts#ClassImpl/old"}
 {op: "rename",  symbol: "src/index.ts#ClassImpl/method", new_name: "run"}
 {op: "replace", path: "src/index.ts", lines: "1-12", source_ref: "sym-14", content: "…"}   // fallback mode
+{path: "src/index.ts", source_ref: "sym-14", content: "…"}                                // whole-file replace
+{path: "src/new.ts", content: "…"}                                                        // create a missing file
 ```
+
+The whole-file form without `source_ref` only creates a file that does not exist yet: `ide.read` and `ide.outline` answer `no_such_file` on a missing path, so there is no read to name. The worker observes the path itself; an absence is the base, the candidate is formatted and written through the same confined, stale-safe path as every edit (reply `edit: created` with the project check), and a file that appears between that observation and the write is refused `stale_source`, never overwritten. On an existing file the call is refused with no write: `invalid bounded parameters: "source_ref" is required to replace an existing file: read it first (ide.read)`.
 
 For a symbol, `content` is the complete symbol including its header. The IDE derives indentation and blank lines from neighboring code. After writing, the project's formatter runs over the candidate (before the write), then the project check (cargo check / pyright / tsc) is scheduled at once and the reply carries the edited file's problems from it. `rename` is performed by the language server across the project.
 

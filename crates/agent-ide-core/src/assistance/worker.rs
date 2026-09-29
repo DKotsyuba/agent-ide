@@ -3302,7 +3302,8 @@ impl<'a> Worker<'a> {
     /// Executes one managed-Codex full-content edit through Changes receipts and Workspace permits.
     ///
     /// The source reference must name a completed same-binding Context detail whose exact source
-    /// observation still matches `path`. A new durable prepare is the only route to Workspace; an
+    /// observation still matches `path`; a full-file call without one is a creation request
+    /// handled by `create_file`. A new durable prepare is the only route to Workspace; an
     /// exact prepared receipt recovered after ambiguity returns unknown and is never dispatched
     /// again. Known effects are followed by source observation and a deadline-bounded provider
     /// diagnostic refresh attached to the same reply only when it matches that post-read source;
@@ -3358,6 +3359,9 @@ impl<'a> Worker<'a> {
         }
         if job.parameters.get("symbol").is_some() || job.parameters.get("lines").is_some() {
             return self.edit_by_symbol(job).await;
+        }
+        if job.parameters.get("source_ref").is_none() {
+            return self.create_file(job).await;
         }
         let request: EditRequest =
             serde_json::from_value(job.parameters.clone()).map_err(|_| FailureCode::Internal)?;

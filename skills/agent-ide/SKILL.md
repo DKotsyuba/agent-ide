@@ -83,9 +83,10 @@ which the reply says `unknown` and `ide.context` shows the result when it lands.
   `stale_source` (no write) when that read no longer matches the file — re-read the lines
   (ide.read) and retry with the new `source_ref`. The symbol forms take `source_ref` too
   (optional; validated when given).
-- `ide.edit` also creates files: the same calls on a path that does not exist yet answer
-  `edit: created` with the same check — prefer it over native creation so the diagnostics
-  arrive in-reply.
+- `ide.edit {"operation_id":"…","path":"src/new.rs","content":"…"}` — creates a file that does
+  not exist yet (no `source_ref`: there is nothing to read) and answers `edit: created` with the
+  same check — prefer it over native creation so the diagnostics arrive in-reply. The same call
+  on an existing file is refused with no write: read it first and pass its `source_ref`.
 - When a reply's last line reads `formatted: +N lines after line X; use source_ref …`, the
   formatter moved lines: any further line-range edit must start from a fresh `ide.read`, not
   from the line numbers you held before the edit.

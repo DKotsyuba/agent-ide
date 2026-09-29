@@ -1696,6 +1696,74 @@ impl Worker<'_> {
             .await
     }
 
+    /// `ide.edit {path, content}` without `source_ref`: creates a file that does not exist yet.
+    ///
+    /// The worker observes `path` itself (the same confined reader as every other observation);
+    /// only an observed absence is a valid base, since `ide.read` and `ide.outline` answer
+    /// `no_such_file` there and so cannot mint a `source_ref`. The candidate is formatted with the
+    /// project formatter and written through the ordinary stale-safe edit path with that missing
+    /// observation as the base, so the reply is `edit: created` with the project check, and a file
+    /// that appears between the observation and the write is refused `stale_source`, never
+    /// overwritten. An existing path is refused as invalid parameters naming `source_ref`, before
+    /// any receipt or write, so a retry with a real `source_ref` may reuse the `operation_id`.
+    pub(super) async fn create_file(
+        &mut self,
+        job: &mut Job,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        let text = |field: &str| {
+            job.parameters
+                .get(field)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or(FailureCode::Internal)
+        };
+        let (operation_id, path, content) =
+            (text("operation_id")?, text("path")?, text("content")?);
+        let file = std::path::PathBuf::from(&path);
+        let (observed, _) = self.observe(&binding, file.clone()).await?;
+        if observed.bytes().is_some() {
+            let authority = self.authority(&binding).await.ok();
+            return Ok((
+                PeerReply::InvalidParameters {
+                    message: crate::assistance::facade::ParameterError::InvalidField {
+                        field: "source_ref",
+                        rule: crate::assistance::facade::FieldRule::ReplaceSourceRef,
+                    }
+                    .message(AssistanceTool::Edit),
+                },
+                authority,
+                None,
+            ));
+        }
+        let candidate = self.format_candidate(&observed, &file, content).await;
+        let request = EditRequest::new(operation_id, path, &job.reference, candidate)
+            .map_err(|_| FailureCode::Internal)?;
+        let prepared = match self.edits.prepare(request.clone()).await {
+            Ok(PrepareAdmission::Prepared(prepared)) => prepared,
+            Ok(
+                PrepareAdmission::Settled(result)
+                | PrepareAdmission::ConflictingDuplicate(result)
+                | PrepareAdmission::OutcomeUnknown(result),
+            ) => {
+                let authority = self.authority(&binding).await.ok();
+                return Ok((
+                    PeerReply::Edit {
+                        result,
+                        diagnostics: EditDiagnostics::Unknown {},
+                        note: None,
+                        operation: None,
+                    },
+                    authority,
+                    None,
+                ));
+            }
+            Err(_) => return Err(FailureCode::Internal),
+        };
+        self.edit_with_source(job, request, prepared, observed, true)
+            .await
+    }
+
     /// Runs the project's stdin formatter over a candidate text; the candidate is returned
     /// unchanged when there is no formatter, it fails, or it takes longer than ten seconds.
     async fn format_candidate(

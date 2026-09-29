@@ -4740,6 +4740,66 @@ async fn an_edit_to_an_undeclared_rust_module_is_not_analysed() {
     daemon.wait().await.unwrap();
 }
 
+/// `ide.edit {path, content}` without `source_ref` creates a file that does not exist yet — the
+/// worker observes the absence itself, since `ide.read` on a missing path answers `no_such_file`
+/// and cannot mint one — and refuses the same call on an existing file with no write.
+#[tokio::test]
+async fn a_full_file_edit_without_source_ref_creates_only_a_missing_file() {
+    let fixture = ProductFixture::new(json!([]));
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "create-edit").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"create-edit"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let content = "pub fn orphan_probe() -> u8 {\n    2\n}\n";
+    let created = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"create-new","path":"src/orphan_probe.rs","content":content}),
+        )
+        .await;
+    let created = actor.settle(&fixture, created).await;
+    assert_eq!(created["state"], "edit", "{created}");
+    assert_eq!(created["result"]["outcome"], "created", "{created}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("src/orphan_probe.rs")).unwrap(),
+        content
+    );
+
+    let before = std::fs::read(fixture.root.join("src/lib.rs")).unwrap();
+    let refused = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"create-existing","path":"src/lib.rs",
+                   "content":"pub fn clobbered() {}\n"}),
+        )
+        .await;
+    let refused = actor.settle(&fixture, refused).await;
+    assert_eq!(refused["state"], "invalid_parameters", "{refused}");
+    assert_eq!(
+        refused["text"],
+        "invalid bounded parameters: \"source_ref\" is required to replace an existing file: \
+         read it first (ide.read)",
+        "{refused}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/lib.rs")).unwrap(),
+        before
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A session that never calls `ide.start` produces hook bookkeeping, not failures: one `info`
 /// skip line per detail per window on each side, and no `warn` hook line at all.
 #[tokio::test]
