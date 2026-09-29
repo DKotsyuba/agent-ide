@@ -493,26 +493,30 @@ pub fn expand_diff(
 /// untracked or conflict data — a plain `git diff` reports neither — so `freshness` stays
 /// [`DiffFreshness::Unknown`] and `provenance` stays empty; the caller marks the rendered text as
 /// a plain-diff fallback and never offers `ide.inspect` continuation for it.
+///
+/// `stdout` must come from `SnapshotIntent::plain_diff` (no renames, `a/`/`b/` prefixes). Returns
+/// `None` when any of it cannot be attributed exactly — a `diff --git` header of another shape, a
+/// hunk before any header, or a hunk line with an unexpected first byte — so file and line counts
+/// are never silently understated; the caller then refuses instead of rendering. A `Some` result
+/// is `Ready`, with `Partial` coverage only when `budget` left hunks unselected.
 pub fn compose_plain_diff(
     expected_scope: &GitScope,
     stdout: &[u8],
     budget: DiffSelectionBudget,
-) -> DiffResult {
+) -> Option<DiffResult> {
     let parsed = parse_plain_diff(stdout);
+    if parsed.malformed {
+        return None;
+    }
     let (selected_hunks, overflow_hunks, overflow_bytes, _cursor) =
         select_hunks(parsed.hunks, budget);
-    let state = if parsed.malformed {
-        DiffResultState::Incomplete
-    } else {
-        DiffResultState::Ready
-    };
-    let coverage = if parsed.malformed || overflow_hunks > 0 {
+    let coverage = if overflow_hunks > 0 {
         DiffCoverage::Partial
     } else {
         DiffCoverage::Complete
     };
-    DiffResult {
-        state,
+    Some(DiffResult {
+        state: DiffResultState::Ready,
         freshness: DiffFreshness::Unknown,
         coverage,
         scope_mode: expected_scope.mode(),
@@ -537,7 +541,7 @@ pub fn compose_plain_diff(
         ignored: Vec::new(),
         detail_cursor: None,
         provenance: DiffProvenance::new(None, None, None, None, None, None),
-    }
+    })
 }
 
 /// Applies common scope/cursor validation before parsing or selecting any hunk payload.
@@ -858,14 +862,16 @@ struct ParsedPlainDiff {
     additions: usize,
     /// Total removed lines across every hunk.
     deletions: usize,
-    /// Whether the parser saw a hunk body line with an unexpected first byte.
+    /// Whether any output could not be attributed exactly: an unparsed `diff --git` header, a
+    /// hunk before any header, or a hunk body line with an unexpected first byte.
     malformed: bool,
 }
 
 /// Splits raw single-pass `git diff` stdout into hunks attributed by their own `diff --git`
-/// header, the only per-file identity this degraded capture has. Lines outside a hunk body are
-/// otherwise skipped without being flagged malformed: this parser is deliberately more permissive
-/// than [`parse_snapshot_hunks`], since it never has the two-pass capture's completeness proof.
+/// header, the only per-file identity this degraded capture has. Extended header lines (`index`,
+/// modes, `---`/`+++`) are skipped; a header [`parse_diff_git_header`] cannot decode flags the
+/// output malformed and detaches the hunks after it, so no hunk is ever credited to the previous
+/// file and the caller can refuse instead of understating counts.
 fn parse_plain_diff(stdout: &[u8]) -> ParsedPlainDiff {
     let mut parsed = ParsedPlainDiff {
         hunks: Vec::new(),
@@ -879,9 +885,13 @@ fn parse_plain_diff(stdout: &[u8]) -> ParsedPlainDiff {
     while cursor < stdout.len() {
         let end = next_line_end(stdout, cursor);
         let line = &stdout[cursor..end];
-        if let Some(path) = parse_diff_git_header(line) {
-            current = Some(path);
-            parsed.files += 1;
+        if line.starts_with(b"diff --git ") {
+            current = parse_diff_git_header(line);
+            if current.is_some() {
+                parsed.files += 1;
+            } else {
+                parsed.malformed = true;
+            }
             cursor = end;
         } else if line.starts_with(b"@@ ") {
             let Some(path) = current.clone() else {
@@ -929,19 +939,73 @@ fn parse_plain_diff(stdout: &[u8]) -> ParsedPlainDiff {
     parsed
 }
 
-/// Extracts the current (`b/`) path from one `diff --git a/<old> b/<new>` header line, splitting
-/// at the first ` b/` boundary. A path containing that exact four-byte sequence is misattributed;
-/// this is an accepted simplification of a degraded fallback that never claims exactness.
+/// Extracts the raw path from one `diff --git a/<path> b/<path>` header line (with or without its
+/// terminating LF). The fallback runs with `--no-renames` and explicit `a/`/`b/` prefixes, so both
+/// sides always name the same path: a quoted header is decoded from Git's C-quoted form, and an
+/// unquoted one is split exactly at its midpoint, so a name that itself contains ` b/` is still
+/// attributed correctly. `None` for any other shape, including two sides naming different paths.
 fn parse_diff_git_header(line: &[u8]) -> Option<PathBuf> {
-    let rest = line.strip_prefix(b"diff --git a/")?;
-    let marker = b" b/";
-    let position = rest
-        .windows(marker.len())
-        .position(|window| window == marker)?;
-    let path = rest[position + marker.len()..]
-        .strip_suffix(b"\n")
-        .unwrap_or(&rest[position + marker.len()..]);
-    Some(PathBuf::from(OsStr::from_bytes(path)))
+    let rest = line.strip_prefix(b"diff --git ")?;
+    let rest = rest.strip_suffix(b"\n").unwrap_or(rest);
+    let (old, new) = if rest.first() == Some(&b'"') {
+        let (old, tail) = unquote_c_path(rest)?;
+        let (new, tail) = unquote_c_path(tail.strip_prefix(b" ")?)?;
+        if !tail.is_empty() {
+            return None;
+        }
+        (old, new)
+    } else {
+        let half = rest.len().checked_sub(1)? / 2;
+        if rest.len() % 2 == 0 || rest[half] != b' ' {
+            return None;
+        }
+        (rest[..half].to_vec(), rest[half + 1..].to_vec())
+    };
+    let old = old.strip_prefix(b"a/")?;
+    let path = new.strip_prefix(b"b/")?;
+    (old == path && !path.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(path)))
+}
+
+/// Decodes one leading Git C-quoted name — `"…"`, as Git writes a path holding a control
+/// character, `"`, `\` or (under the default `core.quotePath`) a non-ASCII byte — with the
+/// `\a \b \t \n \v \f \r \" \\` and three-digit octal escapes Git emits. Returns the raw name
+/// bytes and the input after the closing quote; `None` when `bytes` does not start with one
+/// complete quoted name or carries an escape Git never writes.
+fn unquote_c_path(bytes: &[u8]) -> Option<(Vec<u8>, &[u8])> {
+    let mut rest = bytes.strip_prefix(b"\"")?;
+    let mut name = Vec::new();
+    loop {
+        let (&byte, tail) = rest.split_first()?;
+        rest = tail;
+        if byte == b'"' {
+            return Some((name, rest));
+        }
+        if byte != b'\\' {
+            name.push(byte);
+            continue;
+        }
+        let (&escape, tail) = rest.split_first()?;
+        rest = tail;
+        name.push(match escape {
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b't' => b'\t',
+            b'n' => b'\n',
+            b'v' => 0x0b,
+            b'f' => 0x0c,
+            b'r' => b'\r',
+            b'"' | b'\\' => escape,
+            b'0'..=b'3' => {
+                let (digits, tail) = rest.split_at_checked(2)?;
+                if !digits.iter().all(|digit| (b'0'..=b'7').contains(digit)) {
+                    return None;
+                }
+                rest = tail;
+                ((escape - b'0') << 6) | ((digits[0] - b'0') << 3) | (digits[1] - b'0')
+            }
+            _ => return None,
+        });
+    }
 }
 
 /// Returns the byte index after the next line terminator.

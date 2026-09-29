@@ -506,6 +506,11 @@ impl SnapshotIntent {
     /// Builds a single-pass `git diff` command run directly in the worktree, with no scratch
     /// files and no per-blob hashing — a degraded fallback used only when the exact two-pass
     /// capture proved unstable, trading atomicity for one plain child.
+    ///
+    /// `--no-renames` and the explicit `a/`/`b/` prefixes (overriding a repository's
+    /// `diff.mnemonicPrefix`/`diff.noprefix`) make every `diff --git` header name one path twice,
+    /// the only header shape `changes::compose_plain_diff` accepts; a rename appears as a deletion
+    /// plus an addition.
     pub fn plain_diff(scope: GitScope, program: &Path) -> Result<Self, GitError> {
         let mut arguments: Vec<OsString> = [
             "--no-pager",
@@ -516,6 +521,9 @@ impl SnapshotIntent {
             "--no-ext-diff",
             "--no-textconv",
             "--no-color",
+            "--no-renames",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
             "--full-index",
             "--patch",
         ]

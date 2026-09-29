@@ -392,17 +392,20 @@ impl DiffPageState {
 }
 
 /// Runs one single-pass plain `git diff` directly in the worktree as a degraded fallback, used
-/// only when the exact two-pass capture proved unstable. `None` on any failure — spawn, wait, or a
-/// rejected exit — so the caller reports the original capture failure instead of a confusing
-/// second one.
+/// only when the exact two-pass capture proved unstable, and composes it under `budget`. `None` on
+/// any failure — spawn, wait, a rejected exit, or output `compose_plain_diff` cannot attribute
+/// exactly — so the caller reports the original capture failure instead of a confusing second one
+/// or an understated page.
 async fn plain_diff_fallback(
     runner: &mut ProductSnapshotRunner<'_, '_>,
     program: &Path,
     scope: &GitScope,
-) -> Option<Vec<u8>> {
+    budget: crate::changes::DiffSelectionBudget,
+) -> Option<crate::changes::DiffResult> {
     let intent = SnapshotIntent::plain_diff(scope.clone(), program).ok()?;
     let evidence = runner.run_owned(intent.clone()).await.ok()?;
-    intent.accept(evidence).ok()
+    let stdout = intent.accept(evidence).ok()?;
+    crate::changes::compose_plain_diff(scope, &stdout, budget)
 }
 
 /// Hex-encodes raw comparison-side identity bytes for safe inclusion in rendered text.
@@ -901,18 +904,17 @@ impl Worker<'_> {
             Err(GitError::UnstableSnapshot) => {
                 let scope = GitScope::from_authority(&authority, mode);
                 let budget = crate::changes::DiffSelectionBudget::bounded(32, 48 * 1024);
-                let plain = plain_diff_fallback(&mut runner, &program, &scope).await;
+                let plain = plain_diff_fallback(&mut runner, &program, &scope, budget).await;
                 let failure = runner.failure.take();
                 let stage = runner.stage;
                 let detail = runner.detail.clone();
                 drop(runner);
-                let Some(stdout) = plain else {
+                let Some(result) = plain else {
                     job.failure_detail = Some(detail.unwrap_or_else(|| {
                         git_failure_detail(&GitError::UnstableSnapshot, stage, failure.clone())
                     }));
                     return Err(failure.unwrap_or(FailureCode::SourceUnavailable));
                 };
-                let result = crate::changes::compose_plain_diff(&scope, &stdout, budget);
                 let authority = self.authority(&binding).await?;
                 self.shared.active(&binding)?;
                 let continuation = if result.overflow_hunks() > 0 {
