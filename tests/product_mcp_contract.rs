@@ -5883,7 +5883,8 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     daemon.wait().await.unwrap();
 }
 
-/// A branch another process checks out after activation reaches the next terminal reply's plate
+/// A branch another process checks out after activation reaches the plate of the first terminal
+/// reply that probes HEAD — at most one probe per 30 s per session, the first by the start —
 /// once as a `git: HEAD moved …` line, and is not repeated.
 #[tokio::test]
 async fn a_branch_switched_outside_the_ide_is_noticed_once_on_the_plate() {
@@ -5895,6 +5896,15 @@ async fn a_branch_switched_outside_the_ide_is_noticed_once_on_the_plate() {
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     fixture.git(&["checkout", "--quiet", "-b", "moved-elsewhere"]);
+    let early = actor
+        .call(&fixture, "ide.context", json!({"path":"src/lib.rs"}))
+        .await;
+    let early = actor.settle(&fixture, early).await;
+    assert!(
+        carried_status(&early).is_none_or(|plate| !plate.contains("git: HEAD moved")),
+        "a call inside the start's probe interval does not read HEAD again: {early}"
+    );
+    tokio::time::sleep(Duration::from_secs(31)).await;
     let context = actor
         .call(&fixture, "ide.context", json!({"path":"src/lib.rs"}))
         .await;

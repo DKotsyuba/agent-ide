@@ -8,9 +8,13 @@
 //! declares `mod name;` and is itself reached.
 //!
 //! Ceilings, each answered "unreached" (a redundant notice, never a false clean): a `mod` with a
-//! `#[path]` attribute, a module declared inside an inline `mod x { … }` block or a macro, and a
-//! module file larger than [`MAX_FILE_BYTES`]. A `mod` line inside a block comment counts as a
-//! declaration. A file outside any package in the worktree is left to the check (reached).
+//! `#[path]` attribute; a `mod` gated by any `cfg` or `cfg_attr` other than exactly
+//! `#[cfg(test)]`, since the check may not meet the condition (`cfg(windows)` on macOS); a
+//! `#[cfg(test)]` one whose chain ends at a root `cargo check --all-targets` does not build as a
+//! unit or integration test ([`unit_test_root`]); a module declared inside an inline
+//! `mod x { … }` block or a macro; and a module file larger than [`MAX_FILE_BYTES`]. A `mod` line
+//! inside a block comment counts as a declaration. A file outside any package in the worktree is
+//! left to the check (reached).
 
 use std::path::{Path, PathBuf};
 
@@ -23,8 +27,18 @@ const MAX_STEPS: usize = 64;
 /// Reason reported for a file no build target reaches.
 pub const UNREACHED: &str = "rust check did not compile this file — not declared with `mod`";
 
+/// How a `mod name;` declaration is gated by its attributes, among gates proven compiled.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Gate {
+    /// Exactly `#[cfg(test)]`: compiled only where the root is built as a test.
+    Test,
+    /// No `cfg`, `cfg_attr` or `path` attribute: compiled wherever its parent module is.
+    Always,
+}
+
 /// Reports whether the worktree-relative `path` is reached from a build target of its nearest
-/// package; a file under no package manifest inside `worktree` counts as reached.
+/// package; a file under no package manifest inside `worktree` counts as reached. A chain with a
+/// `#[cfg(test)]` declaration counts only when its root is a [`unit_test_root`].
 pub fn reached(worktree: &Path, path: &Path) -> bool {
     let file = worktree.join(path);
     let Some(package) = file
@@ -38,22 +52,44 @@ pub fn reached(worktree: &Path, path: &Path) -> bool {
     };
     let manifest = std::fs::read_to_string(package.join("Cargo.toml")).unwrap_or_default();
     let mut current = file;
+    let mut test_only = false;
     for _ in 0..MAX_STEPS {
         if is_root(&package, &manifest, &current) {
-            return true;
+            return !test_only || unit_test_root(&package, &manifest, &current);
         }
         let Some((name, declarers)) = parent_module(&package, &manifest, &current) else {
             return false;
         };
         match declarers
             .into_iter()
-            .find(|declarer| declares(declarer, &name))
+            .find_map(|declarer| Some((declares(&declarer, &name)?, declarer)))
         {
-            Some(declarer) => current = declarer,
+            Some((gate, declarer)) => {
+                test_only |= gate == Gate::Test;
+                current = declarer;
+            }
             None => return false,
         }
     }
     false
+}
+
+/// Reports whether `cargo check --all-targets` builds the crate root `file` with `cfg(test)`: the
+/// auto-discovered library, a binary or an integration test, unless any manifest line turns a
+/// target's `test` or `harness` off. Examples, benches, the build script and manifest-named
+/// paths are not proven.
+fn unit_test_root(package: &Path, manifest: &str, file: &Path) -> bool {
+    let Ok(relative) = file.strip_prefix(package) else {
+        return false;
+    };
+    let parts: Vec<&str> = relative.iter().filter_map(|part| part.to_str()).collect();
+    matches!(
+        parts.as_slice(),
+        ["src", "lib.rs"] | ["src", "main.rs"] | ["src", "bin", ..] | ["tests", ..]
+    ) && !manifest.lines().any(|line| {
+        let line: String = line.split_whitespace().collect();
+        line.starts_with("test=false") || line.starts_with("harness=false")
+    })
 }
 
 /// Reports whether `file` is a crate root of `package`: an auto-discovered target or a target
@@ -110,33 +146,48 @@ fn parent_module(package: &Path, manifest: &str, file: &Path) -> Option<(String,
     Some((name, declarers))
 }
 
-/// Reports whether `file` declares `mod name;` (any visibility, same-line attributes allowed),
-/// excluding a declaration carrying a `#[path]` attribute.
-fn declares(file: &Path, name: &str) -> bool {
+/// Returns how `file` declares `mod name;` (any visibility, attributes on the same or preceding
+/// lines), the least gated when declared more than once: [`Gate::Always`] without a condition,
+/// [`Gate::Test`] under exactly `#[cfg(test)]`, and `None` when it is not declared or only under
+/// an unproven attribute — any other `cfg`, a `cfg_attr` (which may also add a `path`), a
+/// `path`, or a `cfg`/`path` attribute continued over several lines.
+fn declares(file: &Path, name: &str) -> Option<Gate> {
     if std::fs::metadata(file).map_or(true, |meta| meta.len() > MAX_FILE_BYTES) {
-        return false;
+        return None;
     }
-    let Ok(text) = std::fs::read_to_string(file) else {
-        return false;
-    };
-    let mut path_attribute = false;
+    let text = std::fs::read_to_string(file).ok()?;
+    let mut found = None;
+    // Gate of the attributes read so far for the next item; `None` once one is unproven.
+    let mut gate = Some(Gate::Always);
+    // Inside an attribute continued from an earlier line, until its first `]`.
+    let mut open = false;
     for line in text.lines() {
         let mut rest = line.trim();
+        if open {
+            let Some(end) = rest.find(']') else {
+                continue;
+            };
+            open = false;
+            rest = rest[end + 1..].trim_start();
+        }
         if rest.starts_with("//") {
             continue;
         }
-        while rest.starts_with("#[") {
-            path_attribute |= rest[2..].trim_start().starts_with("path");
-            let Some(end) = rest.find(']') else {
-                rest = "";
-                break;
-            };
-            rest = rest[end + 1..].trim_start();
+        while let Some(attribute) = rest.strip_prefix("#[") {
+            let (body, after) = attribute.split_once(']').unwrap_or((attribute, ""));
+            open = !attribute.contains(']');
+            let body: String = body.split_whitespace().collect();
+            if body == "cfg(test)" {
+                gate = gate.and(Some(Gate::Test));
+            } else if body.starts_with("cfg") || body.starts_with("path") {
+                gate = None;
+            }
+            rest = after.trim_start();
         }
         if rest.is_empty() {
             continue;
         }
-        let redirected = std::mem::take(&mut path_attribute);
+        let item_gate = gate.replace(Gate::Always);
         let Some(declaration) = without_visibility(rest).strip_prefix("mod ") else {
             continue;
         };
@@ -144,11 +195,11 @@ fn declares(file: &Path, name: &str) -> bool {
             continue;
         };
         let ident = ident.trim();
-        if !redirected && ident.strip_prefix("r#").unwrap_or(ident) == name {
-            return true;
+        if ident.strip_prefix("r#").unwrap_or(ident) == name {
+            found = found.max(item_gate);
         }
     }
-    false
+    found
 }
 
 /// Strips a leading `pub` or `pub(…)` visibility from one item line.
@@ -272,5 +323,50 @@ mod tests {
         assert!(!reached(&root, Path::new("src/elsewhere.rs")));
         assert!(reached(&root, Path::new("tools/extra.rs")));
         assert!(reached(&root, Path::new("tools/util.rs")));
+    }
+
+    /// A `mod` gated by a condition the check may not meet — `cfg(windows)`, a multi-line `cfg`,
+    /// a `cfg_attr` — is unproven, so its file reads unreached; `cfg(test)` counts only where
+    /// `--all-targets` compiles the root as a unit test (a library or binary with its test harness,
+    /// not an example or a `test = false` target).
+    #[test]
+    fn conditional_declarations_are_unproven() {
+        let root = package(
+            "conditional",
+            &[
+                ("Cargo.toml", "[package]\nname = \"c\"\n"),
+                (
+                    "src/lib.rs",
+                    "#[cfg(windows)] mod win;\n#[cfg(any(\n    windows,\n    target_os = \"ios\",\n))]\nmod multi;\n#[cfg_attr(unix, path = \"unix.rs\")]\nmod imp;\n#[cfg( test )]\nmod tests;\n",
+                ),
+                ("src/win.rs", ""),
+                ("src/multi.rs", ""),
+                ("src/imp.rs", ""),
+                ("src/tests.rs", ""),
+                ("examples/demo/main.rs", "#[cfg(test)]\nmod helper;\n"),
+                ("examples/demo/helper.rs", ""),
+            ],
+        );
+        for unreached in [
+            "src/win.rs",
+            "src/multi.rs",
+            "src/imp.rs",
+            "examples/demo/helper.rs",
+        ] {
+            assert!(!reached(&root, Path::new(unreached)), "{unreached}");
+        }
+        assert!(reached(&root, Path::new("src/tests.rs")));
+        let untested = package(
+            "untested",
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"u\"\n[lib]\ntest = false\n",
+                ),
+                ("src/lib.rs", "#[cfg(test)]\nmod tests;\n"),
+                ("src/tests.rs", ""),
+            ],
+        );
+        assert!(!reached(&untested, Path::new("src/tests.rs")));
     }
 }

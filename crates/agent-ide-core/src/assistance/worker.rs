@@ -1807,6 +1807,10 @@ fn evict_settled_details(
 /// the caller still learns the failure, and a daemon restart boot-fences every old grant anyway.
 const MAX_PENDING_REVOCATIONS: usize = 64;
 
+/// Least time between two `HEAD` probes of one binding: rapid tool calls reuse the last reading
+/// instead of re-reading refs and `packed-refs`, so an outside switch is noticed at most this late.
+const HEAD_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
 /// One boot's sequential durable owner; provider operations may be interrupted by inspection service.
 struct Worker<'a> {
     /// Shared bounded ingress and liveness state.
@@ -1827,8 +1831,15 @@ struct Worker<'a> {
     registered: BTreeMap<BindingRef, std::collections::BTreeSet<std::path::PathBuf>>,
     /// Durable partial activation baselines retained for same-binding diff provenance.
     baselines: BTreeMap<BindingRef, crate::workspace::git::BaselineContext>,
-    /// Checked-out branch or detached commit last seen per binding, first read by its start.
-    heads: BTreeMap<BindingRef, crate::workspace::git::head::HeadState>,
+    /// Per binding: when `HEAD` was last probed, successfully or not, and the checked-out branch or
+    /// detached commit last read (first by its start); a failed read keeps the earlier reading.
+    heads: BTreeMap<
+        BindingRef,
+        (
+            tokio::time::Instant,
+            Option<crate::workspace::git::head::HeadState>,
+        ),
+    >,
     /// Boot-unique source observation operation sequence.
     source_sequence: u64,
     /// Finite physical-effect admission, shared by discovery, snapshots and language providers.
@@ -1857,7 +1868,8 @@ struct Worker<'a> {
 }
 
 impl<'a> Worker<'a> {
-    /// Handles an explicit test start or same-worktree status request.
+    /// Handles an explicit test start or a status request for a run the caller's own actor and
+    /// channel started in this worktree; another actor's run answers `unknown job`.
     ///
     /// Runs inside the queued job. The `symbol` branch resolves references through the live
     /// language server before selecting tests, so its caller already holds a `pending` reply (see
@@ -1881,8 +1893,7 @@ impl<'a> Worker<'a> {
         let (result, detail_ref) = if let Some(id) =
             job.parameters.get("status").and_then(Value::as_u64)
         {
-            let Some(job_status) = self.shared.test_runs.get(&root, id, &binding.fingerprint())
-            else {
+            let Some(job_status) = self.shared.test_runs.get(&root, id, &binding) else {
                 return Ok((
                     PeerReply::Complete {
                         kind: ResultKind::Test,
@@ -3834,15 +3845,30 @@ impl<'a> Worker<'a> {
 
     /// Compares the worktree's checked-out branch or detached commit with the one this binding
     /// last saw (first read by its start) and leaves one plate notice when it changed outside the
-    /// IDE. Notice only: nothing is invalidated or restarted. Reads two or three small Git files.
+    /// IDE. Notice only: nothing is invalidated or restarted.
+    ///
+    /// At most one probe per [`HEAD_PROBE_INTERVAL`] per binding reads Git's files (the live
+    /// `.git` validation, `HEAD`, a loose ref and possibly `packed-refs`); a call inside the
+    /// interval returns without reading, and a failed read waits out the interval as well.
     fn observe_head(&mut self, binding: &BindingRef, authority: &AuthorityStamp) {
-        let Some(now) = crate::workspace::git::head::HeadState::read(
+        let probed = tokio::time::Instant::now();
+        if self
+            .heads
+            .get(binding)
+            .is_some_and(|(last, _)| probed.duration_since(*last) < HEAD_PROBE_INTERVAL)
+        {
+            return;
+        }
+        let now = crate::workspace::git::head::HeadState::read(
             authority.worktree().worktree_path(),
             authority.worktree().git_common_dir(),
-        ) else {
+        );
+        let (last, seen) = self.heads.entry(binding.clone()).or_insert((probed, None));
+        *last = probed;
+        let Some(now) = now else {
             return;
         };
-        if let Some(before) = self.heads.insert(binding.clone(), now.clone())
+        if let Some(before) = seen.replace(now.clone())
             && let Some(notice) = before.moved_notice(&now)
             && let Ok(mut notices) = self.shared.git_notices.lock()
         {
@@ -6426,6 +6452,7 @@ mod stop_retry_tests {
                 .cloned()
         };
         worker.observe_head(&binding, &authority);
+        expire_head_probe(&mut worker, &binding);
         worker.observe_head(&binding, &authority);
         assert_eq!(notice(&worker), None, "an unchanged head says nothing");
         let status = std::process::Command::new("/usr/bin/git")
@@ -6435,6 +6462,7 @@ mod stop_retry_tests {
             .status()
             .unwrap();
         assert!(status.success());
+        expire_head_probe(&mut worker, &binding);
         worker.observe_head(&binding, &authority);
         let line = notice(&worker).expect("a switched head leaves a notice");
         assert!(
@@ -6445,8 +6473,60 @@ mod stop_retry_tests {
             "{line}"
         );
         worker.shared.git_notices.lock().unwrap().remove(&owner);
+        expire_head_probe(&mut worker, &binding);
         worker.observe_head(&binding, &authority);
         assert_eq!(notice(&worker), None, "the refreshed baseline stays quiet");
+    }
+
+    /// Ages `binding`'s last `HEAD` probe past the interval, so its next probe reads Git again.
+    fn expire_head_probe(worker: &mut Worker<'_>, binding: &BindingRef) {
+        if let Some((last, _)) = worker.heads.get_mut(binding) {
+            *last -= HEAD_PROBE_INTERVAL;
+        }
+    }
+
+    /// Rapid tool calls do not re-read Git's refs: a probe inside the per-binding interval is
+    /// skipped, so a head switched meanwhile is noticed by the first probe after the interval.
+    #[tokio::test]
+    async fn head_probe_is_rate_limited_per_binding() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("main.rs"), "let value = 1;\n").unwrap();
+        git_commit(&fixture.root, "rate fixture");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, authority) = activate_worktree(&mut worker, "rate-actor", "rate-start").await;
+        let owner = binding.fingerprint();
+        let notice = |worker: &Worker<'_>| {
+            worker
+                .shared
+                .git_notices
+                .lock()
+                .unwrap()
+                .get(&owner)
+                .cloned()
+        };
+        worker.observe_head(&binding, &authority);
+        let status = std::process::Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&fixture.root)
+            .args(["checkout", "--quiet", "--detach"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        worker.observe_head(&binding, &authority);
+        assert_eq!(
+            notice(&worker),
+            None,
+            "a probe inside the interval does not read Git again"
+        );
+        expire_head_probe(&mut worker, &binding);
+        worker.observe_head(&binding, &authority);
+        assert!(
+            notice(&worker).is_some_and(|line| line.contains(" → detached) outside Agent IDE")),
+            "the first probe after the interval notices the switch"
+        );
     }
 
     /// After `ide.stop` the actor/channel identity still reads its test run's status through the
