@@ -104,9 +104,15 @@ servers: rust-analyzer loading (~10 s) · pyright ready · tsserver ready
 problems: rust checking (first check)
 ```
 
-Commands come from CI (`.github/workflows`), `Makefile`/`justfile`, or manifests. If a command comes from README, mark it `(README)`. Layout lists only first- and second-level directories with file counts. Cache the card for the session; `ide.project {}` returns it again.
+Commands come from CI (`.github/workflows`), `Makefile`/`justfile`, or manifests. If a command comes from README, mark it `(README)`. A project may also declare commands itself: a fenced block at the root of `AGENTS.md`, or of `CLAUDE.md` when `AGENTS.md` declares none, tagged `agent-ide`, one `<kind>: <command>` line per kind (the closed set `build`/`check`/`test`/`lint`/`fmt`/`typecheck`):
 
-Implemented wire form: the activation reply keeps its first line (`Workspace activated; authority_epoch: …`) and appends the card after a blank line. The card is computed under a 5 s budget off the runtime; when it does not fit the budget the reply is the plain activation text. Commands print one line per kind with the provenance in the heading (`commands (ci, manifest):`), `environment:` names the toolchain and edition, `servers:` prints `not started` for each detected language (the daemon does not probe servers at start), and there is no `ide.project` yet — call `ide.start` again to see the card. Symbol requests on a Rust worktree where the root is not a Cargo workspace also load nested crates (two directories deep, excluding test material), so references across such a crate's own tests resolve.
+```` ```agent-ide
+check: cargo xtask check
+``` ````
+
+A kind this block names wins outright over CI/manifest/README for that kind (provenance `agents`/`claude` in the heading); a block with an unknown key, a repeated key, a line with no command, or no closing fence is ignored entirely rather than partially trusted, and the kind falls back to CI/manifest as before. Layout lists only first- and second-level directories with file counts. Cache the card for the session; `ide.project {}` returns it again.
+
+Implemented wire form: the activation reply keeps its first line (`Workspace activated; authority_epoch: …`) and appends the card after a blank line. The card is computed under a 5 s budget off the runtime; when it does not fit the budget the reply is the plain activation text. Commands print one line per kind with the provenance in the heading (`commands (agents, ci, manifest):`), `environment:` names the toolchain and edition, `servers:` prints `not started` for each detected language (the daemon does not probe servers at start), and there is no `ide.project` yet — call `ide.start` again to see the card. Symbol requests on a Rust worktree where the root is not a Cargo workspace also load nested crates (two directories deep, excluding test material), so references across such a crate's own tests resolve.
 
 Errors: `outside_allowed_roots` (as today), `not_a_project` (no manifest is present; continue in files-only mode).
 

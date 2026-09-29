@@ -493,6 +493,10 @@ pub struct TestReport {
 /// Where a project command came from; replies print it so the agent knows how far to trust it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandSource {
+    /// A `key: command` line inside the ` ```agent-ide ` fenced block in `AGENTS.md`.
+    Agents,
+    /// Same block, read from `CLAUDE.md` when `AGENTS.md` declares none.
+    Claude,
     Ci,
     Makefile,
     Manifest,
@@ -504,6 +508,8 @@ impl CommandSource {
     /// Stable lowercase name used in the project card.
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Agents => "agents",
+            Self::Claude => "claude",
             Self::Ci => "ci",
             Self::Makefile => "makefile",
             Self::Manifest => "manifest",
