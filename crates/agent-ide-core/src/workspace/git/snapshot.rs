@@ -594,7 +594,7 @@ impl SnapshotIntent {
 /// named, so the fallback never answers for a path the exact capture would refuse.
 ///
 /// Each path gets the same descriptor-relative, no-follow, root-identity-checked regular-file
-/// open that [`SnapshotSource::capture`] uses, without reading bytes. A missing path is an
+/// open that `SnapshotSource::capture` uses, without reading bytes. A missing path is an
 /// accepted deletion; a symlink or non-directory in any component (a tracked directory replaced by
 /// a link), a non-regular final entry (a changed tracked symlink, a gitlink directory, a special
 /// file), an invalid path, or any other native error refuses with

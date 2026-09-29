@@ -25,7 +25,8 @@ const MAX_FILE_BYTES: u64 = 1 << 20;
 const MAX_STEPS: usize = 64;
 
 /// Reason reported for a file no build target reaches.
-pub const UNREACHED: &str = "rust check did not compile this file — not declared with `mod`";
+pub const UNREACHED: &str =
+    "rust check may not have compiled this file — no unconditional `mod` declaration reaches it";
 
 /// Reports whether the worktree-relative `path` is reached from a build target of its nearest
 /// package; a file under no package manifest inside `worktree` counts as reached. The edited file

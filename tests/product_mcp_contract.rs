@@ -4714,7 +4714,7 @@ async fn an_edit_to_an_undeclared_rust_module_is_not_analysed() {
     assert_eq!(orphan["diagnostics"]["state"], "not_analysed", "{orphan}");
     assert_eq!(
         orphan["diagnostics"]["reason"],
-        "rust check did not compile this file — not declared with `mod`",
+        "rust check may not have compiled this file — no unconditional `mod` declaration reaches it",
         "{orphan}"
     );
     let declared = edit(

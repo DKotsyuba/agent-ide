@@ -3,7 +3,7 @@
 //!
 //! Every read stays inside the worktree's already-validated Git directories: the live `.git`
 //! backpointers are rechecked exactly as Execution does before each Git spawn
-//! ([`current_admin_dir`]), and each file is opened by a no-follow walk from `/`, so a `.git`,
+//! (`current_admin_dir`), and each file is opened by a no-follow walk from `/`, so a `.git`,
 //! gitfile or ref redirected elsewhere is refused instead of read. Only a well-formed ref name
 //! and full object ids are kept, so a notice never carries arbitrary file text.
 

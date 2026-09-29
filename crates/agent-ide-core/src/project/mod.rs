@@ -50,7 +50,7 @@ const MAX_LAYOUT_TOP: usize = 12;
 const MAX_DOCS_SHOWN: usize = 6;
 
 /// Byte ceiling for one rendered card; `render` collapses `layout` children first, then `docs`,
-/// and finally cuts the tail off behind [`CARD_TRUNCATED_MARKER`].
+/// and finally cuts the tail off behind `CARD_TRUNCATED_MARKER`.
 const MAX_CARD_BYTES: usize = 1500;
 
 /// Suffix `render` puts on a card it had to cut to fit [`MAX_CARD_BYTES`]; it counts toward the
@@ -577,7 +577,7 @@ const COMMAND_SOURCE_ORDER: [CommandSource; 7] = [
 /// `entry points:`/`docs:`/`servers:` vanish when there is nothing to say. When the full render
 /// exceeds `MAX_CARD_BYTES` bytes, `layout` drops its depth-2 children first, then `docs`
 /// collapses to 3 entries, then to none, in that order, until the render fits. A card that still
-/// overflows after that is cut at a character boundary and ends with [`CARD_TRUNCATED_MARKER`], so
+/// overflows after that is cut at a character boundary and ends with `CARD_TRUNCATED_MARKER`, so
 /// the result is never longer than `MAX_CARD_BYTES` and the cut is never silent.
 pub fn render(card: &ProjectCard) -> String {
     let attempts: [(bool, usize); 4] = [
