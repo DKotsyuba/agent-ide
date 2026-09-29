@@ -26,9 +26,11 @@ use tokio::process::{Child, Command};
 
 static TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
-/// Returns the fixed finite limits used by all real v2 transport contract scenarios.
+/// Returns the fixed finite limits used by all real v2 transport contract scenarios; these mirror
+/// the production `MAX_V2_FRAME_BYTES`/`MAX_ASSISTANCE_JSON_BYTES` constants (v0.6.1 raised both
+/// so a near-maximum `ide.edit` argument round-trips — see `edit_at_the_new_ceiling_round_trips`).
 fn transport_limits() -> HookTransportLimits {
-    HookTransportLimits::new(128 * 1024, 64 * 1024, Duration::from_secs(1)).unwrap()
+    HookTransportLimits::new(160 * 1024, 144 * 1024, Duration::from_secs(1)).unwrap()
 }
 
 /// Supplies opaque deterministic Assistance results without interpreting host identity or tool semantics.
@@ -475,6 +477,39 @@ async fn assistance_transport_is_finite_and_hook_submission_never_autostarts() {
         .unwrap();
     v2_edit.write_all(&body).await.unwrap();
     assert_eq!(v2_edit.read(&mut reply).await.unwrap(), 0);
+    stop_assistance_daemon(task, runtime_dir).await;
+}
+
+/// v0.6.1 raised the wire ceilings (content 128 KiB, argument object 136 KiB, assistance JSON 144
+/// KiB, V2 frame 160 KiB) so a near-maximum `ide.edit` argument round-trips through the real
+/// socket, where the old 64 KiB assistance-JSON/128 KiB frame ceilings would have refused it.
+#[tokio::test]
+async fn edit_at_the_new_ceiling_round_trips() {
+    let runtime_dir = runtime_dir();
+    let task = start_assistance_daemon(&runtime_dir).await;
+    let params = json!({
+        "operation_id": "edit-large",
+        "path": "a.rs",
+        "source_ref": "source",
+        "content": "x".repeat(100 * 1024),
+    });
+    let edit = dispatch_method_if_running(
+        &runtime_dir,
+        MethodDispatch::new(
+            "edit-large-request",
+            "edit-large-correlation",
+            "attachment",
+            agent_ide::app::transport::AssistanceMethod::Edit,
+            OpaqueJson::new(params.to_string(), 144 * 1024).unwrap(),
+        )
+        .unwrap(),
+        transport_limits(),
+    )
+    .await;
+    assert!(matches!(
+        edit,
+        MethodDispatchTransportResult::Dispatched { .. }
+    ));
     stop_assistance_daemon(task, runtime_dir).await;
 }
 

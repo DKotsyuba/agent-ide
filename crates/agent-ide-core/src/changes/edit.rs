@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Maximum canonical JSON size of the four edit arguments, independent of enclosing transports.
-pub const MAX_EDIT_ARGUMENT_BYTES: usize = 56 * 1024;
+pub const MAX_EDIT_ARGUMENT_BYTES: usize = 136 * 1024;
 
 /// Stable Changes migration namespace.
 const DOMAIN: &str = "changes";
@@ -38,7 +38,7 @@ pub struct EditRequest {
     pub path: String,
     /// Opaque same-binding completed-context reference resolved only by Assistance.
     pub source_ref: String,
-    /// Full UTF-8 replacement content, bounded to 48 KiB.
+    /// Full UTF-8 replacement content, bounded to 128 KiB.
     pub content: String,
 }
 
@@ -47,7 +47,7 @@ impl EditRequest {
     ///
     /// The relative path rejects empty, absolute, dot, parent and platform-prefix components.
     /// Identifiers are nonempty and at most 128 UTF-8 bytes. The canonical JSON encoding of all
-    /// four fields must fit 56 KiB even when the content itself fits 48 KiB.
+    /// four fields must fit 136 KiB even when the content itself fits 128 KiB.
     pub fn new(
         operation_id: impl Into<String>,
         path: impl Into<String>,

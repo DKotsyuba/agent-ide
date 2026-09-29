@@ -37,8 +37,8 @@ const LOCK_NAME: &str = "agent-ide.lock";
 const WIRE_VERSION: u8 = 1;
 const MAX_REQUEST_ID_BYTES: usize = 128;
 const MAX_V1_FRAME_BYTES: usize = 64 * 1024;
-const MAX_V2_FRAME_BYTES: usize = 128 * 1024;
-const MAX_ASSISTANCE_JSON_BYTES: usize = 64 * 1024;
+const MAX_V2_FRAME_BYTES: usize = 160 * 1024;
+const MAX_ASSISTANCE_JSON_BYTES: usize = 144 * 1024;
 /// Maximum time to wait for an Assistance method reply after its request is written.
 const METHOD_DISPATCH_BUDGET: Duration = Duration::from_secs(10);
 /// Total connect, request, and acknowledgement budget when a Codex MCP opens its client lease.

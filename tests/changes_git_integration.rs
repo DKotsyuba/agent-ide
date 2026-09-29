@@ -903,9 +903,10 @@ async fn conflicts_retain_actual_stage_modes_and_objects() {
     );
 }
 
-/// Git-listed links are rejected; Apple Git omits FIFOs, while direct source reads reject them without blocking.
+/// A Git-listed untracked symlink stays a listed name only — never refused — while Apple Git
+/// omits FIFOs from its own listing and direct source reads still reject a symlink without blocking.
 #[tokio::test]
-async fn untracked_symlink_and_special_entries_are_explicitly_unsupported() {
+async fn untracked_symlink_and_special_entries_are_listed_by_name_only() {
     use std::{
         ffi::CString,
         os::unix::{ffi::OsStrExt, fs::symlink},
@@ -913,9 +914,25 @@ async fn untracked_symlink_and_special_entries_are_explicitly_unsupported() {
     let fixture = GitFixture::new();
     let entry = fixture.root.join("untracked-special");
     symlink("staged.txt", &entry).unwrap();
+    let snapshot = collect(&fixture, DiffMode::Head, &mut Runner::default())
+        .await
+        .unwrap();
+    assert!(
+        snapshot
+            .status()
+            .untracked()
+            .iter()
+            .any(|entry| entry.path().as_os_str().as_bytes() == b"untracked-special"),
+        "an untracked symlink stays a listed name instead of refusing the whole diff"
+    );
+    let authority = authority_for(&fixture);
     assert_eq!(
-        collect(&fixture, DiffMode::Head, &mut Runner::default()).await,
-        Err(GitError::UnsupportedSnapshot)
+        agent_ide::workspace::observation::read_authorized_source(
+            authority.worktree(),
+            std::path::Path::new("untracked-special"),
+            agent_ide::workspace::observation::SourceReadLimits::new(4096, 1024).unwrap()
+        ),
+        Err(agent_ide::workspace::observation::ObservationError::SymlinkEscape)
     );
     fs::remove_file(&entry).unwrap();
     let path = CString::new(entry.as_os_str().as_bytes()).unwrap();
@@ -932,14 +949,38 @@ async fn untracked_symlink_and_special_entries_are_explicitly_unsupported() {
             .all(|entry| entry.path().as_os_str().as_bytes() != b"untracked-special"),
         "Apple Git does not list untracked FIFOs; this is not a complete filesystem inventory"
     );
+}
+
+/// The single-pass plain `git diff` fallback parses real hunks, per-file names, and add/remove
+/// counts directly from raw stdout — no two-pass exact-capture machinery, used only when that
+/// capture proves unstable.
+#[tokio::test]
+async fn plain_diff_fallback_parses_real_hunks_without_exact_capture() {
+    use agent_ide::{changes::compose_plain_diff, workspace::git::GitScope};
+
+    let fixture = GitFixture::new();
+    fixture.write(b"changed.txt", b"line one\nline two\nline three\n");
+    fixture.git(["add", "."]);
+    fixture.git(["commit", "--quiet", "-m", "plain-diff baseline"]);
+    fixture.write(
+        b"changed.txt",
+        b"line one\nline two edited\nline three\nline four\n",
+    );
     let authority = authority_for(&fixture);
-    assert_eq!(
-        agent_ide::workspace::observation::read_authorized_source(
-            authority.worktree(),
-            std::path::Path::new("untracked-special"),
-            agent_ide::workspace::observation::SourceReadLimits::new(4096, 1024).unwrap()
-        ),
-        Err(agent_ide::workspace::observation::ObservationError::NotRegularFile)
+    let scope = GitScope::from_authority(&authority, DiffMode::Head);
+    let intent = SnapshotIntent::plain_diff(scope.clone(), Path::new(GIT)).unwrap();
+    let mut runner = Runner::default();
+    let evidence = runner.run(intent.clone()).await.unwrap();
+    let stdout = intent.accept(evidence).unwrap();
+    let result = compose_plain_diff(&scope, &stdout, DiffSelectionBudget::default());
+    assert_eq!(result.counts().tracked(), 1);
+    assert_eq!(result.additions(), 2);
+    assert_eq!(result.deletions(), 1);
+    assert_eq!(result.selected_hunks().len(), 1);
+    assert_eq!(result.selected_hunks()[0].path(), Path::new("changed.txt"));
+    assert!(
+        result.untracked().is_empty(),
+        "plain diff names no untracked paths"
     );
 }
 

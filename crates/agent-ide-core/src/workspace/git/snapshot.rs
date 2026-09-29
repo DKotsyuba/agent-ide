@@ -502,6 +502,48 @@ impl SnapshotIntent {
             label: "diff-no-index",
         })
     }
+
+    /// Builds a single-pass `git diff` command run directly in the worktree, with no scratch
+    /// files and no per-blob hashing — a degraded fallback used only when the exact two-pass
+    /// capture proved unstable, trading atomicity for one plain child.
+    pub fn plain_diff(scope: GitScope, program: &Path) -> Result<Self, GitError> {
+        let mut arguments: Vec<OsString> = [
+            "--no-pager",
+            "--no-lazy-fetch",
+            "-c",
+            "core.fsmonitor=false",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--full-index",
+            "--patch",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        match scope.mode() {
+            DiffMode::Head => arguments.push("HEAD".into()),
+            DiffMode::Staged => arguments.push("--cached".into()),
+            DiffMode::Unstaged => {}
+        }
+        let command = ControlledCommand::from_validated_peer(
+            CommandKind::Git,
+            program.to_path_buf(),
+            arguments,
+            scope.worktree().worktree_path().to_path_buf(),
+            safe_git_environment(),
+        )
+        .map_err(|_| GitError::InvalidGitProgram)?;
+        Ok(Self {
+            scope,
+            command,
+            directory: None,
+            differences_allowed: false,
+            label: "diff-plain",
+        })
+    }
+
     /// Accepts only reaped, fully drained bounded output with the command's exact success exit set.
     pub fn accept(&self, result: CapturedProcessEvidence) -> Result<Vec<u8>, GitError> {
         self.acknowledge_reap(&result)?;
@@ -2048,19 +2090,22 @@ async fn capture_attempt<R: SnapshotRunner>(
     })
 }
 
-/// Rejects untracked symlink/special entries without reading bytes; disappearing paths trigger retry.
+/// Keeps an untracked symlink or special entry listed by name only, without reading its bytes or
+/// (for a symlink) its target; a disappearing path or a changed worktree root still retries.
+///
+/// Untracked paths never become baseline content and their bytes are never captured, so a symlink
+/// (typically `node_modules ->` a sibling checkout) or other special entry has nothing to inspect
+/// for content: one such entry used to refuse the whole diff with `diff:unsupported_entry`. Only a
+/// disappearing path or a root-identity change still forces the unstable retry; every other
+/// classification outcome — including an ordinary regular file — keeps the entry.
 fn inspect_untracked(worktree: &WorktreeRef, path: &Path) -> Result<(), GitError> {
-    crate::workspace::observation::inspect_authorized_source_kind(worktree, path).map_err(|error| {
-        match error {
-            ObservationError::SymlinkEscape | ObservationError::NotRegularFile => {
-                GitError::UnsupportedSnapshot
-            }
-            ObservationError::Missing | ObservationError::RootIdentityChanged => {
-                GitError::UnstableSnapshot
-            }
-            _ => GitError::SnapshotIo,
+    match crate::workspace::observation::inspect_authorized_source_kind(worktree, path) {
+        Ok(()) | Err(ObservationError::SymlinkEscape | ObservationError::NotRegularFile) => Ok(()),
+        Err(ObservationError::Missing | ObservationError::RootIdentityChanged) => {
+            Err(GitError::UnstableSnapshot)
         }
-    })
+        Err(_) => Err(GitError::SnapshotIo),
+    }
 }
 
 #[cfg(test)]

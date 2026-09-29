@@ -4161,6 +4161,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 &request.reference,
                 page.budget().max_hunks,
                 true,
+                page.provenance(),
                 |max_hunks| page.expand_with_max_hunks(&expected_scope, max_hunks),
             )
             .map_err(|code| match code {

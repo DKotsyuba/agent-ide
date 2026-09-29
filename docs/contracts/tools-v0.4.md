@@ -12,7 +12,8 @@ Revision: v0.4. Provider: Agent IDE. Consumers: coding agents and IDE hosts.
 | `ide.start` project card | implemented (appended to the activation reply; no `ide.project`, no `not_a_project`; servers always `not started`) |
 | `ide.test` (`symbol` / `path` / `pattern` / `command` / `status`, `budget_s`; one job per worktree; status line in the `<agent-ide>` block; full output paged through `ide.inspect`) | implemented (wire version 4, 11 tools) |
 | `ide.graph` (`symbol`, `direction`, `depth`, `tests`; live bounded caller/callee tree; only functions and methods are nodes, and tests collapse to one `+N tests` line per parent unless `tests: true` expands them with `[test]` marks) | implemented (wire version 5, 11 tools) |
-| `ide.diff` / `ide.problems` cleanup | planned |
+| `ide.diff` cleanup (compact default, `provenance` flag, plain-`git diff` fallback, untracked symlinks listed) | implemented (v0.6.1) |
+| `ide.problems` cleanup | planned |
 | Live language server sessions for Python and TypeScript (one per binding and language) | implemented (Go planned) |
 
 ## 0. Principles
@@ -74,6 +75,7 @@ When the worktree's checked-out branch or detached commit changed outside the ID
 ### Ceilings and pages
 
 - A response is at most 16 KB. Lists are capped at 30 usage lines, 20 caller lines, and 20 diagnostic lines. Any remainder is reported as “N more” with a `detail_ref`.
+- This 16 KB ceiling bounds the *reply*, not the model-facing *argument*: `ide.edit`'s `content` accepts up to 128 KiB (v0.6.1), enough for a whole module in one call.
 - `ide.inspect {detail_ref}` retrieves pages; `ide.inspect {detail_ref, page}` retrieves a specific page.
 - A symbol card with more than 30 usages, or an ambiguity list with more than 20 candidates, keeps the cut rows in its detail. The first page is the card or list as before, ending with `… N more (ide.inspect <detail_ref>)`; each later `ide.inspect` returns the next page of the remaining rows (`usages 31–N of N:` or `candidates 21–N of N:`, same row format). Cards and lists within the ceilings are unchanged. The first `ide.inspect` after an inline reply always returns page two, never page one again, for every paged tool.
 
@@ -357,21 +359,27 @@ A run that counted no test is never shown as `0 passed, 0 failed`: a non-zero ex
 
 Run at most one test job at a time per worktree. Stop a run when its budget expires, return its partial result and the command for manual execution, and page full output through `detail_ref`. The IDE never starts tests on its own.
 
-### 2.7 `ide.diff` — changed files (planned cleanup)
+### 2.7 `ide.diff` — changed files (implemented)
 
-Input: `{mode: head|staged|unstaged, path?}`.
+Input: `{mode: head|staged|unstaged, detail_ref?, provenance?: false}`.
 
 Output is compact and contains no hashes:
 
 ```text
 diff (head): 2 files, +14 −3
-src/assistance/mod.rs  +1
+file: "src/assistance/mod.rs"
 @@ -12,6 +12,7 @@
  …
-tests/support/git_snapshot.rs  +13 −3   diagnostics: clean
+hunks: 3 more (ide.inspect diff-4)
 ```
 
-For files above the response ceiling, return the header and `hunks: N, ide.inspect diff-4`. For large binary or generated files, return only the filename.
+An untracked or conflicted path Git itself never diffs is still named, bounded like any other list: `untracked: node_modules` / `conflicted: path.rs` (five inline, then `(+N more)`). For files above the response ceiling, the header and named files stay and the remaining hunks are reported as `hunks: N more (ide.inspect <detail_ref>)`; when the aggregate retention ceiling cannot hold that continuation, the same page is delivered instead with `hunks: N more; recapture with ide.diff` — never an error for hunks already selected.
+
+`provenance: true` returns today's exact hash-bearing header instead (worktree/comparison identity, capture generation, per-path lists) — kept for debugging, never the default.
+
+If the exact two-pass capture cannot prove a consistent read (for example a concurrent checkout, or a file that changed since a still-recorded observation of it), a single-pass plain `git diff` answers instead, marked on the summary line — naming only what the daemon actually knows, not a guessed specific cause: `diff (head): 2 files, +14 −3 (plain git diff; exact capture unavailable: snapshot unstable or a file changed since it was observed)`. This degraded page never claims currentness (`freshness` stays unknown) and never offers `ide.inspect` continuation.
+
+An untracked symlink or other special entry (for example `node_modules ->` a sibling checkout) is listed by name only — its bytes and, for a symlink, its target are never read — instead of refusing the whole diff.
 
 ### 2.8 `ide.problems` — project or file diagnostics (planned cleanup)
 

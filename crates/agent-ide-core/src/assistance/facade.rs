@@ -226,7 +226,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Diff,
             json!({
                 "type": "object", "additionalProperties": false,
-                "properties": {"mode": {"type":"string","enum":["head","staged","unstaged"],"default":"head","description":"`head`: everything not yet committed; `staged` / `unstaged`: only that part."}, "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."}}
+                "properties": {"mode": {"type":"string","enum":["head","staged","unstaged"],"default":"head","description":"`head`: everything not yet committed; `staged` / `unstaged`: only that part."}, "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."}, "provenance": {"type": "boolean", "default": false, "description": "Return the exact worktree/comparison identity header instead of the compact default; no hashes appear otherwise."}}
             }),
         ),
         schema(
@@ -332,7 +332,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
 pub const MAX_SYMBOL_PATH_BYTES: usize = 1024;
 /// Maximum bytes of the `content` argument on the wire; spliced whole files may be larger
 /// internally (`crate::workspace::edit::MAX_EDIT_CONTENT_BYTES`).
-pub const MAX_EDIT_ARGUMENT_CONTENT_BYTES: usize = 48 * 1024;
+pub const MAX_EDIT_ARGUMENT_CONTENT_BYTES: usize = 128 * 1024;
 
 /// Parses an inclusive 1-based `start-end` line range; `None` for any other shape.
 pub(crate) fn parse_line_range(text: &str) -> Option<crate::lang::LineRange> {
@@ -518,7 +518,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "language",
             "offset",
         ],
-        AssistanceTool::Diff => &["mode", "detail_ref"],
+        AssistanceTool::Diff => &["mode", "detail_ref", "provenance"],
         AssistanceTool::Inspect => &["detail_ref"],
         AssistanceTool::Stop => &[],
         AssistanceTool::Edit => &[
@@ -852,6 +852,12 @@ pub fn validate_call(
                     FieldRule::OneOf("\"head\", \"staged\", or \"unstaged\""),
                 ));
             }
+            if object
+                .get("provenance")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                return Err(invalid_field("provenance", FieldRule::Boolean));
+            }
         }
 
         AssistanceTool::Inspect => {
@@ -974,11 +980,9 @@ pub fn validate_call(
         }
     }
     if tool == AssistanceTool::Diff {
-        parameters
-            .as_object_mut()
-            .expect("validated object")
-            .entry("mode")
-            .or_insert(json!("head"));
+        let object = parameters.as_object_mut().expect("validated object");
+        object.entry("mode").or_insert(json!("head"));
+        object.entry("provenance").or_insert(json!(false));
     }
     Ok(ValidatedCall { tool, parameters })
 }
@@ -2957,11 +2961,13 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
         (
             validate_call(
                 AssistanceTool::Edit,
-                json!({"operation_id":"o","path":"a.rs","source_ref":"s","content":"x".repeat(49 * 1024)}),
+                json!({"operation_id":"o","path":"a.rs","source_ref":"s","content":"x".repeat(MAX_EDIT_ARGUMENT_CONTENT_BYTES + 1)}),
             )
             .unwrap_err(),
             AssistanceTool::Edit,
-            "invalid bounded parameters: \"content\" is longer than 49152 bytes".to_string(),
+            format!(
+                "invalid bounded parameters: \"content\" is longer than {MAX_EDIT_ARGUMENT_CONTENT_BYTES} bytes"
+            ),
         ),
         (
             validate_call(

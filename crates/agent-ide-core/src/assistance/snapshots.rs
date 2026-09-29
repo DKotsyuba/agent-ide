@@ -299,6 +299,9 @@ pub(super) struct DiffPageState {
     cursor: crate::changes::DiffDetailCursor,
     /// Compare mode used both to re-derive the expected scope and to render this page's text.
     mode: DiffMode,
+    /// Whether the page that minted this cursor was rendered with `provenance: true`; a later
+    /// `ide.inspect` page keeps the same rendering the caller originally asked for.
+    provenance: bool,
 }
 
 impl DiffPageState {
@@ -334,6 +337,10 @@ impl DiffPageState {
     pub(super) const fn mode(&self) -> DiffMode {
         self.mode
     }
+    /// Returns whether this page's originating request asked for `provenance: true`.
+    pub(super) const fn provenance(&self) -> bool {
+        self.provenance
+    }
     /// Builds the next retained page state, or `None` once selection no longer overflows.
     pub(super) fn advance(&self, result: &crate::changes::DiffResult) -> Option<Self> {
         result.detail_cursor().map(|cursor| Self {
@@ -343,6 +350,7 @@ impl DiffPageState {
             budget: self.budget,
             cursor: cursor.clone(),
             mode: self.mode,
+            provenance: self.provenance,
         })
     }
     /// Re-verifies every retained tracked path's working-tree bytes against the current worktree
@@ -383,6 +391,20 @@ impl DiffPageState {
     }
 }
 
+/// Runs one single-pass plain `git diff` directly in the worktree as a degraded fallback, used
+/// only when the exact two-pass capture proved unstable. `None` on any failure — spawn, wait, or a
+/// rejected exit — so the caller reports the original capture failure instead of a confusing
+/// second one.
+async fn plain_diff_fallback(
+    runner: &mut ProductSnapshotRunner<'_, '_>,
+    program: &Path,
+    scope: &GitScope,
+) -> Option<Vec<u8>> {
+    let intent = SnapshotIntent::plain_diff(scope.clone(), program).ok()?;
+    let evidence = runner.run_owned(intent.clone()).await.ok()?;
+    intent.accept(evidence).ok()
+}
+
 /// Hex-encodes raw comparison-side identity bytes for safe inclusion in rendered text.
 fn hex_encode(bytes: &[u8]) -> String {
     bytes
@@ -412,6 +434,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// * `max_hunks` — largest count to attempt; halved on each retry and clamped to at least one.
 /// * `retain_continuation` — whether this caller will retain the accepted cursor for later
 ///   `ide.inspect`; helper results pass `false` because their settled ticket has no page state.
+/// * `provenance` — whether to render today's exact hash-bearing header (`render_diff_provenance`)
+///   instead of the compact §2.7 default (`render_diff_compact`).
 /// * `compose` — pure selection callback; it must not mutate retained state, because it is called
 ///   repeatedly and only the returned result of the accepted attempt is retained.
 ///
@@ -434,6 +458,7 @@ pub(crate) fn fit_diff_page(
     reference: &str,
     max_hunks: usize,
     retain_continuation: bool,
+    provenance: bool,
     compose: impl Fn(usize) -> crate::changes::DiffResult,
 ) -> Result<(crate::changes::DiffResult, PeerReply), FailureCode> {
     let mut max_hunks = max_hunks.max(1);
@@ -445,12 +470,17 @@ pub(crate) fn fit_diff_page(
         ) {
             return Err(FailureCode::SourceUnavailable);
         }
-        let text = render_diff_text(
-            mode,
-            &candidate,
-            authority_epoch,
-            retain_continuation && candidate.detail_cursor().is_some(),
-        );
+        let more_available = retain_continuation && candidate.detail_cursor().is_some();
+        let text = if provenance {
+            render_diff_provenance(mode, &candidate, authority_epoch, more_available)
+        } else {
+            let continuation = if more_available {
+                DiffContinuationNote::Inspect(reference)
+            } else {
+                DiffContinuationNote::None
+            };
+            render_diff_compact(mode, &candidate, continuation, None)
+        };
         let reply = PeerReply::Complete {
             kind: ResultKind::Diff,
             text,
@@ -458,7 +488,7 @@ pub(crate) fn fit_diff_page(
             truncated: candidate.truncated_output()
                 || candidate.overflow_hunks() > 0
                 || candidate.overflow_bytes() > 0,
-            continuation: retain_continuation && candidate.detail_cursor().is_some(),
+            continuation: more_available,
         };
         // The daemon composing this page has no host-kind signal of its own (T14B): only the MCP
         // facade, at final per-call render time, knows whether the caller is Claude or Codex. This
@@ -488,7 +518,7 @@ pub(crate) fn fit_diff_page(
 /// The freshness computed by Changes at capture time is preserved verbatim as `captured_freshness`
 /// alongside the untouched captured comparison identities and provenance, so callers keep the exact
 /// capture-time facts without any claim that they still hold now.
-pub(crate) fn render_diff_text(
+fn render_diff_provenance(
     mode: DiffMode,
     result: &crate::changes::DiffResult,
     authority_epoch: u64,
@@ -543,6 +573,102 @@ pub(crate) fn render_diff_text(
         match std::str::from_utf8(hunk.patch()) {
             Ok(patch) => text.push_str(patch),
             Err(_) => text.push_str(&format!("raw_patch_hex: {:02x?}\n", hunk.patch())),
+        }
+    }
+    text
+}
+
+/// Names how a compact Diff page tells its reader that more hunks exist beyond this page.
+enum DiffContinuationNote<'a> {
+    /// Nothing was omitted; no trailer line.
+    None,
+    /// A cursor is retained: `ide.inspect` reaches the rest.
+    Inspect(&'a str),
+    /// Nothing is retained (the aggregate retention ceiling refused it, or this page never
+    /// retains a cursor at all): only recapturing with `ide.diff` reaches the rest.
+    Recapture,
+}
+
+/// Lowercases one compare mode for the compact §2.7 header (`head`/`staged`/`unstaged`).
+const fn mode_label(mode: DiffMode) -> &'static str {
+    match mode {
+        DiffMode::Head => "head",
+        DiffMode::Staged => "staged",
+        DiffMode::Unstaged => "unstaged",
+    }
+}
+
+/// Largest number of untracked/conflicted names shown inline before "+N more".
+const MAX_INLINE_DIFF_NAMES: usize = 5;
+
+/// Renders one bounded `label: name, name (+N more)` line, or an empty string for no paths.
+fn bounded_names_line(label: &str, paths: &[crate::workspace::git::PathStatus]) -> String {
+    if paths.is_empty() {
+        return String::new();
+    }
+    let names: Vec<String> = paths
+        .iter()
+        .take(MAX_INLINE_DIFF_NAMES)
+        .map(|path| path.path().display().to_string())
+        .collect();
+    let hidden = paths.len().saturating_sub(MAX_INLINE_DIFF_NAMES);
+    let mut line = format!("{label}: {}", names.join(", "));
+    if hidden > 0 {
+        line.push_str(&format!(" (+{hidden} more)"));
+    }
+    line.push('\n');
+    line
+}
+
+/// Renders the compact §2.7 default reply: one summary line, the untracked/conflicted names Git
+/// itself never diffs, per-file hunk text, and a bounded continuation marker — no hash-bearing or
+/// bookkeeping fields. `degraded`, when set, is appended in parentheses on the summary line, for
+/// the single-pass plain `git diff` fallback that never claims the two-pass capture's exactness.
+fn render_diff_compact(
+    mode: DiffMode,
+    result: &crate::changes::DiffResult,
+    continuation: DiffContinuationNote<'_>,
+    degraded: Option<&str>,
+) -> String {
+    let mut text = format!(
+        "diff ({}): {} files, +{} \u{2212}{}",
+        mode_label(mode),
+        result.counts().tracked(),
+        result.additions(),
+        result.deletions(),
+    );
+    if let Some(note) = degraded {
+        text.push_str(&format!(" ({note})"));
+    }
+    text.push('\n');
+    text.push_str(&bounded_names_line("untracked", result.untracked()));
+    text.push_str(&bounded_names_line("conflicted", result.conflicts()));
+    let mut current: Option<&std::path::PathBuf> = None;
+    for hunk in result.selected_hunks() {
+        if current != Some(hunk.path()) {
+            text.push_str(&format!("file: {:?}\n", hunk.path()));
+            current = Some(hunk.path());
+        }
+        match std::str::from_utf8(hunk.patch()) {
+            Ok(patch) => text.push_str(patch),
+            Err(_) => text.push_str(&format!("raw_patch_hex: {:02x?}\n", hunk.patch())),
+        }
+    }
+    match continuation {
+        DiffContinuationNote::None => {}
+        DiffContinuationNote::Inspect(reference) => {
+            text.push_str(&format!(
+                "hunks: {} more (ide.inspect {reference})\n",
+                result.overflow_hunks()
+            ));
+        }
+        DiffContinuationNote::Recapture => {
+            if result.overflow_hunks() > 0 {
+                text.push_str(&format!(
+                    "hunks: {} more; recapture with ide.diff\n",
+                    result.overflow_hunks()
+                ));
+            }
         }
     }
     text
@@ -728,6 +854,7 @@ impl Worker<'_> {
             Some("unstaged") => DiffMode::Unstaged,
             _ => return Err(FailureCode::Internal),
         };
+        let provenance = job.parameters["provenance"].as_bool().unwrap_or(false);
         self.source_sequence = self
             .source_sequence
             .checked_add(1)
@@ -767,6 +894,50 @@ impl Worker<'_> {
         .await;
         let evidence = match capture {
             Ok(evidence) => evidence,
+            // W4: the two-pass exact capture retries once and then fails closed on genuine
+            // instability (e.g. a concurrent checkout); a single-pass plain `git diff` trades the
+            // exact-capture atomicity guarantee for an answer, always marked as such. Any other
+            // capture failure keeps its own explicit, non-degraded error below.
+            Err(GitError::UnstableSnapshot) => {
+                let scope = GitScope::from_authority(&authority, mode);
+                let budget = crate::changes::DiffSelectionBudget::bounded(32, 48 * 1024);
+                let plain = plain_diff_fallback(&mut runner, &program, &scope).await;
+                let failure = runner.failure.take();
+                let stage = runner.stage;
+                let detail = runner.detail.clone();
+                drop(runner);
+                let Some(stdout) = plain else {
+                    job.failure_detail = Some(detail.unwrap_or_else(|| {
+                        git_failure_detail(&GitError::UnstableSnapshot, stage, failure.clone())
+                    }));
+                    return Err(failure.unwrap_or(FailureCode::SourceUnavailable));
+                };
+                let result = crate::changes::compose_plain_diff(&scope, &stdout, budget);
+                let authority = self.authority(&binding).await?;
+                self.shared.active(&binding)?;
+                let continuation = if result.overflow_hunks() > 0 {
+                    DiffContinuationNote::Recapture
+                } else {
+                    DiffContinuationNote::None
+                };
+                let text = render_diff_compact(
+                    mode,
+                    &result,
+                    continuation,
+                    Some(
+                        "plain git diff; exact capture unavailable: snapshot unstable or a \
+                         file changed since it was observed",
+                    ),
+                );
+                let reply = PeerReply::Complete {
+                    kind: ResultKind::Diff,
+                    text,
+                    detail_ref: Some(reference.clone()),
+                    truncated: result.overflow_hunks() > 0,
+                    continuation: false,
+                };
+                return Ok((reply, Some(authority), None));
+            }
             Err(error) => {
                 // T27B: the terminal diff failure carries the closed failing stage, so a
                 // sandboxed capture that can never finish is diagnosable from the error log.
@@ -801,6 +972,7 @@ impl Worker<'_> {
             &reference,
             budget.max_hunks,
             true,
+            provenance,
             |max_hunks| {
                 crate::changes::compose_diff(
                     &scope,
@@ -816,7 +988,7 @@ impl Worker<'_> {
         // back any composed page. The collector already bounded the path count and bytes.
         // T36B-r: rendered pages also name untracked and conflict paths, so those names are
         // provenance too — a name denied after capture refuses cached delivery.
-        let provenance: BTreeSet<PathBuf> = evidence
+        let represented_paths: BTreeSet<PathBuf> = evidence
             .paths()
             .iter()
             .flat_map(|path| {
@@ -839,7 +1011,8 @@ impl Worker<'_> {
                     .map(|entry| entry.path().to_path_buf()),
             )
             .collect();
-        self.shared.set_diff_provenance(&job.reference, provenance);
+        self.shared
+            .set_diff_provenance(&job.reference, represented_paths);
         let diff_page = result.detail_cursor().map(|cursor| DiffPageState {
             scope: scope.clone(),
             comparison: comparison.clone(),
@@ -847,14 +1020,27 @@ impl Worker<'_> {
             budget,
             cursor: cursor.clone(),
             mode,
+            provenance,
         });
         // A page that reports further hunks must be resumable. If the aggregate retention ceiling
-        // refuses to hold that continuation, the omitted hunks are unreachable, so this fails with
-        // an explicit finite budget error rather than delivering a page that claims completeness.
+        // refuses to hold that continuation, the omitted hunks stay named but only recapture — not
+        // `ide.inspect` — reaches them: an honest smaller answer beats erroring the whole call.
         let continues = diff_page.is_some();
-        if !self.shared.set_diff_page(&job.reference, diff_page) && continues {
-            return Err(FailureCode::Capacity);
+        if self.shared.set_diff_page(&job.reference, diff_page) || !continues {
+            return Ok((reply, Some(authority), None));
         }
+        let text = if provenance {
+            render_diff_provenance(mode, &result, authority.epoch(), false)
+        } else {
+            render_diff_compact(mode, &result, DiffContinuationNote::Recapture, None)
+        };
+        let reply = PeerReply::Complete {
+            kind: ResultKind::Diff,
+            text,
+            detail_ref: Some(reference),
+            truncated: true,
+            continuation: false,
+        };
         Ok((reply, Some(authority), None))
     }
 }
