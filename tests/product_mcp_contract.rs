@@ -6018,6 +6018,59 @@ async fn configured_product_edit_replies_name_their_operation() {
     daemon.wait().await.unwrap();
 }
 
+/// The Claude path renders the same operation word as every other host: its text-only reply
+/// reads `edit: inserted` / `edit: deleted`, never the durable `edit: replaced`. Project checks
+/// are on, as on the live acceptance route, so the edit settles with current diagnostics.
+#[tokio::test]
+async fn configured_product_claude_edit_replies_name_their_operation() {
+    let fixture = symbol_test_fixture();
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub struct Counter {\n    value: u32,\n}\nimpl Counter {\n    pub fn get(&self) -> u32 {\n        self.value\n    }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("tests/path_tests.rs"), "").unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "tests/path_tests.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "claude edit operation fixture"]);
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "claude-edit-ops").await;
+    let started = actor
+        .call_claude_with_post(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"claude-edit-ops"}),
+        )
+        .await
+        .0;
+    let (started, _) = actor.settle_claude(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    // Warm the analyzer session first, exactly as the workflow's outline call would.
+    let warmup = actor
+        .call_claude_with_post(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+        .await
+        .0;
+    actor.settle_claude(&fixture, warmup).await;
+    let insert = actor
+        .call_claude_with_post(&fixture, "ide.edit", json!({"operation_id":"claude-ops-insert","op":"insert","symbol":"src/lib.rs#Counter/get","where":"after","content":"/// Doubles the value.\npub fn doubled(&self) -> u32 {\n    self.value * 2\n}"}))
+        .await
+        .0;
+    let (insert, _) = actor.settle_claude(&fixture, insert).await;
+    assert_eq!(insert["result"]["outcome"], "inserted", "{insert}");
+    let delete = actor
+        .call_claude_with_post(&fixture, "ide.edit", json!({"operation_id":"claude-ops-delete","op":"delete","symbol":"src/lib.rs#Counter/doubled"}))
+        .await
+        .0;
+    let (delete, _) = actor.settle_claude(&fixture, delete).await;
+    assert_eq!(delete["result"]["outcome"], "deleted", "{delete}");
+    actor
+        .call_claude_with_post(&fixture, "ide.stop", json!({}))
+        .await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A symbol card with more than 30 usages and an ambiguity list with more than 20 candidates
 /// keep their first page and name a `detail_ref`; `ide.inspect` then delivers the cut rows.
 #[tokio::test]
