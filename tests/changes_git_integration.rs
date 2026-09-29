@@ -1046,6 +1046,55 @@ async fn plain_diff_fallback_counts_files_git_quotes() {
     );
 }
 
+/// The fallback applies the exact capture's aggregate pathname ceiling too: 200 changed regular
+/// files — under the 256-path cap, stdout well under 1 MiB — whose raw names total more than
+/// `MAX_SNAPSHOT_PATH_BYTES` refuse for capacity instead of answering, as the exact capture does.
+#[tokio::test]
+async fn plain_diff_fallback_refuses_over_the_aggregate_path_ceiling() {
+    use agent_ide::{
+        changes::compose_plain_diff,
+        workspace::git::{
+            GitScope,
+            snapshot::{MAX_SNAPSHOT_PATH_BYTES, confine_plain_diff_paths},
+        },
+    };
+
+    let fixture = GitFixture::new();
+    let directory = "d".repeat(170);
+    fs::create_dir(fixture.root.join(&directory)).unwrap();
+    let names: Vec<String> = (0..200)
+        .map(|index| format!("{directory}/{index:03}-{}", "f".repeat(175)))
+        .collect();
+    assert!(names.iter().map(String::len).sum::<usize>() > MAX_SNAPSHOT_PATH_BYTES);
+    for name in &names {
+        fixture.write(name.as_bytes(), b"old\n");
+    }
+    fixture.git(["add", "."]);
+    fixture.git(["commit", "--quiet", "-m", "long-path baseline"]);
+    for name in &names {
+        fixture.write(name.as_bytes(), b"new\n");
+    }
+    let authority = authority_for(&fixture);
+    let scope = GitScope::from_authority(&authority, DiffMode::Head);
+    let paths: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
+    assert_eq!(
+        confine_plain_diff_paths(&scope, &paths),
+        Err(GitError::EvidenceTooLarge)
+    );
+    let intent = SnapshotIntent::plain_diff(scope.clone(), Path::new(GIT)).unwrap();
+    let mut runner = Runner::default();
+    let evidence = runner.run(intent.clone()).await.unwrap();
+    let stdout = intent.accept(evidence).unwrap();
+    let result = compose_plain_diff(&scope, &stdout, DiffSelectionBudget::default(), |paths| {
+        confine_plain_diff_paths(&scope, paths).is_ok()
+    });
+    assert!(
+        result.is_none(),
+        "{} files answered",
+        result.map_or(0, |result| result.counts().tracked())
+    );
+}
+
 /// Dropping a borrowed wait preserves ownership; a reaper handoff retains scratch until actual wait.
 #[tokio::test]
 async fn cancellation_handoff_keeps_private_files_until_matching_reap() {
