@@ -7728,20 +7728,20 @@ async fn configured_product_warm_rust_calls_complete_inline_within_three_seconds
 
     // Warm the analyzer to a server answer: the first outline replies from the lexical
     // outline while the workspace loads, so warmth is proven by the marker's absence.
-    let warmup = loop {
+    loop {
         let reply = actor
             .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
             .await;
         let settled = actor.settle(&fixture, reply).await;
         let text = settled["text"].as_str().unwrap_or_default();
         if settled["kind"] == "outline" && !text.contains("outline: lexical") {
-            break settled;
+            break;
         }
         assert!(
             settled["kind"] == "outline" || settled["code"] == "provider_loading",
             "{settled}"
         );
-    };
+    }
     for (tool, params) in [
         ("ide.outline", json!({"path":"src/lib.rs"})),
         (
