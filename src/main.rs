@@ -54,7 +54,13 @@ async fn main() -> ExitCode {
     // Claude's workspace identity is captured before argument parsing or asynchronous setup and is
     // never accepted from an MCP call, hook payload, or later environment read.
     let claude_project_dir = std::env::var_os("CLAUDE_PROJECT_DIR");
-    match command(arguments.into_iter()) {
+    let parsed = command(arguments.into_iter());
+    // Product test seam: only a daemon may simulate a slow (cold, loaded) start, before any
+    // rendezvous-visible work runs; production never sets the variable.
+    if matches!(parsed, Ok(Command::Daemon { .. })) {
+        stall_daemon_startup_for_test().await;
+    }
+    match parsed {
         Ok(Command::Daemon { runtime_dir }) => match RuntimeDir::prepare_for_daemon(runtime_dir) {
             Ok(runtime_dir) => {
                 let config = EffectiveConfig::defaults();
@@ -2615,10 +2621,44 @@ async fn start_managed_daemon(
     Ok((attachment, child))
 }
 
+/// Bounds how long a daemon this process spawned may take to answer its first health request.
+///
+/// The daemon binds its socket only after dispatcher initialization has measured every accepted
+/// executable (over five seconds on a loaded machine by the product's own measurement note), and a
+/// cold CI runner can take several times that; a shorter window kills slow-but-successful starts,
+/// so every managed startup, reconnect, and restart-heal attempt fails and its leftover generation
+/// files then cost each later attempt a further write-race wait. Thirty seconds is the established
+/// startup budget (the product fixture's daemon startup wait and the harness's exchange ceiling),
+/// stays under the dispatcher's own sixty-second initialize bound, and a child that exits first
+/// still fails fast. A tool call that re-establishes inside this window may therefore wait most of
+/// it; a host whose own call timeout is shorter cancels that call, the lease watcher still
+/// completes the heal on its own, and the session's next call lands on the healthy daemon.
+const OWNED_DAEMON_READINESS_BUDGET: Duration = Duration::from_secs(30);
+
+/// Test-only startup stall, honored only when the product-test seam
+/// `AGENT_IDE_DAEMON_STARTUP_STALL_MS` is set to a millisecond value (capped at one minute).
+///
+/// The daemon sleeps before any rendezvous-visible work, so a cold loaded machine's slow start —
+/// the exact condition that killed replacements inside shorter health windows — can be reproduced
+/// deterministically. Only product tests set the variable; production never does.
+async fn stall_daemon_startup_for_test() {
+    let Some(milliseconds) = std::env::var("AGENT_IDE_DAEMON_STARTUP_STALL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    tokio::time::sleep(Duration::from_millis(milliseconds.min(60_000))).await;
+}
+
 /// Waits a bounded interval for an external daemon (not owned by this process) to answer healthy.
 ///
 /// Used only to decide whether a concurrent MCP's in-flight spawn for the same shared rendezvous
-/// completed, before ever treating its files as a stale, crashed generation's leftovers.
+/// completed, before ever treating its files as a stale, crashed generation's leftovers. This is a
+/// race between writers, not a slow-start budget: the previous generation's orderly shutdown
+/// closes client leases before it removes its own files, so the first replacement attempt usually
+/// meets its leftover launcher here, and the wait must stay short enough that clearing those files
+/// and retrying still heals well inside the startup budget.
 async fn wait_for_external_health(runtime: &Path) -> bool {
     tokio::time::timeout(Duration::from_secs(7), async {
         loop {
@@ -2635,9 +2675,10 @@ async fn wait_for_external_health(runtime: &Path) -> bool {
     .is_ok()
 }
 
-/// Waits a bounded interval for the exact child to answer the existing side-effect-free health RPC.
+/// Waits within [`OWNED_DAEMON_READINESS_BUDGET`] for the exact child to answer the existing
+/// side-effect-free health RPC.
 async fn health_check_owned_daemon(child: &mut tokio::process::Child, runtime: &Path) -> bool {
-    tokio::time::timeout(Duration::from_secs(7), async {
+    tokio::time::timeout(OWNED_DAEMON_READINESS_BUDGET, async {
         loop {
             if child.try_wait().ok().flatten().is_some() {
                 return false;

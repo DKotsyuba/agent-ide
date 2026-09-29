@@ -169,6 +169,15 @@ impl Mcp {
 
     /// Starts the shipping self-contained Claude MCP using only its captured project environment.
     async fn start_managed_claude(template: &Path, project: &Path) -> Self {
+        Self::start_managed_claude_with_seam(template, project, None).await
+    }
+
+    /// [`Self::start_managed_claude`] with one product-test seam variable set on the MCP child.
+    async fn start_managed_claude_with_seam(
+        template: &Path,
+        project: &Path,
+        seam: Option<(&str, &str)>,
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
         command
             .env("TOKIO_WORKER_THREADS", "1")
@@ -182,6 +191,9 @@ impl Mcp {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some((key, value)) = seam {
+            command.env(key, value);
+        }
         let mut child = command.spawn().unwrap();
         let mut mcp = Self {
             input: child.stdin.take().unwrap(),
@@ -2572,6 +2584,26 @@ impl ProductActor {
     }
 }
 
+/// Reproduces the public deterministic Claude candidate-cache slot for product-edge assertions.
+///
+/// The candidate cache is keyed by the canonical candidate path itself (never the rendezvous key),
+/// exactly as [`managed_claude_runtime_path`] reproduces the rendezvous formula; its
+/// `candidate-attachment` file holds the daemon-minted attachment the native pre-hook submits
+/// with. Returns the current content, or an empty string when nothing is cached yet.
+fn managed_claude_candidate_attachment(project: &Path) -> String {
+    let identity = blake3::hash(
+        std::fs::canonicalize(project)
+            .unwrap()
+            .as_os_str()
+            .as_bytes(),
+    );
+    let path = std::fs::canonicalize("/private/tmp")
+        .unwrap()
+        .join(format!("ai-k-{}", &identity.to_hex().as_str()[..16]))
+        .join("candidate-attachment");
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
 /// Reproduces the public deterministic Claude rendezvous contract for product-edge assertions.
 ///
 /// The key is `project`'s canonical git common directory (every fixture is its own real Git
@@ -4278,6 +4310,19 @@ async fn claude_call_with_a_late_pre_hook_is_served_not_refused() {
     mcp.close().await;
 }
 
+/// Starts the managed Claude MCP with every daemon start it causes deliberately slower than the
+/// seven-second health window that killed slow-but-successful starts on GitHub's cold macOS
+/// runners: the daemon's startup-stall seam outlives that old window (and the SIGTERM it issued)
+/// by half a second, so recovery must instead complete inside the raised readiness budget.
+async fn start_managed_claude_with_slow_daemon(template: &Path, project: &Path) -> Mcp {
+    Mcp::start_managed_claude_with_seam(
+        template,
+        project,
+        Some(("AGENT_IDE_DAEMON_STARTUP_STALL_MS", "7500")),
+    )
+    .await
+}
+
 /// A session survives a daemon restart between two of its tool calls: the lease watcher heals the
 /// rendezvous at once, the next call transparently re-runs the remembered activation from its own
 /// pre-hook, a reference issued by the dead generation names the restart explicitly, and the
@@ -4287,7 +4332,7 @@ async fn claude_session_survives_a_daemon_restart_between_calls() {
     let fixture = ProductFixture::new(json!([]));
     let runtime = managed_claude_runtime_path(&fixture.root);
     let _guard = SharedClaudeDaemonGuard(runtime.clone());
-    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let mut mcp = start_managed_claude_with_slow_daemon(&fixture.config, &fixture.root).await;
     let mut next = 1;
     let pending = managed_claude_call(
         &mut mcp,
@@ -4329,8 +4374,9 @@ async fn claude_session_survives_a_daemon_restart_between_calls() {
         .expect("read reply carries a source_ref");
 
     // The shared daemon generation ends; the watcher must heal it before the next pre-hook.
+    let stale_attachment = managed_claude_candidate_attachment(&fixture.root);
     terminate_shared_claude_daemon(&runtime);
-    wait_for_healed_daemon(&runtime).await;
+    wait_for_healed_daemon(&fixture.root, &runtime, &stale_attachment).await;
 
     // The next pre-hook lands on the healed daemon and the next call transparently re-activates.
     next += 1;
@@ -4401,7 +4447,7 @@ async fn ide_stop_after_a_daemon_restart_answers_success() {
     let fixture = ProductFixture::new(json!([]));
     let runtime = managed_claude_runtime_path(&fixture.root);
     let _guard = SharedClaudeDaemonGuard(runtime.clone());
-    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let mut mcp = start_managed_claude_with_slow_daemon(&fixture.config, &fixture.root).await;
     let mut next = 1;
     let pending = managed_claude_call(
         &mut mcp,
@@ -4424,8 +4470,9 @@ async fn ide_stop_after_a_daemon_restart_answers_success() {
     .await;
     assert_eq!(started["kind"], "activation", "{started}");
 
+    let stale_attachment = managed_claude_candidate_attachment(&fixture.root);
     terminate_shared_claude_daemon(&runtime);
-    wait_for_healed_daemon(&runtime).await;
+    wait_for_healed_daemon(&fixture.root, &runtime, &stale_attachment).await;
 
     // No pre-hook is fired for this stop: the healed daemon has neither binding nor pre, and the
     // facade answers the session-shaped success instead of a host-binding error.
@@ -4451,15 +4498,24 @@ fn claude_text(fields: &Value) -> &str {
     fields["text"].as_str().unwrap_or_default()
 }
 
-/// Waits until the shared runtime answers healthy again after its generation ended.
-async fn wait_for_healed_daemon(runtime: &Path) {
-    tokio::time::timeout(Duration::from_secs(20), async {
+/// Waits until the shared runtime answers healthy again after its generation ended and the lease
+/// watcher's re-attach has replaced `stale_attachment` — the candidate-cache attachment content
+/// captured while the previous generation still lived.
+///
+/// Daemon health alone leaves a narrow window in which the next pre-hook would still submit with
+/// the dead generation's minted attachment and silently fail open, so the heal is only complete
+/// when the replacement daemon answers and the candidate cache names it. The replacement may
+/// legitimately spend most of the established 30 s startup budget initializing before it binds its
+/// socket, so the deadline matches that budget.
+async fn wait_for_healed_daemon(project: &Path, runtime: &Path, stale_attachment: &str) {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if agent_ide::app::doctor_report(runtime)
                 .await
                 .is_ok_and(|report| {
                     matches!(report.status, agent_ide::app::DoctorStatus::Healthy { .. })
                 })
+                && managed_claude_candidate_attachment(project) != stale_attachment
             {
                 return;
             }
