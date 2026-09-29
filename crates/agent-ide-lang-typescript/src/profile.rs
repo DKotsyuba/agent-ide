@@ -1265,10 +1265,14 @@ struct ConfigShape {
 /// `language_id` is the fixed ID for the opened document and `document` is its worktree-relative
 /// path. A `tsconfig.json`/`jsconfig.json` with no `references` must admit the document through a
 /// bounded top-level `files` entry or a literal `include` file/directory entry (see
-/// [`validate_configured_membership`]) whenever `membership` is [`MembershipRequirement::Required`];
-/// under [`MembershipRequirement::Optional`] a config that does not admit the document is accepted
-/// with `includes_document: false` instead of rejected, so a sibling reached through `references`
-/// may cover it instead. `exclude` is refused because glob membership is not observed.
+/// [`validate_configured_membership`]) whenever `membership` is [`MembershipRequirement::Required`].
+/// Under [`MembershipRequirement::Optional`] (a `references` target) a config that does not admit
+/// the document plays no part in resolving it: only `files`, `include` and
+/// `compilerOptions.allowJs` are read to decide that, every other option (`types`, `module`, …)
+/// is ignored, and it is accepted with `includes_document: false` so a sibling may cover the
+/// document instead; one that declares `extends` or `references` is not decided that way and meets
+/// the refusals below. A config that admits the document keeps every rule that follows.
+/// `exclude` is refused because glob membership is not observed.
 /// `compilerOptions.types` must be `[]` or exactly `["vite/client"]`, `moduleResolution` must be
 /// `node10` or `bundler`, JavaScript-family documents require boolean `allowJs: true`,
 /// path-mapping/plugin/output options are refused because their inputs are not observed, and
@@ -1307,6 +1311,34 @@ fn validate_resolution_shape(
         .as_object()
         .ok_or_else(|| reject("is not a JSON object".into()))?;
     if is_tsconfig_like(name) {
+        // A referenced project that does not include the document plays no part in resolving it:
+        // only what decides inclusion (`files`, `include`, `compilerOptions.allowJs`) is read from
+        // it and its other options are ignored. `extends` could supply those keys and nested
+        // `references` could include the document indirectly, so such a config is not decided
+        // here and falls through to its refusal below.
+        if membership == MembershipRequirement::Optional
+            && !object.contains_key("extends")
+            && !object.contains_key("references")
+            && validate_configured_membership(
+                path,
+                document,
+                object
+                    .get("files")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::as_slice),
+                object
+                    .get("include")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::as_slice),
+                object
+                    .get("compilerOptions")
+                    .and_then(|options| options.get("allowJs"))
+                    == Some(&serde_json::Value::Bool(true)),
+            )
+            .is_err()
+        {
+            return Ok(ConfigShape::default());
+        }
         if let Some(key) = ["extends", "typeAcquisition"]
             .iter()
             .find(|key| object.contains_key(**key))
@@ -1392,23 +1424,19 @@ fn validate_resolution_shape(
                 "`exclude` is unsupported; membership must be literal".into(),
             ));
         }
-        return match (
-            validate_configured_membership(
-                path,
-                document,
-                configured_files.map(Vec::as_slice),
-                configured_includes.map(Vec::as_slice),
-                allow_js,
-            ),
-            membership,
-        ) {
-            (Ok(()), _) => Ok(ConfigShape {
-                includes_document: true,
-                references: Vec::new(),
-            }),
-            (Err(_), MembershipRequirement::Optional) => Ok(ConfigShape::default()),
-            (Err(rejection), MembershipRequirement::Required) => Err(rejection),
-        };
+        // An `Optional` config reaching here already includes the document (see the top of this
+        // branch), so a membership refusal can only be a `Required` config's.
+        return validate_configured_membership(
+            path,
+            document,
+            configured_files.map(Vec::as_slice),
+            configured_includes.map(Vec::as_slice),
+            allow_js,
+        )
+        .map(|()| ConfigShape {
+            includes_document: true,
+            references: Vec::new(),
+        });
     } else if name == "package.json"
         && let Some(key) = ["imports", "workspaces"]
             .iter()
@@ -2348,11 +2376,12 @@ mod tests {
         );
     }
 
-    /// tsconfig files are JSONC, as TypeScript reads them: a default Vite template's solution
-    /// `tsconfig.json` and its referenced `tsconfig.app.json`/`tsconfig.node.json`, all carrying
-    /// `//` and `/* */` comments and trailing commas, resolve exactly like the strict-JSON shape.
-    /// (The node config keeps `types: []` — the template's `["node"]` is refused by the closed
-    /// `types` rule, which has nothing to do with parsing.)
+    /// tsconfig files are JSONC, as TypeScript reads them, and a referenced project that does not
+    /// include the document plays no part in resolving it: the default Vite template's solution
+    /// `tsconfig.json`, `tsconfig.app.json` and `tsconfig.node.json`, all carrying `//` and `/* */`
+    /// comments and trailing commas, resolve `src/App.tsx` through the app config even though the
+    /// node config declares `types: ["node"]` and `module: "nodenext"`. `vite.config.ts`, which
+    /// only that node config includes, is still refused for those options.
     #[test]
     fn project_resolution_reads_vite_tsconfigs_with_comments_and_trailing_commas() {
         let fixture = Fixture::new();
@@ -2371,7 +2400,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             fixture.root.join("tsconfig.node.json"),
-            "{\n  \"compilerOptions\": {\n    \"target\": \"es2023\",\n    \"types\": [],\n    /* Bundler mode */\n    \"moduleResolution\": \"bundler\",\n    \"noEmit\": true, /* Linting */\n  },\n  \"include\": [\"vite.config.ts\"],\n}\n",
+            "{\n  \"compilerOptions\": {\n    \"tsBuildInfoFile\": \"./node_modules/.tmp/tsconfig.node.tsbuildinfo\",\n    \"target\": \"es2023\",\n    \"lib\": [\"ES2023\"],\n    \"types\": [\"node\"],\n    \"skipLibCheck\": true,\n\n    /* Bundler mode */\n    \"module\": \"nodenext\",\n    \"allowImportingTsExtensions\": true,\n    \"verbatimModuleSyntax\": true,\n    \"moduleDetection\": \"force\",\n    \"noEmit\": true,\n\n    /* Linting */\n    \"noUnusedLocals\": true,\n    \"noFallthroughCasesInSwitch\": true,\n  },\n  \"include\": [\"vite.config.ts\"],\n}\n",
         )
         .unwrap();
         let app_document = fixture.root.join("src/App.tsx");
@@ -2382,9 +2411,12 @@ mod tests {
         assert_eq!(resolution.files().len(), 3);
         let node_document = fixture.root.join("vite.config.ts");
         std::fs::write(&node_document, "export {};\n").unwrap();
-        assert!(
-            ProjectResolutionInputsV1::observe(worktree, node_document, &bundle, &|_| true).is_ok(),
-            "vite.config.ts is admitted through the commented tsconfig.node.json"
+        let rejection =
+            ProjectResolutionInputsV1::observe(worktree, node_document, &bundle, &|_| true)
+                .expect_err("the only config including vite.config.ts has unsupported options");
+        assert_eq!(
+            rejection.to_string(),
+            "tsconfig.node.json: `compilerOptions.types` must be `[]` or `[\"vite/client\"]`"
         );
     }
 
