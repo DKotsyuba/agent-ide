@@ -147,7 +147,7 @@ pub(crate) fn stage_default(tool: AssistanceTool, reason: &str) -> String {
 
 /// Derives the default `<tool>:<reason>` stage tag for one closed failure code.
 pub(crate) fn default_stage(tool: AssistanceTool, code: &FailureCode) -> String {
-    let reason: crate::errorlog::ReasonCode = (*code).into();
+    let reason: crate::errorlog::ReasonCode = code.clone().into();
     stage_default(tool, reason.as_str())
 }
 
@@ -380,7 +380,7 @@ fn reply_outcome(reply: &PeerReply) -> ToolOutcome {
 /// counterpart) has no closed reason code at this boundary and reports `None`.
 fn reply_reason(reply: &PeerReply) -> Option<crate::errorlog::ReasonCode> {
     match reply {
-        PeerReply::Error { code, .. } => Some((*code).into()),
+        PeerReply::Error { code, .. } => Some(code.clone().into()),
         PeerReply::Edit { result, .. } => {
             crate::errorlog::ReasonCode::from_edit_outcome(result.outcome)
         }

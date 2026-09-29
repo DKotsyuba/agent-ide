@@ -268,7 +268,8 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "type": "object", "additionalProperties": false,
                 "required": ["path"],
                 "properties": {
-                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root."}
+                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root."},
+                    "kinds": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol)(,(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol))*$", "description": "Comma list over the closed symbol-kind vocabulary; keeps a symbol whose kind is selected or a descendant's is, so a container of a selected member still shows."}
                 }
             }),
         ),
@@ -531,7 +532,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "new_name",
             "lines",
         ],
-        AssistanceTool::Outline => &["path"],
+        AssistanceTool::Outline => &["path", "kinds"],
         AssistanceTool::Read => &["symbol", "path", "lines"],
         AssistanceTool::Symbol => &["symbol", "usages", "callers", "callees", "history"],
         AssistanceTool::Graph => &["symbol", "direction", "depth", "tests"],
@@ -624,6 +625,21 @@ pub fn validate_call(
             let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
             if let Some(rule) = path_shape_rule(path.strip_suffix('/').unwrap_or(path)) {
                 return Err(invalid_field("path", rule));
+            }
+            optional_string(object, "kinds", 256)?;
+            if object
+                .get("kinds")
+                .and_then(Value::as_str)
+                .is_some_and(|kinds| {
+                    kinds
+                        .split(',')
+                        .any(|kind| crate::lang::SymbolKind::from_name(kind).is_none())
+                })
+            {
+                return Err(invalid_field(
+                    "kinds",
+                    FieldRule::OneOf("a comma list over the closed symbol-kind vocabulary"),
+                ));
             }
         }
         AssistanceTool::Read => {

@@ -471,6 +471,55 @@ mod tests {
         );
     }
 
+    /// A missing `ide.outline`/`ide.read` path names the exact bounded requested path in the
+    /// reason itself, ahead of the payload-free stage tag (T163, W6).
+    #[test]
+    fn no_such_file_names_the_requested_path() {
+        let rendered = render(
+            PeerReply::Error {
+                code: FailureCode::NoSuchFile("src/assistance/host_bindng.rs".to_owned()),
+                detail: Some("outline:no_such_file".to_owned()),
+            },
+            Envelope::WithStructured,
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&rendered),
+            "error: no_such_file: src/assistance/host_bindng.rs (outline:no_such_file); check the path"
+        );
+        let for_read = render(
+            PeerReply::Error {
+                code: FailureCode::NoSuchFile("src/missing.rs".to_owned()),
+                detail: Some("read:no_such_file".to_owned()),
+            },
+            Envelope::WithStructured,
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&for_read),
+            "error: no_such_file: src/missing.rs (read:no_such_file); check the path"
+        );
+    }
+
+    /// `ide.context {path}` with no `byte_offset` redirects to `ide.outline`/`ide.read` instead of
+    /// paging the whole file (T163, W5); `kind:"problems"` and the semantic `byte_offset` query
+    /// are unaffected by this failure code and are not exercised here.
+    #[test]
+    fn path_context_retired_redirects_to_outline_and_read() {
+        let rendered = render(
+            PeerReply::Error {
+                code: FailureCode::PathContextRetired,
+                detail: Some("context:path_mode".to_owned()),
+            },
+            Envelope::WithStructured,
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&rendered),
+            "error: path_context_retired (context:path_mode); use ide.outline {\"path\"} for the skeleton or ide.read {\"path\",\"lines\"} for a region; kind:\"problems\" is unchanged"
+        );
+    }
+
     /// An expired or unknown detail says to repeat the original call.
     #[test]
     fn expired_detail_explains_the_recovery() {

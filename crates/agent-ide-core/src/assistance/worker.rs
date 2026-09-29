@@ -6,7 +6,10 @@ use super::{
     host_binding::{ActiveBindingUse, BindingRef, HostBindingGuard, ValidatedInvocation},
     launcher::{LaunchTarget, LauncherConfig},
     problems::{ProblemSource, ProjectProblemFeed, parse_language, problems_text_with_rechecks},
-    reply::{EditDiagnostics, ExecutionProfileCause, FailureCode, PeerReply, ResultKind},
+    reply::{
+        EditDiagnostics, ExecutionProfileCause, FailureCode, MAX_NO_SUCH_FILE_PATH_BYTES,
+        PeerReply, ResultKind, bounded_utf8_prefix,
+    },
     tests::{StartResult, TestRuns},
 };
 use crate::telemetry::{
@@ -2347,9 +2350,9 @@ impl<'a> Worker<'a> {
             let started = job.deadline.checked_sub(lifetime).unwrap_or(job.deadline);
             crate::errorlog::record(
                 errorlog_method(job.tool),
-                job_failure_outcome(*code),
+                job_failure_outcome(code.clone()),
                 crate::errorlog::Fields {
-                    reason: Some((*code).into()),
+                    reason: Some(code.clone().into()),
                     correlation: Some(job.reference.as_str()),
                     detail: job.failure_detail.as_deref(),
                     duration_ms: u32::try_from(started.elapsed().as_millis()).ok(),
@@ -2943,18 +2946,20 @@ impl<'a> Worker<'a> {
         if job.parameters.get("kind").and_then(Value::as_str) == Some("problems") {
             return self.context_problems_job(job, &binding).await;
         }
+        // T163 (W5): a whole-file `path` query duplicates `ide.read`'s bounded region, which
+        // `ide.outline`/`ide.read` now own; only the semantic `byte_offset` query remains.
+        let Some(byte_offset) = job.parameters.get("byte_offset").and_then(Value::as_u64) else {
+            job.failure_detail = Some("context:path_mode".to_owned());
+            return Err(FailureCode::PathContextRetired);
+        };
         let path = job.parameters["path"]
             .as_str()
             .ok_or(FailureCode::SourceUnavailable)?
             .to_owned();
         let (observed, bytes) = self.observe(&binding, path.clone().into()).await?;
-        let query = job
-            .parameters
-            .get("byte_offset")
-            .and_then(Value::as_u64)
-            .map_or(ContextQuery::File, |byte_offset| ContextQuery::Symbol {
-                byte_offset: byte_offset as usize,
-            });
+        let query = ContextQuery::Symbol {
+            byte_offset: byte_offset as usize,
+        };
         let semantic = if observed.bytes().is_none() {
             Ok(None)
         } else {
@@ -4657,7 +4662,7 @@ fn job_failure_outcome_covers_every_terminal_error_class() {
             crate::errorlog::Outcome::Failed,
         ),
     ] {
-        assert_eq!(job_failure_outcome(code), expected, "{code:?}");
+        assert_eq!(job_failure_outcome(code.clone()), expected, "{code:?}");
     }
 }
 
@@ -4972,7 +4977,7 @@ mod stop_retry_tests {
             reference: "context-source".into(),
             invocation,
             tool: AssistanceTool::Context,
-            parameters: serde_json::json!({"path":"main.rs"}),
+            parameters: serde_json::json!({"path":"main.rs","byte_offset":2}),
             target: production_target(&fixture.root),
             deadline: tokio::time::Instant::now() + Duration::from_secs(5),
             cancel,
@@ -5938,6 +5943,7 @@ mod stop_retry_tests {
 
         let invocation = production_call(&worker, "continuation-actor", "continuation-call");
         let (mut job, _cancel_sender) = context_job(&fixture.root, invocation);
+        job.parameters["byte_offset"] = serde_json::json!(3);
 
         // Pre-insert the placeholder detail exactly as `enqueue` would: `context()`'s own
         // `set_context_page` call only mutates an *already retained* detail, matching production.
@@ -6062,6 +6068,7 @@ mod stop_retry_tests {
         let (binding, _) = production_start(&mut worker, "large-actor", "large-start").await;
         let invocation = production_call(&worker, "large-actor", "large-call");
         let (mut job, _cancel_sender) = context_job(&fixture.root, invocation);
+        job.parameters["byte_offset"] = serde_json::json!(3);
         worker.shared.ledger.lock().unwrap().details.insert(
             job.reference.clone(),
             Detail {
@@ -6153,6 +6160,7 @@ mod stop_retry_tests {
         let (binding, _) = production_start(&mut worker, "huge-actor", "huge-start").await;
         let invocation = production_call(&worker, "huge-actor", "huge-call");
         let (mut job, _cancel_sender) = context_job(&fixture.root, invocation);
+        job.parameters["byte_offset"] = serde_json::json!(0);
         worker.shared.ledger.lock().unwrap().details.insert(
             job.reference.clone(),
             Detail {
@@ -6490,6 +6498,7 @@ mod stop_retry_tests {
         let (binding, _) = production_start(&mut worker, "small-actor", "small-start").await;
         let invocation = production_call(&worker, "small-actor", "small-call");
         let (mut job, _cancel_sender) = context_job(&fixture.root, invocation);
+        job.parameters["byte_offset"] = serde_json::json!(2);
         worker.shared.ledger.lock().unwrap().details.insert(
             job.reference.clone(),
             Detail {
@@ -6947,6 +6956,7 @@ mod stop_retry_tests {
                 activate_worktree(&mut worker, "stage-actor", "stage-start").await;
             let invocation = production_call(&worker, "stage-actor", "stage-context");
             let (mut job, _cancel) = context_job(&fixture.root, invocation);
+            job.parameters["byte_offset"] = serde_json::json!(0);
             let error = worker.context(&mut job).await.unwrap_err();
             assert!(matches!(error, FailureCode::SourceTooLarge { .. }));
             assert_eq!(

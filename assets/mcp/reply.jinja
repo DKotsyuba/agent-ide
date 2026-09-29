@@ -41,6 +41,8 @@ pending: use ide.inspect with detail_ref {{ detail_ref }}
 {%- if state == "error" -%}
 {%- if code == "resolution_unverified" -%}
 error: resolution_unverified; {{ resolution_detail if resolution_detail else "the nearest tsconfig.json or jsconfig.json did not prove membership: add the file to `files` or a literal `include` entry and use supported resolution settings" }}; retry ide.context
+{%- elif code.no_such_file is defined -%}
+error: no_such_file: {{ code.no_such_file }}{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; check the path
 {%- elif code is mapping -%}
 error: source_too_large; source is {{ code.source_too_large.size }} bytes, exceeding the {{ code.source_too_large.ceiling }} byte read ceiling; continue with native tools
 {%- elif code == "unknown_symbol" -%}
@@ -59,6 +61,8 @@ error: source_unavailable{% if resolution_detail %} ({{ resolution_detail }}){% 
 error: outside_allowed_roots{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; the working directory is not below any configured allowed root; start the IDE in an allowed directory or add this one to allowed_roots, otherwise continue with native tools
 {%- elif code == "execution_profile" and cause_tag is defined -%}
 error: execution_profile ({{ cause_tag }}); continue with native tools
+{%- elif code == "path_context_retired" -%}
+error: path_context_retired (context:path_mode); use ide.outline {"path"} for the skeleton or ide.read {"path","lines"} for a region; kind:"problems" is unchanged
 {%- else -%}
 error: {{ code }}{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; continue with native tools
 {%- endif -%}
