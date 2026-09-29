@@ -301,8 +301,11 @@ pub enum EditOutcome {
 ///
 /// `still_authorized` and `continue_before_effect` are evaluated immediately before any target
 /// effect. False authority is stale; false continuation is cancellation with zero writes. The
-/// requested content must be UTF-8 and at most 48 KiB. Temporary-file failures before rename are
-/// `unsafe_target`; any failure after rename is `outcome_unknown(operation_id, path)`.
+/// requested content must be UTF-8 and at most 128 KiB on the wire (the facade's
+/// `MAX_EDIT_ARGUMENT_CONTENT_BYTES`; this function's own splice ceiling is
+/// `MAX_EDIT_CONTENT_BYTES`, 1 MiB, for internally spliced whole-file content). Temporary-file
+/// failures before rename are `unsafe_target`; any failure after rename is
+/// `outcome_unknown(operation_id, path)`.
 pub fn replace_if_current(
     permit: EditPermit,
     target: CurrentEditTarget,

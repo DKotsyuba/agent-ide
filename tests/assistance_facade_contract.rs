@@ -487,9 +487,18 @@ fn edit_arguments_are_closed_and_bounded() {
     assert!(
         validate_call(
             AssistanceTool::Edit,
-            json!({"operation_id":"edit-2","path":"src/main.rs","source_ref":"context-1","content":"x".repeat(48 * 1024 + 1)})
+            json!({"operation_id":"edit-2","path":"src/main.rs","source_ref":"context-1","content":"x".repeat(agent_ide::assistance::facade::MAX_EDIT_ARGUMENT_CONTENT_BYTES + 1)})
         )
         .is_err()
+    );
+    // v0.6.1 raised the wire content ceiling from 48 KiB to 128 KiB to cover a whole module in
+    // one call; content right at the new ceiling is still accepted.
+    assert!(
+        validate_call(
+            AssistanceTool::Edit,
+            json!({"operation_id":"edit-3","path":"src/main.rs","source_ref":"context-1","content":"x".repeat(agent_ide::assistance::facade::MAX_EDIT_ARGUMENT_CONTENT_BYTES)})
+        )
+        .is_ok()
     );
 }
 

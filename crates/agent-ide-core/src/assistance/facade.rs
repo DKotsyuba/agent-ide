@@ -331,7 +331,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
 pub const MAX_SYMBOL_PATH_BYTES: usize = 1024;
 /// Maximum bytes of the `content` argument on the wire; spliced whole files may be larger
 /// internally (`crate::workspace::edit::MAX_EDIT_CONTENT_BYTES`).
-pub const MAX_EDIT_ARGUMENT_CONTENT_BYTES: usize = 48 * 1024;
+pub const MAX_EDIT_ARGUMENT_CONTENT_BYTES: usize = 128 * 1024;
 
 /// Parses an inclusive 1-based `start-end` line range; `None` for any other shape.
 pub(crate) fn parse_line_range(text: &str) -> Option<crate::lang::LineRange> {
@@ -2945,11 +2945,13 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
         (
             validate_call(
                 AssistanceTool::Edit,
-                json!({"operation_id":"o","path":"a.rs","source_ref":"s","content":"x".repeat(49 * 1024)}),
+                json!({"operation_id":"o","path":"a.rs","source_ref":"s","content":"x".repeat(MAX_EDIT_ARGUMENT_CONTENT_BYTES + 1)}),
             )
             .unwrap_err(),
             AssistanceTool::Edit,
-            "invalid bounded parameters: \"content\" is longer than 49152 bytes".to_string(),
+            format!(
+                "invalid bounded parameters: \"content\" is longer than {MAX_EDIT_ARGUMENT_CONTENT_BYTES} bytes"
+            ),
         ),
         (
             validate_call(
