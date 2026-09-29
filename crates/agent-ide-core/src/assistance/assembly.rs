@@ -204,6 +204,29 @@ fn due_plate(
     .then_some(plate)
 }
 
+/// Leads `plate` with the binding's one-shot `git: HEAD moved …` line when one is due and the
+/// merged plate still `fits`; the line is consumed only when delivered, otherwise it stays due
+/// and `plate` is returned unchanged. A due line with no other plate becomes a plate of its own.
+fn with_git_notice(
+    worker: &WorkerHandle,
+    fingerprint: &[u8; 32],
+    plate: Option<String>,
+    fits: impl FnOnce(&str) -> bool,
+) -> Option<String> {
+    let Some(notice) = worker.git_notice(fingerprint) else {
+        return plate;
+    };
+    let merged = match &plate {
+        Some(plate) => plate.replacen("<agent-ide>\n", &format!("<agent-ide>\n{notice}\n"), 1),
+        None => format!("<agent-ide>\n{notice}\n</agent-ide>"),
+    };
+    if fits(&merged) && worker.consume_git_notice(fingerprint, &notice) {
+        Some(merged)
+    } else {
+        plate
+    }
+}
+
 /// Attaches the due status plate to one reply-delivered host's terminal reply (T28B).
 ///
 /// The plate is marked delivered only once it was actually attached: the whole reply is fitted
@@ -467,11 +490,16 @@ impl ProductDispatcher {
                         // replies never carry one.
                         if settled_plate
                             && let Some(worker) = &self.worker
-                            && let Some(block) = due_plate(
-                                worker.project_feed(),
-                                Some(worker),
+                            && let Some(block) = with_git_notice(
+                                worker,
                                 &binding.binding_ref().fingerprint(),
-                                None,
+                                due_plate(
+                                    worker.project_feed(),
+                                    Some(worker),
+                                    &binding.binding_ref().fingerprint(),
+                                    None,
+                                ),
+                                |plate| plate.len() <= super::reply::MAX_FEEDBACK_BYTES,
                             )
                         {
                             return Some(PeerReply::Feedback { text: block });
@@ -506,8 +534,13 @@ impl ProductDispatcher {
                             // The block is taken from in-memory snapshots only. It is skipped, and
                             // stays due for a later hook, whenever it could not fit beside the
                             // feedback inside one bounded hook context.
-                            let block =
-                                due_plate(feed, Some(worker), &fingerprint, feedback.as_deref());
+                            let reserved = feedback.as_ref().map_or(0, |text| text.len() + 1);
+                            let block = with_git_notice(
+                                worker,
+                                &fingerprint,
+                                due_plate(feed, Some(worker), &fingerprint, feedback.as_deref()),
+                                |plate| reserved + plate.len() <= super::reply::MAX_FEEDBACK_BYTES,
+                            );
                             let text = match (block, feedback) {
                                 (Some(block), Some(feedback)) => {
                                     Some(format!("{block}\n{feedback}"))
@@ -791,6 +824,13 @@ impl ProductDispatcher {
                                 test_status.as_deref(),
                             ),
                         };
+                        *status = with_git_notice(worker, &fingerprint, status.take(), |plate| {
+                            super::content::fits_with_status(
+                                &reply,
+                                plate,
+                                super::content::Envelope::WithStructured,
+                            )
+                        });
                     }
                 }
                 Some(reply)

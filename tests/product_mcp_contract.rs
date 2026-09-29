@@ -5712,6 +5712,44 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     daemon.wait().await.unwrap();
 }
 
+/// A branch another process checks out after activation reaches the next terminal reply's plate
+/// once as a `git: HEAD moved …` line, and is not repeated.
+#[tokio::test]
+async fn a_branch_switched_outside_the_ide_is_noticed_once_on_the_plate() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "head-moved").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"head-moved"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    fixture.git(&["checkout", "--quiet", "-b", "moved-elsewhere"]);
+    let context = actor
+        .call(&fixture, "ide.context", json!({"path":"src/lib.rs"}))
+        .await;
+    let context = actor.settle(&fixture, context).await;
+    let plate = carried_status(&context).unwrap_or_else(|| panic!("{context}"));
+    assert!(
+        plate.starts_with("<agent-ide>\ngit: HEAD moved ")
+            && plate.contains(
+                " → moved-elsewhere) outside Agent IDE; earlier indexed answers may be stale"
+            ),
+        "{plate}"
+    );
+    let again = actor
+        .call(&fixture, "ide.context", json!({"path":"src/lib.rs"}))
+        .await;
+    let again = actor.settle(&fixture, again).await;
+    assert!(
+        carried_status(&again).is_none_or(|plate| !plate.contains("git: HEAD moved")),
+        "{again}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// After `ide.stop` a test-run handle still answers the run's status through `ide.inspect`, without
 /// a plate or the dropped `full output` detail; every other reference ends with the session.
 #[tokio::test]

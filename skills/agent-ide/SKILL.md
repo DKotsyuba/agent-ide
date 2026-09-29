@@ -164,6 +164,9 @@ counts rise after your edit, call `ide.context` with `{"kind": "problems"}` (opt
 list before continuing. The `typescript` filter covers `.ts`, `.tsx`, `.js`, and `.jsx`.
 An LSP diagnostic push can give only a provisional lower bound for TypeScript/JavaScript;
 claim exact Clean only after a completed configured project check.
+A `git: HEAD moved … outside Agent IDE` line (delivered once) means another process switched the
+worktree's branch: symbol answers you already hold may describe the old branch, so re-read before
+editing from them.
 `check failed (<reason>)`, `environment not found`, `no files analyzed`, `outside allowed roots`
 or `checks disabled` mean the feed has no counts for that language — never treat them as a clean
 result.

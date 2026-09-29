@@ -69,6 +69,8 @@ tests #3: running 42 s — cargo test worker::
 </agent-ide>
 ```
 
+When the worktree's checked-out branch or detached commit changed outside the IDE since the session's previous call (another process ran `git checkout`/`switch`), the next plate leads with one line, delivered once: `git: HEAD moved 4e2e2e2 → 9daac64 (claude/a → claude/b) outside Agent IDE; earlier indexed answers may be stale`. A commit on the same branch is not reported. It is a notice only: nothing is invalidated or restarted.
+
 ### Ceilings and pages
 
 - A response is at most 16 KB. Lists are capped at 30 usage lines, 20 caller lines, and 20 diagnostic lines. Any remainder is reported as “N more” with a `detail_ref`.

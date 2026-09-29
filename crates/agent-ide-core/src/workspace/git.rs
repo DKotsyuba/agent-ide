@@ -9,6 +9,8 @@ use std::{
 
 /// Bounded Git discovery validation before durable worktree identity is resolved.
 pub mod discovery;
+/// Checked-out branch or detached commit read from Git's own files, without running Git.
+pub mod head;
 /// Filter-free object and source snapshot collection.
 pub mod snapshot;
 

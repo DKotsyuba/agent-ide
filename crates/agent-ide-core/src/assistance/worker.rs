@@ -540,6 +540,8 @@ struct Shared {
     project_feed: Option<Arc<ProjectProblemFeed>>,
     /// Explicitly requested background test processes, retained until daemon shutdown.
     test_runs: TestRuns,
+    /// Undelivered one-shot `git: HEAD moved …` plate lines keyed by binding fingerprint.
+    git_notices: Mutex<BTreeMap<[u8; 32], String>>,
 }
 impl Shared {
     /// Acquires a new transient binding use at one exact admission/return boundary.
@@ -961,6 +963,7 @@ impl WorkerHandle {
                 problem_source: None,
                 project_feed: None,
                 test_runs: TestRuns::default(),
+                git_notices: Mutex::new(BTreeMap::new()),
             }),
             inspect,
             receiver: Mutex::new(Some(receiver)),
@@ -1010,6 +1013,19 @@ impl WorkerHandle {
     /// Marks a test status line delivered only if it is still current and fits the reply.
     pub fn mark_test_status_delivered(&self, binding: &[u8; 32], line: &str) -> bool {
         self.shared.test_runs.mark_status_delivered(binding, line)
+    }
+
+    /// Returns the binding's undelivered `git: HEAD moved …` plate line, if any.
+    pub fn git_notice(&self, binding: &[u8; 32]) -> Option<String> {
+        self.shared.git_notices.lock().ok()?.get(binding).cloned()
+    }
+
+    /// Consumes exactly `line` once it was delivered; a newer notice stays due.
+    pub fn consume_git_notice(&self, binding: &[u8; 32], line: &str) -> bool {
+        self.shared.git_notices.lock().is_ok_and(|mut notices| {
+            notices.get(binding).map(String::as_str) == Some(line)
+                && notices.remove(binding).is_some()
+        })
     }
 
     /// Returns the shared slot that holds the telemetry owner once startup has opened it.
@@ -1172,6 +1188,7 @@ impl WorkerHandle {
                 pending_revocations: std::collections::BTreeSet::new(),
                 registered: BTreeMap::new(),
                 baselines: BTreeMap::new(),
+                heads: BTreeMap::new(),
                 source_sequence: 0,
                 uncertain: std::collections::BTreeSet::new(),
                 uncertain_snapshots: Vec::new(),
@@ -1807,6 +1824,8 @@ struct Worker<'a> {
     registered: BTreeMap<BindingRef, std::collections::BTreeSet<std::path::PathBuf>>,
     /// Durable partial activation baselines retained for same-binding diff provenance.
     baselines: BTreeMap<BindingRef, crate::workspace::git::BaselineContext>,
+    /// Checked-out branch or detached commit last seen per binding, first read by its start.
+    heads: BTreeMap<BindingRef, crate::workspace::git::head::HeadState>,
     /// Boot-unique source observation operation sequence.
     source_sequence: u64,
     /// Finite physical-effect admission, shared by discovery, snapshots and language providers.
@@ -2369,6 +2388,9 @@ impl<'a> Worker<'a> {
                     ..Default::default()
                 },
             );
+        }
+        if let Some(authority) = &authority {
+            self.observe_head(&binding, authority);
         }
         if let Some(feed) = &self.shared.project_feed {
             match (&reply, &authority) {
@@ -3801,11 +3823,33 @@ impl<'a> Worker<'a> {
         Ok(())
     }
 
+    /// Compares the worktree's checked-out branch or detached commit with the one this binding
+    /// last saw (first read by its start) and leaves one plate notice when it changed outside the
+    /// IDE. Notice only: nothing is invalidated or restarted. Reads two or three small Git files.
+    fn observe_head(&mut self, binding: &BindingRef, authority: &AuthorityStamp) {
+        let Some(now) = crate::workspace::git::head::HeadState::read(
+            authority.worktree().worktree_path(),
+            authority.worktree().git_common_dir(),
+        ) else {
+            return;
+        };
+        if let Some(before) = self.heads.insert(binding.clone(), now.clone())
+            && let Some(notice) = before.moved_notice(&now)
+            && let Ok(mut notices) = self.shared.git_notices.lock()
+        {
+            notices.insert(binding.fingerprint(), notice);
+        }
+    }
+
     /// Releases the binding-owned state that only a committed durable revoke makes safe to clear.
     fn release_binding_state(&mut self, binding: &BindingRef) {
         self.quiesce_worktree_caches(binding);
         self.registered.remove(binding);
         self.baselines.remove(binding);
+        self.heads.remove(binding);
+        if let Ok(mut notices) = self.shared.git_notices.lock() {
+            notices.remove(&binding.fingerprint());
+        }
         if let Ok(mut ledger) = self.shared.ledger.lock() {
             ledger.feedback.remove(binding);
             ledger.delivered.remove(binding);
@@ -4935,6 +4979,7 @@ mod stop_retry_tests {
                 problem_source: None,
                 project_feed: None,
                 test_runs: TestRuns::default(),
+                git_notices: Mutex::new(BTreeMap::new()),
             }),
             workspace,
             observations: WorkspaceStore::new(store),
@@ -4943,6 +4988,7 @@ mod stop_retry_tests {
             pending_revocations: std::collections::BTreeSet::new(),
             registered: BTreeMap::new(),
             baselines: BTreeMap::new(),
+            heads: BTreeMap::new(),
             source_sequence: 0,
             admission: Arc::new(Mutex::new(admission_controller())),
             uncertain: std::collections::BTreeSet::new(),
@@ -6342,6 +6388,52 @@ mod stop_retry_tests {
             &[0_u8; 32],
             10
         ));
+    }
+
+    /// A branch switched outside the IDE leaves one `git:` notice naming both commits and
+    /// branches; once consumed it is not repeated, and the refreshed baseline stays quiet.
+    #[tokio::test]
+    async fn head_moved_outside_the_ide_leaves_one_notice() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("main.rs"), "let value = 1;\n").unwrap();
+        git_commit(&fixture.root, "head fixture");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, authority) = activate_worktree(&mut worker, "head-actor", "head-start").await;
+        let owner = binding.fingerprint();
+        let notice = |worker: &Worker<'_>| {
+            worker
+                .shared
+                .git_notices
+                .lock()
+                .unwrap()
+                .get(&owner)
+                .cloned()
+        };
+        worker.observe_head(&binding, &authority);
+        worker.observe_head(&binding, &authority);
+        assert_eq!(notice(&worker), None, "an unchanged head says nothing");
+        let status = std::process::Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(&fixture.root)
+            .args(["checkout", "--quiet", "--detach"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        worker.observe_head(&binding, &authority);
+        let line = notice(&worker).expect("a switched head leaves a notice");
+        assert!(
+            line.starts_with("git: HEAD moved ")
+                && line.contains(
+                    " → detached) outside Agent IDE; earlier indexed answers may be stale"
+                ),
+            "{line}"
+        );
+        worker.shared.git_notices.lock().unwrap().remove(&owner);
+        worker.observe_head(&binding, &authority);
+        assert_eq!(notice(&worker), None, "the refreshed baseline stays quiet");
     }
 
     /// After `ide.stop` the actor/channel identity still reads its test run's status through the
