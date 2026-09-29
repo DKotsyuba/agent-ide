@@ -7839,30 +7839,45 @@ async fn configured_product_rust_outline_answers_when_home_is_a_substitute_with_
     daemon.wait().await.unwrap();
 }
 
+/// The lexical corpus files (`crates/agent-ide-lang-rust/tests/fixtures/lexical`) whose lexical
+/// outline must equal the server's; the cross-check copies them in as `src/corpus_<name>.rs`.
+const EXACT_LEXICAL_CORPUS: [&str; 4] = ["attrs", "generics", "items", "module_docs"];
+
 /// Builds the lexical cross-check fixture: the symbol-test crate with real repository sources
 /// copied in as modules, so one warm rust-analyzer outlines exactly the shapes the product
-/// handles (`crates/agent-ide-core` helpers, the Rust language crate's own support module, and
-/// the acceptance scenario's fixture crate).
+/// handles (`crates/agent-ide-core` helpers, the Rust language crate's own support module, the
+/// acceptance scenario's fixture crate, and the exact files of the lexical corpus).
 fn lexical_cross_check_fixture() -> ProductFixture {
     let fixture = symbol_test_fixture();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let copies = [
-        ("src/brace.rs", "crates/agent-ide-core/src/lang/brace.rs"),
-        ("src/git.rs", "crates/agent-ide-core/src/workspace/git.rs"),
+    let mut copies = vec![
         (
-            "src/rust_support.rs",
-            "crates/agent-ide-lang-rust/src/support.rs",
+            "src/brace.rs".to_owned(),
+            "crates/agent-ide-core/src/lang/brace.rs".to_owned(),
         ),
         (
-            "src/fixture_a.rs",
-            "tests/fixtures/eyes/rust-workspace/crates/a/src/lib.rs",
+            "src/git.rs".to_owned(),
+            "crates/agent-ide-core/src/workspace/git.rs".to_owned(),
+        ),
+        (
+            "src/rust_support.rs".to_owned(),
+            "crates/agent-ide-lang-rust/src/support.rs".to_owned(),
+        ),
+        (
+            "src/fixture_a.rs".to_owned(),
+            "tests/fixtures/eyes/rust-workspace/crates/a/src/lib.rs".to_owned(),
         ),
     ];
-    std::fs::write(
-        fixture.root.join("src/lib.rs"),
-        "mod brace;\nmod git;\nmod rust_support;\nmod fixture_a;\n\npub fn value() -> i32 { 7 }\npub fn caller() -> i32 { value() }\n",
-    )
-    .unwrap();
+    let mut lib = "mod brace;\nmod git;\nmod rust_support;\nmod fixture_a;\n".to_owned();
+    for name in EXACT_LEXICAL_CORPUS {
+        copies.push((
+            format!("src/corpus_{name}.rs"),
+            format!("crates/agent-ide-lang-rust/tests/fixtures/lexical/{name}.rs"),
+        ));
+        lib.push_str(&format!("mod corpus_{name};\n"));
+    }
+    lib.push_str("\npub fn value() -> i32 { 7 }\npub fn caller() -> i32 { value() }\n");
+    std::fs::write(fixture.root.join("src/lib.rs"), lib).unwrap();
     for (destination, source) in copies {
         std::fs::copy(root.join(source), fixture.root.join(destination)).unwrap();
     }
@@ -7871,9 +7886,11 @@ fn lexical_cross_check_fixture() -> ProductFixture {
     fixture
 }
 
-/// The lexical outline equals the server path's answer for real repository files: the rendered
-/// outline text (every symbol, signature, doc and start line) is byte-identical, and each
-/// symbol's address resolves on the server path to the lexical range's exact end lines.
+/// The lexical outline is either the server path's answer or refused, live: for every file it
+/// scans, the rendered outline text (every symbol, signature, doc and start line) is
+/// byte-identical to the warm server's, and every address resolves on the server path to the
+/// lexical range. Real repository files may be refused (comments above items are common); the
+/// crate root and the exact lexical corpus files must scan.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment"]
 async fn configured_product_rust_lexical_outline_matches_the_server() {
@@ -7891,13 +7908,21 @@ async fn configured_product_rust_lexical_outline_matches_the_server() {
         )
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
-    for file in [
-        "src/lib.rs",
+    let mut files: Vec<(String, bool)> = [
         "src/brace.rs",
         "src/git.rs",
         "src/rust_support.rs",
         "src/fixture_a.rs",
-    ] {
+    ]
+    .into_iter()
+    .map(|file| (file.to_owned(), false))
+    .collect();
+    files.push(("src/lib.rs".to_owned(), true));
+    for name in EXACT_LEXICAL_CORPUS {
+        files.push((format!("src/corpus_{name}.rs"), true));
+    }
+    for (file, must_scan) in &files {
+        let file = file.as_str();
         // Warm answer from the live server: the first calls answer from the lexical outline
         // while the analyzer loads, so warmth is proven by the marker's absence.
         let server = loop {
@@ -7916,9 +7941,10 @@ async fn configured_product_rust_lexical_outline_matches_the_server() {
         };
         let server_text = server["text"].as_str().unwrap();
         let source = std::fs::read_to_string(fixture.root.join(file)).unwrap();
-        let lexical = RustSupport
-            .outline_from_source(Path::new(file), &source)
-            .unwrap_or_else(|| panic!("{file} must scan cleanly"));
+        let Some(lexical) = RustSupport.outline_from_source(Path::new(file), &source) else {
+            assert!(!must_scan, "{file} must scan cleanly");
+            continue;
+        };
         assert_eq!(
             server_text,
             render::outline_text(&lexical),
@@ -7929,14 +7955,13 @@ async fn configured_product_rust_lexical_outline_matches_the_server() {
         // End lines: every lexical address resolves through the server path to the same
         // range. Same-named siblings (a type and its impl blocks) share one address and
         // `find` answers the first, so each unique address is checked once.
-        let mut addresses: Vec<std::collections::BTreeSet<String>> =
-            vec![std::collections::BTreeSet::new()];
+        let mut addresses = std::collections::BTreeSet::new();
         for symbol in &lexical.symbols {
             symbol.walk(&mut |symbol| {
-                addresses[0].insert(symbol.path.to_string());
+                addresses.insert(symbol.path.to_string());
             });
         }
-        for address in addresses[0].iter().take(60) {
+        for address in &addresses {
             let expected = lexical
                 .find(&SymbolPath::parse(address).unwrap())
                 .unwrap_or_else(|| panic!("{file}: {address} missing from the lexical outline"));
@@ -8091,7 +8116,14 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
         "/// Answers cold.\npub fn value() -> i32 { 7 }\n\npub fn caller() -> i32 { value() }\n",
     )
     .unwrap();
-    fixture.git(&["add", "--", "src/lib.rs"]);
+    // A comment directly above an item: rust-analyzer may attach it to the item's range, so the
+    // lexical outline refuses this file and it waits for the server.
+    std::fs::write(
+        fixture.root.join("src/refused.rs"),
+        "// attached to the item below\npub fn refused() {}\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "src/refused.rs"]);
     fixture.git(&["commit", "--quiet", "-m", "cold lexical fixture"]);
 
     let mut daemon = fixture.daemon().await;
@@ -8149,6 +8181,13 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
             .contains("outline: lexical (rust-analyzer loading)"),
         "{delete}"
     );
+    // An address the lexical outline does not contain is not proven absent (`server_only` is a
+    // symbol only the server reports): the edit answers provider_loading, never unknown_symbol.
+    let missing = edit(
+        json!({"operation_id":"cold-missing","op":"delete","symbol":"src/lib.rs#server_only"}),
+    )
+    .await;
+    assert_eq!(missing["code"], "provider_loading", "{missing}");
 
     // Cold read of a symbol: numbered source, marked lexical, with its source_ref.
     let read = actor
@@ -8177,6 +8216,20 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
         )
         .await;
     assert_eq!(still["state"], "pending", "{still}");
+    // A read of that server-only address waits for the server too, and so does the outline of
+    // a file the lexical scanner refuses (its park is kept, not dropped).
+    let server_only = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"symbol":"src/lib.rs#server_only"}),
+        )
+        .await;
+    assert_eq!(server_only["state"], "pending", "{server_only}");
+    let refused = actor
+        .call(&fixture, "ide.outline", json!({"path":"src/refused.rs"}))
+        .await;
+    assert_eq!(refused["state"], "pending", "{refused}");
 
     // The server becomes ready: the server path is used again.
     std::fs::write(&ready, "ready").unwrap();
@@ -8184,6 +8237,21 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
     let card = settled["text"].as_str().unwrap_or_default();
     assert!(card.contains("symbol: value"), "{settled}");
     assert!(!card.contains("outline: lexical"), "{settled}");
+    let server_only = actor.settle(&fixture, server_only).await;
+    let read_text = server_only["text"].as_str().unwrap_or_default();
+    assert!(
+        read_text.starts_with("src/lib.rs#server_only  (lines "),
+        "{server_only}"
+    );
+    let refused = actor.settle(&fixture, refused).await;
+    assert_eq!(refused["kind"], "outline", "{refused}");
+    assert!(
+        !refused["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("outline: lexical"),
+        "{refused}"
+    );
     let warm = loop {
         let reply = actor
             .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
