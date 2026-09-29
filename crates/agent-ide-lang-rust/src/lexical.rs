@@ -22,7 +22,11 @@
 //! A node range runs from the item's first outer attribute or doc comment (syn keeps doc
 //! comments as attributes, rust-analyzer as attached trivia) to its last token, so a field or a
 //! variant ends before its comma; the selection range is the name. Both come from the syntax
-//! tree's own tokens, so building one symbol costs no more than its header.
+//! tree's own tokens (attributes, keywords, names, closing delimiters, `;`), except that a
+//! field's type and a variant's discriminant are printed whole to find their last token, and an
+//! impl's trait path and self type to take their text (at most [`MAX_LABEL_PART`] bytes each).
+//! A printed node may hold nested symbols, whose own nodes are printed again, so that work is
+//! bounded by the tokens times the bracket depth.
 //!
 //! Refusal over guessing: whatever the parse cannot reproduce with the server's exact answer
 //! makes the whole outline `None`, and the file keeps waiting for the server —
@@ -33,10 +37,17 @@
 //!   the block itself as a symbol);
 //! * text syn reads differently from rust-analyzer: an item-like macro call other than
 //!   `macro_rules!` (`foo! name { … }`), a field named `_`, anything named `gen` (a keyword to
-//!   rust-analyzer in edition 2024), and a visibility before a variant's name (syn drops it,
-//!   rust-analyzer reads it as an error that detaches the variant's attributes);
+//!   rust-analyzer in edition 2024), a visibility before a variant's name (syn drops it,
+//!   rust-analyzer reads it as an error that detaches the variant's attributes), and an impl for
+//!   `!`;
 //! * more than [`MAX_TOKENS`] tokens or brackets nested deeper than [`MAX_DEPTH`] (see
-//!   [`PARSE_STACK`]), and more than [`MAX_SYMBOLS`] symbols;
+//!   [`PARSE_STACK`]), more than [`MAX_SYMBOLS`] symbols, an impl whose trait path or self type
+//!   is longer than [`MAX_LABEL_PART`] bytes or spans lines (its label is kept whole in every
+//!   symbol path below it);
+//! * unstable syntax syn parses in quadratic time — `box`, `become`, `dyn*` and `const` trait
+//!   bounds, which it keeps as verbatim tokens copied again at every nesting level
+//!   ([`slow_to_parse`]) — refused before the parse; and any parse slower than
+//!   [`PARSE_TIMEOUT`];
 //! * whitespace rustc does not accept in code (a no-break space, …), which the parser skips;
 //! * a `// region:` comment, which the server reports as a symbol;
 //! * comments rust-analyzer attaches to an item's node but a parser drops: comment text on the
@@ -52,20 +63,28 @@
 //! outline still agrees.
 //!
 //! The parse runs on a short-lived thread with a stack of its own ([`PARSE_STACK`]), sized so
-//! that no accepted text can exhaust it: every level the parser, the tree walk or the tree's drop
-//! recurses consumes at least one token, so their stack grows at most linearly in the token
-//! count, and the stack holds [`MAX_TOKENS`] tokens at twice the costliest growth per token
-//! measured ([`STACK_PER_TOKEN`]). A parser panic refuses instead of unwinding into the caller,
-//! and `proc-macro2`'s thread-local span table (which keeps the text of every source parsed on a
-//! thread) is freed with the thread.
+//! that no accepted text can exhaust it: every level the parser, the tree walk, the printing of
+//! a field type, discriminant or impl header inside the walk, or the tree's drop recurses
+//! consumes at least one token, so their stack grows at most linearly in the token count, and
+//! the stack holds [`MAX_TOKENS`] tokens at twice the costliest growth per token measured
+//! ([`STACK_PER_TOKEN`]). A parser panic refuses instead of unwinding into the caller, and
+//! `proc-macro2`'s thread-local span table (which keeps the text of every source parsed on a
+//! thread) is freed with the thread. The outline of a text is computed once: repeated calls for
+//! the same file and bytes (a parked call retrying, name cards outlining a file per site) answer
+//! from a small cache, refusals and timeouts included.
+//!
+//! `syn` is pinned to one release: the quadratic-parse triggers and the stack measurements hold
+//! for that release only, and an upgrade repeats both.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError, mpsc};
+use std::time::Duration;
 
 use agent_ide_core::lang::brace::{line_at, source_lines};
 use agent_ide_core::lang::{LanguageSupport, Outline, Symbol, SymbolKind};
 use async_lsp::lsp_types as lsp;
-use proc_macro2::{LineColumn, Span, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, LineColumn, Span, TokenStream, TokenTree};
 use quote::ToTokens;
 use syn::visit::{self, Visit};
 
@@ -89,12 +108,16 @@ const MAX_TOKENS: usize = if cfg!(debug_assertions) {
 };
 
 /// Stack bytes one token may cost the parse at worst: twice the costliest growth per token
-/// measured over 45 shapes, each nested until it overflowed a known stack (nested closures,
+/// measured over 49 shapes, each nested until it overflowed a known stack (nested closures,
 /// prefix operators, references, pointer, tuple, array and function-pointer types, generics,
-/// `dyn`/`impl` chains, qualified paths, casts, binary and assignment chains, `return`/`break`,
-/// blocks, `match` arms, `if`/`else` chains, postfix chains, patterns, struct literals, nested
-/// items, attribute and macro token trees): 4 223 bytes (nested blocks) in an optimized build,
-/// 28 988 bytes (a chain of `&` in a type) in an unoptimized one.
+/// `dyn`/`impl` chains, qualified paths, casts, binary and assignment chains,
+/// `return`/`break`/`yield`, blocks, `match` arms, `if`/`else` chains, postfix chains,
+/// patterns, struct literals, nested items, attribute and macro token trees, and the printed
+/// field types and discriminants): in an optimized build 4 223 bytes for nested blocks (which
+/// [`MAX_DEPTH`] stops long before the token bound) and 3 116 for a `break` chain, the costliest
+/// shape that can reach [`MAX_TOKENS`]; in an unoptimized one 29 051 bytes for a field whose type
+/// is a chain of `&`. The `box`, `become`, `dyn*` and `const`-bound chains are refused before the
+/// parse ([`slow_to_parse`]) and were not measured.
 const STACK_PER_TOKEN: usize = if cfg!(debug_assertions) {
     57 << 10
 } else {
@@ -111,11 +134,63 @@ const _: () = assert!(PARSE_STACK <= 2 << 30);
 /// Most symbols one outline may carry; a larger file waits for the server.
 const MAX_SYMBOLS: usize = 20_000;
 
+/// Longest an impl's trait path or self type may be, in bytes, for the outline to label it:
+/// the label is copied into the path of every symbol below it, so a long one would multiply.
+const MAX_LABEL_PART: usize = 256;
+
+/// Longest the parse thread may take before the outline is refused. Ordinary files take tens of
+/// milliseconds; a parse still running then is abandoned, not stopped (see [`run_bounded`]).
+const PARSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How many outlines [`OUTLINES`] keeps.
+const CACHED_OUTLINES: usize = 32;
+
+/// Outlines already computed, oldest first, keyed by file path and the text's digest; each is
+/// the answer given for that text, a refusal or a timeout included.
+type Outlines = Mutex<VecDeque<(PathBuf, blake3::Hash, Option<Outline>)>>;
+
+/// The process-wide [`Outlines`] of [`lexical_outline`], at most [`CACHED_OUTLINES`] long.
+static OUTLINES: Outlines = Mutex::new(VecDeque::new());
+
 /// Builds the lexical outline of `file` (the path the outline and its symbol paths carry) from
-/// its text `source`, or `None` when the text is refused (see the module docs). Pure function of
-/// the text: no filesystem, server or subprocess; it blocks the caller while one short-lived
-/// parse thread runs (about 40 ms for a 570 KB file in a release build, linear in the tokens).
+/// its text `source`, or `None` when the text is refused (see the module docs). A function of
+/// the path and the text: no filesystem, server or subprocess. The first call for a text blocks
+/// the caller while one short-lived parse thread runs — about 40 ms for a 570 KB file in an
+/// optimized build, never more than [`PARSE_TIMEOUT`] — and its answer is kept (the last
+/// [`CACHED_OUTLINES`] texts), so later calls for the same path and bytes return it at once
+/// and a slow text never starts a second parse. Thread-safe.
 pub(crate) fn lexical_outline(file: &Path, source: &str) -> Option<Outline> {
+    remembered(&OUTLINES, file, source, || outline_of(file, source))
+}
+
+/// The answer `outlines` keeps for `file` with the text `source`, or — when it keeps none —
+/// `compute`'s, which it then keeps, dropping its oldest entry beyond [`CACHED_OUTLINES`].
+/// `compute` runs without the lock held; two callers racing on the same new text both compute.
+fn remembered(
+    outlines: &Outlines,
+    file: &Path,
+    source: &str,
+    compute: impl FnOnce() -> Option<Outline>,
+) -> Option<Outline> {
+    let digest = blake3::hash(source.as_bytes());
+    let lock = || outlines.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((_, _, outline)) = lock()
+        .iter()
+        .find(|(path, hash, _)| *hash == digest && path == file)
+    {
+        return outline.clone();
+    }
+    let outline = compute();
+    let mut kept = lock();
+    if kept.len() >= CACHED_OUTLINES {
+        kept.pop_front();
+    }
+    kept.push_back((file.to_path_buf(), digest, outline.clone()));
+    outline
+}
+
+/// The lexical outline of `file` from `source`, computed (see [`lexical_outline`]).
+fn outline_of(file: &Path, source: &str) -> Option<Outline> {
     // rust-analyzer reports every `// region: name` comment as a symbol of its own, which a
     // parser drops; any mention refuses (a string that contains it too).
     if source.contains("// region:") {
@@ -136,8 +211,9 @@ pub(crate) fn lexical_outline(file: &Path, source: &str) -> Option<Outline> {
 /// character columns; only the lines and the selection line are consumed downstream.
 ///
 /// Everything from tokenizing to dropping the syntax tree runs on a thread of its own with a
-/// [`PARSE_STACK`]-byte stack, after [`within_bounds`] has checked the tokens against the
-/// limits that stack is sized for. A thread that cannot be started, or a parser panic, refuses.
+/// [`PARSE_STACK`]-byte stack ([`run_bounded`]), after [`within_bounds`] has checked the tokens
+/// against the limits that stack is sized for. A thread that cannot be started, a parser panic
+/// or a parse slower than [`PARSE_TIMEOUT`] refuses.
 fn document_symbols(source: &str) -> Option<Vec<lsp::DocumentSymbol>> {
     let chars: Vec<char> = source.chars().collect();
     let code = blanked_code(&chars);
@@ -149,20 +225,36 @@ fn document_symbols(source: &str) -> Option<Vec<lsp::DocumentSymbol>> {
     {
         return None;
     }
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .name("rust-lexical-outline".to_owned())
-            .stack_size(PARSE_STACK)
-            .spawn_scoped(scope, || {
-                let tokens: TokenStream = source.parse().ok()?;
-                within_bounds(&tokens)
-                    .then(|| parsed_symbols(source, &chars, &code, tokens))
-                    .flatten()
-            })
-            .ok()?
-            .join()
-            .ok()?
+    let source = source.to_owned();
+    run_bounded(PARSE_STACK, PARSE_TIMEOUT, move || {
+        let tokens: TokenStream = source.parse().ok()?;
+        within_bounds(&tokens)
+            .then(|| parsed_symbols(&source, &chars, &code, tokens))
+            .flatten()
     })
+}
+
+/// Runs `work` on a new thread with a `stack`-byte stack and waits at most `timeout` for its
+/// answer. `None` when the thread cannot be started, panics or has not answered in time; a late
+/// thread is left to finish on its own and its answer is dropped.
+// ponytail: an abandoned parse keeps its CPU and touched stack until syn returns (no way to stop
+// it inside syn); the outline cache keeps the same bytes from starting a second one, but each
+// distinct slow text starts its own. Parse in a killable subprocess if that ever matters.
+fn run_bounded<T: Send + 'static>(
+    stack: usize,
+    timeout: Duration,
+    work: impl FnOnce() -> Option<T> + Send + 'static,
+) -> Option<T> {
+    let (answer, answered) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("rust-lexical-outline".to_owned())
+        .stack_size(stack)
+        .spawn(move || {
+            // The receiver is gone after a timeout; the late answer is dropped.
+            let _ = answer.send(work());
+        })
+        .ok()?;
+    answered.recv_timeout(timeout).ok().flatten()
 }
 
 /// Parses `tokens` (the tokens of `source`, whose characters are `chars` and code-only form
@@ -202,29 +294,77 @@ fn parsed_symbols(
     Some(symbols)
 }
 
-/// Whether `tokens` fits the limits [`PARSE_STACK`] is sized for: at most [`MAX_TOKENS`] tokens
-/// in all and groups nested at most [`MAX_DEPTH`] deep. Counted without recursion — the check
-/// must not need the stack it protects.
+/// Whether `tokens` may be parsed: at most [`MAX_TOKENS`] tokens in all and groups nested at most
+/// [`MAX_DEPTH`] deep (the limits [`PARSE_STACK`] is sized for), and no token that starts syntax
+/// syn parses in quadratic time ([`slow_to_parse`]). One pass without recursion — the check must
+/// not need the stack it protects.
 fn within_bounds(tokens: &TokenStream) -> bool {
     let mut count = 0usize;
-    let mut open = vec![tokens.clone().into_iter()];
-    while let Some(level) = open.last_mut() {
+    // Each open level: its remaining tokens and the two tokens before the next one.
+    let mut open = vec![(tokens.clone().into_iter().peekable(), None, None)];
+    while let Some((level, earlier, previous)) = open.last_mut() {
         let Some(tree) = level.next() else {
             open.pop();
             continue;
         };
         count += 1;
-        if count > MAX_TOKENS {
+        if count > MAX_TOKENS
+            || slow_to_parse(earlier.as_ref(), previous.as_ref(), &tree, level.peek())
+        {
             return false;
         }
-        if let TokenTree::Group(group) = tree {
+        let nested = match &tree {
+            TokenTree::Group(group) => Some(group.stream()),
+            _ => None,
+        };
+        *earlier = previous.replace(tree);
+        if let Some(stream) = nested {
             if open.len() > MAX_DEPTH {
                 return false;
             }
-            open.push(group.stream().into_iter());
+            open.push((stream.into_iter().peekable(), None, None));
         }
     }
     true
+}
+
+/// Whether `tree` — after `previous` (itself after `earlier`) and before `next` in the same
+/// group — starts unstable syntax syn 2.0.119 keeps as verbatim tokens: every level of it copies
+/// all the tokens after it in the group again, so a chain of it takes quadratic time (a 40 000-
+/// long `box` chain took 25 s). Every such chainable trigger found in syn's
+/// `verbatim::between` call sites: `box` (box patterns), `become` (tail calls), `dyn*` types, and
+/// `const` trait bounds — `const` right after `impl`, `dyn`, `+`, `:`, `~`, `?` or a `>` other
+/// than `=>` (`for<'a> const Trait`), and a `[const]` bracket. The other call sites cover one
+/// item, a fixed number of tokens or tokens inside a group of their own, which costs linear
+/// time. Over-matching is harmless: a refusal only waits for the server.
+fn slow_to_parse(
+    earlier: Option<&TokenTree>,
+    previous: Option<&TokenTree>,
+    tree: &TokenTree,
+    next: Option<&TokenTree>,
+) -> bool {
+    let punct = |token: Option<&TokenTree>, character: char| matches!(token, Some(TokenTree::Punct(punct)) if punct.as_char() == character);
+    match tree {
+        TokenTree::Ident(ident) if ident == "box" || ident == "become" => true,
+        TokenTree::Ident(ident) if ident == "dyn" => punct(next, '*'),
+        TokenTree::Ident(ident) if ident == "const" => match previous {
+            Some(TokenTree::Ident(word)) => word == "impl" || word == "dyn",
+            Some(TokenTree::Punct(mark)) => match mark.as_char() {
+                '+' | ':' | '~' | '?' => true,
+                '>' => !punct(earlier, '='),
+                _ => false,
+            },
+            _ => false,
+        },
+        TokenTree::Group(group) if group.delimiter() == Delimiter::Bracket => {
+            let mut inside = group.stream().into_iter();
+            matches!(
+                (inside.next(), inside.next()),
+                (Some(TokenTree::Ident(word)), None) if word == "const"
+            )
+        }
+        _ => false,
+    }
 }
 
 /// Whether `character` is whitespace to rustc and rust-analyzer: Unicode `Pattern_White_Space`,
@@ -426,15 +566,17 @@ impl Walker<'_> {
     }
 
     /// The verbatim source text of `node`, from its first token to its last, as rust-analyzer's
-    /// syntax text; `None` for a node without tokens or without a source position. Prints the
-    /// node: used on an impl's trait path and self type only.
+    /// syntax text, for an impl label; `None` for a node without tokens or without a source
+    /// position, and for a text that spans lines or runs longer than [`MAX_LABEL_PART`] bytes.
+    /// Prints the node: used on an impl's trait path and self type only, after their length was
+    /// bounded.
     fn text(&self, node: &dyn ToTokens) -> Option<String> {
         let mut tokens = node.to_token_stream().into_iter();
         let first = tokens.next()?.span();
         let last = tokens.last().map_or(first, |token| token.span());
         self.source
             .get(first.byte_range().start..last.byte_range().end)
-            .filter(|text| !text.is_empty())
+            .filter(|text| !text.is_empty() && text.len() <= MAX_LABEL_PART && !text.contains('\n'))
             .map(str::to_owned)
     }
 
@@ -805,8 +947,46 @@ impl<'ast> Visit<'ast> for Walker<'_> {
 
     /// An impl symbol labelled as rust-analyzer labels it, `impl Type` or
     /// `impl Trait for Type` (`!` kept before a negative impl's trait) from the verbatim text of
-    /// the trait path and the self type, and selected at the self type.
+    /// the trait path and the self type, and selected at the self type. Refuses an impl for `!`
+    /// and one whose trait path or self type spans lines or runs longer than
+    /// [`MAX_LABEL_PART`] bytes — measured between the tokens around them before either is
+    /// printed, so a huge one costs nothing.
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        let bytes = |from: usize, to: Span| to.byte_range().start.saturating_sub(from);
+        let self_end = node
+            .generics
+            .where_clause
+            .as_ref()
+            .map_or(node.brace_token.span.open(), |clause| {
+                clause.where_token.span
+            });
+        let (trait_fits, self_start) = match &node.trait_ {
+            Some((bang, path, for_token)) => {
+                let start = bang
+                    .as_ref()
+                    .map(|bang| bang.span)
+                    .or_else(|| path.leading_colon.as_ref().map(|colon| colon.spans[0]))
+                    .or_else(|| path.segments.first().map(|segment| segment.ident.span()));
+                let fits = start.is_some_and(|start| {
+                    bytes(start.byte_range().start, for_token.span) <= MAX_LABEL_PART
+                });
+                (fits, for_token.span.byte_range().end)
+            }
+            None => {
+                let before = node.generics.gt_token.as_ref().map(|gt| gt.span);
+                (
+                    true,
+                    before.unwrap_or(node.impl_token.span).byte_range().end,
+                )
+            }
+        };
+        if !trait_fits
+            || bytes(self_start, self_end) > MAX_LABEL_PART
+            || matches!(*node.self_ty, syn::Type::Never(_))
+        {
+            self.refused = true;
+            return;
+        }
         let target = self.text(&node.self_ty);
         let label = match (&node.trait_, target) {
             (None, Some(target)) => Some(format!("impl {target}")),
@@ -1283,10 +1463,13 @@ let c = '{';\n    let _ = format!(\"{}\", c);\n    let _ = s.len() + r.len();\n}
     /// Every refusal rule outside the corpus answers `None`, so the file keeps waiting for the
     /// server instead of guessing a range: text that does not parse (an unbalanced brace, a
     /// statement at item position, a shebang), syntax kept only as verbatim tokens (a
-    /// macro 2.0 definition), a trait alias, an extern block, whitespace rustc rejects, and
-    /// cfg-duplicated items with the same name.
+    /// macro 2.0 definition), a trait alias, an extern block, whitespace rustc rejects,
+    /// cfg-duplicated items with the same name, an impl for `!`, and impls whose self type or
+    /// trait path spans lines or exceeds [`MAX_LABEL_PART`] bytes.
     #[test]
     fn unclean_sources_are_refused() {
+        let long = format!("impl Tr for Foo<{}> {{}}\n", "u8, ".repeat(70));
+        let long_trait = format!("impl Tr<{}> for Foo {{}}\n", "u8, ".repeat(70));
         let refused = [
             "fn a() {\n",
             "let x = 5;\n",
@@ -1298,6 +1481,10 @@ let c = '{';\n    let _ = format!(\"{}\", c);\n    let _ = s.len() + r.len();\n}
             "fn spaced() {\u{a0}}\n",
             "#[cfg(unix)]\nfn platform() {}\n#[cfg(windows)]\nfn platform() {}\n",
             "#[cfg(test)]\nimpl Guard {}\nimpl Guard {}\n",
+            "impl ! {}\n",
+            "impl Tr for Foo<\n    u8,\n> {}\n",
+            &long,
+            &long_trait,
         ];
         for source in refused {
             assert!(
@@ -1305,6 +1492,105 @@ let c = '{';\n    let _ = format!(\"{}\", c);\n    let _ = s.len() + r.len();\n}
                 "must be refused: {source:?}"
             );
         }
+        // Just within the bound, the same shape is labelled.
+        let fits = format!("impl Tr for Foo<{}> {{}}\n", "u8, ".repeat(60));
+        assert!(lexical_outline(Path::new("a.rs"), &fits).is_some());
+    }
+
+    /// Unstable syntax syn parses in quadratic time is refused before the parse, at the full
+    /// [`MAX_TOKENS`] and well inside [`PARSE_TIMEOUT`]: `box` patterns, `become` chains,
+    /// `dyn*` types, and `const` / `[const]` trait bounds.
+    #[test]
+    fn quadratic_syntax_is_refused_before_the_parse() {
+        // Each text stays within the token bound, so its trigger is what refuses it.
+        let levels = |tokens_per_level: usize| MAX_TOKENS / tokens_per_level - 16;
+        let chain = |open: &str, close: &str, per_level: usize| {
+            let depth = levels(per_level);
+            format!(
+                "fn f() -> {}u8{} {{}}\n",
+                open.repeat(depth),
+                close.repeat(depth)
+            )
+        };
+        let sources = [
+            format!("fn f() {{ let {}x = 0; }}\n", "box ".repeat(levels(1))),
+            format!("fn f() {{ {}x; }}\n", "become ".repeat(levels(1))),
+            chain("Box<dyn* Tr<", ">>", 8),
+            chain("impl const Tr<", ">", 5),
+            chain("impl [const] Tr<", ">", 6),
+            chain("impl ?Sized + const Tr<", ">", 8),
+        ];
+        for source in &sources {
+            let started = std::time::Instant::now();
+            assert!(lexical_outline(Path::new("a.rs"), source).is_none());
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < PARSE_TIMEOUT / 4,
+                "{elapsed:?} for {}",
+                &source[..40]
+            );
+        }
+    }
+
+    /// An impl whose self type holds a long text is refused before its label is printed, well
+    /// inside [`PARSE_TIMEOUT`]: 100 impls nested in each other's const generic argument around
+    /// a 1 MiB string would otherwise make 100 labels of a megabyte each. The same shape two
+    /// levels deep around a short string is labelled.
+    #[test]
+    fn a_huge_impl_header_is_refused_before_it_is_printed() {
+        let nest = |levels: usize, text: usize| {
+            let mut source = format!("\"{}\";", "x".repeat(text));
+            for _ in 0..levels {
+                source = format!("impl T for A<{{ {source} 0 }}> {{}}");
+            }
+            source
+        };
+        assert!(lexical_outline(Path::new("a.rs"), &nest(2, 1)).is_some());
+        let started = std::time::Instant::now();
+        assert!(lexical_outline(Path::new("a.rs"), &nest(100, 1 << 20)).is_none());
+        let elapsed = started.elapsed();
+        assert!(elapsed < PARSE_TIMEOUT / 2, "{elapsed:?}");
+    }
+
+    /// A text is outlined once per file and bytes: a second call answers from the cache, a
+    /// refusal included, and a changed text or another file computes again.
+    #[test]
+    fn an_unchanged_text_is_outlined_once() {
+        let outlines: Outlines = Mutex::new(VecDeque::new());
+        let computed = std::cell::Cell::new(0);
+        let outline = |file: &str, source: &str, answer: Option<Outline>| {
+            remembered(&outlines, Path::new(file), source, || {
+                computed.set(computed.get() + 1);
+                answer
+            })
+        };
+        let some = lexical_outline(Path::new("a.rs"), "fn once() {}\n");
+        assert!(some.is_some());
+        assert_eq!(outline("a.rs", "fn once() {}\n", some.clone()), some);
+        assert_eq!(outline("a.rs", "fn once() {}\n", None), some);
+        assert_eq!(outline("a.rs", "fn slow() {}\n", None), None);
+        assert_eq!(outline("a.rs", "fn slow() {}\n", some.clone()), None);
+        assert_eq!(outline("b.rs", "fn once() {}\n", None), None);
+        assert_eq!(computed.get(), 3);
+    }
+
+    /// The parse backstop answers `None` once the timeout passes, without waiting for the late
+    /// work, and `None` for work that panics.
+    #[test]
+    fn a_slow_or_failed_parse_is_abandoned() {
+        let started = std::time::Instant::now();
+        let late = run_bounded(1 << 20, Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_secs(2));
+            Some(1)
+        });
+        assert_eq!(late, None);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            run_bounded(1 << 20, Duration::from_secs(5), || Some(2)),
+            Some(2)
+        );
+        let failed: Option<u8> = run_bounded(1 << 20, Duration::from_secs(5), || panic!("parse"));
+        assert_eq!(failed, None);
     }
 
     /// Pathological nesting is refused before the parser recurses, from a caller whose stack is
@@ -1346,15 +1632,29 @@ let c = '{';\n    let _ = format!(\"{}\", c);\n    let _ = s.len() + r.len();\n}
     }
 
     /// The token bound is sound at its edge: a text of the costliest shape measured for this
-    /// build (a chain of `&` in a type, one token per level of recursion) at [`MAX_TOKENS`]
-    /// tokens is parsed and outlined on the parse thread's stack, and one token more is refused.
+    /// build that can reach [`MAX_TOKENS`] at all — a field typed by a chain of `&`
+    /// (unoptimized) or a chain of `break` (optimized), one token per level of recursion — is
+    /// parsed and outlined on the parse thread's stack at exactly [`MAX_TOKENS`] tokens, and one
+    /// token more is refused. Nested blocks cost more per token in an optimized build, but
+    /// brackets stop at [`MAX_DEPTH`], far below the token bound, so they cannot reach it.
     #[test]
     fn the_costliest_shape_at_the_token_bound_outlines_without_overflow() {
-        // `fn`, `f`, `()`, `{…}` and, inside, `let _ : … u8 = x ;`: 11 tokens besides the chain.
-        let source = |chain: usize| format!("fn f() {{ let _: {}u8 = x; }}\n", "&".repeat(chain));
-        let outline = lexical_outline(Path::new("a.rs"), &source(MAX_TOKENS - 11));
+        // Besides the chain: `struct S {…}` and `a : … u8`, or `fn f () {…}` and
+        // `loop {…}` with `1 ;`.
+        let (source, others): (fn(usize) -> String, usize) = if cfg!(debug_assertions) {
+            (
+                |chain| format!("struct S {{ a: {}u8 }}\n", "&".repeat(chain)),
+                6,
+            )
+        } else {
+            (
+                |chain| format!("fn f() {{ loop {{ {}1; }} }}\n", "break ".repeat(chain)),
+                8,
+            )
+        };
+        let outline = lexical_outline(Path::new("a.rs"), &source(MAX_TOKENS - others));
         assert_eq!(outline.map(|outline| outline.symbols.len()), Some(1));
-        assert!(lexical_outline(Path::new("a.rs"), &source(MAX_TOKENS - 10)).is_none());
+        assert!(lexical_outline(Path::new("a.rs"), &source(MAX_TOKENS - others + 1)).is_none());
     }
 
     /// Same-named siblings without a gate stay, exactly as the server reports them: a type and

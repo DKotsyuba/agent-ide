@@ -16,7 +16,8 @@ proc-macro2 = { version = "1", default-features = false, features = ["span-locat
 quote = { version = "1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-syn = { version = "2", default-features = false, features = ["full", "parsing", "printing", "visit"] }
+# Pinned: an upgrade repeats the audit of `verbatim::between` triggers and the stack measurements in src/lexical.rs.
+syn = { version = "=2.0.119", default-features = false, features = ["full", "parsing", "printing", "visit"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
