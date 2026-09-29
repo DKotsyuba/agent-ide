@@ -4523,30 +4523,7 @@ fn test_text_line(value: &str, max_chars: usize) -> String {
 /// Renders the bounded parsed test result and actionable rerun/detail references.
 fn test_result_text(id: u64, result: &super::tests::RunResult, owns_detail: bool) -> String {
     let report = &result.report;
-    let mut text = if report.passed == 0
-        && report.failed == 0
-        && report.incomplete
-        && !result.stopped
-    {
-        format!(
-            "tests #{id}: no summary parsed, {} s — inspect the runner's full output with ide.inspect",
-            result.elapsed.as_secs()
-        )
-    } else if result.stopped {
-        format!(
-            "tests #{id}: stopped at budget {} s — {} passed, {} failed so far",
-            result.budget.as_secs(),
-            report.passed,
-            report.failed
-        )
-    } else {
-        format!(
-            "tests #{id}: {} passed, {} failed, {} s",
-            report.passed,
-            report.failed,
-            result.elapsed.as_secs()
-        )
-    };
+    let mut text = super::tests::result_line(id, result);
     for failure in report.failures.iter().take(8) {
         text.push_str(&format!("\n  FAIL {}", test_text_line(&failure.name, 160)));
         if let Some((path, line)) = &failure.location {

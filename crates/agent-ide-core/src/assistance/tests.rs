@@ -70,6 +70,8 @@ pub struct RunResult {
     pub elapsed: Duration,
     /// True when the process was killed at its time budget.
     pub stopped: bool,
+    /// Process exit code; absent after a budget kill, a signal, or a spawn failure.
+    pub exit: Option<i32>,
     /// Budget configured for this process.
     pub budget: Duration,
     /// Detail reference retained under the binding that started the process.
@@ -367,33 +369,43 @@ fn prune_completed(registry: &Arc<Mutex<State>>, root: &PathBuf) {
 /// Renders one job's current compact status without consuming its delivery state.
 fn render_status_line(id: u64, job: &Job) -> Option<String> {
     Some(match &job.result {
-        Some(result) if result.stopped => format!(
-            "tests #{id}: stopped at budget {} s — {} passed, {} failed so far",
-            result.budget.as_secs(),
-            result.report.passed,
-            result.report.failed
-        ),
-        Some(result)
-            if result.report.passed == 0
-                && result.report.failed == 0
-                && result.report.incomplete =>
-        {
-            format!(
-                "tests #{id}: no summary parsed, {} s — inspect the runner's full output with ide.inspect",
-                result.elapsed.as_secs()
-            )
-        }
-        Some(result) => format!(
-            "tests #{id}: {} passed, {} failed, {} s",
-            result.report.passed,
-            result.report.failed,
-            result.elapsed.as_secs()
-        ),
+        Some(result) => result_line(id, result),
         None => format!(
             "tests #{id}: running {} s; poll: ide.test {{\"status\": {id}}}",
             job.started.elapsed().as_secs()
         ),
     })
+}
+
+/// Renders one settled run's first status line, shared by the status plate and the full result.
+///
+/// A run that counted no test is never shown as `0 passed, 0 failed`: a non-zero exit says the
+/// runner could not run (`no test results (exit N)`), and a missing summary says so.
+pub fn result_line(id: u64, result: &RunResult) -> String {
+    let report = &result.report;
+    let seconds = result.elapsed.as_secs();
+    let counted = report.passed != 0 || report.failed != 0;
+    if result.stopped {
+        format!(
+            "tests #{id}: stopped at budget {} s — {} passed, {} failed so far",
+            result.budget.as_secs(),
+            report.passed,
+            report.failed
+        )
+    } else if let Some(code) = result.exit.filter(|code| *code != 0 && !counted) {
+        format!(
+            "tests #{id}: no test results (exit {code}), {seconds} s — inspect the runner's full output with ide.inspect"
+        )
+    } else if !counted && report.incomplete {
+        format!(
+            "tests #{id}: no summary parsed, {seconds} s — inspect the runner's full output with ide.inspect"
+        )
+    } else {
+        format!(
+            "tests #{id}: {} passed, {} failed, {seconds} s",
+            report.passed, report.failed
+        )
+    }
 }
 
 /// Runs one command with inherited environment, bounded output, a process-group budget kill,
@@ -503,6 +515,7 @@ async fn run_child(
         output,
         elapsed: started.elapsed(),
         stopped,
+        exit: status.and_then(|status| status.code()),
         budget,
         detail_ref: String::new(),
         command: Vec::new(),
@@ -520,6 +533,7 @@ fn failed_run(budget: Duration, output: String) -> RunResult {
         output,
         elapsed: Duration::ZERO,
         stopped: false,
+        exit: None,
         budget,
         detail_ref: String::new(),
         command: Vec::new(),
@@ -615,6 +629,48 @@ mod runner_tests {
             .success();
         assert!(!alive, "test process {pid} must be gone");
         let _ = std::fs::remove_file(pid_file);
+    }
+
+    /// A runner that exits non-zero without counting a test (pytest's `no tests ran` from an
+    /// unusable environment, a build error) reads `no test results (exit N)`, never
+    /// `0 passed, 0 failed`; a zero exit keeps the counted line.
+    #[tokio::test]
+    async fn uncounted_nonzero_exit_reads_no_test_results() {
+        let result = run(
+            &std::env::temp_dir(),
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo 'no tests ran in 0.01s'; exit 2".into(),
+            ],
+            crate::lang::testing::ALPHA,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(result.exit, Some(2));
+        let line = result_line(1, &result);
+        assert!(
+            line.starts_with("tests #1: no test results (exit 2), "),
+            "{line}"
+        );
+        let counted_zero = RunResult {
+            report: TestReport::default(),
+            exit: Some(0),
+            ..result.clone()
+        };
+        assert!(
+            result_line(1, &counted_zero).starts_with("tests #1: 0 passed, 0 failed, "),
+            "{}",
+            result_line(1, &counted_zero)
+        );
+        let failed = RunResult {
+            report: TestReport {
+                failed: 1,
+                ..TestReport::default()
+            },
+            ..result
+        };
+        assert!(result_line(1, &failed).starts_with("tests #1: 0 passed, 1 failed, "));
     }
 
     /// Refuses a second live test job for the same worktree.

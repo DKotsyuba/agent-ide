@@ -332,6 +332,8 @@ tests #3: 3 passed, 1 failed, 12 s
   rerun: cargo test stop_cancels_queue      full output: ide.inspect test-3
 ```
 
+A run that counted no test is never shown as `0 passed, 0 failed`: a non-zero exit reads `tests #3: no test results (exit 2), 1 s — inspect the runner's full output with ide.inspect` (the runner could not run, e.g. `uv run pytest` without a usable environment), and a zero exit without a parsed summary reads `no summary parsed`.
+
 Run at most one test job at a time per worktree. Stop a run when its budget expires, return its partial result and the command for manual execution, and page full output through `detail_ref`. The IDE never starts tests on its own.
 
 ### 2.7 `ide.diff` — changed files (planned cleanup)
