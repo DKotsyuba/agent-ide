@@ -599,11 +599,17 @@ impl SnapshotIntent {
 /// a link), a non-regular final entry (a changed tracked symlink, a gitlink directory, a special
 /// file), an invalid path, or any other native error refuses with
 /// [`GitError::UnsupportedSnapshot`], and a replaced worktree root with
-/// [`GitError::UnstableSnapshot`]. More than [`MAX_SNAPSHOT_PATHS`] paths, or one file over
-/// [`MAX_SNAPSHOT_BLOB_BYTES`], refuses with [`GitError::EvidenceTooLarge`] — the exact capture's
-/// own ceilings. Runs after Git exited, so it classifies the worktree as it is at check time.
+/// [`GitError::UnstableSnapshot`]. More than [`MAX_SNAPSHOT_PATHS`] paths, raw path bytes summing
+/// to more than [`MAX_SNAPSHOT_PATH_BYTES`] (both checked before any path is opened), or one file
+/// over [`MAX_SNAPSHOT_BLOB_BYTES`] refuses with [`GitError::EvidenceTooLarge`] — the exact
+/// capture's own ceilings. Runs after Git exited, so it classifies the worktree as it is at check
+/// time.
 pub fn confine_plain_diff_paths(scope: &GitScope, paths: &[PathBuf]) -> Result<(), GitError> {
-    if paths.len() > MAX_SNAPSHOT_PATHS {
+    let path_bytes: usize = paths
+        .iter()
+        .map(|path| path.as_os_str().as_bytes().len())
+        .sum();
+    if paths.len() > MAX_SNAPSHOT_PATHS || path_bytes > MAX_SNAPSHOT_PATH_BYTES {
         return Err(GitError::EvidenceTooLarge);
     }
     for path in paths {
