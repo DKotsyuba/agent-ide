@@ -1277,8 +1277,9 @@ struct ConfigShape {
 /// own referenced targets are returned unvalidated for the caller to chase; nesting (a target that
 /// itself declares `references`) is refused since it is reached with `Optional` membership.
 /// `extends`/`typeAcquisition` remain unsupported outright. `package.json` may declare dependencies
-/// but not `imports` or `workspaces`. Lockfiles are only fingerprinted. Every refusal is attributed
-/// to `path` with its reason.
+/// but not `imports` or `workspaces`. Lockfiles are only fingerprinted. Config files are parsed as
+/// JSONC (comments and trailing commas, see [`jsonc_to_json`]); `package.json` and
+/// `package-lock.json` stay strict JSON. Every refusal is attributed to `path` with its reason.
 fn validate_resolution_shape(
     path: &Path,
     contents: &[u8],
@@ -1293,8 +1294,15 @@ fn validate_resolution_shape(
     if matches!(name, "yarn.lock" | "pnpm-lock.yaml") {
         return Ok(ConfigShape::default());
     }
-    let value: serde_json::Value =
-        serde_json::from_slice(contents).map_err(|_| reject("is not valid JSON".into()))?;
+    // Every file here other than the npm manifest and lockfile is a tsconfig/jsconfig (a
+    // `references` target is one by role), which TypeScript reads as JSONC.
+    let strict = matches!(name, "package.json" | "package-lock.json");
+    let value: serde_json::Value = if strict {
+        serde_json::from_slice(contents).ok()
+    } else {
+        jsonc_to_json(contents).and_then(|json| serde_json::from_slice(&json).ok())
+    }
+    .ok_or_else(|| reject("is not valid JSON".into()))?;
     let object = value
         .as_object()
         .ok_or_else(|| reject("is not a JSON object".into()))?;
@@ -1409,6 +1417,64 @@ fn validate_resolution_shape(
         return Err(reject(format!("`{key}` is unsupported")));
     }
     Ok(ConfigShape::default())
+}
+
+/// Rewrites JSONC — JSON with comments, the dialect TypeScript reads `tsconfig`/`jsconfig` files
+/// in — into strict JSON for `serde_json`.
+///
+/// Outside strings, a `//` comment is removed up to (not including) its newline, a `/* */`
+/// comment becomes one space, and a comma whose next significant byte is `}` or `]` becomes a
+/// space. String contents, including escaped quotes and comment-like text, pass through byte for
+/// byte; every other byte is copied unchanged, so UTF-8 stays intact. The output is never longer
+/// than `contents`, so the caller's resolution byte budget still bounds it, and one linear pass
+/// does the work. Returns `None` for an unterminated block comment; anything else that is still
+/// not JSON is left for the parser to refuse.
+fn jsonc_to_json(contents: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(contents.len());
+    // Position in `out` of the last comma not yet followed by a significant byte.
+    let mut pending_comma = None;
+    let mut index = 0;
+    while index < contents.len() {
+        let byte = contents[index];
+        match (byte, contents.get(index + 1)) {
+            (b'"', _) => {
+                pending_comma = None;
+                let start = index;
+                index += 1;
+                while index < contents.len() && contents[index] != b'"' {
+                    index += if contents[index] == b'\\' { 2 } else { 1 };
+                }
+                index = (index + 1).min(contents.len());
+                out.extend_from_slice(&contents[start..index]);
+                continue;
+            }
+            (b'/', Some(b'/')) => {
+                while index < contents.len() && contents[index] != b'\n' {
+                    index += 1;
+                }
+                continue;
+            }
+            (b'/', Some(b'*')) => {
+                let length = contents[index + 2..]
+                    .windows(2)
+                    .position(|pair| pair == b"*/")?;
+                index += length + 4;
+                out.push(b' ');
+                continue;
+            }
+            (b'}' | b']', _) => {
+                if let Some(comma) = pending_comma.take() {
+                    out[comma] = b' ';
+                }
+            }
+            (b',', _) => pending_comma = Some(out.len()),
+            (byte, _) if byte.is_ascii_whitespace() => {}
+            _ => pending_comma = None,
+        }
+        out.push(byte);
+        index += 1;
+    }
+    Some(out)
 }
 
 /// Parses a `references` array into worktree-relative targets, joined against `config`'s own
@@ -2280,6 +2346,79 @@ mod tests {
                 .is_err(),
             "other.ts is covered by neither referenced project"
         );
+    }
+
+    /// tsconfig files are JSONC, as TypeScript reads them: a default Vite template's solution
+    /// `tsconfig.json` and its referenced `tsconfig.app.json`/`tsconfig.node.json`, all carrying
+    /// `//` and `/* */` comments and trailing commas, resolve exactly like the strict-JSON shape.
+    /// (The node config keeps `types: []` — the template's `["node"]` is refused by the closed
+    /// `types` rule, which has nothing to do with parsing.)
+    #[test]
+    fn project_resolution_reads_vite_tsconfigs_with_comments_and_trailing_commas() {
+        let fixture = Fixture::new();
+        let bundle = fixture.bundle();
+        let (worktree, _) = fixture.worktree();
+        std::fs::create_dir(fixture.root.join("src")).unwrap();
+        std::fs::write(
+            fixture.root.join("tsconfig.json"),
+            "// Solution config: https://vite.dev/guide/\n{\n  \"files\": [],\n  \"references\": [\n    { \"path\": \"./tsconfig.app.json\" },\n    { \"path\": \"./tsconfig.node.json\" }, // node side\n  ],\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.root.join("tsconfig.app.json"),
+            "{\n  \"compilerOptions\": {\n    \"tsBuildInfoFile\": \"./node_modules/.tmp/tsconfig.app.tsbuildinfo\",\n    \"target\": \"es2023\",\n    \"lib\": [\"ES2023\", \"DOM\"],\n    \"module\": \"esnext\",\n    \"types\": [\"vite/client\"],\n    \"skipLibCheck\": true,\n\n    /* Bundler mode */\n    \"moduleResolution\": \"bundler\",\n    \"allowImportingTsExtensions\": true,\n    \"verbatimModuleSyntax\": true,\n    \"moduleDetection\": \"force\",\n    \"noEmit\": true,\n    \"jsx\": \"react-jsx\",\n\n    /* Linting */\n    \"noUnusedLocals\": true,\n    \"noFallthroughCasesInSwitch\": true,\n  },\n  \"include\": [\"src\"],\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.root.join("tsconfig.node.json"),
+            "{\n  \"compilerOptions\": {\n    \"target\": \"es2023\",\n    \"types\": [],\n    /* Bundler mode */\n    \"moduleResolution\": \"bundler\",\n    \"noEmit\": true, /* Linting */\n  },\n  \"include\": [\"vite.config.ts\"],\n}\n",
+        )
+        .unwrap();
+        let app_document = fixture.root.join("src/App.tsx");
+        std::fs::write(&app_document, "export {};\n").unwrap();
+        let resolution =
+            ProjectResolutionInputsV1::observe(worktree.clone(), app_document, &bundle, &|_| true)
+                .expect("src/App.tsx is admitted through the commented tsconfig.app.json");
+        assert_eq!(resolution.files().len(), 3);
+        let node_document = fixture.root.join("vite.config.ts");
+        std::fs::write(&node_document, "export {};\n").unwrap();
+        assert!(
+            ProjectResolutionInputsV1::observe(worktree, node_document, &bundle, &|_| true).is_ok(),
+            "vite.config.ts is admitted through the commented tsconfig.node.json"
+        );
+    }
+
+    /// The JSONC rewrite drops comments and trailing commas outside strings only, keeps every
+    /// string byte (URLs, comment-like text, escaped quotes), never grows the input, and refuses an
+    /// unterminated block comment; `package.json` stays strict JSON.
+    #[test]
+    fn jsonc_rewrite_strips_only_comments_and_trailing_commas() {
+        let parse = |text: &str| {
+            serde_json::from_slice::<serde_json::Value>(&jsonc_to_json(text.as_bytes()).unwrap())
+                .unwrap()
+        };
+        assert_eq!(
+            parse(
+                "{ // lead\n \"url\": \"https://x/*y*/\", /* block\n spans */ \"q\": \"a \\\"//\\\" b\",\n \"list\": [1, [2,], {\"k\": 3,},\n /* tail */ ], }"
+            ),
+            serde_json::json!({"url": "https://x/*y*/", "q": "a \"//\" b", "list": [1, [2], {"k": 3}]})
+        );
+        let input = b"{\"a\": 1, /* c */ } // end";
+        assert!(jsonc_to_json(input).unwrap().len() <= input.len());
+        assert_eq!(jsonc_to_json(b"{\"a\": 1 /* open"), None);
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&jsonc_to_json(b"[1,,]").unwrap()).is_err(),
+            "only one trailing comma is dropped; an empty element stays invalid"
+        );
+        let rejection = validate_resolution_shape(
+            Path::new("package.json"),
+            b"{ // no comments in npm manifests\n \"name\": \"x\" }",
+            "typescript",
+            Path::new("src/a.ts"),
+            MembershipRequirement::Required,
+        )
+        .unwrap_err();
+        assert_eq!(rejection.to_string(), "package.json: is not valid JSON");
     }
 
     /// Refuses every `references` shape this profile cannot verify without discovering ambient
