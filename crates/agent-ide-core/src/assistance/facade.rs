@@ -257,7 +257,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "new_name": {"type": "string", "minLength": 1, "maxLength": 128, "description": "For rename: the new identifier, applied project-wide."},
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES},
                     "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "With `path`: inclusive 1-based line range to replace."},
-                    "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "The source_ref of the ide.read/ide.context this content is based on; required with `path`+`lines`, optional (but validated) with `symbol`."},
+                    "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "The source_ref of the ide.read/ide.context this content is based on; required with `path`+`lines` and to replace an existing file with `path`+`content`, optional (but validated) with `symbol`. Omit it with `path`+`content` to create a new file."},
                     "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES, "description": "Replacement or inserted code, including the symbol's doc comment and attributes."}
                 }
             }),
@@ -376,8 +376,9 @@ pub enum ParameterError {
     /// `ide.read` needs either `symbol` or both `path` and `lines`.
     ReadTarget,
     /// `ide.edit` needs `symbol` (with `op`), or `path` with `lines` and `source_ref` for a range
-    /// replace, or the full-file form `path` + `source_ref` + `content`; the forms are exclusive,
-    /// except a redundant `path` naming the symbol's own file.
+    /// replace, or the full-file form `path` + `content` (with `source_ref` to replace an existing
+    /// file, without it only to create a missing one); the forms are exclusive, except a redundant
+    /// `path` naming the symbol's own file.
     EditTarget,
     /// The language runner rejected a semantically unsupported test target.
     TestTargetUnsupported(String),
@@ -416,6 +417,10 @@ pub enum FieldRule {
     LineRange,
     /// The closed method cannot proceed without the `source_ref` of the read its lines came from.
     RangeEditSourceRef,
+    /// A full-file edit without `source_ref` named a file that already exists: it may only create
+    /// a missing one, so replacing needs the `source_ref` of a read of that file. The worker, not
+    /// the facade, applies this rule, since only it observes whether the path exists.
+    ReplaceSourceRef,
 }
 
 impl FieldRule {
@@ -455,6 +460,9 @@ impl FieldRule {
                 "is required for a line-range edit; re-read the lines (ide.read) and retry with \
                  the new source_ref"
                     .to_string()
+            }
+            Self::ReplaceSourceRef => {
+                "is required to replace an existing file: read it first (ide.read)".to_string()
             }
         }
     }
@@ -954,10 +962,18 @@ pub fn validate_call(
                     FieldRule::TooLong(MAX_EDIT_ARGUMENT_CONTENT_BYTES),
                 ));
             }
+            // Without `source_ref` the call may only create a file that does not exist yet: the
+            // worker observes the path itself and refuses an existing file. The placeholder only
+            // runs the request's own validation here (the worker supplies the real reference) and
+            // is dropped from the forwarded parameters below.
+            let source_ref = object
+                .contains_key("source_ref")
+                .then(|| required_string(object, "source_ref", MAX_DETAIL_REF_BYTES))
+                .transpose()?;
             let request = crate::changes::edit::EditRequest::new(
                 operation_id,
                 path,
-                required_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?,
+                source_ref.unwrap_or("create"),
                 object
                     .get("content")
                     .and_then(Value::as_str)
@@ -975,8 +991,15 @@ pub fn validate_call(
                     path_shape_rule(path).unwrap_or(FieldRule::RelativePath),
                 ),
             })?;
+            let creates = source_ref.is_none();
             parameters =
                 serde_json::to_value(request).map_err(|_| ParameterError::InvalidObject)?;
+            if creates {
+                parameters
+                    .as_object_mut()
+                    .expect("serialized request object")
+                    .remove("source_ref");
+            }
         }
     }
     if tool == AssistanceTool::Diff {
@@ -3054,6 +3077,51 @@ fn range_edit_accepts_the_read_it_came_from() {
         json!({"operation_id":"o","op":"replace","symbol":"a.rs#run","path":"a.rs","lines":"1-2","source_ref":"s","content":"x"})
     )
     .is_err());
+}
+
+/// The full-file form without `source_ref` validates as a creation request whose forwarded
+/// parameters carry no reference (the worker observes the path itself); with one it stays the
+/// canonical replace request, and path/content rules still hold for both.
+#[test]
+fn full_file_edit_without_source_ref_is_a_creation_request() {
+    let created = validate_call(
+        AssistanceTool::Edit,
+        json!({"operation_id":"o","path":"src/new.rs","content":"x"}),
+    )
+    .unwrap();
+    assert_eq!(
+        created.parameters(),
+        &json!({"operation_id":"o","path":"src/new.rs","content":"x"})
+    );
+    let replaced = validate_call(
+        AssistanceTool::Edit,
+        json!({"operation_id":"o","path":"a.rs","source_ref":"s","content":"x"}),
+    )
+    .unwrap();
+    assert_eq!(replaced.parameters()["source_ref"], "s");
+    assert!(
+        validate_call(
+            AssistanceTool::Edit,
+            json!({"operation_id":"o","path":"/abs.rs","content":"x"})
+        )
+        .is_err()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Edit,
+            json!({"operation_id":"o","path":"a.rs","source_ref":"","content":"x"})
+        )
+        .is_err()
+    );
+    assert_eq!(
+        ParameterError::InvalidField {
+            field: "source_ref",
+            rule: FieldRule::ReplaceSourceRef,
+        }
+        .message(AssistanceTool::Edit),
+        "invalid bounded parameters: \"source_ref\" is required to replace an existing file: \
+         read it first (ide.read)"
+    );
 }
 
 /// Start accepts only absolute, normalized optional working-directory roots.

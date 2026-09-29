@@ -83,9 +83,10 @@ which the reply says `unknown` and `ide.context` shows the result when it lands.
   `stale_source` (no write) when that read no longer matches the file — re-read the lines
   (ide.read) and retry with the new `source_ref`. The symbol forms take `source_ref` too
   (optional; validated when given).
-- `ide.edit` also creates files: the same calls on a path that does not exist yet answer
-  `edit: created` with the same check — prefer it over native creation so the diagnostics
-  arrive in-reply.
+- `ide.edit {"operation_id":"…","path":"src/new.rs","content":"…"}` — creates a file that does
+  not exist yet (no `source_ref`: there is nothing to read) and answers `edit: created` with the
+  same check — prefer it over native creation so the diagnostics arrive in-reply. The same call
+  on an existing file is refused with no write: read it first and pass its `source_ref`.
 - When a reply's last line reads `formatted: +N lines after line X; use source_ref …`, the
   formatter moved lines: any further line-range edit must start from a fresh `ide.read`, not
   from the line numbers you held before the edit.
@@ -135,6 +136,8 @@ the language server is still loading the workspace: repeat the same call in a fe
    eight `FAIL name` / `file:line message` lines, a `rerun:` argv and `full output:
    ide.inspect <detail_ref>`. `ide.inspect` also accepts a test-run handle (`tests #N`,
    `tests-N`, `#N`, `N`) and answers that run's status line.
+   After `ide.stop`, `ide.test {"status":N}` is refused (the binding is inactive); read the
+   run's result with `ide.inspect {"detail_ref":"tests #N"}`, which still answers.
    One job per worktree at a time; a stopped budget says `stopped at budget`. The
    `<agent-ide>` block carries the job's line once while it runs and once when it ends.
 6. `ide.diff` before finishing the task, to review the accumulated change.
