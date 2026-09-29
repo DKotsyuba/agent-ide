@@ -177,9 +177,10 @@ impl LanguageSupport for RustSupport {
     /// `ide.edit`. It is either the outline the server path would normalize for the same text or
     /// `None`: whatever the parse cannot reproduce exactly — a syntax error rust-analyzer would
     /// recover from, comments it may attach to an item's range, an extern block, a `// region:`
-    /// comment, cfg-duplicated items with the same name, pathological nesting — keeps the file
-    /// server-backed instead of a guessed range. The recorded corpus in `tests/fixtures/lexical`
-    /// checks the equality against rust-analyzer's own answers (the build in its `VERSION`).
+    /// comment, cfg-duplicated items with the same name, more tokens or deeper brackets than the
+    /// parse's bounded stack is sized for — keeps the file server-backed instead of a guessed
+    /// range. The recorded corpus in `tests/fixtures/lexical` checks the equality against
+    /// rust-analyzer's own answers (the build in its `VERSION`).
     fn outline_from_source(&self, file: &Path, source: &str) -> Option<Outline> {
         crate::lexical::lexical_outline(file, source)
     }

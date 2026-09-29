@@ -7841,16 +7841,18 @@ async fn configured_product_rust_outline_answers_when_home_is_a_substitute_with_
 
 /// The lexical corpus files (`crates/agent-ide-lang-rust/tests/fixtures/lexical`) whose lexical
 /// outline must equal the server's; the cross-check copies them in as `src/corpus_<name>.rs`.
-const EXACT_LEXICAL_CORPUS: [&str; 11] = [
+const EXACT_LEXICAL_CORPUS: [&str; 13] = [
     "attrs",
     "block_doc",
     "comma_next_line",
     "expressions",
+    "gen_usage",
     "generics",
     "impl_literals",
     "items",
     "macros",
     "module_docs",
+    "nested_order",
     "split_header",
     "whitespace",
 ];

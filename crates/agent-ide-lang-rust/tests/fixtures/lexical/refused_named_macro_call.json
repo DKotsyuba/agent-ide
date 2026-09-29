@@ -1,0 +1,29 @@
+[
+ {
+  "name": "after",
+  "detail": "fn()",
+  "kind": 12,
+  "tags": [],
+  "deprecated": false,
+  "range": {
+   "start": {
+    "line": 2,
+    "character": 0
+   },
+   "end": {
+    "line": 2,
+    "character": 17
+   }
+  },
+  "selectionRange": {
+   "start": {
+    "line": 2,
+    "character": 7
+   },
+   "end": {
+    "line": 2,
+    "character": 12
+   }
+  }
+ }
+]

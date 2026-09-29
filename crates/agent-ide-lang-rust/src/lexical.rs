@@ -12,7 +12,7 @@
 //! * functions (methods when they take `self`), structs, unions, enums, their variants, named
 //!   fields, traits, modules, type aliases, constants, statics and `macro_rules!` definitions, at
 //!   any depth — inside function bodies, closures, blocks, initializers, types, impl and trait
-//!   bodies — each a child of the nearest enclosing symbol;
+//!   bodies — each a child of the nearest enclosing symbol, siblings ordered by where they start;
 //! * impl blocks, labelled `impl Type`, `impl Trait for Type` or `impl !Trait for Type` from the
 //!   verbatim source text of the trait path and the self type, selected at the self type;
 //! * no symbol for `const _`: the items inside its initializer belong to the enclosing symbol;
@@ -21,7 +21,8 @@
 //!
 //! A node range runs from the item's first outer attribute or doc comment (syn keeps doc
 //! comments as attributes, rust-analyzer as attached trivia) to its last token, so a field or a
-//! variant ends before its comma; the selection range is the name.
+//! variant ends before its comma; the selection range is the name. Both come from the syntax
+//! tree's own tokens, so building one symbol costs no more than its header.
 //!
 //! Refusal over guessing: whatever the parse cannot reproduce with the server's exact answer
 //! makes the whole outline `None`, and the file keeps waiting for the server —
@@ -30,15 +31,18 @@
 //!   here reproduces; also a shebang line, syntax syn keeps only as verbatim tokens (unstable
 //!   forms, a macro 2.0 definition), a trait alias, and an `extern` block (the server reports
 //!   the block itself as a symbol);
-//! * nesting the recursive parser could not take within its stack ([`too_nested`]): brackets
-//!   deeper than [`MAX_DEPTH`] or an operator chain above [`MAX_NESTING`]; and more than
-//!   [`MAX_SYMBOLS`] symbols;
+//! * text syn reads differently from rust-analyzer: an item-like macro call other than
+//!   `macro_rules!` (`foo! name { … }`), a field named `_`, anything named `gen` (a keyword to
+//!   rust-analyzer in edition 2024), and a visibility before a variant's name (syn drops it,
+//!   rust-analyzer reads it as an error that detaches the variant's attributes);
+//! * more than [`MAX_TOKENS`] tokens or brackets nested deeper than [`MAX_DEPTH`] (see
+//!   [`PARSE_STACK`]), and more than [`MAX_SYMBOLS`] symbols;
 //! * whitespace rustc does not accept in code (a no-break space, …), which the parser skips;
 //! * a `// region:` comment, which the server reports as a symbol;
 //! * comments rust-analyzer attaches to an item's node but a parser drops: comment text on the
 //!   nearest non-blank line above the item's first token (a `//!` inner doc line excepted, which
-//!   is never attached), or a blank line between the item's first attribute or doc comment and
-//!   its first token;
+//!   is never attached, when no block comment sits in between), or a blank line between the
+//!   item's first attribute or doc comment and its first token;
 //! * two same-named same-kind siblings where either carries a `cfg`/`cfg_attr` attribute.
 //!
 //! The corpus under `tests/fixtures/lexical` pins this against recorded rust-analyzer answers:
@@ -47,10 +51,13 @@
 //! upgrade they are recorded again (`record.mjs`) and the corpus test decides whether the
 //! outline still agrees.
 //!
-//! The parse runs on a short-lived thread with a stack of its own ([`PARSE_STACK`]): how deep it
-//! may recurse does not depend on the caller's stack or the build profile, a parser panic refuses
-//! instead of unwinding into the caller, and `proc-macro2`'s thread-local span table (which keeps
-//! the text of every source parsed on a thread) is freed with the thread.
+//! The parse runs on a short-lived thread with a stack of its own ([`PARSE_STACK`]), sized so
+//! that no accepted text can exhaust it: every level the parser, the tree walk or the tree's drop
+//! recurses consumes at least one token, so their stack grows at most linearly in the token
+//! count, and the stack holds [`MAX_TOKENS`] tokens at twice the costliest growth per token
+//! measured ([`STACK_PER_TOKEN`]). A parser panic refuses instead of unwinding into the caller,
+//! and `proc-macro2`'s thread-local span table (which keeps the text of every source parsed on a
+//! thread) is freed with the thread.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -58,25 +65,48 @@ use std::path::Path;
 use agent_ide_core::lang::brace::{line_at, source_lines};
 use agent_ide_core::lang::{LanguageSupport, Outline, Symbol, SymbolKind};
 use async_lsp::lsp_types as lsp;
-use proc_macro2::{Delimiter, LineColumn, Spacing, Span, TokenStream, TokenTree};
+use proc_macro2::{LineColumn, Span, TokenStream, TokenTree};
 use quote::ToTokens;
 use syn::visit::{self, Visit};
 
 use crate::module_graph::blanked_code;
 use crate::support::{RustSupport, attr_path};
 
-/// Deepest `(…)`/`[…]`/`{…}` nesting the parser is given; deeper text is refused before the
-/// recursive-descent parser (and the recursive walk, conversion and drop after it) could exhaust
-/// its stack.
+/// Deepest `(…)`/`[…]`/`{…}` nesting accepted. Symbols nest only inside brackets, so this also
+/// bounds how deep the outline itself nests — the conversion, walks and drops that recurse over
+/// it run on the caller's stack.
 const MAX_DEPTH: usize = 128;
 
-/// Largest nesting estimate ([`too_nested`]) the parser is given; far above hand-written code,
-/// far below what [`PARSE_STACK`] holds in an unoptimized build.
-const MAX_NESTING: usize = 1024;
+/// Most tokens (`proc-macro2` token trees, a delimited group counting as one besides its
+/// contents) a text may have to be parsed; a larger file waits for the server. It bounds the
+/// parse's recursion; see [`PARSE_STACK`]. An optimized build takes 240 000 tokens (this
+/// repository's largest file has about 90 000); an unoptimized one, whose frames are far
+/// larger, 16 000.
+const MAX_TOKENS: usize = if cfg!(debug_assertions) {
+    16_000
+} else {
+    240_000
+};
 
-/// Stack of the parse thread, in bytes: address space reserved per outline, touched only as deep
-/// as the parse recurses.
-const PARSE_STACK: usize = 64 << 20;
+/// Stack bytes one token may cost the parse at worst: twice the costliest growth per token
+/// measured over 45 shapes, each nested until it overflowed a known stack (nested closures,
+/// prefix operators, references, pointer, tuple, array and function-pointer types, generics,
+/// `dyn`/`impl` chains, qualified paths, casts, binary and assignment chains, `return`/`break`,
+/// blocks, `match` arms, `if`/`else` chains, postfix chains, patterns, struct literals, nested
+/// items, attribute and macro token trees): 4 223 bytes (nested blocks) in an optimized build,
+/// 28 988 bytes (a chain of `&` in a type) in an unoptimized one.
+const STACK_PER_TOKEN: usize = if cfg!(debug_assertions) {
+    57 << 10
+} else {
+    17 << 9
+};
+
+/// Stack of the parse thread, in bytes: [`MAX_TOKENS`] tokens at [`STACK_PER_TOKEN`] plus 8 MiB
+/// for the fixed frames, under 2 GiB. It is address space reserved per outline, not memory:
+/// pages are committed only as deep as a parse actually recurses (a few hundred KiB for ordinary
+/// code; a 2 GiB reservation measured no resident memory of its own on macOS).
+const PARSE_STACK: usize = (8 << 20) + MAX_TOKENS * STACK_PER_TOKEN;
+const _: () = assert!(PARSE_STACK <= 2 << 30);
 
 /// Most symbols one outline may carry; a larger file waits for the server.
 const MAX_SYMBOLS: usize = 20_000;
@@ -84,7 +114,7 @@ const MAX_SYMBOLS: usize = 20_000;
 /// Builds the lexical outline of `file` (the path the outline and its symbol paths carry) from
 /// its text `source`, or `None` when the text is refused (see the module docs). Pure function of
 /// the text: no filesystem, server or subprocess; it blocks the caller while one short-lived
-/// parse thread runs (about 50 ms for a 570 KB file in a release build).
+/// parse thread runs (about 40 ms for a 570 KB file in a release build, linear in the tokens).
 pub(crate) fn lexical_outline(file: &Path, source: &str) -> Option<Outline> {
     // rust-analyzer reports every `// region: name` comment as a symbol of its own, which a
     // parser drops; any mention refuses (a string that contains it too).
@@ -105,9 +135,9 @@ pub(crate) fn lexical_outline(file: &Path, source: &str) -> Option<Outline> {
 /// or `None` when the text is refused (see the module docs). Positions are 0-based lines and
 /// character columns; only the lines and the selection line are consumed downstream.
 ///
-/// The parse runs on a thread of its own with a [`PARSE_STACK`]-byte stack, so how deep it may
-/// recurse does not depend on the caller's stack or on the build profile, and its thread-local
-/// span table dies with it. A thread that cannot be started, or a parser panic, refuses.
+/// Everything from tokenizing to dropping the syntax tree runs on a thread of its own with a
+/// [`PARSE_STACK`]-byte stack, after [`within_bounds`] has checked the tokens against the
+/// limits that stack is sized for. A thread that cannot be started, or a parser panic, refuses.
 fn document_symbols(source: &str) -> Option<Vec<lsp::DocumentSymbol>> {
     let chars: Vec<char> = source.chars().collect();
     let code = blanked_code(&chars);
@@ -123,21 +153,27 @@ fn document_symbols(source: &str) -> Option<Vec<lsp::DocumentSymbol>> {
         std::thread::Builder::new()
             .name("rust-lexical-outline".to_owned())
             .stack_size(PARSE_STACK)
-            .spawn_scoped(scope, || parsed_symbols(source, &chars, &code))
+            .spawn_scoped(scope, || {
+                let tokens: TokenStream = source.parse().ok()?;
+                within_bounds(&tokens)
+                    .then(|| parsed_symbols(source, &chars, &code, tokens))
+                    .flatten()
+            })
             .ok()?
             .join()
             .ok()?
     })
 }
 
-/// The body of [`document_symbols`] on the parse thread: tokenizes `source` (whose characters
-/// are `chars` and code-only form `code`), refuses nesting the parser could not take within its
-/// stack ([`too_nested`]), parses and walks it.
-fn parsed_symbols(source: &str, chars: &[char], code: &[char]) -> Option<Vec<lsp::DocumentSymbol>> {
-    let tokens: TokenStream = source.parse().ok()?;
-    if too_nested(tokens.clone()) {
-        return None;
-    }
+/// Parses `tokens` (the tokens of `source`, whose characters are `chars` and code-only form
+/// `code`) and walks the syntax tree into document symbols; `None` when syn does not parse them
+/// or the walk refuses. Recurses as deep as the tokens nest: the caller provides the stack.
+fn parsed_symbols(
+    source: &str,
+    chars: &[char],
+    code: &[char],
+    tokens: TokenStream,
+) -> Option<Vec<lsp::DocumentSymbol>> {
     let file: syn::File = syn::parse2(tokens).ok()?;
     let mut line_starts = vec![0usize];
     line_starts.extend(
@@ -161,7 +197,34 @@ fn parsed_symbols(source: &str, chars: &[char], code: &[char]) -> Option<Vec<lsp
     if walker.refused {
         return None;
     }
-    walker.frames.pop()
+    let mut symbols = walker.frames.pop()?;
+    sort_by_start(&mut symbols);
+    Some(symbols)
+}
+
+/// Whether `tokens` fits the limits [`PARSE_STACK`] is sized for: at most [`MAX_TOKENS`] tokens
+/// in all and groups nested at most [`MAX_DEPTH`] deep. Counted without recursion — the check
+/// must not need the stack it protects.
+fn within_bounds(tokens: &TokenStream) -> bool {
+    let mut count = 0usize;
+    let mut open = vec![tokens.clone().into_iter()];
+    while let Some(level) = open.last_mut() {
+        let Some(tree) = level.next() else {
+            open.pop();
+            continue;
+        };
+        count += 1;
+        if count > MAX_TOKENS {
+            return false;
+        }
+        if let TokenTree::Group(group) = tree {
+            if open.len() > MAX_DEPTH {
+                return false;
+            }
+            open.push(group.stream().into_iter());
+        }
+    }
+    true
 }
 
 /// Whether `character` is whitespace to rustc and rust-analyzer: Unicode `Pattern_White_Space`,
@@ -183,103 +246,73 @@ fn rust_whitespace(character: char) -> bool {
     )
 }
 
-/// Keywords that nest the syntax tree without a delimiter: prefix expressions (`return x`,
-/// `move || x`), casts, `else if` chains, `let` conditions, `dyn`/`impl` types.
-const NESTING_KEYWORDS: [&str; 12] = [
-    "as", "async", "become", "box", "break", "dyn", "else", "impl", "let", "move", "return",
-    "yield",
-];
-
-/// Whether `tokens` may nest the parser's recursion (and the tree walk and drop after it) deeper
-/// than its stack allows: delimited groups deeper than [`MAX_DEPTH`], or a nesting estimate
-/// above [`MAX_NESTING`]. Measured without recursion — the check must not need the stack it
-/// protects — in one pass over every token.
-///
-/// The estimate is an upper bound on the syntax tree's depth. Syntax nests only through tokens:
-/// a delimited group, an operator (prefix `!`/`-`/`*`/`&`, binary, `.`, `?`, `..`, `@`, `->`,
-/// generic `<`/`>`) or a keyword of [`NESTING_KEYWORDS`]. Within one group those tokens are
-/// counted per segment, a stretch the parser treats as one subtree; segments end at `;`, at `=>`,
-/// at a `,` outside generic arguments (a `<` still open makes the comma part of the stretch),
-/// and after a `{…}` block followed by an item, a statement or an attribute (an identifier other
-/// than `as`/`else`, or `#`). A group's estimate is its enclosing group's plus the count of the
-/// whole segment holding it (the tokens after it nest it too: `(a) + b + c`). The bound is
-/// conservative: a long chain of operators in one expression (hundreds of `else if` arms, a
-/// thousand-term sum) is refused rather than parsed.
-fn too_nested(tokens: TokenStream) -> bool {
-    let mut pending = vec![(tokens, 0usize, 0usize)];
-    while let Some((stream, base, depth)) = pending.pop() {
-        let trees: Vec<TokenTree> = stream.into_iter().collect();
-        let mut segments = vec![0usize];
-        let mut groups = Vec::new();
-        let mut angles = 0usize;
-        for (index, tree) in trees.iter().enumerate() {
-            let next = trees.get(index + 1);
-            let joined = |previous: char| {
-                index.checked_sub(1).is_some_and(|before| {
-                    matches!(&trees[before], TokenTree::Punct(punct)
-                        if punct.as_char() == previous && punct.spacing() == Spacing::Joint)
-                })
-            };
-            let segment = segments.len() - 1;
-            let mut split = false;
-            match tree {
-                TokenTree::Group(group) => {
-                    segments[segment] += 1;
-                    groups.push((group.stream(), segment));
-                    split = group.delimiter() == Delimiter::Brace
-                        && match next {
-                            Some(TokenTree::Ident(ident)) => ident != "as" && ident != "else",
-                            Some(TokenTree::Punct(punct)) => punct.as_char() == '#',
-                            _ => false,
-                        };
-                }
-                TokenTree::Punct(punct) => match punct.as_char() {
-                    ';' => split = true,
-                    ',' => split = angles == 0,
-                    ':' | '#' | '$' | '\'' => {}
-                    // The `=` of `=>`; the `>` splits.
-                    '=' if punct.spacing() == Spacing::Joint
-                        && matches!(next, Some(TokenTree::Punct(arrow)) if arrow.as_char() == '>') =>
-                        {}
-                    '>' if joined('=') => split = true,
-                    '<' => {
-                        angles += 1;
-                        segments[segment] += 1;
-                    }
-                    '>' => {
-                        if !joined('-') {
-                            angles = angles.saturating_sub(1);
-                        }
-                        segments[segment] += 1;
-                    }
-                    _ => segments[segment] += 1,
-                },
-                TokenTree::Ident(ident) => {
-                    if NESTING_KEYWORDS.iter().any(|keyword| ident == keyword) {
-                        segments[segment] += 1;
-                    }
-                }
-                TokenTree::Literal(_) => {}
-            }
-            if split {
-                segments.push(0);
-                angles = 0;
-            }
-        }
-        if segments.iter().any(|count| base + count > MAX_NESTING) {
-            return true;
-        }
-        for (stream, segment) in groups {
-            if depth + 1 > MAX_DEPTH {
-                return true;
-            }
-            pending.push((stream, base + segments[segment], depth + 1));
-        }
-    }
-    false
+/// Orders sibling symbols by where their ranges start, as rust-analyzer lists them (the syntax
+/// tree walk visits some parts out of source order: a where clause before the parameters, a
+/// body's inner attributes before the signature). Stable, so equal starts keep walk order.
+fn sort_by_start(symbols: &mut [lsp::DocumentSymbol]) {
+    symbols.sort_by_key(|symbol| (symbol.range.start.line, symbol.range.start.character));
 }
 
-/// Builds the document symbols of one parsed file, one visitor pass in source order.
+/// Where one symbol's node lies in the source, as spans of three of its tokens.
+struct Extent {
+    /// The node's first token: its first outer attribute or doc comment, else `declaration`.
+    first: Span,
+    /// The first token after the outer attributes (visibility, keyword or name).
+    declaration: Span,
+    /// The node's last token (a closing delimiter, a `;`, or the end of a type or expression).
+    last: Span,
+}
+
+impl Extent {
+    /// The extent of a node whose attributes are `attrs` (outer ones first, as syn stores them),
+    /// whose declaration starts with the first token of the first `head` part that has any
+    /// (an absent visibility or modifier prints none), and whose last token is `last`. `None`
+    /// when no head part has a token.
+    fn of(attrs: &[syn::Attribute], head: &[&dyn ToTokens], last: Span) -> Option<Self> {
+        let declaration = head.iter().find_map(|part| first_span(*part))?;
+        let first = attrs
+            .iter()
+            .find(|attr| matches!(attr.style, syn::AttrStyle::Outer))
+            .map_or(declaration, |attr| attr.pound_token.span);
+        Some(Extent {
+            first,
+            declaration,
+            last,
+        })
+    }
+}
+
+/// The parts of a function signature before its name, in order — `const`, `async`, `unsafe`,
+/// `extern "abi"` and `fn` — whose first present token starts the function's declaration.
+fn signature_head(sig: &syn::Signature) -> [&dyn ToTokens; 5] {
+    [
+        &sig.constness,
+        &sig.asyncness,
+        &sig.unsafety,
+        &sig.abi,
+        &sig.fn_token,
+    ]
+}
+
+/// The span of `node`'s first token, `None` for a node without tokens. Prints the node, so it is
+/// used on visibilities, modifiers, keywords, names and an impl's self type, never on an item.
+fn first_span(node: &dyn ToTokens) -> Option<Span> {
+    node.to_token_stream()
+        .into_iter()
+        .next()
+        .map(|token| token.span())
+}
+
+/// The span of `node`'s last token, `None` for a node without tokens. Prints the node, so it is
+/// used only on a field's type and a variant's discriminant.
+fn last_span(node: &dyn ToTokens) -> Option<Span> {
+    node.to_token_stream()
+        .into_iter()
+        .last()
+        .map(|token| token.span())
+}
+
+/// Builds the document symbols of one parsed file, one visitor pass.
 struct Walker<'a> {
     /// The source text, for impl labels sliced verbatim.
     source: &'a str,
@@ -302,46 +335,46 @@ struct Walker<'a> {
 }
 
 impl Walker<'_> {
-    /// Adds one symbol for `node` to the innermost frame. `name` and `kind` are rust-analyzer's,
-    /// `selection` the span it selects (the name, or an impl's self type); `walk` visits the
-    /// node's contents, whose symbols become its children. The range runs from the node's first
-    /// token to its last; the node is checked for comments the server would attach to it.
+    /// Adds one symbol to the innermost frame. `extent` locates the node (`None` refuses), `name`
+    /// and `kind` are rust-analyzer's, `selection` the span it selects (the name, or an impl's
+    /// self type); `walk` visits the node's contents, whose symbols become its children, ordered
+    /// by start. Refuses names rust-analyzer does not give (`_`, the edition-2024 keyword
+    /// `gen`), tokens without a source position, and a node the server may see differently
+    /// ([`Walker::check_start`]).
     fn symbol(
         &mut self,
-        node: &dyn ToTokens,
+        extent: Option<Extent>,
         name: String,
         kind: lsp::SymbolKind,
         selection: Span,
         walk: impl FnOnce(&mut Self),
     ) {
-        let tokens: Vec<TokenTree> = node.to_token_stream().into_iter().collect();
-        let (Some(first), Some(last)) = (tokens.first(), tokens.last()) else {
+        let Some(Extent {
+            first,
+            declaration,
+            last,
+        }) = extent
+        else {
             self.refused = true;
             return;
         };
-        // The first token after the outer attributes (`#` then `[…]`, doc comments included).
-        let mut index = 0;
-        while matches!(&tokens.get(index), Some(TokenTree::Punct(pound)) if pound.as_char() == '#')
-            && matches!(
-                &tokens.get(index + 1),
-                Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Bracket
-            )
+        // A parsed token covers at least one character; a synthesized one covers none.
+        if first.byte_range().is_empty()
+            || last.byte_range().is_empty()
+            || name == "_"
+            || name == "gen"
         {
-            index += 2;
-        }
-        let declaration = tokens.get(index).unwrap_or(first).span().start().line;
-        let (start, end) = (first.span().start(), last.span().end());
-        // Every parsed token has a source position (line 1 or later); a synthesized one would not.
-        if start.line == 0 {
             self.refused = true;
             return;
         }
-        self.check_attached_trivia(start, declaration);
+        let start = first.start();
+        self.check_start(start, declaration.start().line);
         self.symbols += 1;
         self.refused |= self.symbols > MAX_SYMBOLS;
         self.frames.push(Vec::new());
         walk(self);
-        let children = self.frames.pop().unwrap_or_default();
+        let mut children = self.frames.pop().unwrap_or_default();
+        sort_by_start(&mut children);
         #[allow(deprecated)] // `deprecated` is a required field of the LSP type.
         let symbol = lsp::DocumentSymbol {
             name,
@@ -349,7 +382,7 @@ impl Walker<'_> {
             kind,
             tags: None,
             deprecated: None,
-            range: lsp::Range::new(position(start), position(end)),
+            range: lsp::Range::new(position(start), position(last.end())),
             selection_range: lsp::Range::new(
                 position(selection.start()),
                 position(selection.end()),
@@ -361,33 +394,40 @@ impl Walker<'_> {
         }
     }
 
-    /// Refuses when rust-analyzer may attach comments to the item starting at `start` (its first
-    /// attribute, doc comment or keyword), which a parser does not see: comment text on the
-    /// nearest non-blank line above `start` — between the last code before the item and the
-    /// item — unless it is a `//!` inner doc line (never attached, nor anything above it); or a
-    /// blank line between `start` and the item's first token after its attributes, on line
-    /// `declaration` (rust-analyzer attaches a doc comment across one only when no plain comment
-    /// sits between).
-    fn check_attached_trivia(&mut self, start: LineColumn, declaration: usize) {
+    /// Refuses when the server's node may start elsewhere than `start`, the node's first token
+    /// (its first attribute, doc comment or declaration token, on whose line `declaration` the
+    /// declaration starts):
+    ///
+    /// * comment text sits on the nearest non-blank line above `start`, between the last code
+    ///   before the item and the item — rust-analyzer attaches such comments — unless that line
+    ///   is a `//!` inner doc line (never attached, nor anything above it) and no block comment
+    ///   opens or closes in between (a `//!` inside a block comment is no doc line);
+    /// * a blank line separates `start` from the declaration (rust-analyzer attaches a doc
+    ///   comment across one only when no plain comment sits between).
+    fn check_start(&mut self, start: LineColumn, declaration: usize) {
         let line_start = self.line_starts[start.line - 1];
-        let first = line_start + start.column;
-        let gap = self.code[..first]
+        // Just past the last code character before the item (comments and literal contents are
+        // blanked in `code`).
+        let gap = self.code[..line_start + start.column]
             .iter()
             .rposition(|&character| !rust_whitespace(character))
             .map_or(0, |at| at + 1);
         let above: String = self.chars[gap.min(line_start)..line_start].iter().collect();
+        let inner_doc =
+            |line: &str| line.starts_with("//!") && !above.contains("/*") && !above.contains("*/");
         let commented = above
             .lines()
             .map(str::trim)
             .rfind(|line| !line.is_empty())
-            .is_some_and(|nearest| !nearest.starts_with("//!"));
+            .is_some_and(|nearest| !inner_doc(nearest));
         let blank = (start.line..declaration)
             .any(|line| line_at(&self.lines, line as u32).trim().is_empty());
         self.refused |= commented || blank;
     }
 
     /// The verbatim source text of `node`, from its first token to its last, as rust-analyzer's
-    /// syntax text; `None` for a node without tokens or without a source position.
+    /// syntax text; `None` for a node without tokens or without a source position. Prints the
+    /// node: used on an impl's trait path and self type only.
     fn text(&self, node: &dyn ToTokens) -> Option<String> {
         let mut tokens = node.to_token_stream().into_iter();
         let first = tokens.next()?.span();
@@ -398,13 +438,13 @@ impl Walker<'_> {
             .map(str::to_owned)
     }
 
-    /// Adds a function or method symbol for `node` with signature `sig`, named and selected by
-    /// the function's name: rust-analyzer's `METHOD` when it takes `self`, `FUNCTION` otherwise
-    /// (the conversion refines both by owner and test attribute alike). `walk` visits the
-    /// function's contents, as in [`Walker::symbol`].
+    /// Adds a function or method symbol located by `extent`, with signature `sig`, named and
+    /// selected by the function's name: rust-analyzer's `METHOD` when it takes `self`,
+    /// `FUNCTION` otherwise (the conversion refines both by owner and test attribute alike).
+    /// `walk` visits the function's contents, as in [`Walker::symbol`].
     fn function(
         &mut self,
-        node: &dyn ToTokens,
+        extent: Option<Extent>,
         sig: &syn::Signature,
         walk: impl FnOnce(&mut Self),
     ) {
@@ -413,31 +453,36 @@ impl Walker<'_> {
         } else {
             lsp::SymbolKind::FUNCTION
         };
-        self.symbol(node, sig.ident.to_string(), kind, sig.ident.span(), walk);
+        self.symbol(extent, sig.ident.to_string(), kind, sig.ident.span(), walk);
     }
 
-    /// Adds a constant symbol for `node` named and selected by `ident`, whose contents `walk`
-    /// visits; for `const _` there is no symbol and `walk` runs in the enclosing one, so the
-    /// items of the initializer become its children.
-    fn constant(&mut self, node: &dyn ToTokens, ident: &syn::Ident, walk: impl FnOnce(&mut Self)) {
+    /// Adds a constant symbol located by `extent`, named and selected by `ident`, whose contents
+    /// `walk` visits; for `const _` there is no symbol and `walk` runs in the enclosing one, so
+    /// the items of the initializer become its children.
+    fn constant(
+        &mut self,
+        extent: Option<Extent>,
+        ident: &syn::Ident,
+        walk: impl FnOnce(&mut Self),
+    ) {
         if ident == "_" {
             walk(self);
         } else {
             let name = ident.to_string();
-            self.symbol(node, name, lsp::SymbolKind::CONSTANT, ident.span(), walk);
+            self.symbol(extent, name, lsp::SymbolKind::CONSTANT, ident.span(), walk);
         }
     }
 
-    /// Adds a symbol for `node` named and selected by `ident`, with rust-analyzer's `kind`;
-    /// `walk` visits its contents, as in [`Walker::symbol`].
+    /// Adds a symbol located by `extent`, named and selected by `ident`, with rust-analyzer's
+    /// `kind`; `walk` visits its contents, as in [`Walker::symbol`].
     fn named(
         &mut self,
-        node: &dyn ToTokens,
+        extent: Option<Extent>,
         ident: &syn::Ident,
         kind: lsp::SymbolKind,
         walk: impl FnOnce(&mut Self),
     ) {
-        self.symbol(node, ident.to_string(), kind, ident.span(), walk);
+        self.symbol(extent, ident.to_string(), kind, ident.span(), walk);
     }
 }
 
@@ -506,145 +551,256 @@ impl<'ast> Visit<'ast> for Walker<'_> {
         }
     }
 
-    /// A function symbol.
+    /// A function symbol, from its attributes to its body's closing brace.
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        self.function(node, &node.sig, |walker| visit::visit_item_fn(walker, node));
+        let last = node.block.brace_token.span.close();
+        let [constness, asyncness, unsafety, abi, keyword] = signature_head(&node.sig);
+        let head = [
+            &node.vis as &dyn ToTokens,
+            constness,
+            asyncness,
+            unsafety,
+            abi,
+            keyword,
+        ];
+        let extent = Extent::of(&node.attrs, &head, last);
+        self.function(extent, &node.sig, |walker| {
+            visit::visit_item_fn(walker, node)
+        });
     }
 
     /// A method symbol of an impl.
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        self.function(node, &node.sig, |walker| {
+        let last = node.block.brace_token.span.close();
+        let [constness, asyncness, unsafety, abi, keyword] = signature_head(&node.sig);
+        let head = [
+            &node.vis as &dyn ToTokens,
+            &node.defaultness,
+            constness,
+            asyncness,
+            unsafety,
+            abi,
+            keyword,
+        ];
+        let extent = Extent::of(&node.attrs, &head, last);
+        self.function(extent, &node.sig, |walker| {
             visit::visit_impl_item_fn(walker, node)
         });
     }
 
-    /// A method symbol of a trait.
+    /// A method symbol of a trait, ending at its default body or its `;`.
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
-        self.function(node, &node.sig, |walker| {
+        let last = match (&node.default, &node.semi_token) {
+            (Some(block), _) => Some(block.brace_token.span.close()),
+            (None, Some(semi)) => Some(semi.span),
+            (None, None) => None,
+        };
+        let head = signature_head(&node.sig);
+        let extent = last.and_then(|last| Extent::of(&node.attrs, &head, last));
+        self.function(extent, &node.sig, |walker| {
             visit::visit_trait_item_fn(walker, node)
         });
     }
 
     /// A struct symbol; its named fields are its children.
     fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+        let last = match (&node.semi_token, &node.fields) {
+            (Some(semi), _) => Some(semi.span),
+            (None, syn::Fields::Named(fields)) => Some(fields.brace_token.span.close()),
+            (None, _) => None,
+        };
+        let head: [&dyn ToTokens; 2] = [&node.vis, &node.struct_token];
+        let extent = last.and_then(|last| Extent::of(&node.attrs, &head, last));
         let kind = lsp::SymbolKind::STRUCT;
-        self.named(node, &node.ident, kind, |walker| {
+        self.named(extent, &node.ident, kind, |walker| {
             visit::visit_item_struct(walker, node)
         });
     }
 
     /// A union symbol, which rust-analyzer reports as a struct.
     fn visit_item_union(&mut self, node: &'ast syn::ItemUnion) {
+        let last = node.fields.brace_token.span.close();
+        let extent = Extent::of(&node.attrs, &[&node.vis, &node.union_token], last);
         let kind = lsp::SymbolKind::STRUCT;
-        self.named(node, &node.ident, kind, |walker| {
+        self.named(extent, &node.ident, kind, |walker| {
             visit::visit_item_union(walker, node)
         });
     }
 
     /// An enum symbol; its variants are its children.
     fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+        let last = node.brace_token.span.close();
+        let extent = Extent::of(&node.attrs, &[&node.vis, &node.enum_token], last);
         let kind = lsp::SymbolKind::ENUM;
-        self.named(node, &node.ident, kind, |walker| {
+        self.named(extent, &node.ident, kind, |walker| {
             visit::visit_item_enum(walker, node)
         });
     }
 
-    /// An enum variant symbol; a record variant's fields are its children.
+    /// An enum variant symbol, ending at its discriminant, its fields or its name; a record
+    /// variant's fields are its children. A visibility before a variant's name (rejected by
+    /// rustc) refuses: syn drops it, rust-analyzer reads it as an error outside the variant, whose
+    /// node then starts at the name without the attributes and comments above; it shows as code
+    /// other than `{`, `,` or an attribute's `]` right before the name.
     fn visit_variant(&mut self, node: &'ast syn::Variant) {
+        let name = node.ident.span().start();
+        let before = self.code[..self.line_starts[name.line - 1] + name.column]
+            .iter()
+            .rposition(|&character| !rust_whitespace(character));
+        if before.is_some_and(|at| !matches!(self.code[at], '{' | ',' | ']')) {
+            self.refused = true;
+            return;
+        }
+        let last = match (&node.discriminant, &node.fields) {
+            (Some((_, discriminant)), _) => last_span(discriminant),
+            (None, syn::Fields::Named(fields)) => Some(fields.brace_token.span.close()),
+            (None, syn::Fields::Unnamed(fields)) => Some(fields.paren_token.span.close()),
+            (None, syn::Fields::Unit) => Some(node.ident.span()),
+        };
+        let extent = last.and_then(|last| Extent::of(&node.attrs, &[&node.ident], last));
         let kind = lsp::SymbolKind::ENUM_MEMBER;
-        self.named(node, &node.ident, kind, |walker| {
+        self.named(extent, &node.ident, kind, |walker| {
             visit::visit_variant(walker, node)
         });
     }
 
-    /// A named field symbol; a tuple field is no symbol (its type is still walked).
+    /// A named field symbol, ending at its type; a tuple field is no symbol (its type is still
+    /// walked).
     fn visit_field(&mut self, node: &'ast syn::Field) {
         match &node.ident {
-            Some(ident) => self.named(node, ident, lsp::SymbolKind::FIELD, |walker| {
-                visit::visit_field(walker, node)
-            }),
+            Some(ident) => {
+                let head: [&dyn ToTokens; 2] = [&node.vis, ident];
+                let extent =
+                    last_span(&node.ty).and_then(|last| Extent::of(&node.attrs, &head, last));
+                self.named(extent, ident, lsp::SymbolKind::FIELD, |walker| {
+                    visit::visit_field(walker, node)
+                })
+            }
             None => visit::visit_field(self, node),
         }
     }
 
     /// A trait symbol, which rust-analyzer reports as an interface.
     fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        let last = node.brace_token.span.close();
+        let head: [&dyn ToTokens; 4] = [
+            &node.vis,
+            &node.unsafety,
+            &node.auto_token,
+            &node.trait_token,
+        ];
+        let extent = Extent::of(&node.attrs, &head, last);
         let kind = lsp::SymbolKind::INTERFACE;
-        self.named(node, &node.ident, kind, |walker| {
+        self.named(extent, &node.ident, kind, |walker| {
             visit::visit_item_trait(walker, node)
         });
     }
 
-    /// A module symbol, inline or `mod name;`.
+    /// A module symbol, inline (ending at its brace) or `mod name;`.
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        let last = match (&node.content, &node.semi) {
+            (Some((brace, _)), _) => Some(brace.span.close()),
+            (None, Some(semi)) => Some(semi.span),
+            (None, None) => None,
+        };
+        let head: [&dyn ToTokens; 3] = [&node.vis, &node.unsafety, &node.mod_token];
+        let extent = last.and_then(|last| Extent::of(&node.attrs, &head, last));
         let kind = lsp::SymbolKind::MODULE;
-        self.named(node, &node.ident, kind, |walker| {
+        self.named(extent, &node.ident, kind, |walker| {
             visit::visit_item_mod(walker, node)
         });
     }
 
     /// A type alias symbol, which rust-analyzer reports as a type parameter.
     fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
+        let last = node.semi_token.span;
+        let extent = Extent::of(&node.attrs, &[&node.vis, &node.type_token], last);
         let kind = lsp::SymbolKind::TYPE_PARAMETER;
-        self.named(node, &node.ident, kind, |walker| {
+        self.named(extent, &node.ident, kind, |walker| {
             visit::visit_item_type(walker, node)
         });
     }
 
     /// An associated type symbol of an impl.
     fn visit_impl_item_type(&mut self, node: &'ast syn::ImplItemType) {
+        let last = node.semi_token.span;
+        let head: [&dyn ToTokens; 3] = [&node.vis, &node.defaultness, &node.type_token];
+        let extent = Extent::of(&node.attrs, &head, last);
         let kind = lsp::SymbolKind::TYPE_PARAMETER;
-        self.named(node, &node.ident, kind, |walker| {
+        self.named(extent, &node.ident, kind, |walker| {
             visit::visit_impl_item_type(walker, node)
         });
     }
 
     /// An associated type symbol of a trait.
     fn visit_trait_item_type(&mut self, node: &'ast syn::TraitItemType) {
+        let last = node.semi_token.span;
+        let extent = Extent::of(&node.attrs, &[&node.type_token], last);
         let kind = lsp::SymbolKind::TYPE_PARAMETER;
-        self.named(node, &node.ident, kind, |walker| {
+        self.named(extent, &node.ident, kind, |walker| {
             visit::visit_trait_item_type(walker, node)
         });
     }
 
     /// A constant symbol (none for `const _`).
     fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
-        self.constant(node, &node.ident, |walker| {
+        let last = node.semi_token.span;
+        let extent = Extent::of(&node.attrs, &[&node.vis, &node.const_token], last);
+        self.constant(extent, &node.ident, |walker| {
             visit::visit_item_const(walker, node)
         });
     }
 
     /// An associated constant symbol of an impl (none for `const _`).
     fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
-        self.constant(node, &node.ident, |walker| {
+        let last = node.semi_token.span;
+        let head: [&dyn ToTokens; 3] = [&node.vis, &node.defaultness, &node.const_token];
+        let extent = Extent::of(&node.attrs, &head, last);
+        self.constant(extent, &node.ident, |walker| {
             visit::visit_impl_item_const(walker, node)
         });
     }
 
     /// An associated constant symbol of a trait.
     fn visit_trait_item_const(&mut self, node: &'ast syn::TraitItemConst) {
-        self.constant(node, &node.ident, |walker| {
+        let last = node.semi_token.span;
+        let extent = Extent::of(&node.attrs, &[&node.const_token], last);
+        self.constant(extent, &node.ident, |walker| {
             visit::visit_trait_item_const(walker, node)
         });
     }
 
     /// A static symbol, which rust-analyzer reports as a constant.
     fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
+        let last = node.semi_token.span;
+        let extent = Extent::of(&node.attrs, &[&node.vis, &node.static_token], last);
         let kind = lsp::SymbolKind::CONSTANT;
-        self.named(node, &node.ident, kind, |walker| {
+        self.named(extent, &node.ident, kind, |walker| {
             visit::visit_item_static(walker, node)
         });
     }
 
-    /// A `macro_rules!` definition symbol, which rust-analyzer reports as a function; a macro
-    /// invocation at item position is no symbol.
+    /// A `macro_rules!` definition symbol, which rust-analyzer reports as a function, ending at
+    /// its closing delimiter or `;`; a macro invocation at item position is no symbol. Any other
+    /// item-like call with a name (`foo! name { … }`, `r#macro_rules! name { … }`) refuses:
+    /// rust-analyzer makes a definition only of the `macro_rules` keyword.
     fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
-        match &node.ident {
-            Some(ident) => self.named(node, ident, lsp::SymbolKind::FUNCTION, |walker| {
-                visit::visit_item_macro(walker, node)
-            }),
-            None => visit::visit_item_macro(self, node),
+        let Some(ident) = &node.ident else {
+            visit::visit_item_macro(self, node);
+            return;
+        };
+        if !node.mac.path.is_ident("macro_rules") {
+            self.refused = true;
+            return;
         }
+        let last = node
+            .semi_token
+            .as_ref()
+            .map_or(node.mac.delimiter.span().close(), |semi| semi.span);
+        let extent = Extent::of(&node.attrs, &[&node.mac.path], last);
+        self.named(extent, ident, lsp::SymbolKind::FUNCTION, |walker| {
+            visit::visit_item_macro(walker, node)
+        });
     }
 
     /// An impl symbol labelled as rust-analyzer labels it, `impl Type` or
@@ -664,19 +820,14 @@ impl<'ast> Visit<'ast> for Walker<'_> {
             self.refused = true;
             return;
         };
+        let last = node.brace_token.span.close();
+        let head: [&dyn ToTokens; 3] = [&node.defaultness, &node.unsafety, &node.impl_token];
+        let extent = Extent::of(&node.attrs, &head, last);
         let kind = lsp::SymbolKind::OBJECT;
-        self.symbol(node, label, kind, selection, |walker| {
+        self.symbol(extent, label, kind, selection, |walker| {
             visit::visit_item_impl(walker, node)
         });
     }
-}
-
-/// The span of `node`'s first token, `None` for a node without tokens.
-fn first_span(node: &dyn ToTokens) -> Option<Span> {
-    node.to_token_stream()
-        .into_iter()
-        .next()
-        .map(|token| token.span())
 }
 
 /// Whether two same-named same-kind siblings carry a `cfg`/`cfg_attr` attribute in either
@@ -870,7 +1021,7 @@ mod tests {
             .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
             .collect();
         sources.sort();
-        assert!(sources.len() >= 24, "corpus: {sources:?}");
+        assert!(sources.len() >= 32, "corpus: {sources:?}");
         let mut exact = 0;
         for path in sources {
             let source = std::fs::read_to_string(&path).expect("corpus source");
@@ -908,7 +1059,7 @@ mod tests {
             assert_eq!(lexical, server, "{}", file.display());
             exact += 1;
         }
-        assert!(exact >= 11, "{exact} exact corpus files");
+        assert!(exact >= 13, "{exact} exact corpus files");
     }
 
     /// Addresses, kinds, ranges, signatures and docs match the server path's answers.
@@ -1156,23 +1307,20 @@ let c = '{';\n    let _ = format!(\"{}\", c);\n    let _ = s.len() + r.len();\n}
         }
     }
 
-    /// Pathological nesting — the review's 10 000 nested braces (a 20 KB file), a 10 000-deep
-    /// generic type, a 10 000-long prefix operator chain and a 10 000-term sum whose blocks
-    /// separate every term — is refused before the parser recurses, from a caller whose stack is
-    /// only 256 KiB; ordinary nesting still outlines from that caller, because the parse runs
-    /// on its own stack.
+    /// Pathological nesting is refused before the parser recurses, from a caller whose stack is
+    /// only 256 KiB: the reviews' 10 000 nested braces (too deep), 100 000 nested two-parameter
+    /// closures and 900 closures each followed by a thousand `-` (both over [`MAX_TOKENS`], which
+    /// no bracket or operator heuristic may reset). Ordinary nesting still outlines from that
+    /// caller, because the parse runs on its own stack.
     #[test]
     fn pathological_nesting_is_refused_without_overflow() {
-        let deep = 10_000;
         let refused = [
-            format!("fn f() {{{}{}}}\n", "{".repeat(deep), "}".repeat(deep)),
+            format!("fn f() {{{}{}}}\n", "{".repeat(10_000), "}".repeat(10_000)),
+            format!("fn f() {{ let _ = {}0; }}\n", "|a, b| ".repeat(100_000)),
             format!(
-                "fn f() {{ let _: {}u8{} = x; }}\n",
-                "Vec<".repeat(deep),
-                ">".repeat(deep)
+                "fn f() {{ let _ = {}0; }}\n",
+                format!("|a, b| {}", "-".repeat(1000)).repeat(900)
             ),
-            format!("fn f() {{ let _ = {}x; }}\n", "!".repeat(deep)),
-            format!("fn f() {{ let _ = 1{}; }}\n", " + {1} as u8".repeat(deep)),
         ];
         let nested = format!(
             "fn f() {{{}\nfn inner() {{}}\n{}}}\n",
@@ -1193,8 +1341,20 @@ let c = '{';\n    let _ = format!(\"{}\", c);\n    let _ = s.len() + r.len();\n}
             .expect("small-stack thread")
             .join()
             .expect("no overflow");
-        assert_eq!(refused, [true; 4]);
+        assert_eq!(refused, [true; 3]);
         assert_eq!(inner, Some(LineRange::new(2, 2)));
+    }
+
+    /// The token bound is sound at its edge: a text of the costliest shape measured for this
+    /// build (a chain of `&` in a type, one token per level of recursion) at [`MAX_TOKENS`]
+    /// tokens is parsed and outlined on the parse thread's stack, and one token more is refused.
+    #[test]
+    fn the_costliest_shape_at_the_token_bound_outlines_without_overflow() {
+        // `fn`, `f`, `()`, `{…}` and, inside, `let _ : … u8 = x ;`: 11 tokens besides the chain.
+        let source = |chain: usize| format!("fn f() {{ let _: {}u8 = x; }}\n", "&".repeat(chain));
+        let outline = lexical_outline(Path::new("a.rs"), &source(MAX_TOKENS - 11));
+        assert_eq!(outline.map(|outline| outline.symbols.len()), Some(1));
+        assert!(lexical_outline(Path::new("a.rs"), &source(MAX_TOKENS - 10)).is_none());
     }
 
     /// Same-named siblings without a gate stay, exactly as the server reports them: a type and
