@@ -136,6 +136,8 @@ the language server is still loading the workspace: repeat the same call in a fe
    eight `FAIL name` / `file:line message` lines, a `rerun:` argv and `full output:
    ide.inspect <detail_ref>`. `ide.inspect` also accepts a test-run handle (`tests #N`,
    `tests-N`, `#N`, `N`) and answers that run's status line.
+   After `ide.stop`, `ide.test {"status":N}` is refused (the binding is inactive); read the
+   run's result with `ide.inspect {"detail_ref":"tests #N"}`, which still answers.
    One job per worktree at a time; a stopped budget says `stopped at budget`. The
    `<agent-ide>` block carries the job's line once while it runs and once when it ends.
 6. `ide.diff` before finishing the task, to review the accumulated change.
