@@ -49,12 +49,21 @@ const MAX_LAYOUT_TOP: usize = 12;
 /// [`ProjectCard::docs`] entries `render` lists before collapsing the rest into a trailing count.
 const MAX_DOCS_SHOWN: usize = 6;
 
-/// Byte ceiling for one rendered card; `render` collapses `layout` children first, then `docs`.
+/// Byte ceiling for one rendered card; `render` collapses `layout` children first, then `docs`,
+/// and finally cuts the tail off behind [`CARD_TRUNCATED_MARKER`].
 const MAX_CARD_BYTES: usize = 1500;
+
+/// Suffix `render` puts on a card it had to cut to fit [`MAX_CARD_BYTES`]; it counts toward the
+/// ceiling, so a cut card never exceeds it.
+const CARD_TRUNCATED_MARKER: &str = "\n… (card truncated)";
 
 /// Largest `AGENTS.md`/`CLAUDE.md` [`collect_agent_commands`] reads. A bigger file contributes no
 /// commands rather than a partial read that could cut its ` ```agent-ide ` block in half.
 const MAX_COMMAND_DOC_BYTES: usize = 64 * 1024;
+
+/// Longest single `<kind>: <command>` command, in bytes, an ` ```agent-ide ` block may declare; a
+/// longer one makes the whole block malformed, so the card never prints a silently cut command.
+const MAX_COMMAND_BYTES: usize = 200;
 
 /// Git plumbing state for [`ProjectCard::git`].
 ///
@@ -489,7 +498,9 @@ fn collect_agent_commands(root: &Path) -> ProjectCommands {
 /// line per key from the closed [`COMMAND_KINDS`] set (`fmt` for the format slot), every command
 /// tagged `source`. `None` when the doc has no such block (no opening or no closing fence), or
 /// when any content line inside it fails to parse — an unknown or repeated key, a line with no
-/// `:`, or an empty command — so a malformed block is never partially trusted.
+/// `:`, an empty command, a command over [`MAX_COMMAND_BYTES`] bytes, or one containing a control
+/// character (escape sequences, NUL, a lone `\r`, C1 controls) that would otherwise be printed
+/// into the card — so a malformed block is never partially trusted.
 fn parse_agent_commands(content: &str, source: CommandSource) -> Option<ProjectCommands> {
     let lines: Vec<&str> = content.lines().collect();
     let start = lines
@@ -507,7 +518,10 @@ fn parse_agent_commands(content: &str, source: CommandSource) -> Option<ProjectC
         }
         let (key, value) = trimmed.split_once(':')?;
         let value = value.trim();
-        if value.is_empty() {
+        if value.is_empty()
+            || value.len() > MAX_COMMAND_BYTES
+            || value.chars().any(char::is_control)
+        {
             return None;
         }
         let target = match key.trim() {
@@ -562,8 +576,9 @@ const COMMAND_SOURCE_ORDER: [CommandSource; 7] = [
 /// `git:`/`problems:` vanish with a `None` value, and `commands:`/`environment:`/`layout:`/
 /// `entry points:`/`docs:`/`servers:` vanish when there is nothing to say. When the full render
 /// exceeds `MAX_CARD_BYTES` bytes, `layout` drops its depth-2 children first, then `docs`
-/// collapses to 3 entries, then to none, in that order, until the render fits (or the smallest
-/// attempt is returned as a best effort).
+/// collapses to 3 entries, then to none, in that order, until the render fits. A card that still
+/// overflows after that is cut at a character boundary and ends with [`CARD_TRUNCATED_MARKER`], so
+/// the result is never longer than `MAX_CARD_BYTES` and the cut is never silent.
 pub fn render(card: &ProjectCard) -> String {
     let attempts: [(bool, usize); 4] = [
         (true, MAX_DOCS_SHOWN),
@@ -578,6 +593,8 @@ pub fn render(card: &ProjectCard) -> String {
             return last;
         }
     }
+    last.truncate(last.floor_char_boundary(MAX_CARD_BYTES - CARD_TRUNCATED_MARKER.len()));
+    last.push_str(CARD_TRUNCATED_MARKER);
     last
 }
 
@@ -1216,6 +1233,67 @@ mod tests {
             card.agent_commands.check.is_some(),
             "a doc at the cap is read"
         );
+    }
+
+    /// A command with a control character (escape sequence, NUL, lone `\r`, C1 control) or over
+    /// [`MAX_COMMAND_BYTES`] makes the whole block malformed; one exactly at the cap parses.
+    #[test]
+    fn parse_agent_commands_rejects_control_characters_and_overlong_commands() {
+        let source = CommandSource::Agents;
+        for bad in [
+            "cargo \u{1b}[31mcheck",
+            "cargo\u{0}check",
+            "cargo \u{9b}31mcheck",
+            "cargo\rcheck",
+        ] {
+            assert_eq!(
+                parse_agent_commands(&format!("```agent-ide\ncheck: {bad}\n```\n"), source),
+                None,
+                "{bad:?} is malformed"
+            );
+        }
+        let at_cap = "x".repeat(MAX_COMMAND_BYTES);
+        assert!(
+            parse_agent_commands(&format!("```agent-ide\ncheck: {at_cap}\n```\n"), source)
+                .is_some()
+        );
+        let over_cap = "x".repeat(MAX_COMMAND_BYTES + 1);
+        assert_eq!(
+            parse_agent_commands(&format!("```agent-ide\ncheck: {over_cap}\n```\n"), source),
+            None
+        );
+    }
+
+    /// Multi-kilobyte commands in a project doc never reach the card, so the card stays inside
+    /// its byte ceiling.
+    #[test]
+    fn huge_agent_commands_cannot_push_the_card_over_its_ceiling() {
+        let tree = TempTree::new("agents-huge");
+        let long = "x".repeat(5_000);
+        tree.write(
+            "AGENTS.md",
+            &format!("```agent-ide\nbuild: {long}\ncheck: {long}\n```\n"),
+        );
+        let card = collect(tree.path(), vec![], vec![], None);
+        let rendered = render(&card);
+        assert!(
+            rendered.len() <= MAX_CARD_BYTES,
+            "rendered card is {} bytes",
+            rendered.len()
+        );
+    }
+
+    /// When even the smallest render overflows, the card is cut on a character boundary (the
+    /// filler is two-byte `é`) and ends with the truncation marker inside the ceiling.
+    #[test]
+    fn render_cuts_an_overflowing_card_at_a_char_boundary_with_a_marker() {
+        let tree = TempTree::new("overflow");
+        let mut card = collect(tree.path(), vec![], vec![], None);
+        card.problems = Some("é".repeat(MAX_CARD_BYTES));
+        let rendered = render(&card);
+        assert!(rendered.len() <= MAX_CARD_BYTES);
+        assert!(rendered.ends_with(CARD_TRUNCATED_MARKER));
+        assert!(rendered.starts_with("project: "));
     }
 
     #[test]
