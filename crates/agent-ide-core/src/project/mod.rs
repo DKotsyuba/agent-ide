@@ -120,6 +120,11 @@ pub struct ProjectCard {
     /// Set when the walk hit `MAX_WALK_FILES` before finishing; every count above is then a
     /// partial result, not a complete one.
     pub truncated: bool,
+    /// The ` ```agent-ide ` command block declared at the root of `AGENTS.md`, or `CLAUDE.md`
+    /// when `AGENTS.md` declares none; a kind filled here takes priority over every per-language
+    /// provider for that kind. Fields the block does not name stay `None` and fall back to the
+    /// per-language merge as before.
+    pub agent_commands: ProjectCommands,
 }
 
 /// Mutable state threaded through the recursive walk in [`scan_dir`].
@@ -419,6 +424,7 @@ pub fn collect(
     });
     let mut docs = state.docs;
     docs.sort_by(|a, b| doc_priority(a).cmp(&doc_priority(b)).then_with(|| a.cmp(b)));
+    let agent_commands = collect_agent_commands(root);
     ProjectCard {
         root: root.to_path_buf(),
         name,
@@ -429,7 +435,71 @@ pub fn collect(
         servers,
         problems,
         truncated: state.truncated,
+        agent_commands,
     }
+}
+
+/// Reads the project-declared command block: `AGENTS.md`'s ` ```agent-ide ` fenced block, or
+/// `CLAUDE.md`'s when `AGENTS.md` has none (missing file, no such block, or a malformed one all
+/// count as "none" and fall through). [`ProjectCommands::default`] when neither file declares a
+/// usable block.
+fn collect_agent_commands(root: &Path) -> ProjectCommands {
+    for (file_name, source) in [
+        ("AGENTS.md", CommandSource::Agents),
+        ("CLAUDE.md", CommandSource::Claude),
+    ] {
+        if let Ok(content) = fs::read_to_string(root.join(file_name))
+            && let Some(commands) = parse_agent_commands(&content, source)
+        {
+            return commands;
+        }
+    }
+    ProjectCommands::default()
+}
+
+/// Parses the single ` ```agent-ide ` fenced block a doc may contain: one `<kind>: <command>`
+/// line per key from the closed [`COMMAND_KINDS`] set (`fmt` for the format slot), every command
+/// tagged `source`. `None` when the doc has no such block (no opening or no closing fence), or
+/// when any content line inside it fails to parse — an unknown or repeated key, a line with no
+/// `:`, or an empty command — so a malformed block is never partially trusted.
+fn parse_agent_commands(content: &str, source: CommandSource) -> Option<ProjectCommands> {
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| line.trim() == "```agent-ide")?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| line.trim() == "```")
+        .map(|offset| start + 1 + offset)?;
+    let mut commands = ProjectCommands::default();
+    for line in &lines[start + 1..end] {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (key, value) = trimmed.split_once(':')?;
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        let target = match key.trim() {
+            "build" => &mut commands.build,
+            "check" => &mut commands.check,
+            "test" => &mut commands.test,
+            "lint" => &mut commands.lint,
+            "fmt" => &mut commands.format,
+            "typecheck" => &mut commands.typecheck,
+            _ => return None,
+        };
+        if target.is_some() {
+            return None;
+        }
+        *target = Some(ProjectCommand {
+            argv: crate::lang::brace::argv_of(value),
+            source,
+        });
+    }
+    Some(commands)
 }
 
 /// A command kind's field accessor on [`ProjectCommands`].
@@ -446,8 +516,11 @@ const COMMAND_KINDS: [(&str, CommandField); 6] = [
     ("typecheck", |commands| &commands.typecheck),
 ];
 
-/// Fixed [`CommandSource`] order the `commands (…):` provenance note follows.
-const COMMAND_SOURCE_ORDER: [CommandSource; 5] = [
+/// Fixed [`CommandSource`] order the `commands (…):` provenance note follows, highest precedence
+/// first.
+const COMMAND_SOURCE_ORDER: [CommandSource; 7] = [
+    CommandSource::Agents,
+    CommandSource::Claude,
     CommandSource::Ci,
     CommandSource::Makefile,
     CommandSource::Manifest,
@@ -565,14 +638,23 @@ fn render_languages(card: &ProjectCard) -> String {
 
 /// Merges every language's [`ProjectCommands`] into the fixed six-kind order; a kind more than
 /// one language provides gets one `"<kind> (<language>): <argv>"` line per language instead of a
-/// shared unprefixed line, and a kind nobody provides prints as `"<kind>: —"`.
+/// shared unprefixed line, and a kind nobody provides prints as `"<kind>: —"`. A kind
+/// [`ProjectCard::agent_commands`] fills wins outright: it prints as the shared unprefixed line
+/// and no per-language provider for that kind is even consulted.
 fn render_commands(card: &ProjectCard) -> Option<String> {
-    if card.languages.is_empty() {
+    if card.languages.is_empty() && card.agent_commands == ProjectCommands::default() {
         return None;
     }
     let mut sources = Vec::new();
     let mut body = Vec::new();
     for (label, select) in COMMAND_KINDS {
+        if let Some(command) = select(&card.agent_commands) {
+            if !sources.contains(&command.source) {
+                sources.push(command.source);
+            }
+            body.push(format!("  {label}: {}", command.argv.join(" ")));
+            continue;
+        }
         let providers: Vec<(Language, &ProjectCommand)> = card
             .languages
             .iter()
@@ -941,6 +1023,104 @@ mod tests {
         let tree = TempTree::new("nogit");
         tree.write("file.txt", "content\n");
         assert_eq!(collect_git(tree.path()), None);
+    }
+
+    #[test]
+    fn parse_agent_commands_reads_known_kinds_and_rejects_unknown_or_duplicate_keys() {
+        let source = CommandSource::Agents;
+        let valid = parse_agent_commands(
+            "intro\n\n```agent-ide\ncheck: cargo xtask check\nlint:  cargo clippy --fix\n```\n\nmore text\n",
+            source,
+        )
+        .expect("valid block parses");
+        assert_eq!(
+            valid.check,
+            Some(ProjectCommand {
+                argv: vec!["cargo".into(), "xtask".into(), "check".into()],
+                source,
+            })
+        );
+        assert_eq!(
+            valid.lint,
+            Some(ProjectCommand {
+                argv: vec!["cargo".into(), "clippy".into(), "--fix".into()],
+                source,
+            })
+        );
+        assert_eq!(valid.build, None);
+
+        assert_eq!(parse_agent_commands("no block here\n", source), None);
+        assert_eq!(
+            parse_agent_commands("```agent-ide\nbuild:\n```\n", source),
+            None,
+            "empty command is malformed"
+        );
+        assert_eq!(
+            parse_agent_commands("```agent-ide\nunknown: x\n```\n", source),
+            None,
+            "key outside COMMAND_KINDS is malformed"
+        );
+        assert_eq!(
+            parse_agent_commands("```agent-ide\ncheck: a\ncheck: b\n```\n", source),
+            None,
+            "repeated key is malformed"
+        );
+        assert_eq!(
+            parse_agent_commands("```agent-ide\ncheck: a\n", source),
+            None,
+            "unterminated block is malformed"
+        );
+    }
+
+    #[test]
+    fn agent_commands_block_overrides_language_commands_in_render() {
+        crate::lang::testing::install();
+        let tree = TempTree::new("agents-override");
+        tree.write(
+            "AGENTS.md",
+            "# notes\n\n```agent-ide\ncheck: cargo xtask check\n```\n",
+        );
+
+        let card = collect(tree.path(), vec![alpha_project()], vec![], None);
+        assert_eq!(
+            card.agent_commands.check,
+            Some(ProjectCommand {
+                argv: vec!["cargo".into(), "xtask".into(), "check".into()],
+                source: CommandSource::Agents,
+            })
+        );
+        let rendered = render(&card);
+        assert!(rendered.contains("commands (agents, ci, manifest, default):"));
+        assert!(rendered.contains("  check: cargo xtask check"));
+        assert!(!rendered.contains("alphac check"));
+    }
+
+    #[test]
+    fn agent_commands_fall_back_from_agents_to_claude_md() {
+        let tree = TempTree::new("agents-fallback");
+        tree.write("AGENTS.md", "no block in this file\n");
+        tree.write("CLAUDE.md", "```agent-ide\nbuild: make release\n```\n");
+
+        let card = collect(tree.path(), vec![], vec![], None);
+        assert_eq!(
+            card.agent_commands.build,
+            Some(ProjectCommand {
+                argv: vec!["make".into(), "release".into()],
+                source: CommandSource::Claude,
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_agent_commands_block_is_ignored() {
+        crate::lang::testing::install();
+        let tree = TempTree::new("agents-malformed");
+        tree.write("AGENTS.md", "```agent-ide\nbogus_key: nope\n```\n");
+
+        let card = collect(tree.path(), vec![alpha_project()], vec![], None);
+        assert_eq!(card.agent_commands, ProjectCommands::default());
+        let rendered = render(&card);
+        assert!(rendered.contains("commands (ci, manifest, default):"));
     }
 
     #[test]
