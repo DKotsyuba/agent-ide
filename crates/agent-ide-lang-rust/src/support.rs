@@ -171,6 +171,15 @@ impl LanguageSupport for RustSupport {
         }
     }
 
+    /// Outline computed from the text alone by the lexical scanner: the same addresses,
+    /// ranges, kinds, signatures and docs the server path normalizes, so a cold rust-analyzer can
+    /// still answer `ide.outline`, `ide.read` and symbol-addressed `ide.edit`. `None` keeps the
+    /// file server-backed — a source that does not scan cleanly (unbalanced braces, a macro
+    /// invocation at item position, cfg-duplicated items with the same name) is never guessed.
+    fn outline_from_source(&self, file: &Path, source: &str) -> Option<Outline> {
+        crate::lexical::lexical_outline(file, source)
+    }
+
     /// Computes the insertion point; see `place` for the shared rules. A container is any kind
     /// that [`SymbolKind::is_container`] accepts plus a test module (`mod tests`), which is
     /// [`SymbolKind::Test`]; members of an empty container are indented four spaces deeper.
@@ -573,10 +582,7 @@ fn convert(
         .collect();
     Symbol {
         signature: signature(lines, body, true),
-        doc: first_paragraph(header.iter().filter_map(|line| {
-            line.strip_prefix("///")
-                .filter(|_| !line.starts_with("////"))
-        })),
+        doc: doc_of(&header),
         path,
         kind,
         name,
@@ -586,10 +592,19 @@ fn convert(
     }
 }
 
+/// First doc paragraph of one symbol's trimmed header lines (`///` only, `////` excluded); the
+/// same extraction the server path and the lexical outline ([`crate::lexical`]) share.
+pub(crate) fn doc_of(header: &[&str]) -> Option<String> {
+    first_paragraph(header.iter().filter_map(|line| {
+        line.strip_prefix("///")
+            .filter(|_| !line.starts_with("////"))
+    }))
+}
+
 /// Path segment of an impl block named `impl …` by the server: the bare type name for an inherent
 /// impl (generic parameters, generic arguments and the module path dropped), the whitespace-
 /// normalized name unchanged for a trait impl (`… for …`) or a name that is not an impl.
-fn impl_segment(name: &str) -> String {
+pub(crate) fn impl_segment(name: &str) -> String {
     let name = collapse_whitespace(name);
     let Some(rest) = name.strip_prefix("impl") else {
         return name;
@@ -607,7 +622,7 @@ fn impl_segment(name: &str) -> String {
 }
 
 /// `text` after its leading balanced `open … close` group (the whole text when unbalanced).
-fn skip_balanced(text: &str, open: char, close: char) -> &str {
+pub(crate) fn skip_balanced(text: &str, open: char, close: char) -> &str {
     let mut depth = 0usize;
     for (index, ch) in text.char_indices() {
         if ch == open {
@@ -624,12 +639,12 @@ fn skip_balanced(text: &str, open: char, close: char) -> &str {
 
 /// Whether a trimmed header line is an attribute whose path ends in `test` (`#[test]`,
 /// `#[tokio::test(flavor = "multi_thread")]`).
-fn is_test_attr(line: &str) -> bool {
+pub(crate) fn is_test_attr(line: &str) -> bool {
     attr_path(line).is_some_and(|path| path == "test" || path.ends_with("::test"))
 }
 
 /// Whether a trimmed header line is a `#[cfg(…)]` naming `test` (not under `not(…)`).
-fn is_cfg_test(line: &str) -> bool {
+pub(crate) fn is_cfg_test(line: &str) -> bool {
     attr_path(line) == Some("cfg")
         && !line.contains("not(")
         && line
@@ -639,7 +654,7 @@ fn is_cfg_test(line: &str) -> bool {
 }
 
 /// The path of an outer attribute line (`#[tokio::test(…)]` → `tokio::test`), `None` otherwise.
-fn attr_path(line: &str) -> Option<&str> {
+pub(crate) fn attr_path(line: &str) -> Option<&str> {
     let inner = line.strip_prefix("#[")?;
     let end = inner.find(['(', ']', ' ', '=']).unwrap_or(inner.len());
     Some(inner[..end].trim())
@@ -652,7 +667,7 @@ fn is_mod_signature(signature: &str) -> bool {
 
 /// First line of the Rust header above the declaration on 1-based line `decl` (`decl` itself when
 /// there is none): `///` lines and outer attributes, see the module docs.
-fn header_start(lines: &[&str], decl: u32) -> u32 {
+pub(crate) fn header_start(lines: &[&str], decl: u32) -> u32 {
     let mut start = decl;
     let mut line = decl.saturating_sub(1);
     while line >= 1 {

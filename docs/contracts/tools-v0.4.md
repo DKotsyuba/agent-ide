@@ -58,6 +58,7 @@ error: ambiguous_symbol; 3 candidates:
 
 - Return a result directly if the server responds within about 10 seconds. Otherwise return `pending: use ide.inspect with detail_ref X`. `ide.inspect` waits up to 10 seconds before returning `pending` again.
 - While a language server is starting, symbol tools return `error: provider_loading; retry in ~N s` with an estimate instead of waiting silently for minutes.
+- A language that can outline a file from its text answers `ide.outline`, `ide.read {symbol}` and the symbol form of `ide.edit` (`replace`/`insert`/`delete`) from that lexical outline while its registered server is still loading, and the reply says so in one compact line — `outline: lexical (rust-analyzer loading)` — because semantic facts (usages, callers, rename) are not included. The lexical outline carries the same addresses and ranges as the server's; a file that does not scan cleanly with that guarantee keeps `provider_loading` rather than a guessed range, and `rename` always waits for the server. The moment the live session answers, the server path is used again.
 
 ### `<agent-ide>` status block
 

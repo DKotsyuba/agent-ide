@@ -95,6 +95,9 @@ Symbol paths are `file#Owner/name`: `#` separates the file, `/` is nesting (impl
 namespace, module → member). Inherent `impl Foo` members are addressed as `Foo/method`;
 trait impls keep `impl Trait for Foo` as the segment. A `provider_loading` error means
 the language server is still loading the workspace: repeat the same call in a few seconds.
+While it loads, `ide.outline`, `ide.read {symbol}` and symbol edits already answer from the
+lexical outline (the reply says `outline: lexical (<server> loading)`); `ide.symbol`,
+`ide.graph` and rename still wait for the server.
 
 ## Workflow
 

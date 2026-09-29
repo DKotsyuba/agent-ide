@@ -7726,11 +7726,22 @@ async fn configured_product_warm_rust_calls_complete_inline_within_three_seconds
         .await;
     assert_eq!(actor.settle(&fixture, start).await["kind"], "activation");
 
-    let warmup = actor
-        .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
-        .await;
-    let warmup = actor.settle(&fixture, warmup).await;
-    assert_eq!(warmup["kind"], "outline", "{warmup}");
+    // Warm the analyzer to a server answer: the first outline replies from the lexical
+    // outline while the workspace loads, so warmth is proven by the marker's absence.
+    let warmup = loop {
+        let reply = actor
+            .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+            .await;
+        let settled = actor.settle(&fixture, reply).await;
+        let text = settled["text"].as_str().unwrap_or_default();
+        if settled["kind"] == "outline" && !text.contains("outline: lexical") {
+            break settled;
+        }
+        assert!(
+            settled["kind"] == "outline" || settled["code"] == "provider_loading",
+            "{settled}"
+        );
+    };
     for (tool, params) in [
         ("ide.outline", json!({"path":"src/lib.rs"})),
         (
@@ -7828,7 +7839,377 @@ async fn configured_product_rust_outline_answers_when_home_is_a_substitute_with_
     daemon.wait().await.unwrap();
 }
 
-/// Rejects an empty root policy and accepts an explicit start root below an admitted root.
+/// Builds the lexical cross-check fixture: the symbol-test crate with real repository sources
+/// copied in as modules, so one warm rust-analyzer outlines exactly the shapes the product
+/// handles (`crates/agent-ide-core` helpers, the Rust language crate's own support module, and
+/// the acceptance scenario's fixture crate).
+fn lexical_cross_check_fixture() -> ProductFixture {
+    let fixture = symbol_test_fixture();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let copies = [
+        ("src/brace.rs", "crates/agent-ide-core/src/lang/brace.rs"),
+        ("src/git.rs", "crates/agent-ide-core/src/workspace/git.rs"),
+        (
+            "src/rust_support.rs",
+            "crates/agent-ide-lang-rust/src/support.rs",
+        ),
+        (
+            "src/fixture_a.rs",
+            "tests/fixtures/eyes/rust-workspace/crates/a/src/lib.rs",
+        ),
+    ];
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "mod brace;\nmod git;\nmod rust_support;\nmod fixture_a;\n\npub fn value() -> i32 { 7 }\npub fn caller() -> i32 { value() }\n",
+    )
+    .unwrap();
+    for (destination, source) in copies {
+        std::fs::copy(root.join(source), fixture.root.join(destination)).unwrap();
+    }
+    fixture.git(&["add", "-A"]);
+    fixture.git(&["commit", "--quiet", "-m", "lexical cross-check fixture"]);
+    fixture
+}
+
+/// The lexical outline equals the server path's answer for real repository files: the rendered
+/// outline text (every symbol, signature, doc and start line) is byte-identical, and each
+/// symbol's address resolves on the server path to the lexical range's exact end lines.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment"]
+async fn configured_product_rust_lexical_outline_matches_the_server() {
+    use agent_ide::lang::rust::RustSupport;
+    use agent_ide::lang::{LanguageSupport, SymbolPath, render};
+
+    let fixture = lexical_cross_check_fixture();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "lexical-cross-check").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"lexical-cross-check-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    for file in [
+        "src/lib.rs",
+        "src/brace.rs",
+        "src/git.rs",
+        "src/rust_support.rs",
+        "src/fixture_a.rs",
+    ] {
+        // Warm answer from the live server: the first calls answer from the lexical outline
+        // while the analyzer loads, so warmth is proven by the marker's absence.
+        let server = loop {
+            let reply = actor
+                .call(&fixture, "ide.outline", json!({"path":file}))
+                .await;
+            let settled = actor.settle(&fixture, reply).await;
+            let text = settled["text"].as_str().unwrap_or_default();
+            if settled["kind"] == "outline" && !text.contains("outline: lexical") {
+                break settled;
+            }
+            assert!(
+                settled["kind"] == "outline" || settled["code"] == "provider_loading",
+                "{file}: {settled}"
+            );
+        };
+        let server_text = server["text"].as_str().unwrap();
+        let source = std::fs::read_to_string(fixture.root.join(file)).unwrap();
+        let lexical = RustSupport
+            .outline_from_source(Path::new(file), &source)
+            .unwrap_or_else(|| panic!("{file} must scan cleanly"));
+        assert_eq!(
+            server_text,
+            render::outline_text(&lexical),
+            "{file}: the lexical outline must equal the server's"
+        );
+        assert!(!server_text.contains("outline: lexical"), "{file}");
+
+        // End lines: every lexical address resolves through the server path to the same
+        // range. Same-named siblings (a type and its impl blocks) share one address and
+        // `find` answers the first, so each unique address is checked once.
+        let mut addresses: Vec<std::collections::BTreeSet<String>> =
+            vec![std::collections::BTreeSet::new()];
+        for symbol in &lexical.symbols {
+            symbol.walk(&mut |symbol| {
+                addresses[0].insert(symbol.path.to_string());
+            });
+        }
+        for address in addresses[0].iter().take(60) {
+            let expected = lexical
+                .find(&SymbolPath::parse(address).unwrap())
+                .unwrap_or_else(|| panic!("{file}: {address} missing from the lexical outline"));
+            let symbol = expected;
+            let read = actor
+                .call(&fixture, "ide.read", json!({"symbol":address}))
+                .await;
+            let read = actor.settle(&fixture, read).await;
+            let text = read["text"].as_str().unwrap_or_default();
+            let header = format!("{address}  (lines {})\n", symbol.range);
+            assert!(
+                text.starts_with(&header),
+                "{file}: {symbol:?} expected {header:?}, got {text}"
+            );
+        }
+    }
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A rust-analyzer stand-in that completes the LSP handshake, reports one document symbol of
+/// its own (`server_only`) and stays not-ready until its ready flag file appears, then sends
+/// the quiescent `experimental/serverStatus` notification.
+const COLD_STUB_SERVER: &str = r#"
+import fs from 'node:fs';
+const readyFlag = process.argv[2];
+let buffer = Buffer.alloc(0);
+let nextId = 0;
+const pending = new Map();
+const send = (message) => {
+  const text = JSON.stringify(message);
+  process.stdout.write(`Content-Length: ${Buffer.byteLength(text)}\r\n\r\n${text}`);
+};
+const reply = (id, result) => send({ jsonrpc: '2.0', id, result });
+process.stdin.on('data', (chunk) => {
+  buffer = Buffer.concat([buffer, chunk]);
+  for (;;) {
+    const header = buffer.indexOf('\r\n\r\n');
+    if (header < 0) return;
+    const length = parseInt(buffer.slice(0, header).toString().match(/Content-Length: (\d+)/)?.[1] ?? '0', 10);
+    if (buffer.length < header + 4 + length) return;
+    const message = JSON.parse(buffer.slice(header + 4, header + 4 + length).toString());
+    buffer = buffer.slice(header + 4 + length);
+    if (message.id !== undefined) pending.set(message.id, message.method);
+    switch (message.method) {
+      case 'initialize':
+        reply(message.id, {
+          capabilities: {
+            textDocumentSync: 1,
+            documentSymbolProvider: true,
+            definitionProvider: true,
+            referencesProvider: true,
+            hoverProvider: true,
+            callHierarchyProvider: true,
+          },
+          serverInfo: { name: 'rust-analyzer', version: '1.98.1 (48a229ce 2026-09-01)' },
+        });
+        break;
+      case 'initialized':
+        break;
+      case 'shutdown':
+        reply(message.id, null);
+        break;
+      case 'exit':
+        process.exit(0);
+      case 'textDocument/documentSymbol':
+        // The fixture's own functions plus one extra top-level symbol only the server
+        // reports, so a warm reply is visibly the server's answer (three symbols where
+        // the file itself has two functions).
+        reply(message.id, [
+          {
+            name: 'value',
+            kind: 12,
+            range: { start: { line: 0, character: 0 }, end: { line: 3, character: 1 } },
+            selectionRange: { start: { line: 1, character: 7 }, end: { line: 1, character: 12 } },
+          },
+          {
+            name: 'caller',
+            kind: 12,
+            range: { start: { line: 5, character: 0 }, end: { line: 7, character: 1 } },
+            selectionRange: { start: { line: 5, character: 7 }, end: { line: 5, character: 13 } },
+          },
+          {
+            name: 'server_only',
+            kind: 12,
+            range: { start: { line: 0, character: 0 }, end: { line: 7, character: 1 } },
+            selectionRange: { start: { line: 0, character: 0 }, end: { line: 0, character: 7 } },
+          },
+        ]);
+        break;
+      case 'textDocument/references':
+        reply(message.id, []);
+        break;
+      default:
+        if (message.id !== undefined) reply(message.id, null);
+    }
+  }
+});
+const waitReady = () => {
+  if (fs.existsSync(readyFlag)) {
+    send({ jsonrpc: '2.0', method: 'experimental/serverStatus', params: { health: 'ok', quiescent: true } });
+  } else {
+    setTimeout(waitReady, 100);
+  }
+};
+waitReady();
+"#;
+
+/// While the registered Rust server is still loading, `ide.outline`, `ide.read` and the
+/// symbol-addressed `ide.edit` answer at once from the lexical outline and say so in one
+/// compact line; `ide.symbol` keeps waiting for the server, and once the server reports ready
+/// the server path is used again (its own symbol appears, the lexical marker disappears).
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_NODE environment"]
+async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outline() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let node = std::env::var("AGENT_IDE_NODE").unwrap();
+    let fixture = symbol_test_fixture();
+    let stub = fixture.base.join("cold-stub-server.mjs");
+    let ready = fixture.base.join("cold-stub-ready");
+    std::fs::write(&stub, COLD_STUB_SERVER).unwrap();
+    let wrapper = fixture.base.join("cold-rust-provider");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec '{}' '{}' '{}'\n",
+            node,
+            stub.display(),
+            ready.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN")
+        .unwrap_or_else(|_| "1.98.1-aarch64-apple-darwin".into());
+    fixture.write_config(json!([{
+        "executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
+        "settings":"rust_cache_priming_disabled_v1",
+        "toolchain":toolchain,
+        "cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),
+        "cargo_version":"cargo 1.98.1",
+        "rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),
+        "rustc_version":"rustc 1.98.1",
+        "trust":"fixture-disabled",
+        "cache_namespace":"fixture-cold-lexical-cache"
+    }]));
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "/// Answers cold.\npub fn value() -> i32 { 7 }\n\npub fn caller() -> i32 { value() }\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "src/lib.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "cold lexical fixture"]);
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "cold-lexical").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"cold-lexical-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    // Cold outline: complete at once, from the text, and marked lexical.
+    let began = std::time::Instant::now();
+    let outline = actor
+        .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+        .await;
+    let outline = actor.settle(&fixture, outline).await;
+    assert_eq!(outline["kind"], "outline", "{outline}");
+    let text = outline["text"].as_str().unwrap();
+    assert!(text.contains("pub fn value() -> i32"), "{outline}");
+    assert!(
+        text.contains("outline: lexical (rust-analyzer loading)"),
+        "the cold outline must say it is lexical: {outline}"
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(8),
+        "{:?} to answer",
+        began.elapsed()
+    );
+
+    // Cold symbol edits: insert then delete resolve from the lexical outline, marked lexical.
+    let mut edit = async |params: Value| {
+        let reply = actor.call(&fixture, "ide.edit", params).await;
+        actor.settle(&fixture, reply).await
+    };
+    let insert = edit(json!({"operation_id":"cold-insert","op":"insert","symbol":"src/lib.rs#value","where":"before","content":"/// Cold probe.\nfn cold_probe() -> u8 {\n    1\n}"})).await;
+    assert_eq!(insert["operation"], "inserted", "{insert}");
+    assert!(
+        insert["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("outline: lexical (rust-analyzer loading)"),
+        "the cold edit must say its symbol was lexical: {insert}"
+    );
+    let delete =
+        edit(json!({"operation_id":"cold-delete","op":"delete","symbol":"src/lib.rs#cold_probe"}))
+            .await;
+    assert_eq!(delete["operation"], "deleted", "{delete}");
+    assert!(
+        delete["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("outline: lexical (rust-analyzer loading)"),
+        "{delete}"
+    );
+
+    // Cold read of a symbol: numbered source, marked lexical, with its source_ref.
+    let read = actor
+        .call(&fixture, "ide.read", json!({"symbol":"src/lib.rs#value"}))
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let read_text = read["text"].as_str().unwrap_or_default();
+    assert!(read_text.contains("pub fn value()"), "{read}");
+    assert!(
+        read_text.contains("outline: lexical (rust-analyzer loading)"),
+        "{read}"
+    );
+
+    // `ide.symbol` does not answer from the lexical outline: usages need the server, so the
+    // call stays pending instead of completing like the tools above.
+    let symbol = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#value"}))
+        .await;
+    assert_eq!(symbol["state"], "pending", "{symbol}");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let still = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"src/lib.rs#caller"}),
+        )
+        .await;
+    assert_eq!(still["state"], "pending", "{still}");
+
+    // The server becomes ready: the server path is used again.
+    std::fs::write(&ready, "ready").unwrap();
+    let settled = actor.settle(&fixture, symbol).await;
+    let card = settled["text"].as_str().unwrap_or_default();
+    assert!(card.contains("symbol: value"), "{settled}");
+    assert!(!card.contains("outline: lexical"), "{settled}");
+    let warm = loop {
+        let reply = actor
+            .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+            .await;
+        let settled = actor.settle(&fixture, reply).await;
+        let text = settled["text"].as_str().unwrap_or_default();
+        // Three symbols for a file with two functions is the server's answer; the lexical
+        // outline of the same file reports two and marks itself lexical.
+        if settled["kind"] == "outline" && text.contains("(3 symbols)") {
+            break settled;
+        }
+        assert!(
+            text.contains("outline: lexical (rust-analyzer loading)"),
+            "still lexical: {settled}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+    let warm_text = warm["text"].as_str().unwrap();
+    assert!(warm_text.contains("pub fn caller() -> i32"), "{warm}");
+    assert!(!warm_text.contains("outline: lexical"), "{warm}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Rejects an empty root policy and accepts an explicit start root below an admitted root.
 #[tokio::test]
 async fn configured_product_start_enforces_allowed_roots_and_accepts_root_argument() {

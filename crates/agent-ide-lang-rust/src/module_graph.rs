@@ -221,32 +221,36 @@ fn code(file: &Path) -> Option<String> {
         return None;
     }
     let text: Vec<char> = std::fs::read_to_string(file).ok()?.chars().collect();
-    let mut code = String::with_capacity(text.len());
+    Some(blanked_code(&text).into_iter().collect())
+}
+
+/// `text` as code only: every comment and string or char literal replaced by spaces, every line
+/// break and every other character kept, so offsets and line numbers stay those of the source.
+/// Shared by the module graph and the lexical outline ([`crate::lexical`]).
+pub(crate) fn blanked_code(text: &[char]) -> Vec<char> {
+    let mut code = text.to_vec();
     let mut index = 0;
     while index < text.len() {
-        match blank_end(&text, index) {
+        match blank_end(text, index) {
             Some(end) => {
-                code.extend(
-                    text[index..end]
-                        .iter()
-                        .map(|&character| if character == '\n' { '\n' } else { ' ' }),
-                );
+                for position in &mut code[index..end] {
+                    if *position != '\n' {
+                        *position = ' ';
+                    }
+                }
                 index = end;
             }
-            None => {
-                code.push(text[index]);
-                index += 1;
-            }
+            None => index += 1,
         }
     }
-    Some(code)
+    code
 }
 
 /// Returns the end (exclusive) of the comment or literal starting at `index` of `text`, or `None`
 /// when none starts there. Handles `//` and nested `/* */` comments, escaped `"…"` strings,
 /// raw `r#"…"#` strings (also `br`/`cr`), and `'x'`/`'\…'` char literals; a lifetime or label
 /// (`'a`) is not a literal. An unterminated comment or literal runs to the end of `text`.
-fn blank_end(text: &[char], index: usize) -> Option<usize> {
+pub(crate) fn blank_end(text: &[char], index: usize) -> Option<usize> {
     let at = |offset: usize| text.get(index + offset).copied();
     let identifier = |position: Option<usize>| {
         position

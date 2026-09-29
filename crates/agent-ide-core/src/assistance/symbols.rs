@@ -38,7 +38,7 @@ impl Worker<'_> {
             None => resolved.cloned().ok_or(FailureCode::UnknownSymbol)?,
         };
         let (observed, bytes) = self.observe(&binding, file).await?;
-        let (outline, root) = self.outline_of(job, &observed, &bytes).await?;
+        let (outline, root, _) = self.outline_of(job, &observed, &bytes).await?;
         let found = if symbol.file().is_some() {
             outline
                 .find(&symbol)
@@ -82,7 +82,8 @@ impl Worker<'_> {
             let relative = relative.to_path_buf();
             if !outlines.contains_key(&relative) {
                 let (test_observed, test_bytes) = self.observe(&binding, relative.clone()).await?;
-                let (test_outline, _) = self.outline_of(job, &test_observed, &test_bytes).await?;
+                let (test_outline, _, _) =
+                    self.outline_of(job, &test_observed, &test_bytes).await?;
                 outlines.insert(relative.clone(), test_outline);
             }
             let test_outline = &outlines[&relative];
@@ -149,9 +150,9 @@ impl Worker<'_> {
         if let Some(code) = no_such_file(observed.state(), &path) {
             return Err(code);
         }
-        let (outline, _) = self.outline_of(job, &observed, &bytes).await?;
+        let (outline, _, lexical) = self.outline_of(job, &observed, &bytes).await?;
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
-        let text = match job.parameters.get("kinds").and_then(Value::as_str) {
+        let mut text = match job.parameters.get("kinds").and_then(Value::as_str) {
             Some(requested) => {
                 let kinds: Vec<lang::SymbolKind> = requested
                     .split(',')
@@ -161,6 +162,10 @@ impl Worker<'_> {
             }
             None => render::outline_text(&outline),
         };
+        if lexical && let Some(note) = self.lexical_note(observed.path()) {
+            text.push_str(&note);
+            text.push('\n');
+        }
         let (reply, page) =
             ContextPageState::new(text, 0, false, ResultKind::Outline).next(&job.reference)?;
         self.shared.set_context_page(&job.reference, page);
@@ -179,6 +184,7 @@ impl Worker<'_> {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let sigil = requested.as_deref().and_then(links::sigil_address);
+        let mut lexical = None;
         let (path, range, title) = match (requested.as_deref(), sigil) {
             // A sigil address reads the name's first indexed definition.
             (_, Some((namespace, name))) => {
@@ -192,8 +198,11 @@ impl Worker<'_> {
                     .ok_or(FailureCode::UnknownSymbol)?
                     .to_path_buf();
                 let (observed, bytes) = self.observe(&binding, file.clone()).await?;
-                let (outline, _) = self.outline_of(job, &observed, &bytes).await?;
+                let (outline, _, from_text) = self.outline_of(job, &observed, &bytes).await?;
                 let found = outline.find(&symbol).ok_or(FailureCode::UnknownSymbol)?;
+                lexical = from_text
+                    .then(|| self.lexical_note(observed.path()))
+                    .flatten();
                 (file, found.range, symbol.to_string())
             }
             (None, None) => {
@@ -222,6 +231,10 @@ impl Worker<'_> {
         let range = LineRange::new(range.start, range.end.min(total));
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
         let mut text = render::read_text(&path, Some(&title), range, source);
+        if let Some(note) = lexical {
+            text.push_str(&note);
+            text.push('\n');
+        }
         text.push_str(&format!("source_ref: {}\n", job.reference));
         let (reply, page) =
             ContextPageState::new(text, 0, false, ResultKind::Read).next(&job.reference)?;
@@ -303,7 +316,7 @@ impl Worker<'_> {
             }
         };
         let (observed, bytes) = self.observe(&binding, file.clone()).await?;
-        let (outline, worktree_root) = self.outline_of(job, &observed, &bytes).await?;
+        let (outline, worktree_root, _) = self.outline_of(job, &observed, &bytes).await?;
         let found = match symbol.file() {
             Some(_) => outline.find(&symbol).cloned(),
             None => {
@@ -521,7 +534,7 @@ impl Worker<'_> {
             },
         };
         let (observed, bytes) = self.observe(&binding, file.clone()).await?;
-        let (outline, worktree_root) = self.outline_of(job, &observed, &bytes).await?;
+        let (outline, worktree_root, _) = self.outline_of(job, &observed, &bytes).await?;
         let found = match symbol.file() {
             Some(_) => outline.find(&symbol).cloned(),
             None => {
@@ -831,7 +844,7 @@ impl Worker<'_> {
             .to_path_buf();
         let binding = job.invocation.binding_ref().clone();
         let (observed, bytes) = self.observe(&binding, relative.clone()).await?;
-        let (outline, _) = self.outline_of(job, &observed, &bytes).await?;
+        let (outline, _, _) = self.outline_of(job, &observed, &bytes).await?;
         let line = item.selection_range.start.line + 1;
         let found = outline
             .symbols
@@ -874,14 +887,17 @@ impl Worker<'_> {
     }
 
     /// Document symbols of one observed file through the live session, normalized by the
-    /// language module, or the language's source outline when no server owns the file. Returns
-    /// the outline and the worktree root for path rendering.
+    /// language module, or the language's source outline when no server owns the file. While a
+    /// registered server is still loading (a cold workspace load), the source outline answers at
+    /// once instead of parking; an uncertain file keeps waiting for the server. Returns the
+    /// outline, the worktree root for path rendering, and whether the outline came from the text
+    /// alone while that server loads (replies then say so in one compact line).
     async fn outline_of(
         &mut self,
         job: &mut Job,
         observed: &SourceObservation,
         bytes: &[u8],
-    ) -> Result<(Outline, std::path::PathBuf), FailureCode> {
+    ) -> Result<(Outline, std::path::PathBuf, bool), FailureCode> {
         let language = Lang::for_path(observed.path()).ok_or(FailureCode::ProviderUnavailable)?;
         let support = language.support();
         let source = observed_text(observed, bytes)?.to_owned();
@@ -891,10 +907,23 @@ impl Worker<'_> {
             // answers; any other keeps the provider-unavailable refusal.
             return support
                 .outline_from_source(observed.path(), &source)
-                .map(|outline| (outline, worktree_root))
+                .map(|outline| (outline, worktree_root, false))
                 .ok_or(FailureCode::ProviderUnavailable);
         }
-        let live = self.live_session_for(job, observed).await?;
+        let live = match self.live_session_for(job, observed).await {
+            Ok(live) => live,
+            Err(FailureCode::ProviderLoading) => {
+                // The registered server is loading: a language that outlines from its text
+                // answers now and the caller's reply marks the outline lexical; a file that
+                // does not scan cleanly keeps the parking retry exactly as before.
+                job.park_until = None;
+                return support
+                    .outline_from_source(observed.path(), &source)
+                    .map(|outline| (outline, worktree_root, true))
+                    .ok_or(FailureCode::ProviderLoading);
+            }
+            Err(other) => return Err(other),
+        };
         let symbols = live
             .session
             .document_symbols(observed, bytes)
@@ -903,7 +932,16 @@ impl Worker<'_> {
         Ok((
             support.normalize(observed.path(), &source, symbols),
             worktree_root,
+            false,
         ))
+    }
+
+    /// One compact line marking a reply that was built from the lexical outline while the
+    /// file's registered server loads, so the agent knows semantic facts (usages, callers) are
+    /// not included. `None` when no server owns the file (nothing is loading).
+    fn lexical_note(&self, path: &Path) -> Option<String> {
+        self.session_server(path)
+            .map(|server| format!("outline: lexical ({} loading)", server.name()))
     }
 
     /// Resolves a bare symbol name to its definition file.
@@ -1067,7 +1105,7 @@ impl Worker<'_> {
         )
         .ok()?;
         match self.outline_of(job, &observed, read.contents()).await {
-            Ok((outline, _)) => Some((outline, true)),
+            Ok((outline, _, _)) => Some((outline, true)),
             // The server could not outline it (its project config lives below the worktree
             // root): the language's text outline still names the enclosing declaration.
             Err(_) => Lang::for_path(file)?
@@ -1206,7 +1244,7 @@ impl Worker<'_> {
         let Ok((observed, bytes)) = self.observe(&binding, relative.to_path_buf()).await else {
             return item.name.clone();
         };
-        let Ok((outline, _)) = self.outline_of(job, &observed, &bytes).await else {
+        let Ok((outline, _, _)) = self.outline_of(job, &observed, &bytes).await else {
             return item.name.clone();
         };
         let line = item.selection_range.start.line + 1;
@@ -1544,7 +1582,7 @@ impl Worker<'_> {
             .and_then(Value::as_str)
             .map(str::to_owned);
         // Resolve the file and the line span the operation touches.
-        let (file, splice) = match job.parameters.get("symbol").and_then(Value::as_str) {
+        let (file, splice, lexical) = match job.parameters.get("symbol").and_then(Value::as_str) {
             Some(symbol) => {
                 let symbol = SymbolPath::parse(symbol).map_err(|_| FailureCode::UnknownSymbol)?;
                 let file = symbol
@@ -1553,7 +1591,10 @@ impl Worker<'_> {
                     .to_path_buf();
                 let (observed, bytes) = self.observe(&binding, file.clone()).await?;
                 let source = observed_text(&observed, &bytes)?.to_owned();
-                let (outline, _) = self.outline_of(job, &observed, &bytes).await?;
+                let (outline, _, lexical) = self.outline_of(job, &observed, &bytes).await?;
+                let lexical = lexical
+                    .then(|| self.lexical_note(observed.path()))
+                    .flatten();
                 let splice = match op.as_str() {
                     "insert" => {
                         let where_ = match job.parameters.get("where").and_then(Value::as_str) {
@@ -1577,7 +1618,7 @@ impl Worker<'_> {
                         Splice::Replace(found.range)
                     }
                 };
-                (file, splice)
+                (file, splice, lexical)
             }
             None => {
                 let path = job.parameters["path"]
@@ -1590,7 +1631,7 @@ impl Worker<'_> {
                     .and_then(Value::as_str)
                     .and_then(crate::assistance::facade::parse_line_range)
                     .ok_or(FailureCode::Internal)?;
-                (std::path::PathBuf::from(path), Splice::Replace(range))
+                (std::path::PathBuf::from(path), Splice::Replace(range), None)
             }
         };
         // Observe again right before splicing so the base is the exact text being replaced.
@@ -1662,6 +1703,14 @@ impl Worker<'_> {
             &job.reference,
             splice_end(&splice),
         );
+        if let Some(note) = lexical {
+            // The symbol was resolved from the lexical outline while the server loads; the
+            // reply says so next to the formatter's line-movement note.
+            job.format_note = Some(match job.format_note.take() {
+                Some(existing) => format!("{note}\n{existing}"),
+                None => note,
+            });
+        }
         let candidate = formatted;
         let request = EditRequest::new(
             &operation_id,
@@ -1843,7 +1892,7 @@ impl Worker<'_> {
             .ok_or(FailureCode::UnknownSymbol)?
             .to_path_buf();
         let (observed, bytes) = self.observe(&binding, file.clone()).await?;
-        let (outline, worktree_root) = self.outline_of(job, &observed, &bytes).await?;
+        let (outline, worktree_root, _) = self.outline_of(job, &observed, &bytes).await?;
         let found = outline
             .find(&symbol)
             .cloned()
@@ -1851,7 +1900,16 @@ impl Worker<'_> {
         let source = observed_text(&observed, &bytes)?;
         let byte_offset = name_offset(source, &found)?;
         let (edit, encoding) = {
-            let live = self.live_session_for(job, &observed).await?;
+            // Rename is server-only: while the server loads, park and retry instead of failing
+            // fast, exactly as it did before the lexical outline let edits answer while cold.
+            let live = match self.live_session_for(job, &observed).await {
+                Ok(live) => live,
+                Err(FailureCode::ProviderLoading) => {
+                    job.park_until = Some(tokio::time::Instant::now() + Duration::from_millis(300));
+                    return Err(FailureCode::ProviderLoading);
+                }
+                Err(other) => return Err(other),
+            };
             let encoding = live.session.capabilities().position_encoding.clone();
             let edit = live
                 .session
