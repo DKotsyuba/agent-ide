@@ -2801,7 +2801,19 @@ impl<'a> Worker<'a> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Allocates one physical slot without waiting behind a retained idle backend; queued tickets are cancelled.
+    /// Allocates one physical slot for `binding`'s owner without waiting behind a retained idle
+    /// backend: a request that would queue has its ticket cancelled at once, so nothing stays
+    /// queued for this owner.
+    ///
+    /// Submission and cancellation run under one admission guard. The guard of a `match`
+    /// scrutinee lives until the end of the `match`, so locking the (non-reentrant) mutex a second
+    /// time inside an arm deadlocked the worker task's thread forever once the owner's running
+    /// slots were full — e.g. two live language servers of one binding (0.6.1 `ide.diff` hang).
+    ///
+    /// # Errors
+    ///
+    /// * [`FailureCode::Capacity`] when the owner or the daemon has no free running slot.
+    /// * [`FailureCode::Internal`] when the binding fingerprint is not a valid owner identity.
     fn admit(
         &mut self,
         binding: &BindingRef,
@@ -2813,10 +2825,11 @@ impl<'a> Worker<'a> {
                 .to_string(),
         )
         .map_err(|_| FailureCode::Internal)?;
-        match self.admission().submit(owner, AdmissionClass::Interactive) {
+        let mut admission = self.admission();
+        match admission.submit(owner, AdmissionClass::Interactive) {
             Admission::Granted(lease) => Ok(lease),
             Admission::Queued(ticket) => {
-                self.admission().cancel_ticket(ticket);
+                admission.cancel_ticket(ticket);
                 Err(FailureCode::Capacity)
             }
             Admission::Refused(_) => Err(FailureCode::Capacity),
@@ -6531,6 +6544,40 @@ mod stop_retry_tests {
             notice(&worker).is_some_and(|line| line.contains(" → detached) outside Agent IDE")),
             "the first probe after the interval notices the switch"
         );
+    }
+
+    /// Once a binding holds every running slot of its owner (two live language servers under the
+    /// fixed limits), the next admission — the Git spawn of `ide.diff` — is refused with
+    /// `Capacity` and leaves no queued ticket, instead of relocking the admission mutex it still
+    /// holds (the 0.6.1 hang). The body runs on its own thread, so a deadlock fails after a
+    /// bounded wait.
+    #[test]
+    fn admission_at_the_owner_ceiling_is_refused_not_deadlocked() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let fixture = Fixture::new();
+                let store = fixture.store();
+                let workspace = DurableWorkspace::open(&store).await.unwrap();
+                let mut worker = worker(&store, workspace, fixture.root.clone());
+                let binding = BindingRef::fixture("ceiling-actor", "ceiling-channel", 1);
+                let limit = worker.admission().inspect().per_owner_running_limit;
+                let held: Vec<_> = (0..limit).map(|_| worker.admit(&binding)).collect();
+                assert!(held.iter().all(Result::is_ok), "the owner fills its slots");
+                let third = worker.admit(&binding);
+                let queued = worker.admission().inspect().queued;
+                let _ = sender.send((third.err(), queued));
+            });
+        });
+        let (third, queued) = receiver
+            .recv_timeout(Duration::from_secs(20))
+            .expect("admission at the owner ceiling deadlocked the worker");
+        assert_eq!(third, Some(FailureCode::Capacity));
+        assert_eq!(queued, 0, "the refused request leaves no queued ticket");
     }
 
     /// After `ide.stop` the actor/channel identity still reads its test run's status through the
