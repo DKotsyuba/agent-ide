@@ -2048,13 +2048,14 @@ async fn capture_attempt<R: SnapshotRunner>(
     })
 }
 
-/// Keeps untracked entries listed by name only, whatever their kind; disappearing paths retry.
+/// Keeps untracked entries listed by name only, whatever their kind; a changed root retries.
 ///
 /// Untracked paths are never treated as baseline content and their bytes are never captured, so
 /// an untracked symlink (typically `node_modules ->` a sibling checkout) or special file stays a
 /// listed name instead of refusing the whole snapshot: one such entry used to fail every diff
-/// with `unsupported_entry`. No content and no link target is read or disclosed; a path that
-/// disappears or a worktree whose root identity changed still triggers the unstable retry.
+/// with `unsupported_entry`. No content and no link target is read or disclosed. A missing path
+/// (it vanished, or a dangling link) stays a listed name until the next capture; only a worktree
+/// whose root identity changed triggers the unstable retry.
 fn inspect_untracked(worktree: &WorktreeRef, path: &Path) -> Result<(), GitError> {
     match crate::workspace::observation::snapshot_source_metadata(worktree, path) {
         Ok(_) => Ok(()),
