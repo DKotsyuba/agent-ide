@@ -16,8 +16,8 @@ use agent_ide_core::{
     assistance::{host_binding::BindingRef, launcher::ProviderLaunch, reply::FailureCode},
     checks::BoxFuture,
     execution::{
-        AdmissionClass, BackendRelease, ProviderBackendKind, ProviderLeaseAdmission,
-        ProviderLeaseRegistry, ProviderViewLease,
+        AdmissionClass, AdmissionError, BackendRelease, ProviderBackendKind,
+        ProviderLeaseAdmission, ProviderLeaseError, ProviderLeaseRegistry, ProviderViewLease,
     },
     intelligence::{
         context::ContextQuery,
@@ -387,11 +387,21 @@ impl GoplsBackend {
                 lease,
             ) {
                 Ok(capability) => capability,
-                Err((_, unused)) => {
+                Err((error, unused)) => {
                     controller
                         .release(unused)
                         .map_err(|_| FailureCode::Internal)?;
-                    return Err(FailureCode::Internal);
+                    // A binding whose servers already fill their share of its slots is refused
+                    // like any other provider request beyond that share.
+                    return Err(
+                        if error
+                            == ProviderLeaseError::Admission(AdmissionError::OwnerProviderLimit)
+                        {
+                            FailureCode::ProviderUnavailable
+                        } else {
+                            FailureCode::Internal
+                        },
+                    );
                 }
             }
         };

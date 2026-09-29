@@ -312,3 +312,38 @@ async fn dropped_registry_cannot_authorize_an_outstanding_capability() {
         "lost registry does not fabricate settlement"
     );
 }
+
+/// A shared server's forwarder is a provider slot too: once its owner's servers fill
+/// `per_owner_running − 1`, the forwarder is refused and its lease comes back unchanged, so the
+/// owner's last slot stays free for a non-provider operation.
+#[test]
+fn forwarder_beyond_the_owner_provider_share_is_refused() {
+    let mut admission = AdmissionController::new(AdmissionLimits {
+        total_running: 4,
+        per_owner_running: 2,
+        per_owner_queued: 1,
+        total_queued: 4,
+        interactive_burst: 1,
+    })
+    .unwrap();
+    let (_, mut registry) = controllers();
+    let provider = request(CommandKind::Provider, "/bin/sleep", &["30"]);
+    let view = view(&mut registry, &mut admission, &provider);
+    let Admission::Granted(slot) = admission.submit(
+        OwnerId::new("provider").unwrap(),
+        AdmissionClass::Interactive,
+    ) else {
+        panic!("the kept slot admits an operation");
+    };
+    let Err((error, returned)) =
+        registry.take_forwarder_spawn_lease(&mut admission, view, &provider, slot)
+    else {
+        panic!("a forwarder took the owner's last slot");
+    };
+    assert_eq!(
+        error,
+        ProviderLeaseError::Admission(AdmissionError::OwnerProviderLimit)
+    );
+    admission.release(returned).unwrap();
+    assert_eq!(admission.running_count(), 1, "only the server slot remains");
+}

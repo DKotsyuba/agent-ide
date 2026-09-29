@@ -833,7 +833,11 @@ pub enum AdmissionClass {
 pub struct AdmissionLimits {
     /// Maximum simultaneously admitted owned operations.
     pub total_running: usize,
-    /// Maximum simultaneously admitted operations for one owner.
+    /// Maximum simultaneously admitted operations for one owner. Provider (language-server and
+    /// forwarder) slots may hold at most `per_owner_running − 1` of them, so a retained idle
+    /// server never takes the owner's last slot from a short operation such as a Git snapshot or
+    /// a test run; with a single owner slot there is nothing to keep free and one provider may
+    /// hold it.
     pub per_owner_running: usize,
     /// Maximum queued operations for one owner.
     pub per_owner_queued: usize,
@@ -856,6 +860,9 @@ pub enum AdmissionError {
     UnknownLease,
     /// A provider reservation requires the registry's one-time direct-child reap completion.
     ProviderReapRequired,
+    /// The owner's live provider (language-server) slots already fill every owner slot but the
+    /// one kept free for its non-provider operations; see [`AdmissionLimits::per_owner_running`].
+    OwnerProviderLimit,
 }
 
 /// Identifies a queued request that may be inspected or cancelled without terminating a process.
@@ -1151,6 +1158,40 @@ impl AdmissionController {
             return false;
         }
         self.queue.iter().any(|entry| entry.id == ticket.0)
+    }
+
+    /// Submits a request for a new provider backend slot: like [`Self::submit`], except that a
+    /// request which would be granted now while `owner`'s provider slots already fill
+    /// `per_owner_running − 1` is refused with [`AdmissionError::OwnerProviderLimit`], so the slot
+    /// it would take stays free for the owner's non-provider operations. A request that would
+    /// queue still queues and reserves nothing; [`ProviderLeaseRegistry::promote`] checks the
+    /// share again when it is promoted.
+    fn submit_provider(&mut self, owner: OwnerId, class: AdmissionClass) -> Admission {
+        if self.queue.is_empty() && self.can_run(&owner) && !self.provider_room(&owner) {
+            return Admission::Refused(AdmissionError::OwnerProviderLimit);
+        }
+        self.submit(owner, class)
+    }
+
+    /// Returns whether `owner` may bind one more provider slot: its current provider slots stay
+    /// below `per_owner_running − 1` (at least one), keeping one owner slot free for non-provider
+    /// operations. Counts the live provider slots on every call; there are at most
+    /// `total_running` of them.
+    fn provider_room(&self, owner: &OwnerId) -> bool {
+        let held = self
+            .provider_slots
+            .iter()
+            .filter(|id| self.leases.get(id) == Some(owner))
+            .count();
+        held < self.limits.per_owner_running.saturating_sub(1).max(1)
+    }
+
+    /// Returns [`Self::provider_room`] for the owner of the live lease `id`; `false` when `id` is
+    /// not a live lease of this controller.
+    fn lease_provider_room(&self, id: u64) -> bool {
+        self.leases
+            .get(&id)
+            .is_some_and(|owner| self.provider_room(owner))
     }
 
     /// Returns whether an owner can receive one more running slot under both finite ceilings.
@@ -1680,7 +1721,9 @@ impl ProviderLeaseRegistry {
     ///
     /// Each attached view is one forwarder for accounting; only a newly created owned backend
     /// consumes an admission lease, so compatible shared peers do not double-count a heavy
-    /// process. Queue tickets reserve neither a view nor a backend.
+    /// process. Queue tickets reserve neither a view nor a backend. A new owned backend that would
+    /// be granted while `owner`'s provider slots already fill `per_owner_running − 1` is
+    /// [`ProviderLeaseAdmission::Refused`] with [`AdmissionError::OwnerProviderLimit`] instead.
     pub fn request(
         &mut self,
         admission: &mut AdmissionController,
@@ -1718,7 +1761,7 @@ impl ProviderLeaseRegistry {
         let reserved = match kind {
             ProviderBackendKind::Borrowed => None,
             ProviderBackendKind::OwnedShared | ProviderBackendKind::OwnedExclusive => {
-                match admission.submit(owner, class) {
+                match admission.submit_provider(owner, class) {
                     Admission::Granted(lease) => Some(lease),
                     Admission::Queued(ticket) => {
                         self.pending.insert(
@@ -1771,6 +1814,10 @@ impl ProviderLeaseRegistry {
     }
 
     /// Consumes one exact central promotion once, revalidating its stored scope and backend limits.
+    ///
+    /// A promotion whose owner's provider slots already fill `per_owner_running − 1` releases its
+    /// lease and fails with [`AdmissionError::OwnerProviderLimit`], like a mismatched promotion
+    /// fails with [`ProviderLeaseError::InvalidPromotion`].
     pub fn promote(
         &mut self,
         admission: &mut AdmissionController,
@@ -1784,6 +1831,14 @@ impl ProviderLeaseRegistry {
             .pending
             .remove(&promotion.ticket.0)
             .ok_or(ProviderLeaseError::InvalidPromotion)?;
+        if !admission.lease_provider_room(promotion.lease.0) {
+            admission
+                .release(promotion.lease)
+                .map_err(ProviderLeaseError::Admission)?;
+            return Err(ProviderLeaseError::Admission(
+                AdmissionError::OwnerProviderLimit,
+            ));
+        }
         if pending.authority != ProviderView::from_authority("", authority)
             || !self.can_attach(&pending.backend)
             || self.backends.contains_key(&pending.backend)
@@ -1843,6 +1898,8 @@ impl ProviderLeaseRegistry {
 
     /// Consumes one distinct direct reservation into a typed shared-forwarder launch capability.
     /// On refusal returns the unchanged linear lease with the error, allowing safe retry or cancellation.
+    /// A forwarder is a provider slot too: it is refused with [`AdmissionError::OwnerProviderLimit`]
+    /// while the lease owner's provider slots already fill `per_owner_running − 1`.
     pub fn take_forwarder_spawn_lease(
         &mut self,
         admission: &mut AdmissionController,
@@ -1864,6 +1921,12 @@ impl ProviderLeaseRegistry {
             || self.forwarders.contains_key(&view.0)
         {
             return Err((ProviderLeaseError::SpawnUnavailable, lease));
+        }
+        if !admission.lease_provider_room(lease.0) {
+            return Err((
+                ProviderLeaseError::Admission(AdmissionError::OwnerProviderLimit),
+                lease,
+            ));
         }
         let process = ProviderProcess::new(
             &lease,

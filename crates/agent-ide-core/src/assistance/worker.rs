@@ -416,10 +416,16 @@ struct DeliveredIssue {
 /// Exactly one of these exists per daemon boot. Every physical-effect route — discovery, snapshots,
 /// language providers and Claude's foreground helper claims — draws from this one budget, so the
 /// limits below are the real global ceiling and not a per-route hint.
+///
+/// One binding (owner) runs at most five processes, of which its language servers may hold four:
+/// one per registered language that has a server (four today), so the fifth slot always stays
+/// free for the worker's own operations (Git snapshots, tests). A per-view forwarder process of a
+/// shared server is a server slot as well, so with all four servers live such a forwarder is
+/// refused.
 pub(super) fn admission_controller() -> crate::execution::AdmissionController {
     crate::execution::AdmissionController::new(crate::execution::AdmissionLimits {
         total_running: 16,
-        per_owner_running: 2,
+        per_owner_running: 5,
         per_owner_queued: 1,
         total_queued: 64,
         interactive_burst: 8,
@@ -2812,7 +2818,9 @@ impl<'a> Worker<'a> {
     ///
     /// # Errors
     ///
-    /// * [`FailureCode::Capacity`] when the owner or the daemon has no free running slot.
+    /// * [`FailureCode::Capacity`] when the owner or the daemon has no free running slot. Language
+    ///   servers never hold an owner's last slot (see [`admission_controller`]), so for one owner
+    ///   this means its other non-server processes hold it.
     /// * [`FailureCode::Internal`] when the binding fingerprint is not a valid owner identity.
     fn admit(
         &mut self,
@@ -6578,6 +6586,64 @@ mod stop_retry_tests {
             .expect("admission at the owner ceiling deadlocked the worker");
         assert_eq!(third, Some(FailureCode::Capacity));
         assert_eq!(queued, 0, "the refused request leaves no queued ticket");
+    }
+
+    /// Language servers hold at most `per_owner_running − 1` of one binding's slots: with that
+    /// many live, one more server is refused while its slot stays free, and a worker operation
+    /// (the Git spawn of `ide.diff`) is admitted into it; only then is the owner full.
+    #[tokio::test]
+    async fn servers_leave_one_owner_slot_for_worker_operations() {
+        use crate::execution::{
+            AdmissionClass, AdmissionError, ProviderBackendKind, ProviderLeaseAdmission,
+            ProviderLeaseLimits, ProviderLeaseRegistry, WorkspaceAuthority,
+        };
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        let binding = BindingRef::fixture("share-actor", "share-channel", 1);
+        let owner = crate::intelligence::server::owner(&binding).unwrap();
+        let authority =
+            WorkspaceAuthority::from_workspace("tree", "1", fixture.root.clone(), 1).unwrap();
+        let mut registry = ProviderLeaseRegistry::new(ProviderLeaseLimits {
+            total_views: 8,
+            per_backend_views: 1,
+        })
+        .unwrap();
+        let mut server = |admission: &mut crate::execution::AdmissionController, name: String| {
+            registry.request(
+                admission,
+                owner.clone(),
+                AdmissionClass::Interactive,
+                name,
+                ProviderBackendKind::OwnedExclusive,
+                &authority,
+            )
+        };
+        let limit = worker.admission().inspect().per_owner_running_limit;
+        assert_eq!(limit, 5, "one slot per server language plus one");
+        for index in 1..limit {
+            let granted = server(&mut worker.admission(), format!("server-{index}"));
+            assert!(matches!(granted, ProviderLeaseAdmission::Granted(_)));
+        }
+        assert_eq!(
+            server(&mut worker.admission(), "one-server-too-many".to_owned()),
+            ProviderLeaseAdmission::Refused(AdmissionError::OwnerProviderLimit)
+        );
+        assert_eq!(
+            worker.admission().inspect().reserved,
+            limit - 1,
+            "the refused server leaves the last slot free"
+        );
+        assert!(
+            worker.admit(&binding).is_ok(),
+            "the kept slot admits the operation"
+        );
+        assert_eq!(
+            worker.admit(&binding).err(),
+            Some(FailureCode::Capacity),
+            "only now is the owner full"
+        );
     }
 
     /// After `ide.stop` the actor/channel identity still reads its test run's status through the
