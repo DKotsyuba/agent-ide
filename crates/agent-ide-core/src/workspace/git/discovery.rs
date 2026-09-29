@@ -201,6 +201,17 @@ pub fn validate_native_identity(
 /// missing, or inconsistent standalone and linked metadata without running Git or trusting a
 /// stored common-directory path alone.
 pub fn validate_current_git_metadata(root: &Path, common: &Path) -> Result<(), GitError> {
+    current_admin_dir(root, common).map(|_| ())
+}
+
+/// Runs the same live check as [`validate_current_git_metadata`] and returns the worktree's own
+/// canonical administrative directory: `common` itself for a standalone repository, or the
+/// linked worktree's `common/worktrees/<name>` entry whose backpointers name `root`.
+///
+/// `root` and `common` must be the exact canonical paths stored at activation. A `.git`, gitfile,
+/// `commondir` or `gitdir` that is symlinked, missing or points anywhere else fails with
+/// [`GitError::InvalidDiscovery`]; every file it reads lies in `root` or `common`.
+pub fn current_admin_dir(root: &Path, common: &Path) -> Result<PathBuf, GitError> {
     let (real_root, _) = real_directory(root).map_err(|_| GitError::InvalidDiscovery)?;
     let (real_common, common_identity) =
         real_directory(common).map_err(|_| GitError::InvalidDiscovery)?;
@@ -210,17 +221,19 @@ pub fn validate_current_git_metadata(root: &Path, common: &Path) -> Result<(), G
     validate_administrative_identity(root, common, common_identity)
 }
 
-/// Checks the standalone directory or linked gitfile/admin/commondir/gitdir identity cycle.
+/// Checks the standalone directory or linked gitfile/admin/commondir/gitdir identity cycle and
+/// returns the worktree's canonical administrative directory (`common_dir` when standalone).
 fn validate_administrative_identity(
     root: &Path,
     common_dir: &Path,
     common_identity: [u8; 16],
-) -> Result<(), GitError> {
+) -> Result<PathBuf, GitError> {
     let dot_git = root.join(".git");
     if let Ok((directory, identity)) = real_directory(&dot_git) {
         if directory != common_dir || identity != common_identity {
             return Err(GitError::InvalidDiscovery);
         }
+        Ok(directory)
     } else {
         let gitfile = administrative_file(root, common_dir, ".git")?;
         let raw_admin = gitfile
@@ -262,8 +275,8 @@ fn validate_administrative_identity(
         if back_root != root || administrative_file(root, common_dir, ".git")? != gitfile {
             return Err(GitError::InvalidDiscovery);
         }
+        Ok(admin)
     }
-    Ok(())
 }
 
 /// Reads only a named bounded administrative file through the existing no-follow Workspace reader.
