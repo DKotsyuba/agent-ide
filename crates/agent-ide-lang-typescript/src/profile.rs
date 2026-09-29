@@ -969,19 +969,48 @@ fn bounded_identity(value: &str) -> bool {
     !value.is_empty() && value.len() <= 4096 && !value.chars().any(char::is_control)
 }
 
-/// Returns whether one relative input basename participates in the closed resolution profile.
+/// Returns whether one relative input basename participates in the closed resolution profile:
+/// one of the fixed [`RESOLUTION_FILENAMES`], or a `references` sibling of `tsconfig.json`/
+/// `jsconfig.json` (see [`is_tsconfig_like`]) — never discovered by directory listing, only
+/// reached by following an already-validated `references` entry.
 fn supported_resolution_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
     matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some(
-            "tsconfig.json"
-                | "jsconfig.json"
-                | "package.json"
-                | "package-lock.json"
-                | "yarn.lock"
-                | "pnpm-lock.yaml"
-        )
-    )
+        name,
+        "tsconfig.json"
+            | "jsconfig.json"
+            | "package.json"
+            | "package-lock.json"
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
+    ) || is_tsconfig_like(name)
+}
+
+/// Whether `name` is a `tsconfig`/`jsconfig`-prefixed `.json` file with exactly one more
+/// alphanumeric (plus `-`/`_`) segment before the extension, the shape a project-references
+/// solution file's own targets use (`tsconfig.app.json`, `tsconfig.node.json`, …). `tsconfig.json`
+/// and `jsconfig.json` themselves also match (the empty-segment case).
+fn is_tsconfig_like(name: &str) -> bool {
+    for prefix in ["tsconfig", "jsconfig"] {
+        let Some(rest) = name.strip_prefix(prefix) else {
+            continue;
+        };
+        if rest == ".json" {
+            return true;
+        }
+        if let Some(middle) = rest
+            .strip_prefix('.')
+            .and_then(|rest| rest.strip_suffix(".json"))
+        {
+            return !middle.is_empty()
+                && middle
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        }
+    }
+    false
 }
 
 /// Validates canonical bounds and requires every input to be on the document's ancestor chain.
@@ -1070,6 +1099,8 @@ fn observe_resolution_files(
     }
     let mut files = Vec::new();
     let mut remaining = MAX_RESOLUTION_BYTES as usize;
+    let mut pending_references = Vec::new();
+    let mut document_covered = false;
     for path in candidates {
         if !path_proof(&path) {
             return Err(ResolutionRejection::at(
@@ -1087,7 +1118,15 @@ fn observe_resolution_files(
                 ));
             }
         };
-        validate_resolution_shape(observed.path(), observed.contents(), language_id, document)?;
+        let shape = validate_resolution_shape(
+            observed.path(),
+            observed.contents(),
+            language_id,
+            document,
+            MembershipRequirement::Required,
+        )?;
+        document_covered |= shape.includes_document;
+        pending_references.extend(shape.references);
         remaining = remaining
             .checked_sub(observed.length() as usize)
             .ok_or_else(|| {
@@ -1109,7 +1148,62 @@ fn observe_resolution_files(
             )));
         }
     }
+    let mut seen: BTreeSet<PathBuf> = files.iter().map(|file| file.path.clone()).collect();
+    for path in pending_references {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        if !path_proof(&path) {
+            return Err(ResolutionRejection::at(
+                &path,
+                "is outside the allowed roots",
+            ));
+        }
+        let observed = match read_authorized_resolution_input(worktree, &path, remaining) {
+            Ok(observed) => observed,
+            Err(_) => {
+                return Err(ResolutionRejection::at(
+                    &path,
+                    "is referenced but could not be read within the resolution bounds",
+                ));
+            }
+        };
+        let shape = validate_resolution_shape(
+            observed.path(),
+            observed.contents(),
+            language_id,
+            document,
+            MembershipRequirement::Optional,
+        )?;
+        document_covered |= shape.includes_document;
+        remaining = remaining
+            .checked_sub(observed.length() as usize)
+            .ok_or_else(|| {
+                ResolutionRejection::at(
+                    &path,
+                    format!(
+                        "project files exceed the {MAX_RESOLUTION_BYTES} byte resolution budget"
+                    ),
+                )
+            })?;
+        files.push(ProjectResolutionFileV1 {
+            path: observed.path().to_path_buf(),
+            blake3: observed.digest(),
+            bytes: observed.length(),
+        });
+        if files.len() > MAX_RESOLUTION_FILES {
+            return Err(ResolutionRejection::chain(format!(
+                "more than {MAX_RESOLUTION_FILES} project files on the ancestor chain"
+            )));
+        }
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
     validate_resolution_files(document, &files)?;
+    if !document_covered {
+        return Err(ResolutionRejection::chain(
+            "no referenced project's `files`/`include` admits the document",
+        ));
+    }
     Ok(files)
 }
 
@@ -1149,41 +1243,96 @@ fn validate_node_modules_ancestry(
     Ok(())
 }
 
+/// Whether a config found on the document's own ancestor chain must itself admit the document
+/// ([`Self::Required`], the original rule), or may leave admission to a sibling project reached
+/// through `references` ([`Self::Optional`] — used only while chasing those targets).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MembershipRequirement {
+    Required,
+    Optional,
+}
+
+/// One config's validated shape: whether it admits the document, and the `references` targets a
+/// router config (one with no `compilerOptions` of its own) declares.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ConfigShape {
+    includes_document: bool,
+    references: Vec<PathBuf>,
+}
+
 /// Rejects project metadata that can redirect tsserver beyond the exact observed ancestor inputs.
 ///
 /// `language_id` is the fixed ID for the opened document and `document` is its worktree-relative
-/// path. Configs must admit the document through a bounded top-level `files` entry or a literal
-/// `include` file/directory entry (see [`validate_configured_membership`]); `exclude` is refused
-/// because glob membership is not observed. `compilerOptions.types` must be `[]` or exactly
-/// `["vite/client"]`, `moduleResolution` must be `node10` or `bundler`, JavaScript-family documents
-/// require boolean `allowJs: true`, path-mapping/plugin/output options are refused because their
-/// inputs are not observed, and `checkJs`/`noImplicitAny` accept only `true` when present.
-/// `package.json` may declare dependencies but not `imports` or `workspaces`. Lockfiles are only
-/// fingerprinted. Every refusal is attributed to `path` with its reason.
+/// path. A `tsconfig.json`/`jsconfig.json` with no `references` must admit the document through a
+/// bounded top-level `files` entry or a literal `include` file/directory entry (see
+/// [`validate_configured_membership`]) whenever `membership` is [`MembershipRequirement::Required`];
+/// under [`MembershipRequirement::Optional`] a config that does not admit the document is accepted
+/// with `includes_document: false` instead of rejected, so a sibling reached through `references`
+/// may cover it instead. `exclude` is refused because glob membership is not observed.
+/// `compilerOptions.types` must be `[]` or exactly `["vite/client"]`, `moduleResolution` must be
+/// `node10` or `bundler`, JavaScript-family documents require boolean `allowJs: true`,
+/// path-mapping/plugin/output options are refused because their inputs are not observed, and
+/// `checkJs`/`noImplicitAny` accept only `true` when present. A config that instead declares
+/// `references` (see [`parse_references`]) must declare nothing else but an empty `files`, and its
+/// own referenced targets are returned unvalidated for the caller to chase; nesting (a target that
+/// itself declares `references`) is refused since it is reached with `Optional` membership.
+/// `extends`/`typeAcquisition` remain unsupported outright. `package.json` may declare dependencies
+/// but not `imports` or `workspaces`. Lockfiles are only fingerprinted. Every refusal is attributed
+/// to `path` with its reason.
 fn validate_resolution_shape(
     path: &Path,
     contents: &[u8],
     language_id: &str,
     document: &Path,
-) -> Result<(), ResolutionRejection> {
+    membership: MembershipRequirement,
+) -> Result<ConfigShape, ResolutionRejection> {
     let reject = |reason: String| ResolutionRejection::at(path, reason);
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return Err(reject("has no file name".into()));
     };
     if matches!(name, "yarn.lock" | "pnpm-lock.yaml") {
-        return Ok(());
+        return Ok(ConfigShape::default());
     }
     let value: serde_json::Value =
         serde_json::from_slice(contents).map_err(|_| reject("is not valid JSON".into()))?;
     let object = value
         .as_object()
         .ok_or_else(|| reject("is not a JSON object".into()))?;
-    if matches!(name, "tsconfig.json" | "jsconfig.json") {
-        if let Some(key) = ["extends", "references", "typeAcquisition"]
+    if is_tsconfig_like(name) {
+        if let Some(key) = ["extends", "typeAcquisition"]
             .iter()
             .find(|key| object.contains_key(**key))
         {
             return Err(reject(format!("`{key}` is unsupported")));
+        }
+        if let Some(references) = object.get("references") {
+            if membership == MembershipRequirement::Optional {
+                return Err(reject("nested `references` are unsupported".into()));
+            }
+            if object.contains_key("compilerOptions") {
+                return Err(reject(
+                    "a `references` config must not also declare `compilerOptions`".into(),
+                ));
+            }
+            if object.contains_key("include") {
+                return Err(reject(
+                    "a `references` config must not also declare `include`".into(),
+                ));
+            }
+            if object
+                .get("files")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|files| !files.is_empty())
+            {
+                return Err(reject(
+                    "a `references` config's `files` must be empty".into(),
+                ));
+            }
+            let targets = parse_references(&reject, path, references)?;
+            return Ok(ConfigShape {
+                includes_document: false,
+                references: targets,
+            });
         }
         let options = object
             .get("compilerOptions")
@@ -1191,13 +1340,7 @@ fn validate_resolution_shape(
             .ok_or_else(|| reject("`compilerOptions` must be an object".into()))?;
         let configured_files = object.get("files").and_then(serde_json::Value::as_array);
         let configured_includes = object.get("include").and_then(serde_json::Value::as_array);
-        validate_configured_membership(
-            path,
-            document,
-            configured_files.map(Vec::as_slice),
-            configured_includes.map(Vec::as_slice),
-            options.get("allowJs") == Some(&serde_json::Value::Bool(true)),
-        )?;
+        let allow_js = options.get("allowJs") == Some(&serde_json::Value::Bool(true));
         if !closed_types_option(options) {
             return Err(reject(
                 "`compilerOptions.types` must be `[]` or `[\"vite/client\"]`".into(),
@@ -1208,9 +1351,7 @@ fn validate_resolution_shape(
                 "`compilerOptions.moduleResolution` must be `node10` or `bundler`, and `module` must not be node16/nodenext/preserve".into(),
             ));
         }
-        if matches!(language_id, "javascript" | "javascriptreact")
-            && options.get("allowJs") != Some(&serde_json::Value::Bool(true))
-        {
+        if matches!(language_id, "javascript" | "javascriptreact") && !allow_js {
             return Err(reject(
                 "JavaScript documents require `compilerOptions.allowJs: true`".into(),
             ));
@@ -1243,6 +1384,23 @@ fn validate_resolution_shape(
                 "`exclude` is unsupported; membership must be literal".into(),
             ));
         }
+        return match (
+            validate_configured_membership(
+                path,
+                document,
+                configured_files.map(Vec::as_slice),
+                configured_includes.map(Vec::as_slice),
+                allow_js,
+            ),
+            membership,
+        ) {
+            (Ok(()), _) => Ok(ConfigShape {
+                includes_document: true,
+                references: Vec::new(),
+            }),
+            (Err(_), MembershipRequirement::Optional) => Ok(ConfigShape::default()),
+            (Err(rejection), MembershipRequirement::Required) => Err(rejection),
+        };
     } else if name == "package.json"
         && let Some(key) = ["imports", "workspaces"]
             .iter()
@@ -1250,7 +1408,54 @@ fn validate_resolution_shape(
     {
         return Err(reject(format!("`{key}` is unsupported")));
     }
-    Ok(())
+    Ok(ConfigShape::default())
+}
+
+/// Parses a `references` array into worktree-relative targets, joined against `config`'s own
+/// directory: the common project-references shape (a Vite-style solution `tsconfig.json`) is a
+/// bounded list of `{"path": "./relative.json"}` entries, at most [`MAX_RESOLUTION_FILES`] of them,
+/// each a normal relative `.json` path that does not escape `config`'s directory. Any other shape
+/// (a non-string path, a directory reference, traversal, an object with extra keys, …) is refused
+/// rather than partially followed.
+fn parse_references(
+    reject: &impl Fn(String) -> ResolutionRejection,
+    config: &Path,
+    references: &serde_json::Value,
+) -> Result<Vec<PathBuf>, ResolutionRejection> {
+    let entries = references
+        .as_array()
+        .filter(|entries| !entries.is_empty() && entries.len() <= MAX_RESOLUTION_FILES)
+        .ok_or_else(|| {
+            reject(format!(
+                "`references` must be an array of 1 to {MAX_RESOLUTION_FILES} entries"
+            ))
+        })?;
+    let directory = config.parent().unwrap_or_else(|| Path::new(""));
+    let mut targets = Vec::new();
+    for entry in entries {
+        let value = entry
+            .as_object()
+            .filter(|object| object.len() == 1)
+            .and_then(|object| object.get("path"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                reject("each `references` entry must be exactly `{\"path\": \"...\"}`".into())
+            })?;
+        if value.is_empty() || value.contains('\\') || !value.ends_with(".json") {
+            return Err(reject(format!(
+                "references entry `{value}` must be a relative `.json` file path"
+            )));
+        }
+        let relative = Path::new(value.strip_prefix("./").unwrap_or(value));
+        let joined = directory.join(relative);
+        if !normal_relative(relative) || !normal_relative(&joined) {
+            return Err(reject(format!(
+                "references entry `{value}` must be a normal path that stays inside the worktree"
+            )));
+        }
+        targets.push(joined);
+    }
+    Ok(targets)
 }
 
 /// Validates one config's bounded literal membership list against the current document.
@@ -1809,6 +2014,7 @@ mod tests {
                     config,
                     "typescript",
                     Path::new("fixture.ts"),
+                    MembershipRequirement::Required,
                 )
                 .is_ok()
             );
@@ -1843,6 +2049,7 @@ mod tests {
                     config,
                     "typescript",
                     Path::new("fixture.ts"),
+                    MembershipRequirement::Required,
                 )
                 .is_err()
             );
@@ -1858,6 +2065,7 @@ mod tests {
                 CLOSED_CONFIG,
                 "typescript",
                 Path::new("fixture.ts"),
+                MembershipRequirement::Required,
             )
             .is_ok()
         );
@@ -1876,6 +2084,7 @@ mod tests {
                 &too_many_bytes,
                 "javascript",
                 Path::new("fixture.js"),
+                MembershipRequirement::Required,
             )
             .is_err()
         );
@@ -1903,6 +2112,7 @@ mod tests {
                     config,
                     "javascript",
                     Path::new("fixture.js"),
+                    MembershipRequirement::Required,
                 )
                 .is_err()
             );
@@ -1920,6 +2130,7 @@ mod tests {
                     config,
                     "javascript",
                     Path::new("fixture.js"),
+                    MembershipRequirement::Required,
                 )
                 .is_err()
             );
@@ -1930,6 +2141,7 @@ mod tests {
                 JAVASCRIPT_CONFIG,
                 "javascriptreact",
                 Path::new("fixture.js"),
+                MembershipRequirement::Required,
             )
             .is_ok()
         );
@@ -1955,6 +2167,7 @@ mod tests {
                     config,
                     "javascript",
                     Path::new("fixture.js"),
+                    MembershipRequirement::Required,
                 )
                 .is_err()
             );
@@ -1976,6 +2189,7 @@ mod tests {
                     config,
                     language,
                     Path::new(document),
+                    MembershipRequirement::Required,
                 )
                 .is_ok(),
                 "{document} should be admitted by a literal project include"
@@ -1988,6 +2202,7 @@ mod tests {
                     config,
                     "typescript",
                     Path::new(document),
+                    MembershipRequirement::Required,
                 )
                 .is_err()
             );
@@ -1997,6 +2212,7 @@ mod tests {
             config,
             "typescript",
             Path::new("outside.ts"),
+            MembershipRequirement::Required,
         )
         .unwrap_err();
         assert_eq!(
@@ -2007,6 +2223,103 @@ mod tests {
         assert_eq!(
             missing.to_string(),
             "no tsconfig.json or jsconfig.json was found from src up to the worktree root"
+        );
+    }
+
+    /// A default Vite template's solution `tsconfig.json` (`files: []` plus `references` to
+    /// `tsconfig.app.json` and `tsconfig.node.json`) resolves a document through whichever
+    /// referenced project admits it, and still refuses a document neither one covers.
+    #[test]
+    fn project_resolution_follows_vite_style_references() {
+        let fixture = Fixture::new();
+        let bundle = fixture.bundle();
+        let (worktree, _) = fixture.worktree();
+        std::fs::create_dir(fixture.root.join("src")).unwrap();
+        std::fs::write(
+            fixture.root.join("tsconfig.json"),
+            br#"{"files":[],"references":[{"path":"./tsconfig.app.json"},{"path":"./tsconfig.node.json"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.root.join("tsconfig.app.json"),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"bundler"},"include":["src"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.root.join("tsconfig.node.json"),
+            br#"{"compilerOptions":{"types":[],"moduleResolution":"bundler"},"include":["vite.config.ts"]}"#,
+        )
+        .unwrap();
+
+        let app_document = fixture.root.join("src/App.tsx");
+        std::fs::write(&app_document, "export {};\n").unwrap();
+        let resolution =
+            ProjectResolutionInputsV1::observe(worktree.clone(), app_document, &bundle, &|_| true)
+                .expect("src/App.tsx is admitted through tsconfig.app.json");
+        assert_eq!(
+            resolution
+                .files()
+                .iter()
+                .map(|file| file.path.file_name().unwrap().to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["tsconfig.app.json", "tsconfig.json", "tsconfig.node.json"]
+        );
+
+        let node_document = fixture.root.join("vite.config.ts");
+        std::fs::write(&node_document, "export {};\n").unwrap();
+        assert!(
+            ProjectResolutionInputsV1::observe(worktree.clone(), node_document, &bundle, &|_| true)
+                .is_ok(),
+            "vite.config.ts is admitted through tsconfig.node.json"
+        );
+
+        let uncovered_document = fixture.root.join("other.ts");
+        std::fs::write(&uncovered_document, "export {};\n").unwrap();
+        assert!(
+            ProjectResolutionInputsV1::observe(worktree, uncovered_document, &bundle, &|_| true)
+                .is_err(),
+            "other.ts is covered by neither referenced project"
+        );
+    }
+
+    /// Refuses every `references` shape this profile cannot verify without discovering ambient
+    /// state: a non-object entry, extra keys, a directory-style path, escaping traversal, a
+    /// router that also declares `compilerOptions` or a nonempty `files`, and an empty list —
+    /// plus nesting (a target reached through `references` must not itself declare more).
+    #[test]
+    fn project_resolution_refuses_unverifiable_references_shapes() {
+        for config in [
+            br#"{"references":["./tsconfig.app.json"]}"#.as_slice(),
+            br#"{"references":[{"path":"./tsconfig.app.json","extra":true}]}"#.as_slice(),
+            br#"{"references":[{"path":"app"}]}"#.as_slice(),
+            br#"{"references":[{"path":"../outside.json"}]}"#.as_slice(),
+            br#"{"references":[],"files":[]}"#.as_slice(),
+            br#"{"references":[{"path":"./tsconfig.app.json"}],"compilerOptions":{"types":[]}}"#
+                .as_slice(),
+            br#"{"references":[{"path":"./tsconfig.app.json"}],"files":["fixture.ts"]}"#.as_slice(),
+        ] {
+            assert!(
+                validate_resolution_shape(
+                    Path::new("tsconfig.json"),
+                    config,
+                    "typescript",
+                    Path::new("fixture.ts"),
+                    MembershipRequirement::Required,
+                )
+                .is_err(),
+                "{config:?} should be refused"
+            );
+        }
+        assert!(
+            validate_resolution_shape(
+                Path::new("frontend/tsconfig.app.json"),
+                br#"{"references":[{"path":"./tsconfig.json"}]}"#,
+                "typescript",
+                Path::new("frontend/src/App.tsx"),
+                MembershipRequirement::Optional,
+            )
+            .is_err(),
+            "a target reached through references must not itself chase further references"
         );
     }
 
