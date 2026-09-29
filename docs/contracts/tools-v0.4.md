@@ -106,7 +106,7 @@ servers: rust-analyzer loading (~10 s) · pyright ready · tsserver ready
 problems: rust checking (first check)
 ```
 
-Commands come from CI (`.github/workflows`), `Makefile`/`justfile`, or manifests. If a command comes from README, mark it `(README)`. A project may also declare commands itself: a fenced block at the root of `AGENTS.md`, or of `CLAUDE.md` when `AGENTS.md` declares none, tagged `agent-ide`, one `<kind>: <command>` line per kind (the closed set `build`/`check`/`test`/`lint`/`fmt`/`typecheck`):
+Commands come from CI (`.github/workflows`), `Makefile`/`justfile`, or manifests. If a command comes from README, mark it `(README)`. A project may also declare commands itself: a fenced block at the root of `AGENTS.md`, or of `CLAUDE.md` when `AGENTS.md` declares none (each read only as the worktree's own regular file of at most 64 KiB — a symlink, a non-regular file or a larger file declares nothing, so nothing outside the worktree reaches the card), tagged `agent-ide`, one `<kind>: <command>` line per kind (the closed set `build`/`check`/`test`/`lint`/`fmt`/`typecheck`):
 
 ```` ```agent-ide
 check: cargo xtask check
