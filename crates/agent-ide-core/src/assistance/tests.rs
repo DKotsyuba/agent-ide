@@ -181,12 +181,18 @@ impl TestRuns {
         StartResult::Started(id)
     }
 
-    /// Returns the same-worktree job's age, owner, and result; only its starting binding's status
-    /// lookup marks retained output observed for daemon idleness.
-    pub fn get(&self, root: &PathBuf, id: u64, binding: &[u8; 32]) -> Option<JobStatus> {
+    /// Returns the job's age, owner, and result when it ran in `root` and was started by `caller`'s
+    /// actor and channel (any binding generation); another actor's run in the same worktree is
+    /// `None`, like an unknown id, so its failures and rerun command stay with its own actor. Only
+    /// the starting binding's lookup marks retained output observed for daemon idleness.
+    pub fn get(&self, root: &PathBuf, id: u64, caller: &BindingRef) -> Option<JobStatus> {
+        let channel = caller.channel_identity().fingerprint();
         let mut state = self.0.lock().ok()?;
-        let job = state.jobs.get_mut(&id).filter(|job| &job.root == root)?;
-        if job.result.is_some() && &job.owner == binding {
+        let job = state
+            .jobs
+            .get_mut(&id)
+            .filter(|job| &job.root == root && job.channel == channel)?;
+        if job.result.is_some() && job.owner == caller.fingerprint() {
             job.observed = true;
         }
         Some(JobStatus {
@@ -700,5 +706,44 @@ mod runner_tests {
             ),
             StartResult::Running(1, _)
         ));
+    }
+
+    /// A status lookup answers the run's own actor and channel in any binding generation, and
+    /// refuses another actor's retained run in the same worktree, whose failures and rerun
+    /// command stay with the actor that started it.
+    #[tokio::test]
+    async fn status_lookup_is_scoped_to_the_starting_actor() {
+        let runs = TestRuns::default();
+        let root = std::env::temp_dir().to_path_buf();
+        let owner = BindingRef::fixture("actor-a", "channel-a", 1);
+        assert!(matches!(
+            runs.start(
+                root.clone(),
+                vec!["/bin/echo".into(), "pass".into()],
+                crate::lang::testing::ALPHA,
+                Duration::from_secs(10),
+                "ra".into(),
+                &owner
+            ),
+            StartResult::Started(1)
+        ));
+        let later = BindingRef::fixture("actor-a", "channel-a", 2);
+        let mut settled = false;
+        for _ in 0..500 {
+            if runs
+                .get(&root, 1, &later)
+                .is_some_and(|status| status.result.is_some())
+            {
+                settled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(settled, "the owner's next generation reads the settled run");
+        let other = BindingRef::fixture("actor-b", "channel-b", 1);
+        assert!(
+            runs.get(&root, 1, &other).is_none(),
+            "another actor in the same worktree does not read the run"
+        );
     }
 }

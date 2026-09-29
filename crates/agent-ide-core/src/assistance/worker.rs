@@ -1868,7 +1868,8 @@ struct Worker<'a> {
 }
 
 impl<'a> Worker<'a> {
-    /// Handles an explicit test start or same-worktree status request.
+    /// Handles an explicit test start or a status request for a run the caller's own actor and
+    /// channel started in this worktree; another actor's run answers `unknown job`.
     ///
     /// Runs inside the queued job. The `symbol` branch resolves references through the live
     /// language server before selecting tests, so its caller already holds a `pending` reply (see
@@ -1892,8 +1893,7 @@ impl<'a> Worker<'a> {
         let (result, detail_ref) = if let Some(id) =
             job.parameters.get("status").and_then(Value::as_u64)
         {
-            let Some(job_status) = self.shared.test_runs.get(&root, id, &binding.fingerprint())
-            else {
+            let Some(job_status) = self.shared.test_runs.get(&root, id, &binding) else {
                 return Ok((
                     PeerReply::Complete {
                         kind: ResultKind::Test,
