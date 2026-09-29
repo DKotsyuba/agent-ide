@@ -5627,6 +5627,72 @@ async fn diff_with_an_untracked_symlink_lists_it_and_completes() {
     daemon.wait().await.unwrap();
 }
 
+/// The degraded plain `git diff` fallback never answers for a path the exact capture refuses: a
+/// tracked directory replaced by a symlink to a directory outside the worktree refuses the whole
+/// diff instead of delivering hunks for the paths behind it.
+#[tokio::test]
+async fn diff_plain_fallback_refuses_a_path_the_exact_capture_refuses() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(fixture.root.join("a-observed.txt"), "base\n").unwrap();
+    std::fs::create_dir(fixture.root.join("z-linked")).unwrap();
+    std::fs::write(fixture.root.join("z-linked/inner.txt"), "inside\n").unwrap();
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "fallback baseline"]);
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "fallback-confined").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"fallback-confined"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    // A recorded observation edited out of band makes every exact capture unstable, so each
+    // `ide.diff` below goes through the plain fallback.
+    let observed = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"a-observed.txt","byte_offset":0}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, observed).await["kind"], "context");
+    std::fs::write(fixture.root.join("a-observed.txt"), "unreconciled\n").unwrap();
+    let degraded = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let degraded = actor.settle(&fixture, degraded).await;
+    assert_eq!(degraded["kind"], "diff", "{degraded}");
+    assert!(
+        degraded["text"]
+            .as_str()
+            .unwrap()
+            .contains("exact capture unavailable"),
+        "{degraded}"
+    );
+
+    let outside = fixture.base.join("outside-linked");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("inner.txt"), "outside\n").unwrap();
+    std::fs::remove_dir_all(fixture.root.join("z-linked")).unwrap();
+    std::os::unix::fs::symlink(&outside, fixture.root.join("z-linked")).unwrap();
+    let refused = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let refused = actor.settle(&fixture, refused).await;
+    assert_eq!(refused["state"], "error", "{refused}");
+    assert_eq!(refused["code"], "source_unavailable", "{refused}");
+    assert!(!refused.to_string().contains("inner.txt"), "{refused}");
+
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// `ide.test {path}` on a plain Python module answers the `no tests` hint instead of handing the
 /// file to pytest, which would import it top-level.
 #[tokio::test]
