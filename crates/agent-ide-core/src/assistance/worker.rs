@@ -3672,8 +3672,14 @@ impl<'a> Worker<'a> {
                 truncated = true;
             }
         }
-        Some(if messages.is_empty() && !truncated {
-            EditDiagnostics::CurrentClean {}
+        Some(if messages.is_empty() {
+            // A capped snapshot that kept no problem of this file says nothing about it: the
+            // file's problems may be among the dropped ones, so it is neither clean nor reported.
+            if truncated {
+                EditDiagnostics::Unknown {}
+            } else {
+                EditDiagnostics::CurrentClean {}
+            }
         } else {
             EditDiagnostics::CurrentReported {
                 messages,

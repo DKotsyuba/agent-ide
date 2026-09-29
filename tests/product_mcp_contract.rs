@@ -4621,6 +4621,59 @@ async fn a_pending_edit_is_collected_by_inspect_once_its_check_settles() {
     daemon.wait().await.unwrap();
 }
 
+/// A pending edit whose project check was capped with none of this file's problems retained
+/// settles as `unknown`: an empty `current_reported` is not a closed reply, and it used to turn
+/// the whole detail into `inspect:internal` (a Python project with thousands of errors).
+#[tokio::test]
+async fn a_pending_edit_under_a_capped_check_of_other_files_settles_unknown() {
+    let fixture = ProductFixture::new(json!([]));
+    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 12");
+    std::fs::write(fixture.root.join("problems.count"), "600").unwrap();
+    {
+        let cargo = home.join(".rustup/toolchains/fake/bin/cargo");
+        let script = std::fs::read_to_string(&cargo).unwrap();
+        std::fs::write(&cargo, script.replace("src/lib.rs", "src/other.rs")).unwrap();
+    }
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "capped-edit").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"capped-edit"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"src/lib.rs","lines":"1-2"}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let source_ref = read["detail_ref"].as_str().unwrap().to_owned();
+    let edit = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"capped-edit-1","path":"src/lib.rs","lines":"1-1",
+                   "source_ref":source_ref,"content":"pub fn value() -> i32 { 7 }"}),
+        )
+        .await;
+    let settled = actor.settle(&fixture, edit).await;
+    assert_eq!(settled["state"], "edit", "{settled}");
+    assert_eq!(settled["result"]["outcome"], "replaced", "{settled}");
+    assert_eq!(
+        settled["diagnostics"]["state"], "unknown",
+        "a capped check without this file's problems proves nothing about it: {settled}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A session that never calls `ide.start` produces hook bookkeeping, not failures: one `info`
 /// skip line per detail per window on each side, and no `warn` hook line at all.
 #[tokio::test]
