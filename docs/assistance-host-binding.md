@@ -15,7 +15,7 @@ The Codex parser selects root `session_id` for a parent. A native child supplies
 
 Assistance accepts Application r2's single finite `assistance.hook_submit` request. It carries `request_id`, `correlation_id`, `opaque_attachment`, and `sanitized_observation_json`, with one opaque correlated reply. Application owns framing, daemon generation, private endpoint and connection limits, byte limits, and total deadline. `submit_hook_if_running` neither creates runtime files nor starts, retries, or repairs a daemon; it never interprets actor, attachment, or hook identity. Assistance owns sanitization, attachment/identity semantics, and the caller's permissive no-inline-retry behavior.
 
-The v0.1 five MCP methods use one additional finite request/reply operation, `assistance.method_dispatch`. It carries the same request/correlation/opaque-attachment envelope plus one registered method name and bounded JSON parameters, and returns one opaque correlated result. Application routes it without interpreting method or host semantics; Assistance owns the fixed method set, input validation, binding checks, rendering, and fail-open result. Version 3 extends that closed set only with `edit` as defined by [EDIT-r1](contracts/assistance-v0.2.md); it remains no generic event bus, topic subscription, or health-to-RPC upgrade.
+The v0.1 five MCP methods use one additional finite request/reply operation, `assistance.method_dispatch`. It carries the same request/correlation/opaque-attachment envelope plus one registered method name and bounded JSON parameters, and returns one opaque correlated result. Application routes it without interpreting method or host semantics; Assistance owns the fixed method set, input validation, binding checks, rendering, and fail-open result. Version 3 extends that closed set with `edit` ([EDIT-r1](contracts/assistance-v0.2.md)) and the symbol tools `outline`, `read`, and `symbol`; versions 4 and 5 add `test` and `graph` ([tools v0.4](contracts/tools-v0.4.md)). It remains no generic event bus, topic subscription, or health-to-RPC upgrade.
 
 ## Proposed binding liveness
 
@@ -44,7 +44,9 @@ advance the native epoch and invalidate stale source references; inert tools do 
 Claude shared daemon remains one daemon per repository, with hooks rendezvousing to it.
 
 `agent-ide mcp --launcher-template ABSOLUTE_PATH` is the standard self-contained Codex entrypoint.
-It serves exactly `ide.start`, `ide.context`, `ide.diff`, `ide.inspect`, and `ide.stop` over stdio.
+It serves exactly the eleven `ide.*` tools — `ide.start`, `ide.context`, `ide.diff`,
+`ide.inspect`, `ide.stop`, `ide.edit`, `ide.outline`, `ide.read`, `ide.symbol`, `ide.graph`, and
+`ide.test` — over stdio.
 At startup it captures the subprocess current directory once, creates one fresh private runtime,
 rebinds only the attachment and candidate of an otherwise unchanged single-target launcher
 template, validates the existing launcher/execution evidence, and starts and health-checks one owned
@@ -67,8 +69,8 @@ existing directory whose lock is held and whose health endpoint answers is inste
 validated (owner, mode `0700`, non-symlink, device/inode re-checked from an open file descriptor)
 and adopted, never repaired or removed. The owner binds the template's sole target to the captured
 project and a fresh random attachment, writes the bound launcher and project-bound attachment record with mode `0600`, then
-starts and health-checks the daemon through the existing legacy Claude route. It serves the v0.1
-five tools and the v0.2 `edit` tool. Per
+starts and health-checks the daemon through the existing legacy Claude route. It serves the same
+eleven tools as the Codex entrypoint. Per
 EYES-r1 §2, this MCP never owns that daemon's lifetime: stdio EOF, cancellation, SIGINT, or SIGTERM
 end this one MCP process only, leaving an adopted or spawned daemon running for the next MCP of the
 same repository to find.
@@ -109,7 +111,7 @@ configuration; they are not embedded in the plugin manifest.
 
 For legacy Codex mode, configure native `PreToolUse`, `PostToolUse`, and available `PostToolBatch` commands to invoke
 `agent-ide codex-hook --runtime-dir PATH` for supported native tools as well as this MCP
-server's five `ide.*` tools. The placeholder-only example is
+server's eleven `ide.*` tools. The placeholder-only example is
 [`docs/examples/codex-hooks.toml`](examples/codex-hooks.toml) (legacy, operator-run daemon).
 Supply the same `AGENT_IDE_HOST_ATTACHMENT` launch
 environment value to those commands and the MCP process. It must be a fresh opaque
@@ -170,7 +172,9 @@ native hooks can find the same daemon without any operator-configured runtime or
   working: the oldest settled records of a full scope are evicted, never a live session's.
 
 `agent-ide codex-hook --managed` is the managed hook command: it ignores every credential and
-runtime environment override, reads stdin once (at most 64 KiB plus an overflow byte) inside one
+runtime environment override, reads stdin once (at most 8 MiB plus an overflow byte; a payload
+over 64 KiB is projected down to its identity fields, and only a projection still over that
+transport bound is dropped as oversize) inside one
 250 ms total deadline, discovers exactly one live route, submits once, and renders only a
 successful `PostToolUse` feedback result. Missing, ambiguous, stale, or contended routes,
 malformed or oversized payloads, unsupported phases, and deadline expiry all exit 0 with empty
@@ -182,7 +186,7 @@ entries, then reviews and trusts both definitions through Codex's normal UI; the
 writes `hooks.json` or any host configuration, and duplicate agent-ide handlers must not be
 registered (duplicate pre-events are rejected as replays).
 
-Claude Code 2.1.267 is the tested target. Its example config includes exact `PreToolUse`,
+Claude Code 2.1.280 is the tested target. Its example config includes exact `PreToolUse`,
 `PostToolUse`, `PostToolUseFailure`, and `PermissionDenied` commands; older Claude versions
 are not certified. `PermissionRequest` has no exact tool-use ID and manual denial has no
 correlated terminal hook, so neither settles a pending call.
@@ -289,7 +293,7 @@ Closed daemon outcomes are:
 
 | Outcome | Meaning |
 | --- | --- |
-| `{"state":"unavailable","reason":"host_binding"}` | No validated exact invocation. The compact text names one closed cause in parentheses (T15B): `(outside_allowed_roots)` when the attachment's bound project resolves below no allowed root and its channel never delivered a hook, `(hooks_not_delivered)` when a channel that never delivered a hook lacks this observation, `(missing_pre)`, `(replay)`, `(inactive_binding)`, or `(project_moved: bound to <path>, asked <path>)` when a managed re-root failed; the same tag is the journal `detail`. The structured reply keeps its historical fields. |
+| `{"state":"unavailable","reason":"host_binding"}` | No validated exact invocation. The compact text names one closed cause in parentheses (T15B): `(outside_allowed_roots)` when the attachment's bound project resolves below no allowed root and its channel never delivered a hook, `(hooks_not_delivered)` when a channel that never delivered a hook lacks this observation, `(missing_pre)`, `(replay)`, `(mismatch)`, `(inactive_binding)`, `(capacity_exceeded)`, `(host_unrecognized)` when the caller's `_meta` names no supported host contract, or `(project_moved: bound to <path>, asked <path>)` when a managed re-root failed; the same tag is the journal `detail`. The structured reply keeps its historical fields. |
 | `{"state":"unavailable","reason":"workspace_activation"}` | Host invocation and current binding are proven; Workspace activation is not connected. |
 | `{"state":"hook_observed"}` | One pre-hook was retained; no authority or delivery claim. |
 | `{"state":"hook_settled"}` | One exact post-hook settled a validated invocation. |
@@ -322,11 +326,11 @@ IDs, cross-actor rejection, stop isolation, replay/order failures, daemon loss, 
 and malformed hooks, open stdin and hung-daemon deadlines, and discarded payload fields.
 Native edit/delete/rename and failed-command-shaped lifecycle fixtures verify coalesced
 active hints and suppression after stop, without claiming those fixtures changed source.
-The controlled process tests are complemented by live macOS checks. Claude Code 2.1.267 completed
-Go and Rust Context, native-edit diagnostics, Diff, Stop, parallel isolation and sequential handoff.
-Codex CLI 0.154.0 completed parent plus parallel native-child Go isolation: A observed only its
-int/string diagnostic, B stayed semantic after A stopped, and a fresh child independently acquired
-A's worktree and read its final bytes. Linux, real `PostToolBatch` availability, and formal
+The controlled process tests are complemented by live macOS checks. Release 0.6.2 (revision
+`2db699f`) records all five routes `real_pass`/`product_pass` on one revision — the product
+contract, direct Codex CLI 0.156.1, direct Claude Code 2.1.280, and installed agent-run 0.19.0 to
+each host ([docs/evidence](evidence/)). Go and gopls are outside the release scope and their
+evidence rows are pinned `not_tested`. Linux, real `PostToolBatch` availability, and formal
 host-confirmed `model_seen` delivery remain unverified.
 
 The executable deadline regressions enforce a 450 ms wall-clock ceiling: the 250 ms
@@ -335,8 +339,10 @@ are independent of the test runtime, so paused test time cannot control these pa
 The allowance remains below doubled (500 ms) and sixfold (1500 ms) timeout regressions;
 both open-stdin and hung-daemon scenarios keep their real subprocess/Unix IPC boundary.
 
-`ide.context` now requires a relative `path` (at most 1024 UTF-8 bytes), with optional
+`ide.context` takes a relative `path` (at most 1024 UTF-8 bytes), with optional
 `byte_offset` (0..1048576) and `detail_ref`; absolute/traversal/NUL paths are rejected.
+`path` may be omitted for the `{"kind":"problems"}` form, which reads the project check
+results instead of a file.
 `ide.diff` accepts only `head`, `staged`, or `unstaged` mode, defaulting to `head`. Both
 MCP discovery and runtime validation use the same schema definitions. Identity, profiles
 and candidate worktrees remain outside model arguments.

@@ -22,19 +22,25 @@ A successful reply is `{"version":1,"request_id":"opaque-client-id","status":"ok
 
 ## Wire version 2: finite Assistance ingress
 
-Version 1 health remains unchanged. Version 2 has the same one-request/one-reply Unix connection lifecycle, peer-UID boundary, daemon generation, and total connection deadline. Its frame limit is 128 KiB; every opaque identifier (`request_id`, `correlation_id`, and `opaque_attachment`) is required, UTF-8, nonempty, and at most 128 bytes. `sanitized_observation_json`, `params_json`, and `opaque_result_json` are valid JSON values independently capped at 64 KiB. A value at its field limit may still be rejected when its containing frame exceeds 128 KiB.
+Version 1 health remains unchanged. Version 2 has the same one-request/one-reply Unix connection lifecycle, peer-UID boundary, daemon generation, and total connection deadline. Its frame limit is 160 KiB; every opaque identifier (`request_id`, `correlation_id`, and `opaque_attachment`) is required, UTF-8, nonempty, and at most 128 bytes. `sanitized_observation_json`, `params_json`, and `opaque_result_json` are valid JSON values independently capped at 144 KiB. A value at its field limit may still be rejected when its containing frame exceeds 160 KiB.
 
 Only two version-2 methods exist. `assistance.hook_submit` is `{version:2,request_id,correlation_id,opaque_attachment,sanitized_observation_json}`. Its observation is supplied already sanitized by Assistance and is an opaque JSON object to Application; it carries no tool input, tool output, or source content. The bounded reply keeps `request_id` and `correlation_id` and contains only an opaque Assistance reply or the bounded transport state `unavailable` or `overflow`.
 
-`assistance.method_dispatch` is `{version:2,request_id,correlation_id,opaque_attachment,method,params_json}`. `method` is the closed enum `start | context | diff | inspect | stop`; unknown method tags, fields, versions, malformed JSON, or over-limit values are rejected before forwarding. Its reply is `{version:2,request_id,opaque_result_json}` or the bounded transport state `unavailable` or `overflow`. Application correlates and bounds transport only. Assistance alone interprets attachment, identity, params, results, rendering, and tool failures.
+`assistance.method_dispatch` is `{version:2,request_id,correlation_id,opaque_attachment,method,dispatch_method,params_json}`. `method` is the literal tag `assistance.method_dispatch`; `dispatch_method` is the closed enum `start | context | diff | inspect | stop`. Unknown method tags, fields, versions, malformed JSON, or over-limit values are rejected before forwarding. Its reply is `{version:2,request_id,opaque_result_json}` or the bounded transport state `unavailable` or `overflow`. Application correlates and bounds transport only. Assistance alone interprets attachment, identity, params, results, rendering, and tool failures.
 
 `submit_hook_if_running` is connect-only: it never prepares a runtime directory, starts or retries a daemon, or retries inline. Every connect, timeout, framing, or dispatch failure is `unavailable` to its caller, which must exit the host hook permissively. There is no subscription, queue fan-out, retained event stream, or other generic bus.
 
 ## Wire version 3: closed v0.2 method dispatch
 
-Version 3 preserves the version-2 framing, identity limits, one-request/one-reply lifecycle, and opaque Application treatment. Its only method is `assistance.method_dispatch` with the same envelope and a closed method enum `start | context | diff | inspect | stop | edit`. `edit` parameters and result semantics are owned exclusively by [Assistance v0.2](assistance-v0.2.md) and [Changes v0.2](changes-v0.2.md); Application validates only framing, JSON, field sizes, version, and the closed method tag. It neither logs nor retains the parameters/result as telemetry.
+Version 3 preserves the version-2 framing, identity limits, one-request/one-reply lifecycle, and opaque Application treatment. Its only method is `assistance.method_dispatch` with the same envelope and a closed method enum that adds `edit`, `outline`, `read`, and `symbol` to the version-2 tags. `edit` parameters and result semantics are owned exclusively by [Assistance v0.2](assistance-v0.2.md) and [Changes v0.2](changes-v0.2.md); the symbol tools are specified by [tools v0.4](tools-v0.4.md). Application validates only framing, JSON, field sizes, version, and the closed method tag. It neither logs nor retains the parameters/result as telemetry.
 
 The version-3 reply remains `{version:3,request_id,opaque_result_json}` or `unavailable`/`overflow`. Unknown fields, versions, and method tags are rejected before dispatch. Version 2 remains the v0.1 five-method contract; version 3 is required for the sixth method and is not a generic protocol extension.
+
+## Wire versions 4 and 5: `ide.test` and `ide.graph`
+
+Version 4 adds exactly one `dispatch_method` tag, `test` ([tools v0.4 §2.6](tools-v0.4.md)); version 5 adds exactly `graph`. Each keeps the version-2/3 framing, identity limits, envelope, and opaque Application treatment, and each tag is accepted only on its own wire version.
+
+Wire version 4 also carries the long-lived `assistance.client_lease` handshake (EYES-r2 §2), distinguished from a versioned dispatch by its fixed `method` tag: one `{version:4,request_id,method:"assistance.client_lease",candidate?}` request on its own connection, acknowledged once with `{version:4,request_id,status:"ok",attachment?}`, after which the daemon holds the connection open as one lease until the peer's EOF. The handshake is bounded by a three-second connect/ack deadline, never creates runtime state on its own, and is not actor proof.
 
 ## Verification
 

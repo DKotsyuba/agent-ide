@@ -454,7 +454,8 @@ rust: 3 errors (+2), 5 warnings | python: environment not found
   existing 250 ms hook deadline, never waiting for a check, followed by any eligible one-shot
   native feedback within the same bounded context. In addition, every terminal `ide.*` reply —
   `ide.context` (file pages and the problems kind), `ide.diff`, `ide.edit` in every outcome,
-  `ide.inspect` results that resolve a pending job, `ide.start` completion, and typed error
+  `ide.inspect` results that resolve a pending job, `ide.start` completion, the symbol tools
+  (`ide.outline`, `ide.read`, `ide.symbol`, `ide.graph`, `ide.test`), and typed error
   replies — carries the due plate at the start of what the model reads, followed by a newline and
   the normal reply text. Concretely, the plate leads the compact `content` text and is exposed
   verbatim as the `status` string field of the `structuredContent` object (the field

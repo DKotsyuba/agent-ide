@@ -1,6 +1,6 @@
 #!/bin/sh
-# Status: refreshed for the current hosts; first passing run pending; see
-# docs/macos-acceptance.md results table.
+# Status: the complete live cell passed for release 0.6.2 (revision 2db699f,
+# Claude Code 2.1.280); see docs/macos-acceptance.md results table.
 
 # Real-host driver for the direct Claude Code acceptance route.
 #

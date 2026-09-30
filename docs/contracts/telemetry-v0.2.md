@@ -4,7 +4,7 @@ Revision: TELEMETRY-r1 (proposed; no implementation claim). Provider: Telemetry.
 
 ## Closed local event boundary
 
-Telemetry records a closed, privacy-safe set of typed local events for the six public MCP methods and native fallback observations. An event contains only its schema tag, outcome/fallback reason, bounded duration, provider/language/profile revision, cache/diagnostic state, bounded output-size class, and existing measured resource facts. Measured facts are limited to values current Execution or provider paths already produce: elapsed duration, bounded output byte counts and truncation, admission and cancellation state, and descendant-settlement categories. Telemetry neither samples processes nor invents measurements. A tool deadline is an incomplete observation, not a generic failure.
+Telemetry records a closed, privacy-safe set of typed local events for the eleven public MCP methods and native fallback observations. An event contains only its schema tag, outcome/fallback reason, bounded duration, provider/language/profile revision, cache/diagnostic state, bounded output-size class, and existing measured resource facts. Measured facts are limited to values current Execution or provider paths already produce: elapsed duration, bounded output byte counts and truncation, admission and cancellation state, and descendant-settlement categories. Telemetry neither samples processes nor invents measurements. A tool deadline is an incomplete observation, not a generic failure.
 
 A settled Edit result retrieved through `ide.inspect` remains attributed to the `edit` method and carries only its closed completion and diagnostic classes. The earlier pending Edit call remains a separate incomplete observation; neither event stores the inspected reply, path, source reference, or diagnostic messages.
 
@@ -26,7 +26,7 @@ All telemetry settings (enabled state, retention ceilings within the hard maxima
 
 ## Examples
 
-Success: `ToolCompleted { method: "edit", outcome: "completed", duration_ms: 84, language: "typescript", diagnostics: "changed" }` is accepted if its canonical encoding is within 2 KiB. The durable Changes receipt remains the owner of the more specific `replaced` effect outcome.
+Success: `ToolCompleted { method: "edit", outcome: "completed", duration_ms: 84, language: "typescript", cache: "hit", diagnostics: "changed" }` is accepted if its canonical encoding is within 2 KiB. The durable Changes receipt remains the owner of the more specific `replaced` effect outcome.
 
 Error: `ToolCompleted { path: "src/private.ts", outcome: "replaced" }` is rejected because `path` is not a field. If the local sink is unavailable, the edit result is still returned normally and the event is dropped.
 

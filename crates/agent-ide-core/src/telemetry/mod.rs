@@ -55,7 +55,7 @@ const TELEMETRY_MIGRATION_SQL: &str = "
     CREATE INDEX IF NOT EXISTS telemetry_events_tag_sequence
         ON telemetry_events(tag, sequence);";
 
-/// Identifies one of the six public Assistance MCP methods without carrying its arguments.
+/// Identifies one of the eleven public Assistance MCP methods without carrying its arguments.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolMethod {

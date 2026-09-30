@@ -114,54 +114,62 @@ release_root="$(mktemp -d)"
 version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
 cargo build --locked --release --bin agent-ide
 scripts/package-release.sh target/release/agent-ide "v$version" "$release_root"
+tar -xzf "$release_root/agent-ide-v$version-aarch64-apple-darwin.tar.gz" -C "$release_root"
 "$release_root/agent-ide-v$version/agent-ide" self-install --release "$release_root/agent-ide-v$version" --version "$version"
 ```
 
-`package-release.sh` verifies that the tag matches the Cargo and plugin manifest versions and
-produces the bundle (`agent-ide`, plugin manifests, marketplace catalogs, hooks, skill, this
-guide, `metadata.json`, `SHA256SUMS`, `COMPLETE`) plus the tarball and its `SHA256SUMS`;
-`self-install` runs the installer's own code path on that local bundle. The temporary build
-directory may be removed after installation. Use a new version for changed source: the
-installer never overwrites an existing version with different bytes.
+`package-release.sh` verifies that the tag matches the plugin manifest versions and produces
+the bundle (`agent-ide`, plugin manifests, marketplace catalogs, hooks, skill, this guide,
+`metadata.json`, `SHA256SUMS`, `COMPLETE`) plus the tarball and its `SHA256SUMS`; it writes only
+those two files, so the tarball is extracted before `self-install` runs the installer's own code
+path on that local bundle. The release workflow verifies the tag against the Cargo version before
+packaging. The temporary build directory may be removed after installation. Use a new version for
+changed source: the installer never overwrites an existing version with different bytes (source
+builds may pass `self-install --replace` — `scripts/install-local.sh` does — to rebuild a
+same-version release).
 
 For a development install without a release bundle, `scripts/install-local.sh [--prefix DIR]
-[--dry-run] [--no-build]` builds this checkout and installs it into a user prefix (default
-`$HOME/.local`) so agent-run runtimes, crew hooks, and Claude skills catalogs can depend on a
-stable installed path instead of the checkout itself. The checkout remains the development
-working copy; nothing about it changes.
+[--no-build]` builds this checkout, packages and extracts the sealed bundle, and installs it
+through `self-install` into a user prefix (default `$HOME/.local`) so agent-run runtimes, crew
+hooks, and Claude skills catalogs can depend on a stable installed path instead of the checkout
+itself. The checkout remains the development working copy; nothing about it changes.
 
-What is installed where:
+What is installed where (all of it by `self-install`; `<home>` is `$AGENT_IDE_HOME` or the real
+user home):
 
-- `<prefix>/bin/agent-ide` — the release binary, built with `cargo build --locked --release`
-  (skip with `--no-build` when `target/release/agent-ide` is already current) and copied in
-  atomically: staged as `agent-ide.tmp-<pid>`, then `mv`'d over the existing name so running
-  processes keep their already-open old inode.
+- `<home>/.agent-ide/standalone/releases/<version>/` with a `current` symlink — the verified
+  sealed bundle, installed immutably.
+- `<prefix>/bin/agent-ide` — the managed launcher shim, not a copied binary: `exec
+  '<home>/.agent-ide/standalone/current/agent-ide' "$@"`, staged under a temporary name and
+  renamed over the previous file.
 - `<prefix>/share/agent-ide/plugin/<version>/` — a plugin bundle containing `.claude-plugin/`,
   `.codex-plugin/`, `hooks/`, and `skills/` copied from the checkout. Its `hooks/claude-hook.sh`
-  is regenerated to `exec` the installed binary's absolute path directly, so the installed copy
+  is regenerated to `exec` the installed launcher's absolute path directly, so the installed copy
   no longer needs `AGENT_IDE_BIN`; the checkout's own strict `hooks/claude-hook.sh` is untouched.
-  Re-running the installer for the same version replaces that version directory (staged, then
-  swapped in).
+  The bundle is staged in a temporary directory and renamed into place. Re-running the installer
+  while `plugin/current` already selects the same version is refresh-only: the release and plugin
+  directories stay untouched and only the launcher shim is rewritten (`self-install` reports
+  `action:"refreshed"`); the script passes `--replace`, so a same-version release with different
+  bytes is rebuilt instead of refused.
 - `<prefix>/share/agent-ide/plugin/current` — a symlink to the just-installed version directory,
-  swapped atomically (staged as `current.tmp-<pid>`, then `mv -f`).
+  swapped atomically (staged as `.current-next-<pid>-<unique>`, then renamed over the link).
 
-The script validates the installed bundle (`hooks/hooks.json` and `skills/agent-ide/SKILL.md`
-present, the generated hook executable) and runs `agent-ide launcher check` against
-`$HOME/.config/agent-ide/launcher.json` when that file exists; a launcher check failure is
-reported as a warning, not a stop. It never edits `~/.claude/settings.json`,
-`~/.agent-run/config.toml`, `crew.toml`, or any skills catalog — it only prints the exact lines an
-operator should apply there, pointed at `<prefix>/share/agent-ide/plugin/current`. `--dry-run`
-prints every action it would take without writing anything.
+The script never edits `~/.claude/settings.json`, `~/.agent-run/config.toml`, `crew.toml`, or any
+skills catalog — it only prints the exact lines an operator should apply there, pointed at
+`<prefix>/share/agent-ide/plugin/current`.
 
 agent-run resolves `<prefix>/share/agent-ide/plugin/current` to its versioned directory once, when
 its service starts. After an install, restart the agent-run service when no agents are running;
 until then its Claude runtimes keep loading the previous plugin version (seen with 0.3.12 → 0.3.13,
 whose old hooks no longer ran under Claude Code 2.1.280).
 
-To roll back: restore the binary from its `<prefix>/bin/agent-ide.bak-<old-version-or-timestamp>`
-backup (written before the new binary replaces the old one, named from the old binary's own
-`--version` output when it prints one, else a UTC timestamp), and point `current` back at the
-previous `<prefix>/share/agent-ide/plugin/<old-version>/` directory.
+To roll back: point `<home>/.agent-ide/standalone/current` and
+`<prefix>/share/agent-ide/plugin/current` back at the previous version directories
+(`<home>/.agent-ide/standalone/releases/<old-version>/` and
+`<prefix>/share/agent-ide/plugin/<old-version>/`). A `<prefix>/bin/agent-ide.bak-<old-version>`
+backup is written only once — when the installer migrates a previously installed Mach-O binary at
+the launcher path to the managed shim (named from the old binary's own `--version` output when it
+prints one, else a timestamp); afterwards the launcher is a shim and is simply rewritten.
 
 `agent-ide -v`, `-V`, `--version`, and `version` all print `agent-ide <version>` and exit 0
 without touching the daemon, runtime dir, config, or network.
@@ -187,7 +195,8 @@ toolchain is installed, the workspace gate skips exactly the three real-gopls to
 `dropping_live_gopls_owner_closes_its_owned_listener`) by name while running every other
 workspace test, and the runner records `go` and `gopls` evidence as `not_tested`. Publication
 additionally requires
-the checked-in product, direct Codex, direct Claude, and installed agent-run-to-Claude evidence to
+the checked-in product, direct Codex, direct Claude, installed agent-run-to-Claude, and
+installed agent-run-to-Codex evidence to
 name one ancestor candidate revision. Every host scenario must be `real_pass`, the product
 scenarios must be `product_pass`, and all rows must carry the accepted language toolchain versions
 with `go` and `gopls` pinned to `not_tested` and closed privacy fields. Missing drivers, `failed`,
@@ -207,7 +216,9 @@ lexical outline corpus again with the new build
 (`node crates/agent-ide-lang-rust/tests/fixtures/lexical/record.mjs "$AGENT_IDE_RUST_ANALYZER"`,
 which writes its version to `VERSION` there) and keeping the corpus test green: the outline Rust
 answers from while rust-analyzer loads must equal that build's document symbols. After the smoke test the workflow generates one
-`SHA256SUMS`, attests build provenance for it (`actions/attest-build-provenance`), and
-publishes the tarball, `install.sh`, and `SHA256SUMS` to the GitHub Release only after every
+`SHA256SUMS`, attests build provenance for it (`actions/attest-build-provenance`; GitHub keeps
+attestations for public repositories only, so the step is skipped while this repository is
+private), and publishes the tarball, `install.sh`, and `SHA256SUMS` to the GitHub Release only
+after every
 required job succeeds. A failed run leaves no public partial release. Tags are immutable;
 corrections ship as a new patch version.

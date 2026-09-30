@@ -33,7 +33,7 @@ The closed version-one JSON shape is:
         "identity": "accepted-binary-identity",
         "blake3": "64-hex-digit-accepted-executable-digest"
       },
-      "providers": [],
+      "providers": []
     }
   ],
   "allowed_roots": ["/absolute/projects"]
@@ -47,7 +47,8 @@ startup task before the worker becomes ready. Selected executable bytes must rem
 immutable for that daemon boot; changes require restart and fresh verification.
 
 Configurations written for 0.3.16 and earlier may still carry `codex`, `cwd_trampoline`,
-`profiles`, and `allow_disabled_host` on a target; they are accepted and ignored, because no
+`profiles`, and `allow_disabled_host` — and, from the retired Claude helper, `claude_profile` —
+on a target; they are accepted and ignored, because no
 host sandbox is replayed any more. New configurations should omit them.
 
 Each optional provider has `executable` in the same shape as `git`, a closed `settings`
@@ -79,7 +80,7 @@ authority grant. Assistance combines it with the verified durable worktree and
 accepted provider identities to retain a private directory, then supplies only
 that derived directory through the provider's cleared environment. Configuration
 cannot select `HOME` or another writable host path.
-Claude provider processes run one-shot in the daemon and are reaped there Directory retention does not claim a
+Claude provider processes run one-shot in the daemon and are reaped there. Directory retention does not claim a
 surviving backend or proven warm opaque provider index.
 
 Limits are explicit: 1–64 queued operations, 1–128 retained details, 1–300000 ms per
@@ -95,17 +96,22 @@ the closed frame only through the daemon; a null Claude record keeps that host u
 server or automatic typing acquisition.
 
 For a configured TypeScript-family document, the observed ancestor `tsconfig.json` or `jsconfig.json`
-must explicitly set `compilerOptions.types` to `[]` and `compilerOptions.moduleResolution` to
-`node10`. JavaScript and JSX documents additionally require `compilerOptions.allowJs` to be `true`;
-the closed diagnostic options `checkJs` and `noImplicitAny`, when present, must also be `true`.
-The top-level `files` array is required, bounded by the existing 16-entry resolution limit, and
-must list the current document exactly once relative to the config directory. Every entry must be a
-normalized relative UTF-8 path without glob metacharacters, absolute paths, dot/parent components,
-or backslashes; duplicates are rejected. Top-level `include` and `exclude`, compiler output options
-`outDir` and `declarationDir`, and dependency graphs (`extends`, `references`, package
-dependencies/workspaces, or ancestor `node_modules`) are unsupported and rejected. Membership is
-taken only from this exact observed array; no glob, output-path, or dependency membership is
-inferred or scanned.
+must explicitly admit the current document through a bounded top-level `files` entry or a literal
+`include` file/directory entry (wildcard `include` and `exclude` are refused), and must set
+`compilerOptions.types` to `[]` or exactly `["vite/client"]` and `compilerOptions.moduleResolution`
+to `node10` or `bundler` (a `module` of `node16`/`nodenext`/`preserve` is refused). JavaScript and
+JSX documents additionally require `compilerOptions.allowJs` to be `true`; the closed diagnostic
+options `checkJs` and `noImplicitAny`, when present, must also be `true`. Every `files`/`include`
+entry must be a normalized relative UTF-8 path without glob metacharacters, absolute paths,
+dot/parent components, or backslashes; duplicates are rejected, the observed input set is bounded
+by the existing 16-entry resolution limit, and at least one config is required (inferred projects
+are unsupported). A config may instead declare only `references` (with an empty `files` and no
+other options) and route to its sibling projects one level deep; nested `references` and
+`extends`/`typeAcquisition` are unsupported. Compiler output options `outDir` and `declarationDir`
+are rejected. `package.json` may declare dependencies but not `imports` or `workspaces`; package
+resolution is confined to real `node_modules` directories below the worktree, and ambient ancestor
+`node_modules` entries are refused. Membership is taken only from these exact observed entries; no
+glob, output-path, or inferred membership is scanned.
 
 Configuration contains private attachment and evidence values. Diagnostic formatting
 redacts the configuration; it must never be rendered in model-facing tool results.
@@ -158,7 +164,8 @@ configuration is rejected on any malformed value.
     (falling back to `/Applications/Xcode.app/Contents/Developer` then
     `/Library/Developer/CommandLineTools`); the shipped example fragment
     [docs/examples/launcher-eyes.json](examples/launcher-eyes.json) omits both optional fields
-    while the schema on the current base accepts only `toolchain_dir` and rejects unknown fields.
+    while the schema accepts exactly `toolchain_dir`, `cargo_home`, and `developer_dir` and
+    rejects unknown fields.
   - `python`: `node` and `pyright_cli` (both required, absolute, normalized), the accepted Node
     executable and the Pyright CLI entry module it runs. The project's own interpreter is located
     inside the worktree; a missing environment reports `environment not found` rather than the
@@ -179,8 +186,9 @@ Each check owns one process group, killed whole on cancel, timeout (`check_timeo
 shutdown; no pattern-based kill touches processes the daemon did not start.
 
 Check caches live outside every runtime directory, under
-`$HOME/.agent-ide/checks/<16 hex blake3(repository key)>/<16 hex blake3(canonical worktree)>/<language>`
-(mode `0700`), so they survive daemon idle stops and crashes; at daemon start, cache directories
+`$HOME/.agent-ide/checks/<16 hex blake3(repository key)>/<16 hex blake3(canonical worktree)>/<policy digest>/<language>`
+(mode `0700`), so they survive daemon idle stops and crashes and caches from different policies
+never collide; at daemon start, cache directories
 whose recorded worktree no longer exists are removed. A new worktree's Rust cache is cloned
 copy-on-write from the most recently completed sibling worktree of the same repository when
 possible.
@@ -204,7 +212,10 @@ Results: one bounded snapshot per `(worktree, language)` carries state, error/wa
 a bounded problem list. The compact `<agent-ide>` block (at most 256 bytes, counts and fixed state
 text only, never paths or messages) is emitted to the owning Claude actor only when its items
 change; unavailable states render fixed text (`checks disabled`, `outside allowed roots`,
-`tool not found`, `environment not found`, `check failed`, `check timed out`). `ide.context` with
+`tool not found`, `environment not found`, `no files analyzed`, `check failed`,
+`check timed out`, `unavailable: read_restricted`), and a running check renders
+`checking (first check)` or `checking (files changed; last result: N errors, M warnings)`.
+`ide.context` with
 `{"kind":"problems","language"?,"offset"?}` returns counts and up to 20 problems per call with
 `next_offset`. One `ProjectCheckCompleted` telemetry event (bucketed counts, no paths or messages)
 extends the TELEMETRY-r1 event scope.

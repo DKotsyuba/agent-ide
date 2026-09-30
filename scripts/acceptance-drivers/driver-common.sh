@@ -1,6 +1,6 @@
 #!/bin/sh
-# Status: refreshed for the current hosts; first passing run pending; see
-# docs/macos-acceptance.md results table.
+# Status: the committed drivers' cells all passed for release 0.6.2 (revision
+# 2db699f); see docs/macos-acceptance.md results table.
 
 # Shared functions for the committed real-host acceptance drivers.
 #

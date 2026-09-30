@@ -2,13 +2,12 @@
 
 An explicitly activated coding companion for Codex and Claude Code on macOS arm64. One coding agent owns one Git worktree. A local broker coordinates isolated analysis views, compatible shared language-server backends and bounded feedback. Linux remains explicitly `not_tested` and no Linux release artifact is published.
 
-Status: the binary assembles the eleven-tool MCP surface, exact Codex hook-to-MCP binding,
-explicit Codex/Claude native ingress, bounded hook context output, durable Workspace activation,
-source context, safe Git comparisons and owned provider cleanup. Host-shaped process tests exercise
-Claude daemon activation, stale-safe Edit, Go/Rust Context, Diff and emitted additional context.
-Live macOS checks cover Claude Go/Rust and parallel native actors with sequential handoff,
-plus Codex Go context/edit/diff/stop and parent/native-child isolation across distinct worktree
-roots. Complete delivery accounting and the remaining roadmap acceptance checks are still open.
+Status (0.6.2): eleven MCP tools — `ide.start`, `ide.context`, `ide.outline`, `ide.read`,
+`ide.symbol`, `ide.graph`, `ide.edit`, `ide.test`, `ide.diff`, `ide.inspect`, `ide.stop` — over
+Rust, Python and TypeScript/JavaScript language servers, a language-free core with one crate per
+language, and a cross-language name bridge (CSS selectors ↔ HTML/TSX class names). Every release
+passes five live macOS acceptance routes (product, direct Codex, direct Claude, agent-run to Claude,
+agent-run to Codex). Go/gopls support is built in but outside the release scope and `not_tested`.
 
 Tagged releases are built on GitHub Actions using an arm64 macOS runner and published
 with a SHA-256 checksum in GitHub Releases. See [docs/release.md](docs/release.md).
@@ -62,12 +61,15 @@ release_root="$(mktemp -d)"
 version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
 cargo build --locked --release --bin agent-ide
 scripts/package-release.sh target/release/agent-ide "v$version" "$release_root"
+tar -xzf "$release_root/agent-ide-v$version-aarch64-apple-darwin.tar.gz" -C "$release_root"
 "$release_root/agent-ide-v$version/agent-ide" self-install --release "$release_root/agent-ide-v$version" --version "$version"
 ```
 
-Use a new version for changed source: the installer never overwrites an existing version
-with different bytes. For a development install without a release bundle, use
-`scripts/install-local.sh`.
+`package-release.sh` writes only the tarball and its `SHA256SUMS`; the bundle directory exists
+once the tarball is extracted. Use a new version for changed source: the installer never
+overwrites an existing version with different bytes (source builds may pass `self-install
+--replace` — `scripts/install-local.sh` does — to rebuild a same-version release). For a
+development install without a release bundle, use `scripts/install-local.sh`.
 
 Restart agent-run after an install or update: it resolves
 `~/.local/share/agent-ide/plugin/current` once, when its service starts, so its runtimes
@@ -93,7 +95,7 @@ configuration, toolchains, install layout, plugin link, host hooks, daemons, rec
 and exits 2 when it reports errors. `agent-ide doctor --runtime-dir PATH` keeps querying a
 running repository daemon.
 
-The accepted language-server versions for 0.4 are rust-analyzer 1.98.1 (from the pinned
+The accepted language-server versions for 0.6.2 are rust-analyzer 1.98.1 (from the pinned
 Rust toolchain), pyright 1.1.413, typescript-language-server 6.0.0, TypeScript 5.9.3, and
 Node 24.4.0; the release workflow installs exactly these, and [docs/release.md](docs/release.md)
 lists them for the publication gate.
@@ -154,11 +156,12 @@ plugin manifest:
 The Claude plugin contributes the four correlated lifecycle hooks from `hooks/hooks.json`; its
 plugin-local command requires `AGENT_IDE_BIN` to be the same absolute executable configured for
 MCP and delegates to that exact installed binary's `claude-hook`. It never searches `PATH`, so a
-binary update cannot split MCP and hook versions. That argument-free mode finds the active project rendezvous
-solely from Claude's absolute `CLAUDE_PROJECT_DIR`. The managed MCP requires the template's one
-target. It exclusively owns a
-deterministic private runtime for that project, so a second MCP stays disconnected until the owner
-exits and removes it.
+binary update cannot split MCP and hook versions. That argument-free mode finds the active project
+rendezvous from the hook payload's canonical `cwd` — resolved to the nearest ancestor holding the
+MCP-written key cache — never from an environment variable. The managed MCP requires the template's
+one target. It joins one deterministic shared per-repository runtime (`/private/tmp/ai-r-<hash>`,
+keyed by the canonical git common directory): the first MCP starts the daemon, a later MCP of the
+same repository adopts the healthy daemon, and an MCP exit never stops it.
 
 `agent-ide claude-rendezvous /absolute/path/to/project` prints the repository runtime directory without creating runtime state.
 
@@ -185,7 +188,7 @@ pair, as in the shipped fragment
 roots, or an undeclared language keep the feed disabled and v0.2 behaviour unchanged. Each check
 runs under `sandbox-exec` with no network, a read-only worktree, reads limited to the declared
 toolchains, and one private cache under
-`$HOME/.agent-ide/checks/<repository>/<worktree>/<language>`; the environment is rebuilt from an
+`$HOME/.agent-ide/checks/<repository>/<worktree>/<policy digest>/<language>`; the environment is rebuilt from an
 allowlist (`CARGO_NET_OFFLINE=true`, private `CARGO_TARGET_DIR` and temp). Runs are debounced,
 bounded by `check_timeout_s`, and their process groups are killed on cancel or timeout. See the
 [EYES-r2 contract](docs/contracts/eyes-v0.3.md), the

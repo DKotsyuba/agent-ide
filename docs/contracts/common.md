@@ -4,7 +4,7 @@ Revision: r2. Normative intended behavior; no implementation or executable confo
 
 ## Composition and ownership
 
-Use one library/binary with six ordinary modules. The Application owner alone edits root manifests, library registrations, common integration support and migration allocation. Each domain owns its implementation, persistence operations and domain migrations in its assigned files. Contracts below specify observable behavior, not a universal service framework.
+Use one library/binary with six ordinary modules (the r2 boundary; the shipped core has since grown to sixteen top-level modules). The Application owner alone edits root manifests, library registrations, common integration support and migration allocation. Each domain owns its implementation, persistence operations and domain migrations in its assigned files. Contracts below specify observable behavior, not a universal service framework.
 
 `CallContext` is constructed by trusted ingress, never deserialized directly from model arguments: request_id, actor_id, session_id, worktree_incarnation, authority_epoch, deadline, cancellation. Handles and IDs are distinct Rust types. Actor identity is provided by Assistance, accepted by Workspace; a UUID or same-user Unix peer alone is not actor proof. Test constructors belong to test support.
 

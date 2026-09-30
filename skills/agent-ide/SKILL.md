@@ -201,7 +201,8 @@ Each child or subagent activates `ide.*` independently: a parent's
 usable, fall back immediately to native host tools and CodeGraph or native
 search; never block source work waiting for `ide.*` to become available.
 When an `unavailable` reply carries the retry fact `daemon restarted; repeat
-this call once`, repeat that exact same call once before falling back to
+this call once` or `session re-rooted to the requested root; repeat this call
+once`, repeat that exact same call once before falling back to
 native tools.
 
 ## Boundaries

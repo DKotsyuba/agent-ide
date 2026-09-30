@@ -44,8 +44,9 @@ opts into `info` as well.
 ## Closed vocabulary
 
 Every field is one of: an RFC 3339 UTC timestamp; a closed `level` tag; a closed `method` tag
-(`start`, `context`, `diff`, `edit`, `inspect`, `stop`, `hook`, `check`, `daemon`,
-`client`, `feed`); a closed `outcome` tag; an optional closed `reason` tag, which is always the most
+(`start`, `context`, `diff`, `edit`, `outline`, `read`, `symbol`, `graph`, `test`, `inspect`,
+`stop`, `hook`, `check`, `daemon`, `client`, `feed`); a closed `outcome` tag; an optional closed
+`reason` tag, which is always the most
 specific existing enum variant at the point of failure (for example `BindingUnavailable::MissingPre`,
 `FailureCode::InvalidDetail`, or `UnavailableReason::Fatal`, rendered
 `missing_pre`/`invalid_detail`/`check_fatal`); an optional `worktree` path; an optional `host` tag

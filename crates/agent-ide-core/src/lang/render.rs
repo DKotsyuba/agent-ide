@@ -682,7 +682,7 @@ pub struct SymbolCard {
     pub definition: Option<String>,
     pub usages: Vec<Usage>,
     /// Printed in place of an empty usages list when nothing can answer references
-    /// (`unavailable (<language> has no language server; see links)`).
+    /// (`unavailable (<language> has no language server)`).
     pub usages_note: Option<String>,
     /// Printed in place of an empty callers list when the language server has no call
     /// hierarchy (`unavailable (<server> has no call hierarchy)`).

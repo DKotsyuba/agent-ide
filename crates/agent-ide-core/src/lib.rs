@@ -23,7 +23,7 @@ pub mod execution;
 /// Owns worktree identity, authority lifecycles, raw Git evidence, and source observations.
 pub mod workspace;
 
-/// Provides bounded internal LSP wire safety primitives for later semantic views.
+/// Provides bounded internal LSP wire safety primitives for the live semantic views.
 pub mod intelligence;
 
 /// Language identity, registration and the support contract for the symbol-addressed tools.
@@ -32,7 +32,8 @@ pub mod lang;
 /// Builds and renders the language-independent project card `ide.start` shows.
 pub mod project;
 
-/// Composes bounded diff summaries and hunk payload for Changes v0.1.
+/// Composes bounded diff summaries and hunk payload for Changes v0.1 and the
+/// v0.2 one-file edit boundary.
 pub mod changes;
 
 /// Owns closed, bounded, local-only usage telemetry and its durable query/export surface.

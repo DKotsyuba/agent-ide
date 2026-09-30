@@ -1,9 +1,9 @@
 #!/bin/sh
-# Status: sessions start live and complete the scripted tool loop (measured
-# 2026-09-22 against codex-cli 0.155.1), but no host-cell real_pass exists yet:
-# the default operator launcher's accepted codex-managed profile record
-# predates the installed CLI, so the managed host refuses ide.start with the
-# closed `execution_profile` code until the operator re-mints that record.
+# Status: the complete live cell passed for release 0.6.2 (revision 2db699f,
+# codex-cli 0.156.1); the earlier blocker — the operator launcher's accepted
+# codex-managed profile record predating the installed CLI, refused by the
+# managed host with the closed `execution_profile` code — was resolved by
+# re-minting that record.
 #
 # Measured `codex exec --json` transcript shape (codex-cli 0.155.1): one JSON
 # object per line. A session opens with `{"type":"thread.started","thread_id":..}`

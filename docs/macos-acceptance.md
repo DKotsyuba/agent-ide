@@ -33,7 +33,7 @@ scripts/macos-acceptance.sh --route product --evidence /absolute/output/evidence
 The `codex`, `claude`, `agent-run-claude`, and `agent-run-codex` routes accept an optional absolute `--driver`
 executable. Without one, the runner creates bounded `not_tested` evidence and makes no host claim.
 With one, `AGENT_IDE_ACCEPTANCE_HOST_VERSION` must be a public version token — for the committed
-drivers that is a token identifying the actual host version, such as `agent-run-0.14.0+codex-cli-0.156.1`
+drivers that is a token identifying the actual host version, such as `agent-run-0.19.0+codex-cli-0.156.1`
 for agent-run to Codex. The driver is invoked with no arguments and receives only these environment
 variables:
 
@@ -49,8 +49,8 @@ binary's managed MCP and plugin, capturing stream-json transcripts:
 
 ```sh
 claude -p "$(cat <prompt>)" --model haiku --output-format stream-json --verbose \
-  --dangerously-skip-permissions --strict-mcp-config --mcp-config <generated> \
-  --plugin-dir <worktree>
+  --dangerously-skip-permissions --setting-sources project,local --strict-mcp-config \
+  --mcp-config <generated> --plugin-dir <worktree>
 ```
 
 Claude Code 2.1.274 documents no flag that bounds agentic turns (`--max-turns` is gone from
@@ -82,12 +82,13 @@ reach the agent: the agent's MCP comes from the operator's `~/.agent-run/config.
 `[mcp.agent_ide]` entry. The outer `perl alarm` bounds each start call independently of agent-run's
 own timeout setting. Because the driver cannot redirect the agent
 to the candidate, it fails closed with `installed_binary_differs` unless the installed
-`/Users/pluto/.local/bin/agent-ide` is byte-identical to the candidate binary. The Codex route
-also requires a matching accepted v3 visualization profile in the launcher before sessions start.
+`/Users/pluto/.local/bin/agent-ide` is byte-identical to the candidate binary. The Claude route
+also requires the accepted TypeScript r3 record in the launcher before sessions start; the Codex
+route instead checks both fixture worktrees against the launcher's `allowed_roots`.
 Set `TMPDIR` to an existing writable directory covered by the launcher's `allowed_roots` before
 invoking the runner; for the current operator launcher, use `TMPDIR=/private/tmp/agent-ide-stability`.
-The Codex driver checks both fixture worktrees against those roots before starting an agent.
-For both agent-run routes, every captured Agent IDE tool reply must be a complete string result
+The Codex driver checks both fixture worktrees against those roots before starting an agent;
+for both agent-run routes, every captured Agent IDE tool reply must be a complete string result
 of at most 16 KiB; divergent-worktree transcripts must contain no left fixture marker.
 
 The driver must exercise the real host route and write exactly this ordered result to the result
@@ -120,8 +121,8 @@ check the Claude cell uses; the diagnostic log marks such cells `journal-backed`
 
 ### Direct Codex driver
 
-`scripts/acceptance-drivers/codex.sh` is the committed driver for `--route codex`. Status:
-work in progress — first live run pending, and it has produced no `real_pass` claim. It runs real
+`scripts/acceptance-drivers/codex.sh` is the committed driver for `--route codex`. Its complete
+live cell passed at revision `2db699f` (release 0.6.2, Codex CLI 0.156.1). It runs real
 bounded `codex exec --json -C <worktree> --skip-git-repo-check -m <model>
 -o <last-message> "<prompt>"` sessions (with `--dangerously-bypass-hook-trust` only when the
 installed CLI documents that flag; approvals and sandbox are never bypassed). Its private Codex
@@ -133,7 +134,7 @@ with the returned `detail_ref`.
 
 Each run builds a private `CODEX_HOME` in a per-run temporary directory with only the candidate
 binary as the `agent-ide` MCP server (`mcp --launcher-template`), `default_tools_approval_mode =
-"never"` for that server, the candidate's own `codex-hooks print` fragment as `hooks.json`, and the
+"approve"` for that server, the candidate's own `codex-hooks print` fragment as `hooks.json`, and the
 operator's auth linked in place (the `file_link` pattern: a hard link to `~/.codex/auth.json`,
 symlink fallback; never copied, read, or printed). Every scenario session is attempted at most three
 times, and each retry first restores the exact fixture precondition.
@@ -161,47 +162,51 @@ implemented.
 
 ## Host-cell results
 
-The product candidate at revision `d88af079ac1e0c06d411208f513a1bfefeddf4b1` was exercised on
-macOS 26.6.2 arm64. Its locked [product gate](evidence/macos-v0.2-product.json) passed with the
-documented toolchain versions. Direct Claude was rerun at revision
-`0806f50bcde8d68b5404576c5d9e69879bcd14f1`; the intervening revision changed only this acceptance
-documentation and evidence, not the tested product. The real-host matrix remains closed: a
-partially successful route is not a `real_pass`, and the runner marks every scenario `failed` when
-its strict driver withholds the exact complete result document.
-
-All four routes passed on one revision for release 0.3.15 (`edaf281`): Claude Code 2.1.280,
-Codex CLI 0.155.1 and agent-run 0.12.6 to Claude Code 2.1.280.
-Three environment facts were required and are now encoded in the drivers or release notes: the
-Claude plugin hook entry carries no `args` (Claude Code 2.1.280 runs such entries without a shell),
-Claude route sessions exclude user-level settings so an operator-registered hook cannot double the
-candidate hook, and the agent-run service is restarted after an install so it loads the new plugin.
+Release 0.6.2 was exercised at revision `2db699f` on macOS 27.0 arm64: all five routes passed on
+one revision — the product contract (`product_pass`) plus `real_pass` for direct Codex CLI
+0.156.1, direct Claude Code 2.1.280, and installed agent-run 0.19.0 to each host — with the
+documented toolchain versions. The real-host matrix remains closed: a partially successful route
+is not a `real_pass`, and the runner marks every scenario `failed` when its strict driver
+withholds the exact complete result document.
 
 | Route | Public evidence | Result |
 |---|---|---|
 | Product contract | [JSON](evidence/macos-v0.2-product.json) | `product_pass` |
-| Direct Codex CLI 0.155.1 | [JSON](evidence/macos-v0.2-direct-codex.json) | `real_pass` |
+| Direct Codex CLI 0.156.1 | [JSON](evidence/macos-v0.2-direct-codex.json) | `real_pass` |
 | Direct Claude Code 2.1.280 | [JSON](evidence/macos-v0.2-direct-claude.json) | `real_pass` |
-| Installed agent-run 0.12.6 to Claude Code 2.1.280 | [JSON](evidence/macos-v0.2-agent-run-claude.json) | `real_pass` |
-| Installed agent-run to Codex | Pending live evidence | `not_tested` |
+| Installed agent-run 0.19.0 to Claude Code 2.1.280 | [JSON](evidence/macos-v0.2-agent-run-claude.json) | `real_pass` |
+| Installed agent-run 0.19.0 to Codex CLI 0.156.1 | [JSON](evidence/macos-v0.2-agent-run-codex.json) | `real_pass` |
 
-The release evidence gate now requires `macos-v0.2-agent-run-codex.json` with route
-`agent_run_codex` and a complete `real_pass` cell at the same candidate revision. Until that
-live run passes, release publication is blocked.
+The release evidence gate requires `macos-v0.2-agent-run-codex.json` with route `agent_run_codex`
+and a complete `real_pass` cell at the same candidate revision; the 0.6.2 run satisfies it, and
+publication is blocked while any route's evidence does not name the candidate revision.
 
 The installed agent-run route is separate evidence and is not relabeled as direct Claude. Private
 driver prompts, local paths, credentials, transcripts, and host/run identifiers were retained only
 in disposable operator state and do not appear in these artifacts.
 
+The paragraphs below are the historical record of the first runs (macOS 26.6.2, 2026-09-14,
+revisions `d88af079…` and `0806f50…`; the intervening revision changed only this acceptance
+documentation and evidence, not the tested product), kept as the context for the failures the
+current evidence closed out.
+
+All four routes then available passed on one revision for release 0.3.15 (`edaf281`): Claude Code
+2.1.280, Codex CLI 0.155.1 and agent-run 0.12.6 to Claude Code 2.1.280.
+Three environment facts were required and are now encoded in the drivers or release notes: the
+Claude plugin hook entry carries no `args` (Claude Code 2.1.280 runs such entries without a shell),
+Claude route sessions exclude user-level settings so an operator-registered hook cannot double the
+candidate hook, and the agent-run service is restarted after an install so it loads the new plugin.
+
 The earlier direct-Claude login result was false: the host inherited a per-run synthetic `HOME`, so
 Claude resolved an empty isolated profile instead of the operator's normal authorized profile.
 Changing outer sandbox permissions did not change that result; restoring the normal login home did,
 with the existing OAuth read in place and no credential copied or emitted. Direct Claude then reached
-the candidate MCP and its plugin-hook route. This environment correction changes the row from
-`not_tested` to a real `failed` result; it does not turn the incomplete cell into `real_pass`.
+the candidate MCP and its plugin-hook route. This environment correction changed the row from
+`not_tested` to a real `failed` result at the time.
 
-The remaining failures do not justify a product change in this task. The locked Claude gate
-passes real Pyright Context and Diff, while the live direct-Claude Diff failure is
-`workspace_authority`. The agent-run Diff failure is the distinct closed `capacity` result. The
+The failures recorded then did not justify a product change in that task. The locked Claude gate
+passed real Pyright Context and Diff, while the live direct-Claude Diff failure was
+`workspace_authority`. The agent-run Diff failure was the distinct closed `capacity` result. The
 accepted TypeScript r3 provider `claude-r3-2026-09-14` has since been compiled and merged into the
-default launcher, so the refreshed drivers exercise it; whether it closes the TypeScript scenarios
-on the current hosts is exactly what the pending first passing run must show.
+default launcher, and the refreshed drivers closed the TypeScript scenarios on the current hosts in
+the 0.6.2 run above.

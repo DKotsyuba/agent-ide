@@ -1,11 +1,11 @@
 #!/bin/sh
-# Claude evidence exists for an earlier candidate; Codex live run pending.
+# Status: both agent-run cells passed for release 0.6.2 (revision 2db699f).
 
 # Real-host driver for installed agent-run to Claude and Codex acceptance routes.
 #
 # The runner starts this executable with AGENT_IDE_ACCEPTANCE_ROUTE=
 # agent-run-claude or agent-run-codex, two isolated fixture worktrees, and a fresh result
-# path. The driver starts real agents through the installed agent-run 0.14.x
+# path. The driver starts real agents through the installed agent-run 0.19.x
 # CLI. Its resident broker spawns the agent process, so environment variables
 # set on the start command line (AGENT_IDE_BIN, HOME) do NOT reach the agent:
 # the agent's host, agent-ide MCP, and plugin come entirely from the

@@ -21,7 +21,7 @@ Revision: v0.4. Provider: Agent IDE. Consumers: coding agents and IDE hosts.
 1. **Address symbols**, not lines or offsets. Lines are a fallback mode and are used in read output.
 2. A tool returns information an agent cannot get from `grep` or `cat` in a second: types, documentation, relationships, compiler errors, and project commands.
 3. **Keep responses compact.** Responses contain no internal bookkeeping fields (`authority_epoch`, hashes, generations). Lists have ceilings and report “N more”; retrieve the complete list through `detail_ref`.
-4. Errors use one line with the reason and next step, for example `error: ambiguous_symbol; candidates: …`. Every failure also names its closed stage — `<tool>:<stage>` (`diff:too_large`, `symbol:anchor_missing`) — in parentheses after the reason when one is set, and the same tag lands in the daemon journal's `detail` field; a failure with no specific tag derives `<tool>:<reason>`, so no journal line is ever detail-less. Stage tags carry no payloads, paths, or user text — except the reason itself, ahead of the stage tag, which may (T163): a missing `ide.outline`/`ide.read` path answers `error: no_such_file: src/assistance/host_bindng.rs (outline:no_such_file); check the path`, naming the exact bounded path the model asked for while its parenthesized stage tag (`outline:no_such_file`, `read:no_such_file`) stays payload-free. One reply carries a closed cause the same way (T15B): `unavailable: host_binding (<cause>); continue with native tools`, where `<cause>` is `outside_allowed_roots` (the session's bound project is below no allowed root), `hooks_not_delivered` (this daemon received no hook on the calling channel since it started), `missing_pre`, `replay`, `inactive_binding`, or `project_moved: bound to <path>, asked <path>` — the single cause that names two bounded, home-shortened paths, because telling the agent which directory the session is bound to is the recovery — plus `host_unrecognized` when the caller's `_meta` names no supported host contract, so no invocation can correlate at all. The same tag is the daemon journal's `detail`.
+4. Errors use one line with the reason and next step, for example `error: unknown_symbol; no symbol matches that path or name`. Every failure also names its closed stage — `<tool>:<stage>` (`diff:too_large`, `symbol:anchor_missing`) — in parentheses after the reason when one is set, and the same tag lands in the daemon journal's `detail` field; a failure with no specific tag derives `<tool>:<reason>`, so no journal line is ever detail-less. Stage tags carry no payloads, paths, or user text — except the reason itself, ahead of the stage tag, which may (T163): a missing `ide.outline`/`ide.read` path answers `error: no_such_file: src/assistance/host_bindng.rs (outline:no_such_file); check the path`, naming the exact bounded path the model asked for while its parenthesized stage tag (`outline:no_such_file`, `read:no_such_file`) stays payload-free. One reply carries a closed cause the same way (T15B): `unavailable: host_binding (<cause>); continue with native tools`, where `<cause>` is `outside_allowed_roots` (the session's bound project is below no allowed root), `hooks_not_delivered` (this daemon received no hook on the calling channel since it started), `missing_pre`, `replay`, `mismatch`, `inactive_binding`, `capacity_exceeded`, or `project_moved: bound to <path>, asked <path>` — the single cause that names two bounded, home-shortened paths, because telling the agent which directory the session is bound to is the recovery — plus `host_unrecognized` when the caller's `_meta` names no supported host contract, so no invocation can correlate at all. The same tag is the daemon journal's `detail`.
 5. The language server runs as it would in a human's editor and remains alive for the session.
 6. Every host uses one path: return the result directly when it arrives within about 10 seconds; otherwise return `pending` and use `ide.inspect`.
 
@@ -41,7 +41,7 @@ src/agent_tasks/persistence.py#run_mutation
 - To search by name without a file, use `#BindingStatus` or `BindingStatus`. The IDE searches the project (every language) and returns candidates when there is more than one; it does not guess:
 
 ```text
-error: ambiguous_symbol; 3 candidates:
+ambiguous_symbol: new matches 3 symbols; repeat ide.symbol with one exact path:
   src/assistance/host_binding.rs#HostBindingGuard/new
   src/execution/mod.rs#AdmissionController/new
   src/workspace/git.rs#GitIdentity/new
@@ -57,7 +57,7 @@ error: ambiguous_symbol; 3 candidates:
 ### Readiness and waiting
 
 - Return a result directly if the server responds within about 10 seconds. Otherwise return `pending: use ide.inspect with detail_ref X`. `ide.inspect` waits up to 10 seconds before returning `pending` again.
-- While a language server is starting, symbol tools return `error: provider_loading; retry in ~N s` with an estimate instead of waiting silently for minutes.
+- While a language server is starting, symbol tools return `error: provider_loading; the language server is still loading the workspace; repeat the call in a few seconds` instead of waiting silently for minutes.
 - A language that opts in to outlining from its text while loading (today only Rust) answers `ide.outline`, `ide.read {symbol}` and the symbol form of `ide.edit` (`replace`/`insert`/`delete`) from that lexical outline while its registered server is still loading, and the reply says so in one compact line — `outline: lexical (rust-analyzer loading)` — because semantic facts (usages, callers, rename) are not included. A lexical outline is either exactly the outline the server path would give for the same text (addresses, kinds, ranges, children) or it is not used: a file it cannot reproduce exactly (for Rust, whose lexical outline comes from a full parse: a syntax error, from which rust-analyzer recovers with a tree of its own; comment text directly above an item, which rust-analyzer may attach to the item's range; an `extern` block; a `// region:` comment; more tokens or deeper brackets than the parse's bounded stack is sized for — 240 000 tokens, 128 brackets) keeps `provider_loading` rather than a guessed range. An address the lexical outline does not contain is not proven absent: the call waits for the server (`provider_loading`, parked like any loading call; an edit answers it at once) instead of `unknown_symbol`. `ide.symbol`, `ide.graph` and `rename` always wait for the server. The moment the live session answers, the server path is used again.
 
 ### `<agent-ide>` status block
@@ -67,7 +67,7 @@ A hook or the top of a response may include check and background-test status, in
 ```text
 <agent-ide>
 rust: 0 errors, 0 warnings
-tests #3: running 42 s — cargo test worker::
+tests #3: running 42 s; poll: ide.test {"status": 3}
 </agent-ide>
 ```
 
@@ -75,8 +75,8 @@ When the worktree's checked-out branch or detached commit changed outside the ID
 
 ### Ceilings and pages
 
-- A response is at most 16 KB. Lists are capped at 30 usage lines, 20 caller lines, and 20 diagnostic lines. Any remainder is reported as “N more” with a `detail_ref`.
-- This 16 KB ceiling bounds the *reply*, not the model-facing *argument*: `ide.edit`'s `content` accepts up to 128 KiB (v0.6.1), enough for a whole module in one call.
+- A response is at most 64 KiB (the serialized reply is held to 63 KiB, leaving a 1 KiB reserve for the MCP envelope). Lists are capped at 30 usage lines, 20 caller lines, 8 diagnostic lines in an edit reply, and 20 problems per problems page. Any remainder is reported as “N more” with a `detail_ref`.
+- This ceiling bounds the *reply*, not the model-facing *argument*: `ide.edit`'s `content` accepts up to 128 KiB (v0.6.1), enough for a whole module in one call.
 - `ide.inspect {detail_ref}` retrieves pages; `ide.inspect {detail_ref, page}` retrieves a specific page.
 - A symbol card with more than 30 usages, or an ambiguity list with more than 20 candidates, keeps the cut rows in its detail. The first page is the card or list as before, ending with `… N more (ide.inspect <detail_ref>)`; each later `ide.inspect` returns the next page of the remaining rows (`usages 31–N of N:` or `candidates 21–N of N:`, same row format). Cards and lists within the ceilings are unchanged. The first `ide.inspect` after an inline reply always returns page two, never page one again, for every paged tool.
 
@@ -115,13 +115,13 @@ check: cargo xtask check
 
 A kind this block names wins outright over CI/manifest/README for that kind (provenance `agents`/`claude` in the heading); a block with an unknown key, a repeated key, a line with no command, a command over 200 bytes or containing a control character, or no closing fence is ignored entirely rather than partially trusted, and the kind falls back to CI/manifest as before. Layout lists only first- and second-level directories with file counts. The card never exceeds 1,500 bytes: layout children, then docs collapse first, and a card that still overflows is cut on a character boundary and ends with `… (card truncated)`. Cache the card for the session; `ide.project {}` returns it again.
 
-Implemented wire form: the activation reply keeps its first line (`Workspace activated; authority_epoch: …`) and appends the card after a blank line. The card is computed under a 5 s budget off the runtime; when it does not fit the budget the reply is the plain activation text. Commands print one line per kind with the provenance in the heading (`commands (agents, ci, manifest):`), `environment:` names the toolchain and edition, `servers:` prints `not started` for each detected language (the daemon does not probe servers at start), and there is no `ide.project` yet — call `ide.start` again to see the card. Symbol requests on a Rust worktree where the root is not a Cargo workspace also load nested crates (two directories deep, excluding test material), so references across such a crate's own tests resolve.
+Implemented wire form: the activation reply keeps its first line (`activated: epoch N; baseline: …`) and appends the card after a blank line. The card is computed under a 5 s budget off the runtime; when it does not fit the budget the reply is the plain activation text. Commands print one line per kind with the provenance in the heading (`commands (agents, ci, manifest):`), `environment:` names the toolchain and edition, `servers:` prints `not started` for each detected language (the daemon does not probe servers at start), and there is no `ide.project` yet — call `ide.start` again to see the card. Symbol requests on a Rust worktree where the root is not a Cargo workspace also load nested crates (two directories deep, excluding test material), so references across such a crate's own tests resolve.
 
-Errors: `outside_allowed_roots` (as today), `not_a_project` (no manifest is present; continue in files-only mode).
+Errors: `outside_allowed_roots` (as today). There is no `not_a_project` failure (see the status table).
 
 ### 2.2 `ide.outline` — file skeleton (implemented)
 
-Input: `{path, depth?: 1|2|all (default all), bodies: false, kinds?: "fn,method,…"}`. A `path` naming a directory (trailing slash optional) answers a directory outline instead: subdirectories with file counts, then files with line counts and the first documentation line (`//!` for Rust, the module docstring for Python, the leading comment for TypeScript/JavaScript), one level deep, at most 200 files.
+Input: `{path, kinds?: "fn,method,…"}`. A `path` naming a directory (trailing slash optional) answers a directory outline instead: subdirectories with file counts, then files with line counts and the first documentation line (`//!` for Rust, the module docstring for Python, the leading comment for TypeScript/JavaScript), one level deep, at most 200 files.
 
 `kinds` is an optional comma list over the closed `SymbolKind` vocabulary (`module`, `namespace`, `struct`, `enum`, `class`, `interface`, `trait`, `impl`, `type`, `fn`, `method`, `constructor`, `field`, `variant`, `const`, `var`, `test`, `symbol`), for a file too big to read whole (T163): a symbol shows when its own kind is selected or a descendant's is, so a container of a selected member still shows for context, and test modules always collapse exactly as they do unfiltered. Byte paging already bounds the reply; the filter is the agent-controlled cut for a large outline:
 
@@ -156,7 +156,7 @@ Errors: `no_such_file` (the requested path does not exist; check the path), `out
 
 ### 2.3 `ide.symbol` — symbol card and relationships (implemented)
 
-Input: `{symbol, usages?: true, callers?: 0..3, callees?: 0..3, tests?: true, history?: 0..10}`. Defaults: usages, callers 1, tests, and history 3. `history` is planned.
+Input: `{symbol, usages?: true, callers?: 0..3, callees?: 0..3, history?: true}`. Defaults: usages, callers 1, callees 0; `history` is opt-in (boolean) and shows the last 3 commits touching the definition.
 
 Output:
 
@@ -169,17 +169,15 @@ usages: 63 in 9 files (src 19, tests 44)
   src/assistance/worker.rs:3366        let BindingStatus::Validated(invocation) = status else {
   src/assistance/assembly.rs:412       BindingStatus::PreObserved => Some(PeerReply::HookObserved {}),
   src/assistance/host_binding.rs:429   BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded)
-  … 16 more in src (ide.inspect sym-12 page 2)
-tests: 44 usages in 6 test files — tests/assistance_binding_contract.rs (21), tests/execution_contract.rs (7), …
-callers (1 level, for functions): —
-history: 3 last commits touching lines 330–346
+  … 16 more (ide.inspect sym-12)
+history: 3 last commits touching the definition
   ffb25c2 2026-09-25 refactor(assistance)!: serve Claude through the daemon route …
   bbd58f6 2026-09-25 feat(assistance)!: allowed_roots gate …
 ```
 
-For functions, include `callers` (with locations) and `callees` to the requested depth, capped at 20 lines per level. Read function bodies with `ide.read`.
+For functions, include `callers` (`callers: N` with one `name  file:line` row each) and `callees` to the requested depth, capped at 20 lines per level. Read function bodies with `ide.read`.
 
-Errors: `ambiguous_symbol` (candidates), `unknown_symbol` (similar names: “did you mean”), `provider_loading`.
+Errors: `ambiguous_symbol` (candidates), `unknown_symbol` (no similar-name suggestion; check the file with `ide.outline` or search a bare name with `ide.symbol`), `provider_loading`.
 
 ### 2.3.1 Cross-language links (implemented for CSS and HTML)
 

@@ -1,6 +1,6 @@
 # Delivery roadmap
 
-This is the current delivery boundary. It supersedes the earlier all-at-once implementation order in the design documents. The repository does not yet provide a working or installable IDE. The older architecture and contract documents remain design input; they are not evidence that an interface is implemented or still agreed.
+This is the current delivery boundary. It supersedes the earlier all-at-once implementation order in the design documents. The repository ships an installable IDE: release 0.6.2 installs through the [one-line installer](../README.md#install) on macOS arm64 (eleven MCP tools, host plugins, managed launcher), and all five macOS acceptance routes pass at revision `2db699f` (see [docs/evidence](evidence/)). Linux remains explicitly `not_tested`. The older architecture and contract documents remain design input; they are not evidence that an interface is implemented or still agreed.
 
 ## v0.1: working coding companion
 
@@ -37,7 +37,9 @@ Only types, tables and settings actually consumed by this path are implemented. 
 
 The target platforms are Linux and macOS. Current v0.1 acceptance runs real Codex CLI and Claude CLI scenarios on the available Mac, including native coding subagents. Linux validation is deferred and must remain explicitly unverified; it does not block this delivery. A single passing host cell is still only an intermediate milestone. Record exact versions and explicit `not_tested`, `mocked`, or `real_pass` evidence; a passing mock never grants support status.
 
-| Host/provider cell | Current evidence |
+The evidence table below is the historical v0.1 record (recorded 2026-09-12 against Codex CLI 0.154.0 and Claude Code 2.1.267). Go and gopls left the release scope in 0.6: the publication gate pins their evidence rows to `not_tested` ([release gate](release.md#publication-gate)), so those two `real_pass` cells record past capability, not a current claim.
+
+| Host/provider cell | v0.1 evidence (historical) |
 |---|---|
 | macOS 26.6.2, Codex CLI 0.154.0, Go/gopls 0.23.0 | `real_pass`: parent plus parallel native children in divergent worktrees, scoped diagnostic, peer survival and fresh sequential handoff |
 | macOS 26.6.2, Codex CLI 0.154.0, Rust/rust-analyzer 1.98.1 | `real_pass` for the managed product/provider contract; live model CLI cell `not_tested` |
@@ -74,8 +76,11 @@ subagent attach, TypeScript checks, and Go checks last.
 
 These are roadmap boundaries, not authorization to scaffold their APIs now.
 
-The immediate product priority is one measured integrated coding loop rather than
-the previously ordered history-first increment. Work proceeds in this order:
+The immediate product priority was one measured integrated coding loop rather than
+the previously ordered history-first increment. All four items below shipped: v0.2 delivered
+items 1–3 (see the version table), and item 4's acceptance was met — every macOS route in the
+matrix below now records `real_pass`/`product_pass` at one revision (`2db699f`, release 0.6.2;
+see [docs/evidence](evidence/)).
 
 1. Add bounded local usage telemetry to the existing five tools and native-change
    hooks. It records structured metadata for adoption, fallback reason, outcome,
@@ -98,19 +103,22 @@ the previously ordered history-first increment. Work proceeds in this order:
    provider paths.
 4. Accept the increment only after real Codex and Claude macOS scenarios cover
    `start -> context -> edit -> diagnostic -> fix -> diff -> stop`, stale-edit
-   refusal, native fallback, restart-safe telemetry and two-worktree isolation.
+   refusal, native fallback, restart-safe telemetry and two-worktree isolation —
+   met at `2db699f` by all five recorded routes.
    Linux remains explicit `not_tested` until a real host cell passes.
 
 ### v0.2 acceptance evidence matrix (ACCEPTANCE-r1)
 
 This matrix consumes the public [TELEMETRY-r1](contracts/telemetry-v0.2.md),
 [EDIT-r1](contracts/changes-v0.2.md), and [TYPESCRIPT-r3](contracts/intelligence-v0.2.md)
-contracts. It is preparation only: every cell below is `not_tested` until an implementation and
-real run produce public evidence. Public artifacts contain versions, route, scenario outcomes,
-bounded metrics, and explicit truncation only; private supervisor identifiers and transcripts do
-not enter them.
+contracts. The implementation and the real runs happened: every macOS route below now records
+`real_pass` (product `product_pass`) at one revision, `2db699f` — release 0.6.2, in
+[docs/evidence](evidence/). The table below is the historical first-run record (recorded
+2026-09-14), kept as the context for those routes' earlier failures. Public artifacts contain
+versions, route, scenario outcomes, bounded metrics, and explicit truncation only; private
+supervisor identifiers and transcripts do not enter them.
 
-| macOS route | Required real evidence | Status |
+| macOS route | Required real evidence | Status (2026-09-14, historical) |
 |---|---|---|
 | Direct Codex | `start -> context -> edit -> diagnostic -> fix -> diff -> stop`; stale edit has zero writes; native fallback; restart-safe telemetry query/export; divergent worktrees | `failed` on macOS 26.6.2 with Codex CLI 0.154.0: Pyright edit/stale/native behavior and TypeScript semantic Context ran; one Diff inspection completed before a further driver inspection failed without preserving its closed code |
 | Direct Claude | The same scenario through the daemon route, including TypeScript only after its spike; stale edit has zero writes; native fallback; restart-safe telemetry; divergent worktrees | `failed` on Claude Code 2.1.267: normal OAuth was available after removing the synthetic-home isolation; daemon Pyright ran in both worktrees, but Diff returned `workspace_authority` and TypeScript remained lexical pending its separate host record |
@@ -126,12 +134,9 @@ after the collected events show that it is useful.
 |---|---|
 | v0.2 | Local usage telemetry; preferred single-file `ide.edit` with native fallback; JavaScript/TypeScript/Node.js profiles |
 | v0.3 | Project problem feed MVP (EYES-r2); the previously listed explicit checks/finish scope (`ide.check`, `ide.finish`) moves beyond the MVP |
-| v0.4 | ChangeSet, Git/source context and history; Scope WorkBundle and CodeBinding |
-| v0.5 | Computed CriterionAssessment, Task Context Compiler and contract-aware impact |
-| v0.6 | Evaluator registry, cost-aware verification planner and approved automatic checks |
-| v0.7 | Scope adapter, immutable knowledge, publication outbox and baseline/result acceptance |
-| v0.8 | Multi-file edit journal, semantic rename and recovery |
-| v0.9 | Failure context and approved DAP debugging |
-| v1.0 | Cumulative hardening and independent evaluation |
+| v0.4 | Symbol tools (`ide.outline`, `ide.read`, `ide.symbol`, `ide.graph`, `ide.test`, symbol-addressed `ide.edit`); one `allowed_roots` rule instead of copied host sandbox rights; one-command installer (0.4.3) |
+| v0.5 | Language-free core with one crate per language |
+| v0.6 | Cross-language name bridge (CSS selectors ↔ HTML/TSX class names); symbol edits in Rust while rust-analyzer is still loading (0.6.2) |
+| Not scheduled | Items of the original plan not taken up yet: computed criterion assessment and task context compiler, evaluator registry and verification planner, knowledge and publication adapters, multi-file edit journal and recovery, failure context and DAP debugging, independent evaluation |
 
 Scope remains the authority for agreed work. A local bundle can support standalone operation, but its shape is not approval, caller identity, or verification evidence. The daemon does not reinterpret the owner's agreed task. Future verified outcomes require current evidence; v0.1 cannot claim them.

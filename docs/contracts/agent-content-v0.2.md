@@ -23,7 +23,7 @@ Because content is Claude's only carrier, it alone must state every fact an acce
 
 When a configured semantic provider cannot run or cannot verify TypeScript document membership, a path-proven Context uses the normal complete Context content with a lexical mode reason and an editable source reference. The renderer does not turn this Context into a typed error.
 
-Activation points to ide.context. Current source Context presents bounded evidence and points to ide.edit with its exact source_ref (the same value as the reply's detail_ref) when available, or the native editor. A `kind: "problems"` Context has no source_ref and preserves the exact v0.2 problems text without edit guidance. A truncated Context or Diff points to ide.inspect only when its typed `continuation` is true; a detail_ref alone is not evidence of another consumable page. Incomplete Context otherwise guides to edit/native work with that same source_ref when one exists, and incomplete Diff to stopping or safe native review. A reviewed Diff points to ide.stop. Stop confirms authority release.
+Activation points to ide.outline and ide.symbol. Current source Context presents bounded evidence and points to ide.edit with its exact source_ref (the same value as the reply's detail_ref) when available, or the native editor. A `kind: "problems"` Context has no source_ref and preserves the exact v0.2 problems text without edit guidance. A truncated Context or Diff points to ide.inspect only when its typed `continuation` is true; a detail_ref alone is not evidence of another consumable page. Incomplete Context otherwise guides to edit/native work with that same source_ref when one exists, and incomplete Diff to stopping or safe native review. A reviewed Diff points to ide.stop. Stop confirms authority release.
 
 Pending work names ide.inspect with the exact detail_ref. An oversized pending result fails closed.
 
@@ -49,4 +49,4 @@ Diff and Context pagination (`fit_diff_page`, `ContextPageState::next`) compose 
 
 ## Gates
 
-Contract tests cover every PeerReply state, every Edit outcome, pending with a detail reference, errors, UTF-8 truncation, exact references, final-envelope bounds and structuredContent equality. The six public IDE tools and retained Diff pagination use the same renderer. A real Codex and Claude acceptance records compact content, plus the matching typed structured result for Codex and its deliberate absence for Claude.
+Contract tests cover every PeerReply state, every Edit outcome, pending with a detail reference, errors, UTF-8 truncation, exact references, final-envelope bounds and structuredContent equality. The eleven public IDE tools and retained Diff pagination use the same renderer. A real Codex and Claude acceptance records compact content, plus the matching typed structured result for Codex and its deliberate absence for Claude.
