@@ -20,6 +20,28 @@ use crate::{
 };
 use std::collections::BTreeSet;
 
+/// One honest line replacing the old `freshness`/`captured_freshness` pair: whether this captured
+/// page still holds for the current tree, and what to do when it may not.
+///
+/// Delivery itself rechecks nothing, so the line states the capture's own freshness, names the one
+/// recheck a later `ide.inspect` page does get (tracked working-tree bytes; never HEAD or the
+/// index), and gives the recovery for a tree that moved meanwhile.
+fn current_tree_line(freshness: crate::changes::DiffFreshness) -> String {
+    let captured = match freshness {
+        crate::changes::DiffFreshness::Current => {
+            "this page holds the captured tree and delivery rechecks nothing"
+        }
+        crate::changes::DiffFreshness::Stale => {
+            "the capture was already stale for its own comparison"
+        }
+        crate::changes::DiffFreshness::Unknown => "the capture could not prove its own freshness",
+    };
+    format!(
+        "current_tree: {captured}; later pages recheck tracked working-tree bytes but never HEAD \
+         or the index — if the tree moved since, call ide.diff again"
+    )
+}
+
 /// Borrows the sole worker's admission controller while retaining exact job/authority scope.
 struct ProductSnapshotRunner<'w, 'store> {
     /// Sole owner of physical admission and durable authorization.
@@ -516,16 +538,14 @@ pub(crate) fn fit_diff_page(
 /// page independent of any other request: worktree identity/incarnation, authority epoch,
 /// operation reference, capture generation and both raw comparison-side identities.
 ///
-/// Delivery freshness is always rendered as [`crate::changes::DiffFreshness::Unknown`], including
-/// the first ready delivery of a freshly captured page. A retained Diff result is an immutable
-/// captured snapshot, not proof of the repository's state at delivery time: the short `ide.inspect`
-/// service deliberately performs no heavyweight Git recapture, so HEAD/index identities, untracked
-/// and conflict sets and durable current-observation tokens are never revalidated before a page is
-/// handed over. Only tracked working-tree bytes are rechecked (see
+/// Delivery makes no independent freshness claim — a retained Diff result is an immutable captured
+/// snapshot, not proof of the repository's state at delivery time — so the former separate
+/// `freshness`/`captured_freshness` pair is answered as one `current_tree` line: it says what the
+/// capture proved, what delivery rechecks, and what to do when the tree moved meanwhile. The short
+/// `ide.inspect` service deliberately performs no heavyweight Git recapture, so HEAD/index
+/// identities, untracked and conflict sets and durable current-observation tokens are never
+/// revalidated before a page is handed over. Only tracked working-tree bytes are rechecked (see
 /// [`DiffPageState::working_tree_bytes_unchanged`]), which cannot establish complete currentness.
-/// The freshness computed by Changes at capture time is preserved verbatim as `captured_freshness`
-/// alongside the untouched captured comparison identities and provenance, so callers keep the exact
-/// capture-time facts without any claim that they still hold now.
 fn render_diff_provenance(
     mode: DiffMode,
     result: &crate::changes::DiffResult,
@@ -534,12 +554,11 @@ fn render_diff_provenance(
 ) -> String {
     let provenance = result.provenance();
     let mut text = format!(
-        "mode: {:?}\nstate: {:?}\ncoverage: {:?}\nfreshness: {:?}\ncaptured_freshness: {:?}\nauthority_epoch: {}\nworktree_id: {}\nworktree_incarnation: {}\noperation_reference: {}\ncapture_generation: {}\ncomparison_left: {}\ncomparison_right: {}\nbaseline_reference: {}\nbaseline_coverage: {:?}\nbaseline_window: {:?}\ntracked: {}; untracked: {}; conflicted: {}\nomitted_hunks: {}; omitted_bytes: {}; more_available: {}\n",
+        "mode: {:?}\nstate: {:?}\ncoverage: {:?}\n{}\nauthority_epoch: {}\nworktree_id: {}\nworktree_incarnation: {}\noperation_reference: {}\ncapture_generation: {}\ncomparison_left: {}\ncomparison_right: {}\nbaseline_reference: {}\nbaseline_coverage: {:?}\nbaseline_window: {:?}\nbaseline_reason: {}\ntracked: {}; untracked: {}; conflicted: {}\nomitted_hunks: {}; omitted_bytes: {}; more_available: {}\n",
         mode,
         result.state(),
         result.coverage(),
-        crate::changes::DiffFreshness::Unknown,
-        result.freshness(),
+        current_tree_line(result.freshness()),
         authority_epoch,
         result.worktree_id(),
         provenance
@@ -554,6 +573,7 @@ fn render_diff_provenance(
         provenance.baseline_reference().unwrap_or("none"),
         provenance.baseline_coverage(),
         provenance.baseline_window(),
+        BASELINE_PARTIAL_REASON,
         result.counts().tracked(),
         result.counts().untracked(),
         result.counts().conflicted(),

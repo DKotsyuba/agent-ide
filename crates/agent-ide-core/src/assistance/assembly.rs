@@ -508,7 +508,9 @@ impl ProductDispatcher {
                     }
                     BindingStatus::NativeObserved(binding) => {
                         if let Some(worker) = &self.worker {
-                            if advances_epoch {
+                            // A channel with no activation has no cached result a hint could
+                            // invalidate; emitting one per native tool call is pure noise (0.6.5).
+                            if advances_epoch && worker.channel_activated(&binding) {
                                 worker.native_hint(binding.clone());
                                 errorlog::record(
                                     errorlog::Method::Hook,

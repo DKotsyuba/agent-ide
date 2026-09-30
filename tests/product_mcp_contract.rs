@@ -5486,14 +5486,25 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
         started["text"]
             .as_str()
             .unwrap()
-            .contains("baseline: partial (Unverified; durable capture true)"),
+            .contains("baseline: partial (Unverified; durable capture true; git metadata and source bytes are captured in separate steps"),
         "{started}"
     );
     let retried = actor
-        .call(&fixture, "ide.start", json!({"activation_id":"start"}))
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"start-again"}),
+        )
         .await;
     let retried = actor.settle(&fixture, retried).await;
-    assert_eq!(retried, started);
+    assert_eq!(retried["kind"], "activation", "{retried}");
+    assert!(
+        retried["text"]
+            .as_str()
+            .unwrap()
+            .contains("existing activation"),
+        "{retried}"
+    );
     let context = actor
         .call(
             &fixture,
@@ -5898,6 +5909,18 @@ async fn diff_provenance_flag_returns_the_exact_header() {
     assert!(!text.contains("authority_epoch: 0"), "{text}");
     assert!(!text.contains("worktree_id: \n"), "{text}");
     assert_eq!(text.matches("comparison_left: ").count(), 1);
+    assert!(
+        text.contains("current_tree: this page holds the captured tree"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "baseline_reason: git metadata and source bytes are captured in separate steps"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("freshness:"), "{text}");
+    assert!(!text.contains("captured_freshness:"), "{text}");
     assert!(text.contains("tracked_path: \"a.txt\""), "{text}");
     assert!(
         text.contains("file: \"a.txt\"\n@@ -1 +1,2 @@\n line1\n+line2\n"),
@@ -8778,6 +8801,22 @@ async fn configured_product_start_enforces_allowed_roots_and_accepts_root_argume
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
 
+    let absent = ProductFixture::new(json!([]));
+    let mut daemon = absent.daemon().await;
+    let mut actor = ProductActor::new(&absent, "absent-root").await;
+    let refused = actor
+        .call(
+            &absent,
+            "ide.start",
+            json!({"activation_id":"absent","root":absent.root.join("not-created/child")}),
+        )
+        .await;
+    let refused = actor.settle(&absent, refused).await;
+    assert_eq!(refused["code"], "outside_allowed_roots", "{refused}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+
     let allowed = ProductFixture::new(json!([]));
     let mut daemon = allowed.daemon().await;
     let mut actor = ProductActor::new(&allowed, "explicit-root").await;
@@ -8829,7 +8868,7 @@ async fn configured_product_activation_reply_includes_the_project_card() {
     assert!(text.contains("\nlayout: src/ 1"), "{text}");
     assert!(text.contains("\ndocs: README.md"), "{text}");
     assert!(
-        text.contains("\nservers: rust not started · typescript not started · go not started"),
+        text.contains("\nservers: rust not started; ide.outline, ide.read and ide.edit answer from source now; ide.symbol and ide.graph wait for the server, which starts on their first use · typescript not started; ide.outline, ide.read and ide.edit answer from source now; ide.symbol and ide.graph wait for the server, which starts on their first use · go not started"),
         "{text}"
     );
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;

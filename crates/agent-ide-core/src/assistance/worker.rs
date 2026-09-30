@@ -66,6 +66,12 @@ const EDIT_CHECK_WAIT: Duration = Duration::from_secs(90);
 const PROJECT_CARD_BUDGET: Duration = Duration::from_secs(5);
 /// Maximum time an initial tool call waits for its job before returning its retained detail.
 pub const INLINE_REPLY_WAIT: Duration = Duration::from_secs(8);
+/// The honest per-language server state the start card prints while no language server has been
+/// launched: which tools already answer from source, and which ones only the server can answer.
+const SERVER_NOT_STARTED: &str = "not started; ide.outline, ide.read and ide.edit answer from source now; ide.symbol and ide.graph wait for the server, which starts on their first use";
+/// Why an activation baseline never claims complete coverage: Git metadata and source bytes are
+/// captured as separate bounded steps, so no joint Git/source window is ever proven.
+const BASELINE_PARTIAL_REASON: &str = "git metadata and source bytes are captured in separate steps, so no atomic window is proven and coverage cannot be claimed complete";
 
 /// A bounded asynchronous operation whose identity never includes the transient MCP call ID.
 struct Job {
@@ -551,6 +557,10 @@ struct Shared {
     test_runs: TestRuns,
     /// Undelivered one-shot `git: HEAD moved …` plate lines keyed by binding fingerprint.
     git_notices: Mutex<BTreeMap<[u8; 32], String>>,
+    /// Binding fingerprints whose channel currently holds an activation, so the hook ingress can
+    /// stay silent for a channel that never started (or already stopped) instead of emitting
+    /// native hints nothing can consume.
+    activated: Mutex<BTreeSet<[u8; 32]>>,
 }
 impl Shared {
     /// Acquires a new transient binding use at one exact admission/return boundary.
@@ -973,6 +983,7 @@ impl WorkerHandle {
                 project_feed: None,
                 test_runs: TestRuns::default(),
                 git_notices: Mutex::new(BTreeMap::new()),
+                activated: Mutex::new(BTreeSet::new()),
             }),
             inspect,
             receiver: Mutex::new(Some(receiver)),
@@ -1418,6 +1429,16 @@ impl WorkerHandle {
     /// Returns the shared validated finite worker limits for this daemon boot.
     pub fn limits(&self) -> super::launcher::ProductLimits {
         self.shared.launcher.limits
+    }
+
+    /// Reports whether this binding's channel currently holds an activation, so a hook ingress
+    /// can stay silent for a channel that a failed (or stopped) start left with nothing to
+    /// invalidate.
+    pub fn channel_activated(&self, binding: &BindingRef) -> bool {
+        self.shared
+            .activated
+            .lock()
+            .is_ok_and(|activated| activated.contains(&binding.fingerprint()))
     }
 
     /// Invalidates cached results on native hints; reads wait for a current MCP sandbox observation.
@@ -2620,13 +2641,25 @@ impl<'a> Worker<'a> {
                         record_execution_profile(errorlog_method(job.tool), "git_unsupported");
                         FailureCode::ExecutionProfileCause(ExecutionProfileCause::GitUnsupported)
                     }
-                    _ => FailureCode::WorkspaceActivation,
+                    error => {
+                        // Name the closed cause category so a non-worktree directory and a broken
+                        // discovery are distinguishable in the reply and the journal.
+                        job.failure_detail = Some(discovery_failure_detail(&evidence, &error));
+                        FailureCode::WorkspaceActivation
+                    }
                 })?;
         admit_discovered(
             self.shared.launcher.allowed_roots(),
             discovered.root(),
             discovered.common_dir(),
-        )?;
+        )
+        .map_err(|_| {
+            job.failure_detail = Some(
+                "start:worktree_unresolved: discovered root or Git common directory is outside allowed roots"
+                    .to_owned(),
+            );
+            FailureCode::OutsideAllowedRoots
+        })?;
         self.shared.active(&binding)?;
         let tree = self
             .workspace
@@ -2636,7 +2669,13 @@ impl<'a> Worker<'a> {
                 discovered.common_dir().to_path_buf(),
             )
             .await
-            .map_err(|_| FailureCode::WorkspaceActivation)?;
+            .map_err(|_| {
+                job.failure_detail = Some(
+                    "start:worktree_unresolved: the discovered worktree identity could not be resolved"
+                        .to_owned(),
+                );
+                FailureCode::WorkspaceActivation
+            })?;
         self.reconcile_pending_revocations(&tree, job.invocation.actor_id())
             .await;
         let mut identity = blake3::Hasher::new();
@@ -2648,23 +2687,36 @@ impl<'a> Worker<'a> {
                 .as_bytes(),
         );
         let operation = identity.finalize().to_hex().to_string();
+        let requested_operation = operation.clone();
+        let requested_tree = tree.clone();
         let request = crate::workspace::authority::ActivationRequest::new(
             operation,
             job.invocation.clone(),
             self.shared.active(&binding)?,
             tree,
         )
-        .map_err(|_| FailureCode::WorkspaceActivation)?;
+        .map_err(|_| {
+            job.failure_detail = Some(
+                "start:durable_state: the activation request could not be recorded".to_owned(),
+            );
+            FailureCode::WorkspaceActivation
+        })?;
         // Do not cancel an in-flight durable commit: preserve its recoverable receipt before fencing output.
         let receipt = match self.workspace.activate(request).await {
             Ok(receipt) => receipt,
             Err(
-                crate::workspace::durable::DurableError::OperationConflict
+                error @ (crate::workspace::durable::DurableError::OperationConflict
                 | crate::workspace::durable::DurableError::Authority(
                     crate::workspace::authority::AuthorityError::WorktreeOwned
                     | crate::workspace::authority::AuthorityError::ActorAlreadyOwnsWorktree,
-                ),
+                )),
             ) => {
+                // Name who holds what and the way out; a bare `conflict` left three agents without
+                // the IDE for a whole task.
+                job.failure_detail = Some(
+                    self.conflict_detail(&requested_tree, job.invocation.actor_id(), &error)
+                        .await,
+                );
                 return Err(FailureCode::Conflict);
             }
             Err(
@@ -2672,12 +2724,30 @@ impl<'a> Worker<'a> {
                 | crate::workspace::durable::DurableError::CorruptState,
             ) => {
                 self.uncertain.insert(binding.clone());
+                job.failure_detail = Some(
+                    "start:durable_state: the durable activation state refused or failed"
+                        .to_owned(),
+                );
                 return Err(FailureCode::WorkspaceActivation);
             }
-            Err(_) => return Err(FailureCode::WorkspaceActivation),
+            Err(_) => {
+                job.failure_detail = Some(
+                    "start:durable_state: the durable activation state refused or failed"
+                        .to_owned(),
+                );
+                return Err(FailureCode::WorkspaceActivation);
+            }
         };
+        // A receipt whose operation differs from the one this call requested is the same session's
+        // existing activation, returned idempotently; the reply must report that activation.
+        let reused_activation = receipt.operation() != requested_operation;
         let activation_operation = receipt.operation().to_owned();
         self.grants.insert(binding.clone(), receipt);
+        // The one shared fact a hook ingress can check before emitting a native hint: this
+        // channel's binding now holds an activation.
+        if let Ok(mut activated) = self.shared.activated.lock() {
+            activated.insert(binding.fingerprint());
+        }
         let authority = match self.authority(&binding).await {
             Ok(authority) => authority,
             Err(error) => {
@@ -2699,6 +2769,9 @@ impl<'a> Worker<'a> {
         // namespace: fail its activation with the finite reason and roll its own grant back, so the
         // actor that already owns the cache keeps running and can hand off after it stops.
         if let Err(code) = self.retain_worktree_caches(&binding, &authority, &launches, true) {
+            if code == FailureCode::Conflict {
+                job.failure_detail = Some("start:provider_cache_namespace_conflict".to_owned());
+            }
             if let Ok(mut guard) = self.shared.bindings.lock() {
                 let _ = guard.stop_binding(&binding);
             }
@@ -2708,14 +2781,18 @@ impl<'a> Worker<'a> {
         let baseline = match baseline {
             Ok(baseline) => {
                 let description = format!(
-                    "partial ({:?}; durable capture {})",
+                    "partial ({:?}; durable capture {}; {})",
                     baseline.window(),
-                    baseline.capture_digest().is_some()
+                    baseline.capture_digest().is_some(),
+                    BASELINE_PARTIAL_REASON
                 );
                 self.baselines.insert(binding.clone(), baseline);
                 description
             }
-            Err(_) => "unknown (durable capture unavailable)".to_owned(),
+            Err(_) => format!(
+                "unknown (durable capture unavailable; {})",
+                BASELINE_PARTIAL_REASON
+            ),
         };
         // The project card is a bounded best-effort addition: detection, git plumbing, and the
         // tree walk block, so they run on the blocking pool under [`PROJECT_CARD_BUDGET`]. Any
@@ -2744,14 +2821,16 @@ impl<'a> Worker<'a> {
                     .filter_map(|language| language.support().detect(&root))
                     .collect();
                 // The daemon does not probe language servers at start; every detected language's
-                // server state is the honest "not started" until a later tool observes otherwise.
-                // Only languages that have a server get a server state.
+                // server state is the honest "not started" until a later tool observes otherwise,
+                // and it names what already works from source so a heavy user does not wait for
+                // semantic tools that only the server can answer. Only languages that have a
+                // server get a server state.
                 let servers = languages
                     .iter()
                     .filter(|project| project.language.server().is_some())
                     .map(|project| CardServerState {
                         language: project.language,
-                        state: "not started".to_owned(),
+                        state: SERVER_NOT_STARTED.to_owned(),
                     })
                     .collect();
                 let links = project_card::links_line(&languages);
@@ -2775,10 +2854,17 @@ impl<'a> Worker<'a> {
                 Ok(Err(_)) | Err(_) => String::new(),
             }
         };
-        let mut text = format!(
-            "activated: epoch {}; baseline: {baseline}",
-            authority.epoch(),
-        );
+        let mut text = if reused_activation {
+            format!(
+                "activated: epoch {}; existing activation {activation_operation}; baseline: {baseline}",
+                authority.epoch(),
+            )
+        } else {
+            format!(
+                "activated: epoch {}; baseline: {baseline}",
+                authority.epoch(),
+            )
+        };
         if !card.is_empty() {
             text.push_str("\n\n");
             text.push_str(&card);
@@ -2841,6 +2927,33 @@ impl<'a> Worker<'a> {
                 Err(FailureCode::Capacity)
             }
             Admission::Refused(_) => Err(FailureCode::Capacity),
+        }
+    }
+
+    /// Names the holder a refused activation collided with and the remedy that frees it.
+    ///
+    /// A same-actor holder never reaches this method as the same binding: [`DurableWorkspace::activate`]
+    /// answers that case idempotently with the existing activation. Everything here is closed tags;
+    /// the reply template supplies the plain-words remedy for each.
+    async fn conflict_detail(
+        &self,
+        tree: &crate::workspace::authority::WorktreeRef,
+        actor: &str,
+        error: &crate::workspace::durable::DurableError,
+    ) -> String {
+        use crate::workspace::durable::DurableError;
+        match error {
+            DurableError::OperationConflict => "start:activation_conflict".to_owned(),
+            DurableError::Authority(
+                crate::workspace::authority::AuthorityError::ActorAlreadyOwnsWorktree,
+            ) => "start:actor_owns_another_worktree".to_owned(),
+            _ => match self.workspace.start_holder(tree, actor).await {
+                Ok(Some(holder)) if holder.same_actor => {
+                    "start:worktree_held_by_this_actor".to_owned()
+                }
+                Ok(Some(_)) => "start:worktree_held_by_another_actor".to_owned(),
+                Ok(None) | Err(_) => "start:conflict".to_owned(),
+            },
         }
     }
 
@@ -3907,6 +4020,9 @@ impl<'a> Worker<'a> {
         self.registered.remove(binding);
         self.baselines.remove(binding);
         self.heads.remove(binding);
+        if let Ok(mut activated) = self.shared.activated.lock() {
+            activated.remove(&binding.fingerprint());
+        }
         if let Ok(mut notices) = self.shared.git_notices.lock() {
             notices.remove(&binding.fingerprint());
         }
@@ -4475,15 +4591,70 @@ fn diagnostics_reserve_known_edit_settlement_time() {
 ///
 /// The model's `root` parameter wins over the launcher candidate. The result is the canonical
 /// path, so discovery and every later comparison use one spelling. An empty `allowed_roots`, a
-/// root outside every configured entry, or an unresolvable root refuses activation.
-fn activation_root(job: &Job, allowed_roots: &[PathBuf]) -> Result<PathBuf, FailureCode> {
+/// root outside every configured entry, or an unresolvable root refuses activation. A requested
+/// root that does not exist yet gets its own cause and names the nearest existing ancestor below
+/// an allowed root, so an agent told to create that directory knows where it would land.
+fn activation_root(job: &mut Job, allowed_roots: &[PathBuf]) -> Result<PathBuf, FailureCode> {
     let requested = job
         .parameters
         .get("root")
         .and_then(Value::as_str)
         .map_or_else(|| job.target.candidate.clone(), PathBuf::from);
-    crate::assistance::launcher::admit_worktree(allowed_roots, &requested)
-        .map_err(|_| FailureCode::OutsideAllowedRoots)
+    match crate::assistance::launcher::admit_worktree(allowed_roots, &requested) {
+        Ok(canonical) => Ok(canonical),
+        Err(_) => {
+            job.failure_detail = absent_root_detail(allowed_roots, &requested);
+            Err(FailureCode::OutsideAllowedRoots)
+        }
+    }
+}
+
+/// Names a requested activation root that does not exist yet, and the nearest existing ancestor
+/// below an allowed root, bounded to the reply's cause-path budget.
+///
+/// `None` keeps the historical bare refusal: either the root exists (the refusal really is about
+/// allowed roots), or no ancestor below an allowed root exists to name.
+fn absent_root_detail(allowed_roots: &[PathBuf], requested: &Path) -> Option<String> {
+    if allowed_roots.is_empty() || std::fs::symlink_metadata(requested).is_ok() {
+        return None;
+    }
+    let mut ancestor = requested.parent()?;
+    loop {
+        if crate::assistance::launcher::admit_worktree(allowed_roots, ancestor).is_ok() {
+            return Some(format!(
+                "start:root_absent; nearest existing ancestor below an allowed root: {}",
+                super::reply::bounded_utf8_prefix(&ancestor.to_string_lossy(), 256)
+            ));
+        }
+        ancestor = ancestor.parent()?;
+    }
+}
+
+/// Names the closed cause category of a failed Git discovery for the reply and the journal.
+///
+/// Git's own bounded stderr distinguishes a directory that is no worktree at all from any other
+/// failed or malformed discovery; the rest names the closed [`GitError`] tag, never raw output.
+fn discovery_failure_detail(
+    evidence: &[crate::execution::GitDiscoveryEvidence],
+    error: &crate::workspace::git::GitError,
+) -> String {
+    let not_a_worktree = evidence.iter().any(|output| {
+        output
+            .stderr()
+            .bytes
+            .windows(b"not a git".len())
+            .any(|part| part == b"not a git")
+            || output
+                .stderr()
+                .bytes
+                .windows(b"not a working tree".len())
+                .any(|part| part == b"not a working tree")
+    });
+    if not_a_worktree {
+        "start:git_discovery_failed: not a Git worktree".to_owned()
+    } else {
+        format!("start:git_discovery_failed: {error:?}")
+    }
 }
 
 /// Refuses a discovered Git worktree root or common directory outside every allowed root.
@@ -4836,6 +5007,43 @@ mod stop_retry_tests {
         }
     }
 
+    /// A missing requested start root names the nearest existing directory still under policy.
+    #[test]
+    fn absent_start_root_names_its_nearest_allowed_ancestor() {
+        let fixture = Fixture::new();
+        let allowed = vec![fixture.root.clone()];
+        let requested = fixture.root.join("not-created/child");
+        let detail = absent_root_detail(&allowed, &requested).unwrap();
+        assert!(detail.starts_with("start:root_absent;"));
+        assert!(detail.contains(&fixture.root.display().to_string()));
+    }
+
+    /// A native hook has a hint target only after the exact channel has an activation.
+    #[test]
+    fn inactive_channel_has_no_native_hint_target() {
+        let launcher = LauncherConfig::parse(
+            br#"{"version":1,"limits":{"queued":1,"details":1,"operation_ms":1000,"output_bytes":1024},"targets":[]}"#,
+        )
+        .unwrap();
+        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
+        let invocation = validated_call(&bindings, "native-hint-actor", "native-hint-call");
+        let binding = invocation.binding_ref().clone();
+        let handle = WorkerHandle::new(
+            bindings,
+            launcher,
+            [4; 32],
+            Arc::new(Mutex::new(admission_controller())),
+        );
+        assert!(!handle.channel_activated(&binding));
+        handle
+            .shared
+            .activated
+            .lock()
+            .unwrap()
+            .insert(binding.fingerprint());
+        assert!(handle.channel_activated(&binding));
+    }
+
     /// Creates one current host binding for a managed job.
     fn production_call(worker: &Worker<'_>, actor: &str, id: &str) -> ValidatedInvocation {
         validated_call(&worker.shared.bindings, actor, id)
@@ -5041,6 +5249,7 @@ mod stop_retry_tests {
                 project_feed: None,
                 test_runs: TestRuns::default(),
                 git_notices: Mutex::new(BTreeMap::new()),
+                activated: Mutex::new(BTreeSet::new()),
             }),
             workspace,
             observations: WorkspaceStore::new(store),

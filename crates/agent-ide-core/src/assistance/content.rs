@@ -455,7 +455,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&changed),
-            "error: source_unavailable (inspect:source_changed); the file changed since this result was captured; call ide.context again for fresh bytes"
+            "error: source_unavailable (inspect:source_changed); the file changed since this result was captured; read every page of a paged result before any write, then call ide.context again for fresh bytes"
         );
         let bare = render(
             PeerReply::Error {
@@ -565,6 +565,74 @@ mod tests {
             "error: invalid_detail (start:activation_conflict); this activation_id was used \
              with another root; use a new activation_id"
         );
+    }
+
+    /// Start stages keep distinct causes and recovery instructions in the compact reply.
+    #[test]
+    fn start_refusals_name_holder_and_failure_stage() {
+        for (detail, expected) in [
+            (
+                "start:worktree_held_by_another_actor",
+                "another agent's binding owns this worktree",
+            ),
+            (
+                "start:worktree_held_by_this_actor",
+                "this actor's other channel binding owns this worktree",
+            ),
+            (
+                "start:actor_owns_another_worktree",
+                "this actor already owns another worktree",
+            ),
+            (
+                "start:provider_cache_namespace_conflict",
+                "another active IDE owns the provider cache namespace",
+            ),
+            (
+                "start:git_discovery_failed: not a Git worktree",
+                "Git worktree discovery failed",
+            ),
+            (
+                "start:worktree_unresolved: could not be resolved",
+                "the worktree could not be resolved",
+            ),
+            (
+                "start:durable_state: activation state failed",
+                "durable activation state failed",
+            ),
+        ] {
+            let rendered = render(
+                PeerReply::Error {
+                    code: if detail.starts_with("start:provider_cache")
+                        || detail.starts_with("start:worktree_held")
+                        || detail.starts_with("start:actor_owns")
+                    {
+                        FailureCode::Conflict
+                    } else {
+                        FailureCode::WorkspaceActivation
+                    },
+                    detail: Some(detail.to_owned()),
+                },
+                Envelope::TextOnly,
+            )
+            .unwrap();
+            assert!(
+                text_of(&rendered).contains(expected),
+                "{detail}: {rendered:?}"
+            );
+        }
+        let absent = render(
+            PeerReply::Error {
+                code: FailureCode::OutsideAllowedRoots,
+                detail: Some(
+                    "start:root_absent; nearest existing ancestor below an allowed root: /repo"
+                        .to_owned(),
+                ),
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        assert!(text_of(&absent).contains("requested root does not exist yet"));
+        assert!(text_of(&absent).contains("/repo"));
     }
 
     /// A generic failure carrying a stage tag names it after the reason, exactly the same tag

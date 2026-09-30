@@ -54,11 +54,31 @@ error: invalid_detail (start:activation_conflict); this activation_id was used w
 {%- elif code == "invalid_detail" -%}
 error: invalid_detail{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; {% if resolution_detail == "inspect:detail_expired" %}this detail_ref has expired{% else %}this detail_ref was never issued{% endif %}; repeat the original ide.* call to get a fresh one, or continue with native tools
 {%- elif code == "source_unavailable" and resolution_detail == "inspect:source_changed" -%}
-error: source_unavailable (inspect:source_changed); the file changed since this result was captured; call ide.context again for fresh bytes
+error: source_unavailable (inspect:source_changed); the file changed since this result was captured; read every page of a paged result before any write, then call ide.context again for fresh bytes
 {%- elif code == "source_unavailable" -%}
 error: source_unavailable{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; continue with native tools
+{%- elif code == "outside_allowed_roots" and resolution_detail is startingwith("start:root_absent") -%}
+error: outside_allowed_roots ({{ resolution_detail }}); the requested root does not exist yet, so it cannot be activated; create it below the named ancestor or start from that ancestor, otherwise continue with native tools
+{%- elif code == "outside_allowed_roots" and resolution_detail is startingwith("start:worktree_unresolved") -%}
+error: outside_allowed_roots ({{ resolution_detail }}); the discovered worktree or Git directory is outside allowed_roots; start from an admitted worktree root
 {%- elif code == "outside_allowed_roots" -%}
 error: outside_allowed_roots{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; the working directory is not below any configured allowed root; start the IDE in an allowed directory or add this one to allowed_roots, otherwise continue with native tools
+{%- elif code == "workspace_activation" and resolution_detail is startingwith("start:git_discovery_failed") -%}
+error: workspace_activation ({{ resolution_detail }}); Git worktree discovery failed; check the Git checkout and retry ide.start
+{%- elif code == "workspace_activation" and resolution_detail is startingwith("start:worktree_unresolved") -%}
+error: workspace_activation ({{ resolution_detail }}); the worktree could not be resolved; retry ide.start from its root
+{%- elif code == "workspace_activation" and resolution_detail is startingwith("start:durable_state") -%}
+error: workspace_activation ({{ resolution_detail }}); durable activation state failed; retry ide.start, and continue with native tools if it repeats
+{%- elif code == "conflict" and resolution_detail == "start:worktree_held_by_another_actor" -%}
+error: conflict; another agent's binding owns this worktree and keeps its activation; that agent must run ide.stop before this one can activate here, otherwise continue with native tools
+{%- elif code == "conflict" and resolution_detail == "start:worktree_held_by_this_actor" -%}
+error: conflict; this actor's other channel binding owns this worktree; run ide.stop from that binding first, then ide.start again
+{%- elif code == "conflict" and resolution_detail == "start:actor_owns_another_worktree" -%}
+error: conflict; this actor already owns another worktree; call ide.stop first, then ide.start again for this root
+{%- elif code == "conflict" and resolution_detail == "start:activation_conflict" -%}
+error: conflict (start:activation_conflict); this activation_id was already committed with different parameters; use a new activation_id
+{%- elif code == "conflict" and resolution_detail == "start:provider_cache_namespace_conflict" -%}
+error: conflict (start:provider_cache_namespace_conflict); another active IDE owns the provider cache namespace; call ide.stop in that activation, then retry ide.start
 {%- elif code == "execution_profile" and cause_tag is defined -%}
 error: execution_profile ({{ cause_tag }}); continue with native tools
 {%- else -%}

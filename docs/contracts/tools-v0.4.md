@@ -25,6 +25,8 @@ Revision: v0.4. Provider: Agent IDE. Consumers: coding agents and IDE hosts.
 5. The language server runs as it would in a human's editor and remains alive for the session.
 6. Every host uses one path: return the result directly when it arrives within about 10 seconds; otherwise return `pending` and use `ide.inspect`.
 
+`ide.start` refusals name the actionable cause: an absent requested root includes the nearest existing ancestor under an allowed root; Git discovery failures include a short reason; unresolved worktrees and durable state failures have distinct stages. A worktree conflict says whether another actor owns it, this actor's other channel owns it, or this actor already owns another worktree, and names `ide.stop` or reuse as the remedy. Provider cache namespace conflicts have their own stage and recovery. A successful repeat by the same actor and binding reports the existing activation idempotently. The start card explains which tools can answer from source while a language server starts. Its baseline says why coverage is partial: Git metadata and source bytes are captured separately, so an atomic window is not proven.
+
 ## 1. Common conventions
 
 ### Symbol path
@@ -381,6 +383,8 @@ An untracked or conflicted path Git itself never diffs is still named, bounded l
 `provenance: true` returns today's exact hash-bearing header instead (worktree/comparison identity, capture generation, per-path lists) — kept for debugging, never the default.
 
 If the exact two-pass capture cannot prove a consistent read (for example a concurrent checkout, or a file that changed since a still-recorded observation of it), a single-pass plain `git diff` answers instead, marked on the summary line — naming only what the daemon actually knows, not a guessed specific cause: `diff (head): 2 files, +14 −3 (plain git diff; exact capture unavailable: snapshot unstable or a file changed since it was observed)`. This degraded page never claims currentness (`freshness` stays unknown) and never offers `ide.inspect` continuation. It runs without rename detection (a rename shows as a deletion plus an addition), attributes every hunk by its decoded `diff --git` path (Git's quoted form included), and fails `source_unavailable` (`diff:unstable`) instead of answering when any output cannot be attributed exactly — never a smaller count. Every path it names first passes the exact capture's own per-path confinement (a no-follow, in-root open of a regular file or a missing path, at most 256 paths, 64 KiB of path names in total and 1 MiB per file); one that fails — for example a tracked directory replaced by a symlink — refuses the whole page the same way, so the fallback never answers for a path the exact capture would refuse.
+
+Provenance reports one `current_tree` line in place of `freshness` plus `captured_freshness`. It says what the capture proved, what a later page rechecks, and to call `ide.diff` again if the tree moved; it does not imply that delivery rechecked Git state. If `ide.inspect` finds a source file changed after a paged context capture, it says to read every page before writing and call `ide.context` again.
 
 An untracked symlink or other special entry (for example `node_modules ->` a sibling checkout) is listed by name only — its bytes and, for a symlink, its target are never read — instead of refusing the whole diff.
 

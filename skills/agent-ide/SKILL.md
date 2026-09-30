@@ -114,7 +114,11 @@ server while it loads and answer `provider_unavailable` when it failed. `ide.sym
    Git worktree it belongs to and that worktree's Git directory must all lie inside the
    operator's configured `allowed_roots`; `outside_allowed_roots` means start the IDE in
    an allowed directory (or ask the operator to extend the list) and otherwise continue
-   with native tools. Do not call it again for later edits in the same worktree.
+   with native tools. A refusal names its cause: a not-yet-created root includes its nearest
+   existing allowed ancestor; Git discovery, unresolved worktree, durable state, worktree-holder,
+   and provider-cache conflicts have separate recovery advice. A repeated start by the same actor
+   and binding reuses and names the existing activation. Do not call it again for later edits in
+   the same worktree.
 2. Before an edit, prefer `ide.outline` the file (or `ide.symbol` the target) for its skeleton,
    then `ide.read` the exact symbol or line range you are about to change — its `source_ref` is
    the bounded reference `ide.edit` needs. `ide.context {path}` with no `byte_offset` still works
@@ -161,6 +165,10 @@ server while it loads and answer `provider_unavailable` when it failed. `ide.sym
    do not `ide.edit` from a `Context` until its last page arrived — the edit is
    refused as `stale_source` otherwise. Calling `ide.inspect` again after the
    last page just repeats the last page.
+   If inspect reports `source_changed`, finish reading every page before any write, then call
+   `ide.context` again. Diff provenance's `current_tree` line says what the capture established
+   and to call `ide.diff` again if the tree moved. A root-less start refused for `missing_pre`
+   may also include a `retry` hint with the current directory as an explicit root.
 7. `ide.stop` at handoff to another actor, or when the task ends, to release
    this binding's activation.
 

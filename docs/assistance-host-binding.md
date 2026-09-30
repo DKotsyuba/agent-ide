@@ -97,6 +97,12 @@ explains the refusal as well as a move would. A root below no allowed root is ne
 re-rooted to; the daemon's own `outside_allowed_roots` error answers. A re-root that cannot attach
 answers `unavailable: host_binding (project_moved: bound to <path>, asked <path>)`.
 
+A root-less `ide.start` refused specifically for `missing_pre` does not re-root because only that
+call's hook is missing. If this channel activated earlier, its reply includes
+`ide.start {root: <current directory>}` as the recovery hint. Product `ide.start` refusals also
+name the actual holder or failing stage; a channel that never activated does not emit native-hint
+events, because there is no cached result to invalidate.
+
 `agent-ide mcp --auto-launcher-template` selects the same Claude-compatible contract only on
 positive non-Codex evidence: a `ZCODE_*` startup variable (verified on a live ZCode MCP child,
 which carries no `CLAUDE_PROJECT_DIR` and no `CODEX_*`). The candidate is then the canonicalized

@@ -98,6 +98,13 @@ pub struct StartReceipt {
     /// Monotonic durable authority generation issued by this grant.
     epoch: u64,
 }
+/// Closed facts naming the active start a refused activation collided with (no authority).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StartHolder {
+    /// Whether the holder runs under the refused request's own actor.
+    pub same_actor: bool,
+}
+
 impl StartReceipt {
     /// Returns the canonical worktree whose historical grant this receipt records.
     pub fn worktree(&self) -> &WorktreeRef {
@@ -365,6 +372,10 @@ impl<'a> DurableWorkspace<'a> {
     /// The stable identity excludes per-call IDs so a fresh host call can retry the same actor/binding/worktree intent.
     /// Historical receipts survive restart but cannot mint current authority. A binding used by a prior
     /// boot or a stopped grant cannot start a new operation; a fresh host binding is required.
+    ///
+    /// A start whose own actor and binding already hold this worktree in this boot is idempotent: no
+    /// new authority is minted and the holder's original receipt (and its activation operation) is
+    /// returned, so a repeated `ide.start` succeeds instead of refusing with a conflict.
     pub async fn activate(&self, request: ActivationRequest) -> Result<StartReceipt, DurableError> {
         self.validate_native(&request.worktree)?;
         let binding = request.active_use.binding_ref().fingerprint();
@@ -381,6 +392,7 @@ impl<'a> DurableWorkspace<'a> {
         let op = operation("start", id.as_bytes())?;
         let sql_actor = actor.clone();
         let sql_id = id.clone();
+        let sql_binding = binding.to_vec();
         let native_key = request
             .worktree
             .native_key
@@ -390,10 +402,26 @@ impl<'a> DurableWorkspace<'a> {
             .durable_nonce
             .ok_or(DurableError::IdentityUnavailable)?;
         let result = self.store.execute(op.clone(), move |tx| {
+            // The one active start of this incarnation, read before the exclusivity checks so the
+            // same owner can be recognized instead of refused.
+            let holder = tx
+                .query_row(
+                    "SELECT actor,binding,epoch FROM workspace_starts WHERE incarnation=?1 AND active=1",
+                    [incarnation],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
             let outcome = if current_boot(tx)? != boot { "stale" }
                 else if !tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_worktrees WHERE incarnation=?1 AND native_key=?2 AND nonce=?3 AND closed=0)", params![incarnation,native_key.as_slice(),nonce.as_slice()], |row| row.get::<_,bool>(0))? { "identity" }
                 else if tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_starts WHERE binding=?1 AND outcome='granted' AND (boot<>?2 OR active=0))", params![binding.as_slice(),boot], |row| row.get::<_,bool>(0))? { "binding" }
-                else if tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_starts WHERE incarnation=?1 AND active=1)", [incarnation], |row| row.get::<_,bool>(0))? { "worktree_owned" }
+                else if holder.as_ref().is_some_and(|(held_actor,held_binding,_)| held_actor == &sql_actor && held_binding == &sql_binding) { "held" }
+                else if holder.is_some() { "worktree_owned" }
                 else if tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_starts WHERE actor=?1 AND active=1)", [&sql_actor], |row| row.get::<_,bool>(0))? { "actor_owned" }
                 else { "granted" };
             let epoch = if outcome == "granted" {
@@ -401,7 +429,7 @@ impl<'a> DurableWorkspace<'a> {
                 let epoch = epoch.checked_add(1).ok_or(rusqlite::Error::InvalidQuery)?;
                 tx.execute("UPDATE workspace_authority_clock SET epoch=?1 WHERE singleton=1", [epoch])?;
                 epoch
-            } else { 0 };
+            } else { holder.as_ref().map_or(0, |(_,_,epoch)| *epoch) };
             tx.execute("INSERT INTO workspace_starts(operation,digest,incarnation,actor,binding,boot,epoch,outcome,active) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![sql_id,digest.as_slice(),incarnation,sql_actor,binding.as_slice(),boot,epoch,outcome,i64::from(outcome=="granted")])?;
             Ok((digest.to_vec(),boot,epoch,outcome.to_owned()))
         }).await;
@@ -429,6 +457,29 @@ impl<'a> DurableWorkspace<'a> {
         if row.0 != digest {
             return Err(DurableError::OperationConflict);
         }
+        if row.3 == "held" {
+            // The same actor and binding already hold this worktree in this boot. The request
+            // committed no new authority, so answer with the holder's original receipt — including
+            // its activation operation, which is what a repeated `ide.start` must report.
+            let (operation, epoch) = self
+                .store
+                .read_one(
+                    "SELECT operation,epoch FROM workspace_starts WHERE incarnation=?1 AND active=1 AND outcome='granted'",
+                    vec![Value::Integer(incarnation)],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .await?
+                .ok_or(DurableError::CorruptState)?;
+            return Ok(StartReceipt {
+                worktree: request.worktree,
+                operation,
+                digest,
+                actor,
+                binding,
+                boot: unsigned(row.1)?,
+                epoch: unsigned(epoch)?,
+            });
+        }
         if row.3 != "granted" {
             return Err(rejection(&row.3));
         }
@@ -441,6 +492,34 @@ impl<'a> DurableWorkspace<'a> {
             boot: unsigned(row.1)?,
             epoch: unsigned(row.2)?,
         })
+    }
+
+    /// Reads the closed facts of the active start a refused activation collided with, so the
+    /// refusal can name who holds what instead of a bare conflict.
+    ///
+    /// The worktree's own active start is preferred; an actor that owns another worktree answers
+    /// with that start instead. Nothing is granted and no authority is minted by this read.
+    pub async fn start_holder(
+        &self,
+        worktree: &WorktreeRef,
+        actor: &str,
+    ) -> Result<Option<StartHolder>, DurableError> {
+        let incarnation = signed(worktree.incarnation())?;
+        let sql_actor = actor.to_owned();
+        let sql = "SELECT actor FROM workspace_starts WHERE active=1 AND (incarnation=?1 OR actor=?2) ORDER BY (incarnation=?1) DESC LIMIT 1";
+        let holder = self
+            .store
+            .read_one(
+                sql,
+                vec![Value::Integer(incarnation), Value::Text(sql_actor.clone())],
+                move |row| {
+                    Ok(StartHolder {
+                        same_actor: row.get::<_, String>(0)? == sql_actor,
+                    })
+                },
+            )
+            .await?;
+        Ok(holder)
     }
 
     /// Converts a committed receipt to authority only after fresh binding, native identity, and boot checks.

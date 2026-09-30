@@ -2180,6 +2180,40 @@ impl StdioFacade {
         }
     }
 
+    /// The recovery hint for a root-less `ide.start` the daemon refused on its own missing
+    /// pre-hook (F2, 0.6.5): such a start never re-roots, so it would otherwise end with no
+    /// guidance at all.
+    ///
+    /// Only a session that activated before gets one, and it names the current directory as the
+    /// root — the exact argument that lets the next start re-root deliberately, because a start
+    /// naming a root does re-pair on this same refusal.
+    async fn missing_pre_start_hint(
+        &self,
+        tool: AssistanceTool,
+        parameters: &Value,
+        reply: &PeerReply,
+    ) -> Option<String> {
+        if tool != AssistanceTool::Start
+            || parameters.get("root").and_then(Value::as_str).is_some()
+            || !matches!(
+                reply,
+                PeerReply::Unavailable {
+                    reason: MissingPeer::HostBinding,
+                    cause: Some(HostBindingCause::MissingPre),
+                }
+            )
+        {
+            return None;
+        }
+        let reconnect = self.reconnect.as_ref()?;
+        reconnect.last_activation.lock().await.as_ref()?;
+        let root = std::env::current_dir().ok()?;
+        Some(format!(
+            "call ide.start again naming the current directory: ide.start {{root: {}}}",
+            root.display()
+        ))
+    }
+
     /// Validates model parameters before using separately supplied host metadata for finite IPC.
     ///
     /// Missing or invalid ingress performs no IPC. Valid ingress sends selected actor/call metadata;
@@ -2285,10 +2319,18 @@ impl StdioFacade {
             }
             FacadeOutcome::Reply(reply, status) => {
                 let note = self.references_predate_replacement(&reply).await;
-                return note_replaced_references(
-                    render_reply_with_status(*reply, status.as_deref(), envelope),
-                    note,
-                );
+                // F2 (0.6.5): a root-less start refused on its own missing pre-hook gets no
+                // re-root and no guidance, even though this session activated before and naming
+                // the current directory as the root is exactly the call that re-pairs it.
+                let hint = self
+                    .missing_pre_start_hint(tool, &stage_parameters, reply.as_ref())
+                    .await;
+                let rendered = render_reply_with_status(*reply, status.as_deref(), envelope);
+                let rendered = match hint {
+                    Some(hint) => with_retry_hint(rendered, &hint),
+                    None => rendered,
+                };
+                return note_replaced_references(rendered, note);
             }
             FacadeOutcome::InvalidParameters => {
                 "invalid bounded parameters; inspect the tool schema"
@@ -2451,7 +2493,7 @@ fn render_reply_after_reconnect(
             ..
         }
     );
-    let mut rendered = render_reply_with_status(reply, status, envelope);
+    let rendered = render_reply_with_status(reply, status, envelope);
     if !is_host_binding_unavailable {
         return rendered;
     }
@@ -2462,6 +2504,12 @@ fn render_reply_after_reconnect(
         Resume::Rerooted => REROOT_RETRY_HINT,
         Resume::RerootedWithoutPre => REROOT_LATE_PRE_HINT,
     };
+    with_retry_hint(rendered, hint)
+}
+
+/// Appends one stable recovery hint to a rendered result: a `retry` field beside the structured
+/// copy and the same sentence at the end of the compact text.
+fn with_retry_hint(mut rendered: CallToolResult, hint: &str) -> CallToolResult {
     if let Some(Value::Object(fields)) = rendered.structured_content.as_mut() {
         fields.insert("retry".to_owned(), Value::String(hint.to_owned()));
     }
@@ -2617,6 +2665,33 @@ async fn no_start_reroots_while_a_replacement_awaits_reactivation() {
         reroot_target(&rootless, &refused, &connection).await,
         Some((None, Resume::Rerooted))
     );
+}
+
+/// A root-less missing-pre refusal tells a previously activated session how to pair again.
+#[tokio::test]
+async fn rootless_missing_pre_start_names_current_directory_hint() {
+    let reestablish: ReestablishFn = Arc::new(|| Box::pin(async { None }));
+    let reconnect = ManagedConnection::new(PathBuf::from("/runtime"), "a".to_owned(), reestablish);
+    *reconnect.last_activation.lock().await = Some(RememberedActivation {
+        activation_id: "prior-start".to_owned(),
+        root: None,
+    });
+    let mut facade = StdioFacade::new(PathBuf::from("/runtime"));
+    facade.reconnect = Some(reconnect);
+    let reply = PeerReply::Unavailable {
+        reason: MissingPeer::HostBinding,
+        cause: Some(HostBindingCause::MissingPre),
+    };
+    let hint = facade
+        .missing_pre_start_hint(
+            AssistanceTool::Start,
+            &json!({"activation_id":"retry"}),
+            &reply,
+        )
+        .await
+        .unwrap();
+    assert!(hint.contains("ide.start {root:"));
+    assert!(hint.contains(&std::env::current_dir().unwrap().display().to_string()));
 }
 
 /// Ensures escaped compact text cannot defeat the actual serialized response budget.
