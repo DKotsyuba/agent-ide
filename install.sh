@@ -207,5 +207,9 @@ fi
 if [ -n "$share_dir" ]; then
     set -- "$@" --share-dir "$share_dir"
 fi
-"$@"
-printf 'agent-ide %s installed; launcher: %s\n' "$version" "${bin_dir:-$HOME/.local/bin}/agent-ide"
+# The launcher path self-install reports is the one it wrote — the resolved user home may
+# differ from $HOME, and --home/--bin-dir relocate it — so read it from the JSON summary.
+summary=$("$@")
+printf '%s\n' "$summary"
+launcher=$(printf '%s' "$summary" | sed -n 's/.*"launcher"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+printf 'agent-ide %s installed; launcher: %s\n' "$version" "${launcher:-${bin_dir:-$HOME/.local/bin}/agent-ide}"

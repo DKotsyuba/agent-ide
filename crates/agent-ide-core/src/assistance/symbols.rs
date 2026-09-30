@@ -946,11 +946,16 @@ impl Worker<'_> {
     }
 
     /// One compact line marking a reply that was built from the lexical outline while the
-    /// file's registered server loads, so the agent knows semantic facts (usages, callers) are
-    /// not included. `None` when no server owns the file (nothing is loading).
+    /// file's registered server loads: the outline is exact, so the call needs no repeat, but
+    /// semantic facts (usages, callers) are not included. `None` when no server owns the file
+    /// (nothing is loading).
     fn lexical_note(&self, path: &Path) -> Option<String> {
-        self.session_server(path)
-            .map(|server| format!("outline: lexical ({} loading)", server.name()))
+        self.session_server(path).map(|server| {
+            format!(
+                "outline: from source, exact ({} still indexing; no need to repeat)",
+                server.name()
+            )
+        })
     }
 
     /// Resolves a bare symbol name to its definition file.

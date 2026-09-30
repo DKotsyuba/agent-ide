@@ -7734,7 +7734,7 @@ async fn configured_product_warm_rust_calls_complete_inline_within_three_seconds
             .await;
         let settled = actor.settle(&fixture, reply).await;
         let text = settled["text"].as_str().unwrap_or_default();
-        if settled["kind"] == "outline" && !text.contains("outline: lexical") {
+        if settled["kind"] == "outline" && !text.contains("outline: from source") {
             break;
         }
         assert!(
@@ -7945,7 +7945,7 @@ async fn configured_product_rust_lexical_outline_matches_the_server() {
                 .await;
             let settled = actor.settle(&fixture, reply).await;
             let text = settled["text"].as_str().unwrap_or_default();
-            if settled["kind"] == "outline" && !text.contains("outline: lexical") {
+            if settled["kind"] == "outline" && !text.contains("outline: from source") {
                 break settled;
             }
             assert!(
@@ -7964,7 +7964,7 @@ async fn configured_product_rust_lexical_outline_matches_the_server() {
             render::outline_text(&lexical),
             "{file}: the lexical outline must equal the server's"
         );
-        assert!(!server_text.contains("outline: lexical"), "{file}");
+        assert!(!server_text.contains("outline: from source"), "{file}");
 
         // End lines: every lexical address resolves through the server path to the same
         // range. Same-named siblings (a type and its impl blocks) share one address and
@@ -8161,7 +8161,9 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
     let text = outline["text"].as_str().unwrap();
     assert!(text.contains("pub fn value() -> i32"), "{outline}");
     assert!(
-        text.contains("outline: lexical (rust-analyzer loading)"),
+        text.contains(
+            "outline: from source, exact (rust-analyzer still indexing; no need to repeat)"
+        ),
         "the cold outline must say it is lexical: {outline}"
     );
     assert!(
@@ -8178,10 +8180,9 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
     let insert = edit(json!({"operation_id":"cold-insert","op":"insert","symbol":"src/lib.rs#value","where":"before","content":"/// Cold probe.\nfn cold_probe() -> u8 {\n    1\n}"})).await;
     assert_eq!(insert["operation"], "inserted", "{insert}");
     assert!(
-        insert["note"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("outline: lexical (rust-analyzer loading)"),
+        insert["note"].as_str().unwrap_or_default().contains(
+            "outline: from source, exact (rust-analyzer still indexing; no need to repeat)"
+        ),
         "the cold edit must say its symbol was lexical: {insert}"
     );
     let delete =
@@ -8189,10 +8190,9 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
             .await;
     assert_eq!(delete["operation"], "deleted", "{delete}");
     assert!(
-        delete["note"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("outline: lexical (rust-analyzer loading)"),
+        delete["note"].as_str().unwrap_or_default().contains(
+            "outline: from source, exact (rust-analyzer still indexing; no need to repeat)"
+        ),
         "{delete}"
     );
     // An address the lexical outline does not contain is not proven absent (`server_only` is a
@@ -8211,7 +8211,9 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
     let read_text = read["text"].as_str().unwrap_or_default();
     assert!(read_text.contains("pub fn value()"), "{read}");
     assert!(
-        read_text.contains("outline: lexical (rust-analyzer loading)"),
+        read_text.contains(
+            "outline: from source, exact (rust-analyzer still indexing; no need to repeat)"
+        ),
         "{read}"
     );
 
@@ -8250,7 +8252,7 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
     let settled = actor.settle(&fixture, symbol).await;
     let card = settled["text"].as_str().unwrap_or_default();
     assert!(card.contains("symbol: value"), "{settled}");
-    assert!(!card.contains("outline: lexical"), "{settled}");
+    assert!(!card.contains("outline: from source"), "{settled}");
     let server_only = actor.settle(&fixture, server_only).await;
     let read_text = server_only["text"].as_str().unwrap_or_default();
     assert!(
@@ -8263,7 +8265,7 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
         !refused["text"]
             .as_str()
             .unwrap_or_default()
-            .contains("outline: lexical"),
+            .contains("outline: from source"),
         "{refused}"
     );
     let warm = loop {
@@ -8278,14 +8280,16 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
             break settled;
         }
         assert!(
-            text.contains("outline: lexical (rust-analyzer loading)"),
+            text.contains(
+                "outline: from source, exact (rust-analyzer still indexing; no need to repeat)"
+            ),
             "still lexical: {settled}"
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
     };
     let warm_text = warm["text"].as_str().unwrap();
     assert!(warm_text.contains("pub fn caller() -> i32"), "{warm}");
-    assert!(!warm_text.contains("outline: lexical"), "{warm}");
+    assert!(!warm_text.contains("outline: from source"), "{warm}");
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
@@ -9621,7 +9625,9 @@ async fn configured_product_claude_returns_real_typescript_semantic_context_and_
     daemon.wait().await.unwrap();
 }
 
-/// TypeScript project membership falls back to lexical context when dependencies are installed.
+/// TypeScript project membership stays verified while dependencies install: the per-call
+/// observation still finds the document inside the configured project, so context stays
+/// semantic and a symbol edit still replaces.
 #[tokio::test]
 #[ignore = "requires the release-pinned Node and TypeScript bundle"]
 async fn configured_product_typescript_membership_falls_back_after_dependencies_install() {
@@ -9680,11 +9686,17 @@ async fn configured_product_typescript_membership_falls_back_after_dependencies_
         .await;
     let membership = actor.settle(&fixture, membership).await;
     assert_eq!(membership["kind"], "context", "{membership}");
+    // An empty `node_modules` changes no observed project file, and the tsconfig still lists
+    // the document, so the re-observed resolution stays verified and semantic.
     assert!(
         membership["text"]
             .as_str()
             .unwrap()
-            .contains("mode: lexical (semantic project resolution is unverified)"),
+            .contains("mode: semantic"),
+        "{membership}"
+    );
+    assert!(
+        membership["text"].as_str().unwrap().contains(source),
         "{membership}"
     );
     assert!(membership["detail_ref"].as_str().is_some(), "{membership}");
@@ -9868,11 +9880,12 @@ async fn configured_product_claude_typescript_unverified_membership_falls_back_t
         .await;
     let (context, _) = actor.settle_claude(&fixture, context).await;
     assert_eq!(context["kind"], "context", "{context}");
+    // The compact line names the actual rejection (b2155cc renders the reason), not the
+    // generic default.
     assert!(
-        context["text"]
-            .as_str()
-            .unwrap()
-            .contains("mode: lexical (semantic project resolution is unverified)"),
+        context["text"].as_str().unwrap().contains(
+            "mode: lexical (tsconfig.json: fixture.ts is not listed in `files` or under a literal `include` entry)"
+        ),
         "{context}"
     );
     assert!(
