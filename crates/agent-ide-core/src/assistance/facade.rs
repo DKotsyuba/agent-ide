@@ -2543,8 +2543,9 @@ enum Resume {
 /// demonstrably no longer pair where they must — and every other cause keeps the daemon's refusal,
 /// because its hooks are arriving and moving the session would only strand it between two daemons.
 /// A root-less start re-roots back to the host's own project directory on the two never-delivered
-/// causes alone, and never while a daemon replacement still awaits its re-activation: that
-/// replacement, not a moved session, is then the explanation for the same refusal.
+/// causes alone. No start re-roots while a daemon replacement still awaits its re-activation: the
+/// replacement's fresh channel has observed no hook yet, so that replacement, not a moved session,
+/// is then the explanation for the same refusal.
 async fn reroot_target(
     parameters: &Value,
     outcome: &FacadeOutcome,
@@ -2560,6 +2561,12 @@ async fn reroot_target(
     else {
         return None;
     };
+    if reconnect
+        .recovery_pending
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return None;
+    }
     let never_delivered = matches!(
         cause,
         HostBindingCause::HooksNotDelivered | HostBindingCause::OutsideAllowedRoots
@@ -2574,12 +2581,42 @@ async fn reroot_target(
                 None
             }
         }
-        None => (never_delivered
-            && !reconnect
-                .recovery_pending
-                .load(std::sync::atomic::Ordering::Acquire))
-        .then_some((None, Resume::Rerooted)),
+        None => never_delivered.then_some((None, Resume::Rerooted)),
     }
+}
+
+/// A start naming another root does not re-root on a silent channel while a daemon replacement
+/// awaits its re-activation (the replacement explains the refusal); once the binding is current
+/// again the same refusal re-roots.
+#[tokio::test]
+async fn no_start_reroots_while_a_replacement_awaits_reactivation() {
+    let reestablish: ReestablishFn = Arc::new(|| Box::pin(async { None }));
+    let connection = ManagedConnection::new(PathBuf::from("/runtime"), "a".to_owned(), reestablish);
+    let refused = FacadeOutcome::Reply(
+        Box::new(PeerReply::Unavailable {
+            reason: MissingPeer::HostBinding,
+            cause: Some(HostBindingCause::HooksNotDelivered),
+        }),
+        None,
+    );
+    let named = serde_json::json!({"activation_id": "x", "root": "/elsewhere"});
+    let rootless = serde_json::json!({"activation_id": "x"});
+    connection.mark_replaced();
+    assert!(reroot_target(&named, &refused, &connection).await.is_none());
+    assert!(
+        reroot_target(&rootless, &refused, &connection)
+            .await
+            .is_none()
+    );
+    connection.mark_activated();
+    assert_eq!(
+        reroot_target(&named, &refused, &connection).await,
+        Some((Some("/elsewhere".to_owned()), Resume::Rerooted))
+    );
+    assert_eq!(
+        reroot_target(&rootless, &refused, &connection).await,
+        Some((None, Resume::Rerooted))
+    );
 }
 
 /// Ensures escaped compact text cannot defeat the actual serialized response budget.
