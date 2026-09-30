@@ -310,12 +310,8 @@ pub(super) struct DiffPageState {
     /// Exact worktree/incarnation/epoch/mode this page's evidence was captured under; expansion
     /// fails closed the instant the caller's current authority no longer matches it.
     scope: GitScope,
-    /// Exact comparison identities and baseline context bound to `evidence`; `expand_diff` rejects
-    /// any mismatch against a differently captured comparison.
-    comparison: crate::workspace::git::GitComparison,
-    /// Complete retained per-path raw Git evidence this and every later page are selected from.
-    /// This is the heavy payload `MAX_RETAINED_DIFF_PAGE_BYTES` bounds in aggregate across details.
-    evidence: crate::workspace::git::snapshot::GitSnapshot,
+    /// Snapshot evidence or the bounded plain patch and source bytes needed to resume task pages.
+    evidence: DiffPageEvidence,
     /// Byte/hunk ceiling this comparison was originally captured with; later pages may request a
     /// smaller ceiling (see `expand_with_max_bytes`) but never a larger one.
     budget: crate::changes::DiffSelectionBudget,
@@ -326,6 +322,29 @@ pub(super) struct DiffPageState {
     /// Whether the page that minted this cursor was rendered with `provenance: true`; a later
     /// `ide.inspect` page keeps the same rendering the caller originally asked for.
     provenance: bool,
+}
+
+/// Retained source used by the common inspector for snapshot or plain-patch pagination.
+#[derive(Clone)]
+enum DiffPageEvidence {
+    /// Exact typed evidence from the standard snapshot comparisons.
+    Snapshot {
+        /// Comparison identities bound to the captured snapshot.
+        comparison: Box<crate::workspace::git::GitComparison>,
+        /// Complete per-path raw Git evidence retained for selection.
+        snapshot: Box<crate::workspace::git::snapshot::GitSnapshot>,
+    },
+    /// Task-mode patch plus live source fingerprints for every named path, detecting out-of-band edits.
+    Plain {
+        /// Bounded output of the controlled task diff command.
+        stdout: Vec<u8>,
+        /// Current worktree fingerprint when captured; `None` records a deleted path.
+        worktree_sources: Vec<(PathBuf, Option<crate::workspace::observation::SourceBytes>)>,
+        /// Owner operation reference retained with the patch.
+        operation: String,
+        /// Capture generation retained with the patch.
+        generation: u64,
+    },
 }
 
 impl DiffPageState {
@@ -345,13 +364,33 @@ impl DiffPageState {
         max_hunks: usize,
     ) -> crate::changes::DiffResult {
         let budget = crate::changes::DiffSelectionBudget::bounded(max_hunks, self.budget.max_bytes);
-        crate::changes::expand_diff(
-            expected_scope,
-            &self.comparison,
-            self.evidence.clone(),
-            &self.cursor,
-            budget,
-        )
+        match &self.evidence {
+            DiffPageEvidence::Snapshot {
+                comparison,
+                snapshot,
+            } => crate::changes::expand_diff(
+                expected_scope,
+                comparison.as_ref(),
+                snapshot.as_ref().clone(),
+                &self.cursor,
+                budget,
+            ),
+            DiffPageEvidence::Plain {
+                stdout,
+                operation,
+                generation,
+                ..
+            } => crate::changes::compose_plain_diff_page(
+                expected_scope,
+                stdout,
+                Some(&self.cursor),
+                operation,
+                *generation,
+                budget,
+                |paths| confine_plain_diff_paths(expected_scope, paths).is_ok(),
+            )
+            .unwrap_or_else(|| crate::changes::DiffResult::unavailable(expected_scope)),
+        }
     }
     /// Returns the byte/hunk budget originally captured for this comparison.
     pub(super) const fn budget(&self) -> crate::changes::DiffSelectionBudget {
@@ -369,7 +408,6 @@ impl DiffPageState {
     pub(super) fn advance(&self, result: &crate::changes::DiffResult) -> Option<Self> {
         result.detail_cursor().map(|cursor| Self {
             scope: self.scope.clone(),
-            comparison: self.comparison.clone(),
             evidence: self.evidence.clone(),
             budget: self.budget,
             cursor: cursor.clone(),
@@ -380,35 +418,53 @@ impl DiffPageState {
     /// Re-verifies every retained tracked path's working-tree bytes against the current worktree
     /// using the same no-follow reader Workspace itself captured them with. `Staged` never depends
     /// on working-tree content, so it is not a meaningful freshness proof there and this always
-    /// reports unchanged; `Head`/`Unstaged` genuinely compare against the working tree, so a
+    /// reports unchanged; `Head`/`Unstaged`/`Task` genuinely compare against the working tree, so a
     /// silent out-of-band edit (no native hook, so `native_epoch` never advanced) is caught here.
     pub(super) fn working_tree_bytes_unchanged(
         &self,
         worktree: &crate::workspace::authority::WorktreeRef,
     ) -> bool {
-        if self.mode == DiffMode::Staged {
-            return true;
-        }
         use crate::workspace::observation::{
             ObservationError, SourceReadLimits, read_authorized_source,
         };
-        for path in self.evidence.paths() {
-            let Some(source) = path.source() else {
-                continue;
-            };
-            let limits = SourceReadLimits::new(
-                4096,
-                crate::workspace::git::snapshot::MAX_SNAPSHOT_BLOB_BYTES,
-            )
-            .expect("fixed source limits");
-            let current = read_authorized_source(worktree, path.status().path(), limits);
-            let matches = match current {
-                Ok(read) => source.bytes() == Some(read.bytes()),
-                Err(ObservationError::Missing) => source.bytes().is_none(),
-                Err(_) => false,
-            };
-            if !matches {
-                return false;
+        let limits = SourceReadLimits::new(
+            4096,
+            crate::workspace::git::snapshot::MAX_SNAPSHOT_BLOB_BYTES,
+        )
+        .expect("fixed source limits");
+        match &self.evidence {
+            DiffPageEvidence::Snapshot { snapshot, .. } => {
+                if self.mode == DiffMode::Staged {
+                    return true;
+                }
+                for path in snapshot.paths() {
+                    let Some(source) = path.source() else {
+                        continue;
+                    };
+                    let current = read_authorized_source(worktree, path.status().path(), limits);
+                    let matches = match current {
+                        Ok(read) => source.bytes() == Some(read.bytes()),
+                        Err(ObservationError::Missing) => source.bytes().is_none(),
+                        Err(_) => false,
+                    };
+                    if !matches {
+                        return false;
+                    }
+                }
+            }
+            DiffPageEvidence::Plain {
+                worktree_sources, ..
+            } => {
+                for (path, original) in worktree_sources {
+                    let matches = match read_authorized_source(worktree, path, limits) {
+                        Ok(read) => original.as_ref() == Some(read.bytes()),
+                        Err(ObservationError::Missing) => original.is_none(),
+                        Err(_) => false,
+                    };
+                    if !matches {
+                        return false;
+                    }
+                }
             }
         }
         true
@@ -617,12 +673,13 @@ enum DiffContinuationNote<'a> {
     Recapture,
 }
 
-/// Lowercases one compare mode for the compact §2.7 header (`head`/`staged`/`unstaged`).
+/// Lowercases one compare mode for the compact §2.7 header.
 const fn mode_label(mode: DiffMode) -> &'static str {
     match mode {
         DiffMode::Head => "head",
         DiffMode::Staged => "staged",
         DiffMode::Unstaged => "unstaged",
+        DiffMode::Task => "task",
     }
 }
 
@@ -886,6 +943,7 @@ impl Worker<'_> {
             Some("head") => DiffMode::Head,
             Some("staged") => DiffMode::Staged,
             Some("unstaged") => DiffMode::Unstaged,
+            Some("task") => DiffMode::Task,
             _ => return Err(FailureCode::Internal),
         };
         let provenance = job.parameters["provenance"].as_bool().unwrap_or(false);
@@ -896,7 +954,7 @@ impl Worker<'_> {
         let generation = self.source_sequence;
         let program = job.target.git.path.clone();
         let reference = job.reference.clone();
-        let baseline = if mode == DiffMode::Head {
+        let baseline = if matches!(mode, DiffMode::Head | DiffMode::Task) {
             self.baselines.get(&binding).cloned()
         } else {
             None
@@ -908,6 +966,133 @@ impl Worker<'_> {
             },
             Ok,
         )?;
+        if mode == DiffMode::Task {
+            let Some(task_head) = baseline.task_head() else {
+                job.failure_detail =
+                    Some("diff:activation_commit_unknown; use mode: head".to_owned());
+                return Err(FailureCode::SourceUnavailable);
+            };
+            let scope = GitScope::from_authority(&authority, mode);
+            let intent = SnapshotIntent::task_diff(scope.clone(), &program, task_head)
+                .map_err(|_| FailureCode::SourceUnavailable)?;
+            let mut runner = ProductSnapshotRunner {
+                worker: self,
+                job,
+                authority: authority.clone(),
+                failure: None,
+                stage: None,
+                detail: None,
+            };
+            let evidence = runner.run_owned(intent.clone()).await?;
+            let stdout = intent
+                .accept(evidence)
+                .map_err(|_| FailureCode::SourceUnavailable)?;
+            let budget = crate::changes::DiffSelectionBudget::bounded(32, 48 * 1024);
+            let composed = crate::changes::compose_plain_diff_page(
+                &scope,
+                &stdout,
+                None,
+                &reference,
+                generation,
+                budget,
+                |paths| confine_plain_diff_paths(&scope, paths).is_ok(),
+            )
+            .ok_or(FailureCode::SourceUnavailable)?;
+            let paths =
+                crate::changes::plain_diff_paths(&stdout).ok_or(FailureCode::SourceUnavailable)?;
+            let limits = crate::workspace::observation::SourceReadLimits::new(
+                4096,
+                crate::workspace::git::snapshot::MAX_SNAPSHOT_BLOB_BYTES,
+            )
+            .map_err(|_| FailureCode::SourceUnavailable)?;
+            let mut worktree_sources = Vec::with_capacity(paths.len());
+            let mut source_bytes = 0usize;
+            let unique_paths: BTreeSet<PathBuf> = paths.iter().cloned().collect();
+            for path in unique_paths {
+                runner
+                    .authorize_read_path(&path)
+                    .await
+                    .map_err(|_| FailureCode::SourceUnavailable)?;
+                let source = match crate::workspace::observation::read_authorized_source(
+                    authority.worktree(),
+                    &path,
+                    limits,
+                ) {
+                    Ok(source) => {
+                        source_bytes = source_bytes.saturating_add(source.contents().len());
+                        if source_bytes > crate::workspace::git::snapshot::MAX_SNAPSHOT_TOTAL_BYTES
+                        {
+                            return Err(FailureCode::Capacity);
+                        }
+                        Some(crate::workspace::observation::SourceBytes::from_bytes(
+                            source.contents(),
+                        ))
+                    }
+                    Err(crate::workspace::observation::ObservationError::Missing) => None,
+                    Err(_) => return Err(FailureCode::SourceUnavailable),
+                };
+                worktree_sources.push((path, source));
+            }
+            let (result, reply) = fit_diff_page(
+                mode,
+                authority.epoch(),
+                &reference,
+                budget.max_hunks,
+                true,
+                provenance,
+                |max_hunks| {
+                    crate::changes::compose_plain_diff_page(
+                        &scope,
+                        &stdout,
+                        None,
+                        &reference,
+                        generation,
+                        crate::changes::DiffSelectionBudget::bounded(max_hunks, budget.max_bytes),
+                        |paths| confine_plain_diff_paths(&scope, paths).is_ok(),
+                    )
+                    .unwrap_or_else(|| composed.clone())
+                },
+            )?;
+            drop(runner);
+            self.shared
+                .set_diff_provenance(&reference, paths.into_iter().collect());
+            let diff_page = result.detail_cursor().map(|cursor| DiffPageState {
+                scope: scope.clone(),
+                evidence: DiffPageEvidence::Plain {
+                    stdout,
+                    worktree_sources,
+                    operation: reference.clone(),
+                    generation,
+                },
+                budget,
+                cursor: cursor.clone(),
+                mode,
+                provenance,
+            });
+            let continues = diff_page.is_some();
+            let retained = self.shared.set_diff_page(&reference, diff_page);
+            let authority = self.authority(&binding).await?;
+            self.shared.active(&binding)?;
+            if retained || !continues {
+                return Ok((reply, Some(authority), None));
+            }
+            let text = if provenance {
+                render_diff_provenance(mode, &result, authority.epoch(), false)
+            } else {
+                render_diff_compact(mode, &result, DiffContinuationNote::Recapture, None)
+            };
+            return Ok((
+                PeerReply::Complete {
+                    kind: ResultKind::Diff,
+                    text,
+                    detail_ref: Some(reference),
+                    truncated: true,
+                    continuation: false,
+                },
+                Some(authority),
+                None,
+            ));
+        }
         let mut runner = ProductSnapshotRunner {
             worker: self,
             job,
@@ -1049,8 +1234,10 @@ impl Worker<'_> {
             .set_diff_provenance(&job.reference, represented_paths);
         let diff_page = result.detail_cursor().map(|cursor| DiffPageState {
             scope: scope.clone(),
-            comparison: comparison.clone(),
-            evidence,
+            evidence: DiffPageEvidence::Snapshot {
+                comparison: Box::new(comparison.clone()),
+                snapshot: Box::new(evidence),
+            },
             budget,
             cursor: cursor.clone(),
             mode,

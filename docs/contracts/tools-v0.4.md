@@ -375,7 +375,7 @@ Run at most one test job at a time per worktree. Stop a run when its budget expi
 
 ### 2.7 `ide.diff` — changed files (implemented)
 
-Input: `{mode: head|staged|unstaged, detail_ref?, provenance?: false}`.
+Input: `{mode: head|staged|unstaged|task, detail_ref?, provenance?: false}`. `task` compares the worktree with the commit recorded at activation, so it includes changes committed during the task and current uncommitted changes. If activation could not record that commit, the mode refuses and suggests `head`.
 
 Output is compact and contains no hashes:
 

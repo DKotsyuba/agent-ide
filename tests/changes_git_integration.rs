@@ -106,7 +106,7 @@ async fn content_queries_must_not_execute_repository_clean_filters() {
         );
         let paths: Vec<_> = result.tracked().iter().map(|entry| entry.path()).collect();
         match mode {
-            DiffMode::Head => assert_eq!(paths.len(), 3),
+            DiffMode::Head | DiffMode::Task => assert_eq!(paths.len(), 3),
             DiffMode::Staged => {
                 assert_eq!(paths.len(), 2);
                 assert!(!paths.contains(&std::path::Path::new("unstaged.txt")));
