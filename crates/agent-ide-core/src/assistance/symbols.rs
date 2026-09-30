@@ -163,7 +163,9 @@ impl Worker<'_> {
             }
             None => render::outline_text(&outline),
         };
-        if lexical && let Some(note) = self.lexical_note(observed.path()) {
+        if let Some(why) = lexical
+            && let Some(note) = self.lexical_note(observed.path(), why)
+        {
             text.push_str(&note);
             text.push('\n');
         }
@@ -203,9 +205,7 @@ impl Worker<'_> {
                 let found = outline
                     .find(&symbol)
                     .ok_or_else(|| missing_symbol(job, from_text))?;
-                lexical = from_text
-                    .then(|| self.lexical_note(observed.path()))
-                    .flatten();
+                lexical = from_text.and_then(|why| self.lexical_note(observed.path(), why));
                 (file, found.range, symbol.to_string())
             }
             (None, None) => {
@@ -891,19 +891,21 @@ impl Worker<'_> {
 
     /// Document symbols of one observed file through the live session, normalized by the
     /// language module, or the language's source outline when no server owns the file. While a
-    /// registered server is still loading (a cold workspace load), a language that opted in
+    /// registered server is still loading (a cold workspace load), and when it is unavailable
+    /// (its workspace failed to load, or no launch configures it), a language that opted in
     /// ([`LanguageSupport::outline_while_loading`](crate::lang::LanguageSupport::outline_while_loading))
     /// answers from its source outline at once instead of parking; a file it cannot outline,
-    /// and every other language, keeps the loading answer and its parking retry. Returns the
-    /// outline, the worktree root for path rendering, and whether the outline came from the text
-    /// alone while that server loads (replies then say so in one compact line, and an address
-    /// it does not contain waits for the server — see [`missing_symbol`]).
+    /// and every other language, keeps the loading answer and its parking retry, or the
+    /// unavailable refusal. Returns the outline, the worktree root for path rendering, and why
+    /// the outline came from the text alone (replies then say so in one compact line; an
+    /// address it does not contain waits for the server while it loads — see
+    /// [`missing_symbol`]).
     async fn outline_of(
         &mut self,
         job: &mut Job,
         observed: &SourceObservation,
         bytes: &[u8],
-    ) -> Result<(Outline, std::path::PathBuf, bool), FailureCode> {
+    ) -> Result<(Outline, std::path::PathBuf, Option<Lexical>), FailureCode> {
         let language = Lang::for_path(observed.path()).ok_or(FailureCode::ProviderUnavailable)?;
         let support = language.support();
         let source = observed_text(observed, bytes)?.to_owned();
@@ -913,7 +915,7 @@ impl Worker<'_> {
             // answers; any other keeps the provider-unavailable refusal.
             return support
                 .outline_from_source(observed.path(), &source)
-                .map(|outline| (outline, worktree_root, false))
+                .map(|outline| (outline, worktree_root, None))
                 .ok_or(FailureCode::ProviderUnavailable);
         }
         let live = match self.live_session_for(job, observed).await {
@@ -924,12 +926,22 @@ impl Worker<'_> {
                 // file that does not scan cleanly keeps the park, exactly as before.
                 let parked = job.park_until.take();
                 return match support.outline_from_source(observed.path(), &source) {
-                    Some(outline) => Ok((outline, worktree_root, true)),
+                    Some(outline) => Ok((outline, worktree_root, Some(Lexical::Loading))),
                     None => {
                         job.park_until = parked;
                         Err(FailureCode::ProviderLoading)
                     }
                 };
+            }
+            Err(FailureCode::ProviderUnavailable) if support.outline_while_loading() => {
+                // The registered server failed (its workspace would not load) or no launch
+                // configures it: the exact source outline answers at once, marked lexical, and
+                // nothing is parked — a later call asks the server again, so one that recovers
+                // wins. A file that does not scan cleanly keeps the refusal, exactly as before.
+                return support
+                    .outline_from_source(observed.path(), &source)
+                    .map(|outline| (outline, worktree_root, Some(Lexical::Unavailable)))
+                    .ok_or(FailureCode::ProviderUnavailable);
             }
             Err(other) => return Err(other),
         };
@@ -941,21 +953,24 @@ impl Worker<'_> {
         Ok((
             support.normalize(observed.path(), &source, symbols),
             worktree_root,
-            false,
+            None,
         ))
     }
 
-    /// One compact line marking a reply that was built from the lexical outline while the
-    /// file's registered server loads: the outline is exact, so the call needs no repeat, but
-    /// semantic facts (usages, callers) are not included. `None` when no server owns the file
-    /// (nothing is loading).
-    fn lexical_note(&self, path: &Path) -> Option<String> {
-        self.session_server(path).map(|server| {
-            format!(
-                "outline: from source, exact ({} still indexing; no need to repeat)",
-                server.name()
-            )
-        })
+    /// One compact line marking a reply that was built from the lexical outline because the
+    /// file's registered server did not answer it (`why`: still loading, or unavailable): the
+    /// outline is exact, so the call needs no repeat, but semantic facts (usages, callers) are
+    /// not included. `None` when no server owns the file (nothing is loading or failed).
+    fn lexical_note(&self, path: &Path, why: Lexical) -> Option<String> {
+        let server = self.session_server(path)?;
+        let state = match why {
+            Lexical::Loading => "still indexing",
+            Lexical::Unavailable => "unavailable",
+        };
+        Some(format!(
+            "outline: from source, exact ({} {state}; no need to repeat)",
+            server.name()
+        ))
     }
 
     /// Resolves a bare symbol name to its definition file.
@@ -1121,8 +1136,8 @@ impl Worker<'_> {
         )
         .ok()?;
         match self.outline_of(job, &observed, read.contents()).await {
-            // A lexical outline (the server still loading) is not the server's answer.
-            Ok((outline, _, lexical)) => Some((outline, !lexical)),
+            // A lexical outline (the server still loading, or unavailable) is not the server's.
+            Ok((outline, _, lexical)) => Some((outline, lexical.is_none())),
             // The server could not outline it (its project config lives below the worktree
             // root): the language's text outline still names the enclosing declaration.
             Err(_) => Lang::for_path(file)?
@@ -1482,18 +1497,33 @@ fn collect_language_files(
     files
 }
 
-/// The failure for an address the job's outline does not contain (`lexical`: whether that
-/// outline came from the text while the file's server loads). A server outline proves the symbol
-/// absent: `unknown_symbol`. A lexical outline cannot — an item it names differently or does not
-/// report may still exist — so the call waits for the server exactly as while any symbol tool
-/// waits for it: parked for a retry, or `provider_loading` at once for an edit (see
-/// [`park_while_loading`](super::providers::park_while_loading)).
-pub(super) fn missing_symbol(job: &mut Job, lexical: bool) -> FailureCode {
-    if !lexical {
-        return FailureCode::UnknownSymbol;
+/// Why an outline came from the file's text alone: its registered server is still loading, or
+/// it is unavailable (its workspace failed to load, or no launch configures it). `None` marks
+/// the server's own answer — and a file no server owns, which the replies do not mark.
+#[derive(Clone, Copy)]
+pub(super) enum Lexical {
+    /// The registered server has not finished loading its workspace yet.
+    Loading,
+    /// The registered server failed or is absent; it will not answer this call.
+    Unavailable,
+}
+
+/// The failure for an address the job's outline does not contain (`lexical`: why that outline
+/// came from the text). A server outline proves the symbol absent: `unknown_symbol`. A lexical
+/// outline cannot — an item it names differently or does not report may still exist — so while
+/// the server loads the call waits for it exactly as any symbol tool waits: parked for a retry,
+/// or `provider_loading` at once for an edit (see
+/// [`park_while_loading`](super::providers::park_while_loading)). An unavailable server will
+/// not answer either, so the miss refuses `provider_unavailable` at once instead of parking.
+pub(super) fn missing_symbol(job: &mut Job, lexical: Option<Lexical>) -> FailureCode {
+    match lexical {
+        None => FailureCode::UnknownSymbol,
+        Some(Lexical::Unavailable) => FailureCode::ProviderUnavailable,
+        Some(Lexical::Loading) => {
+            super::providers::park_while_loading(job);
+            FailureCode::ProviderLoading
+        }
     }
-    super::providers::park_while_loading(job);
-    FailureCode::ProviderLoading
 }
 
 /// Byte offset of the symbol's name on its declaration line, for position-based requests.
@@ -1629,9 +1659,7 @@ impl Worker<'_> {
                 let (observed, bytes) = self.observe(&binding, file.clone()).await?;
                 let source = observed_text(&observed, &bytes)?.to_owned();
                 let (outline, _, from_text) = self.outline_of(job, &observed, &bytes).await?;
-                let lexical = from_text
-                    .then(|| self.lexical_note(observed.path()))
-                    .flatten();
+                let lexical = from_text.and_then(|why| self.lexical_note(observed.path(), why));
                 let splice = match op.as_str() {
                     "insert" => {
                         let where_ = match job.parameters.get("where").and_then(Value::as_str) {

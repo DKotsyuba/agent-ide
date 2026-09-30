@@ -5836,8 +5836,9 @@ mod stop_retry_tests {
     }
 
     /// An address missing from a server outline is unknown; one missing from a lexical outline
-    /// (the server still loading) waits for the server: a read-only tool is parked for a retry,
-    /// an edit answers `provider_loading` at once and is never parked.
+    /// waits while the server loads (a read-only tool parked for a retry, an edit answering
+    /// `provider_loading` at once and never parked), and refuses `provider_unavailable` at once
+    /// when the server is unavailable: nothing is parked for a server that will not answer.
     #[tokio::test]
     async fn a_lexical_miss_waits_for_the_server_instead_of_unknown_symbol() {
         let fixture = Fixture::new();
@@ -5848,19 +5849,28 @@ mod stop_retry_tests {
         let (mut job, _) = context_job(&fixture.root, call);
         job.tool = AssistanceTool::Read;
 
-        let code = super::symbols::missing_symbol(&mut job, false);
+        let code = super::symbols::missing_symbol(&mut job, None);
         assert_eq!(code, FailureCode::UnknownSymbol);
         assert!(job.park_until.is_none());
 
-        let code = super::symbols::missing_symbol(&mut job, true);
+        let code = super::symbols::missing_symbol(&mut job, Some(super::symbols::Lexical::Loading));
         assert_eq!(code, FailureCode::ProviderLoading);
         assert!(job.park_until.is_some(), "a read waits for the server");
 
         job.park_until = None;
         job.tool = AssistanceTool::Edit;
-        let code = super::symbols::missing_symbol(&mut job, true);
+        let code = super::symbols::missing_symbol(&mut job, Some(super::symbols::Lexical::Loading));
         assert_eq!(code, FailureCode::ProviderLoading);
         assert!(job.park_until.is_none(), "an edit is never parked");
+
+        job.tool = AssistanceTool::Read;
+        let code =
+            super::symbols::missing_symbol(&mut job, Some(super::symbols::Lexical::Unavailable));
+        assert_eq!(code, FailureCode::ProviderUnavailable);
+        assert!(
+            job.park_until.is_none(),
+            "an unavailable server is never waited for"
+        );
     }
 
     /// A parked job yields the worker slot to the next runnable arrival.

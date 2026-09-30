@@ -8296,6 +8296,265 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
     daemon.wait().await.unwrap();
 }
 
+/// A rust-analyzer stand-in whose workspace never loads: it completes the LSP handshake and
+/// answers document symbols, but keeps reporting a quiescent `error` server status (the shape
+/// rust-analyzer sends when `cargo metadata` fails) until its ready flag file appears, from
+/// which it reports the quiescent `ok` status of a recovered workspace.
+const UNAVAILABLE_STUB_SERVER: &str = r#"
+import fs from 'node:fs';
+const readyFlag = process.argv[2];
+let buffer = Buffer.alloc(0);
+const send = (message) => {
+  const text = JSON.stringify(message);
+  process.stdout.write(`Content-Length: ${Buffer.byteLength(text)}\r\n\r\n${text}`);
+};
+const reply = (id, result) => send({ jsonrpc: '2.0', id, result });
+process.stdin.on('data', (chunk) => {
+  buffer = Buffer.concat([buffer, chunk]);
+  for (;;) {
+    const header = buffer.indexOf('\r\n\r\n');
+    if (header < 0) return;
+    const length = parseInt(buffer.slice(0, header).toString().match(/Content-Length: (\d+)/)?.[1] ?? '0', 10);
+    if (buffer.length < header + 4 + length) return;
+    const message = JSON.parse(buffer.slice(header + 4, header + 4 + length).toString());
+    buffer = buffer.slice(header + 4 + length);
+    switch (message.method) {
+      case 'initialize':
+        reply(message.id, {
+          capabilities: {
+            textDocumentSync: 1,
+            documentSymbolProvider: true,
+          },
+          serverInfo: { name: 'rust-analyzer', version: '1.98.1 (48a229ce 2026-09-01)' },
+        });
+        break;
+      case 'shutdown':
+        reply(message.id, null);
+        break;
+      case 'exit':
+        process.exit(0);
+      case 'textDocument/documentSymbol':
+        // The fixture's own functions plus one extra top-level symbol only the server
+        // reports, so a recovered reply is visibly the server's answer (three symbols where
+        // the file itself has two functions).
+        reply(message.id, [
+          {
+            name: 'value',
+            kind: 12,
+            range: { start: { line: 0, character: 0 }, end: { line: 3, character: 1 } },
+            selectionRange: { start: { line: 1, character: 7 }, end: { line: 1, character: 12 } },
+          },
+          {
+            name: 'caller',
+            kind: 12,
+            range: { start: { line: 5, character: 0 }, end: { line: 7, character: 1 } },
+            selectionRange: { start: { line: 5, character: 7 }, end: { line: 5, character: 13 } },
+          },
+          {
+            name: 'server_only',
+            kind: 12,
+            range: { start: { line: 0, character: 0 }, end: { line: 7, character: 1 } },
+            selectionRange: { start: { line: 0, character: 0 }, end: { line: 0, character: 7 } },
+          },
+        ]);
+        break;
+      default:
+        if (message.id !== undefined) reply(message.id, null);
+    }
+  }
+});
+const report = () => {
+  const health = fs.existsSync(readyFlag) ? 'ok' : 'error';
+  send({ jsonrpc: '2.0', method: 'experimental/serverStatus', params: { health, quiescent: true } });
+  setTimeout(report, 100);
+};
+report();
+"#;
+
+/// While the registered Rust server is unavailable (its workspace failed to load), `ide.outline`,
+/// `ide.read` and the symbol-addressed `ide.edit` answer at once from the exact lexical outline
+/// and mark it so; an address the lexical outline does not contain, a file it refuses and
+/// `ide.symbol` answer `provider_unavailable` instead of parking — and once the server
+/// recovers, the server path wins again.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_NODE environment"]
+async fn configured_product_unavailable_rust_symbol_tools_answer_from_the_lexical_outline() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let node = std::env::var("AGENT_IDE_NODE").unwrap();
+    let fixture = symbol_test_fixture();
+    let stub = fixture.base.join("unavailable-stub-server.mjs");
+    let ready = fixture.base.join("unavailable-stub-ready");
+    std::fs::write(&stub, UNAVAILABLE_STUB_SERVER).unwrap();
+    let wrapper = fixture.base.join("unavailable-rust-provider");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec '{}' '{}' '{}'\n",
+            node,
+            stub.display(),
+            ready.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN")
+        .unwrap_or_else(|_| "1.98.1-aarch64-apple-darwin".into());
+    fixture.write_config(json!([{
+        "executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
+        "settings":"rust_cache_priming_disabled_v1",
+        "toolchain":toolchain,
+        "cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),
+        "cargo_version":"cargo 1.98.1",
+        "rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),
+        "rustc_version":"rustc 1.98.1",
+        "trust":"fixture-disabled",
+        "cache_namespace":"fixture-unavailable-lexical-cache"
+    }]));
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "/// Answers cold.\npub fn value() -> i32 { 7 }\n\npub fn caller() -> i32 { value() }\n",
+    )
+    .unwrap();
+    // A comment directly above an item: rust-analyzer may attach it to the item's range, so the
+    // lexical outline refuses this file and it keeps the provider-unavailable refusal.
+    std::fs::write(
+        fixture.root.join("src/refused.rs"),
+        "// attached to the item below\npub fn refused() {}\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "src/refused.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "unavailable lexical fixture"]);
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "unavailable-lexical").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"unavailable-lexical-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    // Outline: complete from the text, marked unavailable (the failed status may still race the
+    // first call, which then answers provider_loading and is retried).
+    let outline = loop {
+        let reply = actor
+            .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+            .await;
+        let settled = actor.settle(&fixture, reply).await;
+        if settled["kind"] == "outline" {
+            break settled;
+        }
+        assert_eq!(settled["code"], "provider_loading", "{settled}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let text = outline["text"].as_str().unwrap();
+    assert!(text.contains("pub fn value() -> i32"), "{outline}");
+    assert!(
+        text.contains("outline: from source, exact (rust-analyzer unavailable; no need to repeat)"),
+        "the unavailable outline must say it is lexical: {outline}"
+    );
+    assert!(!text.contains("still indexing"), "{outline}");
+
+    // Symbol edits: insert then delete resolve from the lexical outline, marked unavailable.
+    let mut edit = async |params: Value| {
+        let reply = actor.call(&fixture, "ide.edit", params).await;
+        actor.settle(&fixture, reply).await
+    };
+    let insert = edit(json!({"operation_id":"unavailable-insert","op":"insert","symbol":"src/lib.rs#value","where":"before","content":"/// Unavailable probe.\nfn unavailable_probe() -> u8 {\n    1\n}"})).await;
+    assert_eq!(insert["operation"], "inserted", "{insert}");
+    assert!(
+        insert["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("outline: from source, exact (rust-analyzer unavailable; no need to repeat)"),
+        "the unavailable edit must say its symbol was lexical: {insert}"
+    );
+    let delete = edit(
+        json!({"operation_id":"unavailable-delete","op":"delete","symbol":"src/lib.rs#unavailable_probe"}),
+    )
+    .await;
+    assert_eq!(delete["operation"], "deleted", "{delete}");
+    assert!(
+        delete["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("outline: from source, exact (rust-analyzer unavailable; no need to repeat)"),
+        "{delete}"
+    );
+
+    // An address the lexical outline does not contain is not parked for a server that will not
+    // answer: the edit answers provider_unavailable at once, never provider_loading.
+    let missing = edit(
+        json!({"operation_id":"unavailable-missing","op":"delete","symbol":"src/lib.rs#server_only"}),
+    )
+    .await;
+    assert_eq!(missing["code"], "provider_unavailable", "{missing}");
+    assert_ne!(missing["state"], "pending", "{missing}");
+
+    // Read of a symbol: numbered source, marked unavailable, with its source_ref.
+    let read = actor
+        .call(&fixture, "ide.read", json!({"symbol":"src/lib.rs#value"}))
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let read_text = read["text"].as_str().unwrap_or_default();
+    assert!(read_text.contains("pub fn value()"), "{read}");
+    assert!(
+        read_text
+            .contains("outline: from source, exact (rust-analyzer unavailable; no need to repeat)"),
+        "{read}"
+    );
+
+    // A file the lexical scanner refuses keeps the refusal instead of a lexical guess, and it is
+    // never parked: the outline answers provider_unavailable at once.
+    let refused = actor
+        .call(&fixture, "ide.outline", json!({"path":"src/refused.rs"}))
+        .await;
+    let refused = actor.settle(&fixture, refused).await;
+    assert_eq!(refused["code"], "provider_unavailable", "{refused}");
+    assert_ne!(refused["state"], "pending", "{refused}");
+
+    // `ide.symbol` stays server-only: usages need the server, so it refuses rather than answer
+    // from the lexical outline.
+    let symbol = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#value"}))
+        .await;
+    let symbol = actor.settle(&fixture, symbol).await;
+    assert_eq!(symbol["code"], "provider_unavailable", "{symbol}");
+    assert_ne!(symbol["state"], "pending", "{symbol}");
+
+    // The server recovers: its own answer wins again, and the marker disappears.
+    std::fs::write(&ready, "ready").unwrap();
+    let warm = loop {
+        let reply = actor
+            .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+            .await;
+        let settled = actor.settle(&fixture, reply).await;
+        let text = settled["text"].as_str().unwrap_or_default();
+        // Three symbols for a file with two functions is the server's answer; the lexical
+        // outline of the same file reports two and marks itself lexical.
+        if settled["kind"] == "outline" && text.contains("(3 symbols)") {
+            break settled;
+        }
+        assert!(
+            text.contains(
+                "outline: from source, exact (rust-analyzer unavailable; no need to repeat)"
+            ),
+            "still lexical: {settled}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+    let warm_text = warm["text"].as_str().unwrap();
+    assert!(warm_text.contains("pub fn caller() -> i32"), "{warm}");
+    assert!(!warm_text.contains("outline: from source"), "{warm}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Rejects an empty root policy and accepts an explicit start root below an admitted root.
 #[tokio::test]
 async fn configured_product_start_enforces_allowed_roots_and_accepts_root_argument() {

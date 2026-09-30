@@ -687,23 +687,27 @@ pub trait LanguageSupport: Send + Sync {
     /// a server may still answer: graph use-site nodes and name-card addresses use it where the
     /// server is not asked or cannot answer, and — only when
     /// [`LanguageSupport::outline_while_loading`] opts in — outline, read and symbol edits use it
-    /// while that server is still loading.
+    /// while that server is still loading or unavailable (its workspace failed to load, or no
+    /// launch configures it).
     fn outline_from_source(&self, file: &Path, source: &str) -> Option<Outline> {
         let _ = (file, source);
         None
     }
 
     /// Whether [`LanguageSupport::outline_from_source`] answers `ide.outline`, `ide.read` and
-    /// symbol-addressed `ide.edit` while the language's registered server is still loading;
-    /// `false` (the default) keeps those calls waiting for the server.
+    /// symbol-addressed `ide.edit` while the language's registered server is still loading, and
+    /// when that server is unavailable (its workspace failed to load, or no launch configures
+    /// it); `false` (the default) keeps those calls waiting for the server, or refusing
+    /// `provider_unavailable` when it failed.
     ///
     /// Opting in is an obligation, because a symbol edit splices by the outline's ranges: every
     /// `Some` outline it returns for a text must equal what [`LanguageSupport::normalize`] makes
     /// of the server's document symbols for the same text — the same addresses, kinds, ranges,
     /// bodies, signatures, docs, children and order — and a text it cannot outline with that
-    /// guarantee must answer `None`, which keeps the call waiting for the server. An address the
-    /// source outline does not contain is not proven absent: the call waits for the server
-    /// instead of answering `unknown_symbol`.
+    /// guarantee must answer `None`, which keeps the call waiting for the server, or refusing
+    /// `provider_unavailable` when it failed. An address the source outline does not contain is
+    /// not proven absent: while the server loads the call waits for it instead of answering
+    /// `unknown_symbol`, and when it is unavailable the call refuses `provider_unavailable`.
     fn outline_while_loading(&self) -> bool {
         false
     }
