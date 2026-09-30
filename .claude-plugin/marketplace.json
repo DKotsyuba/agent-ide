@@ -8,7 +8,7 @@
       "name": "agent-ide",
       "source": "./",
       "description": "Agent IDE coding-companion skill and Claude lifecycle hooks.",
-      "version": "0.6.2"
+      "version": "0.6.3"
     }
   ]
 }
