@@ -89,9 +89,11 @@ including one naming another repository's admitted root — never re-roots: the 
 activates that root, so a cross-repository start can no longer strand a session between two
 daemons. The re-rooted call's own pre-hook necessarily ran before the new rendezvous existed, so
 its first reply is the cause-tagged refusal plus a stable `retry` hint rather than a hard failure,
-and the next call pairs normally; after a `missing_pre` re-root the hint also names the root-less
+and the next call pairs once the host's hooks run in that directory; after a `missing_pre` re-root the hint also names the root-less
 `ide.start` that returns the session to the host's project directory, the same never-delivered
-evidence on which a root-less start re-roots back by itself. A root below no allowed root is never
+evidence on which a root-less start re-roots back by itself. No start re-roots while a daemon
+replacement awaits its re-activation: the replacement's fresh channel has seen no hook yet, which
+explains the refusal as well as a move would. A root below no allowed root is never
 re-rooted to; the daemon's own `outside_allowed_roots` error answers. A re-root that cannot attach
 answers `unavailable: host_binding (project_moved: bound to <path>, asked <path>)`.
 
