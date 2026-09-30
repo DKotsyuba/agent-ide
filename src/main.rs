@@ -2226,6 +2226,7 @@ async fn run_managed_claude_mcp(
         Arc::clone(&binding),
         launcher_template.clone(),
         Arc::clone(&lease),
+        candidate.clone(),
     );
     match StdioFacade::with_reestablishing_claude_attachment(
         runtime_path,
@@ -2319,53 +2320,74 @@ fn claude_reestablish_hook(
 ///
 /// A host that moves a project never restarts this MCP process, so a session started in one
 /// directory stays bound there while its hooks already run with the new project directory and
-/// find no rendezvous. The first `ide.start {root}` naming a different directory re-attaches
-/// through the exact fresh-session path of [`attach_claude_binding`] — key cache, shared daemon,
-/// lease, candidate attachment — so the session's next hooks reach a daemon this MCP dispatches
-/// against. Only roots below the template's `allowed_roots` are accepted; that single rule is the
-/// whole security boundary and is unchanged.
+/// find no rendezvous. Only after the daemon refused a Start with a cause proving this session's
+/// hooks no longer pair there does the facade call this hook: `Some(root)` re-attaches through the
+/// exact fresh-session path of [`attach_claude_binding`] — key cache, shared daemon, lease,
+/// candidate attachment — and `None` returns to `startup`, the host's project directory this MCP
+/// process began in, so a root-less start can never stay stranded on a root its session left. Only
+/// targets below the template's `allowed_roots` are accepted; that single rule is the whole
+/// security boundary and is unchanged.
 fn claude_reroot_hook(
     binding: Arc<std::sync::Mutex<ClaudeBinding>>,
     launcher_template: PathBuf,
     lease: Arc<Mutex<Option<UnixStream>>>,
+    startup: PathBuf,
 ) -> RerootFn {
     Arc::new(move |requested| {
         let binding = Arc::clone(&binding);
         let launcher_template = launcher_template.clone();
         let lease = Arc::clone(&lease);
+        let startup = startup.clone();
         Box::pin(async move {
             let started = std::time::Instant::now();
             let current = binding.lock().expect("claude binding mutex").clone();
-            // An unresolvable root is not this hook's decision: the daemon's own admission answer
-            // names it, exactly as for a Start that never carried a usable root.
-            let outcome = match fs::canonicalize(&requested) {
-                Ok(candidate) if absolute_local_path(&candidate) => {
-                    if agent_ide::assistance::launcher::admit_worktree(
-                        &current.allowed_roots,
-                        &candidate,
-                    )
-                    .is_err()
-                    {
-                        RerootOutcome::OutsideAllowedRoots
-                    } else if candidate == current.candidate {
-                        RerootOutcome::Unchanged
-                    } else {
-                        let key = claude_rendezvous_key(&candidate).await;
-                        let moved = ClaudeBinding {
-                            candidate: candidate.clone(),
-                            key,
-                            allowed_roots: current.allowed_roots.clone(),
-                        };
-                        match attach_claude_binding(&moved, &launcher_template, &lease).await {
-                            Some((runtime, attachment)) => {
-                                *binding.lock().expect("claude binding mutex") = moved;
-                                RerootOutcome::Attached(runtime, attachment, candidate)
+            // An unresolvable explicit root is not this hook's decision: the daemon's own admission
+            // answer names it, exactly as for a Start that never carried a usable root. An
+            // unresolvable host project directory cannot be returned to; the pair stays.
+            let (candidate, outside) = match requested {
+                Some(requested) => match fs::canonicalize(&requested) {
+                    Ok(candidate) if absolute_local_path(&candidate) => (Some(candidate), false),
+                    _ => (None, true),
+                },
+                None => (
+                    fs::canonicalize(&startup)
+                        .ok()
+                        .filter(|path| absolute_local_path(path)),
+                    false,
+                ),
+            };
+            let outcome = if outside {
+                RerootOutcome::OutsideAllowedRoots
+            } else {
+                match candidate {
+                    None => RerootOutcome::Unchanged,
+                    Some(candidate) => {
+                        if agent_ide::assistance::launcher::admit_worktree(
+                            &current.allowed_roots,
+                            &candidate,
+                        )
+                        .is_err()
+                        {
+                            RerootOutcome::OutsideAllowedRoots
+                        } else if candidate == current.candidate {
+                            RerootOutcome::Unchanged
+                        } else {
+                            let key = claude_rendezvous_key(&candidate).await;
+                            let moved = ClaudeBinding {
+                                candidate: candidate.clone(),
+                                key,
+                                allowed_roots: current.allowed_roots.clone(),
+                            };
+                            match attach_claude_binding(&moved, &launcher_template, &lease).await {
+                                Some((runtime, attachment)) => {
+                                    *binding.lock().expect("claude binding mutex") = moved;
+                                    RerootOutcome::Attached(runtime, attachment, candidate)
+                                }
+                                None => RerootOutcome::Failed,
                             }
-                            None => RerootOutcome::Failed,
                         }
                     }
                 }
-                _ => RerootOutcome::OutsideAllowedRoots,
             };
             agent_ide::errorlog::record(
                 agent_ide::errorlog::Method::Client,

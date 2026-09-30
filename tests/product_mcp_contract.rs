@@ -2123,6 +2123,32 @@ impl ProductFixture {
             .unwrap();
         assert!(output.status.success(), "fixture Git failed");
     }
+    /// Creates one committed second Git repository below the fixture's allowed root, so a start
+    /// can name a genuinely different repository's root. Same excluded configuration as
+    /// [`Self::git`].
+    fn other_repository(&self, name: &str) -> PathBuf {
+        let root = self.base.join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("tracked.txt"), "other\n").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("/usr/bin/git")
+                .env_clear()
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(["-C"])
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "second repository Git failed");
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        git(&["config", "user.name", "Product Fixture"]);
+        git(&["add", "--", "."]);
+        git(&["commit", "--quiet", "-m", "other"]);
+        root
+    }
     /// Writes launcher configuration admitting the fixture parent and selected providers.
     ///
     /// The one target serves Codex and Claude actors alike; a Claude target needs no profile.
@@ -4194,6 +4220,184 @@ async fn managed_claude_moved_session_reroots_into_an_allowed_root() {
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     mcp.close().await;
     let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// 0.6.4: an `ide.start {root}` naming a genuinely different repository while the session's hooks
+/// still pair where it dispatches never re-roots. The paired daemon activates the other admitted
+/// root itself, no second daemon appears, and a later root-less start still activates the host's
+/// project directory — the documented default — so a cross-repository start can no longer strand
+/// a managed Claude session between two daemons.
+#[tokio::test]
+async fn managed_claude_cross_repository_start_activates_without_stranding() {
+    let fixture = ProductFixture::new(json!([]));
+    let other = fixture.other_repository("other-repository");
+    let home_runtime = managed_claude_runtime_path(&fixture.root);
+    let other_runtime = managed_claude_runtime_path(&other);
+    let _home_guard = SharedClaudeDaemonGuard(home_runtime.clone());
+    let _other_guard = SharedClaudeDaemonGuard(other_runtime.clone());
+    assert!(!home_runtime.exists() && !other_runtime.exists());
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+
+    // The hooks pair at the session's own project; the start naming the other repository's root
+    // activates that root through the same daemon, end to end with the hook delivered.
+    let mut next = 1;
+    let pending = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "cross-session",
+        None,
+        "ide.start",
+        json!({"activation_id":"cross","root":other.to_str().unwrap()}),
+    )
+    .await;
+    let started = settle_managed_claude_start(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        "cross-session",
+        None,
+        &pending,
+    )
+    .await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    assert!(
+        !other_runtime.exists(),
+        "a cross-repository start must not re-root to the other repository's daemon"
+    );
+
+    // One actor owns one worktree, so the session stops first; a later root-less start then
+    // activates the host's project directory, the documented default.
+    next += 1;
+    let stopped = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "cross-session",
+        None,
+        "ide.stop",
+        json!({}),
+    )
+    .await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    next += 1;
+    let pending = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "cross-session",
+        None,
+        "ide.start",
+        json!({"activation_id":"cross-default"}),
+    )
+    .await;
+    let defaulted = settle_managed_claude_start(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        "cross-session",
+        None,
+        &pending,
+    )
+    .await;
+    assert_eq!(defaulted["kind"], "activation", "{defaulted}");
+    mcp.close().await;
+}
+
+/// 0.6.4: the one residual way a session can move while its hooks stay behind — a re-root on a
+/// missing pre-hook alone — answers with the two-step recovery hint, and the root-less start then
+/// re-roots home and activates the host's project directory, so the session is never stranded.
+#[tokio::test]
+async fn managed_claude_rootless_start_returns_a_stranded_session_home() {
+    let fixture = ProductFixture::new(json!([]));
+    let other = fixture.other_repository("other-repository");
+    let home_runtime = managed_claude_runtime_path(&fixture.root);
+    let other_runtime = managed_claude_runtime_path(&other);
+    let _home_guard = SharedClaudeDaemonGuard(home_runtime.clone());
+    let _other_guard = SharedClaudeDaemonGuard(other_runtime.clone());
+    assert!(!home_runtime.exists() && !other_runtime.exists());
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+
+    // The session first activates normally, so its channel has delivered hooks at home.
+    let mut next = 1;
+    let pending = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "strand-session",
+        None,
+        "ide.start",
+        json!({"activation_id":"strand"}),
+    )
+    .await;
+    let started = settle_managed_claude_start(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        "strand-session",
+        None,
+        &pending,
+    )
+    .await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    // A start naming the other repository whose own pre-hook never ran anywhere: the paired
+    // daemon answers missing_pre, the re-root moves the session anyway (the session may truly
+    // have moved), and the reply keeps the daemon's closed cause plus the two-step recovery hint
+    // instead of promising a pairing repeat that a lost pre-hook cannot guarantee.
+    next += 1;
+    let stranded = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{
+                "name":"ide.start",
+                "arguments":{"activation_id":"strand","root":other.to_str().unwrap()},
+                "_meta":{"claudecode/toolUseId":"strand-lost"}
+            }}),
+        )
+        .await;
+    let stranded_text = assert_claude_envelope(&stranded);
+    assert!(
+        stranded_text.starts_with(
+            "unavailable: host_binding (hooks_not_delivered); continue with native tools"
+        ),
+        "{stranded_text}"
+    );
+    assert!(
+        stranded_text.ends_with(
+            "; retry: session re-rooted to the requested root; repeat this call once, or call ide.start without root"
+        ),
+        "{stranded_text}"
+    );
+    assert!(
+        other_runtime.is_dir(),
+        "the missing-pre re-root must have attached the other repository's daemon"
+    );
+
+    // The session's next hooks run where it lives and reach the home daemon, and the root-less
+    // start re-roots home before activating the host's project directory — the same activation
+    // the session began with, retried where it belongs.
+    next += 1;
+    let pending = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "strand-session",
+        None,
+        "ide.start",
+        json!({"activation_id":"strand"}),
+    )
+    .await;
+    let recovered = settle_managed_claude_start(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        "strand-session",
+        None,
+        &pending,
+    )
+    .await;
+    assert_eq!(recovered["kind"], "activation", "{recovered}");
+    mcp.close().await;
 }
 
 /// Auto mode keeps the Codex contract for Codex children: with Codex startup evidence, and with

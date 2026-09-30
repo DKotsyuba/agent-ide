@@ -207,7 +207,10 @@ search; never block source work waiting for `ide.*` to become available.
 When an `unavailable` reply carries the retry fact `daemon restarted; repeat
 this call once` or `session re-rooted to the requested root; repeat this call
 once`, repeat that exact same call once before falling back to
-native tools.
+native tools. When it carries `session re-rooted to the requested root; repeat
+this call once, or call ide.start without root`, repeat that call once, and if
+it stays unavailable call `ide.start` with no `root` — that returns the session
+to the host's project directory.
 
 ## Boundaries
 
