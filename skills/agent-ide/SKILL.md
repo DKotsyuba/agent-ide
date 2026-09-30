@@ -108,13 +108,15 @@ server while it loads and answer `provider_unavailable` when it failed. `ide.sym
 
 1. `ide.start` once per actor per worktree, optionally with `"root": "/absolute/dir"`
    to name the working directory (default: the host's project directory). Its reply
-   carries the project card: git state, languages with line counts, the project's build /
+   carries the project card: Git state when available, languages with line counts, the project's build /
    check / test / lint commands with their provenance, toolchain, layout, entry points and
    docs — read it before exploring by hand. The root, the
-   Git worktree it belongs to and that worktree's Git directory must all lie inside the
+   detected Git worktree and its Git directory must also lie inside the
    operator's configured `allowed_roots`; `outside_allowed_roots` means start the IDE in
    an allowed directory (or ask the operator to extend the list) and otherwise continue
    with native tools. Do not call it again for later edits in the same worktree.
+   Directories without Git work; `ide.diff` and requested symbol history there answer
+   `not a git repository: no git data`.
 2. Before an edit, prefer `ide.outline` the file (or `ide.symbol` the target) for its skeleton,
    then `ide.read` the exact symbol or line range you are about to change — its `source_ref` is
    the bounded reference `ide.edit` needs. `ide.context {path}` with no `byte_offset` still works

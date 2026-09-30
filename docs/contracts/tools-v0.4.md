@@ -117,6 +117,8 @@ A kind this block names wins outright over CI/manifest/README for that kind (pro
 
 Implemented wire form: the activation reply keeps its first line (`activated: epoch N; baseline: …`) and appends the card after a blank line. The card is computed under a 5 s budget off the runtime; when it does not fit the budget the reply is the plain activation text. Commands print one line per kind with the provenance in the heading (`commands (agents, ci, manifest):`), `environment:` names the toolchain and edition, `servers:` prints `not started` for each detected language (the daemon does not probe servers at start), and there is no `ide.project` yet — call `ide.start` again to see the card. Symbol requests on a Rust worktree where the root is not a Cargo workspace also load nested crates (two directories deep, excluding test material), so references across such a crate's own tests resolve.
 
+A directory with no `.git` in it or any ancestor activates as a plain directory; its baseline says `not a git repository: no git data`, and requested symbol history reports that sentence.
+
 Errors: `outside_allowed_roots` (as today). There is no `not_a_project` failure (see the status table).
 
 ### 2.2 `ide.outline` — file skeleton (implemented)
@@ -383,6 +385,8 @@ An untracked or conflicted path Git itself never diffs is still named, bounded l
 If the exact two-pass capture cannot prove a consistent read (for example a concurrent checkout, or a file that changed since a still-recorded observation of it), a single-pass plain `git diff` answers instead, marked on the summary line — naming only what the daemon actually knows, not a guessed specific cause: `diff (head): 2 files, +14 −3 (plain git diff; exact capture unavailable: snapshot unstable or a file changed since it was observed)`. This degraded page never claims currentness (`freshness` stays unknown) and never offers `ide.inspect` continuation. It runs without rename detection (a rename shows as a deletion plus an addition), attributes every hunk by its decoded `diff --git` path (Git's quoted form included), and fails `source_unavailable` (`diff:unstable`) instead of answering when any output cannot be attributed exactly — never a smaller count. Every path it names first passes the exact capture's own per-path confinement (a no-follow, in-root open of a regular file or a missing path, at most 256 paths, 64 KiB of path names in total and 1 MiB per file); one that fails — for example a tracked directory replaced by a symlink — refuses the whole page the same way, so the fallback never answers for a path the exact capture would refuse.
 
 An untracked symlink or other special entry (for example `node_modules ->` a sibling checkout) is listed by name only — its bytes and, for a symlink, its target are never read — instead of refusing the whole diff.
+
+In a plain directory, `ide.diff` answers `source_unavailable (diff:not_a_git_repository)` with `not a git repository: no git data`.
 
 ### 2.8 `ide.problems` — project or file diagnostics (planned cleanup)
 

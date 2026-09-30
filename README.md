@@ -208,10 +208,13 @@ blocks native tools or turn completion.
 `agent-ide -v`, `-V`, `--version`, and `version` print `agent-ide <version>` and exit 0 without starting or contacting a daemon.
 
 The IDE's only path policy is the launcher `allowed_roots` list: `ide.start` (optionally with
-an absolute `root`) is admitted when the working directory, its Git worktree and its Git
-directory lie inside a configured root, and refused with `outside_allowed_roots` otherwise. No
-host sandbox is replayed and no sandbox profile is ever accepted or captured. The offline
-installation helpers are `agent-ide evidence executable` and `agent-ide launcher check`. The bundled
+an absolute `root`) is admitted when the working directory lies inside a configured root and,
+when Git discovers a worktree, that worktree and its Git directory do too; otherwise it is refused
+with `outside_allowed_roots`. No host sandbox is replayed and no sandbox profile is ever accepted
+or captured. The IDE also supports directories without Git; Git-only diff and history answers say
+no Git data is available.
+The offline installation helpers are `agent-ide evidence executable` and `agent-ide launcher check`.
+The bundled
 `skills/agent-ide` workflow directs coding agents through start, context, the
 supported `ide.edit` path when offered, refreshed context, diff, and stop.
 Native host editing remains available when `ide.edit` is inactive, unavailable,

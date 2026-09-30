@@ -492,7 +492,12 @@ impl Worker<'_> {
                 .await?;
         }
         if want_history {
-            card.history = history_lines(&worktree_root, &file, found.range).await;
+            // A plain directory has no commits to list; the requested section still answers.
+            if observed.worktree().is_plain_directory() {
+                card.history_unavailable = true;
+            } else {
+                card.history = history_lines(&worktree_root, &file, found.range).await;
+            }
         }
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
         if card.usages.len() > render::MAX_USAGE_LINES {
