@@ -119,6 +119,8 @@ A kind this block names wins outright over CI/manifest/README for that kind (pro
 
 Implemented wire form: the activation reply keeps its first line (`activated: epoch N; baseline: …`) and appends the card after a blank line. The card is computed under a 5 s budget off the runtime; when it does not fit the budget the reply is the plain activation text. Commands print one line per kind with the provenance in the heading (`commands (agents, ci, manifest):`), `environment:` names the toolchain and edition, `servers:` prints `not started` for each detected language (the daemon does not probe servers at start), and there is no `ide.project` yet — call `ide.start` again to see the card. Symbol requests on a Rust worktree where the root is not a Cargo workspace also load nested crates (two directories deep, excluding test material), so references across such a crate's own tests resolve.
 
+A directory with no `.git` in it or any ancestor activates as a plain directory; its baseline says `not a git repository: no git data`, and requested symbol history reports that sentence.
+
 Errors: `outside_allowed_roots` (as today). There is no `not_a_project` failure (see the status table).
 
 ### 2.2 `ide.outline` — file skeleton (implemented)
@@ -387,6 +389,8 @@ If the exact two-pass capture cannot prove a consistent read (for example a conc
 Provenance reports one `current_tree` line in place of `freshness` plus `captured_freshness`. It says what the capture proved, what a later page rechecks, and to call `ide.diff` again if the tree moved; it does not imply that delivery rechecked Git state. If `ide.inspect` finds a source file changed after a paged context capture, it says to read every page before writing and call `ide.context` again.
 
 An untracked symlink or other special entry (for example `node_modules ->` a sibling checkout) is listed by name only — its bytes and, for a symlink, its target are never read — instead of refusing the whole diff.
+
+In a plain directory, `ide.diff` answers `source_unavailable (diff:not_a_git_repository)` with `not a git repository: no git data`.
 
 ### 2.8 `ide.problems` — project or file diagnostics (planned cleanup)
 

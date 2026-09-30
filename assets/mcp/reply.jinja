@@ -55,6 +55,8 @@ error: invalid_detail (start:activation_conflict); this activation_id was used w
 error: invalid_detail{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; {% if resolution_detail == "inspect:detail_expired" %}this detail_ref has expired{% else %}this detail_ref was never issued{% endif %}; repeat the original ide.* call to get a fresh one, or continue with native tools
 {%- elif code == "source_unavailable" and resolution_detail == "inspect:source_changed" -%}
 error: source_unavailable (inspect:source_changed); the file changed since this result was captured; read every page of a paged result before any write, then call ide.context again for fresh bytes
+{%- elif code == "source_unavailable" and resolution_detail == "diff:not_a_git_repository" -%}
+error: source_unavailable (diff:not_a_git_repository); not a git repository: no git data
 {%- elif code == "source_unavailable" -%}
 error: source_unavailable{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; continue with native tools
 {%- elif code == "outside_allowed_roots" and resolution_detail is startingwith("start:root_absent") -%}

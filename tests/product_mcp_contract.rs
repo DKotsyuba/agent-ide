@@ -2054,8 +2054,8 @@ struct ProductFixture {
     telemetry: PathBuf,
 }
 impl ProductFixture {
-    /// Creates committed source plus staged/unstaged changes, without user Git configuration or hooks.
-    fn new(providers: Value) -> Self {
+    /// Creates the private admitted layout every fixture kind shares, before any project files.
+    fn skeleton() -> Self {
         let base = std::fs::canonicalize(std::env::temp_dir())
             .unwrap()
             .join(format!(
@@ -2064,20 +2064,25 @@ impl ProductFixture {
                 NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed)
             ));
         let root = base.join("repo");
-        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
         let telemetry_dir = base.join("telemetry");
         std::fs::DirBuilder::new()
             .mode(0o700)
             .recursive(true)
             .create(&telemetry_dir)
             .unwrap();
-        let fixture = Self {
+        Self {
             runtime: base.join("ipc"),
             config: base.join("launcher.json"),
             telemetry: telemetry_dir.join("telemetry.sqlite"),
             base,
             root,
-        };
+        }
+    }
+    /// Creates committed source plus staged/unstaged changes, without user Git configuration or hooks.
+    fn new(providers: Value) -> Self {
+        let fixture = Self::skeleton();
+        std::fs::create_dir_all(fixture.root.join("src")).unwrap();
         std::fs::write(
             fixture.root.join("Cargo.toml"),
             "[package]\nname=\"product_fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
@@ -2107,6 +2112,25 @@ impl ProductFixture {
         std::fs::write(fixture.root.join("tracked.txt"), "index\n").unwrap();
         fixture.git(&["add", "--", "tracked.txt"]);
         std::fs::write(fixture.root.join("tracked.txt"), "worktree\n").unwrap();
+        fixture.write_config(providers);
+        fixture
+    }
+    /// Creates a plain data folder with no Git repository anywhere below the admitted root: a
+    /// simulation script, its runner and its results, never committed to anything.
+    fn new_without_git(providers: Value) -> Self {
+        let fixture = Self::skeleton();
+        std::fs::write(
+            fixture.root.join("sim.py"),
+            "def simulate(steps):\n    return [step * 1.5 for step in range(steps)]\n\n\ndef report(values):\n    return \"mean {:.2f}\".format(sum(values) / len(values))\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.root.join("run.sh"),
+            "#!/bin/sh\npython3 sim.py > results.txt\n",
+        )
+        .unwrap();
+        std::fs::write(fixture.root.join("results.txt"), "mean 7.50\n").unwrap();
+        std::fs::write(fixture.root.join("sim.css"), ".sim { color: blue; }\n").unwrap();
         fixture.write_config(providers);
         fixture
     }
@@ -5329,10 +5353,9 @@ async fn managed_claude_activates_after_removing_an_earlier_worktree() {
 /// The hook resolves its rendezvous key from its own cache, never by probing `git` itself
 /// (EYES-r2 §3): once that cache is warm, a hook call still correlates correctly even after the
 /// candidate's `.git` directory is moved away, which a live re-probe would instead treat as a
-/// non-git candidate and resolve to a completely different (and unreachable) rendezvous. Reaching
-/// the daemon's own unrelated `workspace_activation` refusal (rather than the "host_binding"
-/// outcome an uncorrelated call gets) proves the Pre/PostToolUse hooks still bound to the exact
-/// right daemon.
+/// non-git candidate and resolve to a completely different (and unreachable) rendezvous. A
+/// plain-directory activation (rather than the `host_binding` outcome an uncorrelated call gets)
+/// proves the Pre/PostToolUse hooks still bound to the exact right daemon.
 #[tokio::test]
 async fn managed_claude_hook_relies_on_its_cached_key_not_a_live_git_probe() {
     let fixture = ProductFixture::new(json!([]));
@@ -5367,11 +5390,25 @@ async fn managed_claude_hook_relies_on_its_cached_key_not_a_live_git_probe() {
         &pending,
     )
     .await;
-    assert_eq!(
-        started,
-        json!({"state":"error","code":"workspace_activation"}),
-        "{started}"
+    assert_eq!(started["kind"], "activation", "{started}");
+    assert!(
+        started["text"]
+            .as_str()
+            .unwrap()
+            .contains("baseline: not a git repository: no git data")
     );
+    next += 1;
+    let stopped = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "cache-session",
+        None,
+        "ide.stop",
+        json!({}),
+    )
+    .await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
 
     mcp.close().await;
 }
@@ -8777,6 +8814,192 @@ async fn configured_product_unavailable_rust_symbol_tools_answer_from_the_lexica
     assert!(warm_text.contains("pub fn caller() -> i32"), "{warm}");
     assert!(!warm_text.contains("outline: from source"), "{warm}");
     actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A plain data folder activates without Git, serves source tools, and explains Git-only answers.
+#[tokio::test]
+async fn plain_directory_activates_and_answers_without_git_data() {
+    let fixture = ProductFixture::new_without_git(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "plain-directory").await;
+    let start = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"plain-start"}),
+        )
+        .await;
+    let started = actor.settle(&fixture, start).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let text = started["text"].as_str().unwrap();
+    assert!(
+        text.contains("baseline: not a git repository: no git data"),
+        "{text}"
+    );
+    assert!(!text.contains("(git:"), "{text}");
+
+    let outline = actor
+        .call(&fixture, "ide.outline", json!({"path":"sim.css"}))
+        .await;
+    let outline = actor.settle(&fixture, outline).await;
+    assert_eq!(outline["kind"], "outline", "{outline}");
+    assert!(
+        outline["text"].as_str().unwrap().contains(".sim"),
+        "{outline}"
+    );
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"sim.css","lines":"1-1"}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    assert_eq!(read["kind"], "read", "{read}");
+    assert!(read["text"].as_str().unwrap().contains(".sim"), "{read}");
+    let source = actor
+        .call(&fixture, "ide.context", json!({"path":"sim.css"}))
+        .await;
+    let source = actor.settle(&fixture, source).await;
+    assert_eq!(source["kind"], "context", "{source}");
+    let edit = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"plain-edit",
+                "path":"sim.css",
+                "source_ref":source["detail_ref"],
+                "content":".sim { color: red; }\n"
+            }),
+        )
+        .await;
+    let edit = actor.settle(&fixture, edit).await;
+    assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
+
+    actor.next += 1;
+    let diff_call = format!("call-{}", actor.next);
+    actor.lifecycle(&fixture, "PreToolUse", &diff_call).await;
+    let diff = actor
+        .mcp
+        .exchange(json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{"name":"ide.diff","arguments":{},"_meta":{"threadId":actor.actor,"callId":diff_call,"x-codex-turn-metadata":{},"codex/sandbox-state-meta":actor.state}}}))
+        .await;
+    actor.lifecycle(&fixture, "PostToolUse", &diff_call).await;
+    assert_eq!(
+        diff["result"]["structuredContent"]["code"], "source_unavailable",
+        "{diff}"
+    );
+    let diff_text = diff["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        diff_text.contains("diff:not_a_git_repository"),
+        "{diff_text}"
+    );
+    assert!(
+        diff_text.contains("not a git repository: no git data"),
+        "{diff_text}"
+    );
+
+    let symbol = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"sim.css#.sim","history":true}),
+        )
+        .await;
+    let symbol = actor.settle(&fixture, symbol).await;
+    assert_eq!(symbol["kind"], "symbol", "{symbol}");
+    assert!(
+        symbol["text"]
+            .as_str()
+            .unwrap()
+            .contains("history: not a git repository: no git data"),
+        "{symbol}"
+    );
+
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A nested repository does not change the activated plain directory's identity or Git answers.
+#[tokio::test]
+async fn nested_repository_inside_plain_directory_stays_plain() {
+    let fixture = ProductFixture::new_without_git(json!([]));
+    std::fs::create_dir(fixture.root.join("nested")).unwrap();
+    fixture.git(&["-C", "nested", "init", "--quiet"]);
+    std::fs::write(
+        fixture.root.join("nested/inside.css"),
+        ".inside { color: blue; }\n",
+    )
+    .unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "plain-with-nested-git").await;
+    let start = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"plain"}))
+        .await;
+    let started = actor.settle(&fixture, start).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    assert!(
+        started["text"]
+            .as_str()
+            .unwrap()
+            .contains("baseline: not a git repository: no git data")
+    );
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"nested/inside.css","lines":"1-1"}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    assert_eq!(read["kind"], "read", "{read}");
+    assert!(read["text"].as_str().unwrap().contains(".inside"), "{read}");
+    let diff = actor.call(&fixture, "ide.diff", json!({})).await;
+    let diff = actor.settle(&fixture, diff).await;
+    assert_eq!(diff["code"], "source_unavailable", "{diff}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A non-Git child of a worktree still discovers and activates the enclosing worktree.
+#[tokio::test]
+async fn non_git_folder_inside_worktree_activates_outer_worktree() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::create_dir_all(fixture.root.join("data")).unwrap();
+    std::fs::write(fixture.root.join("data/input.txt"), "input\n").unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "nested-data-folder").await;
+    let start = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"nested","root":fixture.root.join("data")}),
+        )
+        .await;
+    let started = actor.settle(&fixture, start).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    assert!(
+        !started["text"]
+            .as_str()
+            .unwrap()
+            .contains("baseline: not a git repository"),
+        "{started}"
+    );
+    assert!(
+        started["text"].as_str().unwrap().contains("(git:"),
+        "{started}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();

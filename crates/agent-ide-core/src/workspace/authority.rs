@@ -11,6 +11,9 @@ use crate::assistance::host_binding::{ActiveBindingUse, BindingRef, ValidatedInv
 
 const MAX_OPERATION_ID_BYTES: usize = 128;
 
+/// The fixed sentence every Git-backed answer substitutes in a plain directory.
+pub const NO_GIT_DATA: &str = "not a git repository: no git data";
+
 /// Carries a raw worktree incarnation; only durable-resolved values qualify for product authority.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct WorktreeRef {
@@ -109,6 +112,16 @@ impl WorktreeRef {
     /// Returns the descriptor-derived root identity for a replacement-safe inherited helper view.
     pub(crate) fn native_root_identity(&self) -> Option<[u8; 32]> {
         self.native_root_identity
+    }
+
+    /// Reports whether one directory serves as root, repository root and Git common dir alike.
+    ///
+    /// This is the plain-directory identity: the activated folder is not a Git worktree, so every
+    /// Git-backed answer substitutes [`NO_GIT_DATA`] instead of consulting Git. Derived only from
+    /// the three stored paths — a real worktree's common dir is always `.git` or external, never
+    /// the root itself, so the two identities never collide.
+    pub fn is_plain_directory(&self) -> bool {
+        self.worktree_path == self.repository_root && self.worktree_path == self.git_common_dir
     }
 }
 
@@ -416,4 +429,25 @@ fn identity_id(
     }
     hasher.update(&incarnation.to_le_bytes());
     hasher.finalize().to_hex().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NO_GIT_DATA, WorktreeRef};
+    use std::path::PathBuf;
+
+    /// A plain directory is one path in all three identity slots and never collides with a
+    /// Git worktree of the same folder.
+    #[test]
+    fn plain_directory_identity_is_derived_and_distinct() {
+        let root = PathBuf::from("/private/tmp/plain-folder");
+        let plain =
+            WorktreeRef::from_discovery(root.clone(), root.clone(), root.clone(), 1).unwrap();
+        assert!(plain.is_plain_directory());
+        let worktree =
+            WorktreeRef::from_discovery(root.clone(), root.clone(), root.join(".git"), 1).unwrap();
+        assert!(!worktree.is_plain_directory());
+        assert_ne!(plain.id(), worktree.id());
+        assert_eq!(NO_GIT_DATA, "not a git repository: no git data");
+    }
 }

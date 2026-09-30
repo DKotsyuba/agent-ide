@@ -2634,26 +2634,40 @@ impl<'a> Worker<'a> {
             self.shared.active(&binding)?;
             evidence.push(completed.evidence);
         }
-        let discovered =
-            crate::workspace::git::discovery::validate_discovery(&candidate, &operation, &evidence)
-                .map_err(|error| match error {
-                    crate::workspace::git::GitError::UnsupportedDiscoveryGit => {
-                        record_execution_profile(errorlog_method(job.tool), "git_unsupported");
-                        FailureCode::ExecutionProfileCause(ExecutionProfileCause::GitUnsupported)
-                    }
-                    error => {
-                        // Name the closed cause category so a non-worktree directory and a broken
-                        // discovery are distinguishable in the reply and the journal.
-                        job.failure_detail = Some(discovery_failure_detail(&evidence, &error));
-                        FailureCode::WorkspaceActivation
-                    }
-                })?;
-        admit_discovered(
-            self.shared.launcher.allowed_roots(),
-            discovered.root(),
-            discovered.common_dir(),
-        )
-        .map_err(|_| {
+        let discovered = match crate::workspace::git::discovery::validate_discovery(
+            &candidate, &operation, &evidence,
+        ) {
+            Ok(discovered) => Some(discovered),
+            // Git proved there is no repository at all only when no ancestor carries a `.git`;
+            // the folder then activates as a plain directory with no Git data.
+            Err(crate::workspace::git::GitError::InvalidDiscovery)
+                if plain_directory_without_git(&candidate) =>
+            {
+                None
+            }
+            Err(crate::workspace::git::GitError::UnsupportedDiscoveryGit) => {
+                record_execution_profile(errorlog_method(job.tool), "git_unsupported");
+                return Err(FailureCode::ExecutionProfileCause(
+                    ExecutionProfileCause::GitUnsupported,
+                ));
+            }
+            Err(error) => {
+                // Name the closed cause category so a broken discovery is distinguishable in the
+                // reply and the journal.
+                job.failure_detail = Some(discovery_failure_detail(&evidence, &error));
+                return Err(FailureCode::WorkspaceActivation);
+            }
+        };
+        // A plain directory is its own root, repository root and Git common dir.
+        let (root, repository, common) = match &discovered {
+            Some(discovered) => (
+                discovered.root().to_path_buf(),
+                discovered.repository_root().to_path_buf(),
+                discovered.common_dir().to_path_buf(),
+            ),
+            None => (candidate.clone(), candidate.clone(), candidate.clone()),
+        };
+        admit_discovered(self.shared.launcher.allowed_roots(), &root, &common).map_err(|_| {
             job.failure_detail = Some(
                 "start:worktree_unresolved: discovered root or Git common directory is outside allowed roots"
                     .to_owned(),
@@ -2663,11 +2677,7 @@ impl<'a> Worker<'a> {
         self.shared.active(&binding)?;
         let tree = self
             .workspace
-            .resolve_worktree(
-                discovered.root().to_path_buf(),
-                discovered.repository_root().to_path_buf(),
-                discovered.common_dir().to_path_buf(),
-            )
+            .resolve_worktree(root, repository, common)
             .await
             .map_err(|_| {
                 job.failure_detail = Some(
@@ -2676,6 +2686,7 @@ impl<'a> Worker<'a> {
                 );
                 FailureCode::WorkspaceActivation
             })?;
+        let plain_directory = tree.is_plain_directory();
         self.reconcile_pending_revocations(&tree, job.invocation.actor_id())
             .await;
         let mut identity = blake3::Hasher::new();
@@ -2761,9 +2772,15 @@ impl<'a> Worker<'a> {
                     .unwrap_or(error));
             }
         };
-        let baseline = self
-            .capture_activation_baseline(job, &authority, &activation_operation)
-            .await;
+        // A plain directory has no Git state to capture, so no baseline run happens at all.
+        let baseline = if plain_directory {
+            None
+        } else {
+            Some(
+                self.capture_activation_baseline(job, &authority, &activation_operation)
+                    .await,
+            )
+        };
         let launches = job.target.providers.clone();
         // A second concurrent actor on the same physical worktree cannot share a single-owner
         // namespace: fail its activation with the finite reason and roll its own grant back, so the
@@ -2779,7 +2796,7 @@ impl<'a> Worker<'a> {
         }
         self.shared.active(&binding)?;
         let baseline = match baseline {
-            Ok(baseline) => {
+            Some(Ok(baseline)) => {
                 let description = format!(
                     "partial ({:?}; durable capture {}; {})",
                     baseline.window(),
@@ -2789,10 +2806,11 @@ impl<'a> Worker<'a> {
                 self.baselines.insert(binding.clone(), baseline);
                 description
             }
-            Err(_) => format!(
+            Some(Err(_)) => format!(
                 "unknown (durable capture unavailable; {})",
                 BASELINE_PARTIAL_REASON
             ),
+            None => crate::workspace::authority::NO_GIT_DATA.to_owned(),
         };
         // The project card is a bounded best-effort addition: detection, git plumbing, and the
         // tree walk block, so they run on the blocking pool under [`PROJECT_CARD_BUDGET`]. Any
@@ -2803,7 +2821,7 @@ impl<'a> Worker<'a> {
         // already indexed elsewhere builds from the shared cache in moments, so the card waits
         // briefly for it and reports the summary.
         let bridged = {
-            let root = discovered.root().to_path_buf();
+            let root = authority.worktree().worktree_path().to_path_buf();
             tokio::task::spawn_blocking(move || links::bridged_files_present(&root))
                 .await
                 .unwrap_or(false)
@@ -2814,7 +2832,7 @@ impl<'a> Worker<'a> {
         }
         let names = self.names.get(authority.worktree());
         let card = {
-            let root = discovered.root().to_path_buf();
+            let root = authority.worktree().worktree_path().to_path_buf();
             let walk = tokio::task::spawn_blocking(move || {
                 let languages: Vec<LanguageProject> = crate::lang::registered()
                     .iter()
@@ -4671,6 +4689,47 @@ fn admit_discovered(
             .map_err(|_| FailureCode::OutsideAllowedRoots)?;
     }
     Ok(())
+}
+
+/// Reports whether Git discovery failed because no repository exists at all, not because one is
+/// broken.
+///
+/// Only called after Git itself failed: the walk looks for a `.git` (directory or gitfile,
+/// without following a symlinked name) in the candidate and every ancestor. None anywhere means
+/// the directory is plain and activates without Git data; an existing `.git` keeps the activation
+/// refusal — that is a real repository with broken Git. Any inspection failure other than a
+/// missing name is unproven, so it refuses as well.
+fn plain_directory_without_git(candidate: &Path) -> bool {
+    candidate
+        .ancestors()
+        .all(|dir| match std::fs::symlink_metadata(dir.join(".git")) {
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        })
+}
+
+/// Proves only the complete absence of a `.git` makes a directory plain: one at the candidate,
+/// one anywhere above it, or an unproven inspection each keep the activation refusal.
+#[test]
+fn only_a_directory_without_any_git_is_plain() {
+    let base = std::env::temp_dir().join(format!("plain-probe-{}", std::process::id()));
+    let folder = base.join("folder");
+    std::fs::create_dir_all(&folder).unwrap();
+    assert!(plain_directory_without_git(&folder));
+    std::fs::create_dir_all(folder.join(".git")).unwrap();
+    assert!(!plain_directory_without_git(&folder));
+    std::fs::remove_dir_all(folder.join(".git")).unwrap();
+    assert!(plain_directory_without_git(&folder));
+    std::fs::write(folder.join(".git"), "gitdir: elsewhere\n").unwrap();
+    assert!(!plain_directory_without_git(&folder));
+    std::fs::remove_file(folder.join(".git")).unwrap();
+    let nested = folder.join("child/grandchild");
+    std::fs::create_dir_all(&nested).unwrap();
+    assert!(plain_directory_without_git(&nested));
+    std::fs::create_dir_all(folder.join("child/.git")).unwrap();
+    assert!(!plain_directory_without_git(&nested));
+    std::fs::remove_dir_all(&folder).unwrap();
 }
 
 /// Refuses any existing symlink component of one relative path below the worktree root (T36B).

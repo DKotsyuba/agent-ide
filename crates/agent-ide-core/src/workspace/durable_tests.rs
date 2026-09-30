@@ -188,6 +188,37 @@ async fn admitted_directory_descriptors_remain_held_by_the_owner() {
     );
 }
 
+/// A plain directory resolves with root, repository and common dir as one path: the native key
+/// stays stable across resolutions and only recreating the directory mints a new incarnation.
+#[tokio::test]
+async fn plain_directory_identity_is_stable_until_recreation() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let owner = DurableWorkspace::open(&store).await.unwrap();
+    let plain = fixture.0.join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    let first = owner
+        .resolve_worktree(plain.clone(), plain.clone(), plain.clone())
+        .await
+        .unwrap();
+    assert!(first.is_plain_directory());
+    let second = owner
+        .resolve_worktree(plain.clone(), plain.clone(), plain.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.id(), second.id());
+    assert_eq!(first.incarnation(), second.incarnation());
+    fs::remove_dir_all(&plain).unwrap();
+    fs::create_dir_all(&plain).unwrap();
+    let third = owner
+        .resolve_worktree(plain.clone(), plain.clone(), plain.clone())
+        .await
+        .unwrap();
+    assert!(third.is_plain_directory());
+    assert!(third.incarnation() > second.incarnation());
+    assert_ne!(third.id(), second.id());
+}
+
 /// Simulates reusable device/inode numbers and verifies that creation time participates at nanosecond precision.
 #[test]
 fn creation_identity_rejects_reused_inodes_and_unavailable_birthtime() {

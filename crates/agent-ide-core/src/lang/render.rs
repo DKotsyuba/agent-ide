@@ -695,6 +695,9 @@ pub struct SymbolCard {
     pub callees: Vec<Call>,
     /// Short sha, date and subject of recent commits touching the definition.
     pub history: Vec<String>,
+    /// Prints the fixed no-Git-data sentence instead of commits: the activated folder is a plain
+    /// directory, so a requested history section still answers.
+    pub history_unavailable: bool,
     /// Detail reference for the full usage list, printed when usages were cut.
     pub more_detail: Option<String>,
     /// Prints the `usages:` line even with no references — the server legitimately answered
@@ -822,7 +825,12 @@ pub fn symbol_card_text(card: &SymbolCard) -> String {
     } else {
         render_calls(&mut out, "callees", &card.callees);
     }
-    if !card.history.is_empty() {
+    if card.history_unavailable {
+        out.push_str(&format!(
+            "history: {}\n",
+            crate::workspace::authority::NO_GIT_DATA
+        ));
+    } else if !card.history.is_empty() {
         out.push_str(&format!(
             "history: {} last commits touching the definition\n",
             card.history.len()
@@ -1041,6 +1049,17 @@ mod tests {
             "{}",
             symbol_card_text(&card)
         );
+    }
+
+    /// A requested history section in a plain directory prints why no commits can be listed.
+    #[test]
+    fn symbol_card_explains_history_without_git_data() {
+        let card = SymbolCard {
+            heading: "simulate — fn, sim.py#simulate (lines 1–2)".into(),
+            history_unavailable: true,
+            ..Default::default()
+        };
+        assert!(symbol_card_text(&card).contains("history: not a git repository: no git data\n"));
     }
 
     #[test]

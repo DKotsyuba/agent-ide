@@ -868,6 +868,12 @@ impl Worker<'_> {
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         let binding = job.invocation.binding_ref().clone();
         let authority = self.authority(&binding).await?;
+        // A plain directory activated without Git data, so there is no baseline, index or worktree
+        // state to diff against; the refusal says so instead of running a Git that must fail.
+        if authority.worktree().is_plain_directory() {
+            job.failure_detail = Some("diff:not_a_git_repository".to_owned());
+            return Err(FailureCode::SourceUnavailable);
+        }
         // T36B: the former entry-level whole-tree read gate is replaced by per-path
         // authorization inside the capture — `SnapshotRunner::authorize_read_path` routes
         // every native read (tracked captures, staged mode, consistency rereads, untracked
