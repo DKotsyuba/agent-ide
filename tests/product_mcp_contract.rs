@@ -5688,6 +5688,133 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
     daemon.wait().await.unwrap();
 }
 
+/// Verifies task diff compares the activation commit with the current worktree across commits.
+#[tokio::test]
+async fn configured_product_task_diff_includes_committed_and_uncommitted_changes() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "task-diff").await;
+    let start = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"task-diff"}))
+        .await;
+    let started = actor.settle(&fixture, start).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    std::fs::write(fixture.root.join("tracked.txt"), "committed during task\n").unwrap();
+    fixture.git(&["add", "--", "tracked.txt"]);
+    fixture.git(&["commit", "--quiet", "-m", "task change"]);
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub fn value() -> i32 { 8 }\npub fn caller() -> i32 { value() }\n",
+    )
+    .unwrap();
+
+    let task = actor
+        .call(&fixture, "ide.diff", json!({"mode":"task"}))
+        .await;
+    let task = actor.settle(&fixture, task).await;
+    assert_eq!(task["kind"], "diff", "{task}");
+    let task_text = task["text"].as_str().unwrap();
+    assert!(task_text.contains("+committed during task"), "{task_text}");
+    assert!(
+        task_text.contains("+pub fn value() -> i32 { 8 }"),
+        "{task_text}"
+    );
+
+    let head = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let head = actor.settle(&fixture, head).await;
+    assert_eq!(head["kind"], "diff", "{head}");
+    let head_text = head["text"].as_str().unwrap();
+    assert!(!head_text.contains("committed during task"), "{head_text}");
+    assert!(
+        head_text.contains("+pub fn value() -> i32 { 8 }"),
+        "{head_text}"
+    );
+
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Reads every bounded task-diff continuation page for a changeset larger than one page.
+#[tokio::test]
+async fn configured_product_task_diff_paginates_until_every_hunk_is_read() {
+    let fixture = ProductFixture::new(json!([]));
+    for index in 0..40 {
+        std::fs::write(
+            fixture.root.join(format!("task-page-{index:02}.txt")),
+            format!("base-{index:02}\n"),
+        )
+        .unwrap();
+    }
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "task page base"]);
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "task-page").await;
+    let start = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"task-page"}))
+        .await;
+    let started = actor.settle(&fixture, start).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    for index in 0..40 {
+        std::fs::write(
+            fixture.root.join(format!("task-page-{index:02}.txt")),
+            format!("changed-{index:02}\n"),
+        )
+        .unwrap();
+    }
+
+    let first = actor
+        .call(
+            &fixture,
+            "ide.diff",
+            json!({"mode":"task","provenance":true}),
+        )
+        .await;
+    let first = actor.settle(&fixture, first).await;
+    assert_eq!(first["kind"], "diff", "{first}");
+    assert_eq!(first["continuation"], true, "{first}");
+    let reference = first["detail_ref"].as_str().unwrap().to_owned();
+    let first_text = first["text"].as_str().unwrap().to_owned();
+    assert_eq!(
+        page_field(&first_text, "more_available"),
+        "true",
+        "{first_text}"
+    );
+    let mut pages = vec![first_text];
+    while page_field(pages.last().unwrap(), "more_available") == "true" {
+        assert!(pages.len() < 8, "task pagination did not terminate");
+        let next = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+            .await;
+        assert_eq!(next["kind"], "diff", "{next}");
+        let text = next["text"].as_str().unwrap().to_owned();
+        assert_eq!(page_field(&text, "mode"), "Task", "{text}");
+        assert_ne!(page_field(&text, "capture_generation"), "none", "{text}");
+        pages.push(text);
+    }
+    assert!(pages.len() > 1, "task diff unexpectedly fit on one page");
+    for index in 0..40 {
+        let marker = format!("changed-{index:02}");
+        assert_eq!(
+            pages.iter().filter(|page| page.contains(&marker)).count(),
+            1,
+            "{marker} must appear on exactly one page"
+        );
+    }
+
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Parses the authority epoch from a settled activation reply's compact text.
 ///
 /// The activation text always opens with `activated: epoch N;`; this returns
@@ -5699,6 +5826,47 @@ fn activation_epoch(activation: &Value) -> u64 {
         .strip_prefix("activated: epoch ")
         .unwrap_or_else(|| panic!("{text}"));
     rest.split(';').next().unwrap().trim().parse().unwrap()
+}
+
+/// Verifies task mode refuses when activation could not capture a commit identity.
+#[tokio::test]
+async fn configured_product_task_diff_refuses_unknown_activation_commit() {
+    let fixture = ProductFixture::new(json!([]));
+    fixture.git(&["update-ref", "-d", "HEAD"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "task-diff-unknown").await;
+    let start = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"task-diff-unknown"}),
+        )
+        .await;
+    let started = actor.settle(&fixture, start).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    actor.next += 1;
+    let call = format!("call-{}", actor.next);
+    actor.lifecycle(&fixture, "PreToolUse", &call).await;
+    let task = actor
+        .mcp
+        .exchange(json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{"name":"ide.diff","arguments":{"mode":"task"},"_meta":{"threadId":actor.actor,"callId":call,"x-codex-turn-metadata":{},"codex/sandbox-state-meta":actor.state}}}))
+        .await;
+    actor.lifecycle(&fixture, "PostToolUse", &call).await;
+    assert_compact_envelope(&task);
+    assert_eq!(
+        task["result"]["structuredContent"]["code"], "source_unavailable",
+        "{task}"
+    );
+    let text = task["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("activation_commit_unknown"), "{text}");
+    assert!(text.contains("mode: head"), "{text}");
+
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
 }
 
 /// A later Codex binding's `ide.diff` covers a path an earlier grant's `ide.edit` observed.
@@ -8914,6 +9082,26 @@ async fn plain_directory_activates_and_answers_without_git_data() {
     assert!(
         diff_text.contains("not a git repository: no git data"),
         "{diff_text}"
+    );
+    actor.next += 1;
+    let task_call = format!("call-{}", actor.next);
+    actor.lifecycle(&fixture, "PreToolUse", &task_call).await;
+    let task_diff = actor
+        .mcp
+        .exchange(json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{"name":"ide.diff","arguments":{"mode":"task"},"_meta":{"threadId":actor.actor,"callId":task_call,"x-codex-turn-metadata":{},"codex/sandbox-state-meta":actor.state}}}))
+        .await;
+    actor.lifecycle(&fixture, "PostToolUse", &task_call).await;
+    assert_compact_envelope(&task_diff);
+    assert_eq!(
+        task_diff["result"]["structuredContent"]["code"], "source_unavailable",
+        "{task_diff}"
+    );
+    assert!(
+        task_diff["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not a git repository: no git data"),
+        "{task_diff}"
     );
 
     let symbol = actor

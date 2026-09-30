@@ -26,6 +26,8 @@ pub enum DiffMode {
     Staged,
     /// Compares working bytes against the selected index identity.
     Unstaged,
+    /// Compares the current worktree against the commit recorded at activation.
+    Task,
 }
 
 /// Represents one exact Git identity without claiming it is a source revision or baseline.
@@ -80,6 +82,8 @@ pub struct BaselineContext {
     window: BaselineWindow,
     /// Fingerprint of the bounded stored payload, absent for descriptive context.
     capture_digest: Option<[u8; 32]>,
+    /// Exact commit identity captured at activation, when Git baseline collection succeeded.
+    task_head: Option<GitIdentity>,
 }
 
 impl BaselineContext {
@@ -99,6 +103,7 @@ impl BaselineContext {
             scope: None,
             window: BaselineWindow::NotCaptured,
             capture_digest: None,
+            task_head: None,
         })
     }
 
@@ -107,12 +112,19 @@ impl BaselineContext {
         reference: String,
         scope: GitScope,
         digest: [u8; 32],
+        task_head: Option<GitIdentity>,
     ) -> Result<Self, GitError> {
         let mut context = Self::new(reference, BaselineCoverage::Partial)?;
         context.scope = Some(scope);
         context.window = BaselineWindow::Unverified;
         context.capture_digest = Some(digest);
+        context.task_head = task_head;
         Ok(context)
+    }
+
+    /// Returns the activation commit identity, or `None` when baseline capture did not record one.
+    pub fn task_head(&self) -> Option<&GitIdentity> {
+        self.task_head.as_ref()
     }
 
     /// Returns the explicit capture-window status, never an inferred complete snapshot.
@@ -176,7 +188,7 @@ impl GitComparison {
         }
     }
 
-    /// Returns the requested `head`, `staged`, or `unstaged` comparison mode.
+    /// Returns the comparison mode attached to these exact identities.
     pub const fn mode(&self) -> DiffMode {
         self.scope.mode
     }

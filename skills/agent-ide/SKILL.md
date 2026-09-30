@@ -156,6 +156,7 @@ server while it loads and answer `provider_unavailable` when it failed. `ide.sym
    One job per worktree at a time; a stopped budget says `stopped at budget`. The
    `<agent-ide>` block carries the job's line once while it runs and once when it ends.
 6. `ide.diff` before finishing the task, to review the accumulated change.
+   Before finishing a task whose work you committed, review it with `ide.diff {mode: task}`.
 7. `ide.inspect` with the returned `detail_ref` whenever a reply is `Pending`
    or reports truncated content. Do not repeat the same call instead. A
    `Context` or `Diff` reply with `continuation: true` means the result is

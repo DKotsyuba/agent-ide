@@ -980,6 +980,7 @@ impl DurableWorkspace<'_> {
                 id.as_str().to_owned(),
                 scope,
                 stored_capture_digest(&stored_payload)?,
+                task_head_from_payload(&stored_payload)?,
             )
             .map_err(|_| DurableError::CorruptState);
         }
@@ -1050,6 +1051,7 @@ impl DurableWorkspace<'_> {
             id.as_str().to_owned(),
             scope,
             stored_capture_digest(&payload)?,
+            task_head_from_payload(&payload)?,
         )
         .map_err(|_| DurableError::CorruptState)
     }
@@ -1096,6 +1098,7 @@ impl DurableWorkspace<'_> {
             id.as_str().to_owned(),
             super::git::GitScope::from_historical(tree, unsigned(epoch)?),
             stored_capture_digest(&payload)?,
+            task_head_from_payload(&payload)?,
         )
         .map(Some)
         .map_err(|_| DurableError::CorruptState)
@@ -1123,6 +1126,52 @@ fn stored_capture_digest(payload: &[u8]) -> Result<[u8; 32], DurableError> {
         return Err(DurableError::CorruptState);
     }
     Ok(*blake3::hash(payload).as_bytes())
+}
+
+/// Recovers the bounded activation commit identity from a previously validated baseline payload.
+fn task_head_from_payload(payload: &[u8]) -> Result<Option<super::git::GitIdentity>, DurableError> {
+    let mut offset: usize = 0;
+    let mut take = || -> Result<&[u8], DurableError> {
+        let length_end = offset.checked_add(8).ok_or(DurableError::CorruptState)?;
+        let length = u64::from_le_bytes(
+            payload
+                .get(offset..length_end)
+                .ok_or(DurableError::CorruptState)?
+                .try_into()
+                .map_err(|_| DurableError::CorruptState)?,
+        );
+        offset = length_end;
+        let end = offset
+            .checked_add(usize::try_from(length).map_err(|_| DurableError::CorruptState)?)
+            .ok_or(DurableError::CorruptState)?;
+        let value = payload.get(offset..end).ok_or(DurableError::CorruptState)?;
+        offset = end;
+        Ok(value)
+    };
+    if take()? != b"workspace-baseline-partial-unverified-v1" {
+        return Err(DurableError::CorruptState);
+    }
+    let count = u64::from_le_bytes(take()?.try_into().map_err(|_| DurableError::CorruptState)?);
+    if count > 6 {
+        return Err(DurableError::CorruptState);
+    }
+    let mut head = None;
+    for _ in 0..count {
+        let tag = take()?;
+        let _operation = take()?;
+        let exit = i32::from_le_bytes(take()?.try_into().map_err(|_| DurableError::CorruptState)?);
+        let stdout = take()?;
+        let _stderr = take()?;
+        if tag.first() == Some(&(super::git::GitReadQuery::HeadIdentity as u8))
+            && tag.get(1) == Some(&0)
+            && exit == 0
+        {
+            head = stdout
+                .strip_suffix(b"\n")
+                .and_then(|bytes| super::git::GitIdentity::new(bytes.to_vec()).ok());
+        }
+    }
+    Ok(head)
 }
 
 #[cfg(test)]

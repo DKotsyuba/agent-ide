@@ -534,6 +534,7 @@ impl SnapshotIntent {
             DiffMode::Head => arguments.push("HEAD".into()),
             DiffMode::Staged => arguments.push("--cached".into()),
             DiffMode::Unstaged => {}
+            DiffMode::Task => return Err(GitError::InvalidIdentity),
         }
         let command = ControlledCommand::from_validated_peer(
             CommandKind::Git,
@@ -549,6 +550,54 @@ impl SnapshotIntent {
             directory: None,
             differences_allowed: false,
             label: "diff-plain",
+        })
+    }
+
+    /// Builds the bounded no-filter worktree diff against one validated activation commit.
+    pub fn task_diff(
+        scope: GitScope,
+        program: &Path,
+        identity: &super::GitIdentity,
+    ) -> Result<Self, GitError> {
+        let commit = identity
+            .as_bytes()
+            .strip_suffix(b"\n")
+            .unwrap_or(identity.as_bytes());
+        let commit = std::str::from_utf8(commit).map_err(|_| GitError::InvalidIdentity)?;
+        let oid = super::GitObjectId::parse(commit.as_bytes())?.ok_or(GitError::InvalidIdentity)?;
+        let mut arguments: Vec<OsString> = [
+            "--no-pager",
+            "--no-lazy-fetch",
+            "-c",
+            "core.fsmonitor=false",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--no-renames",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--full-index",
+            "--patch",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        arguments.push(oid.as_str().into());
+        let command = ControlledCommand::from_validated_peer(
+            CommandKind::Git,
+            program.to_path_buf(),
+            arguments,
+            scope.worktree().worktree_path().to_path_buf(),
+            safe_git_environment(),
+        )
+        .map_err(|_| GitError::InvalidGitProgram)?;
+        Ok(Self {
+            scope,
+            command,
+            directory: None,
+            differences_allowed: false,
+            label: "diff-task",
         })
     }
 
@@ -1919,7 +1968,7 @@ async fn capture_attempt<R: SnapshotRunner>(
             conflict_stages: Vec::new(),
         };
         let selected = match scope.mode() {
-            DiffMode::Head => true,
+            DiffMode::Head | DiffMode::Task => true,
             DiffMode::Staged => x != b'.',
             DiffMode::Unstaged => y != b'.',
         };
@@ -1936,7 +1985,7 @@ async fn capture_attempt<R: SnapshotRunner>(
         // Left is always a committed/index side; right is a blob only for `Staged`, whose absent
         // side compares as empty bytes rather than the working-tree content.
         let (left, right) = match scope.mode() {
-            DiffMode::Head => (objects[0].clone(), None),
+            DiffMode::Head | DiffMode::Task => (objects[0].clone(), None),
             DiffMode::Staged => (
                 objects[0].clone(),
                 Some(staged_index.map(|entry| entry.oid.clone())),
@@ -2118,7 +2167,7 @@ async fn capture_attempt<R: SnapshotRunner>(
         working.finalize().as_bytes(),
     );
     let (left, right) = match scope.mode() {
-        DiffMode::Head => (head, work),
+        DiffMode::Head | DiffMode::Task => (head, work),
         DiffMode::Staged => (head, index),
         DiffMode::Unstaged => (index, work),
     };

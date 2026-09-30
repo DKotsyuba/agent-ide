@@ -226,7 +226,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Diff,
             json!({
                 "type": "object", "additionalProperties": false,
-                "properties": {"mode": {"type":"string","enum":["head","staged","unstaged"],"default":"head","description":"`head`: everything not yet committed; `staged` / `unstaged`: only that part."}, "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."}, "provenance": {"type": "boolean", "default": false, "description": "Return the exact worktree/comparison identity header instead of the compact default; no hashes appear otherwise."}}
+                "properties": {"mode": {"type":"string","enum":["head","staged","unstaged","task"],"default":"head","description":"`head`: everything not yet committed; `staged` / `unstaged`: only that part; `task`: everything changed since activation, including commits."}, "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."}, "provenance": {"type": "boolean", "default": false, "description": "Return the exact worktree/comparison identity header instead of the compact default; no hashes appear otherwise."}}
             }),
         ),
         schema(
@@ -853,11 +853,14 @@ pub fn validate_call(
         AssistanceTool::Diff => {
             optional_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
             if object.get("mode").is_some_and(|value| {
-                !matches!(value.as_str(), Some("head" | "staged" | "unstaged"))
+                !matches!(
+                    value.as_str(),
+                    Some("head" | "staged" | "unstaged" | "task")
+                )
             }) {
                 return Err(invalid_field(
                     "mode",
-                    FieldRule::OneOf("\"head\", \"staged\", or \"unstaged\""),
+                    FieldRule::OneOf("\"head\", \"staged\", \"unstaged\", or \"task\""),
                 ));
             }
             if object
@@ -2911,7 +2914,7 @@ impl StdioFacade {
             .await
     }
 
-    /// Diff of what this task changed in the working tree (`head`, `staged` or `unstaged`),
+    /// Diff of what this task changed in the working tree (`head`, `staged`, `unstaged` or `task`),
     /// paged. Review it before finishing or handing off, instead of running `git diff` in a
     /// shell.
     #[tool(name = "ide.diff", input_schema = tool_schemas()[2].input_schema.as_object().expect("tool schema is an object").clone())]
@@ -3174,7 +3177,7 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
         (
             validate_call(AssistanceTool::Diff, json!({"mode":"all"})).unwrap_err(),
             AssistanceTool::Diff,
-            "invalid bounded parameters: \"mode\" must be \"head\", \"staged\", or \"unstaged\""
+            "invalid bounded parameters: \"mode\" must be \"head\", \"staged\", \"unstaged\", or \"task\""
                 .to_string(),
         ),
         (

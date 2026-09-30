@@ -155,8 +155,8 @@ pub struct DiffDetailCursor {
     capture_generation: u64,
     /// Bounded owner operation reference, interpreted only together with scope and generation.
     operation_reference: String,
-    /// Exact comparison identities and baseline context retained from the originating request.
-    comparison: GitComparison,
+    /// Exact comparison identities when captured from a snapshot; absent for a plain Git diff.
+    comparison: Option<GitComparison>,
     /// Global index of the first omitted hunk within that exact snapshot.
     next_hunk: usize,
 }
@@ -168,7 +168,18 @@ impl DiffDetailCursor {
             scope: snapshot.scope().clone(),
             capture_generation: snapshot.generation(),
             operation_reference: snapshot.operation_reference().to_owned(),
-            comparison: snapshot.comparison().clone(),
+            comparison: Some(snapshot.comparison().clone()),
+            next_hunk,
+        }
+    }
+
+    /// Mints an owner-bound cursor for a retained plain diff payload.
+    fn new_plain(scope: &GitScope, operation: &str, generation: u64, next_hunk: usize) -> Self {
+        Self {
+            scope: scope.clone(),
+            capture_generation: generation,
+            operation_reference: operation.to_owned(),
+            comparison: None,
             next_hunk,
         }
     }
@@ -186,7 +197,7 @@ impl DiffDetailCursor {
         self.scope == *snapshot.scope()
             && self.capture_generation == snapshot.generation()
             && self.operation_reference == snapshot.operation_reference()
-            && self.comparison == *snapshot.comparison()
+            && self.comparison.as_ref() == Some(snapshot.comparison())
     }
 
     /// Returns the owning operation reference for owner-scoped detail requests.
@@ -365,6 +376,37 @@ pub struct DiffResult {
 }
 
 impl DiffResult {
+    /// Returns a payload-free refusal for retained plain-diff state that no longer validates.
+    pub(crate) fn unavailable(scope: &GitScope) -> Self {
+        Self {
+            state: DiffResultState::Unavailable,
+            freshness: DiffFreshness::Unknown,
+            coverage: DiffCoverage::Unknown,
+            scope_mode: scope.mode(),
+            authority_epoch: scope.authority_epoch(),
+            worktree_id: scope.worktree().id().to_owned(),
+            identities: DiffComparisonIdentities::new(&[], &[]),
+            status_counts: DiffStatusCounts {
+                tracked: 0,
+                conflicted: 0,
+                untracked: 0,
+                ignored: 0,
+            },
+            selected_hunks: Vec::new(),
+            truncated_output: false,
+            overflow_hunks: 0,
+            overflow_bytes: 0,
+            additions: 0,
+            deletions: 0,
+            tracked: Vec::new(),
+            untracked: Vec::new(),
+            conflicts: Vec::new(),
+            ignored: Vec::new(),
+            detail_cursor: None,
+            provenance: DiffProvenance::new(None, None, None, None, None, None),
+        }
+    }
+
     /// Returns bounded outcome for caller routing and downstream rendering.
     pub const fn state(&self) -> DiffResultState {
         self.state
@@ -509,12 +551,48 @@ pub fn compose_plain_diff(
     budget: DiffSelectionBudget,
     confine: impl FnOnce(&[PathBuf]) -> bool,
 ) -> Option<DiffResult> {
+    compose_plain_diff_page(expected_scope, stdout, None, "", 0, budget, confine)
+}
+
+/// Returns paths from a well-formed bounded plain patch, preserving raw path bytes and header order.
+/// Returns `None` if the patch has a malformed header or hunk line.
+pub fn plain_diff_paths(stdout: &[u8]) -> Option<Vec<PathBuf>> {
     let parsed = parse_plain_diff(stdout);
-    if parsed.malformed || !confine(&parsed.paths) {
+    (!parsed.malformed).then_some(parsed.paths)
+}
+
+/// Selects one bounded page from retained plain Git output using the snapshot hunk cursor.
+///
+/// `cursor` must belong to this exact scope, operation, generation, and plain-output capture;
+/// `None` selects page one. `confine` checks every named path before selection. `None` means the
+/// patch is malformed, a path is refused, or the supplied cursor is stale. A successful result
+/// carries the next cursor only while complete hunks remain under the original byte ceiling.
+/// `operation` and `generation` are required for resumable task pages; empty/zero values are used
+/// only by `compose_plain_diff`, which deliberately does not mint a continuation.
+pub fn compose_plain_diff_page(
+    expected_scope: &GitScope,
+    stdout: &[u8],
+    cursor: Option<&DiffDetailCursor>,
+    operation: &str,
+    generation: u64,
+    budget: DiffSelectionBudget,
+    confine: impl FnOnce(&[PathBuf]) -> bool,
+) -> Option<DiffResult> {
+    let parsed = parse_plain_diff(stdout);
+    if parsed.malformed
+        || !confine(&parsed.paths)
+        || cursor.is_some_and(|cursor| {
+            cursor.scope != *expected_scope
+                || cursor.capture_generation != generation
+                || cursor.operation_reference != operation
+                || cursor.comparison.is_some()
+        })
+    {
         return None;
     }
-    let (selected_hunks, overflow_hunks, overflow_bytes, _cursor) =
-        select_hunks(parsed.hunks, budget);
+    let start = cursor.map_or(0, DiffDetailCursor::next_hunk);
+    let (selected_hunks, overflow_hunks, overflow_bytes, next_hunk) =
+        select_hunks(parsed.hunks.into_iter().skip(start).collect(), budget);
     let coverage = if overflow_hunks > 0 {
         DiffCoverage::Partial
     } else {
@@ -544,8 +622,21 @@ pub fn compose_plain_diff(
         untracked: Vec::new(),
         conflicts: Vec::new(),
         ignored: Vec::new(),
-        detail_cursor: None,
-        provenance: DiffProvenance::new(None, None, None, None, None, None),
+        detail_cursor: next_hunk
+            .filter(|_| !operation.is_empty() && generation > 0)
+            .map(|next| DiffDetailCursor::new_plain(expected_scope, operation, generation, next)),
+        provenance: if operation.is_empty() || generation == 0 {
+            DiffProvenance::new(None, None, None, None, None, None)
+        } else {
+            DiffProvenance::new(
+                Some(operation.to_owned()),
+                Some(expected_scope.clone()),
+                Some(generation),
+                None,
+                None,
+                None,
+            )
+        },
     })
 }
 
