@@ -1588,7 +1588,7 @@ mod no_such_file_tests {
 impl Worker<'_> {
     /// `ide.edit` with `symbol` (+ `op`) or `path` + `lines`: splices the file in memory, formats
     /// the candidate when the project has a formatter, then writes it through the ordinary
-    /// stale-safe edit path with the fresh observation as the base.
+    /// stale-safe edit path with the observation the splice was resolved on as the base.
     pub(super) async fn edit_by_symbol(
         &mut self,
         job: &mut Job,
@@ -1612,8 +1612,14 @@ impl Worker<'_> {
             .get("content")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        // Resolve the file and the line span the operation touches.
-        let (file, splice, lexical) = match job.parameters.get("symbol").and_then(Value::as_str) {
+        // Resolve the file and the line span the operation touches. The symbol form carries the
+        // observation it resolved on out of the branch: its line span is only meaningful for those
+        // exact bytes.
+        let (file, splice, lexical, resolved) = match job
+            .parameters
+            .get("symbol")
+            .and_then(Value::as_str)
+        {
             Some(symbol) => {
                 let symbol = SymbolPath::parse(symbol).map_err(|_| FailureCode::UnknownSymbol)?;
                 let file = symbol
@@ -1651,7 +1657,7 @@ impl Worker<'_> {
                         Splice::Replace(found.range)
                     }
                 };
-                (file, splice, lexical)
+                (file, splice, lexical, Some((observed, bytes)))
             }
             None => {
                 let path = job.parameters["path"]
@@ -1664,11 +1670,22 @@ impl Worker<'_> {
                     .and_then(Value::as_str)
                     .and_then(crate::assistance::facade::parse_line_range)
                     .ok_or(FailureCode::Internal)?;
-                (std::path::PathBuf::from(path), Splice::Replace(range), None)
+                (
+                    std::path::PathBuf::from(path),
+                    Splice::Replace(range),
+                    None,
+                    None,
+                )
             }
         };
-        // Observe again right before splicing so the base is the exact text being replaced.
-        let (observed, bytes) = self.observe(&binding, file.clone()).await?;
+        // The line-range form observes right before splicing so the base is the exact text being
+        // replaced; the symbol form splices on — and bases the write on — the observation it
+        // resolved the symbol on, so a file that changed since that read is refused stale_source
+        // at the write instead of splicing version-one line numbers into different bytes.
+        let (observed, bytes) = match resolved {
+            Some(resolved) => resolved,
+            None => self.observe(&binding, file.clone()).await?,
+        };
         let source = observed_text(&observed, &bytes)?.to_owned();
         let path = file.display().to_string();
         // An explicit `source_ref` (mandatory for the line-range form) must name a retained

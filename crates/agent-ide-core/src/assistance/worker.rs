@@ -5214,6 +5214,72 @@ mod stop_retry_tests {
         );
     }
 
+    /// A symbol edit resolves the symbol on one observation and must both splice and base the
+    /// write on that same observation: the observation counter pins exactly one pre-write read
+    /// (the resolution that also became the base) plus the post-write refresh, so a reintroduced
+    /// second "observe again" before the splice — which would splice the resolved line numbers
+    /// into later bytes — fails here. The write path itself refuses a base whose bytes no longer
+    /// match the file, so one observation leaves no cross-version window at all.
+    #[tokio::test]
+    async fn symbol_edit_splices_on_the_observation_it_resolved() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        std::fs::write(
+            fixture.root.join("main.gamma"),
+            "sym first\n1\nend\n\nsym second\n2\nend\n",
+        )
+        .unwrap();
+        git_commit(&fixture.root, "symbol edit fixture");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        worker.edits.install_schema().await.unwrap();
+        activate_worktree(&mut worker, "symbol-edit-actor", "symbol-edit-start").await;
+        let invocation = production_call(&worker, "symbol-edit-actor", "symbol-edit-call");
+        let (mut job, _cancel) = tool_job(
+            &fixture.root,
+            invocation,
+            "symbol-edit",
+            AssistanceTool::Edit,
+            serde_json::json!({
+                "operation_id":"symbol-edit-1",
+                "symbol":"main.gamma#second",
+                "content":"sym second\n3\nend"
+            }),
+        );
+        let before = worker.source_sequence;
+        let (reply, _, _) = loop {
+            match worker.edit(&mut job).await {
+                Ok(complete) => break complete,
+                Err(FailureCode::ProviderLoading) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(code) => panic!("symbol edit failed: {code:?}"),
+            }
+        };
+        assert!(matches!(
+            reply,
+            PeerReply::Edit {
+                result: EditResult {
+                    outcome: ChangesEditOutcome::Replaced,
+                    ..
+                },
+                ..
+            }
+        ));
+        // The splice landed exactly on the resolved symbol's lines of the resolved text.
+        assert_eq!(
+            std::fs::read(fixture.root.join("main.gamma")).unwrap(),
+            b"sym first\n1\nend\n\nsym second\n3\nend\n"
+        );
+        assert_eq!(
+            worker.source_sequence,
+            before + 2,
+            "the symbol form must observe once to resolve and splice, once to refresh"
+        );
+    }
+
     /// Runs one Read job to completion, retrying while it parks, and retains its completed
     /// detail with the observation `ide.edit` later names as `source_ref`.
     async fn read_and_retain(
