@@ -76,16 +76,24 @@ end this one MCP process only, leaving an adopted or spawned daemon running for 
 same repository to find.
 
 A host that moves a project never restarts this MCP process, so a session can stay bound to a
-directory its hooks no longer run in (T15B). The first `ide.start {root}` naming a different
-directory re-roots the session before dispatching: the MCP canonicalizes and admits the root against
-the template's `allowed_roots` — the same single rule activation applies, with no additional
-permission layer — then attaches through the exact fresh-session path of that directory (key cache,
-shared daemon, client lease, candidate attachment) and binds the session there. The re-rooted call's
-own pre-hook necessarily ran before the new rendezvous existed, so its first reply is the
-cause-tagged refusal plus a stable `retry` hint rather than a hard failure, and the next call pairs
-normally. A root below no allowed root is never re-rooted to; the daemon's own
-`outside_allowed_roots` error answers. A re-root that cannot attach answers
-`unavailable: host_binding (project_moved: bound to <path>, asked <path>)`.
+directory its hooks no longer run in (T15B). A re-root never moves the session on the model's
+say-so alone: it follows one `ide.start` the daemon it dispatched against refused with a closed
+cause proving this session's hooks no longer pair there — `hooks_not_delivered` or
+`outside_allowed_roots` (the channel never delivered a hook to that daemon), or `missing_pre`
+(this call's pre-hook never arrived). A start naming another admitted root then re-roots: the MCP
+canonicalizes and admits the root against the template's `allowed_roots` — the same single rule
+activation applies, with no additional permission layer — attaches through the exact fresh-session
+path of that directory (key cache, shared daemon, client lease, candidate attachment), binds the
+session there, and retries the refused call. A start whose hooks still pair where it dispatched —
+including one naming another repository's admitted root — never re-roots: the daemon itself
+activates that root, so a cross-repository start can no longer strand a session between two
+daemons. The re-rooted call's own pre-hook necessarily ran before the new rendezvous existed, so
+its first reply is the cause-tagged refusal plus a stable `retry` hint rather than a hard failure,
+and the next call pairs normally; after a `missing_pre` re-root the hint also names the root-less
+`ide.start` that returns the session to the host's project directory, the same never-delivered
+evidence on which a root-less start re-roots back by itself. A root below no allowed root is never
+re-rooted to; the daemon's own `outside_allowed_roots` error answers. A re-root that cannot attach
+answers `unavailable: host_binding (project_moved: bound to <path>, asked <path>)`.
 
 `agent-ide mcp --auto-launcher-template` selects the same Claude-compatible contract only on
 positive non-Codex evidence: a `ZCODE_*` startup variable (verified on a live ZCode MCP child,
