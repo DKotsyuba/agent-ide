@@ -606,24 +606,55 @@ fn convert(
     }
 }
 
-/// Path segment of an impl block named `impl …` by the server: the bare type name for an inherent
-/// impl (generic parameters, generic arguments and the module path dropped), the whitespace-
-/// normalized name unchanged for a trait impl (`… for …`) or a name that is not an impl.
+/// Caps a server-provided impl path segment while retaining a digest of its original label.
+fn bounded_impl_segment(segment: String, full_label: &str) -> String {
+    const MAX_BYTES: usize = 256;
+    const PREFIX_BYTES: usize = 200;
+
+    if segment.len() <= MAX_BYTES {
+        return segment;
+    }
+
+    let mut end = PREFIX_BYTES.min(segment.len());
+    while !segment.is_char_boundary(end) {
+        end -= 1;
+    }
+    let digest = blake3::hash(full_label.as_bytes());
+    let digest = digest.as_bytes();
+    format!(
+        "{}…{:02x}{:02x}{:02x}{:02x}",
+        &segment[..end],
+        digest[0],
+        digest[1],
+        digest[2],
+        digest[3]
+    )
+}
+
+/// Path segment of an impl block named by the server. Inherent impls use the bare type name;
+/// trait impls keep their whitespace-normalized label. Labels longer than the bound are shortened
+/// with a stable digest so nested paths stay bounded without losing addressability.
 fn impl_segment(name: &str) -> String {
-    let name = collapse_whitespace(name);
-    let Some(rest) = name.strip_prefix("impl") else {
-        return name;
+    let normalized = collapse_whitespace(name);
+    let Some(rest) = normalized.strip_prefix("impl") else {
+        return bounded_impl_segment(normalized, name);
     };
-    if name.contains(" for ") {
-        return name;
-    }
-    let mut rest = rest.trim_start();
-    if rest.starts_with('<') {
-        rest = skip_generics(rest).trim_start();
-    }
-    let ty = rest.split('<').next().unwrap_or(rest).trim();
-    let ty = ty.rsplit("::").next().unwrap_or(ty).trim();
-    if ty.is_empty() { name } else { ty.to_owned() }
+    let segment = if normalized.contains(" for ") {
+        normalized
+    } else {
+        let mut rest = rest.trim_start();
+        if rest.starts_with('<') {
+            rest = skip_generics(rest).trim_start();
+        }
+        let ty = rest.split('<').next().unwrap_or(rest).trim();
+        let ty = ty.rsplit("::").next().unwrap_or(ty).trim();
+        if ty.is_empty() {
+            normalized
+        } else {
+            ty.to_owned()
+        }
+    };
+    bounded_impl_segment(segment, name)
 }
 
 /// `text` after its leading balanced `<…>` generic parameter list, or `""` when it never closes.
@@ -1579,6 +1610,50 @@ mod tests {
         assert_eq!(
             RustSupport.file_doc("//! Rust docs\nfn a() {}"),
             Some("Rust docs".into())
+        );
+    }
+
+    /// Deep server paths keep long impl labels bounded and stable without a rust-analyzer process.
+    #[test]
+    fn nested_long_impl_labels_normalize_to_bounded_paths() {
+        use async_lsp::lsp_types::{Position, Range, SymbolKind as K};
+
+        /// Builds a nested server-symbol chain with the same long impl label at each level.
+        fn nested(label: &str, depth: usize) -> lsp::DocumentSymbol {
+            let mut symbol = ds(label, K::OBJECT, (0, 0), 0, Vec::new());
+            for _ in 1..depth {
+                symbol = ds(label, K::OBJECT, (0, 0), 0, vec![symbol]);
+            }
+            symbol.range = Range::new(Position::new(0, 0), Position::new(0, 1));
+            symbol
+        }
+
+        let literal = "x".repeat(1024 * 1024);
+        let source = format!("const _: &str = {:?};", literal);
+        let label = format!("impl Marker for {}", &literal[..4096]);
+        let support = RustSupport;
+        let outline =
+            support.normalize(Path::new("src/lib.rs"), &source, vec![nested(&label, 128)]);
+
+        let mut symbol = &outline.symbols[0];
+        let mut path = String::new();
+        let mut depth = 0;
+        loop {
+            let name = symbol.path.name().unwrap();
+            assert!(name.len() <= 256);
+            path.push_str(name);
+            path.push('/');
+            depth += 1;
+            let Some(child) = symbol.children.first() else {
+                break;
+            };
+            symbol = child;
+        }
+        assert_eq!(depth, 128);
+        assert!(path.len() < 128 * 256);
+        assert_eq!(
+            outline.symbols[0].path.name(),
+            Some(impl_segment(&label).as_str())
         );
     }
 }

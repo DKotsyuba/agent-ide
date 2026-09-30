@@ -347,3 +347,54 @@ fn forwarder_beyond_the_owner_provider_share_is_refused() {
     admission.release(returned).unwrap();
     assert_eq!(admission.running_count(), 1, "only the server slot remains");
 }
+
+/// All registered languages can hold a server while one ordinary owner slot stays available.
+#[test]
+fn registered_language_servers_leave_one_owner_slot_free() {
+    let server_slots = crate::lang::registered().len().max(1);
+    let owner = OwnerId::new("provider").unwrap();
+    let provider = request(CommandKind::Provider, "/bin/sleep", &["30"]);
+    let mut admission = AdmissionController::new(AdmissionLimits {
+        total_running: server_slots + 1,
+        per_owner_running: server_slots + 1,
+        per_owner_queued: server_slots + 1,
+        total_queued: server_slots + 1,
+        interactive_burst: 1,
+    })
+    .unwrap();
+    let mut registry = ProviderLeaseRegistry::new(ProviderLeaseLimits {
+        total_views: server_slots + 1,
+        per_backend_views: 1,
+    })
+    .unwrap();
+
+    for index in 0..server_slots {
+        assert!(matches!(
+            registry.request(
+                &mut admission,
+                owner.clone(),
+                AdmissionClass::Interactive,
+                format!("language-{index}"),
+                ProviderBackendKind::OwnedExclusive,
+                provider.authority(),
+            ),
+            ProviderLeaseAdmission::Granted(_)
+        ));
+    }
+
+    assert!(matches!(
+        registry.request(
+            &mut admission,
+            owner.clone(),
+            AdmissionClass::Interactive,
+            "extra-server",
+            ProviderBackendKind::OwnedExclusive,
+            provider.authority(),
+        ),
+        ProviderLeaseAdmission::Refused(AdmissionError::OwnerProviderLimit)
+    ));
+    assert!(matches!(
+        admission.submit(owner, AdmissionClass::Interactive),
+        Admission::Granted(_)
+    ));
+}

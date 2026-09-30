@@ -426,20 +426,28 @@ struct DeliveredIssue {
 /// language providers and Claude's foreground helper claims — draws from this one budget, so the
 /// limits below are the real global ceiling and not a per-route hint.
 ///
-/// One binding (owner) runs at most five processes, of which its language servers may hold four:
-/// one per registered language that has a server (four today), so the fifth slot always stays
-/// free for the worker's own operations (Git snapshots, tests). A per-view forwarder process of a
-/// shared server is a server slot as well, so with all four servers live such a forwarder is
-/// refused.
+/// Each registered language may retain one server slot, with one owner slot left for worker
+/// operations such as Git snapshots and tests. A shared-server forwarder consumes a server slot
+/// too. Before language registration, capacity reserves one server slot for core-only callers.
 pub(super) fn admission_controller() -> crate::execution::AdmissionController {
+    let server_slots = crate::lang::registered().len().max(1);
     crate::execution::AdmissionController::new(crate::execution::AdmissionLimits {
         total_running: 16,
-        per_owner_running: 5,
+        per_owner_running: server_slots.saturating_add(1),
         per_owner_queued: 1,
         total_queued: 64,
         interactive_burst: 8,
     })
     .expect("fixed process limits")
+}
+
+/// Keeps the controller's owner budget in sync with the registered language set.
+#[cfg(test)]
+#[test]
+fn admission_reserves_a_server_slot_per_registered_language_and_one_free_slot() {
+    let server_slots = crate::lang::registered().len().max(1);
+    let limits = admission_controller().inspect();
+    assert_eq!(limits.per_owner_running_limit, server_slots + 1);
 }
 
 /// Shared bounded transport-side bookkeeping; no lock survives an I/O await.
