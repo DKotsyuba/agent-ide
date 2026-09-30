@@ -968,4 +968,17 @@ mod deny_tests {
         let dir = scratch_dir("empty-python-presence");
         assert!(!PythonChecks.is_present(&dir));
     }
+
+    /// Resolves a root `.venv` without requiring Python project manifests.
+    #[test]
+    fn resolve_interpreter_finds_root_venv_without_manifest() {
+        let dir = scratch_dir("venv-without-manifest");
+        let interpreter = dir.join(".venv/bin/python");
+        std::fs::create_dir_all(interpreter.parent().unwrap()).unwrap();
+        std::fs::write(&interpreter, "").unwrap();
+
+        assert_eq!(resolve_interpreter(&dir), Some(interpreter));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

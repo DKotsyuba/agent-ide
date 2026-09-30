@@ -188,8 +188,10 @@ newline and the normal reply text, and the `structuredContent` object carries it
 `status` field. `ide.stop` replies and `pending` placeholders carry no plate. `rust: checking
 (first check)` means no result yet this session;
 `rust: checking (files changed; last result: 0 errors, 1 warning)` means a check is running and the
-last counts may be outdated; the next plate carries the result with `(+N)`/`(-N)` deltas. When
-counts rise after your edit, call `ide.context` with `{"kind": "problems"}` (optionally
+last counts may be outdated; the next plate carries the result with `(+N)`/`(-N)` deltas.
+Python semantic imports use the same worktree interpreter as checks; a root `.venv` also applies to
+nested Python files when no root Python manifest exists.
+When counts rise after your edit, call `ide.context` with `{"kind": "problems"}` (optionally
 `"language": "rust" | "python" | "typescript"` and `"offset"`) to read the bounded problem
 list before continuing. The `typescript` filter covers `.ts`, `.tsx`, `.js`, and `.jsx`.
 An LSP diagnostic push can give only a provisional lower bound for TypeScript/JavaScript;

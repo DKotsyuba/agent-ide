@@ -1,8 +1,8 @@
 //! Exclusive Pyright profile and owned stdio-child adapter.
 //!
-//! The adapter validates the fixed Python provider identity, asks Execution for one exclusive
-//! worktree-bound view, and exposes only an Execution-owned protocol child. It never discovers a
-//! virtual environment, chooses an interpreter, or shares a Pyright process between worktrees.
+//! The adapter validates the fixed Python provider identity, selects the worktree interpreter
+//! through the shared Python resolver, asks Execution for one exclusive view, and exposes only an
+//! Execution-owned protocol child. It never shares a Pyright process between worktrees.
 
 use std::{
     collections::BTreeMap,
@@ -62,6 +62,8 @@ pub struct PyrightProfile {
     trust: String,
     /// Absolute private cache namespace.
     cache_namespace: String,
+    /// Shared-resolver interpreter supplied to Pyright for package import resolution, when found.
+    interpreter: Option<PathBuf>,
 }
 
 impl PyrightProfile {
@@ -89,11 +91,19 @@ impl PyrightProfile {
             node_identity: identity.node_identity,
             trust: identity.trust,
             cache_namespace: identity.cache_namespace,
+            interpreter: None,
         };
         profile
             .valid()
             .then_some(profile)
             .ok_or(PyrightProfileError::InvalidProfile)
+    }
+
+    /// Adds an optional absolute interpreter selected by the shared worktree resolver; `None`
+    /// retains Pyright's defaults, and the consumed profile is returned with the setting applied.
+    pub(crate) fn with_interpreter(mut self, interpreter: Option<PathBuf>) -> Self {
+        self.interpreter = interpreter;
+        self
     }
 
     /// Builds fixed `node <absolute-pyright-script> --stdio` with only Node's parent on `PATH`.
@@ -213,9 +223,14 @@ impl PyrightProfile {
 }
 
 impl agent_ide_core::intelligence::session::SessionProfile for PyrightProfile {
-    /// Pyright runs on its defaults: an empty configuration object.
+    /// Returns Pyright defaults, adding `python.pythonPath` only when the shared resolver found one.
     fn workspace_configuration(&self) -> serde_json::Value {
-        serde_json::json!({})
+        match &self.interpreter {
+            Some(interpreter) => {
+                serde_json::json!({"pythonPath": interpreter.to_string_lossy()})
+            }
+            None => serde_json::json!({}),
+        }
     }
 
     /// Accepts an omitted identity or one named `pyright`.
@@ -591,8 +606,8 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    /// Pyright runs on an empty configuration, accepts an omitted or `pyright` identity only, and
-    /// opens `.py`/`.pyi` files as `python`.
+    /// Pyright defaults stay empty without an interpreter and add `python.pythonPath` when one is
+    /// selected; the profile accepts an omitted or `pyright` identity and opens `.py`/`.pyi` files.
     #[test]
     fn pyright_session_profile_is_closed_and_allows_omitted_server_info() {
         use agent_ide_core::intelligence::session::SessionProfile;
@@ -614,6 +629,13 @@ mod tests {
         })
         .unwrap();
         assert_eq!(profile.workspace_configuration(), serde_json::json!({}));
+        assert_eq!(
+            profile
+                .clone()
+                .with_interpreter(Some(PathBuf::from("/repo/.venv/bin/python")))
+                .workspace_configuration(),
+            serde_json::json!({"pythonPath":"/repo/.venv/bin/python"})
+        );
         assert!(profile.accepts_server(None));
         assert!(
             profile.accepts_server(Some(&async_lsp::lsp_types::ServerInfo {

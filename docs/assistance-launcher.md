@@ -168,8 +168,11 @@ configuration is rejected on any malformed value.
     rejects unknown fields.
   - `python`: `node` and `pyright_cli` (both required, absolute, normalized), the accepted Node
     executable and the Pyright CLI entry module it runs. The project's own interpreter is located
-    inside the worktree; a missing environment reports `environment not found` rather than the
-    flood of unresolved imports it would produce.
+    inside the worktree; checks and the Pyright language server share the same interpreter resolver,
+    and the server receives that interpreter as `python.pythonPath`. A root `.venv` applies to
+    nested Python files even when the repository has no root Python manifest. With no resolved
+    interpreter, the server keeps its existing defaults; a missing check environment reports
+    `environment not found` rather than the flood of unresolved imports it would produce.
   - A language subsection absent means that language is never checked and never appears in the
     `<agent-ide>` block.
 

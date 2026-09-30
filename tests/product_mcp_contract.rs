@@ -9476,6 +9476,71 @@ async fn configured_product_returns_real_pyright_semantic_context_and_reaps() {
     daemon.wait().await.unwrap();
 }
 
+/// Resolves a nested Python import from the root `.venv` without a root Python manifest.
+///
+/// `AGENT_IDE_PYTHON` supplies the approved interpreter used by the venv; the only installed package
+/// is the local stub.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT, AGENT_IDE_NODE and AGENT_IDE_PYTHON environments"]
+async fn configured_product_pyright_resolves_root_venv_for_nested_python_file() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = ProductFixture::new(json!([accepted_pyright_provider(
+        "pyright-root-venv-cache"
+    )]));
+    let python = PathBuf::from(std::env::var_os("AGENT_IDE_PYTHON").unwrap());
+    assert!(python.is_file(), "approved Python interpreter is available");
+    let venv = fixture.root.join(".venv");
+    let interpreter = venv.join("bin/python");
+    std::fs::create_dir_all(interpreter.parent().unwrap()).unwrap();
+    symlink(&python, &interpreter).unwrap();
+    std::fs::write(
+        venv.join("pyvenv.cfg"),
+        format!(
+            "home = {}\ninclude-system-site-packages = false\nversion = 3.14.3\n",
+            python.parent().unwrap().display()
+        ),
+    )
+    .unwrap();
+    let site_packages = venv.join("lib/python3.14/site-packages/stub_package");
+    std::fs::create_dir_all(&site_packages).unwrap();
+    std::fs::write(site_packages.join("__init__.py"), "VALUE: int = 42\n").unwrap();
+    let source = fixture.root.join("tools/x.py");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, "from stub_package import VALUE\n").unwrap();
+    fixture.git(&["add", "--", "tools/x.py"]);
+    fixture.git(&["commit", "--quiet", "-m", "nested Python fixture"]);
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "pyright-root-venv").await;
+    let start = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"pyright-root-venv-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, start).await["kind"], "activation");
+    let response = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"tools/x.py","byte_offset":6}),
+        )
+        .await;
+    let response = actor.settle(&fixture, response).await;
+    assert_eq!(response["kind"], "context", "{response}");
+    let text = response["text"].as_str().unwrap();
+    assert!(text.contains("mode: semantic"), "{response}");
+    assert!(text.contains("diagnostic_count: 0"), "{response}");
+    assert!(!text.contains("reportMissingImports"), "{response}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Exercises persistent Pyright symbol tools and a symbol-addressed replacement through binding stop.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
