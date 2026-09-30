@@ -67,7 +67,7 @@ A hook or the top of a response may include check and background-test status, in
 ```text
 <agent-ide>
 rust: 0 errors, 0 warnings
-tests #3: running 42 s; poll: ide.test {"status": 3}
+tests #3: running 42 s; poll: call ide.test with {"status": 3}
 </agent-ide>
 ```
 
@@ -156,7 +156,7 @@ Errors: `no_such_file` (the requested path does not exist; check the path), `out
 
 ### 2.3 `ide.symbol` — symbol card and relationships (implemented)
 
-Input: `{symbol, usages?: true, callers?: 0..3, callees?: 0..3, history?: true}`. Defaults: usages, callers 1, callees 0; `history` is opt-in (boolean) and shows the last 3 commits touching the definition.
+Input: `{symbol, usages?: true, callers?: 0..3, callees?: 0..3, history?: true}`. The descriptions spell out `0–3` because some hosts omit the JSON schema maximum. Defaults: usages, callers 1, callees 0; `history` is opt-in (boolean) and shows the last 3 commits touching the definition.
 
 Output:
 
@@ -298,7 +298,7 @@ The whole-file form without `source_ref` only creates a file that does not exist
 
 For a symbol, `content` is the complete symbol including its header. The IDE derives indentation and blank lines from neighboring code. After writing, the project's formatter runs over the candidate (before the write), then the project check (cargo check / pyright / tsc) is scheduled at once and the reply carries the edited file's problems from it. `rename` is performed by the language server across the project.
 
-The line-range form **requires** `source_ref`, and it must name a retained read of the same file (an `ide.read` reply's `source_ref`, a completed paged read, or a prior edit's `source_ref`). The edit applies only while that observation's bytes are still the file's current bytes; anything else is refused as `stale_source` with no write, and the reply says to re-read the lines and retry with the new `source_ref`. The symbol form resolves the symbol again, so its `source_ref` is optional — but when one is given it is validated the same way. When the formatter changes the file's line count, every successful edit reply states the movement as its last line:
+The line-range form **requires** `source_ref`, and it must name a retained read of the same file (an `ide.read` reply's `source_ref`, a completed paged read, or a prior edit's `source_ref`). The edit applies only while that observation's bytes are still the file's current bytes; anything else is refused as `stale_source` with no write. The reply names the newest `source_ref` for that path known to this binding, from its last successful edit or read, when available; retry with that reference without re-reading. The symbol form resolves the symbol again, so its `source_ref` is optional — but when one is given it is validated the same way. When the formatter changes the file's line count, every successful edit reply states the movement as its last line:
 
 ```text
 formatted: +3 lines after line 24; use source_ref sym-14 for the next edit
@@ -345,7 +345,14 @@ tests #3: started — cargo test --workspace worker::  (4 tests selected, budget
 The `symbol` form first asks the live language server for the symbol's references, which takes
 seconds on a cold session, so it answers `pending` at once and the started line (or
 `tests: no tests reference …`) arrives through `ide.inspect`; `path`, `pattern` and `command`
-answer inline. Every start and running line ends with `poll: ide.test {"status": N}`, and
+answer inline. Start and running lines say `poll: call ide.test with {"status": N}` so the hint
+cannot be mistaken for an `ide.inspect` detail reference. If that hint is passed to
+`ide.inspect` anyway, the reply directs the caller to `ide.test {"status": N}`. Explicit
+`command` runs with no parsed test counts keep the call inline briefly: a completed run answers
+in the starting call with its exit code, up to 4 KiB of output, and `rerun:`; only a truncated
+output includes `full output: ide.inspect <detail_ref>`. A longer run returns the ordinary
+started line. Parsed test-runner replies are unchanged. Every start and running line ends with
+the poll hint, and
 `ide.inspect` with a test-run handle (`tests #N`, `tests-N`, `#N`, `N`) answers with that run's
 status line, so a handle mistaken for a `detail_ref` still reaches the result.
 
@@ -360,7 +367,7 @@ tests #3: 3 passed, 1 failed, 12 s
 
 A run that counted no test is never shown as `0 passed, 0 failed`: a non-zero exit reads `tests #3: no test results (exit 2), 1 s — inspect the runner's full output with ide.inspect` (the runner could not run, e.g. `uv run pytest` without a usable environment), and a zero exit without a parsed summary reads `no summary parsed`.
 
-Run at most one test job at a time per worktree. Stop a run when its budget expires, return its partial result and the command for manual execution, and page full output through `detail_ref`. The IDE never starts tests on its own.
+Run at most one test job at a time per worktree. Stop a run when its budget expires, return its partial result and the command for manual execution, and page full output through `detail_ref`. `ide.stop` lists up to eight runs started in this binding whose results were never collected, including each run number and command (and whether it is still running). The IDE never starts tests on its own.
 
 ### 2.7 `ide.diff` — changed files (implemented)
 
@@ -392,7 +399,7 @@ Output uses the current `file:line:column code message` form, grouped by file an
 
 ### 2.9 Unchanged tools
 
-`ide.inspect {detail_ref, page?}` and `ide.stop {}` remain unchanged, except that an unknown `detail_ref` now says which it is — `this detail_ref was never issued` for a reference this daemon could not have minted, `this detail_ref has expired` for one it minted and no longer retains — and a test-run handle (`tests #N`, `tests-N`, `#N`, `N`) answers with that run's status line instead of failing the lookup. A test-run handle keeps answering read-only for the run's retained lifetime (up to 10 minutes) even after `ide.stop`, without the `full output` line; every other `detail_ref` ends with the session, and a retained run's output detail is never evicted while the session lasts. `ide.context` in its current form is retired; its role is divided among `outline`, `symbol`, `read`, and `problems`.
+`ide.inspect {detail_ref, page?}` and `ide.stop {}`: an unknown `detail_ref` says which it is — `this detail_ref was never issued` for a reference this daemon could not have minted, `this detail_ref has expired` for one it minted and no longer retains — and a test-run handle (`tests #N`, `tests-N`, `#N`, `N`) answers with that run's status line instead of failing the lookup. A poll-hint string passed as `detail_ref` answers with the specific `ide.test {"status": N}` call to make. A test-run handle keeps answering read-only for the run's retained lifetime (up to 10 minutes) even after `ide.stop`, without the `full output` line; every other `detail_ref` ends with the session, and a retained run's output detail is never evicted while the session lasts. `ide.stop` also lists uncollected runs as described above. `ide.context` in its current form is retired; its role is divided among `outline`, `symbol`, `read`, and `problems`.
 
 `ide.context {path}` with no `byte_offset` (T163, W5) still pages the whole file exactly as before, for compatibility with existing hosts and acceptance scripts that mint an edit `source_ref` from it; its first line now leads with a one-line hint toward the bounded alternative: `hint: ide.outline {"path"} gives the skeleton and ide.read {"path","lines"} a bounded region; this whole-file view stays for compatibility`. `ide.context {path, byte_offset}` (the semantic query used by the edit-diagnostics and staleness flow) and `ide.context {kind:"problems"}` are unaffected and carry no hint; prefer `ide.outline`/`ide.read` for new work.
 

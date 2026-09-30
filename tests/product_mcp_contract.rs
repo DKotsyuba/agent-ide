@@ -3112,6 +3112,13 @@ async fn managed_context_problems_then_edit_tracks_content() {
     let stale = settle_managed(&mut mcp, &mut next, actor, &state, stale).await;
     assert_eq!(stale["result"]["outcome"], "stale_source", "{stale}");
     assert_eq!(stale["result"]["source_ref"], Value::Null, "{stale}");
+    assert!(
+        stale["note"]
+            .as_str()
+            .unwrap()
+            .contains(context["detail_ref"].as_str().unwrap()),
+        "stale edit should name this binding's newest known source_ref: {stale}"
+    );
     assert_eq!(
         std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
         b"external\n"
@@ -6178,7 +6185,7 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     );
     assert_eq!(
         start_text.trim_end(),
-        "tests #1: started — cargo test --workspace --lib (budget 120 s); poll: ide.test \
+        "tests #1: started — cargo test --workspace --lib (budget 120 s); poll: call ide.test with \
          {\"status\": 1}",
         "{start_text}"
     );
@@ -6403,7 +6410,14 @@ async fn configured_product_test_status_repeats_after_output_is_paged() {
         run["text"]
             .as_str()
             .unwrap()
-            .starts_with("tests #1: started"),
+            .starts_with("tests #1: no summary parsed (exit 0)"),
+        "{run}"
+    );
+    assert!(
+        run["text"]
+            .as_str()
+            .unwrap()
+            .contains("output:\nretained-output"),
         "{run}"
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);

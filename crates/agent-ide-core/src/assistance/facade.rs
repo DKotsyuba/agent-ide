@@ -292,8 +292,8 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "properties": {
                     "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`, or a bare name to search the project."},
                     "usages": {"type": "boolean", "default": true, "description": "Include usages (src/tests split, with source lines)."},
-                    "callers": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1, "description": "Callers to list (0 = none); use ide.graph for deeper trees."},
-                    "callees": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0, "description": "Callees to list (0 = none)."},
+                    "callers": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1, "description": "Callers to list, 0–3 (0 = none); use ide.graph for deeper trees."},
+                    "callees": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0, "description": "Callees to list, 0–3 (0 = none)."},
                     "history": {"type": "boolean", "default": false, "description": "Include the last commits touching the definition (opt-in)."}
                 }
             }),
@@ -2905,8 +2905,9 @@ impl StdioFacade {
     /// Run tests selected by `symbol` (the tests that reference it), by `path`, by name
     /// `pattern`, or an explicit `command`; one background run per worktree under `budget_s`.
     /// Returns the pass/fail line with an exact rerun command; full output is paged through
-    /// ide.inspect (`status` re-reads a run). Use it instead of running the test command in a
-    /// shell: exact selection, bounded output.
+    /// ide.inspect (`status` re-reads a run). A summary-less explicit command waits briefly and
+    /// includes its exit code and bounded output inline when it finishes inside that window. Use
+    /// it instead of running the test command in a shell: exact selection, bounded output.
     #[tool(name = "ide.test", input_schema = tool_schemas()[10].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn test(
         &self,
@@ -2929,8 +2930,8 @@ impl StdioFacade {
             .await
     }
 
-    /// End this task's IDE session; edited files stay on disk. Call it once when the task is
-    /// done or before handing off.
+    /// End this task's IDE session; edited files stay on disk. Lists up to eight test runs started
+    /// in this binding whose results were never collected. Call once when done or before handing off.
     #[tool(name = "ide.stop", input_schema = tool_schemas()[4].input_schema.as_object().expect("tool schema is an object").clone())]
     async fn stop(
         &self,

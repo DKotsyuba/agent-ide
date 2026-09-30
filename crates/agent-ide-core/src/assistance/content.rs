@@ -757,10 +757,10 @@ mod tests {
         assert!(text.contains("content/presence changed"));
         assert!(text.contains("newer observation alone does not invalidate"));
         assert!(
-            text.contains("Re-read the lines (ide.read) and retry with the new source_ref"),
+            text.contains("Use the newest source_ref below when present")
+                && text.contains("otherwise re-read the lines (ide.read)"),
             "{text}"
         );
-        assert!(!text.contains("source_ref "));
     }
 
     /// A formatter that moved lines is stated as the reply's last line, with the reference the
