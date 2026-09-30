@@ -49,6 +49,11 @@ struct Job {
     channel: [u8; 32],
     /// Detail reference retained for this run's paged output while the run is retained.
     detail_ref: String,
+    /// Exact argv the process runs; known from the start, so an uncollected running run can
+    /// still be named in an `ide.stop` reply.
+    command: Vec<String>,
+    /// True only when the caller supplied an exact command rather than selecting a test runner.
+    explicit_command: bool,
     /// Monotonic start time used for status ages.
     started: tokio::time::Instant,
     /// Absent while active, present after exit, spawn failure, or budget expiry.
@@ -66,6 +71,9 @@ pub struct RunResult {
     pub report: TestReport,
     /// Last at most 256 KiB of combined stdout and stderr.
     pub output: String,
+    /// `true` once the owner's retained detail took over the whole output as its pages and this
+    /// copy was dropped; later replies then point at that detail instead of quoting a head.
+    pub output_paged: bool,
     /// Elapsed wall-clock process duration.
     pub elapsed: Duration,
     /// True when the process was killed at its time budget.
@@ -92,12 +100,18 @@ pub enum StartResult {
 
 /// Read-only age and optional completed result returned by a status lookup.
 pub struct JobStatus {
+    /// Daemon-local run number the caller's `tests #N` line names.
+    pub id: u64,
     /// Monotonic elapsed age of the job.
     pub age: Duration,
     /// Binding that owns the retained output detail reference.
     pub owner: [u8; 32],
     /// Parsed report and bounded output after the process settles.
     pub result: Option<RunResult>,
+    /// The starting job's own detail reference; the run it started can be found back by it.
+    pub detail_ref: String,
+    /// Whether the run came from the explicit command form of `ide.test`.
+    pub explicit_command: bool,
 }
 
 /// Sends a best-effort process-group kill if daemon shutdown drops a running task.
@@ -159,6 +173,8 @@ impl TestRuns {
                 owner: owner.fingerprint(),
                 channel: owner.channel_identity().fingerprint(),
                 detail_ref: detail_ref.clone(),
+                command: argv.clone(),
+                explicit_command: false,
                 started,
                 result: None,
                 completed_at: None,
@@ -181,6 +197,20 @@ impl TestRuns {
         StartResult::Started(id)
     }
 
+    /// Marks `id` as an explicit command only when it belongs to `owner`; missing or foreign ids
+    /// are unchanged. Call immediately after `start` succeeds and before servicing another
+    /// request so summary-less output can be returned inline.
+    pub fn mark_explicit_command(&self, id: u64, owner: &BindingRef) {
+        if let Ok(mut state) = self.0.lock()
+            && let Some(job) = state
+                .jobs
+                .get_mut(&id)
+                .filter(|job| job.owner == owner.fingerprint())
+        {
+            job.explicit_command = true;
+        }
+    }
+
     /// Returns the job's age, owner, and result when it ran in `root` and was started by `caller`'s
     /// actor and channel (any binding generation); another actor's run in the same worktree is
     /// `None`, like an unknown id, so its failures and rerun command stay with its own actor. Only
@@ -196,9 +226,12 @@ impl TestRuns {
             job.observed = true;
         }
         Some(JobStatus {
+            id,
             age: job.started.elapsed(),
             owner: job.owner,
             result: job.result.clone(),
+            detail_ref: job.detail_ref.clone(),
+            explicit_command: job.explicit_command,
         })
     }
 
@@ -216,9 +249,35 @@ impl TestRuns {
             job.observed = true;
         }
         Some(JobStatus {
+            id,
             age: job.started.elapsed(),
             owner: job.owner,
             result: job.result.clone(),
+            detail_ref: job.detail_ref.clone(),
+            explicit_command: job.explicit_command,
+        })
+    }
+
+    /// Returns the run one starting job's own detail reference began, for the same actor and
+    /// channel in any generation, so a job held open for that run resumes it instead of
+    /// spawning a second command. Observes a settled own run exactly like `get`.
+    pub fn started_run(&self, reference: &str, caller: &BindingRef) -> Option<JobStatus> {
+        let channel = caller.channel_identity().fingerprint();
+        let mut state = self.0.lock().ok()?;
+        let (id, job) = state
+            .jobs
+            .iter_mut()
+            .find(|(_, job)| job.detail_ref == reference && job.channel == channel)?;
+        if job.result.is_some() && job.owner == caller.fingerprint() {
+            job.observed = true;
+        }
+        Some(JobStatus {
+            id: *id,
+            age: job.started.elapsed(),
+            owner: job.owner,
+            result: job.result.clone(),
+            detail_ref: job.detail_ref.clone(),
+            explicit_command: job.explicit_command,
         })
     }
 
@@ -232,16 +291,35 @@ impl TestRuns {
     }
 
     /// Drops buffered output after its paged copy is retained by the owner's detail ledger.
-    pub fn clear_output(&self, root: &PathBuf, id: u64, binding: &[u8; 32]) {
+    /// Identifiers are daemon-unique, so the run needs no worktree to be named again.
+    pub fn clear_output(&self, id: u64, binding: &[u8; 32]) {
         if let Ok(mut state) = self.0.lock()
             && let Some(job) = state.jobs.get_mut(&id)
-            && &job.root == root
             && &job.owner == binding
             && let Some(result) = &mut job.result
         {
             result.output.clear();
             result.output.shrink_to_fit();
+            result.output_paged = true;
         }
+    }
+
+    /// Lists one binding's runs whose result no caller of that binding ever read — a run still
+    /// running, or a settled one no status, handle or plate delivered — as `(id, argv, running)`.
+    /// `ide.stop` reports them so an agent cannot claim results it never collected.
+    pub fn uncollected(&self, binding: &[u8; 32]) -> Vec<(u64, Vec<String>, bool)> {
+        self.0
+            .lock()
+            .map(|state| {
+                state
+                    .jobs
+                    .iter()
+                    .filter(|(_, job)| &job.owner == binding)
+                    .filter(|(_, job)| job.result.is_none() || !job.observed)
+                    .map(|(id, job)| (*id, job.command.clone(), job.result.is_none()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Returns the current compact status line for the newest run in `root`.
@@ -377,7 +455,7 @@ fn render_status_line(id: u64, job: &Job) -> Option<String> {
     Some(match &job.result {
         Some(result) => result_line(id, result),
         None => format!(
-            "tests #{id}: running {} s; poll: ide.test {{\"status\": {id}}}",
+            "tests #{id}: running {} s; poll: call ide.test with {{\"status\": {id}}}",
             job.started.elapsed().as_secs()
         ),
     })
@@ -412,6 +490,13 @@ pub fn result_line(id: u64, result: &RunResult) -> String {
             report.passed, report.failed
         )
     }
+}
+
+/// Reports whether a settled run has no parsed test counts and was not budget-stopped. The
+/// explicit-command caller treats this as a shell command rather than a test runner, including
+/// successful zero-output commands, and quotes its output instead of a runner's failure list.
+pub fn summary_absent(result: &RunResult) -> bool {
+    !result.stopped && result.report.passed == 0 && result.report.failed == 0
 }
 
 /// Runs one command with inherited environment, bounded output, a process-group budget kill,
@@ -519,6 +604,7 @@ async fn run_child(
     RunResult {
         report,
         output,
+        output_paged: false,
         elapsed: started.elapsed(),
         stopped,
         exit: status.and_then(|status| status.code()),
@@ -537,6 +623,7 @@ fn failed_run(budget: Duration, output: String) -> RunResult {
             ..TestReport::default()
         },
         output,
+        output_paged: false,
         elapsed: Duration::ZERO,
         stopped: false,
         exit: None,
@@ -691,7 +778,7 @@ mod runner_tests {
                 crate::lang::testing::ALPHA,
                 Duration::from_secs(3),
                 "r1".into(),
-                &BindingRef::fixture("actor-1", "channel-1", 1)
+                &BindingRef::fixture("actor-1", "channel-1", 1),
             ),
             StartResult::Started(1)
         ));
@@ -702,7 +789,7 @@ mod runner_tests {
                 crate::lang::testing::ALPHA,
                 Duration::from_secs(3),
                 "r2".into(),
-                &BindingRef::fixture("actor-2", "channel-2", 1)
+                &BindingRef::fixture("actor-2", "channel-2", 1),
             ),
             StartResult::Running(1, _)
         ));
@@ -723,7 +810,7 @@ mod runner_tests {
                 crate::lang::testing::ALPHA,
                 Duration::from_secs(10),
                 "ra".into(),
-                &owner
+                &owner,
             ),
             StartResult::Started(1)
         ));
@@ -745,5 +832,39 @@ mod runner_tests {
             runs.get(&root, 1, &other).is_none(),
             "another actor in the same worktree does not read the run"
         );
+    }
+
+    /// Reports an uncollected run with its command until the owner reads the settled result.
+    #[tokio::test]
+    async fn uncollected_reports_runs_until_the_owner_reads_them() {
+        let runs = TestRuns::default();
+        let root = std::env::temp_dir().to_path_buf();
+        let owner = BindingRef::fixture("uncollected-actor", "uncollected-channel", 1);
+        assert!(matches!(
+            runs.start(
+                root.clone(),
+                vec!["/bin/echo".into(), "done".into()],
+                crate::lang::testing::ALPHA,
+                Duration::from_secs(10),
+                "uncollected-detail".into(),
+                &owner,
+            ),
+            StartResult::Started(1)
+        ));
+        let binding = owner.fingerprint();
+        assert_eq!(
+            runs.uncollected(&binding),
+            vec![(1, vec!["/bin/echo".into(), "done".into()], true)]
+        );
+        for _ in 0..100 {
+            if runs
+                .get(&root, 1, &owner)
+                .is_some_and(|status| status.result.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(runs.uncollected(&binding).is_empty());
     }
 }

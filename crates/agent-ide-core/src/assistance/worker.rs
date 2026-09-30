@@ -72,6 +72,9 @@ const SERVER_NOT_STARTED: &str = "not started; ide.outline, ide.read and ide.edi
 /// Why an activation baseline never claims complete coverage: Git metadata and source bytes are
 /// captured as separate bounded steps, so no joint Git/source window is ever proven.
 const BASELINE_PARTIAL_REASON: &str = "git metadata and source bytes are captured in separate steps, so no atomic window is proven and coverage cannot be claimed complete";
+/// Longest an explicit `ide.test` command run is held inside that inline window so the starting
+/// call can answer the settled result itself; a longer run falls back to the started line.
+const TEST_INLINE_COMPLETION_WAIT: Duration = Duration::from_secs(6);
 
 /// A bounded asynchronous operation whose identity never includes the transient MCP call ID.
 struct Job {
@@ -595,6 +598,44 @@ impl Shared {
             detail.source = source;
             detail.native_epoch = native_epoch;
         }
+    }
+    /// Answers one settled run's terminal text and, for the owning binding, hands the run's
+    /// whole raw output to its retained detail as pages exactly once: the pager starts
+    /// undelivered, so the first `ide.inspect` of that detail cuts page one itself, and the
+    /// run's buffered copy is dropped only after the detail owns the pages. A later lookup
+    /// finds the copy empty and leaves the retained pages as they are.
+    fn settled_test_reply(
+        &self,
+        id: u64,
+        binding: &BindingRef,
+        status: &super::tests::JobStatus,
+    ) -> (String, Option<String>) {
+        let result = status
+            .result
+            .as_ref()
+            .expect("a settled run always carries its result");
+        let owns_detail = status.owner == binding.fingerprint();
+        let text = test_result_text(id, result, owns_detail, status.explicit_command);
+        if owns_detail && !result.output.is_empty() {
+            let retained = if let Ok(mut ledger) = self.ledger.lock()
+                && let Some(detail) = ledger.details.get_mut(&result.detail_ref)
+            {
+                detail.context_page = Some(ContextPageState::new(
+                    result.output.clone(),
+                    0,
+                    false,
+                    ResultKind::Test,
+                ));
+                detail.context_page_fresh = false;
+                true
+            } else {
+                false
+            };
+            if retained {
+                self.test_runs.clear_output(id, &binding.fingerprint());
+            }
+        }
+        (text, owns_detail.then_some(result.detail_ref.clone()))
     }
     /// Marks `binding`'s retained feedback as already submitted to a live caller, but only when
     /// three things hold: the retained fact is still the exact one produced by `reference` (never
@@ -1321,6 +1362,24 @@ impl WorkerHandle {
     /// cancelled and removed while other bindings' jobs stay queued.
     pub async fn stop(&self, invocation: ValidatedInvocation, attachment: &str) -> PeerReply {
         let binding = invocation.binding_ref().clone();
+        // Captured before `observe_binding` marks every run of this binding read, so the stop
+        // reply can still name the runs whose results no caller ever collected.
+        let never_read = self.shared.test_runs.uncollected(&binding.fingerprint());
+        let mut uncollected = never_read
+            .iter()
+            .take(8)
+            .map(|(id, argv, running)| {
+                format!(
+                    "#{} {}{}",
+                    id,
+                    display_argv(argv),
+                    if *running { " (still running)" } else { "" }
+                )
+            })
+            .collect::<Vec<_>>();
+        if never_read.len() > 8 {
+            uncollected.push(format!("(+{} more)", never_read.len() - 8));
+        }
         self.shared
             .test_runs
             .observe_binding(&binding.fingerprint());
@@ -1345,7 +1404,7 @@ impl WorkerHandle {
         if let Err(code) = self.enqueue(
             invocation,
             AssistanceTool::Stop,
-            serde_json::json!({}),
+            serde_json::json!({ "uncollected_test_runs": uncollected }),
             attachment,
             Some(send),
         ) {
@@ -1901,7 +1960,8 @@ impl<'a> Worker<'a> {
     /// Runs inside the queued job. The `symbol` branch resolves references through the live
     /// language server before selecting tests, so its caller already holds a `pending` reply (see
     /// [`WorkerHandle::submit`]) and reads the started/no-tests line through `ide.inspect`; the other
-    /// branches are answered inline by the waiting submit.
+    /// branches are answered inline by the waiting submit. A summary-less explicit command waits
+    /// briefly for completion and then includes its exit code and bounded output in that reply.
     async fn test(
         &mut self,
         job: &mut Job,
@@ -1933,43 +1993,19 @@ impl<'a> Worker<'a> {
                     None,
                 ));
             };
-            if let Some(result) = job_status.result {
-                let owns_detail = job_status.owner == binding.fingerprint();
-                let text = test_result_text(id, &result, owns_detail);
-                // The output is paged into the owner's detail once and then dropped; a later
-                // status lookup finds it empty and leaves the retained pages as they are (an
-                // empty text has no page to cut and would fail the lookup with `capacity`).
-                if owns_detail && !result.output.is_empty() {
-                    let (first_page, following_pages) =
-                        ContextPageState::new(result.output.clone(), 0, false, ResultKind::Test)
-                            .next(&result.detail_ref)?;
-                    let retained = if let Ok(mut ledger) = self.shared.ledger.lock()
-                        && let Some(detail) = ledger.details.get_mut(&result.detail_ref)
-                    {
-                        detail.reply = first_page;
-                        true
-                    } else {
-                        false
-                    };
-                    if retained {
-                        self.shared
-                            .set_context_page(&result.detail_ref, following_pages);
-                        self.shared
-                            .test_runs
-                            .clear_output(&root, id, &binding.fingerprint());
-                    }
-                }
-                (text, owns_detail.then_some(result.detail_ref))
+            if job_status.result.is_some() {
+                self.shared.settled_test_reply(id, &binding, &job_status)
             } else {
                 (
                     format!(
-                        "tests #{id}: running {} s; poll: ide.test {{\"status\": {id}}}",
+                        "tests #{id}: running {} s; poll: call ide.test with {{\"status\": {id}}}",
                         job_status.age.as_secs()
                     ),
                     None,
                 )
             }
         } else {
+            let mut explicit_command = false;
             let (argv, language, selected_count) = if let Some(path) =
                 job.parameters.get("path").and_then(Value::as_str)
             {
@@ -2033,6 +2069,7 @@ impl<'a> Worker<'a> {
                 else {
                     return Err(FailureCode::ProviderUnavailable);
                 };
+                explicit_command = true;
                 (
                     args.iter()
                         .filter_map(Value::as_str)
@@ -2157,28 +2194,80 @@ impl<'a> Worker<'a> {
                     None,
                 ));
             };
-            match self.shared.test_runs.start(
-                root,
-                argv.clone(),
-                language,
-                budget,
-                job.reference.clone(),
-                &binding,
-            ) {
-                StartResult::Started(id) => {
-                    let selected =
-                        selected_count.map_or_else(String::new, |summary| format!(" ({summary})"));
-                    let line = format!(
-                        "tests #{id}: started — {}{selected} (budget {} s); poll: ide.test \
-                         {{\"status\": {id}}}",
-                        display_argv(&argv),
-                        budget.as_secs()
-                    );
+            // An explicit `command` is often a stand-in shell line rather than a runner, so the
+            // job that starts one holds itself open inside the inline reply window: the starting
+            // call itself then answers the settled result — one call instead of a
+            // start/poll/inspect round trip — and only a run that outlasts the window keeps the
+            // started line and the poll protocol. A resumed job finds its own run back by its
+            // detail reference, never spawning the command a second time.
+            let mut own_run = if explicit_command {
+                self.shared.test_runs.started_run(&job.reference, &binding)
+            } else {
+                None
+            };
+            let mut started_id = None;
+            if own_run.is_none() {
+                match self.shared.test_runs.start(
+                    root.clone(),
+                    argv.clone(),
+                    language,
+                    budget,
+                    job.reference.clone(),
+                    &binding,
+                ) {
+                    StartResult::Started(id) => {
+                        if explicit_command {
+                            self.shared.test_runs.mark_explicit_command(id, &binding);
+                        }
+                        started_id = Some(id);
+                        own_run = self.shared.test_runs.get(&root, id, &binding);
+                    }
+                    StartResult::Running(id, age) => {
+                        return Ok((
+                            PeerReply::Complete {
+                                kind: ResultKind::Test,
+                                text: format!(
+                                    "tests #{id}: still running ({} s); poll: call ide.test with \
+                                     {{\"status\": {id}}}",
+                                    age.as_secs()
+                                ),
+                                detail_ref: None,
+                                truncated: false,
+                                continuation: false,
+                            },
+                            Some(authority),
+                            None,
+                        ));
+                    }
+                    StartResult::Failed(error) => {
+                        let program = argv.first().map(String::as_str).unwrap_or("");
+                        return Ok((
+                            PeerReply::Complete {
+                                kind: ResultKind::Test,
+                                text: format!(
+                                    "tests: could not start {}: {}",
+                                    test_text_line(program, 160),
+                                    test_text_line(&error, 240)
+                                ),
+                                detail_ref: None,
+                                truncated: false,
+                                continuation: false,
+                            },
+                            Some(authority),
+                            None,
+                        ));
+                    }
+                }
+            }
+            match own_run {
+                Some(status) if status.result.is_some() => {
+                    let (text, detail_ref) =
+                        self.shared.settled_test_reply(status.id, &binding, &status);
                     return Ok((
                         PeerReply::Complete {
                             kind: ResultKind::Test,
-                            text: line,
-                            detail_ref: Some(job.reference.clone()),
+                            text,
+                            detail_ref,
                             truncated: false,
                             continuation: false,
                         },
@@ -2186,24 +2275,33 @@ impl<'a> Worker<'a> {
                         None,
                     ));
                 }
-                StartResult::Running(id, age) => (
-                    format!(
-                        "tests #{id}: still running ({} s); poll: ide.test {{\"status\": {id}}}",
-                        age.as_secs()
-                    ),
-                    None,
-                ),
-                StartResult::Failed(error) => {
-                    let program = argv.first().map(String::as_str).unwrap_or("");
+                Some(status)
+                    if explicit_command
+                        && status.age < TEST_INLINE_COMPLETION_WAIT
+                        && tokio::time::Instant::now() + TEST_INLINE_COMPLETION_WAIT
+                            < job.deadline =>
+                {
+                    // Parks instead of blocking the single worker loop; the submit-side inline
+                    // window keeps waiting, and the job re-enters this branch on every wake.
+                    job.park_until = Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                    return Err(FailureCode::ProviderLoading);
+                }
+                running => {
+                    let Some(id) = running.map(|status| status.id).or(started_id) else {
+                        return Err(FailureCode::Internal);
+                    };
+                    let selected =
+                        selected_count.map_or_else(String::new, |summary| format!(" ({summary})"));
                     return Ok((
                         PeerReply::Complete {
                             kind: ResultKind::Test,
                             text: format!(
-                                "tests: could not start {}: {}",
-                                test_text_line(program, 160),
-                                test_text_line(&error, 240)
+                                "tests #{id}: started — {}{selected} (budget {} s); poll: call \
+                                 ide.test with {{\"status\": {id}}}",
+                                display_argv(&argv),
+                                budget.as_secs()
                             ),
-                            detail_ref: None,
+                            detail_ref: Some(job.reference.clone()),
                             truncated: false,
                             continuation: false,
                         },
@@ -2347,7 +2445,18 @@ impl<'a> Worker<'a> {
             .and_then(|ledger| ledger.native_epoch.get(&binding).copied())
             .unwrap_or(0);
         let result = if job.tool == AssistanceTool::Stop {
-            self.revoke(&binding, &job.reference).await
+            let uncollected = job
+                .parameters
+                .get("uncollected_test_runs")
+                .and_then(Value::as_array)
+                .map(|runs| {
+                    runs.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            self.revoke(&binding, &uncollected).await
         } else if *job.cancel.borrow() || self.shared.active(&binding).is_err() {
             if job.stage.is_some() {
                 self.edit(job).await
@@ -2410,6 +2519,35 @@ impl<'a> Worker<'a> {
                     None,
                 )
             }
+        };
+        // Every stale_source refusal names the newest source_ref this binding still holds for the
+        // file — its last successful edit or fully delivered read — so the retry needs no re-read.
+        let reply = match reply {
+            PeerReply::Edit {
+                result,
+                diagnostics,
+                note: None,
+                operation,
+            } if result.outcome == ChangesEditOutcome::StaleSource => {
+                let newest = self
+                    .shared
+                    .ledger
+                    .lock()
+                    .ok()
+                    .and_then(|ledger| newest_edit_source(&ledger, &binding, &result.path));
+                PeerReply::Edit {
+                    note: newest.map(|reference| {
+                        format!(
+                            "newest source_ref for this file: {reference} (its last successful \
+                             edit or read); retry ide.edit with it, no re-read needed"
+                        )
+                    }),
+                    result,
+                    diagnostics,
+                    operation,
+                }
+            }
+            other => other,
         };
         if let PeerReply::Error { code, .. } = &reply {
             // T26B: a queued job's terminal failure must reach the error log with its closed
@@ -4076,21 +4214,36 @@ impl<'a> Worker<'a> {
     }
 
     /// Revokes a recoverable receipt after host stop; absent grants are explicitly harmless.
+    ///
+    /// The reply also names the test runs this binding started but never collected — passed in by
+    /// the stop submitter before it marked them read — because a stopped agent otherwise reports
+    /// results it never saw (ag-20260930-210040 +403…+465 s).
     async fn revoke(
         &mut self,
         binding: &BindingRef,
-        _reference: &str,
+        uncollected: &[String],
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         self.settle_revocation(binding).await?;
         if self.uncertain.contains(binding) {
             return Err(FailureCode::Internal);
         }
+        let mut text =
+            "Assistance stopped for this binding; compatible shared peers remain eligible"
+                .to_owned();
+        if !uncollected.is_empty() {
+            text.push_str(
+                "\nuncollected test runs in this binding — their results were never read; each \
+                 still answers ide.inspect {\"detail_ref\":\"tests #N\"}:",
+            );
+            for run in uncollected {
+                text.push_str("\n  ");
+                text.push_str(run);
+            }
+        }
         Ok((
             PeerReply::Complete {
                 kind: ResultKind::Stop,
-                text:
-                    "Assistance stopped for this binding; compatible shared peers remain eligible"
-                        .into(),
+                text,
                 detail_ref: None,
                 truncated: false,
                 continuation: false,
@@ -4158,20 +4311,38 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
         // and channel, not one generation, so it answers before the liveness check — also after
         // `ide.stop`, when the output detail is gone and its `full output` line is left out.
         if let Some(id) = test_run_handle(&request.reference) {
-            let owner = request.binding.fingerprint();
             let text = match shared.test_runs.find(id, &request.binding) {
-                Some(status) => match &status.result {
-                    Some(result) => test_result_text(id, result, status.owner == owner),
-                    None => format!(
-                        "tests #{id}: running {} s; poll: ide.test {{\"status\": {id}}}",
-                        status.age.as_secs()
-                    ),
-                },
-                None => format!("tests #{id}: unknown job; poll: ide.test {{\"status\": {id}}}"),
+                Some(status) if status.result.is_some() => {
+                    shared
+                        .settled_test_reply(status.id, &request.binding, &status)
+                        .0
+                }
+                Some(status) => format!(
+                    "tests #{id}: running {} s; poll: call ide.test with {{\"status\": {id}}}",
+                    status.age.as_secs()
+                ),
+                None => format!(
+                    "tests #{id}: unknown job; poll: call ide.test with {{\"status\": {id}}}"
+                ),
             };
             return Ok(PeerReply::Complete {
                 kind: ResultKind::Test,
                 text,
+                detail_ref: None,
+                truncated: false,
+                continuation: false,
+            });
+        }
+        // A poll-hint string (`… ide.test … {"status": N}`) is what every running-test line ends
+        // with; a first-time caller can mistake it for a detail_ref. Answer with the exact call
+        // it names instead of a generic invalid_detail.
+        if let Some(id) = poll_hint_run(&request.reference) {
+            return Ok(PeerReply::Complete {
+                kind: ResultKind::Test,
+                text: format!(
+                    "tests #{id}: that text is the poll hint, not a detail_ref; call ide.test \
+                     with {{\"status\": {id}}} to read this run's status"
+                ),
                 detail_ref: None,
                 truncated: false,
                 continuation: false,
@@ -4482,6 +4653,26 @@ pub(crate) fn test_run_handle(reference: &str) -> Option<u64> {
         .filter(|id| *id > 0)
 }
 
+/// Recognizes a poll-hint string an agent mistakenly passed as a `detail_ref` — text naming
+/// `ide.test` and a `"status": N` argument, whatever words surround them — and returns that run
+/// number, so `ide.inspect` can answer with the exact call instead of `invalid_detail`.
+fn poll_hint_run(reference: &str) -> Option<u64> {
+    const MARKER: &str = "\"status\":";
+    if !reference.contains("ide.test") {
+        return None;
+    }
+    let rest = &reference[reference.find(MARKER)? + MARKER.len()..];
+    let digits: &str = rest.trim_start();
+    let end = digits
+        .char_indices()
+        .find(|(_, character)| !character.is_ascii_digit())
+        .map_or(digits.len(), |(at, _)| at);
+    (end > 0)
+        .then(|| digits[..end].parse::<u64>().ok())
+        .flatten()
+        .filter(|id| *id > 0)
+}
+
 /// Reports whether this daemon could never have minted `reference`: another boot's nonce, a
 /// number beyond the ledger counter, or a shape no minted reference has.
 fn never_issued(reference: &str, nonce: &[u8; 32], next: u64) -> bool {
@@ -4531,6 +4722,26 @@ fn admitted_edit_source(
     .then(|| detail.source.clone())
     .flatten()
     .filter(|source| source.path().to_str() == Some(path))
+}
+
+/// Returns the newest retained detail reference that already authorizes a full-file edit of
+/// `path` for this binding — its last successful edit or fully delivered read/context of that
+/// path. Detail references are minted monotonically, so the highest trailing number is the
+/// newest observation; a `stale_source` refusal names it so the retry needs no re-read.
+fn newest_edit_source(ledger: &Ledger, binding: &BindingRef, path: &str) -> Option<String> {
+    ledger
+        .details
+        .iter()
+        .filter(|(reference, detail)| {
+            admitted_edit_source(detail, binding, reference, path).is_some()
+        })
+        .max_by_key(|(reference, _)| {
+            reference
+                .rsplit_once('-')
+                .and_then(|(_, number)| number.parse::<u64>().ok())
+                .unwrap_or(0)
+        })
+        .map(|(reference, _)| reference.clone())
 }
 
 /// Proves a refreshed observation is the exact Workspace post-read and no native write intervened.
@@ -4864,7 +5075,18 @@ fn test_text_line(value: &str, max_chars: usize) -> String {
 }
 
 /// Renders the bounded parsed test result and actionable rerun/detail references.
-fn test_result_text(id: u64, result: &super::tests::RunResult, owns_detail: bool) -> String {
+fn test_result_text(
+    id: u64,
+    result: &super::tests::RunResult,
+    owns_detail: bool,
+    explicit_command: bool,
+) -> String {
+    // A run that parsed no test summary is an arbitrary command, not a runner: its reply carries
+    // the exit code and a bounded head of the output itself, so reading it costs no extra
+    // `ide.inspect` round trip.
+    if explicit_command && super::tests::summary_absent(result) {
+        return command_result_text(id, result, owns_detail);
+    }
     let report = &result.report;
     let mut text = super::tests::result_line(id, result);
     for failure in report.failures.iter().take(8) {
@@ -4891,6 +5113,138 @@ fn test_result_text(id: u64, result: &super::tests::RunResult, owns_detail: bool
         ));
     }
     text
+}
+
+/// Bytes of a summary-less command's output quoted inline in its terminal reply; a longer output
+/// stays in the run's paged detail behind its `full output` line.
+const TEST_OUTPUT_HEAD_BYTES: usize = 4096;
+
+/// Renders one summary-less command run: the exit code, a bounded head of its output, the rerun
+/// line, and — only when that head cut something, or the whole output already lives in the run's
+/// paged detail — the pointer to the full output.
+fn command_result_text(id: u64, result: &super::tests::RunResult, owns_detail: bool) -> String {
+    let seconds = result.elapsed.as_secs();
+    let mut text = match result.exit.filter(|code| *code != 0) {
+        Some(code) => format!("tests #{id}: no test results (exit {code}), {seconds} s"),
+        None => match result.exit {
+            Some(code) => format!("tests #{id}: no summary parsed (exit {code}), {seconds} s"),
+            None => format!("tests #{id}: no summary parsed, {seconds} s"),
+        },
+    };
+    let head = output_head(&result.output);
+    if !head.is_empty() {
+        text.push_str("\n  output:\n");
+        text.push_str(&head);
+    }
+    text.push_str(&format!("\n  rerun: {}", display_argv(&result.command)));
+    if owns_detail && (head.len() < result.output.len() || result.output_paged) {
+        text.push_str(&format!(
+            "\n  full output: ide.inspect {}",
+            result.detail_ref
+        ));
+    }
+    text
+}
+
+/// Cuts the first [`TEST_OUTPUT_HEAD_BYTES`] bytes of a command's output at a UTF-8 boundary, so
+/// the quoted head never splits a character; an output that fits is kept whole. Returns the empty
+/// string for an empty or already-paged-away output.
+fn output_head(output: &str) -> String {
+    let mut cut = TEST_OUTPUT_HEAD_BYTES.min(output.len());
+    while !output.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    if output.len() > TEST_OUTPUT_HEAD_BYTES
+        && let Some(newline) = output[..cut].rfind('\n')
+        && newline > 0
+    {
+        cut = newline + 1;
+    }
+    output[..cut].to_owned()
+}
+
+/// Checks the bounded command reply, poll-hint parsing and the user-facing relationship limits.
+#[cfg(test)]
+mod tool_reply_fix_tests {
+    use super::*;
+    use crate::lang::TestReport;
+
+    /// Builds a minimal explicit-command result for reply-rendering checks.
+    fn command_result(output: String) -> super::super::tests::RunResult {
+        super::super::tests::RunResult {
+            report: TestReport::default(),
+            output,
+            output_paged: false,
+            elapsed: Duration::from_secs(1),
+            stopped: false,
+            exit: Some(0),
+            budget: Duration::from_secs(30),
+            detail_ref: "test-detail".into(),
+            command: vec!["echo".into(), "hello".into()],
+        }
+    }
+
+    /// Quotes an explicit command's successful output, while test-runner replies keep their form.
+    #[test]
+    fn explicit_summaryless_command_quotes_output_only_for_command_form() {
+        let result = command_result("hello\n".into());
+        let command = test_result_text(3, &result, true, true);
+        assert!(command.contains("no summary parsed (exit 0)"), "{command}");
+        assert!(command.contains("output:\nhello\n"), "{command}");
+        assert!(command.contains("rerun: echo hello"), "{command}");
+
+        let runner = test_result_text(3, &result, true, false);
+        assert!(runner.contains("0 passed, 0 failed"), "{runner}");
+        assert!(!runner.contains("\n  output:\n"), "{runner}");
+    }
+
+    /// Limits inline output at a UTF-8 boundary and points to the retained full output.
+    #[test]
+    fn command_reply_bounds_output_and_names_full_detail() {
+        let line = format!("{}\n", "é".repeat(TEST_OUTPUT_HEAD_BYTES / 2 + 50));
+        let result = command_result(line);
+        let reply = command_result_text(4, &result, true);
+        let quoted = reply
+            .split("  output:\n")
+            .nth(1)
+            .unwrap()
+            .split("\n  rerun:")
+            .next()
+            .unwrap();
+        assert!(
+            quoted.len() <= TEST_OUTPUT_HEAD_BYTES,
+            "{} bytes",
+            quoted.len()
+        );
+        assert!(quoted.is_char_boundary(quoted.len()));
+        assert!(
+            reply.contains("full output: ide.inspect test-detail"),
+            "{reply}"
+        );
+    }
+
+    /// Recognizes the prose poll hint without mistaking other `status` text for a run handle.
+    #[test]
+    fn poll_hint_points_to_the_status_call() {
+        assert_eq!(
+            poll_hint_run("poll: call ide.test with {\"status\": 12}"),
+            Some(12)
+        );
+        assert_eq!(poll_hint_run("ide.test {\"status\": 0}"), None);
+        assert_eq!(poll_hint_run("ide.inspect {\"status\": 12}"), None);
+    }
+
+    /// Keeps 0–3 visible in descriptions as well as JSON schema bounds for hosts that drop bounds.
+    #[test]
+    fn symbol_relationship_descriptions_state_their_range() {
+        let schemas = super::super::facade::tool_schemas();
+        for field in ["callers", "callees"] {
+            let description = schemas[8].input_schema["properties"][field]["description"]
+                .as_str()
+                .unwrap();
+            assert!(description.contains("0–3"), "{description}");
+        }
+    }
 }
 
 /// Records one execution-profile refusal with its closed condition detail, best-effort.
@@ -5895,7 +6249,7 @@ mod stop_retry_tests {
         let lock = rusqlite::Connection::open(fixture.base.join("state.sqlite")).unwrap();
         lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
 
-        let outcome = worker.revoke(&old_binding, "stop-1").await;
+        let outcome = worker.revoke(&old_binding, &[]).await;
         assert!(matches!(outcome, Err(FailureCode::WorkspaceAuthority)));
         assert_eq!(worker.grants.get(&old_binding), Some(&old_receipt));
         assert!(worker.pending_revocations.contains(&old_binding));
@@ -5933,7 +6287,7 @@ mod stop_retry_tests {
         assert_eq!(worker.grants.get(&new_binding), Some(&new_receipt));
         assert!(!worker.grants.contains_key(&old_binding));
 
-        let settled = worker.revoke(&new_binding, "stop-2").await;
+        let settled = worker.revoke(&new_binding, &[]).await;
         assert!(settled.is_ok());
         assert!(!worker.grants.contains_key(&new_binding));
         assert!(worker.pending_revocations.is_empty());
@@ -7181,7 +7535,7 @@ mod stop_retry_tests {
         };
         assert!(
             text.starts_with("tests #2: running")
-                && text.ends_with("poll: ide.test {\"status\": 2}"),
+                && text.ends_with("poll: call ide.test with {\"status\": 2}"),
             "{text}"
         );
 
@@ -7192,7 +7546,7 @@ mod stop_retry_tests {
         };
         assert_eq!(
             text,
-            "tests #9: unknown job; poll: ide.test {\"status\": 9}"
+            "tests #9: unknown job; poll: call ide.test with {\"status\": 9}"
         );
 
         // A reference this daemon minted but no longer retains reads expired; one it could

@@ -83,6 +83,7 @@ which the reply says `unknown` and `ide.context` shows the result when it lands.
   `stale_source` (no write) when that read no longer matches the file — re-read the lines
   (ide.read) and retry with the new `source_ref`. The symbol forms take `source_ref` too
   (optional; validated when given).
+  After `ide.edit`, base the next edit of that file on the `source_ref` in the edit reply.
 - `ide.edit {"operation_id":"…","path":"src/new.rs","content":"…"}` — creates a file that does
   not exist yet (no `source_ref`: there is nothing to read) and answers `edit: created` with the
   same check — prefer it over native creation so the diagnostics arrive in-reply. The same call
@@ -145,8 +146,8 @@ server while it loads and answer `provider_unavailable` when it failed. `ide.sym
    `{"symbol":"src/x.rs#Type/method"}` runs the tests that reference the symbol (including
    in-file `mod tests`), `{"path":"src/x.rs"}` the file's tests, `{"pattern":"name"}` a runner
    filter, `{"command":["cargo","test","--lib"]}` an exact argv; optional `budget_s` (default
-   120, max 600). The reply is `tests #N: started — <argv> (budget B s); poll: ide.test
-   {"status":N}`; poll with `{"status":N}` until `tests #N: P passed, F failed, T s` with up to
+   120, max 600). The reply is `tests #N: started — <argv> (budget B s); poll: call ide.test with
+   {"status":N}`; call `ide.test {"status":N}` to poll until `tests #N: P passed, F failed, T s` with up to
    eight `FAIL name` / `file:line message` lines, a `rerun:` argv and `full output:
    ide.inspect <detail_ref>`. `ide.inspect` also accepts a test-run handle (`tests #N`,
    `tests-N`, `#N`, `N`) and answers that run's status line.
