@@ -369,7 +369,7 @@ tests #3: 3 passed, 1 failed, 12 s
   rerun: cargo test stop_cancels_queue      full output: ide.inspect test-3
 ```
 
-A run that counted no test is never shown as `0 passed, 0 failed`: a non-zero exit reads `tests #3: no test results (exit 2), 1 s — runner said: <bounded runner line>; full output: ide.inspect <detail_ref>` (the runner could not run, e.g. `uv run pytest` without a usable environment), and a zero exit without a parsed summary reads `no summary parsed`.
+A run that counted no test is never shown as `0 passed, 0 failed`: a non-zero exit reads `tests #3: no test results (exit 2), 1 s — runner said: <bounded runner line>; full output: ide.inspect <detail_ref>` (the runner could not run, e.g. `uv run pytest` without a usable environment), and a zero exit without a parsed summary reads `no summary parsed`. The `<agent-ide>` status line for the same run keeps the runner line but omits the reference, which the bounded block could otherwise cut.
 
 Run at most one test job at a time per worktree. Stop a run when its budget expires, return its partial result and the command for manual execution, and page full output through `detail_ref`. `ide.stop` lists up to eight runs started in this binding whose results were never collected, including each run number and command (and whether it is still running). The IDE never starts tests on its own.
 
