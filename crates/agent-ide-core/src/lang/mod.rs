@@ -687,8 +687,9 @@ pub trait LanguageSupport: Send + Sync {
     /// a server may still answer: graph use-site nodes and name-card addresses use it where the
     /// server is not asked or cannot answer, and — only when
     /// [`LanguageSupport::outline_while_loading`] opts in — outline, read and symbol edits use it
-    /// while that server is still loading or unavailable (its workspace failed to load, or no
-    /// launch configures it).
+    /// while that server is still loading, when it is unavailable (its workspace failed to load,
+    /// or no launch configures it), and when its ready session's documentSymbols exchange
+    /// failed.
     fn outline_from_source(&self, file: &Path, source: &str) -> Option<Outline> {
         let _ = (file, source);
         None
@@ -697,8 +698,8 @@ pub trait LanguageSupport: Send + Sync {
     /// Whether [`LanguageSupport::outline_from_source`] answers `ide.outline`, `ide.read` and
     /// symbol-addressed `ide.edit` while the language's registered server is still loading, and
     /// when that server is unavailable (its workspace failed to load, or no launch configures
-    /// it); `false` (the default) keeps those calls waiting for the server, or refusing
-    /// `provider_unavailable` when it failed.
+    /// it) or its ready session's documentSymbols exchange failed; `false` (the default) keeps
+    /// those calls waiting for the server, or refusing `provider_unavailable` when it failed.
     ///
     /// Opting in is an obligation, because a symbol edit splices by the outline's ranges: every
     /// `Some` outline it returns for a text must equal what [`LanguageSupport::normalize`] makes

@@ -6,6 +6,7 @@
 //! observation so a later `ide.edit` may name them as `source_ref`.
 
 use super::*;
+use crate::intelligence::server::ProviderJob as _;
 use crate::lang::{
     self, Language as Lang, LineRange, Outline, SymbolPath, TestId,
     render::{self, Call, SymbolCard, Usage},
@@ -163,7 +164,7 @@ impl Worker<'_> {
             }
             None => render::outline_text(&outline),
         };
-        if let Some(why) = lexical
+        if let Some(why) = lexical.as_ref()
             && let Some(note) = self.lexical_note(observed.path(), why)
         {
             text.push_str(&note);
@@ -204,8 +205,10 @@ impl Worker<'_> {
                 let (outline, _, from_text) = self.outline_of(job, &observed, &bytes).await?;
                 let found = outline
                     .find(&symbol)
-                    .ok_or_else(|| missing_symbol(job, from_text))?;
-                lexical = from_text.and_then(|why| self.lexical_note(observed.path(), why));
+                    .ok_or_else(|| missing_symbol(job, from_text.clone()))?;
+                lexical = from_text
+                    .as_ref()
+                    .and_then(|why| self.lexical_note(observed.path(), why));
                 (file, found.range, symbol.to_string())
             }
             (None, None) => {
@@ -338,7 +341,7 @@ impl Worker<'_> {
                 }
             }
         }
-        .ok_or_else(|| missing_symbol(job, lexical))?;
+        .ok_or_else(|| missing_symbol(job, lexical.clone()))?;
         let source = observed_text(&observed, &bytes)?;
         let mut card = SymbolCard {
             heading: format!(
@@ -366,8 +369,38 @@ impl Worker<'_> {
             if callees_depth > 0 {
                 card.callees_note = Some(format!("unavailable ({language} has no call hierarchy)"));
             }
+        } else if matches!(lexical.as_ref(), Some(Lexical::Unavailable))
+            && let Some(server) = self.session_server(observed.path())
+        {
+            // The outline above came from source because the registered server's workspace
+            // failed to load, so no live session can answer hover, references or call
+            // hierarchy. The card's definition facts already come from that outline; every
+            // section a live session would answer says why it is missing instead of failing the
+            // whole call — outline and read answer from source in exactly this state. A
+            // language with name facts shows index-backed usages instead (below).
+            if want_usages && outline.language.names().is_none() {
+                card.usages_note = Some(format!(
+                    "unavailable ({} workspace failed to load)",
+                    server.name()
+                ));
+            }
+            if callers_depth > 0 {
+                card.callers_note = Some(format!(
+                    "unavailable ({} workspace failed to load)",
+                    server.name()
+                ));
+            }
+            if callees_depth > 0 {
+                card.callees_note = Some(format!(
+                    "unavailable ({} workspace failed to load)",
+                    server.name()
+                ));
+            }
         } else {
             let byte_offset = name_offset(source, &found)?;
+            let server_name = self
+                .session_server(observed.path())
+                .map(|server| server.name());
             let live = self.live_session_for(job, &observed).await?;
             if let Ok(Some(hover)) = live.session.hover(&observed, &bytes, byte_offset).await {
                 // The server's hover carries the resolved signature; prefer it over the one-line
@@ -384,11 +417,24 @@ impl Worker<'_> {
                 }
             }
             if want_usages {
-                let references = live
+                let references = match live
                     .session
                     .references(&observed, &bytes, byte_offset)
                     .await
-                    .map_err(|_| FailureCode::ProviderUnavailable)?;
+                {
+                    Ok(references) => references,
+                    Err(_) => {
+                        // The ready session failed this exchange; the stage names the request so
+                        // the refusal's reply can say what still answers and how to recover.
+                        if let Some(name) = server_name {
+                            job.set_stage_failure(
+                                &FailureCode::ProviderUnavailable,
+                                &format!("{name}: references request failed"),
+                            );
+                        }
+                        return Err(FailureCode::ProviderUnavailable);
+                    }
+                };
                 card.usages = self
                     .usage_lines(
                         job,
@@ -930,14 +976,14 @@ impl Worker<'_> {
         let support = language.support();
         let source = observed_text(observed, bytes)?.to_owned();
         let worktree_root = observed.worktree().worktree_path().to_path_buf();
-        if self.session_server(observed.path()).is_none() {
+        let Some(server) = self.session_server(observed.path()) else {
             // No registered server owns the file: a language that outlines from its text still
             // answers; any other keeps the provider-unavailable refusal.
             return support
                 .outline_from_source(observed.path(), &source)
                 .map(|outline| (outline, worktree_root, None))
                 .ok_or(FailureCode::ProviderUnavailable);
-        }
+        };
         let live = match self.live_session_for(job, observed).await {
             Ok(live) => live,
             Err(FailureCode::ProviderLoading) if support.outline_while_loading() => {
@@ -957,19 +1003,40 @@ impl Worker<'_> {
                 // The registered server failed (its workspace would not load) or no launch
                 // configures it: the exact source outline answers at once, marked lexical, and
                 // nothing is parked — a later call asks the server again, so one that recovers
-                // wins. A file that does not scan cleanly keeps the refusal, exactly as before.
-                return support
-                    .outline_from_source(observed.path(), &source)
-                    .map(|outline| (outline, worktree_root, Some(Lexical::Unavailable)))
-                    .ok_or(FailureCode::ProviderUnavailable);
+                // wins. A file that does not scan cleanly keeps the refusal, exactly as before,
+                // with the stage `live_session_for` already named. The lexical answer succeeds,
+                // so its failure detail must not leak into a later refusal of this job.
+                return match support.outline_from_source(observed.path(), &source) {
+                    Some(outline) => {
+                        job.failure_detail = None;
+                        Ok((outline, worktree_root, Some(Lexical::Unavailable)))
+                    }
+                    None => Err(FailureCode::ProviderUnavailable),
+                };
             }
             Err(other) => return Err(other),
         };
-        let symbols = live
-            .session
-            .document_symbols(observed, bytes)
-            .await
-            .map_err(|_| FailureCode::ProviderUnavailable)?;
+        let symbols = match live.session.document_symbols(observed, bytes).await {
+            Ok(symbols) => symbols,
+            Err(error) => {
+                // The session passed readiness but this exchange failed (a server error reply
+                // while it reloads its workspace, or a dying transport): a language that
+                // outlines from its text answers at once, marked lexical with the cause in its
+                // footer, exactly as the unavailable branch. A file its lexer refuses keeps the
+                // refusal, now with the stage naming the failed request.
+                if support.outline_while_loading()
+                    && let Some(outline) = support.outline_from_source(observed.path(), &source)
+                {
+                    let cause = exchange_cause(&error);
+                    return Ok((outline, worktree_root, Some(Lexical::Exchange { cause })));
+                }
+                job.set_stage_failure(
+                    &FailureCode::ProviderUnavailable,
+                    &format!("{}: documentSymbols request failed", server.name()),
+                );
+                return Err(FailureCode::ProviderUnavailable);
+            }
+        };
         Ok((
             support.normalize(observed.path(), &source, symbols),
             worktree_root,
@@ -978,14 +1045,16 @@ impl Worker<'_> {
     }
 
     /// One compact line marking a reply that was built from the lexical outline because the
-    /// file's registered server did not answer it (`why`: still loading, or unavailable): the
-    /// outline is exact, so the call needs no repeat, but semantic facts (usages, callers) are
-    /// not included. `None` when no server owns the file (nothing is loading or failed).
-    fn lexical_note(&self, path: &Path, why: Lexical) -> Option<String> {
+    /// file's registered server did not answer it (`why`: still loading, unavailable, or its
+    /// documentSymbols exchange failed): the outline is exact, so the call needs no repeat, but
+    /// semantic facts (usages, callers) are not included. `None` when no server owns the file
+    /// (nothing is loading, failed or refused).
+    fn lexical_note(&self, path: &Path, why: &Lexical) -> Option<String> {
         let server = self.session_server(path)?;
         let state = match why {
-            Lexical::Loading => "still indexing",
-            Lexical::Unavailable => "unavailable",
+            Lexical::Loading => "still indexing".to_owned(),
+            Lexical::Unavailable => "unavailable".to_owned(),
+            Lexical::Exchange { cause } => format!("request failed: {cause}"),
         };
         Some(format!(
             "outline: from source, exact ({} {state}; no need to repeat)",
@@ -1517,15 +1586,35 @@ fn collect_language_files(
     files
 }
 
-/// Why an outline came from the file's text alone: its registered server is still loading, or
-/// it is unavailable (its workspace failed to load, or no launch configures it). `None` marks
-/// the server's own answer — and a file no server owns, which the replies do not mark.
-#[derive(Clone, Copy)]
+/// Why an outline came from the file's text alone: its registered server is still loading, it
+/// is unavailable (its workspace failed to load, or no launch configures it), or its ready
+/// session failed the documentSymbols exchange itself. `None` marks the server's own answer —
+/// and a file no server owns, which the replies do not mark.
+#[derive(Clone)]
 pub(super) enum Lexical {
     /// The registered server has not finished loading its workspace yet.
     Loading,
     /// The registered server failed or is absent; it will not answer this call.
     Unavailable,
+    /// The registered session passed readiness but its documentSymbols exchange failed; the
+    /// bounded cause names why in the outline footer.
+    Exchange {
+        /// First line of the failed exchange's error, cut to [`EXCHANGE_CAUSE_LIMIT`] bytes.
+        cause: String,
+    },
+}
+
+/// Longest cause of a failed documentSymbols exchange an outline footer quotes; the footer is
+/// one compact line, so a longer error is cut at this byte ceiling.
+const EXCHANGE_CAUSE_LIMIT: usize = 120;
+
+/// The bounded first line of a failed documentSymbols exchange, for the outline footer.
+fn exchange_cause(error: &std::io::Error) -> String {
+    crate::intelligence::context::prefix(
+        error.to_string().lines().next().unwrap_or_default(),
+        EXCHANGE_CAUSE_LIMIT,
+    )
+    .to_owned()
 }
 
 /// The failure for an address the job's outline does not contain (`lexical`: why that outline
@@ -1534,11 +1623,12 @@ pub(super) enum Lexical {
 /// the server loads the call waits for it exactly as any symbol tool waits: parked for a retry,
 /// or `provider_loading` at once for an edit (see
 /// [`park_while_loading`](super::providers::park_while_loading)). An unavailable server will
-/// not answer either, so the miss refuses `provider_unavailable` at once instead of parking.
+/// not answer either — and a session whose exchange failed just did not — so the miss refuses
+/// `provider_unavailable` at once instead of parking.
 pub(super) fn missing_symbol(job: &mut Job, lexical: Option<Lexical>) -> FailureCode {
     match lexical {
         None => FailureCode::UnknownSymbol,
-        Some(Lexical::Unavailable) => FailureCode::ProviderUnavailable,
+        Some(Lexical::Unavailable | Lexical::Exchange { .. }) => FailureCode::ProviderUnavailable,
         Some(Lexical::Loading) => {
             super::providers::park_while_loading(job);
             FailureCode::ProviderLoading
@@ -1679,7 +1769,9 @@ impl Worker<'_> {
                 let (observed, bytes) = self.observe(&binding, file.clone()).await?;
                 let source = observed_text(&observed, &bytes)?.to_owned();
                 let (outline, _, from_text) = self.outline_of(job, &observed, &bytes).await?;
-                let lexical = from_text.and_then(|why| self.lexical_note(observed.path(), why));
+                let lexical = from_text
+                    .as_ref()
+                    .and_then(|why| self.lexical_note(observed.path(), why));
                 let splice = match op.as_str() {
                     "insert" => {
                         let where_ = match job.parameters.get("where").and_then(Value::as_str) {
