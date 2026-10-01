@@ -7229,8 +7229,14 @@ async fn configured_product_batch_read_then_edit_reports_landings_and_bytes() {
 /// The acceptance Python interpreter the syntax probe runs, overridable through the environment.
 fn batch_python_interpreter() -> String {
     std::env::var("AGENT_IDE_PYTHON").unwrap_or_else(|_| {
-        "/Users/pluto/.local/share/uv/python/cpython-3.14-macos-aarch64-none/bin/python3.14"
-            .to_owned()
+        // The first `python3` on PATH: present on every macOS host and release runner.
+        std::env::var_os("PATH")
+            .iter()
+            .flat_map(std::env::split_paths)
+            .map(|dir| dir.join("python3"))
+            .find(|candidate| candidate.is_file())
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "/usr/bin/python3".to_owned())
     })
 }
 
