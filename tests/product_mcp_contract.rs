@@ -6133,10 +6133,7 @@ async fn diff_provenance_flag_returns_the_exact_header() {
     assert!(!text.contains("authority_epoch: 0"), "{text}");
     assert!(!text.contains("worktree_id: \n"), "{text}");
     assert_eq!(text.matches("comparison_left: ").count(), 1);
-    assert!(
-        text.contains("current_tree: captured just now"),
-        "{text}"
-    );
+    assert!(text.contains("current_tree: captured just now"), "{text}");
     assert!(
         text.contains(
             "baseline_reason: git metadata and source bytes are captured in separate steps"
