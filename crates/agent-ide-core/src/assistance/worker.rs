@@ -624,7 +624,9 @@ impl Shared {
             .expect("a settled run always carries its result");
         let owns_detail = status.owner == binding.fingerprint();
         let text = test_result_text(id, result, owns_detail, status.explicit_command);
-        if owns_detail && !result.output.is_empty() {
+        // Paged once: after paging the run keeps only its bounded runner line, which must never
+        // replace the full output page.
+        if owns_detail && !result.output_paged && !result.output.is_empty() {
             let retained = if let Ok(mut ledger) = self.ledger.lock()
                 && let Some(detail) = ledger.details.get_mut(&result.detail_ref)
             {
@@ -5142,7 +5144,12 @@ fn command_result_text(id: u64, result: &super::tests::RunResult, owns_detail: b
             None => format!("tests #{id}: no summary parsed, {seconds} s"),
         },
     };
-    let head = output_head(&result.output);
+    // A paged run keeps only its runner line, which is not the output's head.
+    let head = if result.output_paged {
+        String::new()
+    } else {
+        output_head(&result.output)
+    };
     if !head.is_empty() {
         text.push_str("\n  output:\n");
         text.push_str(&head);
