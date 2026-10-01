@@ -25,6 +25,10 @@ const TOOLCHAIN_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Runtime entries older than this below the temp root count as stale once nobody listens on
 /// their sockets; a live daemon answers on its socket no matter how long it has been running.
 const STALE_RUNTIME_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// Name prefix of the shared repository daemons managed Claude sessions rendezvous with in
+/// `/private/tmp` (the same prefix the launcher and the error log use).
+const SHARED_RUNTIME_PREFIX: &str = "ai-r-";
 /// Wall-clock ceiling for one socket-liveness connect in the stale-runtime check.
 const SOCKET_LIVENESS_TIMEOUT: Duration = Duration::from_millis(250);
 /// Error-level journal lines in the last day above which the volume finding warns.
@@ -477,22 +481,36 @@ fn check_hosts(findings: &mut Vec<Finding>, effective: &Path) {
 /// side-effect-free health exchange, so its reported version is read from the reply the product
 /// itself uses for the same decision. Only versions are reported, never paths. Entries older than
 /// a day that answer on no socket count as stale exactly as before.
+///
+/// The shared repository daemons a managed Claude session rendezvouses with live in
+/// `/private/tmp` under the `ai-r-` prefix rather than below the temp root, so those entries
+/// are listed too — they are exactly the long-lived daemons an upgrade can leave outdated.
 async fn check_running_daemons(findings: &mut Vec<Finding>) {
     let Ok(root) = fs::canonicalize(std::env::temp_dir()) else {
         return;
     };
-    let Ok(entries) = fs::read_dir(&root) else {
-        return;
-    };
     let mut candidates = Vec::new();
-    for entry in entries.flatten() {
-        let Ok(metadata) = entry.metadata() else {
+    let shared = Path::new("/private/tmp");
+    let mut roots = vec![(root.as_path(), "")];
+    if root.as_path() != shared {
+        roots.push((shared, SHARED_RUNTIME_PREFIX));
+    }
+    for (dir, prefix) in roots {
+        let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
-        let owned = metadata.uid() == unsafe { libc::geteuid() }
-            && (metadata.is_dir() || metadata.file_type().is_socket());
-        if owned {
-            candidates.push((entry.path(), metadata.is_dir()));
+        for entry in entries.flatten() {
+            if !entry.file_name().to_string_lossy().starts_with(prefix) {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let owned = metadata.uid() == unsafe { libc::geteuid() }
+                && (metadata.is_dir() || metadata.file_type().is_socket());
+            if owned {
+                candidates.push((entry.path(), metadata.is_dir()));
+            }
         }
     }
     let mut versions: BTreeMap<String, usize> = BTreeMap::new();
