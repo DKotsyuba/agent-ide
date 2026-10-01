@@ -6134,7 +6134,7 @@ async fn diff_provenance_flag_returns_the_exact_header() {
     assert!(!text.contains("worktree_id: \n"), "{text}");
     assert_eq!(text.matches("comparison_left: ").count(), 1);
     assert!(
-        text.contains("current_tree: this page holds the captured tree"),
+        text.contains("current_tree: captured just now"),
         "{text}"
     );
     assert!(
