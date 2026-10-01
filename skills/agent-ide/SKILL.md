@@ -149,7 +149,10 @@ server while it loads and answer `provider_unavailable` when it failed. `ide.sym
    `{"symbol":"src/x.rs#Type/method"}` runs the tests that reference the symbol (including
    in-file `mod tests`), `{"path":"src/x.rs"}` the file's tests, `{"pattern":"name"}` a runner
    filter, `{"command":["cargo","test","--lib"]}` an exact argv; optional `budget_s` (default
-   120, max 600). The reply is `tests #N: started — <argv> (budget B s); poll: call ide.test with
+   120, max 600). A `path` or `symbol` target runs the runner of that file's language — in a
+   mixed worktree a `.py` test path selects pytest, never cargo — while a bare pattern or
+   command uses the first detected project. The reply is
+   `tests #N: started — <argv> (budget B s); poll: call ide.test with
    {"status":N}`; call `ide.test {"status":N}` to poll until `tests #N: P passed, F failed, T s` with up to
    eight `FAIL name` / `file:line message` lines, a `rerun:` argv and `full output:
    ide.inspect <detail_ref>`. `ide.inspect` also accepts a test-run handle (`tests #N`,

@@ -22,7 +22,7 @@ use agent_ide_core::assistance::launcher::absolute;
 use agent_ide_core::checks::runner::{ConfinedRunner, RunSpec};
 use agent_ide_core::checks::{
     BoxFuture, CheckConfig, CheckRequest, CheckState, Checker, Language, LanguageChecks, Problem,
-    ProblemSnapshot, Severity, UnavailableReason,
+    ProblemSnapshot, Severity, UnavailableReason, run_failure_cause,
 };
 
 /// Name of the pyright project config file consulted at a worktree's root.
@@ -196,22 +196,26 @@ impl Checker for PythonChecker {
                 );
             };
             let tmp_dir = request.cache_dir.join("tmp");
-            if fs::create_dir_all(&tmp_dir).is_err() {
-                return ProblemSnapshot::unavailable(
+            if let Err(error) = fs::create_dir_all(&tmp_dir) {
+                return ProblemSnapshot::unavailable_with_detail(
                     crate::LANGUAGE,
                     UnavailableReason::Fatal,
                     generation,
+                    0,
+                    run_failure_cause(error.to_string().as_bytes(), None),
                 );
             }
             let spec = self.pyright_spec(&request, &interpreter);
             let started = Instant::now();
             let output = match self.runner.run(spec).await {
                 Ok(output) => output,
-                Err(_) => {
-                    return ProblemSnapshot::unavailable(
+                Err(error) => {
+                    return ProblemSnapshot::unavailable_with_detail(
                         crate::LANGUAGE,
                         UnavailableReason::Fatal,
                         generation,
+                        started.elapsed().as_millis() as u64,
+                        run_failure_cause(error.to_string().as_bytes(), None),
                     );
                 }
             };
@@ -226,6 +230,7 @@ impl Checker for PythonChecker {
             let mut snapshot = parse_pyright_output_with_denies(
                 output.status,
                 &output.stdout,
+                &output.stderr,
                 generation,
                 duration_ms,
                 &request.worktree,
@@ -610,10 +615,12 @@ struct PyrightSummary {
 ///
 /// `exit` is the process exit code (`None` when the process was killed by a signal; the caller
 /// is expected to have already handled a timeout kill separately and never call this function for
-/// one). `stdout` is the captured `--outputjson` report. Only exit `0` or `1` with a parseable
-/// report are accepted; any other exit code, or a report `serde_json` cannot parse, produces
-/// [`UnavailableReason::Fatal`] without inspecting `stdout` further. A parsed report whose
-/// `summary.filesAnalyzed` is `0` produces [`UnavailableReason::NoFiles`] with a `detail`
+/// one). `stdout` is the captured `--outputjson` report; `stderr` is only read for a failure
+/// cause. Only exit `0` or `1` with a parseable report are accepted; any other exit code, or a
+/// report `serde_json` cannot parse, produces [`UnavailableReason::Fatal`] carrying the run's
+/// cause ([`run_failure_cause`]: first `error:` line of `stderr`, else its first non-empty line,
+/// else `exit <status>`) so a refused sandbox apply or a crashed node says why. A parsed report
+/// whose `summary.filesAnalyzed` is `0` produces [`UnavailableReason::NoFiles`] with a `detail`
 /// pointing at the project's `include`/`exclude` configuration: pyright ran against a resolved
 /// environment but had nothing to analyze, which is a project-configuration problem, not a
 /// missing interpreter ([`UnavailableReason::EnvMissing`] stays reserved for that). A parsed
@@ -626,12 +633,14 @@ struct PyrightSummary {
 pub fn parse_pyright_output(
     exit: Option<i32>,
     stdout: &[u8],
+    stderr: &[u8],
     input_generation: u64,
     duration_ms: u64,
 ) -> ProblemSnapshot {
     parse_pyright_output_with_denies(
         exit,
         stdout,
+        stderr,
         input_generation,
         duration_ms,
         Path::new(""),
@@ -643,23 +652,28 @@ pub fn parse_pyright_output(
 fn parse_pyright_output_with_denies(
     exit: Option<i32>,
     stdout: &[u8],
+    stderr: &[u8],
     input_generation: u64,
     duration_ms: u64,
     worktree: &Path,
     denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
 ) -> ProblemSnapshot {
     if !matches!(exit, Some(0) | Some(1)) {
-        return ProblemSnapshot::unavailable(
+        return ProblemSnapshot::unavailable_with_detail(
             crate::LANGUAGE,
             UnavailableReason::Fatal,
             input_generation,
+            duration_ms,
+            run_failure_cause(stderr, exit),
         );
     }
     let Ok(report) = serde_json::from_slice::<PyrightReport>(stdout) else {
-        return ProblemSnapshot::unavailable(
+        return ProblemSnapshot::unavailable_with_detail(
             crate::LANGUAGE,
             UnavailableReason::Fatal,
             input_generation,
+            duration_ms,
+            run_failure_cause(stderr, exit),
         );
     };
     if report.summary.files_analyzed == 0 {
@@ -667,6 +681,7 @@ fn parse_pyright_output_with_denies(
             crate::LANGUAGE,
             UnavailableReason::NoFiles,
             input_generation,
+            duration_ms,
             Some(NO_FILES_DETAIL.to_owned()),
         );
     }
@@ -700,10 +715,12 @@ fn parse_pyright_output_with_denies(
     }
 
     if errors != report.summary.error_count || warnings != report.summary.warning_count {
-        return ProblemSnapshot::unavailable(
+        return ProblemSnapshot::unavailable_with_detail(
             crate::LANGUAGE,
             UnavailableReason::Fatal,
             input_generation,
+            duration_ms,
+            run_failure_cause(stderr, exit),
         );
     }
 
@@ -719,27 +736,14 @@ fn parse_pyright_output_with_denies(
 /// Python's project-check integration.
 pub struct PythonChecks;
 
-/// Root-level marker files whose presence identifies a worktree as a Python project (T10B),
-/// besides a `.venv`/`venv` directory (checked separately since it is a directory, not a file).
-const PYTHON_PRESENCE_FILES: [&str; 6] = [
-    "pyproject.toml",
-    "setup.py",
-    "setup.cfg",
-    "requirements.txt",
-    "Pipfile",
-    "pyrightconfig.json",
-];
-
 impl LanguageChecks for PythonChecks {
-    /// Python is present iff the worktree root has any of `pyproject.toml`, `setup.py`,
-    /// `setup.cfg`, `requirements.txt`, `Pipfile`, `pyrightconfig.json`, or a `.venv`/`venv`
-    /// directory. This deliberately never walks the tree for source files (for example `*.py`).
+    /// Python is present iff the worktree matches the shared marker rule
+    /// ([`crate::support::is_python_project`], the same list the project card uses): root
+    /// `pyproject.toml`/`setup.py`/`setup.cfg`/`Pipfile`/`pyrightconfig.json`/`requirements*.txt`,
+    /// a `.venv`/`venv` directory, or a bounded depth-1 probe of immediate subdirectories. This
+    /// deliberately never walks the tree for source files (for example `*.py`).
     fn is_present(&self, worktree: &Path) -> bool {
-        PYTHON_PRESENCE_FILES
-            .iter()
-            .any(|name| worktree.join(name).exists())
-            || worktree.join(".venv").is_dir()
-            || worktree.join("venv").is_dir()
+        crate::support::is_python_project(worktree)
     }
 
     /// `pyright`.
@@ -948,12 +952,31 @@ mod deny_tests {
     }
 
     #[test]
-    fn is_present_python_accepts_any_marker_file_or_venv_directory() {
-        for marker in PYTHON_PRESENCE_FILES {
+    fn is_present_python_accepts_any_shared_marker() {
+        for marker in [
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "Pipfile",
+            "pyrightconfig.json",
+        ] {
             let dir = scratch_dir(&format!("python-presence-{marker}"));
             assert!(!PythonChecks.is_present(&dir), "{marker}");
             std::fs::write(dir.join(marker), "").unwrap();
             assert!(PythonChecks.is_present(&dir), "{marker}");
+        }
+        // The glob, not an exact name: a root `requirements-dev.txt` used to register the card
+        // while checks stayed silent because the old presence list matched `requirements.txt`
+        // only.
+        for name in [
+            "requirements.txt",
+            "requirements-dev.txt",
+            "requirements-ml.txt",
+        ] {
+            let dir = scratch_dir(&format!("python-presence-{name}"));
+            assert!(!PythonChecks.is_present(&dir), "{name}");
+            std::fs::write(dir.join(name), "").unwrap();
+            assert!(PythonChecks.is_present(&dir), "{name}");
         }
         for venv_name in [".venv", "venv"] {
             let dir = scratch_dir(&format!("python-presence-{venv_name}"));
@@ -961,6 +984,37 @@ mod deny_tests {
             std::fs::create_dir(dir.join(venv_name)).unwrap();
             assert!(PythonChecks.is_present(&dir), "{venv_name}");
         }
+    }
+
+    /// The bounded depth-1 probe: a script directory such as `tools/` carrying
+    /// `requirements-ml.txt` or a nested `pyproject.toml` registers Python; the probe never
+    /// recurses (`nested/deep/requirements.txt` stays invisible) and skips hidden directories.
+    #[test]
+    fn is_present_python_accepts_depth_one_nested_markers_only() {
+        let dir = scratch_dir("python-presence-nested-tools");
+        assert!(!PythonChecks.is_present(&dir));
+        std::fs::create_dir_all(dir.join("tools")).unwrap();
+        std::fs::write(dir.join("tools/requirements-ml.txt"), "").unwrap();
+        assert!(
+            PythonChecks.is_present(&dir),
+            "tools/requirements-ml.txt registers"
+        );
+
+        let dir = scratch_dir("python-presence-nested-pyproject");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/pyproject.toml"), "").unwrap();
+        assert!(
+            PythonChecks.is_present(&dir),
+            "sub/pyproject.toml registers"
+        );
+
+        let dir = scratch_dir("python-presence-nested-deep");
+        std::fs::create_dir_all(dir.join("nested/deep")).unwrap();
+        std::fs::write(dir.join("nested/deep/requirements.txt"), "").unwrap();
+        assert!(
+            !PythonChecks.is_present(&dir),
+            "the probe is depth-1 and never walks the tree"
+        );
     }
 
     #[test]

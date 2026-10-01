@@ -318,21 +318,30 @@ impl Scheduler {
     /// `input_generation` once regardless of how many languages are configured. A trigger
     /// received after [`Scheduler::shutdown`] has started is silently ignored.
     pub fn trigger(&self, repository_key: &str, worktree: &Path) {
-        self.trigger_inner(repository_key, worktree, false, false);
+        self.trigger_inner(repository_key, worktree, None, false, false);
+    }
+
+    /// Like [`Scheduler::trigger`], naming the changed file when the trigger knows it: only that
+    /// file's language is re-armed, so a `.py` edit never starts a cargo check. A path no
+    /// registered language owns (for example `Cargo.toml` or `README.md`) re-arms every
+    /// configured language, matching a path-less trigger.
+    pub fn trigger_for_path(&self, repository_key: &str, worktree: &Path, path: &Path) {
+        self.trigger_inner(repository_key, worktree, Some(path), false, false);
     }
 
     /// Like [`Scheduler::trigger`], for a check a caller is waiting on (an edit reply): it forces
     /// a check of the requested inputs even when the unchanged-input fingerprint matches, and
-    /// skips the cooldown after the previous run.
-    pub fn trigger_urgent(&self, repository_key: &str, worktree: &Path) {
-        self.trigger_inner(repository_key, worktree, false, true);
+    /// skips the cooldown after the previous run. `path` names the changed file when the caller
+    /// knows it; see [`Scheduler::trigger_for_path`] for how it narrows the armed languages.
+    pub fn trigger_urgent(&self, repository_key: &str, worktree: &Path, path: Option<&Path>) {
+        self.trigger_inner(repository_key, worktree, path, false, true);
     }
 
     /// Like [`Scheduler::trigger`], for a session activating `worktree`: also records the new
     /// `input_generation` as the activation generation, so [`Scheduler::stale`] flags every
     /// snapshot produced before this activation until a check completed after it replaces it.
     pub fn activate(&self, repository_key: &str, worktree: &Path) {
-        self.trigger_inner(repository_key, worktree, true, false);
+        self.trigger_inner(repository_key, worktree, None, true, false);
     }
 
     /// Cancels this worktree's pending and running checks when its caller loses whole-tree read
@@ -355,8 +364,20 @@ impl Scheduler {
         }
     }
 
-    /// Shared body of [`Scheduler::trigger`] and [`Scheduler::activate`].
-    fn trigger_inner(&self, repository_key: &str, worktree: &Path, activation: bool, urgent: bool) {
+    /// Shared body of the trigger entry points. `path` names the changed file when the caller
+    /// knows it: only that file's language is re-armed, so one language's edit never starts
+    /// another language's check. A path whose language is registered but has no configured
+    /// checker arms nothing (the all-language path would not check it either); a path no
+    /// registered language owns — `Cargo.toml`, `README.md` — and a path-less trigger (Bash,
+    /// activation) keep the previous every-configured-language behaviour.
+    fn trigger_inner(
+        &self,
+        repository_key: &str,
+        worktree: &Path,
+        path: Option<&Path>,
+        activation: bool,
+        urgent: bool,
+    ) {
         let worktree = canonical_worktree(worktree);
         let mut state = self.inner.lock_state();
         if state.shutting_down {
@@ -372,7 +393,12 @@ impl Scheduler {
         if activation {
             wt.activation_generation = wt.input_generation;
         }
-        for language in self.inner.checkers.keys().copied().collect::<Vec<_>>() {
+        let armed: Vec<Language> = match path.and_then(Language::for_path) {
+            Some(language) if self.inner.checkers.contains_key(&language) => vec![language],
+            Some(_) => Vec::new(),
+            None => self.inner.checkers.keys().copied().collect(),
+        };
+        for language in armed {
             let lang = wt.languages.entry(language).or_default();
             if urgent {
                 lang.urgent = true;
@@ -1437,7 +1463,7 @@ mod deny_tests {
                     .insert(root.clone(), worktree);
             }
 
-            scheduler.trigger_urgent("repo", &root);
+            scheduler.trigger_urgent("repo", &root, None);
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     if checker.requests().len() == 1
@@ -1465,6 +1491,74 @@ mod deny_tests {
             scheduler.shutdown().await;
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    /// A trigger that names the changed file re-arms only that file's language: a `.beta` edit
+    /// never starts the alpha check. A path no registered language owns (`Cargo.toml`) and a
+    /// path-less trigger (`Bash`, activation) keep arming every configured language.
+    #[tokio::test]
+    async fn path_trigger_arms_only_the_changed_files_language() {
+        crate::lang::testing::install();
+        let root =
+            std::env::temp_dir().join(format!("agent-ide-path-trigger-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        std::fs::write(root.join("alpha.toml"), "").unwrap();
+        std::fs::write(root.join("beta.toml"), "").unwrap();
+        let ready = |language| {
+            ProblemSnapshot::from_problems(language, CheckState::Ready, Vec::new(), 1, 0)
+        };
+        let alpha = Arc::new(FakeChecker::new(
+            crate::lang::testing::ALPHA,
+            ready(crate::lang::testing::ALPHA),
+        ));
+        let beta = Arc::new(FakeChecker::new(
+            crate::lang::testing::BETA,
+            ready(crate::lang::testing::BETA),
+        ));
+        let scheduler = Scheduler::new(
+            vec![alpha.clone(), beta.clone()],
+            Duration::from_millis(1),
+            1,
+            root.join("cache"),
+        );
+
+        scheduler.trigger_for_path("repo", &root, Path::new("src/module.beta"));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while beta.requests().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the changed file's language is checked");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            alpha.requests().is_empty(),
+            "a .beta edit must not start the alpha check"
+        );
+
+        for (label, path) in [
+            ("unowned extension", Some(Path::new("Cargo.toml"))),
+            ("path-less trigger", None),
+        ] {
+            let (alpha_before, beta_before) = (alpha.requests().len(), beta.requests().len());
+            match path {
+                Some(path) => scheduler.trigger_for_path("repo", &root, path),
+                None => scheduler.trigger("repo", &root),
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while alpha.requests().len() <= alpha_before || beta.requests().len() <= beta_before
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{label} arms every configured language"));
+        }
+
+        scheduler.shutdown().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A check already running when an edit arrives must also run its dirty follow-up even when

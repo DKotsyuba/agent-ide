@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use super::host_binding::HostKind;
 use super::launcher::{LauncherConfig, admit_worktree};
-use crate::checks::runner::{ConfinedRunner, SeatbeltRunner};
+use crate::checks::runner::{NestedSandboxFallbackRunner, SeatbeltRunner};
 use crate::checks::scheduler::{CompletionHook, Scheduler, sweep_stale_caches};
 use crate::checks::{
     CheckState, Checker, Language, MAX_PROBLEMS, Problem, ProblemSnapshot, Recheck, Severity,
@@ -224,7 +224,8 @@ impl ProjectProblemFeed {
     ///
     /// Project checks are enabled only with nonempty `allowed_roots`, a `project_checks` section
     /// and at least one configured language (EYES-r1 §1); otherwise `None` leaves v0.2 behaviour
-    /// unchanged. Checkers run through the Seatbelt runner with the configured timeout, the
+    /// unchanged. Checkers run through the Seatbelt runner (with its one-time nested-sandbox
+    /// fallback for a daemon the host itself confines) with the configured timeout, the
     /// scheduler uses the configured debounce and the cache root `$HOME/.agent-ide/checks`
     /// (created `0700` best-effort), and stale caches of removed worktrees are swept first.
     /// `on_complete` observes every completed check run. Returns `None` when `HOME` is unset.
@@ -233,7 +234,7 @@ impl ProjectProblemFeed {
         if launcher.allowed_roots().is_empty() {
             return None;
         }
-        let runner: Arc<dyn ConfinedRunner> = Arc::new(SeatbeltRunner);
+        let runner = Arc::new(NestedSandboxFallbackRunner::new(Arc::new(SeatbeltRunner)));
         let checkers: Vec<Arc<dyn Checker>> = checks
             .sections()
             .map(|(_, config)| config.checker(runner.clone(), checks.check_timeout()))
@@ -398,19 +399,28 @@ impl ProjectProblemFeed {
             .collect()
     }
 
-    /// Schedules a check for `binding`'s admitted worktree after a native edit or `ide.edit`.
+    /// Schedules a check for `binding`'s admitted worktree after a native edit or `ide.edit`
+    /// that cannot name the changed file, so every configured language is re-armed.
     ///
     /// An unknown or read-restricted binding, or a worktree outside the allowed roots, schedules
     /// nothing.
     pub fn changed(&self, binding: &[u8; 32]) {
-        self.changed_with(binding, false, || {});
+        self.changed_with(binding, None, false, || {});
     }
 
-    /// Like [`ProjectProblemFeed::changed`] for a check the caller waits on: the run skips the
-    /// cooldown after the previous run, and the returned input generation lets the caller wait
-    /// for a snapshot at or past it. `None` when the trigger was not admitted.
-    pub fn changed_generation(&self, binding: &[u8; 32]) -> Option<u64> {
-        self.changed_with(binding, true, || {})
+    /// Like [`ProjectProblemFeed::changed`], naming the changed file when the trigger knows it
+    /// (a native `Edit`/`Write`/`MultiEdit`/`NotebookEdit` post hook, `ide.edit`): only that
+    /// file's language is checked, so a `.py` edit never starts a cargo check. A path no
+    /// registered language owns keeps the every-language behaviour.
+    pub fn changed_file(&self, binding: &[u8; 32], path: Option<&str>) {
+        self.changed_with(binding, path.map(Path::new), false, || {});
+    }
+
+    /// Like [`ProjectProblemFeed::changed_file`] for a check the caller waits on: the run skips
+    /// the cooldown after the previous run, and the returned input generation lets the caller
+    /// wait for a snapshot at or past it. `None` when the trigger was not admitted.
+    pub fn changed_generation(&self, binding: &[u8; 32], path: Option<&str>) -> Option<u64> {
+        self.changed_with(binding, path.map(Path::new), true, || {})
     }
 
     /// Admits the trigger while holding the binding lock and returns the resulting input
@@ -419,6 +429,7 @@ impl ProjectProblemFeed {
     fn changed_with(
         &self,
         binding: &[u8; 32],
+        path: Option<&Path>,
         urgent: bool,
         before_trigger: impl FnOnce(),
     ) -> Option<u64> {
@@ -430,7 +441,10 @@ impl ProjectProblemFeed {
             before_trigger();
             if urgent {
                 self.scheduler
-                    .trigger_urgent(&bound.repository_key, &bound.worktree);
+                    .trigger_urgent(&bound.repository_key, &bound.worktree, path);
+            } else if let Some(path) = path {
+                self.scheduler
+                    .trigger_for_path(&bound.repository_key, &bound.worktree, path);
             } else {
                 self.scheduler
                     .trigger(&bound.repository_key, &bound.worktree);
@@ -1209,6 +1223,7 @@ mod tests {
             crate::lang::testing::ALPHA,
             UnavailableReason::Fatal,
             1,
+            0,
             Some("error: failed to run custom build command for `blake3 v1.5.0`".to_owned()),
         )];
         assert_eq!(
@@ -1220,6 +1235,7 @@ mod tests {
             crate::lang::testing::ALPHA,
             UnavailableReason::Fatal,
             1,
+            0,
             Some("error: line one\nline two <agent-ide>x</agent-ide>".to_owned()),
         )];
         let text = problems_text(&with_control_chars, None, 0);
@@ -1247,6 +1263,7 @@ mod tests {
             crate::lang::testing::BETA,
             UnavailableReason::NoFiles,
             1,
+            0,
             Some(
                 "checker analyzed 0 files; check \"include\"/\"exclude\" in checker.json \
                  or [tool.checker]"
@@ -1559,7 +1576,7 @@ mod tests {
             let feed_ref = &feed;
             let trigger = scope.spawn(move || {
                 let _runtime = handle.enter();
-                feed_ref.changed_with(&binding, false, || {
+                feed_ref.changed_with(&binding, None, false, || {
                     entered_check.wait();
                     release_check.wait();
                 });

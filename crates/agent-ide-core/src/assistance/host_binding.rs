@@ -14,6 +14,8 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 const MAX_IDENTIFIER_BYTES: usize = 256;
+/// Longest retained `tool_input.file_path` of a writer tool post event.
+const MAX_TOOL_FILE_BYTES: usize = 1024;
 const MAX_HOOK_METADATA_BYTES: usize = 64 * 1024;
 /// Bounds observed and settling calls within one exact channel, host, and actor scope.
 const MAX_PENDING_PER_SCOPE: usize = 128;
@@ -260,6 +262,11 @@ pub struct HookEvent {
     /// host-specific project-check triggers (EYES-r2 §5, T29B §4) and never carries tool input
     /// or output.
     tool_name: Option<String>,
+    /// Bounded `tool_input.file_path` of a post-phase writer tool (Claude's
+    /// `Edit`/`Write`/`MultiEdit`/`NotebookEdit`), retained so the check trigger can re-arm only
+    /// the changed file's language. Everything else in `tool_input` — including file content —
+    /// stays discarded.
+    tool_file: Option<String>,
 }
 
 impl HookEvent {
@@ -304,6 +311,14 @@ impl HookEvent {
     /// bounded name.
     pub fn tool_name(&self) -> Option<&str> {
         self.tool_name.as_deref()
+    }
+
+    /// Returns the bounded `tool_input.file_path` of a post or post-failure writer event.
+    ///
+    /// Absent for every other phase, for tools whose input names no file (`Bash`), and whenever
+    /// the value is not a bounded non-empty string; an invalid value is dropped, never rejected.
+    pub fn tool_file(&self) -> Option<&str> {
+        self.tool_file.as_deref()
     }
 }
 
@@ -1362,17 +1377,19 @@ pub fn parse_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable>
         session_id,
         agent_type: None,
         tool_name,
+        tool_file: None,
     })
 }
 
 /// Parses Claude Code's documented hook identity without treating permission mode as a sandbox.
 ///
 /// `session_id` is always retained. A subagent is identified by its exact optional `agent_id`,
-/// while a parent is identified by `session_id`; `agent_type` is descriptive only. `tool_name` is
-/// retained only for `PostToolUse`/`PostToolUseFailure` and only when it is a valid bounded
-/// identifier; an invalid name is dropped rather than rejecting the event. Tool input, output,
-/// permission mode, paths, source, and unknown fields are discarded. `PostToolBatch` deliberately
-/// has no fabricated call identity.
+/// while a parent is identified by `session_id`; `agent_type` is descriptive only. `tool_name`
+/// and the bounded `tool_input.file_path` of a writer tool are retained only for
+/// `PostToolUse`/`PostToolUseFailure` and only when valid; an invalid value is dropped rather
+/// than rejecting the event. The rest of tool input, all tool output, permission mode, other
+/// paths, source, and unknown fields are discarded. `PostToolBatch` deliberately has no
+/// fabricated call identity.
 pub fn parse_claude_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable> {
     if payload.len() > MAX_HOOK_METADATA_BYTES {
         return Err(BindingUnavailable::InvalidMetadata);
@@ -1408,6 +1425,15 @@ pub fn parse_claude_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnava
             .and_then(|name| checked_identifier(name, "tool_name").ok()),
         _ => None,
     };
+    let tool_file = match phase {
+        HookPhase::Post | HookPhase::PostFailure => payload
+            .tool_input
+            .as_ref()
+            .and_then(|input| input.get("file_path"))
+            .and_then(|value| value.as_str())
+            .and_then(|path| checked_tool_file(path.to_owned())),
+        _ => None,
+    };
     Ok(HookEvent {
         host: HostKind::Claude,
         phase,
@@ -1416,7 +1442,17 @@ pub fn parse_claude_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnava
         session_id: Some(session_id),
         agent_type,
         tool_name,
+        tool_file,
     })
+}
+
+/// Accepts one bounded non-empty tool file path, or `None` for anything else.
+///
+/// A path longer than [`MAX_TOOL_FILE_BYTES`] (or empty, or not a string) is dropped, never
+/// rejected: the check trigger then conservatively re-arms every configured language instead of
+/// losing the whole event.
+fn checked_tool_file(value: String) -> Option<String> {
+    (!value.is_empty() && value.len() <= MAX_TOOL_FILE_BYTES).then_some(value)
 }
 
 /// Selects only Codex correlation fields plus the post-phase tool name, rejects duplicate known
@@ -1451,6 +1487,8 @@ struct ClaudeHookPayload {
     tool_use_id: Option<String>,
     /// Native tool name; retained only for the post phases after bounded validation.
     tool_name: Option<String>,
+    /// Whole native tool input; only its bounded `file_path` string is ever retained.
+    tool_input: Option<serde_json::Value>,
 }
 
 /// Reads a required bounded string field without reporting its raw value.
@@ -1523,6 +1561,58 @@ mod tests {
             .as_bytes(),
         )
         .expect("test hook is valid")
+    }
+
+    /// A Claude writer post retains only the bounded `tool_input.file_path` — the one field the
+    /// check trigger uses to re-arm just the changed file's language. A tool whose input names
+    /// no file (`Bash`), a pre phase, and an over-limit path all contribute no file, and an
+    /// invalid value is dropped rather than rejecting the event.
+    #[test]
+    fn claude_post_retains_only_the_bounded_tool_input_file_path() {
+        let payload = |tool_name: &str, tool_input: serde_json::Value| {
+            parse_claude_hook_event(
+                json!({
+                    "hook_event_name": "PostToolUse",
+                    "session_id": "session",
+                    "tool_use_id": "call",
+                    "tool_name": tool_name,
+                    "tool_input": tool_input,
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .expect("writer post with tool input is valid")
+        };
+        let edit = payload(
+            "Edit",
+            json!({"file_path": "/worktree/src/module.rs", "old_string": "a", "new_string": "b"}),
+        );
+        assert_eq!(edit.tool_name(), Some("Edit"));
+        assert_eq!(edit.tool_file(), Some("/worktree/src/module.rs"));
+
+        let bash = payload("Bash", json!({"command": "cargo check", "timeout": 120}));
+        assert_eq!(bash.tool_name(), Some("Bash"));
+        assert_eq!(bash.tool_file(), None, "a command names no file");
+
+        let oversize = payload(
+            "Write",
+            json!({"file_path": "x".repeat(1025), "content": "y"}),
+        );
+        assert_eq!(oversize.tool_file(), None, "an over-limit path is dropped");
+
+        let pre = parse_claude_hook_event(
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "session",
+                "tool_use_id": "call",
+                "tool_name": "Edit",
+                "tool_input": {"file_path": "/worktree/src/module.rs"},
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("pre hook is valid");
+        assert_eq!(pre.tool_file(), None, "a pre phase carries no file");
     }
 
     /// Builds one parser-shaped Codex lifecycle event for an exact actor and call.

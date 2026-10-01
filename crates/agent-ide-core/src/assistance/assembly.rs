@@ -421,9 +421,24 @@ impl ProductDispatcher {
                     }
                     return None;
                 }
-                // Six fixed relayed fields plus the optional `tool_name`; a hook from a release
-                // that still relays the retired helper fields does not correlate.
-                if object.len() != 6 + usize::from(object.contains_key("tool_name")) {
+                // Six fixed relayed fields plus the optional post-phase `tool_name` and the
+                // writer tool's optional `tool_file` (the changed file whose language alone is
+                // re-checked); any other field — for example a retired helper field — means the
+                // observation does not correlate.
+                let relayed = [
+                    "host",
+                    "phase",
+                    "actor_id",
+                    "call_id",
+                    "session_id",
+                    "agent_type",
+                    "tool_name",
+                    "tool_file",
+                ]
+                .iter()
+                .filter(|field| object.contains_key(**field))
+                .count();
+                if relayed != object.len() {
                     return None;
                 }
                 let phase = match object.get("phase")?.as_str()? {
@@ -522,7 +537,12 @@ impl ProductDispatcher {
                             let fingerprint = binding.fingerprint();
                             let feed = worker.project_feed().filter(|_| hook_post);
                             if triggers_check && let Some(feed) = feed {
-                                feed.changed(&fingerprint);
+                                // A writer tool that named its file re-arms only that file's
+                                // language; `Bash` and tools without a path re-arm every one.
+                                feed.changed_file(
+                                    &fingerprint,
+                                    object.get("tool_file").and_then(|value| value.as_str()),
+                                );
                             }
                             let feedback =
                                 if feed.is_some_and(|feed| feed.is_read_restricted(&fingerprint)) {

@@ -15,7 +15,7 @@ use agent_ide_core::assistance::launcher::absolute;
 use agent_ide_core::checks::runner::{ConfinedRunner, RunOutput, RunSpec};
 use agent_ide_core::checks::{
     BoxFuture, CheckConfig, CheckRequest, CheckState, Checker, Language, LanguageChecks, Problem,
-    ProblemSnapshot, Severity, UnavailableReason,
+    ProblemSnapshot, Severity, UnavailableReason, run_failure_cause,
 };
 use agent_ide_core::execution::seatbelt::ReadDeny;
 
@@ -222,11 +222,13 @@ impl Checker for TypeScriptChecker {
             let started = Instant::now();
             let output = match self.runner.run(spec.clone()).await {
                 Ok(output) => output,
-                Err(_) => {
-                    return ProblemSnapshot::unavailable(
+                Err(error) => {
+                    return ProblemSnapshot::unavailable_with_detail(
                         crate::LANGUAGE,
                         UnavailableReason::Fatal,
                         generation,
+                        started.elapsed().as_millis() as u64,
+                        run_failure_cause(error.to_string().as_bytes(), None),
                     );
                 }
             };
@@ -397,10 +399,12 @@ fn report_path_allowed(worktree: &Path, reported: &str, denies: &[ReadDeny]) -> 
 /// Parses pinned `tsc --pretty false --diagnostics --listFiles --noEmit` output.
 ///
 /// Unknown lines, footer mismatch, denied diagnostic paths, inconsistent exit status, and
-/// truncation become `Fatal`. With any host read deny, arbitrary diagnostic message text is
-/// redacted after deduplication while admitted path, severity, and TS code remain; counts retain
-/// distinct diagnostics. Zero analyzed worktree files become `NoFiles` even with a config
-/// diagnostic, so no numeric zero is presented as a clean project result.
+/// truncation become `Fatal`, carrying the run's cause ([`run_failure_cause`]: first `error:`
+/// line of `stderr`, else its first non-empty line, else `exit <status>`) so a failed run says
+/// why instead of "checker supplied no reason". With any host read deny, arbitrary diagnostic
+/// message text is redacted after deduplication while admitted path, severity, and TS code
+/// remain; counts retain distinct diagnostics. Zero analyzed worktree files become `NoFiles`
+/// even with a config diagnostic, so no numeric zero is presented as a clean project result.
 pub fn parse_tsc_output(
     output: &RunOutput,
     worktree: &Path,
@@ -409,8 +413,15 @@ pub fn parse_tsc_output(
     generation: u64,
     duration_ms: u64,
 ) -> ProblemSnapshot {
-    let fatal =
-        || ProblemSnapshot::unavailable(crate::LANGUAGE, UnavailableReason::Fatal, generation);
+    let fatal = || {
+        ProblemSnapshot::unavailable_with_detail(
+            crate::LANGUAGE,
+            UnavailableReason::Fatal,
+            generation,
+            duration_ms,
+            run_failure_cause(&output.stderr, output.status),
+        )
+    };
     if output.truncated
         || output.timed_out
         || !output.stderr.is_empty()

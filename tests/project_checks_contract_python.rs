@@ -57,7 +57,7 @@ fn toolchain_paths() -> (PathBuf, PathBuf) {
 #[test]
 fn python_parses_clean_project_json_as_ready_with_zero_counts() {
     let stdout = fs::read(fixture("clean/pyright_output.json")).expect("clean fixture readable");
-    let snapshot = parse_pyright_output(Some(0), &stdout, 5, 42);
+    let snapshot = parse_pyright_output(Some(0), &stdout, b"", 5, 42);
     assert_eq!(snapshot.state, CheckState::Ready);
     assert_eq!(snapshot.errors, 0);
     assert_eq!(snapshot.warnings, 0);
@@ -72,7 +72,7 @@ fn python_parses_errors_and_warnings_including_never_opened_file() {
     let template =
         fs::read_to_string(dir.join("pyright_output.json")).expect("errors fixture readable");
     let stdout = template.replace("{{FIXTURE_DIR}}", &dir.display().to_string());
-    let snapshot = parse_pyright_output(Some(1), stdout.as_bytes(), 7, 179);
+    let snapshot = parse_pyright_output(Some(1), stdout.as_bytes(), b"", 7, 179);
     assert_eq!(snapshot.state, CheckState::Ready);
     assert_eq!(snapshot.errors, 2);
     assert_eq!(snapshot.warnings, 2);
@@ -95,18 +95,51 @@ fn python_parses_errors_and_warnings_including_never_opened_file() {
 fn python_bad_config_exit_3_is_fatal_regardless_of_json() {
     let stdout =
         fs::read(fixture("badconfig/pyright_output.json")).expect("badconfig fixture readable");
-    let snapshot = parse_pyright_output(Some(3), &stdout, 1, 1);
+    let stderr = b"error: invalid pyrightconfig.json\n";
+    let snapshot = parse_pyright_output(Some(3), &stdout, stderr, 1, 1);
     assert_eq!(
         snapshot.state,
         CheckState::Unavailable(UnavailableReason::Fatal)
     );
     assert_eq!(snapshot.errors, 0);
     assert_eq!(snapshot.warnings, 0);
+    // The failure's cause is never dropped: the first `error:` line of stderr becomes the
+    // snapshot detail the plate and journal render.
+    assert_eq!(
+        snapshot.detail.as_deref(),
+        Some("error: invalid pyrightconfig.json")
+    );
+    assert_eq!(snapshot.duration_ms, 1);
+}
+
+/// A run that failed with no `error:` line still says why: the first non-empty stderr line
+/// (a wrapper refusal such as the nested-sandbox `sandbox_apply` message) stands in, and a run
+/// that said nothing at all reports its exit status.
+#[test]
+fn python_fatal_without_error_line_keeps_the_cause_or_exit_status() {
+    let refusal = b"sandbox-exec: sandbox_apply: Operation not permitted\n";
+    let snapshot = parse_pyright_output(Some(71), b"", refusal, 1, 11);
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::Fatal)
+    );
+    assert_eq!(
+        snapshot.detail.as_deref(),
+        Some("sandbox-exec: sandbox_apply: Operation not permitted")
+    );
+    assert_eq!(snapshot.duration_ms, 11);
+
+    let silent = parse_pyright_output(Some(71), b"", b"", 1, 11);
+    assert_eq!(
+        silent.state,
+        CheckState::Unavailable(UnavailableReason::Fatal)
+    );
+    assert_eq!(silent.detail.as_deref(), Some("exit 71"));
 }
 
 #[test]
 fn python_unparseable_stdout_is_fatal() {
-    let snapshot = parse_pyright_output(Some(0), b"not json", 1, 1);
+    let snapshot = parse_pyright_output(Some(0), b"not json", b"", 1, 1);
     assert_eq!(
         snapshot.state,
         CheckState::Unavailable(UnavailableReason::Fatal)
@@ -115,7 +148,7 @@ fn python_unparseable_stdout_is_fatal() {
 
 #[test]
 fn python_signal_killed_exit_is_fatal() {
-    let snapshot = parse_pyright_output(None, b"{}", 1, 1);
+    let snapshot = parse_pyright_output(None, b"{}", b"", 1, 1);
     assert_eq!(
         snapshot.state,
         CheckState::Unavailable(UnavailableReason::Fatal)
@@ -124,7 +157,7 @@ fn python_signal_killed_exit_is_fatal() {
 
 #[test]
 fn python_exit_code_two_is_fatal() {
-    let snapshot = parse_pyright_output(Some(2), b"{}", 1, 1);
+    let snapshot = parse_pyright_output(Some(2), b"{}", b"", 1, 1);
     assert_eq!(
         snapshot.state,
         CheckState::Unavailable(UnavailableReason::Fatal)
@@ -134,7 +167,7 @@ fn python_exit_code_two_is_fatal() {
 #[test]
 fn python_files_analyzed_zero_is_no_files() {
     let json = br#"{"generalDiagnostics": [], "summary": {"errorCount": 0, "warningCount": 0, "filesAnalyzed": 0}}"#;
-    let snapshot = parse_pyright_output(Some(0), json, 1, 1);
+    let snapshot = parse_pyright_output(Some(0), json, b"", 1, 1);
     assert_eq!(
         snapshot.state,
         CheckState::Unavailable(UnavailableReason::NoFiles)
@@ -151,7 +184,7 @@ fn python_files_analyzed_zero_is_no_files() {
 #[test]
 fn python_count_mismatch_against_summary_is_fatal() {
     let json = br#"{"generalDiagnostics": [], "summary": {"errorCount": 1, "warningCount": 0, "filesAnalyzed": 3}}"#;
-    let snapshot = parse_pyright_output(Some(0), json, 1, 1);
+    let snapshot = parse_pyright_output(Some(0), json, b"", 1, 1);
     assert_eq!(
         snapshot.state,
         CheckState::Unavailable(UnavailableReason::Fatal)
@@ -252,6 +285,9 @@ async fn python_checker_runner_error_is_unavailable_fatal() {
         snapshot.state,
         CheckState::Unavailable(UnavailableReason::Fatal)
     );
+    // The runner's io::Error text is the snapshot's cause, so the plate says why instead of
+    // "checker supplied no reason".
+    assert_eq!(snapshot.detail.as_deref(), Some("spawn failed"));
 }
 
 #[tokio::test]

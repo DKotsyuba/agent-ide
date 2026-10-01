@@ -1295,7 +1295,7 @@ async fn binary_codex_hook_hung_daemon_deadline_sends_only_selected_fields() {
         assert_eq!(
             frame["sanitized_observation_json"],
             json!({"host":"codex","phase":"pre","actor_id":"child","call_id":"hung",
-                "session_id":null,"agent_type":null,"tool_name":null})
+                "session_id":null,"agent_type":null,"tool_name":null,"tool_file":null})
         );
         let wire = String::from_utf8(bytes).unwrap();
         for private in [
@@ -6303,6 +6303,51 @@ async fn configured_product_python_non_test_file_answers_no_tests() {
         "tests: no tests in src/hypfactory/yaml_subset.py; the file has no tests",
         "{refused}"
     );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// `ide.test {path}` routes by the target file's language in a mixed worktree: with a root
+/// `Cargo.toml` (the first detected project) and a Python project registered only through the
+/// depth-1 `tools/requirements-ml.txt` marker, a `.py` test path selects pytest, never cargo
+/// (which would answer `no test target named 'test_risk.py'`). The routing is what the reply
+/// proves: whether or not this machine has pytest installed, the named runner is pytest and
+/// never cargo.
+#[tokio::test]
+async fn configured_product_test_path_selects_the_targets_language_runner() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::remove_file(fixture.root.join("go.mod")).unwrap();
+    std::fs::remove_file(fixture.root.join("main.go")).unwrap();
+    std::fs::create_dir_all(fixture.root.join("tools")).unwrap();
+    std::fs::write(fixture.root.join("tools/requirements-ml.txt"), "pytest\n").unwrap();
+    std::fs::create_dir_all(fixture.root.join("tests")).unwrap();
+    std::fs::write(
+        fixture.root.join("tests/test_risk.py"),
+        "def test_empty_day():\n    assert [] == []\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "mixed-language fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "mixed-language-test").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"mixed-language-tests"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let run = actor
+        .call(&fixture, "ide.test", json!({"path":"tests/test_risk.py"}))
+        .await;
+    let run = actor.settle(&fixture, run).await;
+    let text = run["text"].as_str().unwrap_or_default();
+    assert!(text.contains("pytest"), "{run}");
+    assert!(!text.contains("cargo"), "{run}");
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
     actor.mcp.close().await;

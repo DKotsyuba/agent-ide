@@ -137,6 +137,7 @@ async fn main() -> ExitCode {
     let snapshot: ProblemSnapshot = parse_cargo_messages(
         &output.stdout,
         &output.stderr,
+        output.status,
         request.input_generation,
         duration_ms,
     );
