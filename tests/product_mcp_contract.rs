@@ -11142,6 +11142,87 @@ async fn configured_product_rust_resolves_definition_across_a_crate_boundary() {
     daemon.wait().await.unwrap();
 }
 
+/// Deleting an unused function cannot re-label rust-analyzer's cached pre-delete Cargo warning as
+/// current because Rust uses the daemon's project check instead of analyzer check-on-save.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment"]
+async fn configured_product_rust_delete_does_not_report_cached_flycheck_diagnostic() {
+    use std::os::unix::fs::PermissionsExt;
+    let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN").unwrap();
+    let analyzer = std::env::var("AGENT_IDE_RUST_ANALYZER").unwrap();
+    let fixture = ProductFixture::new(json!([]));
+    let wrapper = fixture.base.join("rust-provider");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec '{}' \"$@\"\n",
+            analyzer.replace('\'', "'\\''")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    fixture.write_config(json!([{"executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),"settings":"rust_cache_priming_disabled_v1","toolchain":toolchain,"cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"fixture-rust-stale-diagnostics-cache"}]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "rust-stale-diagnostics").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"rust-stale-diagnostics-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    loop {
+        let warmup = actor
+            .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+            .await;
+        let settled = actor.settle(&fixture, warmup).await;
+        let text = settled["text"].as_str().unwrap_or_default();
+        if settled["kind"] == "outline" && !text.contains("outline: from source") {
+            break;
+        }
+        assert!(
+            settled["kind"] == "outline" || settled["code"] == "provider_loading",
+            "{settled}"
+        );
+    }
+
+    let inserted = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"rust-stale-insert","op":"insert","symbol":"src/lib.rs#caller","where":"after","content":"fn cold_probe() {}"}),
+        )
+        .await;
+    let inserted = actor.settle(&fixture, inserted).await;
+    assert_eq!(inserted["state"], "edit", "{inserted}");
+    assert!(
+        std::fs::read_to_string(fixture.root.join("src/lib.rs"))
+            .unwrap()
+            .contains("cold_probe"),
+        "probe insertion must land"
+    );
+
+    let deleted = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"rust-stale-delete","op":"delete","symbol":"src/lib.rs#cold_probe"}),
+        )
+        .await;
+    let deleted = actor.settle(&fixture, deleted).await;
+    assert_eq!(deleted["state"], "edit", "{deleted}");
+    assert_eq!(deleted["operation"], "deleted", "{deleted}");
+    assert!(
+        !deleted.to_string().contains("cold_probe"),
+        "a deleted function's cached flycheck warning must not be current: {deleted}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A real second actor on the same worktree is refused as a finite conflict, and hands off on stop.
 ///
 /// The refusal comes from durable activation itself (`AuthorityError::WorktreeOwned`), not from the

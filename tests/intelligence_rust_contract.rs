@@ -76,7 +76,7 @@ fn profile(cache_namespace: &Path) -> RustProfile {
         rustc: toolchain_bin("rustc"),
         rustc_version: "rustc 1.98.1".into(),
         rustup_toolchain: "1.98.1-aarch64-apple-darwin".into(),
-        configuration: "cache-priming-and-proc-macro-disabled-v1".into(),
+        configuration: "cache-priming-check-on-save-and-proc-macro-disabled-v1".into(),
         trust: "local-trusted-v1".into(),
         transport: "stdio-v1".into(),
         cache_namespace: cache_namespace.display().to_string(),
@@ -435,7 +435,7 @@ async fn real_rust_analyzer_is_exclusive_across_divergent_worktrees() {
             rustc: toolchain_bin("rustc"),
             rustc_version: "rustc 1.98.1".into(),
             rustup_toolchain: "1.98.1-aarch64-apple-darwin".into(),
-            configuration: "cache-priming-and-proc-macro-disabled-v1".into(),
+            configuration: "cache-priming-check-on-save-and-proc-macro-disabled-v1".into(),
             trust: "local-trusted-v1".into(),
             transport: "stdio-v1".into(),
             cache_namespace: cache_namespace.display().to_string(),
@@ -641,7 +641,7 @@ async fn real_rust_production_session_uses_exact_profile_and_barrier() {
     let outcome=with_session(stdout,stdin,worktree.worktree().clone(),1,ViewGeneration {backend:view.generation(),configuration:1,toolchain:1,view:1},ProviderSettings::new(profile.clone()),SessionOptions{request_timeout:Duration::from_secs(40),lifetime:Duration::from_secs(70)},|mut session|async move{
         assert!(session.provider_readiness().is_ready());
         assert_eq!(session.capabilities().server_info.as_ref().unwrap().version.as_deref(),Some(ANALYZER_VERSION));
-        assert!(matches!(session.settings().downcast_ref::<RustProfile>(),Some(profile) if profile.configuration()=="cache-priming-and-proc-macro-disabled-v1"));
+        assert!(matches!(session.settings().downcast_ref::<RustProfile>(),Some(profile) if profile.configuration()=="cache-priming-check-on-save-and-proc-macro-disabled-v1"));
         let context=session.context(&observed,text.as_bytes(),ContextQuery::Symbol{byte_offset:text.rfind("answer").unwrap()}).await?;
         assert_eq!(context.mode,ContextMode::Semantic,"{context:?}");assert!(!context.definitions.unwrap().is_empty());
         assert_eq!(session.diagnostics().readiness,DiagnosticReadiness::Clean);
@@ -685,7 +685,7 @@ fn rust_profile_rejects_a_relative_cache_namespace() {
         rustc: PathBuf::from("/usr/bin/true"),
         rustc_version: "rustc 1.98.1".into(),
         rustup_toolchain: "1.98.1-aarch64-apple-darwin".into(),
-        configuration: "cache-priming-and-proc-macro-disabled-v1".into(),
+        configuration: "cache-priming-check-on-save-and-proc-macro-disabled-v1".into(),
         trust: "local-trusted-v1".into(),
         transport: "stdio-v1".into(),
         cache_namespace: "relative-cache-label".into(),
