@@ -2674,33 +2674,48 @@ impl Worker<'_> {
     /// The structural verdict for one text: the in-process check first, else its stdin probe run
     /// from the project root with the daemon's formatter PATH and the launcher-configured probe
     /// programs of the file's language. No registered support, checker or runnable probe yields
-    /// [`SyntaxVerdict::Unchecked`] — never a refusal.
+    /// [`SyntaxVerdict::Unchecked`] — never a refusal — with the reason naming the step that
+    /// could not prove a checker, for the gate's error-log event.
     async fn syntax_verdict_of(
         &self,
         job: &Job,
         observed: &SourceObservation,
         file: &Path,
         source: &str,
-    ) -> lang::SyntaxVerdict {
+    ) -> (lang::SyntaxVerdict, Option<&'static str>) {
         let Some(language) = Lang::for_path(file) else {
-            return lang::SyntaxVerdict::Unchecked;
+            return (
+                lang::SyntaxVerdict::Unchecked,
+                Some("no language owns the file"),
+            );
         };
         let support = language.support();
         let verdict = support.syntax_verdict(file, source);
         if verdict != lang::SyntaxVerdict::Unchecked {
-            return verdict;
+            return (verdict, None);
         }
         let root = observed.worktree().worktree_path().to_path_buf();
         let Some(project) = support.detect(&root) else {
-            return lang::SyntaxVerdict::Unchecked;
+            return (
+                lang::SyntaxVerdict::Unchecked,
+                Some("no project detected for the language"),
+            );
         };
         let configured = self.configured_probe_programs(job, language);
         let Some(argv) = support.syntax_probe_command(&project, &root, file, configured.as_ref())
         else {
-            return lang::SyntaxVerdict::Unchecked;
+            let why = if configured.is_none() {
+                "no configured probe and no project-local checker"
+            } else {
+                "the configured probe's module is not on disk and no project-local checker exists"
+            };
+            return (lang::SyntaxVerdict::Unchecked, Some(why));
         };
         let Some(output) = run_stdin(&argv, &root, source, Duration::from_secs(10)).await else {
-            return lang::SyntaxVerdict::Unchecked;
+            return (
+                lang::SyntaxVerdict::Unchecked,
+                Some("the probe did not start or finish in time"),
+            );
         };
         let first = String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -2708,13 +2723,19 @@ impl Worker<'_> {
             .or(String::from_utf8_lossy(&output.stderr).lines().next())
             .unwrap_or_default()
             .to_owned();
-        lang::SyntaxVerdict::from_probe(output.status.success(), &first)
+        (
+            lang::SyntaxVerdict::from_probe(output.status.success(), &first),
+            None,
+        )
     }
 
     /// Gates one edit candidate before any write: the formatted candidate must parse. A failure
     /// the base text already had is pre-existing, so the edit proceeds with a note naming it; a
     /// failure on a clean base refuses with the error's line and message for the caller's
-    /// per-change attribution. `Ok(Some(note))` proceeds with that note line.
+    /// per-change attribution. `Ok(Some(note))` proceeds with that note line. One error-log
+    /// event records the gate's outcome for every edit — `gate: clean`, `gate: failed …`, or
+    /// `gate: unchecked: <reason>` — so a gate that silently cannot engage is diagnosable from
+    /// `~/.agent-ide/logs`.
     async fn gate_candidate(
         &mut self,
         job: &Job,
@@ -2723,19 +2744,51 @@ impl Worker<'_> {
         base: &str,
         candidate: &str,
     ) -> Result<Option<String>, (u32, String)> {
-        let verdict = self.syntax_verdict_of(job, observed, file, candidate).await;
+        let (verdict, unchecked) = self.syntax_verdict_of(job, observed, file, candidate).await;
+        let record_gate = |outcome: crate::errorlog::Outcome, detail: String| {
+            crate::errorlog::record(
+                crate::errorlog::Method::Edit,
+                outcome,
+                crate::errorlog::Fields {
+                    worktree: Some(observed.worktree().worktree_path()),
+                    correlation: Some(&job.reference),
+                    detail: Some(&detail),
+                    ..crate::errorlog::Fields::default()
+                },
+            );
+        };
         let lang::SyntaxVerdict::Failed { line, message } = verdict else {
+            match verdict {
+                lang::SyntaxVerdict::Clean => record_gate(
+                    crate::errorlog::Outcome::Completed,
+                    "gate: clean".to_owned(),
+                ),
+                _ => record_gate(
+                    crate::errorlog::Outcome::Unavailable,
+                    format!("gate: unchecked: {}", unchecked.unwrap_or("unknown")),
+                ),
+            }
             return Ok(None);
         };
         if let lang::SyntaxVerdict::Failed {
             line: base_line, ..
-        } = self.syntax_verdict_of(job, observed, file, base).await
+        } = self.syntax_verdict_of(job, observed, file, base).await.0
         {
+            record_gate(
+                crate::errorlog::Outcome::Completed,
+                format!(
+                    "gate: failed line {line}: {message} (base already failed line {base_line}; applied)"
+                ),
+            );
             return Ok(Some(format!(
                 "note: {} already had a syntax error (line {base_line}) before this edit; edit applied",
                 file.display()
             )));
         }
+        record_gate(
+            crate::errorlog::Outcome::Refused,
+            format!("gate: failed line {line}: {message}"),
+        );
         Err((line, message))
     }
 

@@ -38,10 +38,15 @@ const SCRIPT_EXTENSIONS: [&str; 8] = ["ts", "tsx", "js", "jsx", "mts", "cts", "m
 /// `-e` program of the syntax probe: parses stdin with the `typescript` package named by the
 /// argument after the program (`process.argv[1]`, an absolute `typescript.js` the caller
 /// resolved) and prints `<line+1>: <message>` for the first parse diagnostic — the exact line
-/// [`SyntaxVerdict::from_probe`] maps. Stdin is collected as one buffer and decoded once, so a
-/// multibyte character split across chunk boundaries cannot fake a syntax error. Exit 3 (module
-/// not loadable), a missing node or any other nonzero output means no checker was proven.
-const TS_PROBE: &str = "let ts;try{ts=require(process.argv[1])}catch(e){process.exit(3)}let cs=[];process.stdin.on('data',c=>cs.push(c)).on('end',()=>{const d=Buffer.concat(cs).toString('utf8');const f=ts.createSourceFile('c.ts',d,ts.ScriptTarget.Latest,true);const p=f.parseDiagnostics[0];if(p){const l=f.getLineAndCharacterOfPosition(p.start).line+1;console.log(l+': '+ts.flattenDiagnosticMessageText(p.messageText,' '));process.exit(1)}});";
+/// [`SyntaxVerdict::from_probe`] maps. The second argument (`process.argv[2]`) is the edited
+/// file's own name, so the parser picks the file's language variant: TypeScript parses `.tsx`
+/// and `.jsx` with JSX enabled, and a hardcoded `.ts` name would report a false syntax error on
+/// the first JSX element of an untouched base file — which the gate would then treat as
+/// pre-existing and stop refusing broken candidates for that file. Stdin is collected as one
+/// buffer and decoded once, so a multibyte character split across chunk boundaries cannot fake a
+/// syntax error. Exit 3 (module not loadable), a missing node or any other nonzero output means
+/// no checker was proven.
+const TS_PROBE: &str = "let ts;try{ts=require(process.argv[1])}catch(e){process.exit(3)}let cs=[];process.stdin.on('data',c=>cs.push(c)).on('end',()=>{const d=Buffer.concat(cs).toString('utf8');const f=ts.createSourceFile(process.argv[2]||'c.ts',d,ts.ScriptTarget.Latest,true);const p=f.parseDiagnostics[0];if(p){const l=f.getLineAndCharacterOfPosition(p.start).line+1;console.log(l+': '+ts.flattenDiagnosticMessageText(p.messageText,' '));process.exit(1)}});";
 
 /// Most lines scanned for one declaration's header and signature.
 const SCAN_LINES: usize = 200;
@@ -537,10 +542,13 @@ impl LanguageSupport for TypeScript {
     /// caller resolved from the launcher declaration (`configured`'s module; the accepted
     /// `tsserver.js`'s lib dir holds `typescript.js` beside it), else the project's own
     /// `node_modules/typescript` — parses stdin as a source file and prints `<line+1>:
-    /// <message>` for the first parse diagnostic. With neither package present there is no
-    /// checker to prove, so `None` (the caller maps that to `Unchecked`, never a refusal); any
-    /// other nonzero exit — node missing, the module not loadable (exit 3) — means the same.
-    /// TypeScript parses plain JavaScript with the same parser, so `.js`/`.jsx` are checked too.
+    /// <message>` for the first parse diagnostic. The edited file's own name rides as the last
+    /// argument so the parser uses the file's language variant (JSX for `.tsx`/`.jsx`; a
+    /// hardcoded `.ts` name would report JSX as a syntax error). With neither package present
+    /// there is no checker to prove, so `None` (the caller maps that to `Unchecked`, never a
+    /// refusal); any other nonzero exit — node missing,
+    /// the module not loadable (exit 3) — means the same. TypeScript parses plain JavaScript with
+    /// the same parser, so `.js`/`.jsx` are checked too.
     fn syntax_probe_command(
         &self,
         _project: &LanguageProject,
@@ -562,11 +570,17 @@ impl LanguageSupport for TypeScript {
         let node = configured
             .map(|tools| tools.program.display().to_string())
             .unwrap_or_else(|| "node".to_owned());
+        let name = file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("c.ts")
+            .to_owned();
         Some(vec![
             node,
             "-e".to_owned(),
             TS_PROBE.to_owned(),
             module.display().to_string(),
+            name,
         ])
     }
 
@@ -2330,8 +2344,11 @@ ok 2 - subtracts
     /// The syntax probe is `node -e` with the typescript module passed by absolute path — the
     /// configured package the caller resolved from the launcher declaration (its module beside
     /// the accepted `tsserver.js`), else the project's own `node_modules/typescript` — and
-    /// neither package means no probe. Configuration is passed in, so no environment is read or
-    /// mutated. No subprocess runs here, only the argv shape is checked.
+    /// neither package means no probe. The edited file's own name is the last argument, so the
+    /// parser picks the file's language variant (a `.tsx` name turns JSX on; a hardcoded `.ts`
+    /// name reports a false error on JSX the gate would treat as pre-existing). Configuration is
+    /// passed in, so no environment is read or mutated. No subprocess runs here, only the argv
+    /// shape is checked.
     #[test]
     fn syntax_probe_command_carries_an_absolute_typescript_module() {
         let project = project(&[]);
@@ -2359,6 +2376,14 @@ ok 2 - subtracts
             root.join("node_modules/typescript/lib/typescript.js")
                 .display()
                 .to_string()
+        );
+        assert_eq!(probe[4], "a.ts");
+        assert_eq!(
+            TypeScript
+                .syntax_probe_command(&project, &root, Path::new("src/a.tsx"), None)
+                .unwrap()[4],
+            "a.tsx",
+            "a tsx file must be probed under its own name so JSX parses"
         );
         for file in ["src/a.js", "src/a.jsx"] {
             assert!(

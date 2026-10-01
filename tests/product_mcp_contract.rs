@@ -17222,3 +17222,205 @@ async fn eyes_absent_configuration_keeps_v02_hook_replies() {
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
 }
+
+/// Builds the TypeScript provider exactly in the shape of the operator's real launcher entry.
+///
+/// The closure lives in its own bundle root — `a/_tsserver.js`, `a/typescript.js`,
+/// `b/package.json`, `c/package.json`, the layout `~/.config/agent-ide/typescript-bundle`
+/// ships — copied there from the accepted install, while the accepted `tsserver.js` stays in
+/// the installed TypeScript lib with `typescript.js` beside it (the probe's module), and both
+/// host evidence records are the derived ones, as the real entry's are. Panics when a closure
+/// member or acceptance environment value is missing, because callers are ignored release tests.
+fn accepted_typescript_provider_in_bundle_shape(bundle_root: &Path) -> Value {
+    let node = PathBuf::from(std::env::var("AGENT_IDE_NODE").unwrap());
+    let bridge = PathBuf::from(std::env::var("AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER").unwrap());
+    let tsserver = PathBuf::from(std::env::var("AGENT_IDE_TSSERVER").unwrap());
+    let typescript_root = tsserver.parent().unwrap().parent().unwrap();
+    let bridge_root = bridge.parent().unwrap().parent().unwrap();
+    let members = [
+        bundle_root.join("a/_tsserver.js"),
+        bundle_root.join("a/typescript.js"),
+        bundle_root.join("b/package.json"),
+        bundle_root.join("c/package.json"),
+    ];
+    let sources = [
+        typescript_root.join("lib/_tsserver.js"),
+        typescript_root.join("lib/typescript.js"),
+        typescript_root.join("package.json"),
+        bridge_root.join("package.json"),
+    ];
+    for (member, source) in members.iter().zip(sources) {
+        std::fs::create_dir_all(member.parent().unwrap()).unwrap();
+        std::fs::copy(&source, member).unwrap();
+    }
+    let mut provider = json!({
+        "executable":accepted_program(bridge.to_str().unwrap(),"6.0.0"),
+        "settings":"typescript_defaults_v1",
+        "toolchain":"24.4.0",
+        "node":accepted_program(node.to_str().unwrap(),"24.4.0"),
+        "typescript":{
+            "bridge_bytes":std::fs::metadata(&bridge).unwrap().len(),
+            "bridge_version":"6.0.0",
+            "tsserver":accepted_typescript_file(&tsserver),
+            "typescript_version":"5.9.3",
+            "closure":members.iter().map(|path| accepted_typescript_file(path)).collect::<Vec<_>>(),
+            "codex_macos_evidence":"macos-26.6.2-node-24.4.0-tls-6.0.0-ts-5.9.3-codex-r3-2026-09-14",
+            "claude_macos_evidence":null
+        },
+        "cargo":null,
+        "cargo_version":null,
+        "rustc":null,
+        "rustc_version":null,
+        "trust":"fixture-disabled",
+        "cache_namespace":"fixture-typescript-bundle-cache"
+    });
+    use agent_ide::intelligence::typescript_backend::TypeScriptLaunch;
+    agent_ide::languages::install();
+    let unbound: agent_ide::assistance::launcher::ProviderLaunch =
+        serde_json::from_value(provider.clone()).unwrap();
+    provider["typescript"]["codex_macos_evidence"] =
+        json!(unbound.expected_typescript_codex_macos_evidence().unwrap());
+    provider["typescript"]["claude_macos_evidence"] =
+        json!(unbound.expected_typescript_claude_macos_evidence().unwrap());
+    provider
+}
+
+/// Case 8c (TypeScript, tsx, real launcher shape): a `.tsx` file holding JSX, a project without
+/// `node_modules`, and the provider declared exactly as the operator's real launcher entry shapes
+/// it (separate closure bundle, accepted `tsserver.js` in the installed lib). The gate must prove
+/// the candidate with the configured package under the file's own language variant: before the
+/// probe carried the file's name, TypeScript parsed the JSX base as plain `.ts`, reported the
+/// first JSX element as a pre-existing syntax error, and every later edit — including a broken
+/// one — was written as a "pre-existing" failure, which is exactly what the live 0.6.7 session
+/// on a fresh `agent-tasks-ui` clone showed. Also pins the gate's error-log events.
+#[tokio::test]
+#[ignore = "requires exact AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER environment"]
+async fn configured_product_batch_typescript_tsx_gate_parses_jsx_in_the_real_launcher_shape() {
+    let fixture = ProductFixture::new(json!([]));
+    let providers = json!([accepted_typescript_provider_in_bundle_shape(
+        &fixture.base.join("typescript-bundle")
+    )]);
+    fixture.write_config(providers);
+    std::fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    std::fs::remove_file(fixture.root.join("go.mod")).unwrap();
+    std::fs::remove_file(fixture.root.join("main.go")).unwrap();
+    std::fs::remove_file(fixture.root.join("src/lib.rs")).unwrap();
+    std::fs::remove_dir_all(fixture.root.join("src")).unwrap();
+    std::fs::write(
+        fixture.root.join("package.json"),
+        "{\"name\":\"fixture\",\"private\":true}\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("tsconfig.json"), "{}\n").unwrap();
+    let app = "export function collectIds(value: unknown, prefix: string): string[] {\n  \
+               const found: string[] = [];\n  return found.filter((id) => id.startsWith(prefix));\n\
+               }\n\nexport function Details({ title }: { title: string }): JSX.Element {\n  \
+               return (\n    <VStack align=\"stretch\">\n      <Heading size=\"sm\">{title}</Heading>\n\
+               \x20   </VStack>\n  );\n}\n";
+    std::fs::create_dir_all(fixture.root.join("src")).unwrap();
+    std::fs::write(fixture.root.join("src/details.tsx"), app).unwrap();
+    fixture.git(&[
+        "add",
+        "--",
+        "package.json",
+        "tsconfig.json",
+        "src/details.tsx",
+    ]);
+    fixture.git(&[
+        "commit",
+        "--quiet",
+        "-m",
+        "typescript tsx gate fixture without node_modules",
+    ]);
+    assert!(
+        !fixture.root.join("node_modules").exists(),
+        "the fixture must prove the configured package, not a project-local one"
+    );
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "batch-ts-tsx").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"batch-ts-tsx"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let read = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"src/details.tsx","byte_offset":0}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    assert_eq!(read["kind"], "context", "{read}");
+    let source_ref = read["detail_ref"].as_str().unwrap();
+
+    // A clean edit to the JSX file must not be told the base already fails to parse: that false
+    // note is the live miss's fingerprint (it ungates every later edit to the file).
+    let good = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-ts-tsx-probe",
+            "path":"src/details.tsx",
+            "source_ref":source_ref,
+            "changes":[{"old":"export function collectIds(value: unknown, prefix: string): string[] {",
+                        "new":"export function collectIds(value: unknown, prefix: string): string[] { // probe"}]
+        }),
+    )
+    .await;
+    let (good, good_text) = batch_settle_with_text(&mut actor, &fixture, good).await;
+    let good_ref = good["result"]["source_ref"].as_str().unwrap().to_owned();
+    assert_eq!(good["result"]["outcome"], "replaced", "{good}");
+    assert!(
+        !good_text.contains("already had a syntax error"),
+        "a JSX base file must parse as tsx: {good_text}"
+    );
+    let gated = std::fs::read(fixture.root.join("src/details.tsx")).unwrap();
+
+    // The broken candidate is refused with the probe's own diagnostic and nothing is written.
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-ts-tsx-broken",
+            "path":"src/details.tsx",
+            "source_ref":good_ref,
+            "changes":[{"old":"export function collectIds(","new":"export function collectIds(("}]
+        }),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert!(
+        refused_text.contains("syntax error at line 1: \"Parameter declaration expected.\""),
+        "{refused_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/details.tsx")).unwrap(),
+        gated
+    );
+
+    // The gate's outcome is diagnosable from the journal: one event per edit.
+    let journal = agent_ide::errorlog::log_root()
+        .unwrap()
+        .join(agent_ide::errorlog::repository_key(&fixture.runtime))
+        .join("events.jsonl");
+    let events = std::fs::read_to_string(journal).unwrap_or_default();
+    assert!(
+        events.contains("\"detail\":\"gate: clean\""),
+        "the clean edit logs its gate outcome: {events}"
+    );
+    assert!(
+        events.contains("gate: failed line 1: Parameter declaration expected.\""),
+        "the refused edit logs its gate outcome: {events}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
