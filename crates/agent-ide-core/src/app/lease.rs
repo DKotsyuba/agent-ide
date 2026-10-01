@@ -6,7 +6,7 @@
 //! daemon's [`LeaseController::idle_expired`](crate::app::lease::LeaseController::idle_expired) shutdown signal once no lease has been open, and no
 //! daemon-owned work has been in flight, for the configured idle timeout.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,6 +29,9 @@ const BUSY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 struct Inner {
     /// Count of currently admitted, still-open lease connections.
     open: AtomicUsize,
+    /// Set by [`LeaseController::request_stop`]: the daemon exits through its orderly shutdown
+    /// path once no lease is open, exactly like idle expiry but without waiting the timeout.
+    stopping: AtomicBool,
     /// Duration the daemon must stay idle (zero leases, not busy) before it shuts down.
     idle_timeout: Duration,
     /// Reports whether daemon-owned work (a pending or running project check) is in flight.
@@ -56,6 +59,7 @@ impl LeaseController {
     pub fn new(idle_timeout: Duration, is_busy: impl Fn() -> bool + Send + Sync + 'static) -> Self {
         Self(Arc::new(Inner {
             open: AtomicUsize::new(0),
+            stopping: AtomicBool::new(false),
             idle_timeout,
             is_busy: Box::new(is_busy),
             became_idle_at: Mutex::new(Some(Instant::now())),
@@ -79,6 +83,29 @@ impl LeaseController {
     pub fn mark_activity(&self) {
         *self.0.became_idle_at.lock().unwrap() = Some(Instant::now());
         self.0.changed.notify_waiters();
+    }
+
+    /// Reports whether no lease is open and no daemon-owned work is in flight right now.
+    ///
+    /// The answer to "may this daemon be asked to stop": a daemon with open leases or running
+    /// daemon-owned work is serving someone and must not be replaced under them.
+    pub fn is_idle(&self) -> bool {
+        self.0.open.load(Ordering::SeqCst) == 0 && !(self.0.is_busy)()
+    }
+
+    /// Asks this daemon to exit through its orderly shutdown path as soon as no lease is open.
+    ///
+    /// A version-checking front (0.6.7) sends `daemon.stop` after observing the daemon is older
+    /// than itself; the daemon answers only while idle, so a lease that opens after this request
+    /// still defers the exit to its own release instead of being killed under.
+    pub fn request_stop(&self) {
+        self.0.stopping.store(true, Ordering::SeqCst);
+        self.0.changed.notify_waiters();
+    }
+
+    /// Reports whether [`Self::request_stop`] was ever called on this controller.
+    pub fn stop_requested(&self) -> bool {
+        self.0.stopping.load(Ordering::SeqCst)
     }
 
     /// Admits one open lease if the bounded pool has room, cancelling any pending idle countdown.
@@ -121,6 +148,9 @@ impl LeaseController {
     /// signalling busyness, so a silent session still expires after exactly one full timeout.
     pub async fn idle_expired(&self) {
         loop {
+            if self.stop_requested() && self.0.open.load(Ordering::SeqCst) == 0 {
+                return;
+            }
             let changed = self.0.changed.notified();
             tokio::pin!(changed);
             match self.current_deadline() {
@@ -331,5 +361,57 @@ mod tests {
             vec![0, 1, 2],
             "a second run must not repeat already-run hooks"
         );
+    }
+
+    /// A requested stop exits an idle daemon at once instead of after its idle timeout, and a busy
+    /// daemon (daemon-owned work in flight) is not idle enough to be stopped.
+    #[tokio::test(start_paused = true)]
+    async fn requested_stop_exits_an_idle_daemon_immediately() {
+        let lease = LeaseController::new(Duration::from_secs(300), || false);
+        let expiry = tokio::spawn({
+            let lease = lease.clone();
+            async move { lease.idle_expired().await }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !expiry.is_finished(),
+            "the idle timeout alone must not exit"
+        );
+        assert!(lease.is_idle());
+        lease.request_stop();
+        tokio::time::timeout(Duration::from_millis(50), expiry)
+            .await
+            .expect("a requested stop must exit an idle daemon without waiting the timeout")
+            .unwrap();
+
+        let busy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let busy_lease = LeaseController::new(Duration::from_secs(300), {
+            let busy = Arc::clone(&busy);
+            move || busy.load(Ordering::SeqCst)
+        });
+        assert!(!busy_lease.is_idle(), "a busy daemon must not be stoppable");
+    }
+
+    /// A requested stop defers to a lease that opens after the request: the daemon exits when that
+    /// last binding stops, never under it.
+    #[tokio::test(start_paused = true)]
+    async fn requested_stop_waits_for_a_lease_opened_after_the_request() {
+        let lease = LeaseController::new(Duration::from_secs(300), || false);
+        let expiry = tokio::spawn({
+            let lease = lease.clone();
+            async move { lease.idle_expired().await }
+        });
+        lease.request_stop();
+        let guard = lease.try_admit().expect("pool has room");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !expiry.is_finished(),
+            "a stop must never exit a daemon under an open lease"
+        );
+        drop(guard);
+        tokio::time::timeout(Duration::from_millis(50), expiry)
+            .await
+            .expect("the stop must exit once the last binding stops")
+            .unwrap();
     }
 }

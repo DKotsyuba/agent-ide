@@ -1638,6 +1638,62 @@ struct RememberedActivation {
     root: Option<String>,
 }
 
+/// What a managed front knows about the currency of the daemon it serves (0.6.7), shared between
+/// the attach path that learns it and the facade that renders it.
+///
+/// The front compares the daemon's health-reported version with its own at every rendezvous: an
+/// idle older daemon is replaced before serving begins, and one still bound by another session is
+/// kept serving with one honest line on the start card naming both versions.
+#[derive(Default)]
+pub struct DaemonCurrencyNote {
+    /// One honest start-card line while an outdated daemon is still serving this session.
+    line: Option<String>,
+    /// One-shot: the most recent attach replaced an outdated daemon before serving began.
+    replaced: bool,
+}
+
+impl DaemonCurrencyNote {
+    /// Records that this session serves a current daemon; no note is due.
+    pub fn note_current(&mut self) {
+        self.line = None;
+        self.replaced = false;
+    }
+
+    /// Records that this session's attach spawned a current daemon: no honest line is due, and a
+    /// replacement marker set earlier in the same attach (it stopped an outdated daemon first)
+    /// survives, because that first reply's pre-hook observations still died with the old daemon.
+    pub fn note_spawned_current(&mut self) {
+        self.line = None;
+    }
+
+    /// Records that this session keeps serving an outdated daemon, with the start-card line
+    /// explaining why it was not replaced.
+    pub fn note_outdated(&mut self, line: String) {
+        self.line = Some(line);
+        self.replaced = false;
+    }
+
+    /// Records that this session's attach replaced an outdated daemon.
+    pub fn note_replaced(&mut self) {
+        self.line = None;
+        self.replaced = true;
+    }
+
+    /// Returns the honest start-card line, when one is due.
+    pub fn line(&self) -> Option<&str> {
+        self.line.as_deref()
+    }
+
+    /// Takes the one-shot replaced marker: the first reply after the replacement is the only one
+    /// that can still predate the new daemon's own observations.
+    pub fn take_replaced(&mut self) -> bool {
+        std::mem::take(&mut self.replaced)
+    }
+}
+
+/// One shared [`DaemonCurrencyNote`], held by the managed attach path and the facade together.
+pub type SharedDaemonNote = Arc<std::sync::Mutex<DaemonCurrencyNote>>;
+
 /// Shares one live `(runtime_dir, attachment)` pair across every clone of a [`StdioFacade`].
 ///
 /// A managed daemon can exit while its MCP process keeps running. Every call reads the current
@@ -1658,6 +1714,9 @@ struct ManagedConnection {
     /// Set from a daemon replacement until the next successful activation; references issued
     /// before it are the ones a replacement invalidated.
     replaced: Arc<std::sync::atomic::AtomicBool>,
+    /// What the attach path learned about this daemon's version currency (0.6.7); a plain or
+    /// Codex-owned connection never notes anything.
+    note: Option<SharedDaemonNote>,
     reroot: Option<RerootFn>,
     reestablish: ReestablishFn,
 }
@@ -1670,22 +1729,26 @@ impl ManagedConnection {
             last_activation: Arc::new(Mutex::new(None)),
             recovery_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             replaced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            note: None,
             reroot: None,
             reestablish,
         }
     }
 
     /// Like [`Self::new`], for a managed Claude session that knows its bound project and can
-    /// re-root to another admitted root (T15B).
+    /// re-root to another admitted root (T15B), sharing its daemon-currency note with the attach
+    /// path that keeps it current (0.6.7).
     fn rerootable(
         runtime_dir: PathBuf,
         attachment: String,
         candidate: PathBuf,
         reestablish: ReestablishFn,
         reroot: RerootFn,
+        note: SharedDaemonNote,
     ) -> Self {
         Self {
             candidate: Arc::new(Mutex::new(Some(candidate))),
+            note: Some(note),
             ..Self::new(runtime_dir, attachment, reestablish)
         }
         .with_reroot(reroot)
@@ -1860,6 +1923,7 @@ impl StdioFacade {
         candidate: PathBuf,
         reestablish: ReestablishFn,
         reroot: RerootFn,
+        note: SharedDaemonNote,
     ) -> Option<Self> {
         TrustedTransport::from_host_ingress("validate", "validate", attachment.clone())?;
         Some(Self {
@@ -1871,6 +1935,7 @@ impl StdioFacade {
                 candidate,
                 reestablish,
                 reroot,
+                note,
             )),
             publisher: None,
             router: Self::described_tool_router(),
@@ -2201,6 +2266,56 @@ impl StdioFacade {
         }
     }
 
+    /// Reads this session's daemon-currency knowledge for one about-to-render reply (0.6.7).
+    ///
+    /// Two honest additions, both learned at the rendezvous: the start card carries one line
+    /// naming the older daemon still serving this session and why it was not replaced, and the
+    /// first reply after an attach *replaced* an outdated daemon carries the same restart guidance
+    /// a mid-call replacement gives — that reply's own pre-hook observations died with the old
+    /// daemon, so a repeat against the new one is exactly what pairs the session again.
+    async fn daemon_currency_due(
+        &self,
+        tool: AssistanceTool,
+        reply: &PeerReply,
+    ) -> (Option<String>, Option<&'static str>) {
+        let Some(reconnect) = &self.reconnect else {
+            return (None, None);
+        };
+        let Some(shared) = &reconnect.note else {
+            return (None, None);
+        };
+        let mut note = shared.lock().expect("daemon currency note mutex");
+        let activation = matches!(
+            reply,
+            PeerReply::Complete {
+                kind: ResultKind::Activation,
+                ..
+            }
+        );
+        let host_binding = matches!(
+            reply,
+            PeerReply::Unavailable {
+                reason: MissingPeer::HostBinding,
+                ..
+            }
+        );
+        let line = if tool == AssistanceTool::Start && (activation || host_binding) {
+            note.line().map(str::to_owned)
+        } else {
+            None
+        };
+        let hint = if (activation || host_binding) && note.take_replaced() {
+            Some(if tool == AssistanceTool::Start {
+                RECONNECT_RETRY_HINT
+            } else {
+                RECONNECT_START_HINT
+            })
+        } else {
+            None
+        };
+        (line, hint)
+    }
+
     /// The recovery hint for a root-less `ide.start` the daemon refused on its own missing
     /// pre-hook (F2, 0.6.5): such a start never re-roots, so it would otherwise end with no
     /// guidance at all.
@@ -2333,10 +2448,10 @@ impl StdioFacade {
         let message = match outcome {
             FacadeOutcome::Reply(reply, status) if resume != Resume::Fresh => {
                 let note = self.references_predate_replacement(&reply).await;
-                return note_replaced_references(
-                    render_reply_after_reconnect(tool, *reply, status.as_deref(), envelope, resume),
-                    note,
-                );
+                let (line, hint) = self.daemon_currency_due(tool, &reply).await;
+                let rendered =
+                    render_reply_after_reconnect(tool, *reply, status.as_deref(), envelope, resume);
+                return note_replaced_references(apply_daemon_currency(rendered, line, hint), note);
             }
             FacadeOutcome::Reply(reply, status) => {
                 let note = self.references_predate_replacement(&reply).await;
@@ -2346,6 +2461,7 @@ impl StdioFacade {
                 let hint = self
                     .missing_pre_start_hint(tool, &stage_parameters, reply.as_ref())
                     .await;
+                let (line, currency) = self.daemon_currency_due(tool, reply.as_ref()).await;
                 let rendered = content::render_with_call(
                     (*reply).clone(),
                     status.as_deref(),
@@ -2360,7 +2476,10 @@ impl StdioFacade {
                     Some(hint) => with_retry_hint(rendered, &hint),
                     None => rendered,
                 };
-                return note_replaced_references(rendered, note);
+                return note_replaced_references(
+                    apply_daemon_currency(rendered, line, currency),
+                    note,
+                );
             }
             FacadeOutcome::InvalidParameters => {
                 "invalid bounded parameters; inspect the tool schema"
@@ -2547,6 +2666,30 @@ fn with_retry_hint(mut rendered: CallToolResult, hint: &str) -> CallToolResult {
         text.text = format!("{}; retry: {hint}", text.text);
     }
     rendered
+}
+
+/// Appends one plain sentence to a rendered result's compact text, changing no machine field.
+fn append_text_note(mut rendered: CallToolResult, note: &str) -> CallToolResult {
+    if let Some(ContentBlock::Text(text)) = rendered.content.first_mut() {
+        text.text = format!("{}; {note}", text.text);
+    }
+    rendered
+}
+
+/// Applies the daemon-currency additions [`StdioFacade::daemon_currency_due`] selected: the honest
+/// start-card line, then the one-shot restart hint.
+fn apply_daemon_currency(
+    mut rendered: CallToolResult,
+    line: Option<String>,
+    hint: Option<&'static str>,
+) -> CallToolResult {
+    if let Some(line) = line.as_deref() {
+        rendered = append_text_note(rendered, line);
+    }
+    match hint {
+        Some(hint) => with_retry_hint(rendered, hint),
+        None => rendered,
+    }
 }
 
 /// Derives the default `<tool>:<reason>` stage, appending the requested file's extension for a

@@ -242,7 +242,11 @@ once`, repeat that exact same call once before falling back to
 native tools. When it carries `session re-rooted to the requested root; repeat
 this call once, or call ide.start without root`, repeat that call once, and if
 it stays unavailable call `ide.start` with no `root` — that returns the session
-to the host's project directory.
+to the host's project directory. A start card may instead end with one
+`daemon: <version> still serving` line: an older daemon is active, so this
+session uses its behavior. Restart this session after other sessions have
+stopped, or wait for this session to stop and start it again, to use the
+current daemon.
 
 ## Boundaries
 

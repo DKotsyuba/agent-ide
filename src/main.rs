@@ -12,13 +12,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use agent_ide::app::{
-    AppError, DoctorLockState, DoctorReport, DoctorStatus, RuntimeDir, config::EffectiveConfig,
-    doctor_report, run_daemon_with_assistance,
+    AppError, DaemonStop, DoctorLockState, DoctorReport, DoctorStatus, RuntimeDir,
+    config::EffectiveConfig, daemon_needs_replacement, doctor_report, reported_daemon_version,
+    request_daemon_stop, run_daemon_with_assistance,
 };
 use agent_ide::assistance::{
     assembly::ProductDispatcher,
     codex_rendezvous::ManagedCodexPublisher,
-    facade::{ReestablishFn, RerootFn, RerootOutcome, SharedCodexPublisher, StdioFacade},
+    facade::{
+        DaemonCurrencyNote, ReestablishFn, RerootFn, RerootOutcome, SharedCodexPublisher,
+        SharedDaemonNote, StdioFacade,
+    },
     host_binding::HostKind,
     launcher::{AcceptedExecutable, LauncherConfig},
 };
@@ -2157,19 +2161,27 @@ struct ClaudeBinding {
 ///
 /// The one shared tail of managed startup, a reconnect, and a re-root (T15B): refresh the
 /// project's key cache so its hooks can resolve the daemon (EYES-r2 §3 — the hook cannot resolve
-/// the key itself), adopt or spawn the repository's shared daemon, open one fresh `ClientLease`,
-/// publish the candidate attachment, and swap the held lease so the daemon's idle countdown never
-/// runs under a live MCP. Returns the live `(runtime_dir, attachment)` pair.
+/// the key itself), adopt or spawn the repository's shared daemon — replacing an outdated idle one
+/// on the way (0.6.7) — open one fresh `ClientLease`, publish the candidate attachment, and swap
+/// the held lease so the daemon's idle countdown never runs under a live MCP. Returns the live
+/// `(runtime_dir, attachment)` pair; `note` receives what the attach learned about the daemon's
+/// version currency.
 async fn attach_claude_binding(
     binding: &ClaudeBinding,
     launcher_template: &Path,
     lease: &Arc<Mutex<Option<UnixStream>>>,
+    note: &SharedDaemonNote,
 ) -> Option<(PathBuf, String)> {
     write_claude_key_cache(&binding.candidate, &binding.key);
     let path = claude_runtime_path(&binding.key).ok()?;
-    let (runtime_path, _) =
-        rendezvous_with_claude_daemon(&path, &binding.key, launcher_template, &binding.candidate)
-            .await?;
+    let (runtime_path, _) = rendezvous_with_claude_daemon(
+        &path,
+        &binding.key,
+        launcher_template,
+        &binding.candidate,
+        note,
+    )
+    .await?;
     let (connection, attachment) = open_client_lease(&runtime_path, &binding.candidate).await?;
     write_claude_candidate_attachment(&binding.candidate, &attachment);
     *lease.lock().await = Some(connection);
@@ -2206,6 +2218,9 @@ async fn run_managed_claude_mcp(
         allowed_roots,
     }));
     let lease: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
+    // What every attach learns about the shared daemon's version currency (0.6.7): the initial
+    // rendezvous, each re-establish, and each re-root all write it, and the facade renders it.
+    let note: SharedDaemonNote = Arc::new(std::sync::Mutex::new(DaemonCurrencyNote::default()));
     // Per EYES-r2 §2, this generation never owns the shared daemon's lifetime, so it holds one
     // `ClientLease` connection open for its own entire lifetime instead: the daemon's
     // idle-shutdown countdown only ever runs while zero managed Claude MCPs are attached.
@@ -2213,7 +2228,7 @@ async fn run_managed_claude_mcp(
     // re-established daemon, so the same guarantee holds across a reconnect or a re-root.
     let initial = binding.lock().expect("claude binding mutex").clone();
     let Some((runtime_path, attachment)) =
-        attach_claude_binding(&initial, &launcher_template, &lease).await
+        attach_claude_binding(&initial, &launcher_template, &lease, &note).await
     else {
         return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None).await;
     };
@@ -2221,11 +2236,13 @@ async fn run_managed_claude_mcp(
         Arc::clone(&binding),
         launcher_template.clone(),
         Arc::clone(&lease),
+        Arc::clone(&note),
     );
     let reroot = claude_reroot_hook(
         Arc::clone(&binding),
         launcher_template.clone(),
         Arc::clone(&lease),
+        Arc::clone(&note),
         candidate.clone(),
     );
     match StdioFacade::with_reestablishing_claude_attachment(
@@ -2234,6 +2251,7 @@ async fn run_managed_claude_mcp(
         candidate,
         reestablish,
         reroot,
+        note,
     ) {
         Some(facade) => {
             // The held lease stream is a live death notice for the shared daemon: watching it
@@ -2286,14 +2304,16 @@ fn claude_reestablish_hook(
     binding: Arc<std::sync::Mutex<ClaudeBinding>>,
     launcher_template: PathBuf,
     lease: Arc<Mutex<Option<UnixStream>>>,
+    note: SharedDaemonNote,
 ) -> ReestablishFn {
     Arc::new(move || {
         let binding = binding.lock().expect("claude binding mutex").clone();
         let launcher_template = launcher_template.clone();
         let lease = Arc::clone(&lease);
+        let note = Arc::clone(&note);
         Box::pin(async move {
             let started = std::time::Instant::now();
-            let result = attach_claude_binding(&binding, &launcher_template, &lease).await;
+            let result = attach_claude_binding(&binding, &launcher_template, &lease, &note).await;
             agent_ide::errorlog::record(
                 agent_ide::errorlog::Method::Client,
                 if result.is_some() {
@@ -2331,12 +2351,14 @@ fn claude_reroot_hook(
     binding: Arc<std::sync::Mutex<ClaudeBinding>>,
     launcher_template: PathBuf,
     lease: Arc<Mutex<Option<UnixStream>>>,
+    note: SharedDaemonNote,
     startup: PathBuf,
 ) -> RerootFn {
     Arc::new(move |requested| {
         let binding = Arc::clone(&binding);
         let launcher_template = launcher_template.clone();
         let lease = Arc::clone(&lease);
+        let note = Arc::clone(&note);
         let startup = startup.clone();
         Box::pin(async move {
             let started = std::time::Instant::now();
@@ -2378,7 +2400,9 @@ fn claude_reroot_hook(
                                 key,
                                 allowed_roots: current.allowed_roots.clone(),
                             };
-                            match attach_claude_binding(&moved, &launcher_template, &lease).await {
+                            match attach_claude_binding(&moved, &launcher_template, &lease, &note)
+                                .await
+                            {
                                 Some((runtime, attachment)) => {
                                     *binding.lock().expect("claude binding mutex") = moved;
                                     RerootOutcome::Attached(runtime, attachment, candidate)
@@ -2432,25 +2456,41 @@ async fn open_client_lease(runtime: &Path, candidate: &Path) -> Option<(UnixStre
 ///
 /// Never returns ownership of a child process or the runtime directory to the caller: whichever
 /// generation actually serves the daemon manages its own lifetime independently of this MCP.
+/// Every adoption checks the daemon's reported version against this binary (0.6.7): an outdated
+/// idle daemon is stopped and replaced by a current spawn, an outdated busy one keeps serving with
+/// the honest line `note` records, and a current or newer one is adopted unchanged. Two bounded
+/// rounds cover a replacement racing another front's spawn; after them, whatever answers is
+/// served, because no daemon at all is worse than an outdated one.
 async fn rendezvous_with_claude_daemon(
     path: &Path,
     key: &Path,
     launcher_template: &Path,
     candidate: &Path,
+    note: &SharedDaemonNote,
 ) -> Option<(PathBuf, String)> {
-    if let Some(attachment) = adopt_claude_daemon(path, key).await {
-        return Some((path.to_owned(), attachment));
-    }
-    let runtime = ManagedRuntime::ensure_deterministic(path.to_owned()).ok()?;
-    if let Some(attachment) = spawn_claude_daemon(&runtime, key, launcher_template, candidate).await
-    {
-        return Some((path.to_owned(), attachment));
+    for _ in 0..2 {
+        if let Some(attachment) = adopt_current_claude_daemon(path, key, note).await {
+            return Some((path.to_owned(), attachment));
+        }
+        if let Ok(runtime) = ManagedRuntime::ensure_deterministic(path.to_owned()) {
+            if let Some(attachment) =
+                spawn_claude_daemon(&runtime, key, launcher_template, candidate, note).await
+            {
+                return Some((path.to_owned(), attachment));
+            }
+        } else {
+            break;
+        }
     }
     // Lost the start race to a concurrent MCP, or startup failed for another reason; make one more
     // adoption attempt before reporting this generation unavailable.
-    adopt_claude_daemon(path, key)
+    let adopted = adopt_claude_daemon(path, key)
         .await
-        .map(|attachment| (path.to_owned(), attachment))
+        .map(|attachment| (path.to_owned(), attachment));
+    if adopted.is_some() {
+        note_last_resort_daemon(path, note).await;
+    }
+    adopted
 }
 
 /// Adopts an existing daemon only after its directory identity, lock, and health all check out.
@@ -2474,6 +2514,115 @@ async fn adopt_claude_daemon(path: &Path, key: &Path) -> Option<String> {
         .map(|(_, attachment)| attachment)
 }
 
+/// Adopts the repository's live daemon only when its reported version may serve this front
+/// (0.6.7), asking an outdated idle one to stop so the caller spawns the current binary.
+///
+/// Returns the attachment to keep serving, or `None` when nothing is adoptable or the outdated
+/// daemon acknowledged `daemon.stop` (the caller's spawn path then rebuilds the rendezvous). A
+/// daemon still bound by another session is never stopped under it: the note records the honest
+/// start-card line instead. A pre-0.6.7 daemon reports no version and cannot be asked to stop at
+/// all, so it too keeps serving under that line until it idles out after its last session.
+async fn adopt_current_claude_daemon(
+    path: &Path,
+    key: &Path,
+    note: &SharedDaemonNote,
+) -> Option<String> {
+    let attachment = adopt_claude_daemon(path, key).await?;
+    let DoctorStatus::Healthy { daemon_generation } = doctor_report(path).await.ok()?.status else {
+        return None;
+    };
+    let daemon_version = reported_daemon_version(&daemon_generation);
+    let front_version = front_version();
+    let outdated = daemon_needs_replacement(&daemon_generation, &front_version);
+    if !outdated {
+        note.lock()
+            .expect("daemon currency note mutex")
+            .note_current();
+        return Some(attachment);
+    }
+    // Only a version-reporting daemon can be asked to stop; a pre-0.6.7 one stays silent.
+    if daemon_version.is_some() && request_daemon_stop(path).await == DaemonStop::Stopped {
+        wait_for_daemon_exit(path).await;
+        note.lock()
+            .expect("daemon currency note mutex")
+            .note_replaced();
+        return None;
+    }
+    note.lock()
+        .expect("daemon currency note mutex")
+        .note_outdated(outdated_daemon_line(daemon_version, &front_version));
+    Some(attachment)
+}
+
+/// The product version of this running front, the reference every adopted daemon is compared to.
+/// Returns the installed front version, with a validated test seam for release-version scenarios.
+fn front_version() -> String {
+    std::env::var("AGENT_IDE_TEST_FRONT_VERSION")
+        .ok()
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 32
+                && value
+                    .split('.')
+                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
+}
+
+/// One honest start-card line for a session still served by a daemon older than this front.
+fn outdated_daemon_line(daemon_version: Option<&str>, front_version: &str) -> String {
+    match daemon_version {
+        Some(version) => format!(
+            "daemon: {version} still serving (another session is active); restart that session or wait for it to stop for {front_version}"
+        ),
+        None => format!(
+            "daemon: older than 0.6.7 still serving (it reports no version and cannot be asked to stop); stop it manually or wait for it to idle out after its last session, then start a fresh session for {front_version}"
+        ),
+    }
+}
+
+/// Waits a bounded interval for a daemon that acknowledged `daemon.stop` to finish its orderly
+/// exit, so the caller's spawn does not immediately collide with the dying generation's lock,
+/// launcher, or runtime directory. A stuck daemon simply exhausts the wait; the spawn path's
+/// existing write-race recovery then clears whatever it left behind.
+async fn wait_for_daemon_exit(path: &Path) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let healthy = doctor_report(path)
+                .await
+                .is_ok_and(|report| matches!(report.status, DoctorStatus::Healthy { .. }));
+            if !healthy && !path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .ok();
+}
+
+/// Records the currency of a last-resort adopted daemon without ever stopping it (0.6.7): the
+/// rendezvous already spent its replacement rounds, so the note alone says what is being served.
+async fn note_last_resort_daemon(path: &Path, note: &SharedDaemonNote) {
+    let daemon_generation = match doctor_report(path).await {
+        Ok(report) => match report.status {
+            DoctorStatus::Healthy {
+                ref daemon_generation,
+            } => daemon_generation.clone(),
+            DoctorStatus::Unavailable => return,
+        },
+        Err(_) => return,
+    };
+    let daemon_version = reported_daemon_version(&daemon_generation);
+    let front_version = front_version();
+    let mut note = note.lock().expect("daemon currency note mutex");
+    if daemon_needs_replacement(&daemon_generation, &front_version) {
+        note.note_outdated(outdated_daemon_line(daemon_version, &front_version));
+    } else {
+        note.note_current();
+    }
+}
+
 /// Spawns one detached daemon generation, or safely joins a concurrent MCP's in-flight spawn.
 ///
 /// Only ever called after [`adopt_claude_daemon`] found nothing live. A [`StartDaemonError::WriteRace`]
@@ -2487,6 +2636,7 @@ async fn spawn_claude_daemon(
     key: &Path,
     launcher_template: &Path,
     candidate: &Path,
+    note: &SharedDaemonNote,
 ) -> Option<String> {
     match start_managed_daemon(
         runtime,
@@ -2500,12 +2650,19 @@ async fn spawn_claude_daemon(
         Ok((attachment, child)) => {
             // Detached: the daemon now owns its own lifetime independently of this MCP process, so
             // its handle is dropped without killing it (kill-on-drop was disabled for this spawn).
+            // A daemon this binary itself started is current by construction; the note keeps only
+            // a replacement marker this same attach set by stopping an outdated daemon (0.6.7).
+            note.lock()
+                .expect("daemon currency note mutex")
+                .note_spawned_current();
             drop(child);
             Some(attachment)
         }
         Err(StartDaemonError::WriteRace) => {
             if wait_for_external_health(&runtime.path).await {
-                return adopt_claude_daemon(&runtime.path, key).await;
+                // The winner is a foreign daemon: adopt it under the same version check, so a
+                // concurrent older front's spawn is itself replaced when nothing binds it (0.6.7).
+                return adopt_current_claude_daemon(&runtime.path, key, note).await;
             }
             clear_claude_generation(runtime);
             match start_managed_daemon(
@@ -2518,6 +2675,9 @@ async fn spawn_claude_daemon(
             .await
             {
                 Ok((attachment, child)) => {
+                    note.lock()
+                        .expect("daemon currency note mutex")
+                        .note_spawned_current();
                     drop(child);
                     Some(attachment)
                 }

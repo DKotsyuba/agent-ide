@@ -126,6 +126,31 @@ with the existing launcher configuration error.
   `structuredContent` field and compact text on Codex, and compact text alone on Claude
   (agent-content-v0.2 §"Host-specific projection", T14B). Every other reply,
   including a still-unavailable retry, is unchanged.
+- Daemon version currency (0.6.7): the daemon's health reply reports its product version and the
+  hash of its executable path inside the opaque generation identifier
+  (`<version>-<executable-hash>-<random>`; pre-0.6.7 daemons answer bare random hex), so every front
+  learns the daemon's version from the health exchange it already performs — no new wire field
+  exists, and every older consumer that compared generations for equality keeps working. At
+  every adoption (startup rendezvous, re-establishment, or losing a spawn race to another front) the
+  front compares that version with its own binary, numerically per dot segment:
+  - a daemon at least as new as the front is adopted unchanged — including a newer daemon, so a
+    downgrade never starts a replacement loop. An equal-version daemon launched from a different
+    executable path is replaced to match the current install target;
+  - an older daemon with no open lease and no running check is asked, over the same private socket
+    and uid-checked v1 wire, to `daemon.stop`: it acknowledges, then exits through the same orderly
+    path as idle expiry (checks cancelled, socket closed, runtime directory removed). The front
+    waits for that exit and spawns the current binary, which takes the rendezvous through the
+    ordinary write-race recovery. The first reply after such a replacement carries the same T08B
+    restart hint, because its pre-hook observations died with the old daemon;
+  - an older daemon another session still binds (an open `ClientLease`) is never stopped under that
+    binding — the stop request is refused while any lease is open — and the front keeps serving it,
+    appending one honest line to its start card naming both versions and the remedy. The same line,
+    naming the real reason, covers a pre-0.6.7 daemon: it reports no version and cannot be asked to
+    stop, so it serves on until it idles out after its last session.
+  Two daemons per repository are not possible by design — one deterministic rendezvous directory,
+  one socket, one runtime lock — so a bound outdated daemon is served as is rather than duplicated.
+  `agent-ide doctor` (no arguments) lists this user's live daemons with their reported versions and
+  flags the outdated ones.
 
 Success example: agents A and B in two worktrees of one repository call `ide.start`; one daemon
 serves both; A exits; B keeps working; B exits; the daemon stops 300 s later.
