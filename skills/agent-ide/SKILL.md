@@ -59,6 +59,21 @@ and cost a fraction of the context:
   — the body with line numbers; its `source_ref` is what `ide.edit` needs. Each line reads
   `NNN<TAB>code`: one tab separates the number from the code, so stripping the gutter leaves
   the code exactly as it is in the file.
+- `ide.read {"symbols":["src/x.rs#A","src/x.rs#A/b","src/y.rs#C"]}` — several bodies in one
+  reply, request order, one `source_ref` valid for every file included; unknown symbols are
+  listed per item without failing the rest. Over-budget blocks are named in a footer with the
+  exact call to fetch them — never silently truncated. `{"path":…,"ranges":["10-20","44-60"]}`
+  reads several line ranges the same way.
+- `ide.edit {"operation_id":"…","path":"src/x.rs","source_ref":"…","changes":[…]}` — many
+  changes to one file in one call: entries by `lines` (numbers of the version you read),
+  by `symbol` (same `op`/`where` as the single forms), or by `old`/`new` exact text
+  (must match once; add `"within":"sym"` to scope it). All addresses resolve against the
+  version `source_ref` names; overlaps, no-match and multi-match are refused with the exact
+  per-change fix and nothing is written — retry with the same `operation_id`. The edit is
+  refused the same way when the result would not parse (the reply shows the line and the
+  change that caused it). The success reply lists where each change landed in the final
+  file (`3 changes applied: change 1: lines 12–20 replaced (now 12–24); …`), so continue
+  from it without re-reading. Prefer one read + one batch edit over a call per change.
 
 Edit by symbol with the same paths; every form formats the candidate with the project's
 formatter, then runs the project check (cargo check, pyright or tsc) and answers with the

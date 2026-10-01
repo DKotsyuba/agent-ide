@@ -150,6 +150,10 @@ struct Detail {
     authority: Option<AuthorityStamp>,
     /// Exact registered source facts rechecked before context delivery.
     source: Option<crate::workspace::observation::SourceObservation>,
+    /// Additional per-file observations a batch `ide.read` covered under this one detail: the
+    /// first file's observation stays `source`; every other delivered file rides here so the
+    /// same reference authorizes an edit of any file the read included. Path disambiguates.
+    extra_sources: Vec<crate::workspace::observation::SourceObservation>,
     /// Native lifecycle revision associated with this result.
     native_epoch: u64,
     /// Retained bounded Changes state for the next Diff page; absent once fully delivered.
@@ -805,6 +809,20 @@ impl Shared {
             {
                 *continuation = false;
             }
+        }
+    }
+    /// Retains the additional per-file edit bases a batch `ide.read` covered under one detail
+    /// reference (the in-job write precedent is [`Self::set_context_page`]). Each observation
+    /// keeps its own path, so `admitted_edit_source` can match an edit of any included file by
+    /// path alone.
+    fn add_edit_sources(&self, reference: &str, sources: Vec<SourceObservation>) {
+        if sources.is_empty() {
+            return;
+        }
+        if let Ok(mut ledger) = self.ledger.lock()
+            && let Some(detail) = ledger.details.get_mut(reference)
+        {
+            detail.extra_sources = sources;
         }
     }
 }
@@ -1688,6 +1706,7 @@ impl WorkerHandle {
                     context_page: None,
                     context_page_fresh: false,
                     diff_provenance: None,
+                    extra_sources: Vec::new(),
                 },
             );
         }
@@ -3659,6 +3678,9 @@ impl<'a> Worker<'a> {
                 source,
             ));
         }
+        if job.parameters.get("changes").is_some() {
+            return self.edit_changes(job).await;
+        }
         if job.parameters.get("symbol").is_some() || job.parameters.get("lines").is_some() {
             return self.edit_by_symbol(job).await;
         }
@@ -4717,7 +4739,7 @@ fn admitted_edit_source(
     reference: &str,
     path: &str,
 ) -> Option<SourceObservation> {
-    (detail.binding == *binding
+    let admitted = detail.binding == *binding
         // A Context or Read source_ref names the complete observed source, but its pages are the
         // only view the caller has: while any page is still undelivered the caller has not
         // observed the whole file, so a full-content replace built on it could silently truncate
@@ -4736,10 +4758,19 @@ fn admitted_edit_source(
                 result.source_ref.as_deref() == Some(reference) && result.outcome.has_post_source()
             }
             _ => false,
+        };
+    // The first file's observation, then the batch read's additional files: path disambiguates,
+    // so the same reference authorizes an edit of any file the read covered.
+    admitted
+        .then(|| {
+            detail
+                .source
+                .iter()
+                .chain(detail.extra_sources.iter())
+                .find(|source| source.path().to_str() == Some(path))
+                .cloned()
         })
-    .then(|| detail.source.clone())
-    .flatten()
-    .filter(|source| source.path().to_str() == Some(path))
+        .flatten()
 }
 
 /// Returns the newest retained detail reference that already authorizes a full-file edit of
@@ -5782,6 +5813,7 @@ mod stop_retry_tests {
                 context_page: None,
                 context_page_fresh: false,
                 diff_provenance: None,
+                extra_sources: Vec::new(),
             },
         );
 
@@ -5846,6 +5878,7 @@ mod stop_retry_tests {
                 context_page: None,
                 context_page_fresh: false,
                 diff_provenance: None,
+                extra_sources: Vec::new(),
             },
         );
         edit_job.reference = "edit-result-2".into();
@@ -5997,6 +6030,7 @@ mod stop_retry_tests {
                 context_page: None,
                 context_page_fresh: false,
                 diff_provenance: None,
+                extra_sources: Vec::new(),
             },
         );
     }
@@ -6616,6 +6650,7 @@ mod stop_retry_tests {
                 context_page: None,
                 context_page_fresh: false,
                 diff_provenance: None,
+                extra_sources: Vec::new(),
             },
         );
     }
@@ -6887,6 +6922,7 @@ mod stop_retry_tests {
                 context_page: None,
                 context_page_fresh: false,
                 diff_provenance: None,
+                extra_sources: Vec::new(),
             },
         );
         let (first_reply, authority, source) = worker.context(&mut job).await.unwrap();
@@ -7009,6 +7045,7 @@ mod stop_retry_tests {
                 context_page: None,
                 context_page_fresh: false,
                 diff_provenance: None,
+                extra_sources: Vec::new(),
             },
         );
         let (first_reply, authority, source) = worker.context(&mut job).await.unwrap();
@@ -7101,6 +7138,7 @@ mod stop_retry_tests {
                 context_page: None,
                 context_page_fresh: false,
                 diff_provenance: None,
+                extra_sources: Vec::new(),
             },
         );
         let Err(code) = worker.context(&mut job).await else {
@@ -7176,6 +7214,7 @@ mod stop_retry_tests {
                 context_page: None,
                 context_page_fresh: false,
                 diff_provenance: None,
+                extra_sources: Vec::new(),
             },
         );
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -7658,6 +7697,7 @@ mod stop_retry_tests {
                 context_page: None,
                 context_page_fresh: false,
                 diff_provenance: None,
+                extra_sources: Vec::new(),
             },
         );
         let retry = serde_json::json!({"activation_id":"same-id","root":"/another/root"});
@@ -7711,6 +7751,7 @@ mod stop_retry_tests {
                 context_page: None,
                 context_page_fresh: false,
                 diff_provenance: None,
+                extra_sources: Vec::new(),
             },
         );
         let (reply, _authority, _source) = worker.context(&mut job).await.unwrap();
@@ -7796,6 +7837,7 @@ mod stop_retry_tests {
                 context_page: None,
                 context_page_fresh: false,
                 diff_provenance: None,
+                extra_sources: Vec::new(),
             },
         );
     }

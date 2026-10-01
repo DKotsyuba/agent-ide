@@ -159,6 +159,10 @@ pub enum FailureCode {
     ProviderLoading,
     /// No symbol matches the requested path or name in the file or project.
     UnknownSymbol,
+    /// An edit's addresses or content did not resolve against the file it names — an overlap, a
+    /// text that does not match exactly once, an unknown symbol or range, or a candidate that
+    /// does not parse. Nothing was written and the `operation_id` is unconsumed.
+    EditRefused,
     /// The requested path is not a registered source in the authorized worktree scope: the file
     /// does not exist. Carries the bounded path exactly as requested (T163 precedent: paths in
     /// the reason are allowed; the stage tag itself stays payload-free).

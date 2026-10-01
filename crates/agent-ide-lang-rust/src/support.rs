@@ -40,7 +40,8 @@ use agent_ide_core::lang::brace::{
 use agent_ide_core::lang::{
     CommandSource, InsertSite, InsertWhere, LangError, Language, LanguageProject, LanguageSupport,
     LineRange, Outline, ProjectCommand, ProjectCommands, Symbol, SymbolKind, SymbolPath,
-    TestFailure, TestReport, TestSelection, TestTarget, kind_of, line_count, lines_of,
+    SyntaxVerdict, TestFailure, TestReport, TestSelection, TestTarget, kind_of, line_count,
+    lines_of,
 };
 
 /// More referencing tests than this are selected by their common module prefix instead of by name.
@@ -183,6 +184,13 @@ impl LanguageSupport for RustSupport {
     /// rust-analyzer's own answers (the build in its `VERSION`).
     fn outline_from_source(&self, file: &Path, source: &str) -> Option<Outline> {
         crate::lexical::lexical_outline(file, source)
+    }
+
+    /// `syn` parses the text in this process (on the lexical outline's bounded parse thread); a
+    /// refusal that keeps the outline server-backed is `Unchecked` so the edit still proceeds and
+    /// the project check reports.
+    fn syntax_verdict(&self, _file: &Path, source: &str) -> SyntaxVerdict {
+        crate::lexical::syntax_verdict(source)
     }
 
     /// Always `true`: the lexical outline above meets the equality obligation, so outline, read
