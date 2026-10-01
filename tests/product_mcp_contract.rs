@@ -5077,7 +5077,7 @@ async fn a_full_file_edit_without_source_ref_creates_only_a_missing_file() {
     let refused = actor.settle(&fixture, refused).await;
     assert_eq!(refused["state"], "invalid_parameters", "{refused}");
     assert_eq!(
-        refused["result"]["content"][0]["text"],
+        refused["text"],
         "invalid bounded parameters: \"source_ref\" is required to replace an existing file: \
          read it first (ide.read)",
         "{refused}"
