@@ -182,8 +182,8 @@ struct LanguageState {
     run_start_fingerprint: Option<u64>,
     /// Fingerprint the last completed run started with (T20B); the skip comparison baseline.
     completed_fingerprint: Option<u64>,
-    /// `true` when an edit reply is waiting for the next run: that run skips the EYES-r2
-    /// cooldown once, since the caller asked for it explicitly instead of the feed guessing.
+    /// `true` when an edit reply is waiting for the next run: that run skips unchanged-input
+    /// elision and the EYES-r2 cooldown so it checks the requested post-edit source.
     urgent: bool,
     /// `true` only when the last completed run ended `Ready` (T20B): any other outcome —
     /// `Partial`, `Checking`, or an `Unavailable` failure or condition — must be re-checked on
@@ -321,8 +321,9 @@ impl Scheduler {
         self.trigger_inner(repository_key, worktree, false, false);
     }
 
-    /// Like [`Scheduler::trigger`], for a check a caller is waiting on (an edit reply): the run
-    /// it leads to skips the cooldown after the previous run instead of waiting it out.
+    /// Like [`Scheduler::trigger`], for a check a caller is waiting on (an edit reply): it forces
+    /// a check of the requested inputs even when the unchanged-input fingerprint matches, and
+    /// skips the cooldown after the previous run.
     pub fn trigger_urgent(&self, repository_key: &str, worktree: &Path) {
         self.trigger_inner(repository_key, worktree, false, true);
     }
@@ -606,7 +607,7 @@ impl Inner {
                 return;
             }
             (
-                wt.activation_armed,
+                wt.activation_armed || lang.urgent,
                 lang.skip_eligible,
                 lang.completed_fingerprint,
                 wt.input_generation,
@@ -823,14 +824,17 @@ impl Inner {
     }
 
     /// Reports whether a dirty follow-up run for this pair can still be skipped by the T20B
-    /// fingerprint comparison: the baseline exists and was armed by a completed `Ready` run.
+    /// fingerprint comparison: the baseline exists and was armed by a completed `Ready` run;
+    /// urgent edit checks always execute for their exact post-edit source.
     fn rerun_skip_candidate(&self, worktree: &Path, language: Language) -> bool {
         let state = self.lock_state();
         state
             .worktrees
             .get(worktree)
             .and_then(|wt| wt.languages.get(&language))
-            .is_some_and(|lang| lang.skip_eligible && lang.completed_fingerprint.is_some())
+            .is_some_and(|lang| {
+                !lang.urgent && lang.skip_eligible && lang.completed_fingerprint.is_some()
+            })
     }
 
     /// Applies the T20B skip to a dirty follow-up run (T28B): returns `true` when the current
@@ -1343,6 +1347,157 @@ mod deny_tests {
     use crate::execution::seatbelt::CredentialGlob;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// An edit-triggered check must run when the prior ready result has the same cheap fingerprint:
+    /// carrying its warning would falsely report `current_reported`, and carrying its clean result
+    /// would falsely report `current_clean` for the edited source.
+    #[tokio::test]
+    async fn urgent_edit_checks_do_not_promote_prior_generation_results() {
+        for (old_problem, current_problem) in
+            [(Some("removed warning"), None), (None, Some("new warning"))]
+        {
+            let root = std::env::temp_dir().join(format!(
+                "agent-ide-urgent-check-{}-{}",
+                std::process::id(),
+                old_problem.is_some()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let root = std::fs::canonicalize(root).unwrap();
+            std::fs::write(root.join("beta.toml"), "").unwrap();
+            let old = ProblemSnapshot::from_problems(
+                crate::lang::testing::BETA,
+                CheckState::Ready,
+                old_problem
+                    .map(|message| {
+                        vec![Problem::new(
+                            "src/lib.rs".into(),
+                            1,
+                            1,
+                            Severity::Warning,
+                            Some("dead_code".into()),
+                            message.into(),
+                        )]
+                    })
+                    .unwrap_or_default(),
+                1,
+                1,
+            );
+            let current = ProblemSnapshot::from_problems(
+                crate::lang::testing::BETA,
+                CheckState::Ready,
+                current_problem
+                    .map(|message| {
+                        vec![Problem::new(
+                            "src/lib.rs".into(),
+                            1,
+                            1,
+                            Severity::Warning,
+                            Some("dead_code".into()),
+                            message.into(),
+                        )]
+                    })
+                    .unwrap_or_default(),
+                2,
+                1,
+            );
+            let checker = Arc::new(FakeChecker::new(crate::lang::testing::BETA, current));
+            let fingerprint_calls = Arc::new(AtomicUsize::new(0));
+            let scheduler = Scheduler::new(
+                vec![checker.clone()],
+                Duration::from_millis(1),
+                1,
+                root.join("cache"),
+            )
+            .with_fingerprint({
+                let fingerprint_calls = Arc::clone(&fingerprint_calls);
+                Arc::new(move |_| {
+                    fingerprint_calls.fetch_add(1, Ordering::SeqCst);
+                    Some(7)
+                })
+            });
+            assert!(crate::lang::testing::BETA.is_present(&root));
+            {
+                let mut worktree = WorktreeState::new("repo");
+                worktree.input_generation = 1;
+                let language = LanguageState {
+                    latest_snapshot: Some(old),
+                    last_stored_generation: 1,
+                    completed_fingerprint: Some(7),
+                    skip_eligible: true,
+                    ..Default::default()
+                };
+                worktree
+                    .languages
+                    .insert(crate::lang::testing::BETA, language);
+                scheduler
+                    .inner
+                    .lock_state()
+                    .worktrees
+                    .insert(root.clone(), worktree);
+            }
+
+            scheduler.trigger_urgent("repo", &root);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if checker.requests().len() == 1
+                        && scheduler
+                            .latest(&root)
+                            .first()
+                            .is_some_and(|snapshot| snapshot.input_generation == 2)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("edit-triggered check must replace the earlier generation");
+            assert_eq!(fingerprint_calls.load(Ordering::SeqCst), 1);
+            let snapshot = scheduler.latest(&root).remove(0);
+            assert_eq!(
+                snapshot.problems.len(),
+                usize::from(current_problem.is_some())
+            );
+            if let Some(message) = current_problem {
+                assert_eq!(snapshot.problems[0].message, message);
+            }
+            scheduler.shutdown().await;
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    /// A check already running when an edit arrives must also run its dirty follow-up even when
+    /// the cheap fingerprint matches the pre-edit baseline.
+    #[test]
+    fn urgent_dirty_follow_up_cannot_skip_on_matching_fingerprint() {
+        let root = PathBuf::from("/tmp/agent-ide-urgent-dirty-rerun");
+        let scheduler = Scheduler::new(Vec::new(), Duration::ZERO, 1, PathBuf::new());
+        let mut worktree = WorktreeState::new("repo");
+        let mut language = LanguageState {
+            running: true,
+            dirty: true,
+            completed_fingerprint: Some(7),
+            skip_eligible: true,
+            urgent: true,
+            ..Default::default()
+        };
+        language.latest_snapshot = Some(ProblemSnapshot::checking(crate::lang::testing::BETA, 1));
+        worktree
+            .languages
+            .insert(crate::lang::testing::BETA, language);
+        scheduler
+            .inner
+            .lock_state()
+            .worktrees
+            .insert(root.clone(), worktree);
+
+        assert!(
+            !scheduler
+                .inner
+                .rerun_skip_candidate(&root, crate::lang::testing::BETA)
+        );
+    }
 
     /// A check result cannot disclose a denied path or count it in its cached plate.
     #[test]

@@ -117,14 +117,14 @@ impl LanguageServer for RustServer {
         "rust-analyzer"
     }
 
-    /// Cache priming disabled, versioned.
+    /// Rust-analyzer cache priming and check-on-save disabled, versioned.
     fn cache_settings(&self) -> &'static str {
-        "rust-cache-priming-disabled-v1"
+        "rust-cache-priming-check-on-save-disabled-v1"
     }
 
     /// The configuration identity [`RustProfile`] accepts for managed sessions.
     fn effective_configuration(&self) -> &'static str {
-        "cache-priming-disabled-v1"
+        "cache-priming-check-on-save-disabled-v1"
     }
 
     /// Cargo home, target directory and temporary files live in the worktree namespace.
