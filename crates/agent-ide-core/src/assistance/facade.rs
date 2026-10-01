@@ -258,7 +258,8 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES},
                     "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "With `path`: inclusive 1-based line range to replace."},
                     "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "The source_ref of the ide.read/ide.context this content is based on; required with `path`+`lines` and to replace an existing file with `path`+`content`, optional (but validated) with `symbol`. Omit it with `path`+`content` to create a new file."},
-                    "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES, "description": "Replacement or inserted code, including the symbol's doc comment and attributes."}
+                    "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES, "description": "Replacement or inserted code, including the symbol's doc comment and attributes."},
+                    "changes": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "additionalProperties": false, "properties": {"lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "op": {"type": "string", "enum": ["replace", "insert", "delete"]}, "where": {"type": "string", "enum": ["before", "after", "first", "last"]}, "content": {"type": "string"}, "old": {"type": "string", "minLength": 1}, "new": {"type": "string"}, "within": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}}, "description": "1–32 changes to ONE file (named by `path`), each addressed by exactly one of `lines`, `symbol` or `old`; every address resolves against the bytes `source_ref` names before anything is applied, and overlapping or unmatched addresses are refused together with nothing written. `lines` numbers are that version's, never shifted by other changes; `old` must match exactly once (add `within` to scope it) and `new` replaces it (`\"\"` deletes)."}}
                 }
             }),
         ),
@@ -279,8 +280,10 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "type": "object", "additionalProperties": false,
                 "properties": {
                     "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`; returns its body with the doc header."},
-                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root, with `lines`."},
-                    "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "Inclusive 1-based line range such as `120-180`."}
+                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root, with `lines` or `ranges`."},
+                    "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "Inclusive 1-based line range such as `120-180`."},
+                    "symbols": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "description": "Several bodies in one reply, request order, one `source_ref` valid for every file included: `[\"src/a.rs#Foo/bar\",\"src/b.rs#qux\"]`. Unknown symbols are reported per item without failing the rest."},
+                    "ranges": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "description": "Several line ranges of `path` in one reply, request order, with the same numbered gutter and one `source_ref`."}
                 }
             }),
         ),
@@ -333,6 +336,78 @@ pub const MAX_SYMBOL_PATH_BYTES: usize = 1024;
 /// Maximum bytes of the `content` argument on the wire; spliced whole files may be larger
 /// internally (`crate::workspace::edit::MAX_EDIT_CONTENT_BYTES`).
 pub const MAX_EDIT_ARGUMENT_CONTENT_BYTES: usize = 128 * 1024;
+/// Most entries one `ide.edit` `changes` array may hold.
+pub const MAX_EDIT_CHANGES: usize = 32;
+/// Most entries one `ide.read` `symbols` array or `ranges` array may hold.
+pub const MAX_READ_ADDRESSES: usize = 16;
+
+/// Reads one bounded optional array of nonempty strings from a closed method object: `None` when
+/// the field is absent, the clipped list when present, with the field's own shape refusal
+/// otherwise. `bound` bounds both the entry count and each entry's bytes.
+fn string_list(
+    object: &Map<String, Value>,
+    field: &'static str,
+    max: usize,
+) -> Result<Option<Vec<String>>, ParameterError> {
+    let Some(list) = object.get(field) else {
+        return Ok(None);
+    };
+    let list = list
+        .as_array()
+        .filter(|list| !list.is_empty() && list.len() <= max)
+        .ok_or_else(|| invalid_field(field, FieldRule::OneOf(LIST_OF_STRINGS)))?;
+    list.iter()
+        .map(|entry| {
+            let text = entry
+                .as_str()
+                .filter(|text| !text.is_empty() && text.len() <= max * 64);
+            text.map(str::to_owned)
+                .ok_or_else(|| invalid_field(field, FieldRule::OneOf("non-empty string entries")))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// Closed rule text for a bounded list argument of strings.
+const LIST_OF_STRINGS: &str = "an array of 1 to 16 non-empty strings";
+
+/// The `symbols` list: each entry a strict `path#Owner/name` (a nonempty file part before the
+/// `#`), never a sigil address — those stay on the single `symbol` form.
+fn symbol_list(
+    object: &Map<String, Value>,
+    field: &'static str,
+    max: usize,
+) -> Result<Option<Vec<String>>, ParameterError> {
+    let list = string_list(object, field, max)?;
+    if let Some(list) = &list
+        && list.iter().any(|entry| {
+            crate::lang::SymbolPath::parse(entry).map_or(true, |symbol| {
+                symbol.file().is_none() || symbol.segments().is_empty()
+            })
+        })
+    {
+        return Err(invalid_field(
+            field,
+            FieldRule::OneOf("strict symbol paths like src/x.rs#Owner/name"),
+        ));
+    }
+    Ok(list)
+}
+
+/// The `ranges` list: each entry an inclusive 1-based `start-end` range.
+fn range_list(
+    object: &Map<String, Value>,
+    field: &'static str,
+    max: usize,
+) -> Result<Option<Vec<String>>, ParameterError> {
+    let list = string_list(object, field, max)?;
+    if let Some(list) = &list
+        && list.iter().any(|range| parse_line_range(range).is_none())
+    {
+        return Err(invalid_field(field, FieldRule::LineRange));
+    }
+    Ok(list)
+}
 
 /// Parses an inclusive 1-based `start-end` line range; `None` for any other shape.
 pub(crate) fn parse_line_range(text: &str) -> Option<crate::lang::LineRange> {
@@ -373,13 +448,16 @@ pub enum ParameterError {
     /// The published schema stays a plain object (providers such as GLM drop a tool whose schema
     /// uses `allOf`/`if`/`else`), so this either-or rule lives here instead of in the schema.
     ContextTarget,
-    /// `ide.read` needs either `symbol` or both `path` and `lines`.
+    /// `ide.read` needs exactly one of: `symbol`, `path` with `lines`, `path` with `ranges`, or
+    /// `symbols`.
     ReadTarget,
     /// `ide.edit` needs `symbol` (with `op`), or `path` with `lines` and `source_ref` for a range
     /// replace, or the full-file form `path` + `content` (with `source_ref` to replace an existing
     /// file, without it only to create a missing one); the forms are exclusive, except a redundant
     /// `path` naming the symbol's own file.
     EditTarget,
+    /// `ide.edit` with `changes` needs `path` (one file) and no single-change form beside it.
+    ChangesTarget,
     /// The language runner rejected a semantically unsupported test target.
     TestTargetUnsupported(String),
 }
@@ -506,11 +584,18 @@ impl ParameterError {
             }
             Self::ContextTarget => CONTEXT_TARGET_MESSAGE.to_string(),
             Self::ReadTarget => {
-                "ide.read needs either `symbol`, or `path` with `lines` — not both".to_string()
+                "ide.read needs one form: `symbol`, or `path` with `lines`, or `path` with \
+                 `ranges`, or `symbols` — exactly one"
+                    .to_string()
             }
             Self::EditTarget => {
                 "ide.edit takes one form: `symbol` with `op`, or `path` with `lines` and \
                  `source_ref` — not both"
+                    .to_string()
+            }
+            Self::ChangesTarget => {
+                "ide.edit takes one form: \"changes\" with \"path\", or one single-change form \
+                 — not both"
                     .to_string()
             }
             Self::TestTargetUnsupported(message) => format!(
@@ -544,6 +629,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "path",
             "source_ref",
             "content",
+            "changes",
             "op",
             "symbol",
             "where",
@@ -551,7 +637,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "lines",
         ],
         AssistanceTool::Outline => &["path", "kinds"],
-        AssistanceTool::Read => &["symbol", "path", "lines"],
+        AssistanceTool::Read => &["symbol", "path", "lines", "symbols", "ranges"],
         AssistanceTool::Symbol => &["symbol", "usages", "callers", "callees", "history"],
         AssistanceTool::Graph => &["symbol", "direction", "depth", "tests"],
         AssistanceTool::Test => &["symbol", "path", "pattern", "command", "status", "budget_s"],
@@ -664,19 +750,33 @@ pub fn validate_call(
             optional_string(object, "symbol", MAX_SYMBOL_PATH_BYTES)?;
             optional_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
             optional_string(object, "lines", 32)?;
+            // `symbols`: several strict `path#Owner/name` addresses (no sigil addresses — those
+            // stay on the single `symbol` form); `ranges`: several ranges of one `path`.
+            let symbols = symbol_list(object, "symbols", MAX_READ_ADDRESSES)?;
+            let ranges = range_list(object, "ranges", MAX_READ_ADDRESSES)?;
             match (
                 object.contains_key("symbol"),
                 object.contains_key("path"),
                 object.contains_key("lines"),
+                symbols.as_ref().is_some_and(|list| !list.is_empty()),
+                ranges.as_ref().is_some_and(|list| !list.is_empty()),
             ) {
-                (true, false, false) => {}
-                (false, true, true) => {
+                (true, false, false, false, false) => {}
+                (false, true, true, false, false) => {
                     let path = object["path"].as_str().unwrap_or_default();
                     if let Some(rule) = path_shape_rule(path) {
                         return Err(invalid_field("path", rule));
                     }
                     if parse_line_range(object["lines"].as_str().unwrap_or_default()).is_none() {
                         return Err(invalid_field("lines", FieldRule::LineRange));
+                    }
+                }
+                // A batch of symbol addresses needs nothing else.
+                (false, false, false, true, false) => {}
+                (false, true, false, false, true) => {
+                    let path = object["path"].as_str().unwrap_or_default();
+                    if let Some(rule) = path_shape_rule(path) {
+                        return Err(invalid_field("path", rule));
                     }
                 }
                 _ => return Err(ParameterError::ReadTarget),
@@ -888,6 +988,155 @@ pub fn validate_call(
             required_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
         }
         AssistanceTool::Stop => {}
+        AssistanceTool::Edit if object.contains_key("changes") => {
+            required_string(object, "operation_id", 128)?;
+            for field in ["symbol", "lines", "op", "where", "new_name", "content"] {
+                if object.contains_key(field) {
+                    return Err(ParameterError::ChangesTarget);
+                }
+            }
+            let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
+            if let Some(rule) = path_shape_rule(path) {
+                return Err(invalid_field("path", rule));
+            }
+            let changes = object["changes"]
+                .as_array()
+                .filter(|list| (1..=MAX_EDIT_CHANGES).contains(&list.len()))
+                .ok_or_else(|| {
+                    invalid_field(
+                        "changes",
+                        FieldRule::OneOf("an array of 1 to 32 change objects"),
+                    )
+                })?;
+            // Line numbers and exact text are only meaningful for the bytes the caller read, so
+            // any `lines` or `old` entry makes the call name the observation it came from.
+            let mut needs_source = false;
+            for entry in changes {
+                let entry = entry.as_object().ok_or_else(|| {
+                    invalid_field("changes", FieldRule::OneOf("an array of change objects"))
+                })?;
+                let allowed = [
+                    "lines", "symbol", "op", "where", "content", "old", "new", "within",
+                ];
+                if let Some(field) = entry
+                    .keys()
+                    .find(|field| !allowed.contains(&field.as_str()))
+                {
+                    return Err(ParameterError::UnknownField(echoable_field(field)));
+                }
+                let addresses = ["lines", "symbol", "old"]
+                    .into_iter()
+                    .filter(|field| entry.contains_key(*field))
+                    .count();
+                if addresses != 1 {
+                    return Err(invalid_field(
+                        "changes",
+                        FieldRule::OneOf(
+                            "each entry addressed by exactly one of \"lines\", \"symbol\" or \
+                             \"old\"",
+                        ),
+                    ));
+                }
+                if entry.contains_key("lines") {
+                    if parse_line_range(entry_string(entry, "lines")?).is_none() {
+                        return Err(invalid_field(
+                            "changes",
+                            FieldRule::OneOf("entry \"lines\" like 12-20"),
+                        ));
+                    }
+                    needs_source = true;
+                    entry_string(entry, "content")?;
+                } else if entry.contains_key("symbol") {
+                    let symbol = entry_string(entry, "symbol")?;
+                    if symbol.len() > MAX_SYMBOL_PATH_BYTES {
+                        return Err(invalid_field(
+                            "changes",
+                            FieldRule::OneOf("entry \"symbol\" at most 1024 bytes"),
+                        ));
+                    }
+                    let op = match entry.get("op") {
+                        Some(Value::String(op)) => op.as_str(),
+                        Some(_) => {
+                            return Err(invalid_field(
+                                "changes",
+                                FieldRule::OneOf(
+                                    "entry \"op\" one of \"replace\", \"insert\", \"delete\"",
+                                ),
+                            ));
+                        }
+                        None => "replace",
+                    };
+                    if !matches!(op, "replace" | "insert" | "delete") {
+                        return Err(invalid_field(
+                            "changes",
+                            FieldRule::OneOf(
+                                "entry \"op\" one of \"replace\", \"insert\", \"delete\"",
+                            ),
+                        ));
+                    }
+                    match op {
+                        "replace" => {
+                            entry_string(entry, "content")?;
+                        }
+                        "insert" => {
+                            entry_string(entry, "content")?;
+                            if !entry
+                                .get("where")
+                                .and_then(Value::as_str)
+                                .is_some_and(|value| {
+                                    matches!(value, "before" | "after" | "first" | "last")
+                                })
+                            {
+                                return Err(invalid_field(
+                                    "changes",
+                                    FieldRule::OneOf(
+                                        "an insert entry needs \"where\" one of \"before\", \
+                                         \"after\", \"first\", \"last\"",
+                                    ),
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    entry_string(entry, "old")?;
+                    needs_source = true;
+                    if !entry
+                        .get("new")
+                        .is_some_and(|value| value.as_str().is_some())
+                    {
+                        return Err(invalid_field(
+                            "changes",
+                            FieldRule::OneOf("an \"old\" entry needs its \"new\" text"),
+                        ));
+                    }
+                    if let Some(value) = entry.get("within") {
+                        let Some(within) = value.as_str() else {
+                            return Err(invalid_field(
+                                "changes",
+                                FieldRule::OneOf("entry \"within\" a symbol path string"),
+                            ));
+                        };
+                        if within.is_empty() || within.len() > MAX_SYMBOL_PATH_BYTES {
+                            return Err(invalid_field(
+                                "changes",
+                                FieldRule::OneOf("entry \"within\" at most 1024 bytes"),
+                            ));
+                        }
+                    }
+                }
+            }
+            if needs_source {
+                // Line numbers and exact text name the read they came from; the refusal teaches
+                // the re-read the way the single line-range form's does.
+                if !object.contains_key("source_ref") {
+                    return Err(invalid_field("source_ref", FieldRule::RangeEditSourceRef));
+                }
+                required_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?;
+            } else {
+                optional_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?;
+            }
+        }
         AssistanceTool::Edit if object.contains_key("symbol") || object.contains_key("lines") => {
             required_string(object, "operation_id", 128)?;
             let op = object
@@ -1024,6 +1273,19 @@ pub fn validate_call(
         object.entry("provenance").or_insert(json!(false));
     }
     Ok(ValidatedCall { tool, parameters })
+}
+
+/// Reads one required bounded nonempty string from one `changes` entry, refusing on the entry
+/// field's own name so the caller learns exactly which key was missing or empty.
+fn entry_string<'a>(
+    entry: &'a Map<String, Value>,
+    field: &'static str,
+) -> Result<&'a str, ParameterError> {
+    entry
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid_field(field, FieldRule::NonEmptyString))
 }
 
 /// Reads one required bounded nonempty string from a closed method object.
@@ -3256,7 +3518,20 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Read,
-            "ide.read needs either `symbol`, or `path` with `lines` — not both".to_string(),
+            "ide.read needs one form: `symbol`, or `path` with `lines`, or `path` with \
+             `ranges`, or `symbols` — exactly one"
+                .to_string(),
+        ),
+        (
+            validate_call(
+                AssistanceTool::Edit,
+                json!({"operation_id":"o","path":"a.rs","changes":[{"lines":"1-2","content":"x"}],"content":"y"}),
+            )
+            .unwrap_err(),
+            AssistanceTool::Edit,
+            "ide.edit takes one form: \"changes\" with \"path\", or one single-change form \
+             — not both"
+                .to_string(),
         ),
         (
             validate_call(
@@ -3319,6 +3594,132 @@ fn range_edit_accepts_the_read_it_came_from() {
         json!({"operation_id":"o","op":"replace","symbol":"a.rs#run","path":"a.rs","lines":"1-2","source_ref":"s","content":"x"})
     )
     .is_err());
+}
+
+/// The `changes` shape matrix: one address per entry, payloads per operation, `source_ref`
+/// required exactly when an entry addresses by lines or text, and no single-change form beside.
+#[test]
+fn edit_changes_shape_matrix() {
+    let batch = |source_ref: bool, changes: Value| {
+        let mut call = json!({"operation_id":"o","path":"src/x.rs","changes":changes});
+        if source_ref {
+            call["source_ref"] = json!("read-1");
+        }
+        validate_call(AssistanceTool::Edit, call)
+    };
+    // Every address form is admitted with its payload; lines/old force the source_ref.
+    assert!(batch(true, json!([{"lines":"3-4","content":"x"}])).is_ok());
+    assert!(
+        batch(true, json!([{"old":"a","new":"b","within":"src/x.rs#F"}])).is_ok(),
+        "old/within entries resolve"
+    );
+    assert!(batch(false, json!([{"symbol":"src/x.rs#F","op":"delete"}])).is_ok());
+    assert!(
+        batch(
+            false,
+            json!([{"symbol":"src/x.rs#F","op":"replace","content":"x"}])
+        )
+        .is_ok()
+    );
+    assert!(
+        batch(
+            false,
+            json!([{"symbol":"src/x.rs#F","op":"insert","where":"after","content":"x"}])
+        )
+        .is_ok()
+    );
+    // A lines entry without source_ref is refused on the source_ref rule.
+    assert_eq!(
+        batch(false, json!([{"lines":"3-4","content":"x"}])).unwrap_err(),
+        invalid_field("source_ref", FieldRule::RangeEditSourceRef)
+    );
+    assert_eq!(
+        batch(false, json!([{"old":"a","new":"b"}])).unwrap_err(),
+        invalid_field("source_ref", FieldRule::RangeEditSourceRef)
+    );
+    // No address, two addresses, a bad op, a bad where, a missing payload.
+    assert!(batch(true, json!([{"content":"x"}])).is_err());
+    assert!(batch(true, json!([{"lines":"1-2","old":"a","new":"b"}])).is_err());
+    assert!(
+        batch(
+            true,
+            json!([{"symbol":"src/x.rs#F","op":"rename","new_name":"g"}])
+        )
+        .is_err()
+    );
+    assert!(
+        batch(
+            true,
+            json!([{"symbol":"src/x.rs#F","op":"insert","where":"under","content":"x"}])
+        )
+        .is_err()
+    );
+    assert!(batch(true, json!([{"symbol":"src/x.rs#F","op":7,"content":"x"}])).is_err());
+    assert!(batch(true, json!([{"old":"a","new":"b","within":7}])).is_err());
+    assert!(batch(true, json!([{"symbol":"src/x.rs#F","op":"replace"}])).is_err());
+    // Bounds: at most 32 entries.
+    let many: Vec<Value> = (0..33)
+        .map(|_| json!({"symbol":"src/x.rs#F","op":"delete"}))
+        .collect();
+    assert!(batch(false, json!(many)).is_err());
+    // A single-change field beside `changes` is refused as a form mix.
+    assert_eq!(
+        validate_call(
+            AssistanceTool::Edit,
+            json!({"operation_id":"o","path":"src/x.rs","changes":[{"lines":"1-2","content":"x"}],"lines":"1-2","source_ref":"s"})
+        )
+        .unwrap_err(),
+        ParameterError::ChangesTarget
+    );
+}
+
+/// Batch reads validate their list shapes and stay exclusive with the single forms.
+#[test]
+fn read_symbols_and_ranges_validate() {
+    assert!(
+        validate_call(
+            AssistanceTool::Read,
+            json!({"symbols":["src/a.rs#F/g","src/b.rs#q"]})
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Read,
+            json!({"path":"src/x.rs","ranges":["10-20","44-60"]})
+        )
+        .is_ok()
+    );
+    // A sigil address is not a strict symbol path; ranges need `path`.
+    assert!(
+        validate_call(AssistanceTool::Read, json!({"symbols":["#main"]})).is_err(),
+        "a sigil stays on the single form"
+    );
+    assert!(validate_call(AssistanceTool::Read, json!({"symbols":["src/a.rs#"]})).is_err());
+    assert!(validate_call(AssistanceTool::Read, json!({"ranges":["10-20"]})).is_err());
+    // The two batch forms are exclusive with every single form.
+    assert!(
+        validate_call(
+            AssistanceTool::Read,
+            json!({"symbols":["src/a.rs#F"],"path":"src/a.rs"})
+        )
+        .is_err()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Read,
+            json!({"path":"src/x.rs","ranges":["10-20"],"lines":"1-2"})
+        )
+        .is_err()
+    );
+    // At most 16 entries, each a range.
+    let many: Vec<String> = (0..17).map(|index| format!("{index}-20")).collect();
+    let mut call = json!({"path":"src/x.rs"});
+    call["ranges"] = json!(many);
+    assert!(validate_call(AssistanceTool::Read, call).is_err());
+    let mut call = json!({});
+    call["symbols"] = json!((0..17).map(|_| "a.rs#F").collect::<Vec<_>>());
+    assert!(validate_call(AssistanceTool::Read, call).is_err());
 }
 
 /// The full-file form without `source_ref` validates as a creation request whose forwarded

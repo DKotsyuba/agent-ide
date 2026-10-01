@@ -516,6 +516,17 @@ pub struct TestReport {
     pub incomplete: bool,
 }
 
+/// Structural verdict for a candidate file text, used to refuse a broken edit before any write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SyntaxVerdict {
+    /// The text parses structurally.
+    Clean,
+    /// The text does not parse; 1-based line (0 when unknown) in the checked text, bounded message.
+    Failed { line: u32, message: String },
+    /// No structural checker is available here; the edit proceeds and the project check reports.
+    Unchecked,
+}
+
 /// Where a project command came from; replies print it so the agent knows how far to trust it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandSource {
@@ -605,7 +616,8 @@ impl fmt::Display for LangError {
 impl std::error::Error for LangError {}
 
 /// The per-language contract. Implementations are stateless; every method is a pure function of
-/// its inputs except `detect`, which reads manifests under `root`.
+/// its inputs except `detect`, which reads manifests under `root`, and `syntax_probe_command`,
+/// which names a subprocess the caller (never this trait) runs.
 pub trait LanguageSupport: Send + Sync {
     fn language(&self) -> Language;
 
@@ -646,6 +658,25 @@ pub trait LanguageSupport: Send + Sync {
     /// candidate that is not on disk yet. `file` is the relative path the text belongs to (formatters
     /// pick their config and language from it). `None` when the project has no formatter for it.
     fn format_stdin_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>>;
+
+    /// In-process structural check when this module has a parser available.
+    /// Bounded like the lexical outline: a text the checker refuses to attempt is [`Self::Unchecked`],
+    /// which lets the edit proceed and the project check report.
+    fn syntax_verdict(&self, file: &Path, source: &str) -> SyntaxVerdict {
+        let _ = (file, source);
+        SyntaxVerdict::Unchecked
+    }
+
+    /// stdin probe command for a bounded external structural checker. `None` means no probe here,
+    /// i.e. [`SyntaxVerdict::Unchecked`]. The caller runs it from the project root with the candidate
+    /// on stdin and maps its output through [`SyntaxVerdict::from_probe`]; the probe's first output
+    /// line must be `<line>: <message>` and a nonzero exit without that shape means "no checker".
+    /// Same contract as [`Self::format_stdin_command`].
+    /// Same contract as [`Self::format_stdin_command`].
+    fn syntax_probe_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>> {
+        let _ = (project, file);
+        None
+    }
 
     /// Runner identifier of the test whose outline path (segments joined with `::`) is
     /// `outline_path` in the project-relative `file`. Defaults to `outline_path` itself; a

@@ -319,6 +319,72 @@ mod tests {
         assert_eq!(rendered.structured_content, Some(expected));
     }
 
+    /// An `edit_refused` refusal renders its stage, the per-change sentences and the retry step.
+    #[test]
+    fn edit_refused_names_its_changes_and_the_same_operation_id() {
+        let reply = PeerReply::Error {
+            code: FailureCode::EditRefused,
+            detail: Some(
+                "edit:refused: 2 of 3 changes refused, nothing written — change 2: old text \
+                 not found; closest line 214: \"        let total = lang::line_count(&source);\"; \
+                 change 3: old text matches 2 places (lines 40, 88); add \
+                 \"within\":\"src/x.rs#Owner/name\" or more surrounding lines"
+                    .to_owned(),
+            ),
+        };
+        let rendered = render(reply, Envelope::WithStructured).unwrap();
+        let text = text_of(&rendered);
+        assert_eq!(
+            text,
+            "error: edit_refused (edit:refused); 2 of 3 changes refused, nothing written — \
+             change 2: old text not found; closest line 214: \"        let total = \
+             lang::line_count(&source);\"; change 3: old text matches 2 places (lines 40, 88); \
+             add \"within\":\"src/x.rs#Owner/name\" or more surrounding lines. Fix the named \
+             changes and retry with the same operation_id"
+        );
+        // The structured copy keeps the closed code and drops the detail payload.
+        let structured = rendered.structured_content.unwrap();
+        assert_eq!(structured["code"], "edit_refused");
+        assert!(structured.get("detail").is_none());
+        assert!(fits(
+            &PeerReply::Error {
+                code: FailureCode::EditRefused,
+                detail: Some("edit:refused: 32 of 32 changes refused, nothing written".to_owned()),
+            },
+            Envelope::WithStructured
+        ));
+    }
+
+    /// A batch landing note rides the ordinary edit note field after the first line.
+    #[test]
+    fn batch_landing_note_lines_render_after_the_edit_line() {
+        let reply = PeerReply::Edit {
+            result: edit_result(EditOutcome::Replaced).unwrap(),
+            diagnostics: EditDiagnostics::CurrentClean {},
+            note: Some(
+                "3 changes applied: change 1: lines 12–20 replaced (now 12–24); change 2: \
+                 src/x.rs#Foo/bar inserted after #Foo (now 26–33); change 3: old text at line \
+                 88 replaced (now 90–91)\nnote: src/x.rs already had a syntax error (line 4) \
+                 before this edit; edit applied"
+                    .into(),
+            ),
+            operation: None,
+        };
+        let rendered = render(reply, Envelope::TextOnly).unwrap();
+        let text = text_of(&rendered);
+        assert!(
+            text.contains("\n3 changes applied: change 1: lines 12–20 replaced (now 12–24)"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(
+                "note: src/x.rs already had a syntax error (line 4) before this \
+                            edit; edit applied"
+            ),
+            "{text}"
+        );
+    }
+
     /// Refuses future reply variants instead of emitting an empty success-shaped MCP page.
     #[test]
     fn unknown_template_branches_fail_closed() {

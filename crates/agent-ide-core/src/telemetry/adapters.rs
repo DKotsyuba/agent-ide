@@ -150,6 +150,14 @@ pub(crate) fn stage_default(tool: AssistanceTool, reason: &str) -> String {
 
 /// Derives the default `<tool>:<reason>` stage tag for one closed failure code.
 pub(crate) fn default_stage(tool: AssistanceTool, code: &FailureCode) -> String {
+    // An edit refusal's stage is the `edit:refused` prefix its detail sentences extend, not the
+    // generic reason tag (the refusal always sets this detail itself; this arm is the backstop).
+    if matches!(
+        (tool, code),
+        (AssistanceTool::Edit, FailureCode::EditRefused)
+    ) {
+        return "edit:refused".to_owned();
+    }
     let reason: crate::errorlog::ReasonCode = code.clone().into();
     stage_default(tool, reason.as_str())
 }

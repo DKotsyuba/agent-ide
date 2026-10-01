@@ -7044,6 +7044,141 @@ async fn configured_product_outline_kinds_filter_keeps_containers_and_states_the
     daemon.wait().await.unwrap();
 }
 
+/// Exercises the owner's outline → cross-file batch read → single-file batch edit flow without an intervening re-read.
+#[tokio::test]
+async fn configured_product_batch_read_then_edit_reports_landings_and_bytes() {
+    let fixture = symbol_test_fixture();
+    let path = fixture.root.join("src/lib.rs");
+    std::fs::write(&path, "pub struct Service;\npub fn value() -> i32 { 1 }\n").unwrap();
+    std::fs::write(
+        fixture.root.join("src/util.rs"),
+        "// fixture\npub fn utility() -> i32 {\n    2\n}\npub fn second() -> i32 {\n    3\n}\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "src/util.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "batch read edit fixture"]);
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "batch-read-edit").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"batch-read-edit-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    let outline = actor
+        .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+        .await;
+    let outline = actor.settle(&fixture, outline).await;
+    assert_eq!(outline["kind"], "outline", "{outline}");
+    assert!(
+        outline["text"]
+            .as_str()
+            .unwrap()
+            .contains("pub struct Service"),
+        "{outline}"
+    );
+
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"symbols":["src/lib.rs#Service","src/lib.rs#value","src/util.rs#utility","src/util.rs#second"]}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    assert_eq!(read["kind"], "read", "{read}");
+    let read_text = read["text"].as_str().unwrap();
+    assert!(read_text.contains("src/lib.rs#value"), "{read_text}");
+    assert!(read_text.contains("src/util.rs#utility"), "{read_text}");
+    assert!(read_text.contains("src/util.rs#second"), "{read_text}");
+    let source_ref = read["detail_ref"].as_str().unwrap();
+
+    let edit = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"batch-read-edit-once",
+                "path":"src/util.rs",
+                "source_ref":source_ref,
+                "changes":[
+                    {"lines":"1-1","content":"// changed"},
+                    {"old":"pub fn second() -> i32 {\n    3\n}","new":"pub fn second() -> i32 {\n    42\n}"}
+                ]
+            }),
+        )
+        .await;
+    let edit = actor.settle(&fixture, edit).await;
+    assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
+    let note = edit["note"].as_str().unwrap_or_default();
+    assert!(
+        note.contains("change 1: lines 1 replaced (now 1)"),
+        "{edit}"
+    );
+    assert!(
+        note.contains("change 2: old text at line 5 replaced (now 5–7)"),
+        "{edit}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/util.rs")).unwrap(),
+        b"// changed\npub fn utility() -> i32 {\n    2\n}\npub fn second() -> i32 {\n    42\n}\n"
+    );
+
+    let current_ref = edit["result"]["source_ref"].as_str().unwrap();
+    let invalid = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"syntax-retry",
+                "path":"src/util.rs",
+                "source_ref":current_ref,
+                "changes":[{
+                    "old":"pub fn second() -> i32 {\n    42\n}",
+                    "new":"pub fn second() -> i32 {"
+                }]
+            }),
+        )
+        .await;
+    let invalid = actor.settle(&fixture, invalid).await;
+    assert_eq!(invalid["state"], "error", "{invalid}");
+    assert_eq!(invalid["code"], "edit_refused", "{invalid}");
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/util.rs")).unwrap(),
+        b"// changed\npub fn utility() -> i32 {\n    2\n}\npub fn second() -> i32 {\n    42\n}\n"
+    );
+    let retry = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"syntax-retry",
+                "path":"src/util.rs",
+                "source_ref":current_ref,
+                "changes":[{
+                    "old":"pub fn second() -> i32 {\n    42\n}",
+                    "new":"pub fn second() -> i32 {\n    99\n}"
+                }]
+            }),
+        )
+        .await;
+    let retry = actor.settle(&fixture, retry).await;
+    assert_eq!(retry["result"]["outcome"], "replaced", "{retry}");
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/util.rs")).unwrap(),
+        b"// changed\npub fn utility() -> i32 {\n    2\n}\npub fn second() -> i32 {\n    99\n}\n"
+    );
+
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// The symbol edit replies name their operation — `edit: inserted`, `edit: deleted` — and a
 /// rename answers once with `edit: renamed` plus a note listing every touched file with its
 /// site count, instead of one file's plain `edit: replaced`.

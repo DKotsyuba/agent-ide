@@ -266,6 +266,8 @@ pub enum ReasonCode {
     ProviderLoading,
     /// [`FailureCode::UnknownSymbol`].
     UnknownSymbol,
+    /// [`FailureCode::EditRefused`]: addresses or content refused before any write.
+    EditRefused,
     /// [`FailureCode::ResolutionUnverified`].
     ResolutionUnverified,
     /// [`FailureCode::Cancelled`].
@@ -354,6 +356,7 @@ impl ReasonCode {
             Self::ProviderUnavailable => "provider_unavailable",
             Self::ProviderLoading => "provider_loading",
             Self::UnknownSymbol => "unknown_symbol",
+            Self::EditRefused => "edit_refused",
             Self::ResolutionUnverified => "resolution_unverified",
             Self::Cancelled => "cancelled",
             Self::Deadline => "deadline",
@@ -419,6 +422,7 @@ impl From<FailureCode> for ReasonCode {
             FailureCode::ProviderUnavailable => Self::ProviderUnavailable,
             FailureCode::ProviderLoading => Self::ProviderLoading,
             FailureCode::UnknownSymbol => Self::UnknownSymbol,
+            FailureCode::EditRefused => Self::EditRefused,
             FailureCode::NoSuchFile(_) => Self::NoSuchFile,
             FailureCode::ResolutionUnverified => Self::ResolutionUnverified,
             FailureCode::Cancelled => Self::Cancelled,

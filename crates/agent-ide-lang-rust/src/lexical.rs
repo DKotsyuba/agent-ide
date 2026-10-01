@@ -82,7 +82,7 @@ use std::sync::{Mutex, PoisonError, mpsc};
 use std::time::Duration;
 
 use agent_ide_core::lang::brace::{line_at, source_lines};
-use agent_ide_core::lang::{LanguageSupport, Outline, Symbol, SymbolKind};
+use agent_ide_core::lang::{LanguageSupport, Outline, Symbol, SymbolKind, SyntaxVerdict};
 use async_lsp::lsp_types as lsp;
 use proc_macro2::{Delimiter, LineColumn, Span, TokenStream, TokenTree};
 use quote::ToTokens;
@@ -161,6 +161,60 @@ static OUTLINES: Outlines = Mutex::new(VecDeque::new());
 /// and a slow text never starts a second parse. Thread-safe.
 pub(crate) fn lexical_outline(file: &Path, source: &str) -> Option<Outline> {
     remembered(&OUTLINES, file, source, || outline_of(file, source))
+}
+
+/// Structural verdict for one Rust text (see `LanguageSupport::syntax_verdict`): `syn` is a
+/// complete Rust parser, so a text it accepts is [`SyntaxVerdict::Clean`] and a text it rejects
+/// fails with the error's own 1-based line and message. Every refusal the lexical outline makes
+/// for its own equality guarantee (a `// region:` comment, whitespace rustc does not accept,
+/// text past the token or depth bounds, a parse slower than [`PARSE_TIMEOUT`], a thread that
+/// could not start) is [`SyntaxVerdict::Unchecked`] here: those texts still edit exactly as
+/// they did before this check existed, and the project check reports. Runs on the same bounded
+/// parse thread as the outline; a function of the text only.
+pub(crate) fn syntax_verdict(source: &str) -> SyntaxVerdict {
+    if source.contains("// region:") {
+        return SyntaxVerdict::Unchecked;
+    }
+    // A shebang line is legal Rust to rustc but not to `syn`, so no verdict is proven.
+    if source.starts_with("#!") {
+        return SyntaxVerdict::Unchecked;
+    }
+    let chars: Vec<char> = source.chars().collect();
+    let code = blanked_code(&chars);
+    if code
+        .iter()
+        .any(|&character| character.is_whitespace() && !rust_whitespace(character))
+    {
+        return SyntaxVerdict::Unchecked;
+    }
+    let source = source.to_owned();
+    run_bounded(PARSE_STACK, PARSE_TIMEOUT, move || {
+        let tokens: TokenStream = match source.parse() {
+            Ok(tokens) => tokens,
+            // The lex error's own span is 1-based over the parsed string (span-locations).
+            Err(error) => {
+                let start = error.span().start();
+                return Some(SyntaxVerdict::Failed {
+                    line: start.line as u32,
+                    message: error.to_string(),
+                });
+            }
+        };
+        if !within_bounds(&tokens) {
+            return Some(SyntaxVerdict::Unchecked);
+        }
+        Some(match syn::parse2::<syn::File>(tokens) {
+            Ok(_) => SyntaxVerdict::Clean,
+            Err(error) => {
+                let start = error.span().start();
+                SyntaxVerdict::Failed {
+                    line: start.line as u32,
+                    message: error.to_string(),
+                }
+            }
+        })
+    })
+    .unwrap_or(SyntaxVerdict::Unchecked)
 }
 
 /// The answer `outlines` keeps for `file` with the text `source`, or — when it keeps none —
@@ -1715,5 +1769,35 @@ b: u32,\n}\npub struct Unit;\nmod leaf;\n";
         assert_eq!(tests.kind, SymbolKind::Test);
         assert_eq!(tests.range, LineRange::new(2, 6));
         assert_eq!(find(&outline, "outer/tests/waits").kind, SymbolKind::Test);
+    }
+}
+
+#[cfg(test)]
+mod syntax_tests {
+    use super::*;
+
+    /// A clean text is `Clean`; a truncated item fails at its own line with syn's message; a
+    /// text the outline refuses for its own equality rules stays `Unchecked`.
+    #[test]
+    fn syntax_verdict_cleans_fails_and_refuses() {
+        assert_eq!(syntax_verdict("fn a() {}\n"), SyntaxVerdict::Clean);
+        let failed = syntax_verdict("fn a() {\n");
+        assert!(
+            matches!(failed, SyntaxVerdict::Failed { line, .. } if line == 1 || line == 2),
+            "{failed:?}"
+        );
+        if let SyntaxVerdict::Failed { message, .. } = failed {
+            assert!(!message.is_empty());
+        }
+        // A shebang is legal Rust rustc accepts; no verdict is proven, so the edit proceeds.
+        assert_eq!(
+            syntax_verdict("#!/usr/bin/env run-crate\nfn a() {}\n"),
+            SyntaxVerdict::Unchecked
+        );
+        // Region comments refuse the outline; they are no syntax verdict either way.
+        assert_ne!(
+            syntax_verdict("// region: fold\nfn a() {}\n"),
+            SyntaxVerdict::Clean
+        );
     }
 }

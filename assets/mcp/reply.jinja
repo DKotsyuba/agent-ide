@@ -81,6 +81,8 @@ error: no_such_file: {{ code.no_such_file }}{% if resolution_detail %} ({{ resol
 error: source_too_large (read:source_too_large); source is {{ code.source_too_large.size }} bytes, over the {{ code.source_too_large.ceiling }} byte read limit. Read it in pieces with native tools
 {%- elif code == "unknown_symbol" and resolution_detail is startingwith("edit:range_past_end:") -%}
 error: unknown_symbol (edit:range_past_end); {{ resolution_message }}. Re-read the range with ide.read and retry with a fresh source_ref
+{%- elif code == "edit_refused" -%}
+error: edit_refused (edit:refused); {{ resolution_message }}. Fix the named changes and retry with the same operation_id
 {%- elif code == "unknown_symbol" -%}
 error: unknown_symbol{% if resolution_detail %} ({{ resolution_detail }}){% else %} (symbol:unknown_symbol){% endif %}; no symbol matches that path or name; check the file with ide.outline or search a bare name with ide.symbol
 {%- elif code == "provider_loading" -%}

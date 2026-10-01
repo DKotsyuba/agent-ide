@@ -37,6 +37,11 @@ pub struct Python;
 /// makes pytest print no summary line at all, which the parser then cannot read.
 const PYTEST_FLAGS: [&str; 3] = ["--no-header", "-p", "no:cacheprovider"];
 
+/// `-c` program of the syntax probe: parses stdin with `ast` and prints `<lineno>: <msg>` on a
+/// syntax error, the exact line [`SyntaxVerdict::from_probe`] maps (any other nonzero output
+/// means no checker was proven).
+const PY_AST_PROBE: &str = "import ast,sys\ntry:\n    ast.parse(sys.stdin.read())\nexcept SyntaxError as e:\n    print(f\"{e.lineno}: {e.msg}\")\n    sys.exit(1)";
+
 impl LanguageSupport for Python {
     /// Always the Python [`LANGUAGE`].
     fn language(&self) -> Language {
@@ -428,6 +433,25 @@ impl LanguageSupport for Python {
     /// Tests live only in test files by this runner's naming convention.
     fn tests_only_in_test_files(&self) -> bool {
         true
+    }
+
+    /// The project's own interpreter (the detected venv, else `python3` on PATH like the
+    /// formatter's tools) runs `ast.parse` over the candidate on stdin and prints
+    /// `<lineno>: <msg>` on a syntax error — exactly the probe line
+    /// [`SyntaxVerdict::from_probe`] maps. A missing interpreter fails the spawn, which the
+    /// caller maps to `Unchecked`, never a refusal.
+    fn syntax_probe_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>> {
+        match file.extension().and_then(|ext| ext.to_str()) {
+            Some("py" | "pyi") => {}
+            _ => return None,
+        }
+        let interpreter = project
+            .interpreter
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("python3"))
+            .display()
+            .to_string();
+        Some(vec![interpreter, "-c".to_owned(), PY_AST_PROBE.to_owned()])
     }
 
     /// The module docstring's first line (or the line after an empty opening quote).
@@ -1800,6 +1824,36 @@ FAILED tests/test_service.py::TestWorker::test_label
         fs::remove_dir_all(&empty).unwrap();
     }
 
+    /// The syntax probe is the project's own interpreter running `ast.parse` on stdin; no
+    /// subprocess runs here, only the argv shape is checked.
+    #[test]
+    fn syntax_probe_command_uses_the_project_interpreter() {
+        let mut venv = project(&[]);
+        venv.interpreter = Some(PathBuf::from("/repo/.venv/bin/python"));
+        assert_eq!(
+            Python
+                .syntax_probe_command(&venv, Path::new("src/svc/cli.py"))
+                .unwrap()[..2],
+            ["/repo/.venv/bin/python".to_owned(), "-c".to_owned()]
+        );
+        assert!(
+            Python
+                .syntax_probe_command(&venv, Path::new("src/svc/cli.py"))
+                .unwrap()[2]
+                .contains("ast.parse")
+        );
+        // Without a venv the probe falls back to python3 on PATH, like the formatter's tools.
+        let bare = project(&[]);
+        assert_eq!(
+            Python
+                .syntax_probe_command(&bare, Path::new("a.py"))
+                .unwrap()[0],
+            "python3"
+        );
+        assert_eq!(Python.syntax_probe_command(&bare, Path::new("a.js")), None);
+    }
+
+    /// Checks stdin formatter argv for each supported formatter configuration.
     #[test]
     fn format_stdin_command_reads_stdin_for_each_formatter() {
         let ruff = project(&[("tool", "uv"), ("formatter", "ruff")]);

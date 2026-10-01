@@ -281,6 +281,15 @@ source_ref: sym-14
 
 `source_ref` is the reference currently called `detail_ref` by edit: it binds to the read content. A stale or incomplete read is refused as `stale_source` with no write; retry with the newest `source_ref` in the reply, or re-read every page before retrying.
 
+Batch reads fetch everything one edit needs in one call:
+
+```text
+ide.read {"symbols": ["src/a.rs#Foo/bar", "src/b.rs#qux"]}   // up to 16, any files
+ide.read {"path": "src/x.rs", "ranges": ["10-20", "44-60"]}  // up to 16 ranges
+```
+
+The reply has one block per item in request order, headed by its address and line range, with the same numbered gutter as every read. Unknown symbols are reported per item (`no such symbol: … — check ide.outline {"path":"…"}`) without failing the rest. One `source_ref` is minted per call and is valid for every file it included: a batch `ide.edit` on any of them needs no re-read, and its line numbers are that version's. Blocks are never cut mid-body: what the reply budget could not hold is listed explicitly (`not included (over the reply budget): src/c.rs#C — call ide.read {"symbols":["src/c.rs#C"]}`); a single block larger than the whole budget pages by bytes like any read. An exactly duplicated address renders once; a nested symbol (a method inside a requested type) renders inside its parent and as its own block.
+
 Errors: `no_such_file` (the requested path does not exist in the worktree; fix the path or use `ide.symbol` with a bare name), `unknown_symbol`.
 
 ### 2.5 `ide.edit` — edit a symbol or range (implemented)
@@ -332,7 +341,30 @@ renamed method → run; 7 sites in 4 files: src/index.ts (3), src/api.ts (2), te
 
 The first line's operation word names what happened: `edit: inserted`, `edit: deleted`, `edit: renamed` (`replace` and every plain edit keep `edit: replaced`, `edit: created`, `edit: unchanged`). The rename's second line lists every touched file with its site count, bounded like every other list (five files inline, then `+N more`); its diagnostics are the last written file's, and a rename never waits for the project check — a still-running check reports `diagnostics: unknown` and reaches the next `<agent-ide>` block or `ide.context` like any other edit.
 
-Errors: `stale_source`, `ambiguous_symbol`, `unknown_symbol`, `syntax_error` (the edit is applied, but the file does not parse; report the error and do not roll back).
+Errors: `stale_source`, `unknown_symbol`, `edit_refused` (address resolution, overlap, or a candidate that does not parse — nothing written, retry with the same `operation_id`).
+
+A batch edit changes many places in ONE file in one call:
+
+```text
+{operation_id, path, source_ref, changes: [
+  {lines: "12-20", content: "…"},
+  {symbol: "src/index.ts#ClassImpl/method", op: "replace", content: "…"},
+  {symbol: "src/index.ts#ClassImpl", op: "insert", where: "after", content: "…"},
+  {symbol: "src/index.ts#ClassImpl/old", op: "delete"},
+  {old: "exact text", new: "…", within?: "src/index.ts#ClassImpl/method"}]}
+```
+
+`changes` holds 1–32 entries, each addressed by exactly one of `lines` (numbers of the version `source_ref` read — never shifted by other changes in the same call), `symbol` (with the same `op`/`where` vocabulary as the single form), or `old` (exact text that must match once, optionally scoped to `within`'s symbol; `new: ""` deletes it). Every address resolves against the base bytes before anything is applied; overlapping ranges, zero-or-multi matches, unknown symbols and ranges past the end are refused together in one reply (`error: edit_refused (edit:refused); change N: …`) naming each failed change and the exact fix — nothing is written and the `operation_id` is unconsumed, so the same id retries. Application is all-or-nothing: one atomic write, one project check.
+
+Before the write the formatted candidate must parse: a structural check runs per language (Rust: syn; Python: its interpreter's `ast.parse`; TypeScript/JavaScript: the project's typescript parser). A candidate that does not parse is NOT written; the reply names the change that produced the error, its line and a few lines around it. A file that already failed the same check before the edit is still edited (the reply notes the pre-existing error). Languages and files without a checker proceed and report through the project check as before.
+
+The success reply lists where every change landed in the final file, so no re-read is needed to learn the new numbers:
+
+```text
+edit: replaced; path src/x.rs; source_ref …-7; diagnostics: current_clean. Next: use ide.diff
+3 changes applied: change 1: lines 12–20 replaced (now 12–24); change 2: src/x.rs#Foo/bar inserted after #Foo (now 26–33); change 3: old text at line 88 replaced (now 90–91)
+formatted: +3 lines after line 33; use source_ref …-7 for the next edit
+```
 
 ### 2.6 `ide.test` — run tests on request, in the background (implemented)
 

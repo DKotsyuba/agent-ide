@@ -35,6 +35,12 @@ pub struct TypeScript;
 /// Extensions of files this module treats as scripts.
 const SCRIPT_EXTENSIONS: [&str; 8] = ["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
 
+/// `-e` program of the syntax probe: parses stdin with the project's own `typescript` package and
+/// prints `<line+1>: <message>` for the first parse diagnostic — the exact line
+/// [`SyntaxVerdict::from_probe`] maps. Exit 3 (package not resolvable from the worktree root),
+/// a missing node or any other nonzero output means no checker was proven.
+const TS_PROBE: &str = "let ts;try{ts=require('typescript')}catch(e){process.exit(3)}let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const f=ts.createSourceFile('c.ts',d,ts.ScriptTarget.Latest,true);const p=f.parseDiagnostics[0];if(p){const l=f.getLineAndCharacterOfPosition(p.start).line+1;console.log(l+': '+ts.flattenDiagnosticMessageText(p.messageText,' '));process.exit(1)}});";
+
 /// Most lines scanned for one declaration's header and signature.
 const SCAN_LINES: usize = 200;
 
@@ -523,6 +529,24 @@ impl LanguageSupport for TypeScript {
     /// Tests live only in test files by this runner's naming convention.
     fn tests_only_in_test_files(&self) -> bool {
         true
+    }
+
+    /// `node -e` with the project's own `typescript` package (resolved from the worktree root the
+    /// probe runs in, so `node_modules/typescript` needs no path on the wire) parses stdin as a
+    /// source file and prints `<line+1>: <message>` for the first parse diagnostic. Any other
+    /// nonzero exit — node missing, `typescript` not installed (exit 3) — means no checker was
+    /// proven, which the caller maps to `Unchecked`, never a refusal. TypeScript parses plain
+    /// JavaScript with the same parser, so `.js`/`.jsx` are checked too.
+    fn syntax_probe_command(&self, _project: &LanguageProject, file: &Path) -> Option<Vec<String>> {
+        match file.extension().and_then(|ext| ext.to_str()) {
+            Some("ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs") => {}
+            _ => return None,
+        }
+        Some(vec![
+            "node".to_owned(),
+            "-e".to_owned(),
+            TS_PROBE.to_owned(),
+        ])
     }
 
     /// A leading `//` comment, or the first text line of a leading `/** */` block.
@@ -2282,6 +2306,31 @@ ok 2 - subtracts
         );
     }
 
+    /// The syntax probe is `node -e` resolving the project's own typescript package from the
+    /// worktree root the probe runs in; no subprocess runs here, only the argv shape is checked.
+    #[test]
+    fn syntax_probe_command_is_node_with_the_local_typescript() {
+        let project = project(&[]);
+        let probe = TypeScript
+            .syntax_probe_command(&project, Path::new("src/a.ts"))
+            .unwrap();
+        assert_eq!(probe[..2], ["node".to_owned(), "-e".to_owned()]);
+        assert!(probe[2].contains("parseDiagnostics"));
+        assert!(probe[2].contains("process.exit(3)"));
+        for file in ["src/a.js", "src/a.jsx"] {
+            assert!(
+                TypeScript
+                    .syntax_probe_command(&project, Path::new(file))
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            TypeScript.syntax_probe_command(&project, Path::new("src/a.py")),
+            None
+        );
+    }
+
+    /// Checks stdin formatter argv for each supported script extension.
     #[test]
     fn format_stdin_command_covers_the_script_extensions() {
         let prettier = project(&[("formatter", "prettier")]);
