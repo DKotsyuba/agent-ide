@@ -20,26 +20,19 @@ use crate::{
 };
 use std::collections::BTreeSet;
 
-/// One honest line replacing the old `freshness`/`captured_freshness` pair: whether this captured
-/// page still holds for the current tree, and what to do when it may not.
+/// Renders the capture time on page one and the bounded rechecks and recovery on later pages.
 ///
-/// Delivery itself rechecks nothing, so the line states the capture's own freshness, names the one
-/// recheck a later `ide.inspect` page does get (tracked working-tree bytes; never HEAD or the
-/// index), and gives the recovery for a tree that moved meanwhile.
-fn current_tree_line(freshness: crate::changes::DiffFreshness) -> String {
-    let captured = match freshness {
-        crate::changes::DiffFreshness::Current => {
-            "this page holds the captured tree and delivery rechecks nothing"
-        }
-        crate::changes::DiffFreshness::Stale => {
-            "the capture was already stale for its own comparison"
-        }
-        crate::changes::DiffFreshness::Unknown => "the capture could not prove its own freshness",
+/// Later staged pages do not recheck file content; other later pages recheck tracked working-tree
+/// bytes. No later page rereads commits, staging state or untracked names.
+fn current_tree_line(mode: DiffMode, later_page: bool) -> String {
+    let text = if !later_page {
+        "current_tree: captured just now"
+    } else if mode == DiffMode::Staged {
+        "current_tree: staged contents are not rechecked; commits, staging, and untracked names since the first page are not — if you committed, staged, or added an untracked file since, call ide.diff again"
+    } else {
+        "current_tree: tracked file contents rechecked; commits, staging, and untracked names since the first page are not — if you committed, staged, or added an untracked file since, call ide.diff again"
     };
-    format!(
-        "current_tree: {captured}; later pages recheck tracked working-tree bytes but never HEAD \
-         or the index — if the tree moved since, call ide.diff again"
-    )
+    text.to_owned()
 }
 
 /// Borrows the sole worker's admission controller while retaining exact job/authority scope.
@@ -338,6 +331,8 @@ enum DiffPageEvidence {
     Plain {
         /// Bounded output of the controlled task diff command.
         stdout: Vec<u8>,
+        /// Confined untracked names captured with Git's standard ignore rules.
+        untracked: Vec<crate::workspace::git::PathStatus>,
         /// Current worktree fingerprint when captured; `None` records a deleted path.
         worktree_sources: Vec<(PathBuf, Option<crate::workspace::observation::SourceBytes>)>,
         /// Owner operation reference retained with the patch.
@@ -377,6 +372,7 @@ impl DiffPageState {
             ),
             DiffPageEvidence::Plain {
                 stdout,
+                untracked,
                 operation,
                 generation,
                 ..
@@ -389,6 +385,7 @@ impl DiffPageState {
                 budget,
                 |paths| confine_plain_diff_paths(expected_scope, paths).is_ok(),
             )
+            .map(|result| result.with_untracked(untracked.clone()))
             .unwrap_or_else(|| crate::changes::DiffResult::unavailable(expected_scope)),
         }
     }
@@ -518,15 +515,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// * `authority_epoch` — current durable epoch rendered as provenance.
 /// * `reference` — same-binding detail handle echoed as `detail_ref`.
 /// * `max_hunks` — largest count to attempt; halved on each retry and clamped to at least one.
-/// * `retain_continuation` — whether this caller will retain the accepted cursor for later
-///   `ide.inspect`; helper results pass `false` because their settled ticket has no page state.
 /// * `provenance` — whether to render today's exact hash-bearing header (`render_diff_provenance`)
 ///   instead of the compact §2.7 default (`render_diff_compact`).
 /// * `compose` — pure selection callback; it must not mutate retained state, because it is called
 ///   repeatedly and only the returned result of the accepted attempt is retained.
 ///
-/// The rendered `more_available` marker and typed `continuation` flag are both true only when the
-/// caller retains a cursor for a later `ide.inspect`.
+/// The accepted cursor is retained for a later `ide.inspect` when one exists.
 ///
 /// Returns the accepted selection together with the exact [`PeerReply`] rendered from it; the
 /// caller retains continuation state derived from that same selection.
@@ -543,8 +537,8 @@ pub(crate) fn fit_diff_page(
     authority_epoch: u64,
     reference: &str,
     max_hunks: usize,
-    retain_continuation: bool,
     provenance: bool,
+    later_page: bool,
     compose: impl Fn(usize) -> crate::changes::DiffResult,
 ) -> Result<(crate::changes::DiffResult, PeerReply), FailureCode> {
     let mut max_hunks = max_hunks.max(1);
@@ -556,9 +550,15 @@ pub(crate) fn fit_diff_page(
         ) {
             return Err(FailureCode::SourceUnavailable);
         }
-        let more_available = retain_continuation && candidate.detail_cursor().is_some();
+        let more_available = candidate.detail_cursor().is_some();
         let text = if provenance {
-            render_diff_provenance(mode, &candidate, authority_epoch, more_available)
+            render_diff_provenance(
+                mode,
+                &candidate,
+                authority_epoch,
+                more_available,
+                later_page,
+            )
         } else {
             let continuation = if more_available {
                 DiffContinuationNote::Inspect(reference)
@@ -596,17 +596,19 @@ pub(crate) fn fit_diff_page(
 ///
 /// Delivery makes no independent freshness claim — a retained Diff result is an immutable captured
 /// snapshot, not proof of the repository's state at delivery time — so the former separate
-/// `freshness`/`captured_freshness` pair is answered as one `current_tree` line: it says what the
-/// capture proved, what delivery rechecks, and what to do when the tree moved meanwhile. The short
+/// `freshness`/`captured_freshness` pair is answered as one `current_tree` line: it says when the
+/// result was captured, what a later page rechecks, and what to do after Git state changes. The short
 /// `ide.inspect` service deliberately performs no heavyweight Git recapture, so HEAD/index
 /// identities, untracked and conflict sets and durable current-observation tokens are never
-/// revalidated before a page is handed over. Only tracked working-tree bytes are rechecked (see
-/// [`DiffPageState::working_tree_bytes_unchanged`]), which cannot establish complete currentness.
+/// revalidated before a page is handed over. Later pages recheck tracked working-tree bytes except
+/// for staged mode (see [`DiffPageState::working_tree_bytes_unchanged`]), which cannot establish
+/// complete currentness.
 fn render_diff_provenance(
     mode: DiffMode,
     result: &crate::changes::DiffResult,
     authority_epoch: u64,
     more_available: bool,
+    later_page: bool,
 ) -> String {
     let provenance = result.provenance();
     let mut text = format!(
@@ -614,7 +616,7 @@ fn render_diff_provenance(
         mode,
         result.state(),
         result.coverage(),
-        current_tree_line(result.freshness()),
+        current_tree_line(mode, later_page),
         authority_epoch,
         result.worktree_id(),
         provenance
@@ -987,6 +989,26 @@ impl Worker<'_> {
             let stdout = intent
                 .accept(evidence)
                 .map_err(|_| FailureCode::SourceUnavailable)?;
+            let untracked_intent = SnapshotIntent::untracked_paths(&scope, &program)
+                .map_err(|_| FailureCode::SourceUnavailable)?;
+            let untracked_evidence = runner.run_owned(untracked_intent.clone()).await?;
+            let untracked_output = untracked_intent
+                .accept(untracked_evidence)
+                .map_err(|_| FailureCode::SourceUnavailable)?;
+            let untracked =
+                crate::workspace::git::snapshot::parse_untracked_paths(&untracked_output)
+                    .map_err(|_| FailureCode::SourceUnavailable)?;
+            for path in &untracked {
+                runner
+                    .authorize_read_path(path.path())
+                    .await
+                    .map_err(|_| FailureCode::SourceUnavailable)?;
+                crate::workspace::git::snapshot::inspect_untracked(
+                    authority.worktree(),
+                    path.path(),
+                )
+                .map_err(|_| FailureCode::SourceUnavailable)?;
+            }
             let budget = crate::changes::DiffSelectionBudget::bounded(32, 48 * 1024);
             let composed = crate::changes::compose_plain_diff_page(
                 &scope,
@@ -997,7 +1019,8 @@ impl Worker<'_> {
                 budget,
                 |paths| confine_plain_diff_paths(&scope, paths).is_ok(),
             )
-            .ok_or(FailureCode::SourceUnavailable)?;
+            .ok_or(FailureCode::SourceUnavailable)?
+            .with_untracked(untracked.clone());
             let paths =
                 crate::changes::plain_diff_paths(&stdout).ok_or(FailureCode::SourceUnavailable)?;
             let limits = crate::workspace::observation::SourceReadLimits::new(
@@ -1038,8 +1061,8 @@ impl Worker<'_> {
                 authority.epoch(),
                 &reference,
                 budget.max_hunks,
-                true,
                 provenance,
+                false,
                 |max_hunks| {
                     crate::changes::compose_plain_diff_page(
                         &scope,
@@ -1050,16 +1073,23 @@ impl Worker<'_> {
                         crate::changes::DiffSelectionBudget::bounded(max_hunks, budget.max_bytes),
                         |paths| confine_plain_diff_paths(&scope, paths).is_ok(),
                     )
+                    .map(|result| result.with_untracked(untracked.clone()))
                     .unwrap_or_else(|| composed.clone())
                 },
             )?;
             drop(runner);
-            self.shared
-                .set_diff_provenance(&reference, paths.into_iter().collect());
+            self.shared.set_diff_provenance(
+                &reference,
+                paths
+                    .into_iter()
+                    .chain(untracked.iter().map(|path| path.path().to_path_buf()))
+                    .collect(),
+            );
             let diff_page = result.detail_cursor().map(|cursor| DiffPageState {
                 scope: scope.clone(),
                 evidence: DiffPageEvidence::Plain {
                     stdout,
+                    untracked,
                     worktree_sources,
                     operation: reference.clone(),
                     generation,
@@ -1077,7 +1107,7 @@ impl Worker<'_> {
                 return Ok((reply, Some(authority), None));
             }
             let text = if provenance {
-                render_diff_provenance(mode, &result, authority.epoch(), false)
+                render_diff_provenance(mode, &result, authority.epoch(), false, false)
             } else {
                 render_diff_compact(mode, &result, DiffContinuationNote::Recapture, None)
             };
@@ -1190,8 +1220,8 @@ impl Worker<'_> {
             authority.epoch(),
             &reference,
             budget.max_hunks,
-            true,
             provenance,
+            false,
             |max_hunks| {
                 crate::changes::compose_diff(
                     &scope,
@@ -1251,7 +1281,7 @@ impl Worker<'_> {
             return Ok((reply, Some(authority), None));
         }
         let text = if provenance {
-            render_diff_provenance(mode, &result, authority.epoch(), false)
+            render_diff_provenance(mode, &result, authority.epoch(), false, false)
         } else {
             render_diff_compact(mode, &result, DiffContinuationNote::Recapture, None)
         };

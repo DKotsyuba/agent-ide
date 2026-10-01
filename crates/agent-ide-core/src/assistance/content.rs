@@ -92,11 +92,14 @@ fn project(reply: &PeerReply, status: Option<&str>, envelope: Envelope) -> Optio
         _ => None,
     };
     let mut context = structured.clone();
-    // Always defined so strict-undefined rendering stays uniform for cause-less replies.
+    // Strict-undefined rendering expects these fields on every reply.
     context["cause_tag"] = serde_json::Value::String(String::new());
+    context["resolution_message"] = serde_json::Value::String(String::new());
     if let PeerReply::Error { detail, .. } = reply {
-        context["resolution_detail"] =
-            serde_json::Value::String(detail.clone().unwrap_or_default());
+        let detail = detail.as_deref().unwrap_or_default();
+        context["resolution_detail"] = serde_json::Value::String(detail.to_owned());
+        context["resolution_message"] =
+            serde_json::Value::String(resolution_message(detail).to_owned());
         if let Some(fields) = structured.as_object_mut() {
             fields.remove("detail");
         }
@@ -160,6 +163,21 @@ fn project(reply: &PeerReply, status: Option<&str>, envelope: Envelope) -> Optio
     )
     .then_some(true);
     Some(rendered)
+}
+
+/// Extracts a producer's trailing detail payload without depending on prefix byte lengths.
+fn resolution_message(detail: &str) -> &str {
+    let Some((_, stage_detail)) = detail.split_once(':') else {
+        return detail;
+    };
+    if let Some(extension) = stage_detail.strip_prefix("provider_unavailable ext=") {
+        return extension;
+    }
+    stage_detail
+        .split_once(':')
+        .map_or(stage_detail, |(_, message)| {
+            message.strip_prefix(' ').unwrap_or(message)
+        })
 }
 
 /// Returns the shared compile-time template environment for every MCP text projection.
@@ -513,6 +531,10 @@ mod tests {
                 "context:observation_failed:\"src/main.rs\"",
                 "error: source_unavailable (context:observation_failed); \"src/main.rs\" could not be read through the confined reader. Retry ide.context, or continue with native tools",
             ),
+            (
+                "diff:activation_commit_unknown; use mode: head",
+                "error: source_unavailable (diff:activation_commit_unknown); the start commit of this activation is unknown, so the task view is unavailable; use ide.diff {\"mode\": \"head\"}",
+            ),
         ] {
             let rendered = render(
                 PeerReply::Error {
@@ -706,6 +728,18 @@ mod tests {
     /// Capacity failures preserve their stage and explain how to free bounded result storage.
     #[test]
     fn capacity_error_names_its_stage_and_recovery() {
+        let large_diff = render(
+            PeerReply::Error {
+                code: FailureCode::Capacity,
+                detail: Some("diff:too_large".to_owned()),
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&large_diff),
+            "error: capacity (diff:too_large); the change is larger than one diff result allows; narrow it (head vs staged/unstaged) or review it with native git"
+        );
         let staged = render(
             PeerReply::Error {
                 code: FailureCode::Capacity,
@@ -765,6 +799,26 @@ mod tests {
                 FailureCode::ProviderUnavailable,
                 "test:selection_unavailable",
                 "error: provider_unavailable (test:selection_unavailable); tests could not be selected from these arguments. Use ide.test with a pattern or path",
+            ),
+            (
+                FailureCode::ProviderUnavailable,
+                "read:provider_unavailable ext=gamma",
+                "error: provider_unavailable (read:no_server); no language server is configured for .gamma files in this project. Continue with native tools",
+            ),
+            (
+                FailureCode::ProviderUnavailable,
+                "symbol:provider_unavailable ext=delta",
+                "error: provider_unavailable (symbol:no_server); no language server is configured for .delta files in this project. Continue with native tools",
+            ),
+            (
+                FailureCode::ProviderUnavailable,
+                "context:provider_unavailable ext=epsilon",
+                "error: provider_unavailable (context:no_server); no language server is configured for .epsilon files in this project. Continue with native tools",
+            ),
+            (
+                FailureCode::InvalidDetail,
+                "test:unknown_run:42",
+                "error: invalid_detail (test:unknown_run); run #42 is unknown or expired. Start a new run with ide.test",
             ),
             (
                 FailureCode::Deadline,

@@ -376,6 +376,16 @@ pub struct DiffResult {
 }
 
 impl DiffResult {
+    /// Attaches separately captured untracked names to a plain diff result and updates its count.
+    ///
+    /// The caller must already have authorized and confined these paths; this method only stores
+    /// the records for rendering and later-page reuse.
+    pub fn with_untracked(mut self, untracked: Vec<PathStatus>) -> Self {
+        self.status_counts.untracked = untracked.len();
+        self.untracked = untracked;
+        self
+    }
+
     /// Returns a payload-free refusal for retained plain-diff state that no longer validates.
     pub(crate) fn unavailable(scope: &GitScope) -> Self {
         Self {

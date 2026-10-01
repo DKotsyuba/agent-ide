@@ -4523,8 +4523,8 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 authority.epoch(),
                 &request.reference,
                 page.budget().max_hunks,
-                true,
                 page.provenance(),
+                true,
                 |max_hunks| page.expand_with_max_hunks(&expected_scope, max_hunks),
             )
             .map_err(|code| match code {

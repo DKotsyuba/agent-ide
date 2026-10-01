@@ -576,6 +576,25 @@ pub struct PathStatus {
 }
 
 impl PathStatus {
+    /// Creates a name-only untracked record for a valid worktree-relative path.
+    ///
+    /// Returns `InvalidPorcelain` for an invalid relative path. Status bytes, modes, objects and
+    /// conflict stages are absent because `ls-files --others` supplies only the path name.
+    pub fn untracked(path: PathBuf) -> Result<Self, GitError> {
+        if !crate::workspace::observation::valid_relative_path(&path) {
+            return Err(GitError::InvalidPorcelain);
+        }
+        Ok(Self {
+            kind: StatusKind::Untracked,
+            path,
+            original_path: None,
+            status: None,
+            modes: None,
+            objects: None,
+            conflict_stages: Vec::new(),
+        })
+    }
+
     /// Returns the porcelain record category.
     pub const fn kind(&self) -> StatusKind {
         self.kind

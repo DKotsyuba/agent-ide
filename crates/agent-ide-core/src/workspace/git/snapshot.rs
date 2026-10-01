@@ -291,6 +291,14 @@ impl SnapshotIntent {
             label,
         })
     }
+
+    /// Creates the fixed `ls-files --others --exclude-standard -z` query for one scope.
+    ///
+    /// The result preserves that scope and uses Git's standard ignore rules. Invalid query
+    /// construction is returned as `GitError` before a process is launched.
+    pub fn untracked_paths(scope: &GitScope, program: &Path) -> Result<Self, GitError> {
+        Self::metadata(scope, program, GitReadQuery::UntrackedPaths)
+    }
     /// Builds a no-filter immutable-object read; full OIDs prevent revision or option injection.
     pub fn blob(scope: GitScope, program: &Path, oid: &GitObjectId) -> Result<Self, GitError> {
         let command = ControlledCommand::from_validated_peer(
@@ -2190,7 +2198,7 @@ async fn capture_attempt<R: SnapshotRunner>(
 /// for content: one such entry used to refuse the whole diff with `diff:unsupported_entry`. Only a
 /// disappearing path or a root-identity change still forces the unstable retry; every other
 /// classification outcome — including an ordinary regular file — keeps the entry.
-fn inspect_untracked(worktree: &WorktreeRef, path: &Path) -> Result<(), GitError> {
+pub(crate) fn inspect_untracked(worktree: &WorktreeRef, path: &Path) -> Result<(), GitError> {
     match crate::workspace::observation::inspect_authorized_source_kind(worktree, path) {
         Ok(()) | Err(ObservationError::SymlinkEscape | ObservationError::NotRegularFile) => Ok(()),
         Err(ObservationError::Missing | ObservationError::RootIdentityChanged) => {
@@ -2198,6 +2206,31 @@ fn inspect_untracked(worktree: &WorktreeRef, path: &Path) -> Result<(), GitError
         }
         Err(_) => Err(GitError::SnapshotIo),
     }
+}
+
+/// Parses complete NUL-delimited output of `ls-files --others --exclude-standard`.
+///
+/// Raw Unix path bytes are preserved in name-only untracked records. Missing final NUL or an
+/// invalid relative path returns `InvalidPorcelain`; exceeding the snapshot path-count or
+/// aggregate path-byte ceilings returns `EvidenceTooLarge`.
+pub fn parse_untracked_paths(output: &[u8]) -> Result<Vec<PathStatus>, GitError> {
+    if !output.is_empty() && !output.ends_with(&[0]) {
+        return Err(GitError::InvalidPorcelain);
+    }
+    let mut paths = Vec::new();
+    let mut path_bytes = 0usize;
+    for raw in output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let path = super::raw_path(raw);
+        path_bytes = path_bytes.saturating_add(path.as_os_str().as_bytes().len());
+        if paths.len() >= MAX_SNAPSHOT_PATHS || path_bytes > MAX_SNAPSHOT_PATH_BYTES {
+            return Err(GitError::EvidenceTooLarge);
+        }
+        paths.push(PathStatus::untracked(path)?);
+    }
+    Ok(paths)
 }
 
 #[cfg(test)]

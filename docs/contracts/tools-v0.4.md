@@ -375,7 +375,7 @@ Run at most one test job at a time per worktree. Stop a run when its budget expi
 
 ### 2.7 `ide.diff` — changed files (implemented)
 
-Input: `{mode: head|staged|unstaged|task, detail_ref?, provenance?: false}`. `task` compares the worktree with the commit recorded at activation, so it includes changes committed during the task and current uncommitted changes. If activation could not record that commit, the mode refuses and suggests `head`.
+Input: `{mode: head|staged|unstaged|task, detail_ref?, provenance?: false}`. `task` compares the worktree with the commit recorded at activation, so it includes changes committed during the task, current uncommitted changes, and names of current untracked paths that pass Git's standard ignore rules. If activation could not record that commit, the mode refuses and directs the caller to `ide.diff {"mode": "head"}`.
 
 Output is compact and contains no hashes:
 
@@ -393,9 +393,11 @@ An untracked or conflicted path Git itself never diffs is still named, bounded l
 
 If the exact two-pass capture cannot prove a consistent read (for example a concurrent checkout, or a file that changed since a still-recorded observation of it), a single-pass plain `git diff` answers instead, marked on the summary line — naming only what the daemon actually knows, not a guessed specific cause: `diff (head): 2 files, +14 −3 (plain git diff; exact capture unavailable: snapshot unstable or a file changed since it was observed)`. This degraded page never claims currentness (`freshness` stays unknown) and never offers `ide.inspect` continuation. It runs without rename detection (a rename shows as a deletion plus an addition), attributes every hunk by its decoded `diff --git` path (Git's quoted form included), and fails `source_unavailable` (`diff:unstable`) instead of answering when any output cannot be attributed exactly — never a smaller count. Every path it names first passes the exact capture's own per-path confinement (a no-follow, in-root open of a regular file or a missing path, at most 256 paths, 64 KiB of path names in total and 1 MiB per file); one that fails — for example a tracked directory replaced by a symlink — refuses the whole page the same way, so the fallback never answers for a path the exact capture would refuse.
 
-Provenance reports one `current_tree` line in place of `freshness` plus `captured_freshness`. It says what the capture proved, what a later page rechecks, and to call `ide.diff` again if the tree moved; it does not imply that delivery rechecked Git state. If `ide.inspect` finds a source file changed after a paged context capture, it says to read every page before writing and call `ide.context` again.
+Provenance reports `current_tree: captured just now` on the first page. Later pages say they recheck tracked file contents except in staged mode, but not commits, staging, or untracked names since the first page; after any of those changes, call `ide.diff` again. Delivery does not recheck Git state. If `ide.inspect` finds a source file changed after a paged context capture, it says to read every page before writing and call `ide.context` again.
 
 An untracked symlink or other special entry (for example `node_modules ->` a sibling checkout) is listed by name only — its bytes and, for a symlink, its target are never read — instead of refusing the whole diff.
+
+If a requested diff exceeds one bounded result, narrow the comparison with `head`, `staged`, or `unstaged`, or review it with native Git.
 
 In a plain directory, `ide.diff` answers `source_unavailable (diff:not_a_git_repository)` with `not a git repository: no git data`.
 

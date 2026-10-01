@@ -123,6 +123,7 @@ server while it loads and answer `provider_unavailable` when it failed. `ide.sym
    the same worktree.
    Directories without Git work; `ide.diff` and requested symbol history there answer
    `not a git repository: no git data`.
+   `ide.diff {"mode": "task"}` includes committed and uncommitted changes since activation plus names of untracked paths that pass Git's standard ignore rules. If no activation commit was recorded, it directs the caller to `head`; when one result is too large, narrow with `head`, `staged`, or `unstaged`, or use native Git.
 2. Before an edit, prefer `ide.outline` the file (or `ide.symbol` the target) for its skeleton,
    then `ide.read` the exact symbol or line range you are about to change — its `source_ref` is
    the bounded reference `ide.edit` needs. `ide.context {path}` with no `byte_offset` still works

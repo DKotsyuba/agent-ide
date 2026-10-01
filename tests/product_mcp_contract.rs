@@ -5709,6 +5709,7 @@ async fn configured_product_task_diff_includes_committed_and_uncommitted_changes
         "pub fn value() -> i32 { 8 }\npub fn caller() -> i32 { value() }\n",
     )
     .unwrap();
+    std::fs::write(fixture.root.join("new-task.txt"), "untracked during task\n").unwrap();
 
     let task = actor
         .call(&fixture, "ide.diff", json!({"mode":"task"}))
@@ -5721,6 +5722,7 @@ async fn configured_product_task_diff_includes_committed_and_uncommitted_changes
         task_text.contains("+pub fn value() -> i32 { 8 }"),
         "{task_text}"
     );
+    assert!(task_text.contains("untracked: new-task.txt"), "{task_text}");
 
     let head = actor
         .call(&fixture, "ide.diff", json!({"mode":"head"}))
@@ -5769,6 +5771,7 @@ async fn configured_product_task_diff_paginates_until_every_hunk_is_read() {
         )
         .unwrap();
     }
+    std::fs::write(fixture.root.join("task-untracked.txt"), "untracked\n").unwrap();
 
     let first = actor
         .call(
@@ -5800,6 +5803,12 @@ async fn configured_product_task_diff_paginates_until_every_hunk_is_read() {
         pages.push(text);
     }
     assert!(pages.len() > 1, "task diff unexpectedly fit on one page");
+    assert!(
+        pages
+            .iter()
+            .all(|page| page.contains("untracked_path: \"task-untracked.txt\"")),
+        "untracked paths must accompany every task page: {pages:?}"
+    );
     for index in 0..40 {
         let marker = format!("changed-{index:02}");
         assert_eq!(
@@ -5860,8 +5869,10 @@ async fn configured_product_task_diff_refuses_unknown_activation_commit() {
         "{task}"
     );
     let text = task["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("activation_commit_unknown"), "{text}");
-    assert!(text.contains("mode: head"), "{text}");
+    assert_eq!(
+        text,
+        "error: source_unavailable (diff:activation_commit_unknown); the start commit of this activation is unknown, so the task view is unavailable; use ide.diff {\"mode\": \"head\"}"
+    );
 
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
@@ -12427,10 +12438,8 @@ async fn diff_pagination_delivers_every_whole_hunk_once_with_truthful_freshness(
     assert_eq!(page_field(&page1_text, "more_available"), "true");
     assert_eq!(page1["detail_ref"].as_str().unwrap(), reference);
 
-    // Delivery never claims currentness; the capture-time freshness is preserved separately.
-    assert_eq!(page_field(&page1_text, "freshness"), "Unknown");
     assert!(
-        !page_field(&page1_text, "captured_freshness").is_empty(),
+        page1_text.contains("current_tree: captured just now\n"),
         "{page1_text}"
     );
     // Typed provenance is present and non-placeholder on the delivered page.
@@ -12455,7 +12464,14 @@ async fn diff_pagination_delivers_every_whole_hunk_once_with_truthful_freshness(
             .await;
         assert_eq!(next["kind"], "diff", "{next}");
         let text = next["text"].as_str().unwrap().to_owned();
-        assert_eq!(page_field(&text, "freshness"), "Unknown", "{text}");
+        assert!(
+            text.contains("current_tree: tracked file contents rechecked; commits, staging, and untracked names since the first page are not — if you committed, staged, or added an untracked file since, call ide.diff again"),
+            "{text}"
+        );
+        assert_ne!(
+            page_field(&page1_text, "current_tree"),
+            page_field(&text, "current_tree")
+        );
         assert_ne!(page_field(&text, "capture_generation"), "none", "{text}");
         assert!(!pages.contains(&text), "page repeated verbatim:\n{text}");
         pages.push(text);
@@ -12482,9 +12498,13 @@ async fn diff_pagination_delivers_every_whole_hunk_once_with_truthful_freshness(
     let reopened = actor.settle(&fixture, reopened).await;
     assert_eq!(reopened["kind"], "diff", "{reopened}");
     let reopened_ref = reopened["detail_ref"].as_str().unwrap().to_owned();
-    assert_eq!(
-        page_field(reopened["text"].as_str().unwrap(), "freshness"),
-        "Unknown"
+    assert!(
+        reopened["text"]
+            .as_str()
+            .unwrap()
+            .contains("current_tree: captured just now\n"),
+        "{}",
+        reopened["text"]
     );
     std::fs::write(
         fixture.root.join("many-00.txt"),
