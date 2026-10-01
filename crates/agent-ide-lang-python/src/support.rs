@@ -21,8 +21,9 @@ use agent_ide_core::lang::text::{
 };
 use agent_ide_core::lang::{
     CommandSource, InsertSite, InsertWhere, LangError, Language, LanguageProject, LanguageSupport,
-    LineRange, Outline, ProjectCommand, ProjectCommands, Symbol, SymbolKind, SymbolPath,
-    TestFailure, TestId, TestReport, TestSelection, TestTarget, kind_of, line_count, lines_of,
+    LineRange, Outline, ProbePrograms, ProjectCommand, ProjectCommands, Symbol, SymbolKind,
+    SymbolPath, TestFailure, TestId, TestReport, TestSelection, TestTarget, kind_of, line_count,
+    lines_of,
 };
 
 use crate::LANGUAGE;
@@ -507,12 +508,14 @@ impl LanguageSupport for Python {
     /// formatter's tools) runs `ast.parse` over the candidate on stdin and prints
     /// `<lineno>: <msg>` on a syntax error — exactly the probe line
     /// `SyntaxVerdict::from_probe` maps. A missing interpreter fails the spawn, which the
-    /// caller maps to `Unchecked`, never a refusal.
+    /// caller maps to `Unchecked`, never a refusal. Python has no launcher-configured probe
+    /// programs, so `configured` is ignored.
     fn syntax_probe_command(
         &self,
         project: &LanguageProject,
         _root: &Path,
         file: &Path,
+        _configured: Option<&ProbePrograms>,
     ) -> Option<Vec<String>> {
         match file.extension().and_then(|ext| ext.to_str()) {
             Some("py" | "pyi") => {}
@@ -1906,13 +1909,13 @@ FAILED tests/test_service.py::TestWorker::test_label
         venv.interpreter = Some(PathBuf::from("/repo/.venv/bin/python"));
         assert_eq!(
             Python
-                .syntax_probe_command(&venv, root, Path::new("src/svc/cli.py"))
+                .syntax_probe_command(&venv, root, Path::new("src/svc/cli.py"), None)
                 .unwrap()[..2],
             ["/repo/.venv/bin/python".to_owned(), "-c".to_owned()]
         );
         assert!(
             Python
-                .syntax_probe_command(&venv, root, Path::new("src/svc/cli.py"))
+                .syntax_probe_command(&venv, root, Path::new("src/svc/cli.py"), None)
                 .unwrap()[2]
                 .contains("ast.parse")
         );
@@ -1920,12 +1923,12 @@ FAILED tests/test_service.py::TestWorker::test_label
         let bare = project(&[]);
         assert_eq!(
             Python
-                .syntax_probe_command(&bare, root, Path::new("a.py"))
+                .syntax_probe_command(&bare, root, Path::new("a.py"), None)
                 .unwrap()[0],
             "python3"
         );
         assert_eq!(
-            Python.syntax_probe_command(&bare, root, Path::new("a.js")),
+            Python.syntax_probe_command(&bare, root, Path::new("a.js"), None),
             None
         );
     }

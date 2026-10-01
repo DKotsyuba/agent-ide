@@ -107,6 +107,15 @@ pub trait LanguageServer: Send + Sync + 'static {
         vec![(launch.executable.path.clone(), None)]
     }
 
+    /// The stdin syntax probe's configured programs this declaration supplies for the language's
+    /// symbol support (see [`LanguageSupport::syntax_probe_command`](crate::lang::LanguageSupport));
+    /// `None` (the default) when the declaration names none, leaving the probe on project-local
+    /// tools.
+    fn probe_programs(&self, launch: &ProviderLaunch) -> Option<crate::lang::ProbePrograms> {
+        let _ = launch;
+        None
+    }
+
     /// Short server name used in replies that explain a missing capability.
     fn name(&self) -> &'static str;
 

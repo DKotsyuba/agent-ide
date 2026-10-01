@@ -8279,6 +8279,121 @@ async fn configured_product_batch_typescript_syntax_gate_refuses_and_writes() {
     daemon.wait().await.unwrap();
 }
 
+/// Case 8b (TypeScript, no local package): a project without `node_modules` still gets its broken
+/// candidate refused when the launcher configuration names the accepted TypeScript — the probe uses
+/// the configured Node and `typescript.js` beside the accepted `tsserver.js`, exactly the package
+/// the bridge session runs, instead of having no checker to prove.
+#[tokio::test]
+#[ignore = "requires exact AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER environment"]
+async fn configured_product_batch_typescript_gate_uses_the_configured_package() {
+    let providers = json!([accepted_typescript_provider()]);
+    let fixture = ProductFixture::new(providers);
+    std::fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    std::fs::remove_file(fixture.root.join("go.mod")).unwrap();
+    std::fs::remove_file(fixture.root.join("main.go")).unwrap();
+    std::fs::remove_file(fixture.root.join("src/lib.rs")).unwrap();
+    std::fs::remove_dir_all(fixture.root.join("src")).unwrap();
+    std::fs::write(
+        fixture.root.join("package.json"),
+        "{\"name\":\"fixture\",\"private\":true}\n",
+    )
+    .unwrap();
+    let app = "function value(): number {\n    return 1;\n}\n\nfunction broken(): number {\n    \
+               return 2;\n}\n";
+    std::fs::write(fixture.root.join("app.ts"), app).unwrap();
+    fixture.git(&["add", "--", "package.json", "app.ts"]);
+    fixture.git(&[
+        "commit",
+        "--quiet",
+        "-m",
+        "typescript batch fixture without node_modules",
+    ]);
+    assert!(
+        !fixture.root.join("node_modules").exists(),
+        "the fixture must prove the configured package, not a project-local one"
+    );
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "batch-ts-configured").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"batch-ts-configured"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let read = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"app.ts","byte_offset":0}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    assert_eq!(read["kind"], "context", "{read}");
+    let source_ref = read["detail_ref"].as_str().unwrap();
+
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-ts-configured",
+            "path":"app.ts",
+            "source_ref":source_ref,
+            "changes":[{"old":"function broken(): number {","new":"function broken( : number {"}]
+        }),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert_eq!(
+        batch_without_status_plate(&refused_text),
+        "error: edit_refused (edit:refused); 1 of 1 changes refused, nothing written — \
+         change 1 produced a syntax error at line 5: \"Parameter declaration expected.\" \
+         (candidate lines 3-7: \"}\\n\\nfunction broken( : number {\\n    return 2;\\n}\"); \
+         candidate not written. Fix the named changes and retry with the same operation_id",
+        "{refused_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("app.ts")).unwrap(),
+        app.as_bytes()
+    );
+
+    let written = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-ts-configured",
+            "path":"app.ts",
+            "source_ref":source_ref,
+            "changes":[{"old":"function broken(): number {","new":"function renamed(): number {"}]
+        }),
+    )
+    .await;
+    let (written, written_text) = batch_settle_with_text(&mut actor, &fixture, written).await;
+    assert_eq!(written["result"]["outcome"], "replaced", "{written}");
+    let written_ref = written["result"]["source_ref"].as_str().unwrap();
+    assert_eq!(
+        batch_without_status_plate(&written_text),
+        format!(
+            "edit: replaced; path app.ts; source_ref {written_ref}; {}\n1 change applied: \
+             change 1: old text at line 5 replaced (now 5)",
+            batch_diagnostics_segment(&written)
+        ),
+        "{written_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("app.ts")).unwrap(),
+        b"function value(): number {\n    return 1;\n}\n\nfunction renamed(): number {\n    return 2;\n}\n"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Case 9: one `ide.read {path, ranges}` answers two ranges in request order, and a batch edit
 /// addresses exactly those lines through that read's `source_ref` with no re-read between.
 #[tokio::test]

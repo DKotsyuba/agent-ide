@@ -589,6 +589,18 @@ pub struct LanguageProject {
     pub entry_points: Vec<PathBuf>,
 }
 
+/// The externally configured programs one language's stdin syntax probe may run: an absolute
+/// program and the absolute module it runs, resolved by the worker from the effective launcher
+/// configuration for that language's server. Both are opaque paths here; the owning language
+/// decides how its probe uses them (see [`LanguageSupport::syntax_probe_command`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProbePrograms {
+    /// Absolute program that runs the module.
+    pub program: PathBuf,
+    /// Absolute module the program runs.
+    pub module: PathBuf,
+}
+
 /// Failures a language module reports; the reply layer maps them onto closed failure codes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LangError {
@@ -617,8 +629,7 @@ impl std::error::Error for LangError {}
 
 /// The per-language contract. Implementations are stateless; every method is a pure function of
 /// its inputs except `detect`, which reads manifests under `root`, and `syntax_probe_command`,
-/// which names a subprocess the caller (never this trait) runs and may read the
-/// configured-toolchain environment.
+/// which also probes the files its `root` and configured programs name.
 pub trait LanguageSupport: Send + Sync {
     fn language(&self) -> Language;
 
@@ -672,16 +683,18 @@ pub trait LanguageSupport: Send + Sync {
     /// i.e. [`SyntaxVerdict::Unchecked`]. The caller runs it from the project `root` with the
     /// candidate on stdin and maps its output through [`SyntaxVerdict::from_probe`]; the probe's
     /// first output line must be `<line>: <message>` and a nonzero exit without that shape means
-    /// "no checker". May read the configured-toolchain environment (the accepted node and language
-    /// packages) the way the language's server launcher does.
+    /// "no checker". `configured` carries the programs the caller resolved from the effective
+    /// launcher configuration for this language's server (see [`ProbePrograms`]); the probe
+    /// prefers them over project-local tools and never reads the process environment.
     /// Same contract as [`Self::format_stdin_command`].
     fn syntax_probe_command(
         &self,
         project: &LanguageProject,
         root: &Path,
         file: &Path,
+        configured: Option<&ProbePrograms>,
     ) -> Option<Vec<String>> {
-        let _ = (project, root, file);
+        let _ = (project, root, file, configured);
         None
     }
 

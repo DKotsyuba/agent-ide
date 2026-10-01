@@ -2267,10 +2267,10 @@ impl Worker<'_> {
         let formatted = self.format_candidate(&observed, &file, candidate).await;
         // Pre-write structural gate, shared with batches and file creation: a candidate that
         // does not parse is not written; a base that already failed is edited with a note.
-        let pre_existing = match self
-            .gate_candidate(&observed, &file, &source, &formatted)
-            .await
-        {
+        let gated = self
+            .gate_candidate(job, &observed, &file, &source, &formatted)
+            .await;
+        let pre_existing = match gated {
             Ok(note) => note,
             Err((line, message)) => {
                 job.failure_detail = Some(format!(
@@ -2462,10 +2462,10 @@ impl Worker<'_> {
             .await;
         // Pre-write structural gate: a candidate that does not parse is not written; a file that
         // already failed the same check before the edit is still edited, with a note.
-        let pre_existing = match self
-            .gate_candidate(&observed, &file, &source, &candidate)
-            .await
-        {
+        let gated = self
+            .gate_candidate(job, &observed, &file, &source, &candidate)
+            .await;
+        let pre_existing = match gated {
             Ok(note) => note,
             Err((line, message)) => {
                 let mut refusal = Refusal {
@@ -2589,7 +2589,10 @@ impl Worker<'_> {
         let candidate = self.format_candidate(&observed, &file, content).await;
         // The same pre-write structural gate as every edit: new content that does not parse is
         // not written (an empty base can never have carried a pre-existing error).
-        if let Err((line, message)) = self.gate_candidate(&observed, &file, "", &candidate).await {
+        let gated = self
+            .gate_candidate(job, &observed, &file, "", &candidate)
+            .await;
+        if let Err((line, message)) = gated {
             job.failure_detail = Some(format!(
                 "edit:refused: {}",
                 crate::assistance::reply::bounded_utf8_prefix(
@@ -2656,11 +2659,25 @@ impl Worker<'_> {
         }
     }
 
+    /// The stdin-probe programs the launcher declaration of `language`'s server configures, from
+    /// this job's target; `None` when no declaration configures that language or it names none.
+    /// Opaque paths — core never interprets them (see [`lang::ProbePrograms`]).
+    fn configured_probe_programs(&self, job: &Job, language: Lang) -> Option<lang::ProbePrograms> {
+        let launch = job
+            .target
+            .providers
+            .iter()
+            .find(|launch| launch.language == language)?;
+        language.server()?.probe_programs(launch)
+    }
+
     /// The structural verdict for one text: the in-process check first, else its stdin probe run
-    /// from the project root with the daemon's formatter PATH. No registered support, checker or
-    /// runnable probe yields [`SyntaxVerdict::Unchecked`] — never a refusal.
+    /// from the project root with the daemon's formatter PATH and the launcher-configured probe
+    /// programs of the file's language. No registered support, checker or runnable probe yields
+    /// [`SyntaxVerdict::Unchecked`] — never a refusal.
     async fn syntax_verdict_of(
         &self,
+        job: &Job,
         observed: &SourceObservation,
         file: &Path,
         source: &str,
@@ -2677,7 +2694,9 @@ impl Worker<'_> {
         let Some(project) = support.detect(&root) else {
             return lang::SyntaxVerdict::Unchecked;
         };
-        let Some(argv) = support.syntax_probe_command(&project, &root, file) else {
+        let configured = self.configured_probe_programs(job, language);
+        let Some(argv) = support.syntax_probe_command(&project, &root, file, configured.as_ref())
+        else {
             return lang::SyntaxVerdict::Unchecked;
         };
         let Some(output) = run_stdin(&argv, &root, source, Duration::from_secs(10)).await else {
@@ -2698,18 +2717,19 @@ impl Worker<'_> {
     /// per-change attribution. `Ok(Some(note))` proceeds with that note line.
     async fn gate_candidate(
         &mut self,
+        job: &Job,
         observed: &SourceObservation,
         file: &Path,
         base: &str,
         candidate: &str,
     ) -> Result<Option<String>, (u32, String)> {
-        let verdict = self.syntax_verdict_of(observed, file, candidate).await;
+        let verdict = self.syntax_verdict_of(job, observed, file, candidate).await;
         let lang::SyntaxVerdict::Failed { line, message } = verdict else {
             return Ok(None);
         };
         if let lang::SyntaxVerdict::Failed {
             line: base_line, ..
-        } = self.syntax_verdict_of(observed, file, base).await
+        } = self.syntax_verdict_of(job, observed, file, base).await
         {
             return Ok(Some(format!(
                 "note: {} already had a syntax error (line {base_line}) before this edit; edit applied",

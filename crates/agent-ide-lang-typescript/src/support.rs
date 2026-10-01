@@ -15,8 +15,8 @@ use serde_json::Value;
 
 use agent_ide_core::lang::{
     CommandSource, InsertSite, InsertWhere, LangError, Language, LanguageProject, LanguageSupport,
-    LineRange, Outline, ProjectCommand, ProjectCommands, Symbol, SymbolKind, SymbolPath,
-    TestFailure, TestReport, TestSelection, TestTarget, kind_of, line_count, lines_of,
+    LineRange, Outline, ProbePrograms, ProjectCommand, ProjectCommands, Symbol, SymbolKind,
+    SymbolPath, TestFailure, TestReport, TestSelection, TestTarget, kind_of, line_count, lines_of,
     render::clip,
     text::{
         MAX_ATTRIBUTE_CHARS, MAX_NAMED_TESTS, distinct, distinct_files, entry_names, env_value,
@@ -534,35 +534,33 @@ impl LanguageSupport for TypeScript {
     }
 
     /// `node -e` with the `typescript` package passed by absolute path — the accepted package the
-    /// launcher configured (`AGENT_IDE_TSSERVER`'s lib dir holds `typescript.js` beside
-    /// `tsserver.js`), else the project's own `node_modules/typescript` — parses stdin as a
-    /// source file and prints `<line+1>: <message>` for the first parse diagnostic. With neither
-    /// package present there is no checker to prove, so `None` (the caller maps that to
-    /// `Unchecked`, never a refusal); any other nonzero exit — node missing, the module not
-    /// loadable (exit 3) — means the same. TypeScript parses plain JavaScript with the same
-    /// parser, so `.js`/`.jsx` are checked too.
+    /// caller resolved from the launcher declaration (`configured`'s module; the accepted
+    /// `tsserver.js`'s lib dir holds `typescript.js` beside it), else the project's own
+    /// `node_modules/typescript` — parses stdin as a source file and prints `<line+1>:
+    /// <message>` for the first parse diagnostic. With neither package present there is no
+    /// checker to prove, so `None` (the caller maps that to `Unchecked`, never a refusal); any
+    /// other nonzero exit — node missing, the module not loadable (exit 3) — means the same.
+    /// TypeScript parses plain JavaScript with the same parser, so `.js`/`.jsx` are checked too.
     fn syntax_probe_command(
         &self,
         _project: &LanguageProject,
         root: &Path,
         file: &Path,
+        configured: Option<&ProbePrograms>,
     ) -> Option<Vec<String>> {
         match file.extension().and_then(|ext| ext.to_str()) {
             Some("ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs") => {}
             _ => return None,
         }
-        let module = std::env::var_os("AGENT_IDE_TSSERVER")
-            .map(PathBuf::from)
-            .as_deref()
-            .and_then(Path::parent)
-            .map(|dir| dir.join("typescript.js"))
-            .filter(|path| path.is_file())
+        let module = configured
+            .filter(|tools| tools.module.is_file())
+            .map(|tools| tools.module.clone())
             .or_else(|| {
                 let local = root.join("node_modules/typescript/lib/typescript.js");
                 local.is_file().then_some(local)
             })?;
-        let node = std::env::var_os("AGENT_IDE_NODE")
-            .map(|node| PathBuf::from(node).display().to_string())
+        let node = configured
+            .map(|tools| tools.program.display().to_string())
             .unwrap_or_else(|| "node".to_owned());
         Some(vec![
             node,
@@ -2330,9 +2328,10 @@ ok 2 - subtracts
     }
 
     /// The syntax probe is `node -e` with the typescript module passed by absolute path — the
-    /// accepted package the launcher configured (`AGENT_IDE_TSSERVER`'s lib dir), else the
-    /// project's own `node_modules/typescript` — and neither package means no probe. No
-    /// subprocess runs here, only the argv shape is checked.
+    /// configured package the caller resolved from the launcher declaration (its module beside
+    /// the accepted `tsserver.js`), else the project's own `node_modules/typescript` — and
+    /// neither package means no probe. Configuration is passed in, so no environment is read or
+    /// mutated. No subprocess runs here, only the argv shape is checked.
     #[test]
     fn syntax_probe_command_carries_an_absolute_typescript_module() {
         let project = project(&[]);
@@ -2340,28 +2339,19 @@ ok 2 - subtracts
         let local = root.join("node_modules/typescript/lib");
         std::fs::create_dir_all(&local).unwrap();
         std::fs::write(local.join("typescript.js"), "export {};\n").unwrap();
-        let configured =
+        let configured_dir =
             std::env::temp_dir().join(format!("agent-ide-ts-configured-{}", std::process::id()));
-        std::fs::create_dir_all(&configured).unwrap();
-        std::fs::write(configured.join("tsserver.js"), "tsserver\n").unwrap();
-        std::fs::write(configured.join("typescript.js"), "export {};\n").unwrap();
-        let saved = (
-            std::env::var_os("AGENT_IDE_TSSERVER"),
-            std::env::var_os("AGENT_IDE_NODE"),
-        );
-        // Only this test reads these variables, so setting them process-wide cannot race
-        // another assertion; the saved values are restored on the way out.
-        unsafe {
-            std::env::remove_var("AGENT_IDE_TSSERVER");
-            std::env::set_var("AGENT_IDE_NODE", "/opt/node/bin/node");
-        }
+        std::fs::create_dir_all(&configured_dir).unwrap();
+        std::fs::write(configured_dir.join("tsserver.js"), "tsserver\n").unwrap();
+        std::fs::write(configured_dir.join("typescript.js"), "export {};\n").unwrap();
+        let configured = |module: PathBuf| ProbePrograms {
+            program: PathBuf::from("/opt/node/bin/node"),
+            module,
+        };
         let probe = TypeScript
-            .syntax_probe_command(&project, &root, Path::new("src/a.ts"))
+            .syntax_probe_command(&project, &root, Path::new("src/a.ts"), None)
             .unwrap();
-        assert_eq!(
-            probe[..2],
-            ["/opt/node/bin/node".to_owned(), "-e".to_owned()]
-        );
+        assert_eq!(probe[..2], ["node".to_owned(), "-e".to_owned()]);
         assert!(probe[2].contains("parseDiagnostics"));
         assert!(probe[2].contains("Buffer.concat"));
         assert_eq!(
@@ -2373,50 +2363,67 @@ ok 2 - subtracts
         for file in ["src/a.js", "src/a.jsx"] {
             assert!(
                 TypeScript
-                    .syntax_probe_command(&project, &root, Path::new(file))
+                    .syntax_probe_command(&project, &root, Path::new(file), None)
                     .is_some()
             );
         }
         assert_eq!(
-            TypeScript.syntax_probe_command(&project, &root, Path::new("src/a.py")),
+            TypeScript.syntax_probe_command(&project, &root, Path::new("src/a.py"), None),
             None
         );
-        unsafe {
-            std::env::set_var("AGENT_IDE_TSSERVER", configured.join("tsserver.js"));
-        }
         let probe = TypeScript
-            .syntax_probe_command(&project, Path::new("/elsewhere"), Path::new("src/a.ts"))
+            .syntax_probe_command(
+                &project,
+                &root,
+                Path::new("src/a.ts"),
+                Some(&configured(configured_dir.join("typescript.js"))),
+            )
+            .unwrap();
+        assert_eq!(probe[0], "/opt/node/bin/node");
+        assert_eq!(
+            probe[3],
+            configured_dir.join("typescript.js").display().to_string(),
+            "the configured package wins over any project-local package"
+        );
+        assert!(Path::new(&probe[3]).is_absolute());
+        let probe = TypeScript
+            .syntax_probe_command(
+                &project,
+                &root,
+                Path::new("src/a.ts"),
+                Some(&configured(configured_dir.join("nowhere.js"))),
+            )
             .unwrap();
         assert_eq!(
             probe[3],
-            configured.join("typescript.js").display().to_string(),
-            "the configured lib dir's typescript.js wins over any project-local package"
+            root.join("node_modules/typescript/lib/typescript.js")
+                .display()
+                .to_string(),
+            "a configured module that is not on disk falls back to the project-local package"
         );
-        assert!(Path::new(&probe[3]).is_absolute());
-        unsafe {
-            std::env::remove_var("AGENT_IDE_TSSERVER");
-            std::env::remove_var("AGENT_IDE_NODE");
-        }
-        match saved {
-            (Some(tsserver), Some(node)) => unsafe {
-                std::env::set_var("AGENT_IDE_TSSERVER", tsserver);
-                std::env::set_var("AGENT_IDE_NODE", node);
-            },
-            (Some(tsserver), None) => unsafe {
-                std::env::set_var("AGENT_IDE_TSSERVER", tsserver);
-            },
-            (None, Some(node)) => unsafe {
-                std::env::set_var("AGENT_IDE_NODE", node);
-            },
-            (None, None) => {}
-        }
+        assert!(
+            TypeScript
+                .syntax_probe_command(
+                    &project,
+                    Path::new("/nowhere"),
+                    Path::new("src/a.ts"),
+                    Some(&configured(configured_dir.join("typescript.js")))
+                )
+                .is_some(),
+            "a configured package needs no project-local one"
+        );
         assert_eq!(
-            TypeScript.syntax_probe_command(&project, Path::new("/nowhere"), Path::new("src/a.ts")),
+            TypeScript.syntax_probe_command(
+                &project,
+                Path::new("/nowhere"),
+                Path::new("src/a.ts"),
+                None
+            ),
             None,
             "no configured and no project-local package means no checker is proven"
         );
         std::fs::remove_dir_all(&root).unwrap();
-        std::fs::remove_dir_all(&configured).unwrap();
+        std::fs::remove_dir_all(&configured_dir).unwrap();
     }
 
     /// Checks stdin formatter argv for each supported script extension.

@@ -28,7 +28,7 @@ use agent_ide_core::{
         server::{self, LanguageServer, ProviderContext, ProviderHost, ProviderJob, ServerBackend},
         session::{LiveSession, ProviderSettings},
     },
-    lang::Language,
+    lang::{Language, ProbePrograms},
     workspace::{authority::WorktreeRef, observation::SourceObservation},
 };
 
@@ -451,6 +451,23 @@ impl LanguageServer for TypeScriptServer {
                 .map(|bundle| (bundle.tsserver.path.clone(), node)),
         );
         programs
+    }
+
+    /// Node and the `typescript.js` beside the declared `tsserver.js` — the same accepted Node
+    /// and TypeScript package the bridge session runs, so the syntax probe proves with the
+    /// configured tools instead of a project-local package.
+    fn probe_programs(&self, launch: &ProviderLaunch) -> Option<ProbePrograms> {
+        let options = launch.options::<TypeScriptLaunchOptions>()?;
+        Some(ProbePrograms {
+            program: options.node.as_ref()?.path.clone(),
+            module: options
+                .typescript
+                .as_ref()?
+                .tsserver
+                .path
+                .parent()?
+                .join("typescript.js"),
+        })
     }
 
     /// The bridge's own name.
