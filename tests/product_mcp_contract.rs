@@ -5077,7 +5077,7 @@ async fn a_full_file_edit_without_source_ref_creates_only_a_missing_file() {
     let refused = actor.settle(&fixture, refused).await;
     assert_eq!(refused["state"], "invalid_parameters", "{refused}");
     assert_eq!(
-        refused["text"],
+        refused["result"]["content"][0]["text"],
         "invalid bounded parameters: \"source_ref\" is required to replace an existing file: \
          read it first (ide.read)",
         "{refused}"
@@ -6608,6 +6608,9 @@ async fn configured_product_test_handle_answers_after_stop() {
         "{handle}"
     );
     assert!(carried_status(&handle).is_none(), "{handle}");
+    let refused = actor.call(&fixture, "ide.test", json!({"status":1})).await;
+    assert_eq!(refused["state"], "unavailable", "{refused}");
+    assert_eq!(refused["reason"], "host_binding", "{refused}");
     let detail = actor
         .call(&fixture, "ide.inspect", json!({"detail_ref":run_ref}))
         .await;

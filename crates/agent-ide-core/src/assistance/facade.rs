@@ -2341,7 +2341,16 @@ impl StdioFacade {
                 let hint = self
                     .missing_pre_start_hint(tool, &stage_parameters, reply.as_ref())
                     .await;
-                let rendered = render_reply_with_status(*reply, status.as_deref(), envelope);
+                let rendered = content::render_with_call(
+                    (*reply).clone(),
+                    status.as_deref(),
+                    envelope,
+                    Some(tool.mcp_name()),
+                    (tool == AssistanceTool::Test)
+                        .then(|| stage_parameters.get("status").and_then(Value::as_u64))
+                        .flatten(),
+                )
+                .unwrap_or_else(|| render_reply_with_status(*reply, status.as_deref(), envelope));
                 let rendered = match hint {
                     Some(hint) => with_retry_hint(rendered, &hint),
                     None => rendered,

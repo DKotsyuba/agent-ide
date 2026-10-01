@@ -1782,7 +1782,7 @@ impl Worker<'_> {
                     ));
                     return Err(FailureCode::UnknownSymbol);
                 }
-                splice_lines(&source, *range, "")
+                delete_symbol_lines(&source, *range)
             }
             ("insert", Splice::Insert(site)) => {
                 let content = content.ok_or(FailureCode::Internal)?;
@@ -2184,6 +2184,27 @@ fn splice_lines(source: &str, range: LineRange, content: &str) -> String {
     out
 }
 
+/// Deletes a symbol's lines and merges the blank runs on either side into the narrower one, so
+/// the surviving neighbours keep the file's own spacing (one or two blank lines, none next to
+/// an opening or closing bracket line) and a file boundary keeps none. This makes an
+/// insert followed by a delete of the same symbol restore the original bytes.
+fn delete_symbol_lines(source: &str, range: LineRange) -> String {
+    let mut lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let start = (range.start.saturating_sub(1) as usize).min(lines.len());
+    let end = (range.end as usize).min(lines.len());
+    lines.drain(start..end);
+    let blank = |line: &&&str| line.trim().is_empty();
+    let left = lines[..start].iter().rev().take_while(blank).count();
+    let right = lines[start..].iter().take_while(blank).count();
+    let keep = if left == start || start + right == lines.len() {
+        0
+    } else {
+        left.min(right)
+    };
+    lines.drain(start - left + keep..start + right);
+    lines.concat()
+}
+
 /// Inserts `content` before `site.line` with the site's indentation and blank lines.
 fn insert_lines(source: &str, site: &lang::InsertSite, content: &str) -> String {
     let mut out = String::with_capacity(source.len() + content.len() + 64);
@@ -2396,6 +2417,77 @@ mod splice_tests {
             blank_after: 0,
         };
         assert_eq!(insert_lines(source, &append, "e"), "a\nb\nc\nd\n\ne\n");
+    }
+
+    #[test]
+    fn inserting_then_deleting_restores_middle_and_end_layouts() {
+        for (source, site, range) in [
+            (
+                "a\n\nb\n",
+                lang::InsertSite {
+                    line: 3,
+                    indent: String::new(),
+                    blank_before: 1,
+                    blank_after: 1,
+                },
+                LineRange::new(4, 4),
+            ),
+            (
+                "a\n\nb\n",
+                lang::InsertSite {
+                    line: 2,
+                    indent: String::new(),
+                    blank_before: 1,
+                    blank_after: 1,
+                },
+                LineRange::new(3, 3),
+            ),
+            (
+                "a\n",
+                lang::InsertSite {
+                    line: 2,
+                    indent: String::new(),
+                    blank_before: 1,
+                    blank_after: 0,
+                },
+                LineRange::new(3, 3),
+            ),
+        ] {
+            let inserted = insert_lines(source, &site, "probe");
+            assert_eq!(delete_symbol_lines(&inserted, range), source);
+        }
+    }
+
+    #[test]
+    fn deleting_between_neighbours_keeps_the_narrower_separator() {
+        assert_eq!(
+            delete_symbol_lines("a\n\nprobe\n\n\nb\n", LineRange::new(3, 3)),
+            "a\n\nb\n"
+        );
+        // Two blank lines between top-level definitions stay two.
+        assert_eq!(
+            delete_symbol_lines("a\n\n\nprobe\n\n\nb\n", LineRange::new(4, 4)),
+            "a\n\n\nb\n"
+        );
+        // The first and last members next to bracket lines leave no blank line behind.
+        let body = "impl X {\n    fn a() {}\n\n    fn b() {}\n}\n";
+        assert_eq!(
+            delete_symbol_lines(body, LineRange::new(2, 2)),
+            "impl X {\n    fn b() {}\n}\n"
+        );
+        assert_eq!(
+            delete_symbol_lines(body, LineRange::new(4, 4)),
+            "impl X {\n    fn a() {}\n}\n"
+        );
+        // Adjacent neighbours stay adjacent; a deleted first symbol leaves no leading blank.
+        assert_eq!(
+            delete_symbol_lines("a\nprobe\nb\n", LineRange::new(2, 2)),
+            "a\nb\n"
+        );
+        assert_eq!(
+            delete_symbol_lines("probe\n\nb\n", LineRange::new(1, 1)),
+            "b\n"
+        );
     }
 
     /// Keeps identifier matches while rejecting names embedded in larger ASCII identifiers.

@@ -464,7 +464,8 @@ fn render_status_line(id: u64, job: &Job) -> Option<String> {
 /// Renders one settled run's first status line, shared by the status plate and the full result.
 ///
 /// A run that counted no test is never shown as `0 passed, 0 failed`: a non-zero exit says the
-/// runner could not run (`no test results (exit N)`), and a missing summary says so.
+/// runner could not run (`no test results (exit N)` plus a bounded output excerpt and detail ref),
+/// and a missing summary says so.
 pub fn result_line(id: u64, result: &RunResult) -> String {
     let report = &result.report;
     let seconds = result.elapsed.as_secs();
@@ -478,18 +479,44 @@ pub fn result_line(id: u64, result: &RunResult) -> String {
         )
     } else if let Some(code) = result.exit.filter(|code| *code != 0 && !counted) {
         format!(
-            "tests #{id}: no test results (exit {code}), {seconds} s — inspect the runner's full output with ide.inspect"
+            "tests #{id}: no test results (exit {code}), {seconds} s — runner said: {}; full output: ide.inspect {}",
+            runner_excerpt(&result.output),
+            result.detail_ref
         )
     } else if !counted && report.incomplete {
-        format!(
-            "tests #{id}: no summary parsed, {seconds} s — inspect the runner's full output with ide.inspect"
-        )
+        let summary = format!("tests #{id}: no summary parsed, {seconds} s");
+        if let Some(code) = result.exit.filter(|code| *code != 0) {
+            format!(
+                "{summary} (exit {code}) — runner said: {}; full output: ide.inspect {}",
+                runner_excerpt(&result.output),
+                result.detail_ref
+            )
+        } else {
+            format!("{summary} — inspect the runner's full output with ide.inspect")
+        }
     } else {
         format!(
             "tests #{id}: {} passed, {} failed, {seconds} s",
             report.passed, report.failed
         )
     }
+}
+
+/// Selects the most useful bounded runner line for an empty result summary.
+pub(super) fn runner_excerpt(output: &str) -> String {
+    let line = output
+        .lines()
+        .find(|line| {
+            let line = line.trim_start();
+            line.starts_with("ERROR") || line.starts_with("error") || line.starts_with("E ")
+        })
+        .or_else(|| output.lines().rev().find(|line| !line.trim().is_empty()))
+        .unwrap_or("(empty output)");
+    let mut excerpt = line.to_owned();
+    while excerpt.len() > 200 {
+        excerpt.pop();
+    }
+    excerpt
 }
 
 /// Reports whether a settled run has no parsed test counts and was not budget-stopped. The
@@ -673,6 +700,29 @@ async fn kill_group(pid: u32) -> io::Result<std::process::ExitStatus> {
 mod runner_tests {
     //! Minimal process and parser checks for the test runner.
     use super::*;
+
+    /// Empty summaries surface the first error line, falling back to the final output line.
+    #[test]
+    fn empty_summary_quotes_bounded_runner_reason() {
+        let mut result = failed_run(
+            Duration::from_secs(10),
+            "noise\nERROR: missing collectors\nlast\n".into(),
+        );
+        result.exit = Some(4);
+        assert_eq!(
+            result_line(3, &result),
+            format!(
+                "tests #3: no test results (exit 4), 0 s — runner said: ERROR: missing collectors; full output: ide.inspect {}",
+                result.detail_ref
+            )
+        );
+        result.output = "noise\nlast line\n".into();
+        assert!(
+            result_line(3, &result).contains("runner said: last line; full output: ide.inspect")
+        );
+        result.output = "x".repeat(300);
+        assert!(runner_excerpt(&result.output).len() <= 200);
+    }
 
     /// Uses a test-language transcript to prove captured output reaches the language parser.
     #[tokio::test]
