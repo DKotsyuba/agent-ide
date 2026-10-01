@@ -262,10 +262,12 @@ fn log_oversize() {
 ///
 /// The daemon's observation uses only the host, phase, actor, session, and optional call/tool-name
 /// fields, so a multi-megabyte `tool_input`/`tool_response` body is dropped rather than the whole
-/// event. Payloads already inside the 64 KiB transport bound keep their exact bytes (preserving the
-/// parser's duplicate-key rejection); only larger ones are projected, where duplicate keys
-/// collapse last-wins. Returns `None` when the payload is not a JSON object or even the projection
-/// exceeds the transport bound (oversized identifiers).
+/// event — except Claude's bounded `tool_input.file_path`, which a projected writer post keeps so
+/// its check trigger can still narrow to the changed file's language. Payloads already inside the
+/// 64 KiB transport bound keep their exact bytes (preserving the parser's duplicate-key
+/// rejection); only larger ones are projected, where duplicate keys collapse last-wins. Returns
+/// `None` when the payload is not a JSON object or even the projection exceeds the transport
+/// bound (oversized identifiers).
 pub fn project_hook_payload(host_kind: HostKind, payload: &[u8]) -> Option<Vec<u8>> {
     let mut projected = serde_json::Map::new();
     {
@@ -284,6 +286,18 @@ pub fn project_hook_payload(host_kind: HostKind, payload: &[u8]) -> Option<Vec<u
             if let Some(item) = object.get(field) {
                 projected.insert(field.to_owned(), item.clone());
             }
+        }
+        if host_kind == HostKind::Claude
+            && let Some(file) = object
+                .get("tool_input")
+                .and_then(|input| input.get("file_path"))
+                .and_then(|value| value.as_str())
+                .filter(|path| !path.is_empty() && path.len() <= 1024)
+        {
+            projected.insert(
+                "tool_input".to_owned(),
+                serde_json::json!({ "file_path": file }),
+            );
         }
     }
     let bytes = serde_json::to_vec(&serde_json::Value::Object(projected)).ok()?;
@@ -465,7 +479,17 @@ mod tests {
                 event.tool_name(),
                 phase.eq("PostToolUse").then_some("Write")
             );
-            assert!(!String::from_utf8(projected).unwrap().contains('x'));
+            // The megabyte body is gone (`xx` never occurs; only the single `x` of `.txt`
+            // survives), while the bounded `file_path` a post's check trigger needs is kept —
+            // parsed out for a post, discarded for a pre.
+            let text = String::from_utf8(projected).unwrap();
+            assert!(!text.contains("xx"), "{text}");
+            assert_eq!(
+                event.tool_file(),
+                phase
+                    .eq("PostToolUse")
+                    .then_some("/private/tmp/project/a.txt")
+            );
         }
         // A Codex payload keeps its own field set, and non-object input never projects.
         let codex = project_hook_payload(

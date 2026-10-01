@@ -702,6 +702,7 @@ mod tests {
             crate::lang::testing::ALPHA,
             UnavailableReason::Fatal,
             1,
+            0,
             Some(detail),
         );
         let block = FeedState::default()
@@ -719,6 +720,7 @@ mod tests {
             crate::lang::testing::BETA,
             UnavailableReason::NoFiles,
             1,
+            0,
             Some("checker analyzed 0 files".to_string()),
         );
         assert_eq!(
@@ -739,12 +741,14 @@ mod tests {
                         crate::lang::testing::ALPHA,
                         UnavailableReason::Fatal,
                         1,
+                        0,
                         long.clone(),
                     ),
                     ProblemSnapshot::unavailable_with_detail(
                         crate::lang::testing::BETA,
                         UnavailableReason::Fatal,
                         1,
+                        0,
                         long,
                     ),
                 ],

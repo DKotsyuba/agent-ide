@@ -1278,9 +1278,11 @@ pub async fn submit_inactive_hook(
 /// Submits one already host-validated event using only its selected identity and lifecycle fields.
 ///
 /// The serialized observation explicitly names its host contract. The root session (retained for
-/// both hosts) and Claude's optional agent type are kept for isolation evidence, and the post
-/// phase tool name selects check triggers; raw hook fields never enter the transport. Only an
-/// observed, settled, or feedback reply counts as submission; a daemon refusal is unavailable.
+/// both hosts) and Claude's optional agent type are kept for isolation evidence, the post phase
+/// tool name selects check triggers, and a writer tool's bounded `file_path` narrows that
+/// trigger to the changed file's language; no other raw hook field ever enters the transport.
+/// Only an observed, settled, or feedback reply counts as submission; a daemon refusal is
+/// unavailable.
 pub async fn submit_hook_event(
     runtime_dir: &Path,
     host: &TrustedTransport,
@@ -1302,8 +1304,11 @@ pub async fn submit_hook_event(
         "call_id": event.optional_call_id(),
         "session_id": event.session_id(),
         "agent_type": event.agent_type(),
-        // Post phases of either host: the bare native tool name that selects project-check triggers.
+        // Post phases of either host: the bare native tool name that selects project-check
+        // triggers, and the writer tool's bounded `file_path` that narrows the trigger to the
+        // changed file's language (`None` for a tool that names no file, e.g. `Bash`).
         "tool_name": event.tool_name(),
+        "tool_file": event.tool_file(),
     });
     let Some(observation) = OpaqueJson::from_value(&observation, MAX_HOOK_BYTES) else {
         return HookIngressOutcome::Unavailable;

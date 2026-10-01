@@ -2596,7 +2596,12 @@ impl<'a> Worker<'a> {
                 (PeerReply::Edit { result, .. }, _)
                     if result.outcome.has_post_source() && !job.check_scheduled =>
                 {
-                    feed.changed(&binding.fingerprint());
+                    // Name the edited file so only its language is re-checked; an edit whose
+                    // parameters carry no path keeps the every-language behaviour.
+                    feed.changed_file(
+                        &binding.fingerprint(),
+                        job.parameters.get("path").and_then(Value::as_str),
+                    );
                 }
                 _ => {}
             }
@@ -3947,7 +3952,10 @@ impl<'a> Worker<'a> {
         let feed = self.shared.project_feed.as_ref()?;
         let language = Language::for_path(std::path::Path::new(path))
             .filter(|language| language.checks().is_some())?;
-        let generation = feed.changed_generation(&job.invocation.binding_ref().fingerprint())?;
+        // The edit's own language is the only one re-armed: a `.py` edit must not also start a
+        // cargo check in a mixed worktree.
+        let generation =
+            feed.changed_generation(&job.invocation.binding_ref().fingerprint(), Some(path))?;
         job.check_scheduled = true;
         let worktree = authority.worktree().worktree_path().to_path_buf();
         let deadline = job
@@ -5030,21 +5038,34 @@ fn detect_test_language(root: &Path) -> Option<crate::lang::Language> {
 }
 
 /// Resolves a target through the detected runner, returning argv, language, and an optional
-/// user-facing selected-test summary (`None` when the runner cannot enumerate tests). Returns
+/// user-facing selected-test summary (`None` when the runner cannot enumerate tests). A target
+/// that names a file runs that file's language's runner — in a mixed worktree a `.py` test path
+/// selects pytest, never the first detected project's cargo — falling back to the first detected
+/// project for a bare pattern or an undetected language. Returns
 /// [`crate::lang::LangError::Unsupported`] when no runner supports the target.
 fn test_selection(
     root: &Path,
     target: crate::lang::TestTarget,
 ) -> Result<(Vec<String>, crate::lang::Language, Option<String>), crate::lang::LangError> {
-    let Some((language, project)) = test_projects(root).into_iter().next() else {
+    let projects = test_projects(root);
+    let target_file = match &target {
+        crate::lang::TestTarget::Symbol { path, .. } => path.file(),
+        crate::lang::TestTarget::File(path) => Some(path.as_path()),
+        crate::lang::TestTarget::Pattern(_) => None,
+    };
+    let Some((language, project)) = target_file
+        .and_then(crate::lang::Language::for_path)
+        .and_then(|language| projects.iter().find(|(detected, _)| *detected == language))
+        .or_else(|| projects.first())
+    else {
         return Err(crate::lang::LangError::Unsupported(
             "no supported test runner was detected".to_owned(),
         ));
     };
-    let selection = language.support().test_selection(&project, &target)?;
+    let selection = language.support().test_selection(project, &target)?;
     let count = (!selection.tests.is_empty())
         .then_some(format!("{} tests selected", selection.tests.len()));
-    Ok((selection.command, language, count))
+    Ok((selection.command, *language, count))
 }
 
 /// Formats an argv vector for the compact test status line without shell interpretation.

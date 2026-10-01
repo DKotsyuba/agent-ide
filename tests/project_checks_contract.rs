@@ -498,7 +498,7 @@ async fn rust_check_clean_stream_is_ready_with_deduped_warning() {
 #[test]
 fn rust_parser_failure_stream_maps_partial_with_dedup() {
     agent_ide::languages::install();
-    let snapshot = parse_cargo_messages(FAILURE_STREAM.as_bytes(), &[], 7, 1234);
+    let snapshot = parse_cargo_messages(FAILURE_STREAM.as_bytes(), &[], None, 7, 1234);
     assert_eq!(snapshot.state, CheckState::Partial);
     assert_eq!(snapshot.errors, 1);
     assert_eq!(snapshot.warnings, 1);
@@ -511,7 +511,7 @@ fn rust_parser_failure_stream_maps_partial_with_dedup() {
 #[test]
 fn rust_parser_clean_stream_maps_ready() {
     agent_ide::languages::install();
-    let snapshot = parse_cargo_messages(CLEAN_STREAM.as_bytes(), &[], 8, 20);
+    let snapshot = parse_cargo_messages(CLEAN_STREAM.as_bytes(), &[], None, 8, 20);
     assert_eq!(snapshot.state, CheckState::Ready);
     assert_eq!(snapshot.errors, 0);
     assert_eq!(snapshot.warnings, 1);
@@ -527,7 +527,7 @@ fn rust_parser_failed_build_with_no_errors_is_fatal_with_stderr_detail() {
     agent_ide::languages::install();
     let stream = br#"{"reason":"build-finished","success":false}"#;
     let stderr = b"Compiling blake3 v1.5.0\nerror: failed to run custom build command for `blake3 v1.5.0`\n\nCaused by:\n  process didn't exit successfully\n";
-    let snapshot = parse_cargo_messages(stream, stderr, 11, 99);
+    let snapshot = parse_cargo_messages(stream, stderr, Some(101), 11, 99);
     assert_eq!(
         snapshot.state,
         CheckState::Unavailable(UnavailableReason::Fatal)
@@ -535,7 +535,8 @@ fn rust_parser_failed_build_with_no_errors_is_fatal_with_stderr_detail() {
     assert_eq!(snapshot.errors, 0);
     assert_eq!(snapshot.warnings, 0);
     assert!(snapshot.problems.is_empty());
-    assert_eq!(snapshot.duration_ms, 0);
+    // The failed run's measured duration is kept, never hard-coded to zero.
+    assert_eq!(snapshot.duration_ms, 99);
     assert_eq!(
         snapshot.detail.as_deref(),
         Some("error: failed to run custom build command for `blake3 v1.5.0`")
@@ -548,7 +549,7 @@ fn rust_parser_failed_build_with_no_errors_is_fatal_with_stderr_detail() {
 fn rust_parser_failed_build_with_no_errors_and_no_stderr_has_no_detail() {
     agent_ide::languages::install();
     let stream = br#"{"reason":"build-finished","success":false}"#;
-    let snapshot = parse_cargo_messages(stream, b"", 11, 99);
+    let snapshot = parse_cargo_messages(stream, b"", None, 11, 99);
     assert_eq!(
         snapshot.state,
         CheckState::Unavailable(UnavailableReason::Fatal)
@@ -563,7 +564,7 @@ fn rust_parser_failed_build_detail_is_truncated_to_160_bytes() {
     let stream = br#"{"reason":"build-finished","success":false}"#;
     let long_suffix = "x".repeat(200);
     let stderr = format!("error: {long_suffix}\n");
-    let snapshot = parse_cargo_messages(stream, stderr.as_bytes(), 1, 1);
+    let snapshot = parse_cargo_messages(stream, stderr.as_bytes(), Some(101), 1, 1);
     let detail = snapshot.detail.expect("detail present");
     assert!(detail.len() <= 160, "{}", detail.len());
     assert!(stderr.starts_with(&detail));
@@ -582,7 +583,7 @@ fn rust_parser_prefers_spanless_compiler_error_message_over_stderr() {
         r#"{"reason":"build-finished","success":false}"#,
     );
     let stderr = b"error: could not compile `pastey` (build script)\n";
-    let snapshot = parse_cargo_messages(stream.as_bytes(), stderr, 3, 42);
+    let snapshot = parse_cargo_messages(stream.as_bytes(), stderr, Some(101), 3, 42);
     assert_eq!(
         snapshot.state,
         CheckState::Unavailable(UnavailableReason::Fatal)
@@ -600,7 +601,7 @@ fn rust_parser_prefers_spanless_compiler_error_message_over_stderr() {
 #[test]
 fn rust_parser_stream_without_build_finished_is_fatal() {
     agent_ide::languages::install();
-    let snapshot = parse_cargo_messages(TRUNCATED_STREAM.as_bytes(), &[], 9, 55);
+    let snapshot = parse_cargo_messages(TRUNCATED_STREAM.as_bytes(), &[], None, 9, 55);
     assert_eq!(
         snapshot.state,
         CheckState::Unavailable(UnavailableReason::Fatal)
@@ -608,8 +609,8 @@ fn rust_parser_stream_without_build_finished_is_fatal() {
     assert_eq!(snapshot.errors, 0);
     assert_eq!(snapshot.warnings, 0);
     assert!(snapshot.problems.is_empty());
-    // The sanctioned zero-count constructor pins duration to 0, like every unavailable outcome.
-    assert_eq!(snapshot.duration_ms, 0);
+    // The failed run's measured duration is kept, never hard-coded to zero.
+    assert_eq!(snapshot.duration_ms, 55);
     assert_eq!(snapshot.detail, None);
 }
 
@@ -622,7 +623,7 @@ fn rust_parser_stream_without_build_finished_carries_stderr_detail() {
     agent_ide::languages::install();
     let stderr =
         b"error: failed searching for potential workspace\nCaused by:\n  Operation not permitted (os error 1)\n";
-    let snapshot = parse_cargo_messages(TRUNCATED_STREAM.as_bytes(), stderr, 9, 55);
+    let snapshot = parse_cargo_messages(TRUNCATED_STREAM.as_bytes(), stderr, Some(71), 9, 55);
     assert_eq!(
         snapshot.state,
         CheckState::Unavailable(UnavailableReason::Fatal)
@@ -631,6 +632,33 @@ fn rust_parser_stream_without_build_finished_carries_stderr_detail() {
         snapshot.detail.as_deref(),
         Some("error: failed searching for potential workspace")
     );
+}
+
+/// Proves a stream without the terminal `build-finished` event whose stderr carries no `error:`
+/// line still names its cause: the wrapper's own refusal line (the nested-sandbox
+/// `sandbox_apply` message, `exit 71`, no output) becomes the detail, and a run that printed
+/// nothing at all reports its exit status.
+#[test]
+fn rust_parser_stream_without_build_finished_keeps_refusal_or_exit_cause() {
+    agent_ide::languages::install();
+    let refusal = b"sandbox-exec: sandbox_apply: Operation not permitted\n";
+    let snapshot = parse_cargo_messages(TRUNCATED_STREAM.as_bytes(), refusal, Some(71), 9, 11);
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::Fatal)
+    );
+    assert_eq!(
+        snapshot.detail.as_deref(),
+        Some("sandbox-exec: sandbox_apply: Operation not permitted")
+    );
+    assert_eq!(snapshot.duration_ms, 11);
+
+    let silent = parse_cargo_messages(TRUNCATED_STREAM.as_bytes(), b"", Some(71), 9, 11);
+    assert_eq!(
+        silent.state,
+        CheckState::Unavailable(UnavailableReason::Fatal)
+    );
+    assert_eq!(silent.detail.as_deref(), Some("exit 71"));
 }
 
 /// Proves a runner-level failure maps to `Unavailable(Fatal)`.
@@ -650,6 +678,9 @@ async fn rust_check_runner_error_is_fatal() {
     );
     assert_eq!(snapshot.errors, 0);
     assert_eq!(snapshot.warnings, 0);
+    // The runner's io::Error text is the snapshot's cause, so the plate says why instead of
+    // "checker supplied no reason".
+    assert_eq!(snapshot.detail.as_deref(), Some("spawn refused"));
     let _ = fs::remove_dir_all(&root);
 }
 

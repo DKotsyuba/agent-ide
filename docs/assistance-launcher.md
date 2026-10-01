@@ -185,6 +185,15 @@ For Rust, T06B adds `CC`/`CXX`/`SDKROOT` plus `CARGO_TARGET_<TRIPLE>_LINKER` (or
 pointing at the resolved developer directory's own `clang`, bypassing the `/usr/bin/cc` `xcrun`
 shim that a build script's link step cannot run under this profile; see EYES-r2 §3 for the exact
 resolution.
+One environment limit is handled, not hidden: when the daemon itself is already confined by the
+host (an agent's own sandboxed session), macOS refuses to apply a nested profile —
+`sandbox-exec: sandbox_apply: Operation not permitted`, a non-zero exit with no checker output.
+The runner detects that refusal, runs the same check once without our profile (the host's own
+confinement of the daemon already applies to the child; the product's only path policy is the
+`allowed_roots` list, so this adds no security layer), and remembers the refusal for the daemon's
+lifetime so later checks never retry the doomed wrapper. A check that fails for any other reason
+keeps its own cause: the snapshot detail carries the first `error:` line of stderr, else its
+first non-empty line, else `exit <status>`, so a failed check always says why.
 Each check owns one process group, killed whole on cancel, timeout (`check_timeout_s`), or daemon
 shutdown; no pattern-based kill touches processes the daemon did not start.
 
@@ -207,7 +216,11 @@ With zero open leases and no running check the daemon stops after `idle_timeout_
 socket, and removes its runtime directory; the caches remain.
 
 Scheduling: triggers are a successful `ide.start`, Claude post hooks for `Edit`, `Write`,
-`MultiEdit`, `NotebookEdit`, and `Bash`, and a completed `ide.edit`. Per `(worktree, language)`,
+`MultiEdit`, `NotebookEdit`, and `Bash`, and a completed `ide.edit`. A trigger that names the
+changed file — a writer post's retained `tool_input.file_path`, the edited path of `ide.edit` —
+re-arms only that file's language, so a `.py` edit never starts a cargo check; a path no
+registered language owns (`Cargo.toml`, `README.md`) and a path-less trigger (`Bash`, `ide.start`)
+re-arm every configured language. Per `(worktree, language)`,
 runs are debounced by `debounce_ms`, at most one runs at a time, and at most two run concurrently
 across the daemon.
 

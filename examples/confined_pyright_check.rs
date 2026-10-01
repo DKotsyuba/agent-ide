@@ -138,6 +138,7 @@ async fn main() -> ExitCode {
     let snapshot: ProblemSnapshot = parse_pyright_output(
         output.status,
         &output.stdout,
+        &output.stderr,
         request.input_generation,
         duration_ms,
     );

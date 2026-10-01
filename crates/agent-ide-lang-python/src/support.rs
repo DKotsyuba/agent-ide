@@ -37,20 +37,70 @@ pub struct Python;
 /// makes pytest print no summary line at all, which the parser then cannot read.
 const PYTEST_FLAGS: [&str; 3] = ["--no-header", "-p", "no:cacheprovider"];
 
+/// Root marker files (besides any root `requirements*.txt` and a `.venv`/`venv` directory, both
+/// matched separately) whose presence identifies a worktree as a Python project.
+///
+/// This is the ONE marker list shared by the project card ([`Python::detect`]) and project
+/// checks ([`crate::checks::PythonChecks::is_present`]); the two must never diverge again — a
+/// root `requirements-dev.txt` used to register the card while checks stayed silent.
+const ROOT_MARKER_FILES: [&str; 5] = [
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "Pipfile",
+    "pyrightconfig.json",
+];
+
+/// Reports whether `name` is a `requirements*.txt` marker file.
+fn is_requirements_txt(name: &str) -> bool {
+    name.starts_with("requirements") && name.ends_with(".txt")
+}
+
+/// Reports whether `root` is a Python project, per the shared marker rule.
+///
+/// Root markers: any of [`ROOT_MARKER_FILES`], any root `requirements*.txt`, or a `.venv`/`venv`
+/// directory. Plus a bounded depth-1 probe: nested `requirements*.txt` or `pyproject.toml` in
+/// immediate subdirectories — a repository whose Python dependencies live in
+/// `tools/requirements-ml.txt` still registers. No deeper tree is walked.
+pub(crate) fn is_python_project(root: &Path) -> bool {
+    let names = entry_names(root);
+    if ROOT_MARKER_FILES
+        .iter()
+        .any(|name| root.join(name).is_file())
+        || names.iter().any(|name| is_requirements_txt(name))
+        || [".venv", "venv"].iter().any(|dir| root.join(dir).is_dir())
+    {
+        return true;
+    }
+    names
+        .iter()
+        .filter(|name| !name.starts_with('.'))
+        .filter_map(|name| root.join(name).is_dir().then_some(root.join(name)))
+        .any(|dir| {
+            dir.join("pyproject.toml").is_file()
+                || entry_names(&dir)
+                    .iter()
+                    .any(|name| is_requirements_txt(name))
+        })
+}
+
 impl LanguageSupport for Python {
     /// Always the Python [`LANGUAGE`].
     fn language(&self) -> Language {
         LANGUAGE
     }
 
-    /// Establishes a Python project from `pyproject.toml`, `setup.py`, `setup.cfg` or
-    /// `requirements*.txt`; `None` when none exists. Environment facts recorded (in this order,
+    /// Establishes a Python project per the shared marker rule ([`is_python_project`]); `None`
+    /// when none of the markers exists. Environment facts recorded (in this order,
     /// each only when present): `venv` (`.venv` or `venv`, whose `bin/python` becomes the absolute
     /// `interpreter`), `tool` (`uv`, `poetry`), `python` (`.python-version`), `configured`
     /// (`pyright`, `mypy`, `ruff`) and `formatter` (`black` or `ruff`, which `format_command`
     /// reads back). Commands start from the manifests and are overridden by Makefile targets and
     /// then by CI workflow `run:` lines, so CI wins.
     fn detect(&self, root: &Path) -> Option<LanguageProject> {
+        if !is_python_project(root) {
+            return None;
+        }
         let names = entry_names(root);
         let has = |name: &str| root.join(name).is_file();
         let mut manifests: Vec<PathBuf> = ["pyproject.toml", "setup.py", "setup.cfg"]
@@ -64,9 +114,6 @@ impl LanguageSupport for Python {
                 .filter(|name| name.starts_with("requirements") && name.ends_with(".txt"))
                 .map(PathBuf::from),
         );
-        if manifests.is_empty() {
-            return None;
-        }
         let pyproject = read_text(root, "pyproject.toml");
         let setup_cfg = read_text(root, "setup.cfg");
 
@@ -1798,6 +1845,45 @@ FAILED tests/test_service.py::TestWorker::test_label
         let empty = scratch("empty");
         assert_eq!(Python.detect(&empty), None);
         fs::remove_dir_all(&empty).unwrap();
+    }
+
+    #[test]
+    /// The card's marker rule is the same shared list checks use: a root
+    /// `requirements-dev.txt` registers (the old exact-`requirements.txt` check list missed it),
+    /// a nested `tools/requirements-ml.txt` registers through the depth-1 probe with the pytest
+    /// command, and a marker deeper than depth 1 does not.
+    fn detect_uses_the_shared_marker_list_including_nested_requirements() {
+        let root = scratch("requirements-dev-only");
+        put(&root, "requirements-dev.txt", "pytest\n");
+        let project = Python
+            .detect(&root)
+            .expect("root requirements-dev.txt registers (shared marker list)");
+        assert_eq!(
+            project.commands.test.as_ref().unwrap().argv,
+            argv(&["pytest"])
+        );
+        fs::remove_dir_all(&root).unwrap();
+
+        let root = scratch("tools-requirements");
+        put(&root, "tools/requirements-ml.txt", "pandas\n");
+        put(&root, "tools/analyze.py", "import pandas\n");
+        let project = Python
+            .detect(&root)
+            .expect("tools/requirements-ml.txt registers via the depth-1 probe");
+        assert_eq!(project.manifests, Vec::<PathBuf>::new());
+        assert_eq!(
+            project.commands.test.as_ref().unwrap().argv,
+            argv(&["pytest"])
+        );
+        fs::remove_dir_all(&root).unwrap();
+
+        let root = scratch("deep-requirements");
+        put(&root, "nested/deep/requirements.txt", "");
+        assert!(
+            Python.detect(&root).is_none(),
+            "the probe is depth-1, never a tree walk"
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

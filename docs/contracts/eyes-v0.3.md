@@ -200,8 +200,13 @@ worktree: a worktree that gains its manifest between triggers is checked startin
 trigger, no daemon restart required.
 
 - Rust is present iff `<worktree>/Cargo.toml` exists.
-- Python is present iff the worktree root has any of `pyproject.toml`, `setup.py`, `setup.cfg`,
-  `requirements.txt`, `Pipfile`, `pyrightconfig.json`, or a `.venv`/`venv` directory.
+- Python is present iff the worktree matches the ONE marker list shared with the project card
+  (`ide.start`): a root `pyproject.toml`, `setup.py`, `setup.cfg`, `Pipfile`,
+  `pyrightconfig.json`, any root `requirements*.txt` (a glob, not the exact name), a `.venv` or
+  `venv` directory, or a bounded depth-1 probe — `requirements*.txt` or `pyproject.toml` in a
+  non-hidden immediate subdirectory (a `tools/requirements-ml.txt` registers; nothing deeper is
+  walked). The check list and the card list are the same function, so a marker can never register
+  one and not the other.
 - TypeScript/JavaScript is present only when the worktree root has `tsconfig.json` or
   `jsconfig.json`; `package.json` alone does not enable it.
 
@@ -250,16 +255,20 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
   `--all-targets` repeats a diagnostic for lib and lib-test units.
 - `Ready` requires the final `build-finished` message. If any compilation unit failed so dependent
   units produced no result, state is `Partial`. Missing `build-finished` → `Unavailable(Fatal)`,
-  carrying the first `error:`-prefixed line of stderr as `detail` (T07B) when one exists — cargo
-  dying before any JSON event (for example the ancestor-workspace-search failure in §3) never
-  produces a `compiler-message` to draw a detail from otherwise.
+  carrying the run's cause as `detail` (T07B): the first `error:`-prefixed line of stderr when one
+  exists, else the first non-empty stderr line (a wrapper's refusal such as
+  `sandbox-exec: sandbox_apply: Operation not permitted` carries no `error:` prefix), else
+  `exit <status>` — cargo dying before any JSON event (for example the ancestor-workspace-search
+  failure in §3, or a refused profile apply) never produces a `compiler-message` to draw a detail
+  from otherwise, but it never drops its cause. The measured run duration is kept; a fast fatal
+  is never reported as an instant one.
 - `build-finished.success: false` with zero deduplicated errors (T05B: a build failure with no
   diagnostic to show, for example a build-script link failure — T06B: `cc` exiting nonzero has no
   primary span, so it is never counted) is also `Unavailable(Fatal)`, never `Ready`: counts are
   never fabricated for a run that did not actually compile the workspace. The snapshot's `detail`
   prefers the `message.message` of the first `error`-level `compiler-message`, even without a
-  primary span (T06B), over cargo's own summary; only when no such message exists does the first
-  `error:` line of cargo's stderr stand in (both trimmed to 160 bytes).
+  primary span (T06B), over cargo's own summary; only when no such message exists does the same
+  stderr-cause rule stand in (both trimmed to 160 bytes).
 - `CARGO_TARGET_DIR` is the check's private cache dir for that worktree.
 - Missing `cargo` in `toolchain_dir` → `Unavailable(ToolMissing)`.
 
@@ -323,13 +332,21 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
 
 - Triggers: successful `ide.start` (initial warm check), a native `PostToolUse`/`PostToolUseFailure`
   hook event whose retained `tool_name` passes the host's trigger predicate (the hook parser
-  retains `tool_name` for post phases only; tool input and output stay discarded), a completed
-  `ide.edit`, and — (T28B) for every host whose plate delivery rides replies (see §6) — each
-  `ide.*` tool call of that host, so a native edit made between two calls (`apply_patch`, shell)
-  is noticed even without any hook stream. That per-call trigger is free while the worktree inputs
-  are unchanged (see the T20B skip below). An actor whose `ide.start` was refused (for example
-  `conflict` because another actor owns the worktree) has no binding: it triggers no check and
-  receives no block.
+  retains `tool_name` and, for a Claude writer post, the bounded `tool_input.file_path` — the
+  one tool-input field kept; everything else of tool input and all tool output stays
+  discarded), a completed `ide.edit`, and — (T28B) for every host whose plate delivery rides
+  replies (see §6) — each `ide.*` tool call of that host, so a native edit made between two
+  calls (`apply_patch`, shell) is noticed even without any hook stream. That per-call trigger
+  is free while the worktree inputs are unchanged (see the T20B skip below). An actor whose
+  `ide.start` was refused (for example `conflict` because another actor owns the worktree) has
+  no binding: it triggers no check and receives no block.
+- A trigger that knows which file changed re-arms only that file's language, so a `.py` edit
+  never starts a cargo check: the retained `tool_input.file_path` of a Claude
+  `Edit`/`Write`/`MultiEdit`/`NotebookEdit` post and the edited path of a completed `ide.edit`
+  both map through the file's extension to one language. A path no registered language owns
+  (`Cargo.toml`, `README.md`) conservatively re-arms every configured language, and a path-less
+  trigger (`Bash`, `ide.start`, the reply-delivered per-call trigger) keeps the previous
+  all-languages behaviour.
 - Trigger predicate (`triggers_check`, T29B §4): Claude keeps the exact
   `Edit`/`Write`/`MultiEdit`/`NotebookEdit`/`Bash` writer allowlist. Codex has no certified writer
   allowlist, so every paired native `PostToolUse` triggers — except this product's own MCP tool

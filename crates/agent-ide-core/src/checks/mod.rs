@@ -304,24 +304,31 @@ impl ProblemSnapshot {
     }
 
     /// Builds the zero-count snapshot for a language that cannot produce any result.
+    ///
+    /// No process ran, so the snapshot's duration is honestly zero; a run that did happen must
+    /// report its measured duration through [`ProblemSnapshot::unavailable_with_detail`].
     pub fn unavailable(
         language: Language,
         reason: UnavailableReason,
         input_generation: u64,
     ) -> Self {
-        Self::unavailable_with_detail(language, reason, input_generation, None)
+        Self::unavailable_with_detail(language, reason, input_generation, 0, None)
     }
 
     /// Builds the zero-count snapshot for a language that cannot produce any result, carrying an
-    /// optional bounded explanation of the cause.
+    /// optional bounded explanation of the cause and the measured duration of the run that
+    /// produced the failure.
     ///
     /// `detail` is untrusted checker text (for example the first `error:` line of a failed
     /// build's stderr); callers that have no cheap explanation should use
-    /// [`ProblemSnapshot::unavailable`] instead of passing `None` here explicitly.
+    /// [`ProblemSnapshot::unavailable`] instead of passing `None` here explicitly. `duration_ms`
+    /// is the wall-clock time the failed run actually took, so a fast fatal (`exit 71` from a
+    /// refused sandbox apply, ~10 ms) is never reported as an instant one.
     pub fn unavailable_with_detail(
         language: Language,
         reason: UnavailableReason,
         input_generation: u64,
+        duration_ms: u64,
         detail: Option<String>,
     ) -> Self {
         Self {
@@ -332,7 +339,7 @@ impl ProblemSnapshot {
             problems: Vec::new(),
             truncated: false,
             input_generation,
-            duration_ms: 0,
+            duration_ms,
             detail,
         }
     }
@@ -350,6 +357,43 @@ impl ProblemSnapshot {
             duration_ms: 0,
             detail: None,
         }
+    }
+}
+
+/// Maximum bytes of a checker-run failure cause retained in a [`ProblemSnapshot::detail`].
+pub const MAX_CAUSE_BYTES: usize = 160;
+
+/// Truncates `value` to at most `max_bytes` UTF-8 bytes, cutting only on a whole character.
+pub fn truncate_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+/// Builds the bounded cause line for a check run that failed without a usable result.
+///
+/// Tiers, first match wins: the first `error:`-prefixed line of `stderr` (the tool's own summary,
+/// for example `error: failed to run custom build command for …`), else the first non-empty
+/// `stderr` line (a wrapper's refusal such as `sandbox-exec: sandbox_apply: Operation not
+/// permitted` carries no `error:` prefix), else `exit <status>` when the run died with no output
+/// at all. Every tier is untrusted checker output, so it is cut to [`MAX_CAUSE_BYTES`] and later
+/// rendered through the single-line untrusted filter. Returns `None` only when the run left no
+/// evidence whatsoever (empty stderr and no exit status).
+pub fn run_failure_cause(stderr: &[u8], status: Option<i32>) -> Option<String> {
+    let text = String::from_utf8_lossy(stderr);
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("error:"))
+        .or_else(|| text.lines().map(str::trim).find(|line| !line.is_empty()));
+    match line {
+        Some(line) => Some(truncate_bytes(line, MAX_CAUSE_BYTES)),
+        None => status.map(|code| format!("exit {code}")),
     }
 }
 

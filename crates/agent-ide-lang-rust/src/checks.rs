@@ -22,7 +22,7 @@ use agent_ide_core::assistance::launcher::absolute;
 use agent_ide_core::checks::runner::{ConfinedRunner, RunOutput, RunSpec};
 use agent_ide_core::checks::{
     BoxFuture, CheckConfig, CheckRequest, CheckState, Checker, Language, LanguageChecks, Problem,
-    ProblemSnapshot, Severity, UnavailableReason,
+    ProblemSnapshot, Severity, UnavailableReason, run_failure_cause, truncate_bytes,
 };
 
 /// Per-stream capture limit for one confined cargo run: 64 MiB.
@@ -482,19 +482,31 @@ impl RustChecker {
         }
         let cache_tmp = request.cache_dir.join("tmp");
         let cache_target = request.cache_dir.join("target");
-        if fs::create_dir_all(&cache_tmp).is_err() || fs::create_dir_all(&cache_target).is_err() {
-            return ProblemSnapshot::unavailable(
+        if let Err(error) =
+            fs::create_dir_all(&cache_tmp).and_then(|()| fs::create_dir_all(&cache_target))
+        {
+            return ProblemSnapshot::unavailable_with_detail(
                 crate::LANGUAGE,
                 UnavailableReason::Fatal,
                 request.input_generation,
+                0,
+                Some(truncate_bytes(
+                    &error.to_string(),
+                    agent_ide_core::checks::MAX_CAUSE_BYTES,
+                )),
             );
         }
         let spec = self.cargo_check_spec(&request);
         match self.runner.run(spec).await {
-            Err(_) => ProblemSnapshot::unavailable(
+            Err(error) => ProblemSnapshot::unavailable_with_detail(
                 crate::LANGUAGE,
                 UnavailableReason::Fatal,
                 request.input_generation,
+                started.elapsed().as_millis() as u64,
+                Some(truncate_bytes(
+                    &error.to_string(),
+                    agent_ide_core::checks::MAX_CAUSE_BYTES,
+                )),
             ),
             Ok(output) => {
                 let duration_ms = started.elapsed().as_millis() as u64;
@@ -534,6 +546,7 @@ fn map_run_output(request: &CheckRequest, output: &RunOutput, duration_ms: u64) 
     parse_cargo_messages_with_denies(
         &output.stdout,
         &output.stderr,
+        output.status,
         request.input_generation,
         duration_ms,
         &request.worktree,
@@ -568,17 +581,18 @@ fn lockfile_write_failure(stderr: &[u8]) -> bool {
 /// lib-test unit, and the repetition collapses there.
 ///
 /// State heuristic (EYES-r2 §4): a missing terminal `build-finished` event means cargo never
-/// completed the run, which is [`UnavailableReason::Fatal`], carrying the first `error:` line of
-/// `stderr` (T07B) as its [`ProblemSnapshot::detail`] when one exists — for example cargo's own
-/// `error: failed searching for potential workspace` when an ancestor manifest it needed to read
-/// was outside the confined read roots. A terminal `build-finished.success:
+/// completed the run, which is [`UnavailableReason::Fatal`], carrying the run's cause as its
+/// [`ProblemSnapshot::detail`] via [`run_failure_cause`] (T07B) — the first `error:` line of
+/// `stderr` when one exists, else the first non-empty stderr line (for example a wrapper's
+/// `sandbox-exec: sandbox_apply: Operation not permitted` refusal, which carries no `error:`
+/// prefix), else `exit <status>`. A terminal `build-finished.success:
 /// false` with zero deduplicated errors — a build failure with no diagnostics to show, for
 /// example a build-script link failure (T06B: `cc` exiting with a nonzero status has no primary
 /// span, so it is never counted as a diagnostic) — is also [`UnavailableReason::Fatal`],
 /// carrying [`ProblemSnapshot::detail`] when one is available: the `message.message` of the first
 /// `compiler-message` at `error` level, even without a primary span, takes priority over cargo's
-/// own stderr summary; only when no such message exists does the first `error:` line of `stderr`
-/// stand in (both trimmed to 160 bytes). Counts must never be fabricated as `Ready` for a build
+/// own stderr summary; only when no such message exists does [`run_failure_cause`] stand in
+/// (both trimmed to 160 bytes). Counts must never be fabricated as `Ready` for a build
 /// that did not actually compile the workspace. Otherwise the snapshot is
 /// [`CheckState::Partial`] exactly when `build-finished.success` is `false`, at least one
 /// deduplicated error exists, and at least one package that produced `compiler-message` events
@@ -590,12 +604,14 @@ fn lockfile_write_failure(stderr: &[u8]) -> bool {
 pub fn parse_cargo_messages(
     stdout: &[u8],
     stderr: &[u8],
+    status: Option<i32>,
     input_generation: u64,
     duration_ms: u64,
 ) -> ProblemSnapshot {
     parse_cargo_messages_with_denies(
         stdout,
         stderr,
+        status,
         input_generation,
         duration_ms,
         Path::new(""),
@@ -607,6 +623,7 @@ pub fn parse_cargo_messages(
 fn parse_cargo_messages_with_denies(
     stdout: &[u8],
     stderr: &[u8],
+    status: Option<i32>,
     input_generation: u64,
     duration_ms: u64,
     worktree: &Path,
@@ -660,7 +677,8 @@ fn parse_cargo_messages_with_denies(
             crate::LANGUAGE,
             UnavailableReason::Fatal,
             input_generation,
-            first_error_line(stderr),
+            duration_ms,
+            run_failure_cause(stderr, status),
         );
     };
     let base = ProblemSnapshot::from_problems(
@@ -672,12 +690,13 @@ fn parse_cargo_messages_with_denies(
     );
     if !success && base.errors == 0 {
         let detail = first_error_message
-            .map(|message| truncate_bytes(&message, 160))
-            .or_else(|| first_error_line(stderr));
+            .map(|message| truncate_bytes(&message, agent_ide_core::checks::MAX_CAUSE_BYTES))
+            .or_else(|| run_failure_cause(stderr, status));
         return ProblemSnapshot::unavailable_with_detail(
             crate::LANGUAGE,
             UnavailableReason::Fatal,
             input_generation,
+            duration_ms,
             detail,
         );
     }
@@ -692,36 +711,6 @@ fn parse_cargo_messages_with_denies(
         CheckState::Ready
     };
     ProblemSnapshot { state, ..base }
-}
-
-/// Extracts the first `error:`-prefixed line of cargo stderr, trimmed to at most 160 bytes.
-///
-/// Fallback source of [`ProblemSnapshot::detail`] for an [`UnavailableReason::Fatal`] snapshot
-/// produced by a failed build with no error-level `compiler-message` at all (so
-/// [`parse_cargo_messages`] has no rustc-authored text to prefer): cargo's own summary line (for
-/// example `error: failed to run custom build command for \`blake3 v1.5.0\``) is the most
-/// actionable cause available without running an unbounded, untrusted stderr stream through the
-/// feed. Returns `None` when no line starts with `error:` after trimming, so a build failure with
-/// no such line simply carries no detail.
-fn first_error_line(stderr: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(stderr);
-    let line = text
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with("error:"))?;
-    Some(truncate_bytes(line, 160))
-}
-
-/// Truncates `value` to at most `max_bytes` UTF-8 bytes, cutting only on a whole character.
-fn truncate_bytes(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_owned();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value[..end].to_owned()
 }
 
 /// Converts one rustc diagnostic to a [`Problem`], or `None` when it must not be counted.
