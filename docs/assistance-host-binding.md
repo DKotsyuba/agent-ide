@@ -95,7 +95,7 @@ evidence on which a root-less start re-roots back by itself. No start re-roots w
 replacement awaits its re-activation: the replacement's fresh channel has seen no hook yet, which
 explains the refusal as well as a move would. A root below no allowed root is never
 re-rooted to; the daemon's own `outside_allowed_roots` error answers. A re-root that cannot attach
-answers `unavailable: host_binding (project_moved: bound to <path>, asked <path>)`.
+answers `unavailable: host_binding (project_moved: bound to <path>, asked <path>); the IDE could not move to the requested root. Call ide.start under the session's current root, or continue with native tools`.
 
 A root-less `ide.start` refused specifically for `missing_pre` does not re-root because only that
 call's hook is missing. If this channel activated earlier, its reply includes
@@ -108,7 +108,7 @@ positive non-Codex evidence: a `ZCODE_*` startup variable (verified on a live ZC
 which carries no `CLAUDE_PROJECT_DIR` and no `CODEX_*`). The candidate is then the canonicalized
 process directory (outside `allowed_roots` for an app-managed workspace), hooks ride the Claude
 rendezvous of the re-rooted project, and a call whose `_meta` names no supported host contract
-answers `unavailable: host_binding (host_unrecognized)` — such a host must forward Claude Code's
+answers `unavailable: host_binding (host_unrecognized); this host did not identify the call in a supported format. Continue with native tools` — such a host must forward Claude Code's
 per-call `_meta` (`claudecode/toolUseId`) for invocations to correlate. Everything else keeps the
 previous Codex default: Codex startup markers (`CODEX_THREAD_ID`/`CODEX_TURN_ID`/`CODEX_SESSION_ID`)
 select Codex, and so does no evidence at all, because live Codex children — including agent-run's
@@ -309,7 +309,7 @@ Closed daemon outcomes are:
 
 | Outcome | Meaning |
 | --- | --- |
-| `{"state":"unavailable","reason":"host_binding"}` | No validated exact invocation. The compact text names one closed cause in parentheses (T15B): `(outside_allowed_roots)` when the attachment's bound project resolves below no allowed root and its channel never delivered a hook, `(hooks_not_delivered)` when a channel that never delivered a hook lacks this observation, `(missing_pre)`, `(replay)`, `(mismatch)`, `(inactive_binding)`, `(capacity_exceeded)`, `(host_unrecognized)` when the caller's `_meta` names no supported host contract, or `(project_moved: bound to <path>, asked <path>)` when a managed re-root failed; the same tag is the journal `detail`. The structured reply keeps its historical fields. |
+| `{"state":"unavailable","reason":"host_binding"}` | No validated exact invocation. The compact text names one closed cause in parentheses (T15B): `(invalid_metadata)`, `(missing_field)`, `(invalid_field)`, `(invalid_attachment)`, `(unsupported_hook_phase)`, `(missing_invocation)`, `(outside_allowed_roots)`, `(hooks_not_delivered)`, `(missing_pre)`, `(replay)`, `(mismatch)`, `(inactive_binding)`, `(capacity_exceeded)`, `(host_unrecognized)`, or `(project_moved: bound to <path>, asked <path>)`; the refusal follows with the cause and next step. The same tag is the journal `detail`. The structured reply keeps its historical fields. |
 | `{"state":"unavailable","reason":"workspace_activation"}` | Host invocation and current binding are proven; Workspace activation is not connected. |
 | `{"state":"hook_observed"}` | One pre-hook was retained; no authority or delivery claim. |
 | `{"state":"hook_settled"}` | One exact post-hook settled a validated invocation. |

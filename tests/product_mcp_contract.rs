@@ -738,7 +738,7 @@ async fn binary_routes_methods_to_typed_missing_peer_and_survives_daemon_loss() 
     // No supported host metadata can never correlate: the closed cause names it (T15B follow-up).
     assert_eq!(
         no_metadata["result"]["content"][0]["text"],
-        "unavailable: host_binding (host_unrecognized); continue with native tools"
+        "unavailable: host_binding (host_unrecognized); this host did not identify the call in a supported format. Continue with native tools"
     );
     for (index, (name, arguments)) in [
         ("ide.start", json!({"activation_id":"activate"})),
@@ -765,7 +765,7 @@ async fn binary_routes_methods_to_typed_missing_peer_and_survives_daemon_loss() 
         assert_eq!(response["result"]["content"].as_array().unwrap().len(), 1);
         assert_eq!(
             response["result"]["content"][0]["text"],
-            "unavailable: host_binding (hooks_not_delivered); continue with native tools"
+            "unavailable: host_binding (hooks_not_delivered); the daemon has received no host event for this session. Call ide.start with the same root, or continue with native tools"
         );
         assert_eq!(
             response["result"]["structuredContent"],
@@ -4169,7 +4169,7 @@ async fn managed_claude_moved_session_reroots_into_an_allowed_root() {
         .await;
     assert_eq!(
         assert_claude_envelope(&refused),
-        "unavailable: host_binding (outside_allowed_roots); continue with native tools",
+        "unavailable: host_binding (outside_allowed_roots); the session project is outside the directories the IDE may open. Call ide.start with an allowed root, or continue with native tools",
         "{refused}"
     );
 
@@ -4200,7 +4200,7 @@ async fn managed_claude_moved_session_reroots_into_an_allowed_root() {
     let rerooted_text = assert_claude_envelope(&rerooted);
     assert!(
         rerooted_text.starts_with(
-            "unavailable: host_binding (hooks_not_delivered); continue with native tools"
+            "unavailable: host_binding (hooks_not_delivered); the daemon has received no host event for this session. Call ide.start with the same root, or continue with native tools"
         ),
         "{rerooted_text}"
     );
@@ -4389,7 +4389,7 @@ async fn managed_claude_rootless_start_returns_a_stranded_session_home() {
     let stranded_text = assert_claude_envelope(&stranded);
     assert!(
         stranded_text.starts_with(
-            "unavailable: host_binding (hooks_not_delivered); continue with native tools"
+            "unavailable: host_binding (hooks_not_delivered); the daemon has received no host event for this session. Call ide.start with the same root, or continue with native tools"
         ),
         "{stranded_text}"
     );
@@ -4835,7 +4835,8 @@ async fn claude_context_pages_survive_native_posts_but_not_real_edits() {
     assert!(
         refused_text.contains("error: source_unavailable")
             && refused_text.contains("inspect:source_changed")
-            && refused_text.contains("call ide.context again for fresh bytes"),
+            && refused_text.contains("\"claude-pages.py\" changed since this result was captured")
+            && refused_text.contains("Call ide.context with this path again for fresh bytes"),
         "{refused_text}"
     );
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
@@ -5191,7 +5192,7 @@ async fn managed_auto_zcode_host_reroots_like_claude() {
         .await;
     assert_eq!(
         unrecognized["result"]["content"][0]["text"],
-        "unavailable: host_binding (host_unrecognized); continue with native tools",
+        "unavailable: host_binding (host_unrecognized); this host did not identify the call in a supported format. Continue with native tools",
         "{unrecognized}"
     );
     assert_eq!(
@@ -5223,7 +5224,7 @@ async fn managed_auto_zcode_host_reroots_like_claude() {
     let rerooted_text = assert_claude_envelope(&rerooted);
     assert!(
         rerooted_text.starts_with(
-            "unavailable: host_binding (hooks_not_delivered); continue with native tools; retry: session re-rooted"
+            "unavailable: host_binding (hooks_not_delivered); the daemon has received no host event for this session. Call ide.start with the same root, or continue with native tools; retry: session re-rooted"
         ),
         "{rerooted_text}"
     );

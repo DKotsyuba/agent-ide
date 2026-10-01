@@ -133,9 +133,9 @@ same check, and a host upgrade or a changed sandbox mode changes nothing. The da
   dependencies) are admitted with `admit_path`: a path that does not exist yet is judged by its
   deepest existing ancestor plus the remaining components; relative paths and `.`/`..` segments
   are refused.
-- Any failure, and an empty `allowed_roots`, answers `error: outside_allowed_roots` with the hint
-  to start the IDE in an allowed directory or extend the list. The error log records the same
-  `outside_allowed_roots` reason.
+- Any failure, and an empty `allowed_roots`, answers `error: outside_allowed_roots` with a stage
+  tag and a hint to start in an allowed directory or extend the list. The error log records the
+  same `outside_allowed_roots` reason.
 
 What the list does not do: it does not confine the language servers' or Git's own reads, and it
 does not stop a child from writing where the daemon's user may write. That is deliberate — the
@@ -209,11 +209,10 @@ runs are debounced by `debounce_ms`, at most one runs at a time, and at most two
 across the daemon.
 
 Results: one bounded snapshot per `(worktree, language)` carries state, error/warning counts, and
-a bounded problem list. The compact `<agent-ide>` block (at most 256 bytes, counts and fixed state
-text only, never paths or messages) is emitted to the owning Claude actor only when its items
-change; unavailable states render fixed text (`checks disabled`, `outside allowed roots`,
-`tool not found`, `environment not found`, `no files analyzed`, `check failed`,
-`check timed out`, `unavailable: read_restricted`), and a running check renders
+a bounded problem list. The compact `<agent-ide>` block (at most 256 bytes) is emitted to the
+owning Claude actor only when its items change; unavailable states use fixed phrases, and failed
+checks add a bounded reason when the checker reported one (or say no reason was reported), e.g.
+`check failed (cannot start compiler)`. A running check renders
 `checking (first check)` or `checking (files changed; last result: N errors, M warnings)`.
 `ide.context` with
 `{"kind":"problems","language"?,"offset"?}` returns counts and up to 20 problems per call with

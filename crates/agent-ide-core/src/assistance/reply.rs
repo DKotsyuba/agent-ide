@@ -39,12 +39,24 @@ pub enum HostBindingCause {
     OutsideAllowedRoots,
     /// This daemon received no successful hook for the calling channel since it started.
     HooksNotDelivered,
+    /// The host metadata was not a valid bounded JSON object.
+    InvalidMetadata,
+    /// A required host metadata field was absent.
+    MissingField,
+    /// A supported host metadata field was empty, not a string, or too long.
+    InvalidField,
+    /// The private host attachment did not identify a valid channel session.
+    InvalidAttachment,
+    /// The host hook used a lifecycle phase the IDE does not support.
+    UnsupportedHookPhase,
     /// No exact pre-hook observation existed for this invocation.
     MissingPre,
     /// The exact call identity was already observed, validated, or permanently rejected.
     Replay,
     /// A hook could not be linked exactly to one registered MCP candidate.
     Mismatch,
+    /// A post-hook arrived before the matching tool invocation completed validation.
+    MissingInvocation,
     /// No active matching actor/channel-session binding existed for an ordinary call.
     InactiveBinding,
     /// Bounded pending, binding, or replay storage is full for this scope.
@@ -64,12 +76,19 @@ impl HostBindingCause {
     /// Maps the guard's own closed refusal reasons that a model-facing reply can carry.
     pub(crate) fn from_binding(reason: super::host_binding::BindingUnavailable) -> Option<Self> {
         Some(match reason {
+            super::host_binding::BindingUnavailable::InvalidMetadata => Self::InvalidMetadata,
+            super::host_binding::BindingUnavailable::MissingField(_) => Self::MissingField,
+            super::host_binding::BindingUnavailable::InvalidField(_) => Self::InvalidField,
+            super::host_binding::BindingUnavailable::InvalidAttachment => Self::InvalidAttachment,
+            super::host_binding::BindingUnavailable::UnsupportedHookPhase => {
+                Self::UnsupportedHookPhase
+            }
             super::host_binding::BindingUnavailable::MissingPre => Self::MissingPre,
             super::host_binding::BindingUnavailable::Replay => Self::Replay,
             super::host_binding::BindingUnavailable::Mismatch => Self::Mismatch,
+            super::host_binding::BindingUnavailable::MissingInvocation => Self::MissingInvocation,
             super::host_binding::BindingUnavailable::InactiveBinding => Self::InactiveBinding,
             super::host_binding::BindingUnavailable::CapacityExceeded => Self::CapacityExceeded,
-            _ => return None,
         })
     }
 
@@ -86,9 +105,15 @@ impl HostBindingCause {
         match self {
             Self::OutsideAllowedRoots => "outside_allowed_roots".to_owned(),
             Self::HooksNotDelivered => "hooks_not_delivered".to_owned(),
+            Self::InvalidMetadata => "invalid_metadata".to_owned(),
+            Self::MissingField => "missing_field".to_owned(),
+            Self::InvalidField => "invalid_field".to_owned(),
+            Self::InvalidAttachment => "invalid_attachment".to_owned(),
+            Self::UnsupportedHookPhase => "unsupported_hook_phase".to_owned(),
             Self::MissingPre => "missing_pre".to_owned(),
             Self::Replay => "replay".to_owned(),
             Self::Mismatch => "mismatch".to_owned(),
+            Self::MissingInvocation => "missing_invocation".to_owned(),
             Self::InactiveBinding => "inactive_binding".to_owned(),
             Self::CapacityExceeded => "capacity_exceeded".to_owned(),
             Self::HostUnrecognized => "host_unrecognized".to_owned(),
@@ -634,9 +659,15 @@ fn host_binding_causes_round_trip_and_bare_replies_stay_bare() {
     for cause in [
         HostBindingCause::OutsideAllowedRoots,
         HostBindingCause::HooksNotDelivered,
+        HostBindingCause::InvalidMetadata,
+        HostBindingCause::MissingField,
+        HostBindingCause::InvalidField,
+        HostBindingCause::InvalidAttachment,
+        HostBindingCause::UnsupportedHookPhase,
         HostBindingCause::MissingPre,
         HostBindingCause::Replay,
         HostBindingCause::Mismatch,
+        HostBindingCause::MissingInvocation,
         HostBindingCause::InactiveBinding,
         HostBindingCause::CapacityExceeded,
         HostBindingCause::HostUnrecognized,
@@ -684,28 +715,27 @@ fn host_binding_causes_round_trip_and_bare_replies_stay_bare() {
 fn host_binding_causes_map_the_guard_refusals() {
     use super::host_binding::BindingUnavailable;
     for (reason, expected) in [
+        (BindingUnavailable::InvalidMetadata, "invalid_metadata"),
+        (BindingUnavailable::MissingField("field"), "missing_field"),
+        (BindingUnavailable::InvalidField("field"), "invalid_field"),
+        (BindingUnavailable::InvalidAttachment, "invalid_attachment"),
+        (
+            BindingUnavailable::UnsupportedHookPhase,
+            "unsupported_hook_phase",
+        ),
         (BindingUnavailable::MissingPre, "missing_pre"),
         (BindingUnavailable::Replay, "replay"),
         (BindingUnavailable::Mismatch, "mismatch"),
+        (BindingUnavailable::MissingInvocation, "missing_invocation"),
         (BindingUnavailable::InactiveBinding, "inactive_binding"),
         (BindingUnavailable::CapacityExceeded, "capacity_exceeded"),
     ] {
         assert_eq!(
             HostBindingCause::from_binding(reason)
-                .expect("reachable refusal maps")
+                .expect("every guard refusal maps")
                 .cause_tag(),
             expected
         );
-    }
-    for reason in [
-        BindingUnavailable::InvalidMetadata,
-        BindingUnavailable::MissingField("field"),
-        BindingUnavailable::InvalidField("field"),
-        BindingUnavailable::InvalidAttachment,
-        BindingUnavailable::UnsupportedHookPhase,
-        BindingUnavailable::MissingInvocation,
-    ] {
-        assert!(HostBindingCause::from_binding(reason).is_none());
     }
 }
 

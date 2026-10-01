@@ -278,6 +278,7 @@ template, `session_id=436c54dc-e1b7-42c2-9166-b158fee96114`, `duration_ms=35227`
 START: ERROR: conflict; continue with native tools
 PROBLEMS: error: workspace_authority; continue with native tools
 ```
+Historical transcript: this 0.3 capture predates the current stage-tagged conflict wording and is preserved verbatim.
 `error: conflict` is `FailureCode::Conflict`'s exact rendered text
 (`src/assistance/content.rs:105`), and the daemon's own doc comment names the cause precisely:
 `activate_claude` "Returns `FailureCode::Conflict` when another actor already owns this

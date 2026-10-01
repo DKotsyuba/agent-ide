@@ -247,6 +247,11 @@ fn feedback_deduplicates_rechecks_and_suppresses_after_stop() {
         Some("detail-1".into()),
     )
     .unwrap();
+    assert_eq!(
+        delta.render(),
+        "Fact: one new fact\nNext: inspect detail\nFreshness: current\nDetail: detail-1"
+    );
+    assert!(!delta.render().contains("Evidence:"));
     let mut feedback = FeedbackLedger::default();
     assert_eq!(
         feedback.record("authority-1", "source-1", &delta),

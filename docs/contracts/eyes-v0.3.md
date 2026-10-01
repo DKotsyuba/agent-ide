@@ -403,9 +403,10 @@ rust: 3 errors (+2), 5 warnings | python: environment not found
     after the session's last result; the last counts stay visible (`checking (files changed)` when
     the last result carried no counts).
   - `Unavailable` renders fixed text: `outside allowed roots`, `tool not found`, `environment not
-    found`, `no files analyzed` (T12B), `check timed out`, and `check failed` — the last with the
-    first 80 UTF-8 bytes of the snapshot detail in parentheses, `check failed (<detail>)`, control
-    characters replaced by spaces and `<`/`>` by `?` so the detail cannot forge the framing.
+    found`, `no files analyzed` (T12B), `check timed out`, and `check failed` — the last with a
+    bounded sanitized detail in parentheses when present, or `check failed (checker supplied no
+    reason)` when absent. Control characters become spaces and `<`/`>` become `?` so the detail
+    cannot forge the framing.
   - (T10B) A language absent from the worktree (`Unavailable(Disabled)`, §4) is never mentioned; a
     pure-Python worktree renders `<agent-ide>\npython: 2 errors, 0 warnings\n</agent-ide>` with no
     `rust:` item. When no configured language is present, no block is emitted.
@@ -472,12 +473,12 @@ Parameters: `{"kind": "problems", "language": "rust" | "python" | "typescript" (
 `path` is not required for this kind; any other `kind` value or absent `kind` keeps v0.2 behaviour.
 Reply: per language the state, counts, and up to 20 problems from `offset`, each
 `path:line:column severity [code] message`, plus `next_offset` when more exist. Messages are
-untrusted text. An `unavailable:<reason>` state line carrying a [`ProblemSnapshot::detail`] (T05B)
-appends it in parentheses, for example `rust: unavailable:fatal (error: failed to run custom
-build command for \`blake3 v1.5.0\`)` or (T12B) `python: unavailable:no_files (pyright analyzed 0
-files; check "include"/"exclude" in pyrightconfig.json or [tool.pyright])`; a snapshot with no
-detail renders exactly as before. The `<agent-ide>` block (§6) carries only the first 80 bytes of a
-failed check's detail. Process states use the block's vocabulary (T18B): a check running after the
+untrusted text. An unavailable state line carrying a [`ProblemSnapshot::detail`] (T05B) appends it
+in parentheses using the same plain phrase as the status plate, for example `rust: check failed
+(error: failed to run custom build command for \`blake3 v1.5.0\`)` or (T12B) `python: no files
+analyzed (pyright analyzed 0 files; check "include"/"exclude" in pyrightconfig.json or
+[tool.pyright])`; a fatal snapshot without detail says `check failed (checker supplied no reason)`.
+The `<agent-ide>` block (§6) carries a bounded prefix of a failed check's detail. Process states use the block's vocabulary (T18B): a check running after the
 session's last result renders `<lang>: checking (files changed); last result: errors: N; warnings:
 M`, and a stored result predating this session's activation renders `<lang>: checking (first check
 in this session); previous session result: errors: N; warnings: M`; a language with no result yet

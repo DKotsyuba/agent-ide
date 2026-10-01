@@ -248,6 +248,16 @@ async fn real_gopls_production_context_tracks_exact_observed_bytes() {
             let query = ContextQuery::Symbol {
                 byte_offset: initial.rfind("Value").unwrap(),
             };
+            let path_only = session
+                .context(&first, initial.as_bytes(), ContextQuery::File)
+                .await?;
+            let ContextMode::Lexical { reason } = path_only.mode else {
+                panic!("path-only context should explain its lexical result");
+            };
+            assert_eq!(
+                reason,
+                "path context returns file text only; use ide.symbol or ide.read with a symbol for definitions and references"
+            );
             let before = session.context(&first, initial.as_bytes(), query).await?;
             assert_eq!(before.mode, ContextMode::Semantic, "{before:?}");
             assert_eq!(before.document_version, Some(1));

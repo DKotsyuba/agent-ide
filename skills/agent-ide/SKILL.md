@@ -80,8 +80,9 @@ which the reply says `unknown` and `ide.context` shows the result when it lands.
 - `ide.edit {"operation_id":"…","path":"src/x.rs","lines":"120-180","source_ref":"…","content":"…"}` —
   replaces a line range when the target is not a symbol (imports, constants, configuration).
   `source_ref` is required: the `ide.read` the lines came from. The edit is refused
-  `stale_source` (no write) when that read no longer matches the file — re-read the lines
-  (ide.read) and retry with the new `source_ref`. The symbol forms take `source_ref` too
+  `stale_source` (no write) when the file changed or the reference did not cover a complete read.
+  Retry with the newest `source_ref` in the reply; if none is given, re-read with `ide.read` and
+  inspect every page before retrying. The symbol forms take `source_ref` too
   (optional; validated when given).
   After `ide.edit`, base the next edit of that file on the `source_ref` in the edit reply.
 - `ide.edit {"operation_id":"…","path":"src/new.rs","content":"…"}` — creates a file that does
@@ -127,7 +128,8 @@ server while it loads and answer `provider_unavailable` when it failed. `ide.sym
    the bounded reference `ide.edit` needs. `ide.context {path}` with no `byte_offset` still works
    and still mints a usable `source_ref` (its first line is now a hint toward `ide.outline`/
    `ide.read`); `ide.context {path, byte_offset}` still answers definitions/references at that
-   exact position when needed.
+   exact position when needed. Path-only context is the file text; use `ide.symbol` or
+   `ide.read {symbol}` when definitions or references are needed.
 3. Prefer `ide.edit` for a supported bounded full-content edit when it is offered
    and its Context contract is satisfied. Native host editing — the model's own
    file-edit tool (Claude's editor, Codex `apply_patch`, etc.) — remains available
@@ -166,7 +168,8 @@ server while it loads and answer `provider_unavailable` when it failed. `ide.sym
    text. Every page starts with `page N; bytes A-B of TOTAL`; the last one says
    `(last)` and `complete`. A whole source up to 1 MiB is delivered this way;
    do not `ide.edit` from a `Context` until its last page arrived — the edit is
-   refused as `stale_source` otherwise. Calling `ide.inspect` again after the
+   refused as `stale_source` otherwise; use the newest `source_ref` when supplied, or re-read all
+   pages before retrying. Calling `ide.inspect` again after the
    last page just repeats the last page.
    If inspect reports `source_changed`, finish reading every page before any write, then call
    `ide.context` again. Diff provenance's `current_tree` line says what the capture established

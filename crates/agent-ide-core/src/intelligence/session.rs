@@ -822,7 +822,8 @@ impl Session {
     }
 
     /// Synchronizes exact observation bytes, then requests advertised definition/reference methods.
-    /// Unsupported or failed semantic operations return explicitly lexical context over the same bytes.
+    /// Path-only queries return file text; use `ide.symbol` or `ide.read {symbol}` for semantic operations.
+    /// Unsupported or failed semantic operations return lexical context over the same bytes.
     /// Invalid source, wrong worktree/epoch, old sequence, and invalid query coordinates are rejected.
     pub async fn context(
         &mut self,
@@ -871,6 +872,9 @@ impl Session {
             return Ok(result);
         }
         let ContextQuery::Symbol { byte_offset } = query else {
+            result.mode = ContextMode::Lexical {
+                reason: "path context returns file text only; use ide.symbol or ide.read with a symbol for definitions and references".into(),
+            };
             return Ok(result);
         };
         if result.symbol.is_none() {
@@ -1062,6 +1066,40 @@ impl Session {
             .unwrap_or_default())
     }
 
+    /// Prepares call-hierarchy items at a byte offset. An empty vector means the server found no callable; an error means preparing the request failed.
+    pub async fn prepare_call_hierarchy(
+        &mut self,
+        observation: &SourceObservation,
+        bytes: &[u8],
+        byte_offset: usize,
+    ) -> io::Result<Vec<lsp::CallHierarchyItem>> {
+        let params = self
+            .position_params(observation, bytes, byte_offset)
+            .await?;
+        Ok(self
+            .request::<request::CallHierarchyPrepare>(lsp::CallHierarchyPrepareParams {
+                text_document_position_params: params,
+                work_done_progress_params: Default::default(),
+            })
+            .await?
+            .unwrap_or_default())
+    }
+
+    /// Returns callers of one prepared callable; an empty vector means it has no incoming calls.
+    pub async fn incoming_calls_for(
+        &mut self,
+        item: lsp::CallHierarchyItem,
+    ) -> io::Result<Vec<lsp::CallHierarchyIncomingCall>> {
+        Ok(self
+            .request::<request::CallHierarchyIncomingCalls>(lsp::CallHierarchyIncomingCallsParams {
+                item,
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await?
+            .unwrap_or_default())
+    }
+
     /// Incoming calls of the callable at a byte offset (who calls it), one level.
     pub async fn incoming_calls(
         &mut self,
@@ -1069,31 +1107,15 @@ impl Session {
         bytes: &[u8],
         byte_offset: usize,
     ) -> io::Result<Vec<lsp::CallHierarchyIncomingCall>> {
-        let params = self
-            .position_params(observation, bytes, byte_offset)
-            .await?;
-        let items = self
-            .request::<request::CallHierarchyPrepare>(lsp::CallHierarchyPrepareParams {
-                text_document_position_params: params,
-                work_done_progress_params: Default::default(),
-            })
+        let Some(item) = self
+            .prepare_call_hierarchy(observation, bytes, byte_offset)
             .await?
-            .unwrap_or_default();
-        let mut calls = Vec::new();
-        for item in items.into_iter().take(1) {
-            calls.extend(
-                self.request::<request::CallHierarchyIncomingCalls>(
-                    lsp::CallHierarchyIncomingCallsParams {
-                        item,
-                        work_done_progress_params: Default::default(),
-                        partial_result_params: Default::default(),
-                    },
-                )
-                .await?
-                .unwrap_or_default(),
-            );
-        }
-        Ok(calls)
+            .into_iter()
+            .next()
+        else {
+            return Ok(Vec::new());
+        };
+        self.incoming_calls_for(item).await
     }
 
     /// Outgoing calls of the callable at a byte offset (what it calls), one level.

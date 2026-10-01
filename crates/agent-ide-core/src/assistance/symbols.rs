@@ -422,15 +422,31 @@ impl Worker<'_> {
                         server.name()
                     ));
                 } else {
-                    // A failed incoming-call request is stated, never silently omitted; an
-                    // answered empty list stays absent exactly as before.
-                    match self
-                        .live_session_for(job, &observed)
-                        .await?
-                        .session
-                        .incoming_calls(&observed, &bytes, byte_offset)
-                        .await
-                    {
+                    let calls = match self.live_session_for(job, &observed).await {
+                        Ok(live) => match live
+                            .session
+                            .prepare_call_hierarchy(&observed, &bytes, byte_offset)
+                            .await
+                        {
+                            Err(_) => Err("prepare call hierarchy request failed"),
+                            Ok(items) => match items.into_iter().next() {
+                                Some(item) => live
+                                    .session
+                                    .incoming_calls_for(item)
+                                    .await
+                                    .map_err(|_| "incoming calls request failed"),
+                                None => Ok(Vec::new()),
+                            },
+                        },
+                        Err(FailureCode::ProviderLoading) => Err(
+                            "callers are not available yet because the language server is still indexing; repeat ide.symbol later",
+                        ),
+                        Err(FailureCode::ProviderUnavailable) => {
+                            Err("the language server could not load the workspace")
+                        }
+                        Err(other) => return Err(other),
+                    };
+                    match calls {
                         Ok(calls) => {
                             for call in calls {
                                 card.callers.push(Call {
@@ -442,9 +458,8 @@ impl Worker<'_> {
                                 });
                             }
                         }
-                        Err(_) => {
-                            card.callers_note =
-                                Some("unavailable (call hierarchy request failed)".to_owned());
+                        Err(reason) => {
+                            card.callers_note = Some(format!("unavailable ({reason})"));
                         }
                     }
                 }
@@ -1761,6 +1776,10 @@ impl Worker<'_> {
         let candidate = match (&op[..], &splice) {
             ("delete", Splice::Replace(range)) => {
                 if range.start > total {
+                    job.failure_detail = Some(format!(
+                        "edit:range_past_end: line {} is past the end of {path} ({total} lines)",
+                        range.start
+                    ));
                     return Err(FailureCode::UnknownSymbol);
                 }
                 splice_lines(&source, *range, "")
@@ -1772,7 +1791,11 @@ impl Worker<'_> {
             (_, Splice::Replace(range)) => {
                 let content = content.ok_or(FailureCode::Internal)?;
                 if range.start > total {
-                    return Err(FailureCode::SourceUnavailable);
+                    job.failure_detail = Some(format!(
+                        "edit:range_past_end: line {} is past the end of {path} ({total} lines)",
+                        range.start
+                    ));
+                    return Err(FailureCode::UnknownSymbol);
                 }
                 splice_lines(&source, *range, &content)
             }
@@ -2008,13 +2031,19 @@ impl Worker<'_> {
                 .session
                 .rename(&observed, &bytes, byte_offset, &new_name)
                 .await
-                .map_err(|_| FailureCode::ProviderUnavailable)?
-                .ok_or(FailureCode::ProviderUnavailable)?;
+                .map_err(|_| {
+                    job.failure_detail = Some(format!("edit:rename_request_failed:{}", found.name));
+                    FailureCode::ProviderUnavailable
+                })?
+                .ok_or_else(|| {
+                    job.failure_detail = Some(format!("edit:rename_no_edits:{}", found.name));
+                    FailureCode::ProviderUnavailable
+                })?;
             (edit, encoding)
         };
         let grouped = lang::edits::group_workspace_edit(edit);
         if !grouped.unsupported.is_empty() {
-            job.failure_detail = Some(grouped.unsupported.join(", "));
+            job.failure_detail = Some(format!("edit:rename_unsupported_edits:{}", found.name));
             return Err(FailureCode::ProviderUnavailable);
         }
         let mut summary: Vec<(String, usize)> = Vec::new();
