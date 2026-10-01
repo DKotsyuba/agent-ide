@@ -191,12 +191,14 @@ pub(crate) fn syntax_verdict(source: &str) -> SyntaxVerdict {
     run_bounded(PARSE_STACK, PARSE_TIMEOUT, move || {
         let tokens: TokenStream = match source.parse() {
             Ok(tokens) => tokens,
-            // The lex error's own span is 1-based over the parsed string (span-locations).
+            // The lex error's own span is 1-based over the parsed string (span-locations); its
+            // Display is the generic "cannot parse string into token stream", so a delimiter
+            // imbalance — the usual edit mistake — is named in plain terms instead.
             Err(error) => {
                 let start = error.span().start();
                 return Some(SyntaxVerdict::Failed {
                     line: start.line as u32,
-                    message: error.to_string(),
+                    message: unbalanced_delimiters(&source).unwrap_or_else(|| error.to_string()),
                 });
             }
         };
@@ -215,6 +217,140 @@ pub(crate) fn syntax_verdict(source: &str) -> SyntaxVerdict {
         })
     })
     .unwrap_or(SyntaxVerdict::Unchecked)
+}
+
+/// The first delimiter imbalance of `source` as a plain sentence the reply can quote: an opener
+/// never closed (with the line it was opened on), a closer matching nothing, or a closer that
+/// does not match the opener it met — `unbalanced delimiters: '{' opened at line 868 is never
+/// closed`. One linear scan skipping strings, char literals, lifetimes, raw strings and
+/// comments; `None` when the scan finds no imbalance, so the lexer's own text is kept.
+fn unbalanced_delimiters(source: &str) -> Option<String> {
+    /// The pairs a closer must match, indexed by its own character.
+    const OPENERS: [(char, char); 3] = [(')', '('), (']', '['), ('}', '{')];
+    let mut line: u32 = 1;
+    let mut opened: Vec<(char, u32)> = Vec::new();
+    let mut chars = source.chars().peekable();
+    // Consumes the rest of a `//` line comment, counting the newline it ends with.
+    let newline = |chars: &mut std::iter::Peekable<std::str::Chars>, line: &mut u32| {
+        for character in chars.by_ref() {
+            if character == '\n' {
+                *line += 1;
+                break;
+            }
+        }
+    };
+    while let Some(character) = chars.next() {
+        match character {
+            '\n' => line += 1,
+            '/' if chars.peek() == Some(&'/') => newline(&mut chars, &mut line),
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut depth = 1;
+                while let Some(character) = chars.next() {
+                    match character {
+                        '\n' => line += 1,
+                        '*' if chars.peek() == Some(&'/') => {
+                            chars.next();
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        '/' if chars.peek() == Some(&'*') => {
+                            chars.next();
+                            depth += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            '"' => {
+                while let Some(character) = chars.next() {
+                    match character {
+                        '\\' => {
+                            chars.next();
+                        }
+                        '"' => break,
+                        '\n' => line += 1,
+                        _ => {}
+                    }
+                }
+            }
+            'r' if matches!(chars.peek(), Some('#' | '"')) => {
+                let mut hashes = 0;
+                while chars.peek() == Some(&'#') {
+                    chars.next();
+                    hashes += 1;
+                }
+                if chars.next() == Some('"') {
+                    'raw: while let Some(character) = chars.next() {
+                        if character == '\n' {
+                            line += 1;
+                        } else if character == '"' {
+                            let mut matched = 0;
+                            while matched < hashes && chars.peek() == Some(&'#') {
+                                chars.next();
+                                matched += 1;
+                            }
+                            if matched == hashes {
+                                break 'raw;
+                            }
+                        }
+                    }
+                }
+            }
+            // A char literal (`'x'`, `'\n'`, `'\''`) closes within two characters of the quote;
+            // anything longer is a lifetime, which opens nothing.
+            '\'' => {
+                if chars.peek() == Some(&'\\') {
+                    chars.next();
+                    chars.next();
+                    if chars.peek() == Some(&'\'') {
+                        chars.next();
+                    }
+                } else {
+                    let mut look = chars.clone();
+                    if look.next().is_some_and(|character| character != '\'')
+                        && look.peek() == Some(&'\'')
+                    {
+                        chars.next();
+                        chars.next();
+                    } else {
+                        for character in chars.by_ref() {
+                            if !character.is_alphanumeric() && character != '_' {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            '(' | '[' | '{' => opened.push((character, line)),
+            closer @ (')' | ']' | '}') => match opened.pop() {
+                None => {
+                    return Some(format!(
+                        "unbalanced delimiters: '{closer}' closes nothing on line {line}"
+                    ));
+                }
+                Some((opener, opened_at)) => {
+                    let expected = OPENERS
+                        .iter()
+                        .find(|(close, _)| *close == closer)
+                        .map(|(_, open)| *open);
+                    if expected != Some(opener) {
+                        return Some(format!(
+                            "unbalanced delimiters: '{closer}' on line {line} does not match \
+                             '{opener}' opened at line {opened_at}"
+                        ));
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+    let (opener, opened_at) = *opened.first()?;
+    Some(format!(
+        "unbalanced delimiters: '{opener}' opened at line {opened_at} is never closed"
+    ))
 }
 
 /// The answer `outlines` keeps for `file` with the text `source`, or — when it keeps none —
@@ -1798,6 +1934,59 @@ mod syntax_tests {
         assert_ne!(
             syntax_verdict("// region: fold\nfn a() {}\n"),
             SyntaxVerdict::Clean
+        );
+    }
+
+    /// The lexer's generic `cannot parse string into token stream` becomes a plain sentence an
+    /// edit refusal can quote: the delimiter that is never closed is named with the line it was
+    /// opened on, a stray closer and a mismatched closer name their own lines. The verdict's own
+    /// line stays the lexer span's (where parsing gave up), not the opener's.
+    #[test]
+    fn unbalanced_delimiters_name_the_opener_and_its_line() {
+        let unclosed = "pub fn target( -> i32 {";
+        assert_eq!(
+            syntax_verdict(unclosed),
+            SyntaxVerdict::Failed {
+                line: 1,
+                message: "unbalanced delimiters: '(' opened at line 1 is never closed".to_owned(),
+            }
+        );
+        let unclosed_brace = "pub fn a() {\n    1\npub fn b() {\n    2\n}\n";
+        match syntax_verdict(unclosed_brace) {
+            SyntaxVerdict::Failed { line, message } => {
+                assert_eq!(
+                    message,
+                    "unbalanced delimiters: '{' opened at line 1 is never closed"
+                );
+                assert!(line >= 1, "the span's line, {line}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert_eq!(
+            unbalanced_delimiters("fn a() {\n    let s = \"}\";\n    let c = '}';\n    1\n}\n"),
+            None,
+            "delimiters inside strings and char literals are not counted"
+        );
+        assert_eq!(
+            unbalanced_delimiters("fn a() { // {\n    r#\"{\"\"#\n}\n"),
+            None,
+            "comments and raw strings are not counted"
+        );
+        assert_eq!(
+            unbalanced_delimiters("fn a<'a>() {\n    let lifetime: &'a str = \"x\";\n}\n"),
+            None,
+            "lifetimes are not char literals"
+        );
+        assert_eq!(
+            unbalanced_delimiters("fn a() }\n"),
+            Some("unbalanced delimiters: '}' closes nothing on line 1".to_owned())
+        );
+        assert_eq!(
+            unbalanced_delimiters("fn a() {\n    (1\n}\n"),
+            Some(
+                "unbalanced delimiters: '}' on line 3 does not match '(' opened at line 2"
+                    .to_owned()
+            )
         );
     }
 }

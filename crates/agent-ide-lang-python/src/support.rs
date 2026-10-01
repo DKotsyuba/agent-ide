@@ -508,7 +508,12 @@ impl LanguageSupport for Python {
     /// `<lineno>: <msg>` on a syntax error — exactly the probe line
     /// `SyntaxVerdict::from_probe` maps. A missing interpreter fails the spawn, which the
     /// caller maps to `Unchecked`, never a refusal.
-    fn syntax_probe_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>> {
+    fn syntax_probe_command(
+        &self,
+        project: &LanguageProject,
+        _root: &Path,
+        file: &Path,
+    ) -> Option<Vec<String>> {
         match file.extension().and_then(|ext| ext.to_str()) {
             Some("py" | "pyi") => {}
             _ => return None,
@@ -1896,17 +1901,18 @@ FAILED tests/test_service.py::TestWorker::test_label
     /// subprocess runs here, only the argv shape is checked.
     #[test]
     fn syntax_probe_command_uses_the_project_interpreter() {
+        let root = Path::new("/repo");
         let mut venv = project(&[]);
         venv.interpreter = Some(PathBuf::from("/repo/.venv/bin/python"));
         assert_eq!(
             Python
-                .syntax_probe_command(&venv, Path::new("src/svc/cli.py"))
+                .syntax_probe_command(&venv, root, Path::new("src/svc/cli.py"))
                 .unwrap()[..2],
             ["/repo/.venv/bin/python".to_owned(), "-c".to_owned()]
         );
         assert!(
             Python
-                .syntax_probe_command(&venv, Path::new("src/svc/cli.py"))
+                .syntax_probe_command(&venv, root, Path::new("src/svc/cli.py"))
                 .unwrap()[2]
                 .contains("ast.parse")
         );
@@ -1914,11 +1920,14 @@ FAILED tests/test_service.py::TestWorker::test_label
         let bare = project(&[]);
         assert_eq!(
             Python
-                .syntax_probe_command(&bare, Path::new("a.py"))
+                .syntax_probe_command(&bare, root, Path::new("a.py"))
                 .unwrap()[0],
             "python3"
         );
-        assert_eq!(Python.syntax_probe_command(&bare, Path::new("a.js")), None);
+        assert_eq!(
+            Python.syntax_probe_command(&bare, root, Path::new("a.js")),
+            None
+        );
     }
 
     /// Checks stdin formatter argv for each supported formatter configuration.

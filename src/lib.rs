@@ -78,3 +78,49 @@ pub mod languages {
 /// Launcher declaration tests that need the bundled languages registered.
 #[cfg(test)]
 mod launcher_tests;
+
+/// Start-card tests that need the bundled languages registered.
+#[cfg(test)]
+mod start_card_tests {
+    use agent_ide_core::project::{ServerState, collect, not_started_state, render};
+
+    /// A mixed rust+python card's `servers:` line renders each language's own not-started
+    /// sentence: only a language whose outline stays exact from source claims outline, read and
+    /// edit answer now; the others just say when they start.
+    #[test]
+    fn not_started_server_states_are_per_language() {
+        crate::languages::install();
+        let root =
+            std::env::temp_dir().join(format!("agent-ide-card-{}-rust-python", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.join("pyproject.toml"), "[project]\nname = \"x\"\n").unwrap();
+        std::fs::write(root.join("main.py"), "print(1)\n").unwrap();
+        let languages: Vec<_> = [crate::languages::RUST, crate::languages::PYTHON]
+            .into_iter()
+            .filter_map(|language| language.support().detect(&root))
+            .collect();
+        assert_eq!(languages.len(), 2, "rust and python both detect");
+        let servers: Vec<_> = languages
+            .iter()
+            .map(|project| ServerState {
+                language: project.language,
+                state: not_started_state(project.language).to_owned(),
+            })
+            .collect();
+        let card = collect(&root, languages, servers, None);
+        let rendered = render(&card);
+        let servers_line = rendered
+            .lines()
+            .find(|line| line.starts_with("servers: "))
+            .expect("the card renders a servers line");
+        assert_eq!(
+            servers_line,
+            "servers: rust not started; ide.outline, ide.read and ide.edit answer from source \
+             now; ide.symbol and ide.graph wait for the server, which starts on their first \
+             use · python not started; starts on first use"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}

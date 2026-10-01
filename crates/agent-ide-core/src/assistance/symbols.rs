@@ -489,15 +489,7 @@ impl Worker<'_> {
             .collect::<String>();
         text.push_str(&source_line(&delivered));
         if !duplicates.is_empty() {
-            text.push_str(&format!(
-                "duplicates shown once: {}\n",
-                duplicates
-                    .iter()
-                    .take(MAX_LANDING_SENTENCES)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+            text.push_str(&duplicates_footer(&duplicates));
         }
         if !cut.is_empty() {
             text.push_str(&follow_up(&items, &cut));
@@ -2483,7 +2475,10 @@ impl Worker<'_> {
                     refused: std::collections::BTreeSet::new(),
                     total: changes.len(),
                 };
-                if let Some(number) = syntax_change(&changes, &landings, line) {
+                if let Some(attribution) = syntax_change(&changes, &landings, line) {
+                    let number = match attribution {
+                        Attribution::Within(number) | Attribution::JustAfter(number, _) => number,
+                    };
                     refusal.refused.insert(number);
                 } else {
                     refusal
@@ -2682,7 +2677,7 @@ impl Worker<'_> {
         let Some(project) = support.detect(&root) else {
             return lang::SyntaxVerdict::Unchecked;
         };
-        let Some(argv) = support.syntax_probe_command(&project, file) else {
+        let Some(argv) = support.syntax_probe_command(&project, &root, file) else {
             return lang::SyntaxVerdict::Unchecked;
         };
         let Some(output) = run_stdin(&argv, &root, source, Duration::from_secs(10)).await else {
@@ -3098,6 +3093,13 @@ enum ChangeAction {
     Delete,
     /// Insert this code before the site's line, with the site's indentation and blanks.
     Insert(lang::InsertSite, String),
+    /// Replace exactly the base bytes `[start, end)` with this text — the `old`-text form,
+    /// whose match may start or end mid-line and include line terminators.
+    Splice {
+        start: usize,
+        end: usize,
+        new: String,
+    },
 }
 
 impl ChangeAction {
@@ -3108,6 +3110,8 @@ impl ChangeAction {
             Self::Replace(_) => "replaced",
             Self::Delete => "deleted",
             Self::Insert(..) => "inserted",
+            Self::Splice { new, .. } if new.is_empty() => "deleted",
+            Self::Splice { .. } => "replaced",
         }
     }
 }
@@ -3314,6 +3318,17 @@ fn line_byte_spans(source: &str) -> Vec<(usize, usize)> {
     spans
 }
 
+/// The 1-based line `byte` sits on among `spans` (see [`line_byte_spans`]): a byte at a line's
+/// end — its terminator, or the end of a final unterminated line — belongs to that line, and the
+/// position past a terminated file belongs to its last line.
+fn line_of_byte(spans: &[(usize, usize)], byte: usize) -> u32 {
+    1 + spans
+        .iter()
+        .position(|&(start, end)| byte >= start && byte <= end)
+        .unwrap_or(spans.len())
+        .min(spans.len().saturating_sub(1)) as u32
+}
+
 /// Finds `old` in `source`, wholly inside `scope`'s lines when given: exactly one match, none
 /// (with the closest line), or several (with each match's first line).
 fn find_old(source: &str, old: &str, scope: Option<LineRange>) -> OldMatch {
@@ -3381,13 +3396,7 @@ fn resolve_changes(
     requests: &[ChangeRequest],
 ) -> Result<Vec<ResolvedChange>, Refusal> {
     let spans = line_byte_spans(source);
-    let line_of = |byte: usize| -> u32 {
-        1 + spans
-            .iter()
-            .position(|&(start, end)| byte >= start && byte <= end)
-            .unwrap_or(spans.len())
-            .min(spans.len().saturating_sub(1)) as u32
-    };
+    let line_of = |byte: usize| line_of_byte(&spans, byte);
     let mut refusal = Refusal {
         sentences: Vec::new(),
         refused: std::collections::BTreeSet::new(),
@@ -3522,18 +3531,20 @@ fn resolve_changes(
                 };
                 match find_old(source, old, scope) {
                     OldMatch::One { start, end } => {
+                        // The match replaces exactly its own bytes: it may start and end
+                        // mid-line and include line terminators, so it applies as a byte
+                        // splice; the base line span is what the match's first and last byte
+                        // touch, and the landing lines are computed from the byte positions.
                         let first = line_of(start);
                         let last = line_of(end.saturating_sub(1));
-                        // A byte-level replacement phrased as whole lines: the matched lines are
-                        // replaced by the first line's prefix, the new text and the last line's
-                        // suffix, so text around the match on its own lines survives.
-                        let prefix = &source[spans[(first - 1) as usize].0..start];
-                        let suffix = &source[end..spans[(last - 1) as usize].1];
-                        let replacement = format!("{prefix}{new}{suffix}");
                         resolved.push(ResolvedChange {
                             number,
                             base: LineRange::new(first, last),
-                            action: ChangeAction::Replace(replacement),
+                            action: ChangeAction::Splice {
+                                start,
+                                end,
+                                new: new.clone(),
+                            },
                             address: ChangeAddress::OldText { line: first },
                         });
                     }
@@ -3586,6 +3597,26 @@ enum ReadBatch {
     Ranges,
 }
 
+/// The batch-read duplicates footer: every duplicated address named once, eight inline then
+/// `+N more` like the cut footer. The `+N more` form needs more than eight duplicated addresses,
+/// which one call's 16-entry bound cannot produce today — the footer stays honest if that bound
+/// ever rises.
+fn duplicates_footer(duplicates: &[String]) -> String {
+    let shown = duplicates
+        .iter()
+        .take(MAX_LANDING_SENTENCES)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hidden = duplicates.len().saturating_sub(MAX_LANDING_SENTENCES);
+    let mut footer = format!("duplicates shown once: {shown}");
+    if hidden > 0 {
+        footer.push_str(&format!("; +{hidden} more"));
+    }
+    footer.push('\n');
+    footer
+}
+
 /// Bytes of one quoted excerpt inside a refusal sentence.
 const MAX_REFUSAL_EXCERPT_BYTES: usize = 80;
 /// Change sentences a success reply lists inline before `+N more`.
@@ -3593,19 +3624,48 @@ const MAX_LANDING_SENTENCES: usize = 8;
 /// Bytes the whole refusal detail is clipped to, one line.
 const MAX_REFUSAL_DETAIL_BYTES: usize = 512;
 
-/// The change whose final range contains `line`, if any: the error is attributed to the change
-/// that produced it. Ranges are post-splice; a formatter that moved lines can shift the
-/// attribution, which is cosmetic — the excerpt disambiguates.
+/// How a syntax error relates to the change it is attributed to.
+enum Attribution {
+    /// The error line is inside the change's final range.
+    Within(usize),
+    /// The error line sits just after the change's final range — a parser reports an
+    /// unterminated construct a line or two after the edit that opened it.
+    JustAfter(usize, LineRange),
+}
+
+/// The change a syntax error at `line` is attributed to: the change whose final range contains
+/// `line`, else the nearest change that ended before it — which is the only change when there
+/// is one — so an unterminated construct opened by an edit is named for that edit. Ranges are
+/// post-splice; a formatter that moved lines can shift the attribution, which is cosmetic — the
+/// excerpt disambiguates.
 fn syntax_change(
     changes: &[ResolvedChange],
     landings: &[Option<LineRange>],
     line: u32,
-) -> Option<usize> {
-    changes
+) -> Option<Attribution> {
+    let landed: Vec<(usize, LineRange)> = changes
         .iter()
         .zip(landings)
-        .find(|(_, now)| now.is_some_and(|range| range.start <= line && line <= range.end))
-        .map(|(change, _)| change.number)
+        .filter_map(|(change, now)| now.map(|range| (change.number, range)))
+        .collect();
+    if let Some(&(number, _)) = landed
+        .iter()
+        .find(|(_, range)| range.start <= line && line <= range.end)
+    {
+        return Some(Attribution::Within(number));
+    }
+    let nearest = landed
+        .iter()
+        .filter(|(_, range)| range.end < line)
+        .max_by_key(|(_, range)| (range.end, range.start));
+    match (nearest, landed.len() == 1) {
+        (Some(&(number, range)), _) => Some(Attribution::JustAfter(number, range)),
+        (None, true) => {
+            let (number, range) = landed[0];
+            Some(Attribution::JustAfter(number, range))
+        }
+        (None, false) => None,
+    }
 }
 
 /// The syntax refusal sentence for a candidate that does not parse: the change that produced the
@@ -3626,10 +3686,21 @@ fn syntax_sentence(
         .map(|lines| lines.join("\\n"))
         .unwrap_or_default();
     let (who, where_) = match syntax_change(changes, landings, line) {
-        Some(number) => (format!("change {number} produced"), ""),
+        Some(Attribution::Within(number)) => (format!("change {number} produced"), String::new()),
+        Some(Attribution::JustAfter(number, range)) => {
+            let lines = if range.start == range.end {
+                format!("its line {}", range.start)
+            } else {
+                format!("its lines {range}")
+            };
+            (
+                format!("change {number} produced"),
+                format!(" (just after {lines})"),
+            )
+        }
         None => (
             "the candidate produced".to_owned(),
-            " outside the edited ranges",
+            " outside the edited ranges".to_owned(),
         ),
     };
     format!(
@@ -3641,13 +3712,14 @@ fn syntax_sentence(
 }
 
 /// Applies resolved changes and returns the candidate with each change's exact final line range
-/// (post-splice, pre-format). Application is bottom-up — descending base start, and among equal
-/// starts in reverse array order, so two inserts at one anchor keep their array order in the
-/// file — so every change's base numbers are still valid when it applies; its landing span is
-/// recorded where the application left it and then shifted by every later application above it,
-/// so the reported range is where the change's text sits in the final file. Overlapping spans,
-/// an insert strictly inside another change's span, and a range past the end of the file are
-/// refused with nothing applied.
+/// (post-splice, pre-format). Application is bottom-up — descending base start; at equal starts
+/// a span change applies before an insert anchored at that line (so the inserted text ends up
+/// immediately before the span's result), and two inserts at one anchor apply in reverse array
+/// order so they keep their array order in the file — so every change's base numbers are still
+/// valid when it applies; its landing span is recorded where the application left it and then
+/// shifted by every later application above it, so the reported range is where the change's
+/// text sits in the final file. Overlapping spans, an insert strictly inside another change's
+/// span, and a range past the end of the file are refused with nothing applied.
 fn apply_changes(
     source: &str,
     path: &str,
@@ -3707,6 +3779,11 @@ fn apply_changes(
             .base
             .start
             .cmp(&changes[a].base.start)
+            // At one start line the span change applies first and an insert anchored there
+            // applies after it, so the inserted text ends up immediately before the span's
+            // result whichever order the array listed them in; two inserts at one anchor keep
+            // their array order (the later array entry applies first, above the other).
+            .then(changes[a].inserts().cmp(&changes[b].inserts()))
             .then(b.cmp(&a))
     });
     let mut buffer = source.to_owned();
@@ -3735,6 +3812,21 @@ fn apply_changes(
                 let block = indent_block(content, &site.indent);
                 let start = change.base.start + u32::from(site.blank_before);
                 Some(LineRange::new(start, start + lang::line_count(&block) - 1))
+            }
+            ChangeAction::Splice { start, end, new } => {
+                // Applications above this span only touch bytes below it, so the base byte
+                // offsets still address the buffer; the clamp covers the one same-batch case
+                // where a symbol delete's blank merge has consumed the span's tail bytes.
+                let length = buffer.len();
+                let (start, end) = ((*start).min(length), (*end).min(length));
+                buffer.replace_range(start..end, new);
+                (!new.is_empty()).then(|| {
+                    let spans = line_byte_spans(&buffer);
+                    LineRange::new(
+                        line_of_byte(&spans, start),
+                        line_of_byte(&spans, (start + new.len()).saturating_sub(1)),
+                    )
+                })
             }
         };
         let shift = i64::from(lang::line_count(&buffer)) - i64::from(before);
@@ -4056,7 +4148,8 @@ mod batch_tests {
                 .detail()
                 .starts_with("2 of 3 changes refused, nothing written")
         );
-        // An insert strictly inside another span is refused; at either boundary it is fine.
+        // An insert strictly inside another span is refused; at either boundary it applies —
+        // after the span change when they share its first line, before the span's result.
         for (line, allowed) in [(3, false), (2, true), (5, true)] {
             let result = apply_changes(
                 source,
@@ -4071,6 +4164,16 @@ mod batch_tests {
                 ],
             );
             assert_eq!(result.is_ok(), allowed, "insert at {line}");
+            if allowed {
+                let (candidate, now) = result.unwrap();
+                let (expected, insert_now) = if line == 2 {
+                    ("a\ni\nX\ne\nf\n", LineRange::new(2, 2))
+                } else {
+                    ("a\nX\ni\ne\nf\n", LineRange::new(3, 3))
+                };
+                assert_eq!(candidate, expected, "insert at {line}");
+                assert_eq!(now[1], Some(insert_now), "insert at {line}");
+            }
         }
         // Two inserts at one anchor keep their array order in the file, and each reports where
         // its own block landed: the earlier array entry applies last, above the other.
@@ -4250,6 +4353,205 @@ mod batch_tests {
         let insert = single_change("insert", &Splice::Insert(site.clone()), Some("i")).unwrap();
         let (candidate, _) = apply_changes(source, "a.rs", std::slice::from_ref(&insert)).unwrap();
         assert_eq!(candidate, insert_lines(source, &site, "i"));
+    }
+
+    /// `old` replaces exactly its matched bytes, terminators included: `b\n` deleted leaves the
+    /// following line, `b\n` → `B\n` stays its own line, and a match that is only the terminator
+    /// joins the lines around it.
+    #[test]
+    fn old_text_replaces_its_exact_bytes_including_terminators() {
+        let source = "a\nb\nc\n";
+        let outline = gamma_outline(source);
+        let splice = |old: &str, new: &str| {
+            let requests = [ChangeRequest::Old {
+                old: old.to_owned(),
+                new: new.to_owned(),
+                within: None,
+            }];
+            let changes = resolve_changes(source, Some(&outline), "a.gamma", &requests).unwrap();
+            apply_changes(source, "a.gamma", &changes)
+        };
+        let (candidate, landing) = splice("b\n", "").unwrap();
+        assert_eq!(candidate, "a\nc\n");
+        assert_eq!(landing[0], None, "a deleted match reports no range");
+        let (candidate, landing) = splice("b\n", "B\n").unwrap();
+        assert_eq!(candidate, "a\nB\nc\n");
+        assert_eq!(landing[0], Some(LineRange::new(2, 2)));
+        let (candidate, _) = splice("b\n", "B").unwrap();
+        assert_eq!(
+            candidate, "a\nBc\n",
+            "the new text joins the following line"
+        );
+        let source = "ab\ncd";
+        let outline = gamma_outline(source);
+        let requests = [ChangeRequest::Old {
+            old: "\n".to_owned(),
+            new: "".to_owned(),
+            within: None,
+        }];
+        let changes = resolve_changes(source, Some(&outline), "a.gamma", &requests).unwrap();
+        let (candidate, _) = apply_changes(source, "a.gamma", &changes).unwrap();
+        assert_eq!(candidate, "abcd");
+    }
+
+    /// Every substring of a multi-line text — with and without a trailing newline, LF and CRLF —
+    /// either refuses (no unique match) or replaces exactly its own bytes: no panic anywhere,
+    /// byte-exact results for any `old` and any of a terminator-free, terminated and empty `new`.
+    #[test]
+    fn old_text_never_panics_and_is_byte_exact_for_every_substring() {
+        let resolve_and_apply = |source: &str, old: &str, new: &str| {
+            let outline = gamma_outline(source);
+            let requests = [ChangeRequest::Old {
+                old: old.to_owned(),
+                new: new.to_owned(),
+                within: None,
+            }];
+            match resolve_changes(source, Some(&outline), "a.gamma", &requests) {
+                Ok(changes) => apply_changes(source, "a.gamma", &changes).map(|(text, _)| text),
+                Err(_) => Ok("__refused__".to_owned()),
+            }
+        };
+        for source in [
+            "fn one() {\n    1\n}\n\nfn two() {\n    2\n}\n",
+            "fn one() {\n    1\n}\n\nfn two() {\n    2\n}",
+            "fn one() {\r\n    1\r\n}\r\n\r\nfn two() {\r\n    2\r\n}\r\n",
+        ] {
+            for start in 0..source.len() {
+                for end in start..source.len() {
+                    let old = &source[start..end];
+                    // Only byte boundaries are valid `old` texts.
+                    if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
+                        continue;
+                    }
+                    for new in ["X", "X\n", ""] {
+                        let applied = resolve_and_apply(source, old, new)
+                            .unwrap_or_else(|_| panic!("apply panicked for {old:?} → {new:?}"));
+                        if applied == "__refused__" {
+                            continue;
+                        }
+                        assert_eq!(
+                            applied,
+                            format!("{}{new}{}", &source[..start], &source[end..]),
+                            "old {old:?} at {start}..{end} with new {new:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// An insert anchored at a span change's first line applies after it in either array order:
+    /// the inserted text ends up immediately before the replaced (or deleted) region's result,
+    /// and each landing note reports where its own text sits.
+    #[test]
+    fn same_line_insert_applies_after_the_span_change_in_either_array_order() {
+        let source = "a\nb\nc\nd\ne\nf\n";
+        let span_then_insert = vec![
+            change(
+                1,
+                LineRange::new(2, 4),
+                ChangeAction::Replace("X".to_owned()),
+            ),
+            insert_at(2, 2, "i"),
+        ];
+        // The reversed array order: insert first in the array, replace second.
+        let insert_first = vec![
+            insert_at(1, 2, "i"),
+            change(
+                2,
+                LineRange::new(2, 4),
+                ChangeAction::Replace("X".to_owned()),
+            ),
+        ];
+        for (label, changes) in [
+            ("span first", span_then_insert),
+            ("insert first", insert_first),
+        ] {
+            let (candidate, landings) = apply_changes(source, "a.gamma", &changes).unwrap();
+            assert_eq!(candidate, "a\ni\nX\ne\nf\n", "{label}");
+            let (insert_landing, replace_landing) = if label == "span first" {
+                (landings[1], landings[0])
+            } else {
+                (landings[0], landings[1])
+            };
+            assert_eq!(insert_landing, Some(LineRange::new(2, 2)), "{label}");
+            assert_eq!(replace_landing, Some(LineRange::new(3, 3)), "{label}");
+        }
+        // With a delete at the same start line the inserted line survives and the target lines
+        // are the ones removed.
+        let deleted = vec![
+            change(1, LineRange::new(2, 4), ChangeAction::Delete),
+            insert_at(2, 2, "i"),
+        ];
+        let (candidate, landings) = apply_changes(source, "a.gamma", &deleted).unwrap();
+        assert_eq!(candidate, "a\ni\ne\nf\n");
+        assert_eq!(landings[1], Some(LineRange::new(2, 2)));
+        assert_eq!(landings[0], None);
+    }
+
+    /// The duplicates footer names eight addresses and counts the rest, like the cut footer.
+    #[test]
+    fn duplicates_footer_clips_after_eight_names() {
+        assert_eq!(
+            duplicates_footer(&["src/x.rs#a".to_owned(), "src/x.rs#b".to_owned()]),
+            "duplicates shown once: src/x.rs#a, src/x.rs#b\n"
+        );
+        let ten: Vec<String> = (0..10)
+            .map(|index| format!("src/x.rs#sym_{index}"))
+            .collect();
+        assert_eq!(
+            duplicates_footer(&ten),
+            format!("duplicates shown once: {}; +2 more\n", ten[..8].join(", "))
+        );
+    }
+
+    /// A syntax error outside every change's range is attributed to the nearest change before
+    /// it — and to the only change when there is one — while an error inside a range keeps the
+    /// plain sentence and an error beyond several changes stays the candidate's own.
+    #[test]
+    fn syntax_errors_after_a_change_are_attributed_to_it() {
+        let candidate = "a\nb\nc\nd\ne\nf\ng\n";
+        let single = vec![change(
+            1,
+            LineRange::new(2, 2),
+            ChangeAction::Replace("B".to_owned()),
+        )];
+        let landings = vec![Some(LineRange::new(2, 2))];
+        assert!(
+            syntax_sentence(candidate, &single, &landings, 2, "boom")
+                .starts_with("change 1 produced a syntax error at line 2: \"boom\""),
+            "an error inside the range keeps the plain sentence"
+        );
+        assert_eq!(
+            syntax_sentence(candidate, &single, &landings, 5, "boom"),
+            "change 1 produced a syntax error at line 5 (just after its line 2): \"boom\" \
+             (candidate lines 3-7: \"c\\nd\\ne\\nf\\ng\"); candidate not written"
+        );
+        let several = vec![
+            change(
+                1,
+                LineRange::new(2, 2),
+                ChangeAction::Replace("B".to_owned()),
+            ),
+            change(
+                2,
+                LineRange::new(4, 5),
+                ChangeAction::Replace("D".to_owned()),
+            ),
+        ];
+        let landings = vec![Some(LineRange::new(2, 2)), Some(LineRange::new(4, 5))];
+        assert!(
+            syntax_sentence(candidate, &several, &landings, 7, "boom").starts_with(
+                "change 2 produced a syntax error at line 7 (just after its lines 4–5)"
+            ),
+            "the nearest preceding change is named"
+        );
+        assert!(
+            syntax_sentence(candidate, &several, &landings, 1, "boom").starts_with(
+                "the candidate produced a syntax error at line 1 outside the edited ranges"
+            ),
+            "an error no change precedes stays the candidate's own"
+        );
     }
 }
 

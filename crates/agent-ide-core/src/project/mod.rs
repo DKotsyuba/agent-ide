@@ -832,6 +832,20 @@ fn render_servers(card: &ProjectCard) -> String {
     format!("servers: {}", parts.join(" · "))
 }
 
+/// The `not started` state `ide.start` prints for one language while its server is down: only a
+/// language whose lexical outline is exact
+/// ([`outline_while_loading`](crate::lang::LanguageSupport::outline_while_loading)) may
+/// claim outline/read/edit already answer from source; every other language's tools all wait
+/// for the server.
+pub fn not_started_state(language: Language) -> &'static str {
+    if language.support().outline_while_loading() {
+        "not started; ide.outline, ide.read and ide.edit answer from source now; ide.symbol and \
+         ide.graph wait for the server, which starts on their first use"
+    } else {
+        "not started; starts on first use"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -987,6 +1001,40 @@ mod tests {
             root = tree.path().display(),
         );
         assert_eq!(rendered, expected);
+    }
+
+    /// The not-started server state never claims source tools for a language whose lexical
+    /// outline is not exact; the exact claim is `not_started_state`'s other branch, covered by
+    /// the bundled-language card test.
+    #[test]
+    fn not_started_states_render_per_language() {
+        crate::lang::testing::install();
+        let card = ProjectCard {
+            root: PathBuf::from("/repo"),
+            name: "repo".to_owned(),
+            git: None,
+            languages: Vec::new(),
+            layout: Vec::new(),
+            docs: Vec::new(),
+            servers: vec![
+                ServerState {
+                    language: crate::lang::testing::ALPHA,
+                    state: not_started_state(crate::lang::testing::ALPHA).to_owned(),
+                },
+                ServerState {
+                    language: crate::lang::testing::BETA,
+                    state: not_started_state(crate::lang::testing::BETA).to_owned(),
+                },
+            ],
+            problems: None,
+            truncated: false,
+            agent_commands: crate::lang::ProjectCommands::default(),
+        };
+        assert_eq!(
+            render_servers(&card),
+            "servers: alpha not started; starts on first use · beta not started; starts on \
+             first use"
+        );
     }
 
     #[test]

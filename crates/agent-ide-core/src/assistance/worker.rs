@@ -67,8 +67,8 @@ const PROJECT_CARD_BUDGET: Duration = Duration::from_secs(5);
 /// Maximum time an initial tool call waits for its job before returning its retained detail.
 pub const INLINE_REPLY_WAIT: Duration = Duration::from_secs(8);
 /// The honest per-language server state the start card prints while no language server has been
-/// launched: which tools already answer from source, and which ones only the server can answer.
-const SERVER_NOT_STARTED: &str = "not started; ide.outline, ide.read and ide.edit answer from source now; ide.symbol and ide.graph wait for the server, which starts on their first use";
+/// launched: which tools already answer from source, and which ones only the server can answer
+/// (see [`project::not_started_state`]).
 /// Why an activation baseline never claims complete coverage: Git metadata and source bytes are
 /// captured as separate bounded steps, so no joint Git/source window is ever proven.
 const BASELINE_PARTIAL_REASON: &str = "git metadata and source bytes are captured in separate steps, so no atomic window is proven and coverage cannot be claimed complete";
@@ -2263,15 +2263,16 @@ impl<'a> Worker<'a> {
                             None,
                         ));
                     }
-                    StartResult::Failed(error) => {
+                    StartResult::Failed { error, not_found } => {
                         let program = argv.first().map(String::as_str).unwrap_or("");
                         return Ok((
                             PeerReply::Complete {
                                 kind: ResultKind::Test,
-                                text: format!(
-                                    "tests: could not start {}: {}",
-                                    test_text_line(program, 160),
-                                    test_text_line(&error, 240)
+                                text: missing_runner_text(
+                                    program,
+                                    &error,
+                                    not_found && !explicit_command,
+                                    &root,
                                 ),
                                 detail_ref: None,
                                 truncated: false,
@@ -3015,7 +3016,7 @@ impl<'a> Worker<'a> {
                     .filter(|project| project.language.server().is_some())
                     .map(|project| CardServerState {
                         language: project.language,
-                        state: SERVER_NOT_STARTED.to_owned(),
+                        state: project_card::not_started_state(project.language).to_owned(),
                     })
                     .collect();
                 let links = project_card::links_line(&languages);
@@ -5136,6 +5137,38 @@ fn test_text_line(value: &str, max_chars: usize) -> String {
         .collect()
 }
 
+/// The reply line for a runner that could not start. A missing executable of the language's own
+/// runner selection says what is missing and the next step — the project environment, or an
+/// exact command — instead of quoting errno; every other spawn failure (and every explicit
+/// command, whose program the caller named themselves) keeps the program and the error.
+fn missing_runner_text(program: &str, error: &str, not_found: bool, root: &Path) -> String {
+    if not_found {
+        let program = test_text_line(program, 160);
+        if program.contains('/') {
+            return format!(
+                "tests: could not start {program} — not found; recreate the project \
+                 environment, or run an exact command with ide.test {{\"command\":[...]}}"
+            );
+        }
+        // A project virtual environment would have put this program on an absolute path, so a
+        // bare name that is missing also says none was found.
+        let venv = if [".venv", "venv"].iter().any(|dir| root.join(dir).is_dir()) {
+            ""
+        } else {
+            " and the project has no .venv"
+        };
+        return format!(
+            "tests: could not start {program} — not found on PATH{venv}; create the project \
+             environment, or run an exact command with ide.test {{\"command\":[...]}}"
+        );
+    }
+    format!(
+        "tests: could not start {}: {}",
+        test_text_line(program, 160),
+        test_text_line(error, 240)
+    )
+}
+
 /// Renders the bounded parsed test result and actionable rerun/detail references.
 fn test_result_text(
     id: u64,
@@ -5272,6 +5305,39 @@ mod tool_reply_fix_tests {
         let runner = test_result_text(3, &result, true, false);
         assert!(runner.contains("0 passed, 0 failed"), "{runner}");
         assert!(!runner.contains("\n  output:\n"), "{runner}");
+    }
+
+    /// A missing runner says what is missing and the next step instead of quoting errno — a bare
+    /// program also says no project environment was found — while any other spawn failure keeps
+    /// the program and the error.
+    #[test]
+    fn a_missing_runner_teaches_the_next_step() {
+        let empty = Path::new("/definitely/empty");
+        assert_eq!(
+            missing_runner_text(
+                "pytest",
+                "No such file or directory (os error 2)",
+                true,
+                empty
+            ),
+            "tests: could not start pytest — not found on PATH and the project has no .venv; \
+             create the project environment, or run an exact command with ide.test \
+             {\"command\":[...]}"
+        );
+        assert_eq!(
+            missing_runner_text(
+                "/repo/.venv/bin/runner",
+                "No such file or directory (os error 2)",
+                true,
+                empty
+            ),
+            "tests: could not start /repo/.venv/bin/runner — not found; recreate the project \
+             environment, or run an exact command with ide.test {\"command\":[...]}"
+        );
+        assert_eq!(
+            missing_runner_text("pytest", "Permission denied (os error 13)", false, empty),
+            "tests: could not start pytest: Permission denied (os error 13)"
+        );
     }
 
     /// A failed summary-less command surfaces its error line and retained output handle.
@@ -7587,7 +7653,7 @@ mod stop_retry_tests {
             &binding,
         ) {
             StartResult::Started(id) => assert_eq!(id, 1),
-            StartResult::Running(..) | StartResult::Failed(..) => {
+            StartResult::Running(..) | StartResult::Failed { .. } => {
                 panic!("echo run must start")
             }
         }
@@ -7621,7 +7687,7 @@ mod stop_retry_tests {
                 StartResult::Running(..) => {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                StartResult::Failed(_) => panic!("sleep run must start"),
+                StartResult::Failed { .. } => panic!("sleep run must start"),
             }
         };
         assert_eq!(sleep_started, 2);

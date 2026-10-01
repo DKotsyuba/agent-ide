@@ -65,9 +65,11 @@ and cost a fraction of the context:
   exact call to fetch them — never silently truncated. `{"path":…,"ranges":["10-20","44-60"]}`
   reads several line ranges the same way.
 - `ide.edit {"operation_id":"…","path":"src/x.rs","source_ref":"…","changes":[…]}` — many
-  changes to one file in one call: entries by `lines` (numbers of the version you read),
-  by `symbol` (same `op`/`where` as the single forms), or by `old`/`new` exact text
-  (must match once; add `"within":"sym"` to scope it). All addresses resolve against the
+  changes to one file in one call: entries by `lines` (numbers of the version you read;
+  empty `content` deletes the range), by `symbol` (same `op`/`where` as the single forms), or
+  by `old`/`new` exact text (must match once; add `"within":"sym"` to scope it). Exactly the
+  matched bytes are replaced — `old` may start or end mid-line and may include the line
+  terminator, and `"new":""` deletes the match. All addresses resolve against the
   version `source_ref` names; overlaps, no-match and multi-match are refused with the exact
   per-change fix and nothing is written — retry with the same `operation_id`. The edit is
   refused the same way when the result would not parse (the reply shows the line and the

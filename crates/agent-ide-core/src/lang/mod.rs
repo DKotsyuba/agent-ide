@@ -617,7 +617,8 @@ impl std::error::Error for LangError {}
 
 /// The per-language contract. Implementations are stateless; every method is a pure function of
 /// its inputs except `detect`, which reads manifests under `root`, and `syntax_probe_command`,
-/// which names a subprocess the caller (never this trait) runs.
+/// which names a subprocess the caller (never this trait) runs and may read the
+/// configured-toolchain environment.
 pub trait LanguageSupport: Send + Sync {
     fn language(&self) -> Language;
 
@@ -668,13 +669,19 @@ pub trait LanguageSupport: Send + Sync {
     }
 
     /// stdin probe command for a bounded external structural checker. `None` means no probe here,
-    /// i.e. [`SyntaxVerdict::Unchecked`]. The caller runs it from the project root with the candidate
-    /// on stdin and maps its output through [`SyntaxVerdict::from_probe`]; the probe's first output
-    /// line must be `<line>: <message>` and a nonzero exit without that shape means "no checker".
+    /// i.e. [`SyntaxVerdict::Unchecked`]. The caller runs it from the project `root` with the
+    /// candidate on stdin and maps its output through [`SyntaxVerdict::from_probe`]; the probe's
+    /// first output line must be `<line>: <message>` and a nonzero exit without that shape means
+    /// "no checker". May read the configured-toolchain environment (the accepted node and language
+    /// packages) the way the language's server launcher does.
     /// Same contract as [`Self::format_stdin_command`].
-    /// Same contract as [`Self::format_stdin_command`].
-    fn syntax_probe_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>> {
-        let _ = (project, file);
+    fn syntax_probe_command(
+        &self,
+        project: &LanguageProject,
+        root: &Path,
+        file: &Path,
+    ) -> Option<Vec<String>> {
+        let _ = (project, root, file);
         None
     }
 

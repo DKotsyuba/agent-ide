@@ -7588,6 +7588,100 @@ async fn configured_product_batch_overlapping_changes_refuse_naming_both_ranges(
     daemon.wait().await.unwrap();
 }
 
+/// Case 3b: `old` text that includes a line terminator replaces exactly its matched bytes, a
+/// `lines` entry with empty content deletes the range, and an insert anchored at a replaced
+/// range's first line applies after the replace whichever array order the request used — so the
+/// inserted text survives immediately before the replacement and every landing note is true.
+#[tokio::test]
+async fn configured_product_batch_terminator_old_empty_lines_and_same_line_insert() {
+    let batch = "pub fn alpha() -> i32 {\n    1\n}\n\npub fn beta() -> i32 {\n    2\n}\n";
+    let fixture = batch_edit_fixture(batch);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = batch_started_actor(&fixture, "batch-bytes", "src/batch.rs").await;
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"symbols":["src/batch.rs#alpha"]}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let source_ref = read["detail_ref"].as_str().unwrap();
+
+    let edit = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-bytes-once",
+            "path":"src/batch.rs",
+            "source_ref":source_ref,
+            "changes":[
+                {"old":"    1\n","new":"    11\n"},
+                {"lines":"4-4","content":""}
+            ]
+        }),
+    )
+    .await;
+    let (edit, edit_text) = batch_settle_with_text(&mut actor, &fixture, edit).await;
+    let edit_ref = edit["result"]["source_ref"].as_str().unwrap();
+    assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
+    assert_eq!(
+        batch_without_status_plate(&edit_text),
+        format!(
+            "edit: replaced; path src/batch.rs; source_ref {edit_ref}; {}\n2 changes applied: \
+             change 1: old text at line 2 replaced (now 2); change 2: lines 4 deleted",
+            batch_diagnostics_segment(&edit)
+        ),
+        "{edit_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/batch.rs")).unwrap(),
+        b"pub fn alpha() -> i32 {\n    11\n}\npub fn beta() -> i32 {\n    2\n}\n"
+    );
+
+    // The insert is the earlier array entry and the replace still applies first at their shared
+    // start line: the helper lands immediately before beta's replacement.
+    let insert = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-bytes-insert",
+            "path":"src/batch.rs",
+            "source_ref":edit_ref,
+            "changes":[
+                {"symbol":"src/batch.rs#beta","op":"insert","where":"before",
+                 "content":"fn helper() -> i32 {\n    0\n}"},
+                {"lines":"4-6","content":"pub fn beta() -> i32 {\n    22\n}"}
+            ]
+        }),
+    )
+    .await;
+    let (insert, insert_text) = batch_settle_with_text(&mut actor, &fixture, insert).await;
+    let insert_ref = insert["result"]["source_ref"].as_str().unwrap();
+    assert_eq!(insert["result"]["outcome"], "replaced", "{insert}");
+    assert_eq!(
+        batch_without_status_plate(&insert_text),
+        format!(
+            "edit: replaced; path src/batch.rs; source_ref {insert_ref}; {}\n2 changes applied: \
+             change 1: src/batch.rs#beta inserted before #beta (now 5–7); change 2: lines 4–6 \
+             replaced (now 9–11)",
+            batch_diagnostics_segment(&insert)
+        ),
+        "{insert_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/batch.rs")).unwrap(),
+        b"pub fn alpha() -> i32 {\n    11\n}\n\nfn helper() -> i32 {\n    0\n}\n\npub fn \
+           beta() -> i32 {\n    22\n}\n"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Case 4: a change may not address a symbol only an earlier change of the same call creates —
 /// the base outline knows nothing of it, so the reply refuses that change by name.
 #[tokio::test]
@@ -7725,7 +7819,8 @@ async fn configured_product_batch_rust_syntax_gate_refuses_and_notes_pre_existin
     assert_eq!(
         batch_without_status_plate(&refused_text),
         "error: edit_refused (edit:refused); 1 of 1 changes refused, nothing written — \
-         change 1 produced a syntax error at line 5: \"cannot parse string into token stream\" \
+         change 1 produced a syntax error at line 5: \"unbalanced delimiters: '(' opened at \
+         line 5 is never closed\" \
          (candidate lines 3-7: \"}\\n\\npub fn target( -> i32 {\\n    helper()\\n}\"); candidate \
          not written. Fix the named changes and retry with the same operation_id",
         "{refused_text}"
@@ -10922,7 +11017,7 @@ async fn configured_product_activation_reply_includes_the_project_card() {
     assert!(text.contains("\nlayout: src/ 1"), "{text}");
     assert!(text.contains("\ndocs: README.md"), "{text}");
     assert!(
-        text.contains("\nservers: rust not started; ide.outline, ide.read and ide.edit answer from source now; ide.symbol and ide.graph wait for the server, which starts on their first use · typescript not started; ide.outline, ide.read and ide.edit answer from source now; ide.symbol and ide.graph wait for the server, which starts on their first use · go not started"),
+        text.contains("\nservers: rust not started; ide.outline, ide.read and ide.edit answer from source now; ide.symbol and ide.graph wait for the server, which starts on their first use · typescript not started; starts on first use · go not started; starts on first use"),
         "{text}"
     );
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;

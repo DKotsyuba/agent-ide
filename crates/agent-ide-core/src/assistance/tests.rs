@@ -96,8 +96,9 @@ pub enum StartResult {
     Started(u64),
     /// An existing live job id and its age; no second command was spawned.
     Running(u64, Duration),
-    /// A local configuration or operating-system error prevented command spawn.
-    Failed(String),
+    /// A local configuration or operating-system error prevented command spawn. `not_found` is
+    /// the missing-executable kind, so the reply can teach the fix instead of quoting errno.
+    Failed { error: String, not_found: bool },
 }
 
 /// Read-only age and optional completed result returned by a status lookup.
@@ -152,7 +153,12 @@ impl TestRuns {
     ) -> StartResult {
         let mut state = match self.0.lock() {
             Ok(state) => state,
-            Err(error) => return StartResult::Failed(error.to_string()),
+            Err(error) => {
+                return StartResult::Failed {
+                    error: error.to_string(),
+                    not_found: false,
+                };
+            }
         };
         if let Some((id, job)) = state
             .jobs
@@ -163,7 +169,12 @@ impl TestRuns {
         }
         let child = match spawn_command(&root, &argv) {
             Ok(child) => child,
-            Err(error) => return StartResult::Failed(error.to_string()),
+            Err(error) => {
+                return StartResult::Failed {
+                    not_found: error.kind() == std::io::ErrorKind::NotFound,
+                    error: error.to_string(),
+                };
+            }
         };
         state.next_id = state.next_id.saturating_add(1);
         let id = state.next_id;
