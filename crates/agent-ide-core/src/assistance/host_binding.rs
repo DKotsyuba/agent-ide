@@ -261,7 +261,7 @@ pub struct HookEvent {
     agent_type: Option<String>,
     /// Native tool name retained only for post phases of either host; the name alone selects the
     /// host-specific project-check triggers (EYES-r2 §5, T29B §4) and never carries tool input
-    /// or output.
+    /// or output (the written file's path rides separately in `tool_file`).
     tool_name: Option<String>,
     /// Bounded tool-input file path of a post-phase writer tool — `tool_input.file_path`, or
     /// `tool_input.notebook_path` for Claude's `NotebookEdit`, which carries its file there —

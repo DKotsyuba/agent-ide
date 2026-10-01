@@ -106,7 +106,7 @@ pub(crate) fn is_python_project(root: &Path) -> bool {
 }
 
 /// `-c` program of the syntax probe: parses stdin with `ast` and prints `<lineno>: <msg>` on a
-/// syntax error, the exact line [`SyntaxVerdict::from_probe`] maps (any other nonzero output
+/// syntax error, the exact line `SyntaxVerdict::from_probe` maps (any other nonzero output
 /// means no checker was proven).
 const PY_AST_PROBE: &str = "import ast,sys\ntry:\n    ast.parse(sys.stdin.read())\nexcept SyntaxError as e:\n    print(f\"{e.lineno}: {e.msg}\")\n    sys.exit(1)";
 
@@ -116,7 +116,7 @@ impl LanguageSupport for Python {
         LANGUAGE
     }
 
-    /// Establishes a Python project per the shared marker rule ([`is_python_project`]); `None`
+    /// Establishes a Python project per the shared marker rule (`is_python_project`); `None`
     /// when none of the markers exists. Environment facts recorded (in this order,
     /// each only when present): `venv` (`.venv` or `venv`, whose `bin/python` becomes the absolute
     /// `interpreter`), `tool` (`uv`, `poetry`), `python` (`.python-version`), `configured`
@@ -506,7 +506,7 @@ impl LanguageSupport for Python {
     /// The project's own interpreter (the detected venv, else `python3` on PATH like the
     /// formatter's tools) runs `ast.parse` over the candidate on stdin and prints
     /// `<lineno>: <msg>` on a syntax error — exactly the probe line
-    /// [`SyntaxVerdict::from_probe`] maps. A missing interpreter fails the spawn, which the
+    /// `SyntaxVerdict::from_probe` maps. A missing interpreter fails the spawn, which the
     /// caller maps to `Unchecked`, never a refusal.
     fn syntax_probe_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>> {
         match file.extension().and_then(|ext| ext.to_str()) {

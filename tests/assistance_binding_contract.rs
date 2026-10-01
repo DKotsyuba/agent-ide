@@ -231,18 +231,22 @@ fn claude_parent_and_two_subagents_remain_explicit_and_isolated() {
     }
 }
 
-/// Retains the native tool name for Claude post phases only, never for pre-hooks.
+/// Retains, for Claude post phases only, the native tool name and the written file's path (so the
+/// project check can pick that file's language) — never the tool's content or response, and
+/// nothing for pre-hooks.
 #[test]
-fn claude_post_phases_retain_only_the_tool_name() {
+fn claude_post_phases_retain_only_the_tool_name_and_written_path() {
     for phase in ["PostToolUse", "PostToolUseFailure"] {
         let event = parse_claude_hook_event(
             json!({"hook_event_name":phase,"session_id":"session","tool_use_id":"call",
-                "tool_name":"Edit","tool_input":{"file_path":"/secret"},"tool_response":"secret"})
+                "tool_name":"Edit","tool_input":{"file_path":"/worktree/src/lib.rs",
+                "old_string":"secret","new_string":"secret"},"tool_response":"secret"})
             .to_string()
             .as_bytes(),
         )
         .unwrap();
         assert_eq!(event.tool_name(), Some("Edit"));
+        assert_eq!(event.tool_file(), Some("/worktree/src/lib.rs"));
         assert!(!format!("{event:?}").contains("secret"));
     }
     let pre = parse_claude_hook_event(

@@ -125,7 +125,7 @@ fn nested_sandbox_refusal(output: &RunOutput) -> bool {
 /// profile (`sandbox-exec: sandbox_apply: Operation not permitted`), the same check runs once
 /// without our profile — the host's own confinement of this daemon already applies to the child,
 /// and the product's only path policy is the launcher `allowed_roots` list, so this drops no
-/// security layer. The refusal is remembered for the daemon's lifetime ([`NESTED_SANDBOX_REFUSED`]),
+/// security layer. The refusal is remembered for the daemon's lifetime,
 /// so later checks skip the doomed wrapper and run directly; a run that fails for any other
 /// reason is returned untouched for the checker to report its cause.
 pub struct NestedSandboxFallbackRunner {

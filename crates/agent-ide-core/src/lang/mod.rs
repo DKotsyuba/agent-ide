@@ -660,7 +660,7 @@ pub trait LanguageSupport: Send + Sync {
     fn format_stdin_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>>;
 
     /// In-process structural check when this module has a parser available.
-    /// Bounded like the lexical outline: a text the checker refuses to attempt is [`Self::Unchecked`],
+    /// Bounded like the lexical outline: a text the checker refuses to attempt is [`SyntaxVerdict::Unchecked`],
     /// which lets the edit proceed and the project check report.
     fn syntax_verdict(&self, file: &Path, source: &str) -> SyntaxVerdict {
         let _ = (file, source);

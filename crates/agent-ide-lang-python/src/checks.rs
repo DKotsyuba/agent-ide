@@ -738,7 +738,7 @@ pub struct PythonChecks;
 
 impl LanguageChecks for PythonChecks {
     /// Python is present iff the worktree matches the shared marker rule
-    /// ([`crate::support::is_python_project`], the same list the project card uses): root
+    /// (`is_python_project`, the same list the project card uses): root
     /// `pyproject.toml`/`setup.py`/`setup.cfg`/`Pipfile`/`pyrightconfig.json`/`requirements*.txt`,
     /// a `.venv`/`venv` directory, or a bounded depth-1 probe of immediate subdirectories whose
     /// nested marker sits beside at least one `.py` file. This deliberately never walks the tree

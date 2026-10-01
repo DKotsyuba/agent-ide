@@ -256,7 +256,7 @@ impl LineAlign {
 }
 
 /// Aligns the lines of `before` onto `after`: `None` when either text is longer than
-/// [`ALIGN_MAX_LINES`] or their differing window exceeds [`ALIGN_WINDOW_LINES`] per side (the
+/// the line limit or their differing window exceeds the window limit per side (the
 /// caller then keeps its coarse movement note). Equal texts map identically. Pure and
 /// language-free; used to keep an edit reply's landing ranges exact across a formatter run.
 // ponytail: bounded LCS window; files > 5,000 lines skip the map and keep the coarse note.
