@@ -277,7 +277,10 @@ impl Worker<'_> {
         // One observation, one outline and one finish per distinct file; items reference files
         // by index so request order survives.
         let mut files: Vec<(PathBuf, SourceObservation, String, Outline)> = Vec::new();
-        let mut items: Vec<(String, Option<usize>)> = Vec::new();
+        // (rendered block, the file whose observation it retains, the address exactly as
+        // requested) — duplicates never become items, so an item's own address is what the
+        // continuation footer must name, never an index back into `requested`.
+        let mut items: Vec<(String, Option<usize>, String)> = Vec::new();
         let mut duplicates: Vec<String> = Vec::new();
         let mut seen: Vec<String> = Vec::new();
         for entry in requested {
@@ -305,7 +308,11 @@ impl Worker<'_> {
                     {
                         Ok(index) => index,
                         Err(FailureCode::NoSuchFile(_)) => {
-                            items.push((format!("no such file: {}\n", file.display()), None));
+                            items.push((
+                                format!("no such file: {}\n", file.display()),
+                                None,
+                                address.to_owned(),
+                            ));
                             continue;
                         }
                         Err(code) => return Err(code),
@@ -314,7 +321,7 @@ impl Worker<'_> {
                     match outline.find(&symbol) {
                         Some(found) => {
                             let text = render::read_text(&file, Some(address), found.range, source);
-                            items.push((text, Some(index)));
+                            items.push((text, Some(index), address.to_owned()));
                         }
                         None => items.push((
                             format!(
@@ -323,6 +330,7 @@ impl Worker<'_> {
                                 file.display()
                             ),
                             None,
+                            address.to_owned(),
                         )),
                     }
                 }
@@ -340,7 +348,11 @@ impl Worker<'_> {
                     {
                         Ok(index) => index,
                         Err(FailureCode::NoSuchFile(_)) => {
-                            items.push((format!("no such file: {path}\n"), None));
+                            items.push((
+                                format!("no such file: {path}\n"),
+                                None,
+                                address.to_owned(),
+                            ));
                             continue;
                         }
                         Err(code) => return Err(code),
@@ -355,12 +367,13 @@ impl Worker<'_> {
                                  ({total} lines)\n"
                             ),
                             None,
+                            address.to_owned(),
                         ));
                         continue;
                     }
                     let clamped = LineRange::new(range.start, range.end.min(total));
                     let text = render::read_text(&file, None, clamped, source);
-                    items.push((text, Some(index)));
+                    items.push((text, Some(index), address.to_owned()));
                 }
             }
         }
@@ -394,13 +407,12 @@ impl Worker<'_> {
                 format!("source_ref: {}\n", job.reference)
             }
         };
-        let follow_up = |cut: &[usize]| -> String {
-            let names: Vec<String> = cut
+        // The continuation footer names exactly the cut items' own requested addresses and the
+        // exact call that fetches them — one quoted entry per address, so the call is well formed.
+        let follow_up = |items: &[(String, Option<usize>, String)], cut: &[usize]| -> String {
+            let names: Vec<&str> = cut
                 .iter()
-                .map(|&index| match form {
-                    ReadBatch::Symbols => requested[index].as_str().unwrap_or_default().to_owned(),
-                    ReadBatch::Ranges => requested[index].as_str().unwrap_or_default().to_owned(),
-                })
+                .map(|&index| items[index].2.as_str())
                 .take(MAX_LANDING_SENTENCES)
                 .collect();
             let hidden = cut.len().saturating_sub(MAX_LANDING_SENTENCES);
@@ -424,14 +436,20 @@ impl Worker<'_> {
                 }
                 ReadBatch::Ranges => {
                     let path = job.parameters["path"].as_str().unwrap_or_default();
-                    let list = names.join(",");
+                    let call = names
+                        .iter()
+                        .map(|name| format!("\"{name}\""))
+                        .collect::<Vec<_>>()
+                        .join(",");
                     let mut footer = format!(
-                        "not included (over the reply budget): {list} — call ide.read \
-                         {{\"path\":\"{path}\",\"ranges\":[\"{list}\"]}}\n",
+                        "not included (over the reply budget): {} — call ide.read \
+                         {{\"path\":\"{path}\",\"ranges\":[{call}]}}",
+                        names.join(", ")
                     );
                     if hidden > 0 {
-                        footer.push_str(&format!("+{hidden} more\n"));
+                        footer.push_str(&format!("; +{hidden} more"));
                     }
+                    footer.push('\n');
                     footer
                 }
             }
@@ -442,7 +460,7 @@ impl Worker<'_> {
         let mut cut: Vec<usize> = Vec::new();
         let mut delivered: Vec<usize> = Vec::new();
         for index in 0..items.len() {
-            let (_, file) = &items[index];
+            let (_, file, _) = &items[index];
             let mut candidate_delivered = delivered.clone();
             if let Some(file) = file
                 && !candidate_delivered.contains(file)
@@ -451,7 +469,7 @@ impl Worker<'_> {
             }
             let candidate = items[..=index]
                 .iter()
-                .map(|(text, _)| text.as_str())
+                .map(|(text, ..)| text.as_str())
                 .collect::<String>()
                 + &source_line(&candidate_delivered);
             if fits(&candidate) {
@@ -464,7 +482,7 @@ impl Worker<'_> {
         }
         let mut text = items[..included]
             .iter()
-            .map(|(text, _)| text.as_str())
+            .map(|(text, ..)| text.as_str())
             .collect::<String>();
         text.push_str(&source_line(&delivered));
         if !duplicates.is_empty() {
@@ -479,25 +497,25 @@ impl Worker<'_> {
             ));
         }
         if !cut.is_empty() {
-            text.push_str(&follow_up(&cut));
+            text.push_str(&follow_up(&items, &cut));
         }
         // The footers may push the whole reply past the budget: give blocks back until it fits.
         while included > 0 && !fits(&text) {
             included -= 1;
-            if let Some((_, Some(file))) = items.get(included)
+            if let Some((_, Some(file), _)) = items.get(included)
                 && !items[..included]
                     .iter()
-                    .any(|(_, delivered)| *delivered == Some(*file))
+                    .any(|(_, delivered, _)| *delivered == Some(*file))
             {
                 delivered.retain(|&index| index != *file);
             }
             cut.insert(0, included);
             text = items[..included]
                 .iter()
-                .map(|(text, _)| text.as_str())
+                .map(|(text, ..)| text.as_str())
                 .collect::<String>();
             text.push_str(&source_line(&delivered));
-            text.push_str(&follow_up(&cut));
+            text.push_str(&follow_up(&items, &cut));
         }
         // Retain one edit base per delivered file: the first returns through the job tuple, the
         // rest ride the same detail as extra sources. A file whose every block was cut gets none.
@@ -506,12 +524,12 @@ impl Worker<'_> {
             .map(|&index| files[index].1.clone())
             .collect();
         let authority = self.authority(&binding).await.ok();
-        if included == 0 && items.iter().any(|(_, file)| file.is_some()) {
+        if included == 0 && items.iter().any(|(_, file, _)| file.is_some()) {
             // One block larger than the whole budget: deliver it alone through the ordinary
             // byte paging (editable once its last page has been delivered, T16B).
             let index = items
                 .iter()
-                .position(|(_, file)| file.is_some())
+                .position(|(_, file, _)| file.is_some())
                 .unwrap_or_default();
             let file = items[index].1.expect("selected item carries a file");
             let mut oversized = items[index].0.clone();
@@ -2259,12 +2277,32 @@ impl Worker<'_> {
             }
             None => observed.clone(),
         };
-        let (outline, _, from_text) = self.outline_of(job, &observed, &bytes).await?;
-        let lexical = from_text.and_then(|why| self.lexical_note(observed.path(), why));
         let entries = job.parameters["changes"]
             .as_array()
             .ok_or(FailureCode::Internal)?;
         let requests = parse_change_requests(entries)?;
+        // Only `symbol` and `within` addresses resolve against an outline: a batch of `lines`
+        // and `old` entries edits a file whose language outlines nowhere here (a probe-checked
+        // language without its server) exactly like the single line-range form does, instead of
+        // refusing provider_unavailable for addresses it never uses.
+        let needs_outline = requests.iter().any(|request| {
+            matches!(request, ChangeRequest::Symbol { .. })
+                || matches!(
+                    request,
+                    ChangeRequest::Old {
+                        within: Some(_),
+                        ..
+                    }
+                )
+        });
+        let mut outline: Option<Outline> = None;
+        let lexical = if needs_outline {
+            let (resolved, _, from_text) = self.outline_of(job, &observed, &bytes).await?;
+            outline = Some(resolved);
+            from_text.and_then(|why| self.lexical_note(observed.path(), why))
+        } else {
+            None
+        };
         let refused = |job: &mut Job, refusal: Refusal| -> FailureCode {
             job.failure_detail = Some(format!(
                 "edit:refused: {}",
@@ -2275,7 +2313,7 @@ impl Worker<'_> {
             ));
             FailureCode::EditRefused
         };
-        let changes = match resolve_changes(&source, &outline, &path, &requests) {
+        let changes = match resolve_changes(&source, outline.as_ref(), &path, &requests) {
             Ok(changes) => changes,
             Err(refusal) => return Err(refused(job, refusal)),
         };
@@ -3193,14 +3231,14 @@ fn find_old(source: &str, old: &str, scope: Option<LineRange>) -> OldMatch {
 
 /// Resolves every change against the base bytes and the base outline: a symbol an earlier change
 /// would create is simply not in the base outline, so a later change cannot address it. All
-/// refusals are collected so one reply names every failed change.
+/// refusals are collected so one reply names every failed change. `outline` is `None` only when
+/// no request addresses a symbol, so no arm below ever consults it then.
 fn resolve_changes(
     source: &str,
-    outline: &Outline,
+    outline: Option<&Outline>,
     path: &str,
     requests: &[ChangeRequest],
 ) -> Result<Vec<ResolvedChange>, Refusal> {
-    let support = outline.language.support();
     let spans = line_byte_spans(source);
     let line_of = |byte: usize| -> u32 {
         1 + spans
@@ -3247,6 +3285,8 @@ fn resolve_changes(
                     continue;
                 }
                 if *op == "insert" {
+                    let outline = outline.expect("an insert entry resolves against the outline");
+                    let support = outline.language.support();
                     let where_ = match where_.as_deref() {
                         Some("before") => lang::InsertWhere::Before,
                         Some("after") => lang::InsertWhere::After,
@@ -3296,7 +3336,10 @@ fn resolve_changes(
                         ),
                     }
                 } else {
-                    let Some(found) = outline.find(symbol) else {
+                    let Some(found) = outline
+                        .expect("a symbol entry resolves against the outline")
+                        .find(symbol)
+                    else {
                         no_symbol(requested, &mut refusal);
                         continue;
                     };
@@ -3317,8 +3360,11 @@ fn resolve_changes(
                     Some(within) => match SymbolPath::parse(within)
                         .ok()
                         .filter(|symbol| symbol.file().is_none_or(|file| file == Path::new(path)))
-                        .and_then(|symbol| outline.find(&symbol))
-                    {
+                        .and_then(|symbol| {
+                            outline
+                                .expect("a `within` address resolves against the outline")
+                                .find(&symbol)
+                        }) {
                         Some(found) => Some(found.range),
                         None => {
                             refusal.push(
@@ -3456,9 +3502,11 @@ fn syntax_sentence(
 /// Applies resolved changes and returns the candidate with each change's exact final line range
 /// (post-splice, pre-format). Application is bottom-up — descending base start, and among equal
 /// starts in reverse array order, so two inserts at one anchor keep their array order in the
-/// file — so the text above any change is untouched when it applies and its final range is exact
-/// by construction. Overlapping spans, an insert strictly inside another change's span, and a
-/// range past the end of the file are refused with nothing applied.
+/// file — so every change's base numbers are still valid when it applies; its landing span is
+/// recorded where the application left it and then shifted by every later application above it,
+/// so the reported range is where the change's text sits in the final file. Overlapping spans,
+/// an insert strictly inside another change's span, and a range past the end of the file are
+/// refused with nothing applied.
 fn apply_changes(
     source: &str,
     path: &str,
@@ -3521,29 +3569,52 @@ fn apply_changes(
             .then(b.cmp(&a))
     });
     let mut buffer = source.to_owned();
+    // Each change's span is recorded where its application left it, then shifted by every later
+    // application above it: application runs bottom-up, so a change that changes the line count
+    // moves the already-applied changes below it, and the reply must report where each change's
+    // text finally sits, not where it sat when it applied.
+    let mut recorded: Vec<(usize, Option<LineRange>)> = Vec::with_capacity(changes.len());
     for &index in &order {
         let change = &changes[index];
-        buffer = match &change.action {
-            ChangeAction::Replace(content) => splice_lines(&buffer, change.base, content),
-            ChangeAction::Delete => delete_symbol_lines(&buffer, change.base),
-            ChangeAction::Insert(site, content) => insert_lines(&buffer, site, content),
-        };
-    }
-    let landings = changes
-        .iter()
-        .map(|change| match &change.action {
-            ChangeAction::Replace(content) if !content.is_empty() => Some(LineRange::new(
-                change.base.start,
-                change.base.start + lang::line_count(content) - 1,
-            )),
+        let before = lang::line_count(&buffer);
+        let applied = match &change.action {
+            ChangeAction::Replace(content) => {
+                buffer = splice_lines(&buffer, change.base, content);
+                (!content.is_empty()).then(|| {
+                    let produced = lang::line_count(content);
+                    LineRange::new(change.base.start, change.base.start + produced - 1)
+                })
+            }
+            ChangeAction::Delete => {
+                buffer = delete_symbol_lines(&buffer, change.base);
+                None
+            }
             ChangeAction::Insert(site, content) => {
+                buffer = insert_lines(&buffer, site, content);
                 let block = indent_block(content, &site.indent);
                 let start = change.base.start + u32::from(site.blank_before);
                 Some(LineRange::new(start, start + lang::line_count(&block) - 1))
             }
-            _ => None,
-        })
-        .collect();
+        };
+        let shift = i64::from(lang::line_count(&buffer)) - i64::from(before);
+        for (_, span) in &mut recorded {
+            // An insert lands before its anchor line, so a span at that line moves too.
+            let moves = match (&change.action, span.as_ref()) {
+                (ChangeAction::Insert(..), Some(span)) => span.start >= change.base.start,
+                (_, Some(span)) => span.start > change.base.end,
+                (_, None) => false,
+            };
+            if moves && let Some(span) = span {
+                *span = LineRange::new(
+                    (i64::from(span.start) + shift).max(1) as u32,
+                    (i64::from(span.end) + shift).max(1) as u32,
+                );
+            }
+        }
+        recorded.push((index, applied));
+    }
+    recorded.sort_by_key(|(index, _)| *index);
+    let landings = recorded.into_iter().map(|(_, span)| span).collect();
     Ok((buffer, landings))
 }
 
@@ -3754,18 +3825,21 @@ mod batch_tests {
                 within: None,
             },
         ];
-        let changes = resolve_changes(source, &outline, "a.gamma", &requests).expect("all resolve");
+        let changes =
+            resolve_changes(source, Some(&outline), "a.gamma", &requests).expect("all resolve");
         let (candidate, now) = apply_changes(source, "a.gamma", &changes).expect("no overlaps");
         assert_eq!(
             candidate,
             "sym card\n7\n8\nsym btn\nthree\nend\nmark,two\nend\n"
         );
+        // The lines change grew by one line, so everything below it lands one line lower than
+        // its base numbers: the reply reports where each change's text sits in the final file.
         assert_eq!(now[0], Some(LineRange::new(1, 3)), "lines 1-2 became 1-3");
-        assert_eq!(now[1], Some(LineRange::new(3, 5)), "btn spans 3-5");
+        assert_eq!(now[1], Some(LineRange::new(4, 6)), "btn spans 4-6");
         assert_eq!(
             now[2],
-            Some(LineRange::new(6, 6)),
-            "mark,two stays one line"
+            Some(LineRange::new(7, 7)),
+            "mark,two stays one line, shifted down one"
         );
     }
 
@@ -3855,14 +3929,21 @@ mod batch_tests {
             );
             assert_eq!(result.is_ok(), allowed, "insert at {line}");
         }
-        // Two inserts at one anchor keep their array order in the file.
-        let (candidate, _) = apply_changes(
+        // Two inserts at one anchor keep their array order in the file, and each reports where
+        // its own block landed: the earlier array entry applies last, above the other.
+        let (candidate, now) = apply_changes(
             source,
             "a.gamma",
             &[insert_at(1, 3, "first"), insert_at(2, 3, "second")],
         )
         .unwrap();
         assert_eq!(candidate, "a\nb\nfirst\nsecond\nc\nd\ne\nf\n");
+        assert_eq!(now[0], Some(LineRange::new(3, 3)), "first lands at 3");
+        assert_eq!(
+            now[1],
+            Some(LineRange::new(4, 4)),
+            "second lands below the later insert"
+        );
         // A range past the end is refused with the unified grammar.
         assert_eq!(
             apply_changes(
@@ -3892,7 +3973,7 @@ mod batch_tests {
                 new: "stain".to_owned(),
                 within: within.map(str::to_owned),
             }];
-            resolve_changes(source, &outline, "a.gamma", &requests)
+            resolve_changes(source, Some(&outline), "a.gamma", &requests)
         };
         // Ambiguous in the file, unique inside the card's btn symbol.
         match resolve("mark", None) {
@@ -3927,7 +4008,7 @@ mod batch_tests {
             new: "YM BTN".to_owned(),
             within: None,
         }];
-        let changes = resolve_changes(source, &outline, "a.gamma", &requests).unwrap();
+        let changes = resolve_changes(source, Some(&outline), "a.gamma", &requests).unwrap();
         let (candidate, _) = apply_changes(source, "a.gamma", &changes).unwrap();
         assert!(
             candidate.starts_with("sym card\n1\nsYM BTN\n"),
@@ -3957,7 +4038,7 @@ mod batch_tests {
                 content: None,
             },
         ];
-        match resolve_changes(source, &outline, "a.gamma", &requests) {
+        match resolve_changes(source, Some(&outline), "a.gamma", &requests) {
             Err(refusal) => assert!(
                 refusal.detail().contains(
                     "change 2: no symbol a.gamma#card/made; check ide.outline \

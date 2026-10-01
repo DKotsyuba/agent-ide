@@ -7179,6 +7179,1226 @@ async fn configured_product_batch_read_then_edit_reports_landings_and_bytes() {
     daemon.wait().await.unwrap();
 }
 
+/// The acceptance Python interpreter the syntax probe runs, overridable through the environment.
+fn batch_python_interpreter() -> String {
+    std::env::var("AGENT_IDE_PYTHON").unwrap_or_else(|_| {
+        "/Users/pluto/.local/share/uv/python/cpython-3.14-macos-aarch64-none/bin/python3.14"
+            .to_owned()
+    })
+}
+
+/// A symbol-test fixture whose `src/batch.rs` is declared from `src/lib.rs`, so edits of it are
+/// reached by the project check of exactly the bytes under test.
+fn batch_edit_fixture(batch: &str) -> ProductFixture {
+    let fixture = symbol_test_fixture();
+    std::fs::write(fixture.root.join("src/batch.rs"), batch).unwrap();
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub struct FileFlag;\nimpl FileFlag { pub fn is_file(&self) -> bool { true } }\npub mod batch;\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "src/batch.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "batch edit fixture"]);
+    fixture
+}
+
+/// Calls one tool and returns its structured reply beside the compact text block the model sees.
+async fn batch_call_with_text(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    name: &str,
+    arguments: Value,
+) -> (Value, String) {
+    actor.next += 1;
+    let call = format!("call-{}", actor.next);
+    actor.lifecycle(fixture, "PreToolUse", &call).await;
+    let reply = actor
+        .mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
+            "name":name,"arguments":arguments,"_meta":{"threadId":actor.actor,"callId":call,
+            "x-codex-turn-metadata":{},"codex/sandbox-state-meta":actor.state}}}),
+        )
+        .await;
+    actor.lifecycle(fixture, "PostToolUse", &call).await;
+    assert_compact_envelope(&reply);
+    let text = reply["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    (reply["result"]["structuredContent"].clone(), text)
+}
+
+/// [`ProductActor::settle`] for calls whose compact text must be asserted too.
+async fn batch_settle_with_text(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    mut reply: (Value, String),
+) -> (Value, String) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+    let mut polls = 0;
+    let mut delay = PRODUCT_SETTLE_INITIAL_DELAY;
+    while reply.0["state"] == "pending" {
+        assert!(
+            tokio::time::Instant::now() < deadline && polls < PRODUCT_SETTLE_MAX_POLLS,
+            "product operation did not settle: {}",
+            reply.0
+        );
+        let reference = reply.0["detail_ref"].as_str().unwrap().to_owned();
+        tokio::time::sleep(delay).await;
+        polls += 1;
+        reply = batch_call_with_text(
+            actor,
+            fixture,
+            "ide.inspect",
+            json!({"detail_ref":reference}),
+        )
+        .await;
+        delay = delay.saturating_mul(2).min(PRODUCT_SETTLE_MAX_DELAY);
+    }
+    reply
+}
+
+/// Starts one actor over `fixture` and warms the analyzer until `path`'s outline answers from
+/// the live server, so no later reply carries the loading-time `outline: from source` note.
+async fn batch_started_actor(
+    fixture: &ProductFixture,
+    name: &'static str,
+    path: &str,
+) -> ProductActor {
+    let mut actor = ProductActor::new(fixture, name).await;
+    let started = actor
+        .call(fixture, "ide.start", json!({"activation_id":name}))
+        .await;
+    assert_eq!(actor.settle(fixture, started).await["kind"], "activation");
+    batch_wait_semantic_outline(&mut actor, fixture, path).await;
+    actor
+}
+
+/// Strips a due status plate a settled reply may lead with (T28B); the plate rides the
+/// structured `status` field, never the edit text under test here.
+fn batch_without_status_plate(text: &str) -> &str {
+    match text.strip_prefix("<agent-ide>\n") {
+        Some(rest) => {
+            let end = rest.find("\n</agent-ide>\n").expect("closed status plate");
+            &rest[end + "\n</agent-ide>\n".len()..]
+        }
+        None => text,
+    }
+}
+
+/// Waits until `path`'s outline answers from the live server, not the loading-time source
+/// outline, so symbol-addressed edits never carry the `outline: from source` note.
+async fn batch_wait_semantic_outline(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    path: &str,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let outline = actor
+            .call(fixture, "ide.outline", json!({"path":path}))
+            .await;
+        let settled = actor.settle(fixture, outline).await;
+        assert_eq!(settled["kind"], "outline", "{settled}");
+        let text = settled["text"].as_str().unwrap_or_default();
+        if !text.contains("outline: from source") {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server never answered: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+/// Renders the diagnostics segment of an edit reply's first line for the state that same reply
+/// reports, so a byte-exact text assertion does not depend on whether this machine's confined
+/// project checks can run at all (a Seatbelt-denied host answers `unknown` for every edit).
+fn batch_diagnostics_segment(edit: &Value) -> String {
+    match edit["diagnostics"]["state"].as_str().unwrap_or_default() {
+        "current_clean" => "diagnostics: current_clean. Next: use ide.diff".to_owned(),
+        "unknown" => "diagnostics: unknown. Next: use ide.context".to_owned(),
+        "not_analysed" => format!(
+            "diagnostics: not_analysed ({}); declare it, then edit again",
+            edit["diagnostics"]["reason"].as_str().unwrap_or_default()
+        ),
+        other => panic!("unexpected diagnostics state {other}: {edit}"),
+    }
+}
+
+/// Case 1: `old` text that matches nothing refuses the whole batch naming the change and quoting
+/// the closest line, writes nothing, and the same `operation_id` retries once the text is fixed.
+#[tokio::test]
+async fn configured_product_batch_old_not_found_refuses_and_retries_the_same_operation_id() {
+    let batch = "pub fn first() -> i32 {\n    1\n}\n\npub fn second() -> i32 {\n    2\n}\n";
+    let fixture = batch_edit_fixture(batch);
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = batch_started_actor(&fixture, "batch-old-miss", "src/batch.rs").await;
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"symbols":["src/batch.rs#first","src/batch.rs#second"]}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let source_ref = read["detail_ref"].as_str().unwrap();
+
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-miss-once",
+            "path":"src/batch.rs",
+            "source_ref":source_ref,
+            "changes":[
+                {"lines":"1-1","content":"// touched"},
+                {"old":"pub fn missing() -> i32 {\n    9\n}","new":"pub fn missing() -> i32 {\n    8\n}"}
+            ]
+        }),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["state"], "error", "{refused}");
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert_eq!(
+        batch_without_status_plate(&refused_text),
+        "error: edit_refused (edit:refused); 1 of 2 changes refused, nothing written — \
+         change 2: old text not found; closest line 1: \"pub fn first() -> i32 {\". \
+         Fix the named changes and retry with the same operation_id",
+        "{refused_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/batch.rs")).unwrap(),
+        batch.as_bytes()
+    );
+
+    let retried = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-miss-once",
+            "path":"src/batch.rs",
+            "source_ref":source_ref,
+            "changes":[
+                {"lines":"1-3","content":"// touched"},
+                {"old":"pub fn second() -> i32 {\n    2\n}","new":"pub fn second() -> i32 {\n    42\n}"}
+            ]
+        }),
+    )
+    .await;
+    let (retried, retried_text) = batch_settle_with_text(&mut actor, &fixture, retried).await;
+    let edit_ref = retried["result"]["source_ref"].as_str().unwrap();
+    assert_eq!(
+        batch_without_status_plate(&retried_text),
+        format!(
+            "edit: replaced; path src/batch.rs; source_ref {edit_ref}; {}\n2 changes applied: \
+             change 1: lines 1–3 replaced (now 1); change 2: old text at line 5 replaced (now 3–5)",
+            batch_diagnostics_segment(&retried)
+        ),
+        "{retried_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/batch.rs")).unwrap(),
+        b"// touched\n\npub fn second() -> i32 {\n    42\n}\n"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Case 2: `old` text matching two places refuses listing both lines and suggesting `within`;
+/// the retry scoped by `within` writes exactly the one match.
+#[tokio::test]
+async fn configured_product_batch_old_ambiguous_lists_both_lines_and_within_retry_writes() {
+    let batch = "fn helper(value: i32) {\n    let _ = value;\n}\n\npub fn alpha() {\n    \
+                 helper(0);\n}\n\npub fn beta() {\n    helper(0);\n}\n";
+    let fixture = batch_edit_fixture(batch);
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = batch_started_actor(&fixture, "batch-old-two", "src/batch.rs").await;
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"symbols":["src/batch.rs#alpha","src/batch.rs#beta"]}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let source_ref = read["detail_ref"].as_str().unwrap();
+
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-ambiguous-once",
+            "path":"src/batch.rs",
+            "source_ref":source_ref,
+            "changes":[{"old":"helper(0);","new":"helper(9);"}]
+        }),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert_eq!(
+        batch_without_status_plate(&refused_text),
+        "error: edit_refused (edit:refused); 1 of 1 changes refused, nothing written — \
+         change 1: old text matches 2 places (lines 6, 10); add \"within\":\"<symbol>\" or \
+         more surrounding lines. Fix the named changes and retry with the same operation_id",
+        "{refused_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/batch.rs")).unwrap(),
+        batch.as_bytes()
+    );
+
+    let scoped = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-ambiguous-once",
+            "path":"src/batch.rs",
+            "source_ref":source_ref,
+            "changes":[{"old":"helper(0);","new":"helper(9);","within":"src/batch.rs#beta"}]
+        }),
+    )
+    .await;
+    let (scoped, scoped_text) = batch_settle_with_text(&mut actor, &fixture, scoped).await;
+    let edit_ref = scoped["result"]["source_ref"].as_str().unwrap();
+    assert_eq!(
+        batch_without_status_plate(&scoped_text),
+        format!(
+            "edit: replaced; path src/batch.rs; source_ref {edit_ref}; {}\n1 changes applied: \
+             change 1: old text at line 10 replaced (now 10)",
+            batch_diagnostics_segment(&scoped)
+        ),
+        "{scoped_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/batch.rs")).unwrap(),
+        b"fn helper(value: i32) {\n    let _ = value;\n}\n\npub fn alpha() {\n    helper(0);\n}\n\npub fn beta() {\n    helper(9);\n}\n"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Case 3: two changes whose base ranges intersect are refused together, both changes and both
+/// base spans named, and nothing is written.
+#[tokio::test]
+async fn configured_product_batch_overlapping_changes_refuse_naming_both_ranges() {
+    let batch = "pub fn first() -> i32 {\n    1\n}\n\npub fn second() -> i32 {\n    2\n}\n";
+    let fixture = batch_edit_fixture(batch);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = batch_started_actor(&fixture, "batch-overlap", "src/batch.rs").await;
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"symbols":["src/batch.rs#first"]}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let source_ref = read["detail_ref"].as_str().unwrap();
+
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-overlap-once",
+            "path":"src/batch.rs",
+            "source_ref":source_ref,
+            "changes":[{"lines":"1-2","content":"// a"},{"lines":"2-3","content":"// b"}]
+        }),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert_eq!(
+        batch_without_status_plate(&refused_text),
+        "error: edit_refused (edit:refused); 2 of 2 changes refused, nothing written — \
+         changes 1 and 2 overlap (base lines 1–2 and 2–3); merge them or narrow the ranges. \
+         Fix the named changes and retry with the same operation_id",
+        "{refused_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/batch.rs")).unwrap(),
+        batch.as_bytes()
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Case 4: a change may not address a symbol only an earlier change of the same call creates —
+/// the base outline knows nothing of it, so the reply refuses that change by name.
+#[tokio::test]
+async fn configured_product_batch_cannot_address_a_symbol_an_earlier_change_would_create() {
+    let batch = "pub fn alpha() -> i32 {\n    1\n}\n";
+    let fixture = batch_edit_fixture(batch);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = batch_started_actor(&fixture, "batch-future-symbol", "src/batch.rs").await;
+    // A symbol-only batch needs no source_ref; the read is only the outline warm-up above.
+
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-future-once",
+            "path":"src/batch.rs",
+            "changes":[
+                {"symbol":"src/batch.rs#alpha","op":"insert","where":"after",
+                 "content":"pub fn gamma() -> i32 {\n    3\n}"},
+                {"symbol":"src/batch.rs#gamma","op":"replace",
+                 "content":"pub fn gamma() -> i32 {\n    4\n}"}
+            ]
+        }),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert_eq!(
+        batch_without_status_plate(&refused_text),
+        "error: edit_refused (edit:refused); 1 of 2 changes refused, nothing written — \
+         change 2: no symbol src/batch.rs#gamma; check ide.outline {\"path\":\"src/batch.rs\"}. \
+         Fix the named changes and retry with the same operation_id",
+        "{refused_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/batch.rs")).unwrap(),
+        batch.as_bytes()
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Case 5: a `lines` change past the end of the file is refused naming the change and the file's
+/// real length, with nothing written.
+#[tokio::test]
+async fn configured_product_batch_lines_past_end_refuses_naming_the_file_length() {
+    let batch = "pub fn first() -> i32 {\n    1\n}\n\npub fn second() -> i32 {\n    2\n}\n";
+    let fixture = batch_edit_fixture(batch);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = batch_started_actor(&fixture, "batch-past-end", "src/batch.rs").await;
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"symbols":["src/batch.rs#first"]}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let source_ref = read["detail_ref"].as_str().unwrap();
+
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-past-end-once",
+            "path":"src/batch.rs",
+            "source_ref":source_ref,
+            "changes":[{"lines":"9-9","content":"// nowhere"}]
+        }),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert_eq!(
+        batch_without_status_plate(&refused_text),
+        "error: edit_refused (edit:refused); 1 of 1 changes refused, nothing written — \
+         change 1: lines 9 is past the end of src/batch.rs (7 lines); re-read the file. \
+         Fix the named changes and retry with the same operation_id",
+        "{refused_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/batch.rs")).unwrap(),
+        batch.as_bytes()
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Case 6: a Rust candidate that does not parse is refused naming the change, its line and an
+/// excerpt, with nothing written; a base that already had the same syntax error is still edited,
+/// and the reply notes the pre-existing error instead of refusing.
+#[tokio::test]
+async fn configured_product_batch_rust_syntax_gate_refuses_and_notes_pre_existing_errors() {
+    let batch = "pub fn helper() -> i32 {\n    1\n}\n\npub fn target() -> i32 {\n    helper()\n}\n";
+    let fixture = batch_edit_fixture(batch);
+    // An undeclared file that already does not parse: the gate must proceed (the note names the
+    // pre-existing error) rather than strand the file, and it is never claimed clean.
+    let broken = "pub fn helper() -> i32 {\n    1\n}\n\npub fn target( -> i32 {\n    helper()\n}\n";
+    std::fs::write(fixture.root.join("src/broken.rs"), broken).unwrap();
+    fixture.git(&["add", "--", "src/broken.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "pre-broken fixture"]);
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = batch_started_actor(&fixture, "batch-syntax", "src/batch.rs").await;
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"symbols":["src/batch.rs#target"]}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let source_ref = read["detail_ref"].as_str().unwrap();
+
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-syntax-once",
+            "path":"src/batch.rs",
+            "source_ref":source_ref,
+            "changes":[{"old":"pub fn target() -> i32 {","new":"pub fn target( -> i32 {"}]
+        }),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert_eq!(
+        batch_without_status_plate(&refused_text),
+        "error: edit_refused (edit:refused); 1 of 1 changes refused, nothing written — \
+         change 1 produced a syntax error at line 5: \"cannot parse string into token stream\" \
+         (candidate lines 3-7: \"}\\n\\npub fn target( -> i32 {\\n    helper()\\n}\"); candidate \
+         not written. Fix the named changes and retry with the same operation_id",
+        "{refused_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/batch.rs")).unwrap(),
+        batch.as_bytes()
+    );
+
+    let broken_read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"src/broken.rs","ranges":["1-7"]}),
+        )
+        .await;
+    let broken_read = actor.settle(&fixture, broken_read).await;
+    let broken_ref = broken_read["detail_ref"].as_str().unwrap();
+    let applied = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-syntax-broken",
+            "path":"src/broken.rs",
+            "source_ref":broken_ref,
+            "changes":[{"old":"    1","new":"    2"}]
+        }),
+    )
+    .await;
+    let (applied, applied_text) = batch_settle_with_text(&mut actor, &fixture, applied).await;
+    let broken_edit_ref = applied["result"]["source_ref"].as_str().unwrap();
+    assert_eq!(
+        batch_without_status_plate(&applied_text),
+        format!(
+            "edit: replaced; path src/broken.rs; source_ref {broken_edit_ref}; {}\n1 changes \
+             applied: change 1: old text at line 2 replaced (now 2)\nnote: src/broken.rs already \
+             had a syntax error (line 5) before this edit; edit applied",
+            batch_diagnostics_segment(&applied)
+        ),
+        "{applied_text}"
+    );
+    assert!(
+        matches!(
+            applied["diagnostics"]["state"].as_str(),
+            Some("not_analysed" | "unknown")
+        ),
+        "an undeclared file is never claimed clean: {applied}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/broken.rs")).unwrap(),
+        b"pub fn helper() -> i32 {\n    2\n}\n\npub fn target( -> i32 {\n    helper()\n}\n"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Case 7: several refused changes answer in one reply, each named in request order, and the
+/// whole refusal stays inside its 512-byte detail bound however many changes refuse.
+#[tokio::test]
+async fn configured_product_batch_several_refusals_in_one_bounded_reply() {
+    let long_comment = format!("// {}\n", "x".repeat(120));
+    // The refusal quotes at most 80 bytes of the closest line, cut at the byte boundary.
+    let clipped_comment = format!("{}…", "x".repeat(77));
+    let batch = format!("{long_comment}pub fn first() -> i32 {{\n    1\n}}\n");
+    let fixture = batch_edit_fixture(&batch);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = batch_started_actor(&fixture, "batch-many-refused", "src/batch.rs").await;
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"symbols":["src/batch.rs#first"]}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let source_ref = read["detail_ref"].as_str().unwrap();
+
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-many-once",
+            "path":"src/batch.rs",
+            "source_ref":source_ref,
+            "changes":[
+                {"lines":"1-1","content":"// ok"},
+                {"old":"definitely absent two","new":"x"},
+                {"symbol":"src/batch.rs#nope","op":"delete"}
+            ]
+        }),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert_eq!(
+        batch_without_status_plate(&refused_text),
+        format!(
+            "error: edit_refused (edit:refused); 2 of 3 changes refused, nothing written — \
+             change 2: old text not found; closest line 1: \"// {clipped_comment}\"; change 3: \
+             no symbol src/batch.rs#nope; check ide.outline {{\"path\":\"src/batch.rs\"}}. \
+             Fix the named changes and retry with the same operation_id"
+        ),
+        "{refused_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/batch.rs")).unwrap(),
+        batch.as_bytes()
+    );
+
+    // Five refusals with full-length excerpts overflow the bound: the reply is clipped at the
+    // bound (never past it) and stays a single actionable line.
+    let changes: Vec<Value> = (0..5)
+        .map(|number| json!({"old":format!("definitely absent {number}"),"new":"x"}))
+        .collect();
+    let clipped = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-many-clipped",
+            "path":"src/batch.rs",
+            "source_ref":source_ref,
+            "changes":changes
+        }),
+    )
+    .await;
+    let (clipped, clipped_text) = batch_settle_with_text(&mut actor, &fixture, clipped).await;
+    assert_eq!(clipped["code"], "edit_refused", "{clipped}");
+    let prefix = "error: edit_refused (edit:refused); ";
+    let suffix = ". Fix the named changes and retry with the same operation_id";
+    assert!(
+        clipped_text.starts_with(
+            "error: edit_refused (edit:refused); 5 of 5 changes refused, nothing written — \
+             change 1: old text not found; closest line 1: \""
+        ),
+        "{clipped_text}"
+    );
+    assert!(clipped_text.ends_with(suffix), "{clipped_text}");
+    assert!(
+        !clipped_text.contains("change 5:"),
+        "the bound must clip before the fifth change is fully named: {clipped_text}"
+    );
+    assert!(
+        clipped_text.len() <= prefix.len() + 512 + suffix.len(),
+        "the refusal detail stays inside its byte bound: {clipped_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/batch.rs")).unwrap(),
+        batch.as_bytes()
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Builds the Python fixture of the syntax-gate tests: a manifest, a `.venv` whose `bin/python`
+/// is either the acceptance interpreter (a real symlink) or a shim that always exits 1 (no
+/// checker is proven, so edits proceed `Unchecked`), and one `svc/app.py`.
+fn batch_python_fixture(interpreter: Option<&str>) -> ProductFixture {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    std::fs::remove_file(fixture.root.join("go.mod")).unwrap();
+    std::fs::remove_file(fixture.root.join("main.go")).unwrap();
+    std::fs::remove_file(fixture.root.join("src/lib.rs")).unwrap();
+    std::fs::remove_dir_all(fixture.root.join("src")).unwrap();
+    std::fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(fixture.root.join(".venv/bin")).unwrap();
+    std::fs::create_dir_all(fixture.root.join("svc")).unwrap();
+    let venv_python = fixture.root.join(".venv/bin/python");
+    match interpreter {
+        Some(interpreter) => {
+            std::os::unix::fs::symlink(interpreter, &venv_python).unwrap();
+        }
+        None => {
+            std::fs::write(&venv_python, "#!/bin/sh\nexit 1\n").unwrap();
+            std::fs::set_permissions(&venv_python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    std::fs::write(
+        fixture.root.join("svc/app.py"),
+        "def value():\n    return 1\n\n\ndef broken():\n    return 2\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "pyproject.toml", "svc/app.py"]);
+    fixture.git(&["commit", "--quiet", "-m", "python batch fixture"]);
+    fixture
+}
+
+/// Case 8 (Python): the interpreter probe refuses a candidate Python cannot parse, exactly as
+/// the in-process Rust check does, and writes a good one; with no proven checker the same broken
+/// candidate proceeds (`Unchecked`), never blocking the edit.
+#[tokio::test]
+async fn configured_product_batch_python_syntax_gate_refuses_writes_and_proceeds_unchecked() {
+    let interpreter = batch_python_interpreter();
+    assert!(
+        Path::new(&interpreter).is_file(),
+        "the acceptance Python interpreter must exist: {interpreter}"
+    );
+    let fixture = batch_python_fixture(Some(&interpreter));
+    let mut daemon = fixture.daemon().await;
+    // No Python server is configured: the fixture starts without an outline warm-up, exactly
+    // like a probe-checked language on a host without its language server.
+    let mut actor = ProductActor::new(&fixture, "batch-py-gate").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"batch-py-gate"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let read = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"svc/app.py","byte_offset":0}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    assert_eq!(read["kind"], "context", "{read}");
+    let source_ref = read["detail_ref"].as_str().unwrap();
+    let original =
+        String::from_utf8(std::fs::read(fixture.root.join("svc/app.py")).unwrap()).unwrap();
+
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-py-broken",
+            "path":"svc/app.py",
+            "source_ref":source_ref,
+            "changes":[{"old":"def broken():","new":"def broken(:"}]
+        }),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert_eq!(
+        batch_without_status_plate(&refused_text),
+        "error: edit_refused (edit:refused); 1 of 1 changes refused, nothing written — \
+         change 1 produced a syntax error at line 5: \"invalid syntax\" (candidate lines 3-6: \
+         \"\\n\\ndef broken(:\\n    return 2\"); candidate not written. Fix the named changes \
+         and retry with the same operation_id",
+        "{refused_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("svc/app.py")).unwrap(),
+        original.as_bytes()
+    );
+
+    let written = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-py-broken",
+            "path":"svc/app.py",
+            "source_ref":source_ref,
+            "changes":[{"old":"def broken():","new":"def broken(value):"}]
+        }),
+    )
+    .await;
+    let (written, written_text) = batch_settle_with_text(&mut actor, &fixture, written).await;
+    assert_eq!(written["result"]["outcome"], "replaced", "{written}");
+    let python_ref = written["result"]["source_ref"].as_str().unwrap();
+    assert_eq!(
+        batch_without_status_plate(&written_text),
+        format!(
+            "edit: replaced; path svc/app.py; source_ref {python_ref}; {}\n1 changes applied: \
+             change 1: old text at line 5 replaced (now 5)",
+            batch_diagnostics_segment(&written)
+        ),
+        "{written_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("svc/app.py")).unwrap(),
+        b"def value():\n    return 1\n\n\ndef broken(value):\n    return 2\n"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+
+    // No proven checker: the same broken candidate is written, and the reply says nothing about
+    // syntax — the project check reports, exactly as before the gate existed.
+    let fixture = batch_python_fixture(None);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "batch-py-unchecked").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"batch-py-unchecked"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let read = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"svc/app.py","byte_offset":0}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let source_ref = read["detail_ref"].as_str().unwrap();
+    let unchecked = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-py-unchecked",
+            "path":"svc/app.py",
+            "source_ref":source_ref,
+            "changes":[{"old":"def broken():","new":"def broken(:"}]
+        }),
+    )
+    .await;
+    let (unchecked, unchecked_text) = batch_settle_with_text(&mut actor, &fixture, unchecked).await;
+    assert_eq!(unchecked["result"]["outcome"], "replaced", "{unchecked}");
+    assert_eq!(
+        unchecked["note"].as_str().unwrap_or_default(),
+        "1 changes applied: change 1: old text at line 5 replaced (now 5)",
+        "{unchecked}"
+    );
+    assert!(
+        !unchecked_text.contains("syntax error"),
+        "no checker was proven, so nothing may read as a syntax refusal: {unchecked_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("svc/app.py")).unwrap(),
+        b"def value():\n    return 1\n\n\ndef broken(:\n    return 2\n"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Case 8 (TypeScript): the node/typescript probe refuses a candidate the project's own parser
+/// rejects and writes a good one, through the same refusal grammar as every language.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_TSSERVER and AGENT_IDE_NODE environment"]
+async fn configured_product_batch_typescript_syntax_gate_refuses_and_writes() {
+    let tsserver = PathBuf::from(std::env::var("AGENT_IDE_TSSERVER").unwrap());
+    let typescript = tsserver.parent().unwrap().parent().unwrap().to_path_buf();
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    std::fs::remove_file(fixture.root.join("go.mod")).unwrap();
+    std::fs::remove_file(fixture.root.join("main.go")).unwrap();
+    std::fs::remove_file(fixture.root.join("src/lib.rs")).unwrap();
+    std::fs::remove_dir_all(fixture.root.join("src")).unwrap();
+    std::fs::write(
+        fixture.root.join("package.json"),
+        "{\"name\":\"fixture\",\"private\":true}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(fixture.root.join("node_modules")).unwrap();
+    std::os::unix::fs::symlink(&typescript, fixture.root.join("node_modules/typescript")).unwrap();
+    let app = "function value(): number {\n    return 1;\n}\n\nfunction broken(): number {\n    \
+               return 2;\n}\n";
+    std::fs::write(fixture.root.join("app.ts"), app).unwrap();
+    fixture.git(&["add", "--", "package.json", "app.ts"]);
+    fixture.git(&["commit", "--quiet", "-m", "typescript batch fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "batch-ts-gate").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"batch-ts-gate"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    // No TypeScript server launch is accepted, so symbol reads wait for a server that cannot
+    // start; the edit's `old`-text addresses need no outline, and `ide.context` mints the
+    // edit-admissible source the same way.
+    let read = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"app.ts","byte_offset":0}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    assert_eq!(read["kind"], "context", "{read}");
+    let source_ref = read["detail_ref"].as_str().unwrap();
+
+    let refused = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-ts-broken",
+            "path":"app.ts",
+            "source_ref":source_ref,
+            "changes":[{"old":"function broken(): number {","new":"function broken( : number {"}]
+        }),
+    )
+    .await;
+    let (refused, refused_text) = batch_settle_with_text(&mut actor, &fixture, refused).await;
+    assert_eq!(refused["code"], "edit_refused", "{refused}");
+    assert_eq!(
+        batch_without_status_plate(&refused_text),
+        "error: edit_refused (edit:refused); 1 of 1 changes refused, nothing written — \
+         change 1 produced a syntax error at line 5: \"Parameter declaration expected.\" \
+         (candidate lines 3-7: \"}\\n\\nfunction broken( : number {\\n    return 2;\\n}\"); \
+         candidate not written. Fix the named changes and retry with the same operation_id",
+        "{refused_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("app.ts")).unwrap(),
+        app.as_bytes()
+    );
+
+    let written = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-ts-broken",
+            "path":"app.ts",
+            "source_ref":source_ref,
+            "changes":[{"old":"function broken(): number {","new":"function renamed(): number {"}]
+        }),
+    )
+    .await;
+    let (written, written_text) = batch_settle_with_text(&mut actor, &fixture, written).await;
+    assert_eq!(written["result"]["outcome"], "replaced", "{written}");
+    let written_ref = written["result"]["source_ref"].as_str().unwrap();
+    assert_eq!(
+        batch_without_status_plate(&written_text),
+        format!(
+            "edit: replaced; path app.ts; source_ref {written_ref}; {}\n1 changes applied: \
+             change 1: old text at line 5 replaced (now 5)",
+            batch_diagnostics_segment(&written)
+        ),
+        "{written_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("app.ts")).unwrap(),
+        b"function value(): number {\n    return 1;\n}\n\nfunction renamed(): number {\n    return 2;\n}\n"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Case 9: one `ide.read {path, ranges}` answers two ranges in request order, and a batch edit
+/// addresses exactly those lines through that read's `source_ref` with no re-read between.
+#[tokio::test]
+async fn configured_product_batch_ranges_read_then_edit_by_those_lines_without_reread() {
+    let batch = "fn helper(value: i32) -> i32 {\n    value + 1\n}\n\npub fn alpha() -> i32 {\n    \
+                 helper(1)\n}\n\npub fn beta() -> i32 {\n    helper(2)\n}\n";
+    let fixture = batch_edit_fixture(batch);
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = batch_started_actor(&fixture, "batch-ranges", "src/batch.rs").await;
+    let read = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"path":"src/batch.rs","ranges":["5-7","9-11"]}),
+    )
+    .await;
+    let (read, read_text) = batch_settle_with_text(&mut actor, &fixture, read).await;
+    assert_eq!(read["kind"], "read", "{read}");
+    let source_ref = read["detail_ref"].as_str().unwrap();
+    assert_eq!(
+        batch_without_status_plate(&read_text),
+        format!(
+            "src/batch.rs  (lines 5–7)\n5\tpub fn alpha() -> i32 {{\n6\t    helper(1)\n7\t}}\n\
+             src/batch.rs  (lines 9–11)\n 9\tpub fn beta() -> i32 {{\n10\t    helper(2)\n11\t}}\n\
+             source_ref: {source_ref}\n"
+        ),
+        "{read_text}"
+    );
+
+    let edit = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-ranges-once",
+            "path":"src/batch.rs",
+            "source_ref":source_ref,
+            "changes":[
+                {"lines":"6-6","content":"    helper(3)"},
+                {"lines":"10-10","content":"    helper(4)"}
+            ]
+        }),
+    )
+    .await;
+    let (edit, edit_text) = batch_settle_with_text(&mut actor, &fixture, edit).await;
+    let edit_ref = edit["result"]["source_ref"].as_str().unwrap();
+    assert_eq!(
+        batch_without_status_plate(&edit_text),
+        format!(
+            "edit: replaced; path src/batch.rs; source_ref {edit_ref}; {}\n2 changes applied: \
+             change 1: lines 6 replaced (now 6); change 2: lines 10 replaced (now 10)",
+            batch_diagnostics_segment(&edit)
+        ),
+        "{edit_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/batch.rs")).unwrap(),
+        b"fn helper(value: i32) -> i32 {\n    value + 1\n}\n\npub fn alpha() -> i32 {\n    helper(3)\n}\n\npub fn beta() -> i32 {\n    helper(4)\n}\n"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Case 10: a batch read over the reply budget names exactly what was not included and the exact
+/// call to fetch it, renders a duplicated address once, and reports an unknown symbol per item
+/// while the other blocks still arrive.
+#[tokio::test]
+async fn configured_product_batch_read_budget_footer_duplicate_and_unknown_symbol() {
+    let huge_body: String = (0..380)
+        .map(|index| {
+            format!(
+                "    let value_{index:03} = {index} + 0; // padding padding padding {index:03}\n"
+            )
+        })
+        .collect();
+    let other_body: String = (0..160)
+        .map(|index| {
+            format!(
+                "    let other_{index:03} = {index} + 0; // padding padding padding {index:03}\n"
+            )
+        })
+        .collect();
+    let content = format!(
+        "pub fn huge_a() -> i32 {{\n{huge_body}    0\n}}\n\npub fn huge_b() -> i32 {{\n\
+         {other_body}    0\n}}\n"
+    );
+    let lines: Vec<&str> = content.lines().collect();
+    let fixture = symbol_test_fixture();
+    std::fs::write(fixture.root.join("src/big.rs"), &content).unwrap();
+    fixture.git(&["add", "--", "src/big.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "big read fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = batch_started_actor(&fixture, "batch-budget", "src/big.rs").await;
+
+    let read = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"symbols":[
+            "src/big.rs#huge_a",
+            "src/big.rs#huge_a",
+            "src/big.rs#missing",
+            "src/big.rs#huge_b"
+        ]}),
+    )
+    .await;
+    let (read, read_text) = batch_settle_with_text(&mut actor, &fixture, read).await;
+    assert_eq!(read["kind"], "read", "{read}");
+    assert_eq!(read["truncated"], true, "{read}");
+    let source_ref = read["detail_ref"].as_str().unwrap();
+    // The delivered block renders with the same numbered gutter as every read.
+    let huge_a_end = 383usize;
+    let width = huge_a_end.to_string().len();
+    let mut expected = format!("src/big.rs#huge_a  (lines 1–{huge_a_end})\n");
+    for number in 1..=huge_a_end {
+        expected.push_str(&format!("{number:>width$}\t{}\n", lines[number - 1]));
+    }
+    expected.push_str(&format!(
+        "no such symbol: src/big.rs#missing — check ide.outline {{\"path\":\"src/big.rs\"}}\n\
+         source_ref: {source_ref}\n\
+         duplicates shown once: src/big.rs#huge_a\n\
+         not included (over the reply budget): src/big.rs#huge_b — call ide.read \
+         {{\"symbols\":[\"src/big.rs#huge_b\"]}}\n\n\
+         Output is incomplete"
+    ));
+    assert_eq!(read_text, expected, "{read_text}");
+    // The cut symbol's body is not in the reply, and the footer's exact call fetches it in full.
+    assert!(!read_text.contains("let other_159"), "{read_text}");
+    let follow = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"symbols":["src/big.rs#huge_b"]}),
+        )
+        .await;
+    let follow = actor.settle(&fixture, follow).await;
+    assert!(
+        follow["text"].as_str().unwrap().contains("let other_159"),
+        "{follow}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Case 11: the legacy single-change forms answer the same bytes 0.6.6 answered — insert,
+/// replace by symbol, and the line-range form — so no existing workflow's reply changes.
+#[tokio::test]
+async fn configured_product_batch_legacy_single_change_replies_stay_byte_identical() {
+    let batch = "pub fn alpha() -> i32 {\n    1\n}\n\npub fn beta() -> i32 {\n    2\n}\n";
+    let fixture = batch_edit_fixture(batch);
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = batch_started_actor(&fixture, "batch-legacy", "src/batch.rs").await;
+
+    let insert = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"legacy-insert",
+            "op":"insert",
+            "symbol":"src/batch.rs#alpha",
+            "where":"after",
+            "content":"pub fn added() -> bool { true }"
+        }),
+    )
+    .await;
+    let (insert, insert_text) = batch_settle_with_text(&mut actor, &fixture, insert).await;
+    let insert_ref = insert["result"]["source_ref"].as_str().unwrap();
+    assert_eq!(insert["operation"], "inserted", "{insert}");
+    assert_eq!(
+        batch_without_status_plate(&insert_text),
+        format!(
+            "edit: inserted; path src/batch.rs; source_ref {insert_ref}; {}\nformatted: +2 \
+             lines after line 4; use source_ref {insert_ref} for the next edit",
+            batch_diagnostics_segment(&insert)
+        ),
+        "{insert_text}"
+    );
+    let after_insert =
+        String::from_utf8(std::fs::read(fixture.root.join("src/batch.rs")).unwrap()).unwrap();
+    assert_eq!(
+        after_insert,
+        "pub fn alpha() -> i32 {\n    1\n}\n\npub fn added() -> bool {\n    true\n}\n\n\
+         pub fn beta() -> i32 {\n    2\n}\n",
+        "{after_insert}"
+    );
+
+    let replace = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"legacy-replace",
+            "symbol":"src/batch.rs#beta",
+            "op":"replace",
+            "content":"pub fn beta() -> i32 {\n    3\n}"
+        }),
+    )
+    .await;
+    let (replace, replace_text) = batch_settle_with_text(&mut actor, &fixture, replace).await;
+    let replace_ref = replace["result"]["source_ref"].as_str().unwrap();
+    assert_eq!(
+        batch_without_status_plate(&replace_text),
+        format!(
+            "edit: replaced; path src/batch.rs; source_ref {replace_ref}; {}",
+            batch_diagnostics_segment(&replace)
+        ),
+        "{replace_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/batch.rs")).unwrap(),
+        b"pub fn alpha() -> i32 {\n    1\n}\n\npub fn added() -> bool {\n    true\n}\n\npub fn beta() -> i32 {\n    3\n}\n"
+    );
+
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"src/batch.rs","ranges":["1-3"]}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let source_ref = read["detail_ref"].as_str().unwrap();
+    let lines = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"legacy-lines",
+            "path":"src/batch.rs",
+            "lines":"2-2",
+            "content":"    5",
+            "source_ref":source_ref
+        }),
+    )
+    .await;
+    let (lines, lines_text) = batch_settle_with_text(&mut actor, &fixture, lines).await;
+    let lines_ref = lines["result"]["source_ref"].as_str().unwrap();
+    assert_eq!(
+        batch_without_status_plate(&lines_text),
+        format!(
+            "edit: replaced; path src/batch.rs; source_ref {lines_ref}; {}",
+            batch_diagnostics_segment(&lines)
+        ),
+        "{lines_text}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/batch.rs")).unwrap(),
+        b"pub fn alpha() -> i32 {\n    5\n}\n\npub fn added() -> bool {\n    true\n}\n\npub fn beta() -> i32 {\n    3\n}\n"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// The symbol edit replies name their operation — `edit: inserted`, `edit: deleted` — and a
 /// rename answers once with `edit: renamed` plus a note listing every touched file with its
 /// site count, instead of one file's plain `edit: replaced`.
