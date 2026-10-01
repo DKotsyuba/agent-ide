@@ -70,7 +70,7 @@ pub struct RunResult {
     /// Counts and failures explicitly parsed from runner output.
     pub report: TestReport,
     /// Last at most 256 KiB of combined stdout and stderr; once paged, only its bounded runner
-    /// line ([`runner_excerpt`]).
+    /// line.
     pub output: String,
     /// `true` once the owner's retained detail took over the whole output as its pages and this
     /// copy shrank to the runner line; later replies then point at that detail instead of
