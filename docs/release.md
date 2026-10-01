@@ -1,6 +1,6 @@
 # Release installation and update
 
-Agent IDE 0.6.8 publishes one `aarch64-apple-darwin` archive plus `install.sh` and
+Agent IDE 0.6.9 publishes one `aarch64-apple-darwin` archive plus `install.sh` and
 `SHA256SUMS`. macOS arm64 is the only claimed platform; Linux remains explicitly `not_tested`
 and has no release artifact.
 
@@ -74,7 +74,7 @@ that the configured `command` still names the installer destination.
 Add the tag-pinned marketplace and install its plugin:
 
 ```sh
-claude plugin marketplace add DKotsyuba/agent-ide@v0.6.8
+claude plugin marketplace add DKotsyuba/agent-ide@v0.6.9
 claude plugin install agent-ide@agent-ide
 ```
 
