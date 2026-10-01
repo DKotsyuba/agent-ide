@@ -69,10 +69,12 @@ struct Job {
 pub struct RunResult {
     /// Counts and failures explicitly parsed from runner output.
     pub report: TestReport,
-    /// Last at most 256 KiB of combined stdout and stderr.
+    /// Last at most 256 KiB of combined stdout and stderr; once paged, only its bounded runner
+    /// line ([`runner_excerpt`]).
     pub output: String,
     /// `true` once the owner's retained detail took over the whole output as its pages and this
-    /// copy was dropped; later replies then point at that detail instead of quoting a head.
+    /// copy shrank to the runner line; later replies then point at that detail instead of
+    /// quoting a head.
     pub output_paged: bool,
     /// Elapsed wall-clock process duration.
     pub elapsed: Duration,
@@ -475,14 +477,22 @@ pub fn result_line(id: u64, result: &RunResult) -> String {
     settled_line(id, result, true)
 }
 
-/// [`result_line`], optionally without the trailing detail reference: the bounded status plate
-/// may cut its line, and a cut reference would name a detail that was never issued.
+/// Suffix that names a run's full output in reply lines; status plates never carry it.
+const FULL_OUTPUT: &str = "; full output: ide.inspect ";
+
+/// The status-plate form of a reply's first line: the line without its full-output reference.
+/// The plate is length-bounded, and a cut reference would name a detail that was never issued.
+pub fn plate_line(line: &str) -> &str {
+    line.split_once(FULL_OUTPUT).map_or(line, |(head, _)| head)
+}
+
+/// [`result_line`], optionally without the trailing detail reference ([`plate_line`]).
 fn settled_line(id: u64, result: &RunResult, with_ref: bool) -> String {
     let report = &result.report;
     let seconds = result.elapsed.as_secs();
     let counted = report.passed != 0 || report.failed != 0;
     let reference = if with_ref {
-        format!("; full output: ide.inspect {}", result.detail_ref)
+        format!("{FULL_OUTPUT}{}", result.detail_ref)
     } else {
         String::new()
     };
@@ -735,6 +745,8 @@ mod runner_tests {
         let plate =
             "tests #3: no test results (exit 4), 0 s — runner said: ERROR: missing collectors";
         assert_eq!(settled_line(3, &result, false), plate);
+        // The reply's first line, as the dispatcher snapshots it for the plate, agrees.
+        assert_eq!(plate_line(&result_line(3, &result)), plate);
         result.output = runner_excerpt(&result.output);
         assert_eq!(settled_line(3, &result, false), plate);
         result.output = "noise\nlast line\n".into();

@@ -304,7 +304,7 @@ fn test_status_snapshot(reply: &PeerReply) -> Option<String> {
     else {
         return None;
     };
-    let line = text.lines().next()?;
+    let line = super::tests::plate_line(text.lines().next()?);
     (line.starts_with("tests #") && !line.contains("started —") && !line.contains("still running"))
         .then(|| line.to_owned())
 }
