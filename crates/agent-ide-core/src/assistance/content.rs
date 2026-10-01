@@ -38,12 +38,24 @@ pub(crate) enum Envelope {
 /// field of the structured copy. The plate itself is never shrunk or cut — only owner text is — so
 /// a fitted result always carries it whole.
 pub(crate) fn render_with_status(
-    mut reply: PeerReply,
+    reply: PeerReply,
     status: Option<&str>,
     envelope: Envelope,
 ) -> Option<CallToolResult> {
+    render_with_call(reply, status, envelope, None, None)
+}
+
+/// Renders with the tool name and optional `ide.test` status run id so inactive-binding guidance
+/// can name the correct recovery action; all other replies keep their existing compact wording.
+pub(crate) fn render_with_call(
+    mut reply: PeerReply,
+    status: Option<&str>,
+    envelope: Envelope,
+    tool_name: Option<&str>,
+    test_status_id: Option<u64>,
+) -> Option<CallToolResult> {
     loop {
-        let rendered = project(&reply, status, envelope)?;
+        let rendered = project(&reply, status, envelope, tool_name, test_status_id)?;
         if call_tool_result_fits(&rendered) {
             return Some(rendered);
         }
@@ -58,7 +70,8 @@ pub(crate) fn render_with_status(
 /// This predicate never shrinks text. Diff pagination uses it to accept only whole-hunk pages that
 /// the facade can later render byte-for-byte without advancing a cursor past omitted content.
 pub(crate) fn fits(reply: &PeerReply, envelope: Envelope) -> bool {
-    project(reply, None, envelope).is_some_and(|rendered| call_tool_result_fits(&rendered))
+    project(reply, None, envelope, None, None)
+        .is_some_and(|rendered| call_tool_result_fits(&rendered))
 }
 
 /// Reports whether one unchanged reply fits the final MCP carrier with `status` attached whole.
@@ -67,7 +80,8 @@ pub(crate) fn fits(reply: &PeerReply, envelope: Envelope) -> bool {
 /// attaches a plate only after this accepts it, so the facade's own render can never be the
 /// call that cuts it.
 pub(crate) fn fits_with_status(reply: &PeerReply, status: &str, envelope: Envelope) -> bool {
-    project(reply, Some(status), envelope).is_some_and(|rendered| call_tool_result_fits(&rendered))
+    project(reply, Some(status), envelope, None, None)
+        .is_some_and(|rendered| call_tool_result_fits(&rendered))
 }
 
 /// Projects one unchanged reply into compact content plus, per `envelope`, the complete typed
@@ -79,7 +93,13 @@ pub(crate) fn fits_with_status(reply: &PeerReply, status: &str, envelope: Envelo
 /// tag is passed to the template only, so it appears solely in compact text; likewise an error's
 /// `detail` reaches the template as `resolution_detail` and is removed from the structured copy.
 /// Projection performs no I/O, host inspection, diagnostics inference, or model call.
-fn project(reply: &PeerReply, status: Option<&str>, envelope: Envelope) -> Option<CallToolResult> {
+fn project(
+    reply: &PeerReply,
+    status: Option<&str>,
+    envelope: Envelope,
+    tool_name: Option<&str>,
+    test_status_id: Option<u64>,
+) -> Option<CallToolResult> {
     let mut structured = serde_json::to_value(reply).ok()?;
     let cause_tag = match reply {
         PeerReply::Error {
@@ -95,6 +115,9 @@ fn project(reply: &PeerReply, status: Option<&str>, envelope: Envelope) -> Optio
     // Strict-undefined rendering expects these fields on every reply.
     context["cause_tag"] = serde_json::Value::String(String::new());
     context["resolution_message"] = serde_json::Value::String(String::new());
+    context["tool_name"] = serde_json::Value::String(tool_name.unwrap_or_default().to_owned());
+    context["test_status_id"] =
+        test_status_id.map_or(serde_json::Value::Null, serde_json::Value::from);
     if let PeerReply::Error { detail, .. } = reply {
         let detail = detail.as_deref().unwrap_or_default();
         context["resolution_detail"] = serde_json::Value::String(detail.to_owned());
@@ -392,8 +415,45 @@ mod tests {
         }
     }
 
-    /// Every host-binding cause names its closed tag in the compact text parentheses and never
-    /// changes the public structured copy; a cause-less refusal keeps its historical text (T15B).
+    /// An inactive test status names the preserved run and inspect route, while other tools retain
+    /// the generic activation recovery wording.
+    #[test]
+    fn inactive_test_status_names_inspect_run() {
+        let reply = PeerReply::Unavailable {
+            reason: MissingPeer::HostBinding,
+            cause: Some(crate::assistance::reply::HostBindingCause::InactiveBinding),
+        };
+        let rendered = render_with_call(
+            reply,
+            None,
+            Envelope::WithStructured,
+            Some("ide.test"),
+            Some(7),
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&rendered),
+            "unavailable: host_binding (inactive_binding); this session's IDE activation has stopped; read run 7 with ide.inspect {\"detail_ref\":\"tests #7\"}, or call ide.start to run tests again"
+        );
+        let other = render_with_call(
+            PeerReply::Unavailable {
+                reason: MissingPeer::HostBinding,
+                cause: Some(crate::assistance::reply::HostBindingCause::InactiveBinding),
+            },
+            None,
+            Envelope::WithStructured,
+            Some("ide.context"),
+            Some(7),
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&other),
+            "unavailable: host_binding (inactive_binding); this session's IDE activation has stopped. Call ide.start, then repeat this call, or continue with native tools"
+        );
+    }
+
+    /// Every host-binding cause names its closed tag in compact text without changing the public
+    /// structured copy; a cause-less refusal keeps its historical text (T15B).
     #[test]
     fn host_binding_causes_name_their_tag_in_compact_text_only() {
         use crate::assistance::reply::HostBindingCause;

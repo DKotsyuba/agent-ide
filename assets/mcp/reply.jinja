@@ -40,6 +40,8 @@ unavailable: host_binding (missing_pre); the host's before-tool event for this c
 unavailable: host_binding (replay); this exact call was already processed. Send it as a new tool call, or continue with native tools
 {%- elif reason == "host_binding" and cause_tag == "mismatch" -%}
 unavailable: host_binding (mismatch); the host event did not match this call. Repeat the call, or continue with native tools
+{%- elif reason == "host_binding" and cause_tag == "inactive_binding" and tool_name == "ide.test" and test_status_id -%}
+unavailable: host_binding (inactive_binding); this session's IDE activation has stopped; read run {{ test_status_id }} with ide.inspect {"detail_ref":"tests #{{ test_status_id }}"}, or call ide.start to run tests again
 {%- elif reason == "host_binding" and cause_tag == "inactive_binding" -%}
 unavailable: host_binding (inactive_binding); this session's IDE activation has stopped. Call ide.start, then repeat this call, or continue with native tools
 {%- elif reason == "host_binding" and cause_tag == "capacity_exceeded" -%}

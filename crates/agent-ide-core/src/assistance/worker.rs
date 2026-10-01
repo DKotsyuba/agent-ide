@@ -5132,7 +5132,11 @@ const TEST_OUTPUT_HEAD_BYTES: usize = 4096;
 fn command_result_text(id: u64, result: &super::tests::RunResult, owns_detail: bool) -> String {
     let seconds = result.elapsed.as_secs();
     let mut text = match result.exit.filter(|code| *code != 0) {
-        Some(code) => format!("tests #{id}: no test results (exit {code}), {seconds} s"),
+        Some(code) => format!(
+            "tests #{id}: no test results (exit {code}), {seconds} s — runner said: {}; full output: ide.inspect {}",
+            super::tests::runner_excerpt(&result.output),
+            result.detail_ref
+        ),
         None => match result.exit {
             Some(code) => format!("tests #{id}: no summary parsed (exit {code}), {seconds} s"),
             None => format!("tests #{id}: no summary parsed, {seconds} s"),
@@ -5144,7 +5148,12 @@ fn command_result_text(id: u64, result: &super::tests::RunResult, owns_detail: b
         text.push_str(&head);
     }
     text.push_str(&format!("\n  rerun: {}", display_argv(&result.command)));
-    if owns_detail && (head.len() < result.output.len() || result.output_paged) {
+    if owns_detail
+        && (head.len() < result.output.len() || result.output_paged)
+        && !(result.exit.is_some_and(|code| code != 0)
+            && result.report.passed == 0
+            && result.report.failed == 0)
+    {
         text.push_str(&format!(
             "\n  full output: ide.inspect {}",
             result.detail_ref
@@ -5203,6 +5212,15 @@ mod tool_reply_fix_tests {
         let runner = test_result_text(3, &result, true, false);
         assert!(runner.contains("0 passed, 0 failed"), "{runner}");
         assert!(!runner.contains("\n  output:\n"), "{runner}");
+    }
+
+    /// A failed summary-less command surfaces its error line and retained output handle.
+    #[test]
+    fn explicit_failed_command_names_runner_reason() {
+        let mut result = command_result("noise\nERROR: no collectors\n".into());
+        result.exit = Some(4);
+        let reply = command_result_text(4, &result, true);
+        assert!(reply.starts_with("tests #4: no test results (exit 4), 1 s — runner said: ERROR: no collectors; full output: ide.inspect test-detail"), "{reply}");
     }
 
     /// Limits inline output at a UTF-8 boundary and points to the retained full output.
