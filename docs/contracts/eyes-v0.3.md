@@ -365,13 +365,16 @@ pub struct ProblemSnapshot { pub language: Language, pub state: CheckState,
   is free while the worktree inputs are unchanged (see the T20B skip below). An actor whose
   `ide.start` was refused (for example `conflict` because another actor owns the worktree) has
   no binding: it triggers no check and receives no block.
-- A trigger that knows which file changed re-arms only that file's language, so a `.py` edit
-  never starts a cargo check: the retained `tool_input.file_path` of a Claude
-  `Edit`/`Write`/`MultiEdit`/`NotebookEdit` post and the edited path of a completed `ide.edit`
-  both map through the file's extension to one language. A path no registered language owns
-  (`Cargo.toml`, `README.md`) conservatively re-arms every configured language, and a path-less
-  trigger (`Bash`, `ide.start`, the reply-delivered per-call trigger) keeps the previous
-  all-languages behaviour.
+- A trigger that knows which file changed makes that file's language the forced one — an edit
+  reply waits only for it — while every other configured language stays on the ordinary
+  debounced, fingerprint-gated trigger, so a `.py` edit never forces a cargo check and a
+  cross-language input (`include_str!("../web/app.js")`) still re-checks its consumer once the
+  worktree fingerprint changed: the retained `tool_input.file_path` (`notebook_path` for
+  `NotebookEdit`) of a Claude `Edit`/`Write`/`MultiEdit`/`NotebookEdit` post and the edited path
+  of a completed `ide.edit` both map through the file's extension to one language. A path no
+  registered language owns (`Cargo.toml`, `README.md`) conservatively re-arms every configured
+  language, and a path-less trigger (`Bash`, `ide.start`, the reply-delivered per-call trigger)
+  keeps the previous all-languages behaviour.
 - Trigger predicate (`triggers_check`, T29B §4): Claude keeps the exact
   `Edit`/`Write`/`MultiEdit`/`NotebookEdit`/`Bash` writer allowlist. Codex has no certified writer
   allowlist, so every paired native `PostToolUse` triggers — except this product's own MCP tool

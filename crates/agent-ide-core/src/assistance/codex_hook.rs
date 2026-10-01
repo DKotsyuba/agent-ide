@@ -263,7 +263,7 @@ fn log_oversize() {
 /// The daemon's observation uses only the host, phase, actor, session, and optional call/tool-name
 /// fields, so a multi-megabyte `tool_input`/`tool_response` body is dropped rather than the whole
 /// event — except Claude's bounded `tool_input.file_path`, which a projected writer post keeps so
-/// its check trigger can still narrow to the changed file's language. Payloads already inside the
+/// its check trigger can still name the changed file's language. Payloads already inside the
 /// 64 KiB transport bound keep their exact bytes (preserving the parser's duplicate-key
 /// rejection); only larger ones are projected, where duplicate keys collapse last-wins. Returns
 /// `None` when the payload is not a JSON object or even the projection exceeds the transport

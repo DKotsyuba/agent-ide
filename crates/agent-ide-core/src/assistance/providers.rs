@@ -31,6 +31,19 @@ fn servers() -> Vec<&'static dyn LanguageServer> {
         .collect()
 }
 
+/// The clause a failed-session stage appends to say what still answers without the server:
+/// `ide.outline` and `ide.read` from the source outline for a language that opted into
+/// [`LanguageSupport::outline_while_loading`](crate::lang::LanguageSupport::outline_while_loading),
+/// native reads for every other language. The reply template keys its recovery sentence on
+/// exactly this clause, so the producer — the side that knows the language — decides it.
+pub(super) fn session_fallback_clause(source_outlines: bool) -> &'static str {
+    if source_outlines {
+        "; outline and read answer from source"
+    } else {
+        "; use native reads"
+    }
+}
+
 /// Bounds the in-memory cache-lifecycle map so an unbounded stream of distinct worktree
 /// incarnations cannot grow it or the retained on-disk namespaces without limit. Matches the fixed
 /// `total_views`/`per_backend_views` provider-lease ceiling; a full map fails new namespaces closed
@@ -392,7 +405,13 @@ impl Worker<'_> {
             Err(ReadinessError::WorkspaceError) => {
                 job.set_stage_failure(
                     &FailureCode::ProviderUnavailable,
-                    &format!("{}: workspace load failed", server.name()),
+                    &format!(
+                        "{}: workspace load failed{}",
+                        server.name(),
+                        session_fallback_clause(
+                            server.language().support().outline_while_loading()
+                        )
+                    ),
                 );
                 return Err(FailureCode::ProviderUnavailable);
             }
@@ -406,7 +425,13 @@ impl Worker<'_> {
                 }
                 job.set_stage_failure(
                     &FailureCode::ProviderUnavailable,
-                    &format!("{}: transport gone", server.name()),
+                    &format!(
+                        "{}: transport gone{}",
+                        server.name(),
+                        session_fallback_clause(
+                            server.language().support().outline_while_loading()
+                        )
+                    ),
                 );
                 return Err(FailureCode::ProviderUnavailable);
             }

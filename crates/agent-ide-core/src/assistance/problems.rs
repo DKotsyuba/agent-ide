@@ -409,16 +409,18 @@ impl ProjectProblemFeed {
     }
 
     /// Like [`ProjectProblemFeed::changed`], naming the changed file when the trigger knows it
-    /// (a native `Edit`/`Write`/`MultiEdit`/`NotebookEdit` post hook, `ide.edit`): only that
-    /// file's language is checked, so a `.py` edit never starts a cargo check. A path no
-    /// registered language owns keeps the every-language behaviour.
+    /// (a native `Edit`/`Write`/`MultiEdit`/`NotebookEdit` post hook, `ide.edit`): that file's
+    /// language is the one a waiting caller expects, and every other configured language is
+    /// re-armed through the ordinary fingerprint-gated trigger, so a `.py` edit never forces a
+    /// cargo check. A path no registered language owns keeps the every-language behaviour.
     pub fn changed_file(&self, binding: &[u8; 32], path: Option<&str>) {
         self.changed_with(binding, path.map(Path::new), false, || {});
     }
 
-    /// Like [`ProjectProblemFeed::changed_file`] for a check the caller waits on: the run skips
-    /// the cooldown after the previous run, and the returned input generation lets the caller
-    /// wait for a snapshot at or past it. `None` when the trigger was not admitted.
+    /// Like [`ProjectProblemFeed::changed_file`] for a check the caller waits on: the changed
+    /// file's own language skips the unchanged-input elision and the cooldown after the
+    /// previous run, and the returned input generation lets the caller wait for a snapshot at
+    /// or past it. `None` when the trigger was not admitted.
     pub fn changed_generation(&self, binding: &[u8; 32], path: Option<&str>) -> Option<u64> {
         self.changed_with(binding, path.map(Path::new), true, || {})
     }

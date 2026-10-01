@@ -537,8 +537,9 @@ impl ProductDispatcher {
                             let fingerprint = binding.fingerprint();
                             let feed = worker.project_feed().filter(|_| hook_post);
                             if triggers_check && let Some(feed) = feed {
-                                // A writer tool that named its file re-arms only that file's
-                                // language; `Bash` and tools without a path re-arm every one.
+                                // A writer tool that named its file makes that file's language
+                                // the forced one; `Bash` and tools without a path keep every
+                                // language on the same footing.
                                 feed.changed_file(
                                     &fingerprint,
                                     object.get("tool_file").and_then(|value| value.as_str()),

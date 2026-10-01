@@ -159,8 +159,10 @@ error: provider_unavailable (symbol:no_server); no language server is configured
 error: provider_unavailable (context:no_server); no language server is configured for .{{ resolution_message }} files in this project. Continue with native tools
 {%- elif code == "provider_unavailable" and resolution_detail is startingwith("context:") -%}
 error: provider_unavailable ({{ resolution_detail }}); the language server could not provide this result. Retry the same ide.* call later, or continue with native tools
-{%- elif code == "provider_unavailable" and (resolution_detail is endingwith("workspace load failed)") or resolution_detail is endingwith("transport gone)") or resolution_detail is endingwith("request failed)")) -%}
+{%- elif code == "provider_unavailable" and resolution_detail is endingwith("answer from source)") -%}
 error: provider_unavailable ({{ resolution_detail }}); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {"kind":"problems"} shows the project check)
+{%- elif code == "provider_unavailable" and resolution_detail is endingwith("use native reads)") -%}
+error: provider_unavailable ({{ resolution_detail }}); the language server cannot answer semantic requests. No source outline answers either; use native reads. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {"kind":"problems"} shows the project check)
 {%- elif code == "provider_unavailable" -%}
 error: provider_unavailable{% if resolution_detail %} ({{ resolution_detail }}){% else %} (provider:unavailable){% endif %}; no language server result is available for this request. Continue with native tools
 {%- elif code == "deadline" and resolution_detail == "stop:deadline" -%}

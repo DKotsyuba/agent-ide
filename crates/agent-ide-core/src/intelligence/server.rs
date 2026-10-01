@@ -330,8 +330,9 @@ pub trait ProviderJob: Send + Sync {
 
     /// Attaches the failed session stage to the job's failure reply: the default
     /// `<tool>:<reason>` tag composed with the backend-reported stage, e.g.
-    /// `outline:provider_unavailable (<language>: workspace load failed)`. The stage is closed
-    /// words naming the failing step — never paths or payloads.
+    /// `outline:provider_unavailable (<language>: workspace load failed; outline and read
+    /// answer from source)`. The stage is closed words naming the failing step and what still
+    /// answers without the server — never paths or payloads.
     fn set_stage_failure(&mut self, code: &FailureCode, stage: &str);
 }
 

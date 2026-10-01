@@ -2596,7 +2596,7 @@ impl<'a> Worker<'a> {
                 (PeerReply::Edit { result, .. }, _)
                     if result.outcome.has_post_source() && !job.check_scheduled =>
                 {
-                    // Name the edited file so only its language is re-checked; an edit whose
+                    // Name the edited file so only its language is forced; an edit whose
                     // parameters carry no path keeps the every-language behaviour.
                     feed.changed_file(
                         &binding.fingerprint(),
@@ -3952,8 +3952,9 @@ impl<'a> Worker<'a> {
         let feed = self.shared.project_feed.as_ref()?;
         let language = Language::for_path(std::path::Path::new(path))
             .filter(|language| language.checks().is_some())?;
-        // The edit's own language is the only one re-armed: a `.py` edit must not also start a
-        // cargo check in a mixed worktree.
+        // The edit's own language is the only one forced: a `.py` edit must not also start a
+        // cargo check in a mixed worktree, while every other configured language still re-arms
+        // through the ordinary fingerprint-gated trigger.
         let generation =
             feed.changed_generation(&job.invocation.binding_ref().fingerprint(), Some(path))?;
         job.check_scheduled = true;

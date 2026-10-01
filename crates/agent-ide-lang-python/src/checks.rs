@@ -740,8 +740,9 @@ impl LanguageChecks for PythonChecks {
     /// Python is present iff the worktree matches the shared marker rule
     /// ([`crate::support::is_python_project`], the same list the project card uses): root
     /// `pyproject.toml`/`setup.py`/`setup.cfg`/`Pipfile`/`pyrightconfig.json`/`requirements*.txt`,
-    /// a `.venv`/`venv` directory, or a bounded depth-1 probe of immediate subdirectories. This
-    /// deliberately never walks the tree for source files (for example `*.py`).
+    /// a `.venv`/`venv` directory, or a bounded depth-1 probe of immediate subdirectories whose
+    /// nested marker sits beside at least one `.py` file. This deliberately never walks the tree
+    /// for source files.
     fn is_present(&self, worktree: &Path) -> bool {
         crate::support::is_python_project(worktree)
     }
@@ -987,8 +988,10 @@ mod deny_tests {
     }
 
     /// The bounded depth-1 probe: a script directory such as `tools/` carrying
-    /// `requirements-ml.txt` or a nested `pyproject.toml` registers Python; the probe never
-    /// recurses (`nested/deep/requirements.txt` stays invisible) and skips hidden directories.
+    /// `requirements-ml.txt` or a nested `pyproject.toml` registers Python when the same
+    /// subdirectory holds at least one `.py` file; a marker alone — a Sphinx
+    /// `docs/requirements.txt` in a non-Python repository — does not. The probe never recurses
+    /// (`nested/deep/requirements.txt` stays invisible) and skips hidden and vendor directories.
     #[test]
     fn is_present_python_accepts_depth_one_nested_markers_only() {
         let dir = scratch_dir("python-presence-nested-tools");
@@ -996,21 +999,36 @@ mod deny_tests {
         std::fs::create_dir_all(dir.join("tools")).unwrap();
         std::fs::write(dir.join("tools/requirements-ml.txt"), "").unwrap();
         assert!(
+            !PythonChecks.is_present(&dir),
+            "tools/requirements-ml.txt alone does not register"
+        );
+        std::fs::write(dir.join("tools/analyze.py"), "import pandas\n").unwrap();
+        assert!(
             PythonChecks.is_present(&dir),
-            "tools/requirements-ml.txt registers"
+            "tools/requirements-ml.txt beside tools/analyze.py registers"
         );
 
         let dir = scratch_dir("python-presence-nested-pyproject");
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub/pyproject.toml"), "").unwrap();
+        std::fs::write(dir.join("sub/lib.py"), "").unwrap();
         assert!(
             PythonChecks.is_present(&dir),
-            "sub/pyproject.toml registers"
+            "sub/pyproject.toml beside sub/lib.py registers"
+        );
+
+        let dir = scratch_dir("python-presence-docs-requirements");
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("docs/requirements.txt"), "sphinx\n").unwrap();
+        assert!(
+            !PythonChecks.is_present(&dir),
+            "a requirements.txt with no .py file beside it does not register"
         );
 
         let dir = scratch_dir("python-presence-nested-deep");
         std::fs::create_dir_all(dir.join("nested/deep")).unwrap();
         std::fs::write(dir.join("nested/deep/requirements.txt"), "").unwrap();
+        std::fs::write(dir.join("nested/deep/lib.py"), "").unwrap();
         assert!(
             !PythonChecks.is_present(&dir),
             "the probe is depth-1 and never walks the tree"

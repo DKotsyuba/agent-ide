@@ -6312,10 +6312,10 @@ async fn configured_product_python_non_test_file_answers_no_tests() {
 
 /// `ide.test {path}` routes by the target file's language in a mixed worktree: with a root
 /// `Cargo.toml` (the first detected project) and a Python project registered only through the
-/// depth-1 `tools/requirements-ml.txt` marker, a `.py` test path selects pytest, never cargo
-/// (which would answer `no test target named 'test_risk.py'`). The routing is what the reply
-/// proves: whether or not this machine has pytest installed, the named runner is pytest and
-/// never cargo.
+/// depth-1 `tools/requirements-ml.txt` marker beside a `.py` file, a `.py` test path selects
+/// pytest, never cargo (which would answer `no test target named 'test_risk.py'`). The routing
+/// is what the reply proves: whether or not this machine has pytest installed, the named runner
+/// is pytest and never cargo.
 #[tokio::test]
 async fn configured_product_test_path_selects_the_targets_language_runner() {
     let fixture = ProductFixture::new(json!([]));
@@ -6323,6 +6323,8 @@ async fn configured_product_test_path_selects_the_targets_language_runner() {
     std::fs::remove_file(fixture.root.join("main.go")).unwrap();
     std::fs::create_dir_all(fixture.root.join("tools")).unwrap();
     std::fs::write(fixture.root.join("tools/requirements-ml.txt"), "pytest\n").unwrap();
+    // The nested marker registers Python only beside a `.py` file in the same directory.
+    std::fs::write(fixture.root.join("tools/analyze.py"), "import pandas\n").unwrap();
     std::fs::create_dir_all(fixture.root.join("tests")).unwrap();
     std::fs::write(
         fixture.root.join("tests/test_risk.py"),
@@ -9141,8 +9143,10 @@ report();
 
 /// While the registered Rust session passes readiness but its documentSymbols exchange fails,
 /// `ide.outline` answers from the exact lexical outline with a footer naming the failed request;
-/// `ide.read {symbol}` carries the same footer; a file the lexical scanner refuses and
-/// `ide.symbol` (whose references exchange also fails) answer `provider_unavailable`.
+/// `ide.read {symbol}` carries the same footer; `ide.symbol` answers the definition-only card —
+/// its hover answers nothing and its references exchange also fails, so every live-session
+/// section names the failed request instead of failing the whole call; a file the lexical
+/// scanner refuses answers `provider_unavailable`.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_NODE environment"]
 async fn configured_product_failed_exchange_rust_outline_answers_from_source() {
@@ -9241,13 +9245,29 @@ async fn configured_product_failed_exchange_rust_outline_answers_from_source() {
     assert_eq!(refused["code"], "provider_unavailable", "{refused}");
     assert_ne!(refused["state"], "pending", "{refused}");
 
-    // `ide.symbol` finds the address in the lexical outline, but its usages section needs the
-    // references exchange, which also fails: the call refuses rather than guess.
+    // `ide.symbol` answers the definition-only card: signature, doc and definition come from the
+    // lexical outline, hover answers nothing, and the references exchange fails too — so every
+    // section a live session would answer names the failed request instead of failing the call.
     let symbol = actor
         .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#value"}))
         .await;
     let symbol = actor.settle(&fixture, symbol).await;
-    assert_eq!(symbol["code"], "provider_unavailable", "{symbol}");
+    assert_eq!(symbol["kind"], "symbol", "{symbol}");
+    let card = symbol["text"].as_str().unwrap_or_default();
+    assert!(card.contains("symbol: value"), "{symbol}");
+    assert!(
+        card.contains("signature: pub fn value() -> i32"),
+        "{symbol}"
+    );
+    assert!(card.contains("doc: Answers broken."), "{symbol}");
+    assert!(
+        card.contains("usages: unavailable (rust-analyzer references request failed)"),
+        "{symbol}"
+    );
+    assert!(
+        card.contains("callers: unavailable (rust-analyzer references request failed)"),
+        "{symbol}"
+    );
     assert_ne!(symbol["state"], "pending", "{symbol}");
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;

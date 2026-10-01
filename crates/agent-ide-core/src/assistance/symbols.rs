@@ -401,40 +401,68 @@ impl Worker<'_> {
             let server_name = self
                 .session_server(observed.path())
                 .map(|server| server.name());
-            let live = self.live_session_for(job, &observed).await?;
-            if let Ok(Some(hover)) = live.session.hover(&observed, &bytes, byte_offset).await {
-                // The server's hover carries the resolved signature; prefer it over the one-line
-                // header when it is a single code line.
-                // The server's hover carries the resolved declaration; prefer its first
-                // declaration line over the header when it is a single, bounded code line.
-                let resolved = hover
-                    .lines()
-                    .map(str::trim)
-                    .find(|line| is_declaration_line(line))
-                    .filter(|line| line.len() <= 200);
-                if let Some(resolved) = resolved {
-                    card.signature = Some(resolved.trim_end_matches(" {").to_owned());
+            // An outline that answered from source because its documentSymbols exchange failed
+            // was resolved against a ready session: hover and references may still answer. When
+            // the session or the references exchange then fails, the card keeps the definition
+            // facts the source outline gave it and every section a live session would answer
+            // names the failure — the same shape as the unavailable branch above — instead of
+            // failing the whole call.
+            let exchange = matches!(lexical.as_ref(), Some(Lexical::Exchange { .. }));
+            let live = match self.live_session_for(job, &observed).await {
+                Ok(live) => Some(live),
+                Err(FailureCode::ProviderUnavailable) if exchange => None,
+                Err(code) => return Err(code),
+            };
+            let mut degraded = live
+                .is_none()
+                .then(|| "workspace failed to load".to_owned());
+            let mut references: Option<Vec<async_lsp::lsp_types::Location>> = None;
+            if let Some(live) = live {
+                if let Ok(Some(hover)) = live.session.hover(&observed, &bytes, byte_offset).await {
+                    // The server's hover carries the resolved signature; prefer it over the one-line
+                    // header when it is a single code line.
+                    // The server's hover carries the resolved declaration; prefer its first
+                    // declaration line over the header when it is a single, bounded code line.
+                    let resolved = hover
+                        .lines()
+                        .map(str::trim)
+                        .find(|line| is_declaration_line(line))
+                        .filter(|line| line.len() <= 200);
+                    if let Some(resolved) = resolved {
+                        card.signature = Some(resolved.trim_end_matches(" {").to_owned());
+                    }
+                }
+                if want_usages {
+                    match live
+                        .session
+                        .references(&observed, &bytes, byte_offset)
+                        .await
+                    {
+                        Ok(found) => references = Some(found),
+                        Err(_) if exchange => {
+                            degraded = Some("references request failed".to_owned());
+                        }
+                        Err(_) => {
+                            // The ready session failed this exchange; the stage names the request
+                            // so the refusal's reply can say what still answers and how to
+                            // recover.
+                            if let Some(name) = server_name {
+                                job.set_stage_failure(
+                                    &FailureCode::ProviderUnavailable,
+                                    &format!(
+                                        "{name}: references request failed{}",
+                                        super::providers::session_fallback_clause(
+                                            outline.language.support().outline_while_loading()
+                                        )
+                                    ),
+                                );
+                            }
+                            return Err(FailureCode::ProviderUnavailable);
+                        }
+                    }
                 }
             }
-            if want_usages {
-                let references = match live
-                    .session
-                    .references(&observed, &bytes, byte_offset)
-                    .await
-                {
-                    Ok(references) => references,
-                    Err(_) => {
-                        // The ready session failed this exchange; the stage names the request so
-                        // the refusal's reply can say what still answers and how to recover.
-                        if let Some(name) = server_name {
-                            job.set_stage_failure(
-                                &FailureCode::ProviderUnavailable,
-                                &format!("{name}: references request failed"),
-                            );
-                        }
-                        return Err(FailureCode::ProviderUnavailable);
-                    }
-                };
+            if let Some(references) = references {
                 card.usages = self
                     .usage_lines(
                         job,
@@ -455,7 +483,20 @@ impl Worker<'_> {
                     card.report_empty_usages = true;
                 }
             }
-            if callers_depth > 0 {
+            if let Some(reason) = degraded.as_deref() {
+                let note =
+                    |reason: &str| server_name.map(|name| format!("unavailable ({name} {reason})"));
+                if want_usages && outline.language.names().is_none() {
+                    card.usages_note = note(reason);
+                }
+                if callers_depth > 0 {
+                    card.callers_note = note(reason);
+                }
+                if callees_depth > 0 {
+                    card.callees_note = note(reason);
+                }
+            }
+            if degraded.is_none() && callers_depth > 0 {
                 // A server whose call hierarchy is unreliable (a constructor answers nothing while
                 // a plain method answers) would make graphs through callers silently miss call
                 // sites; say unavailable instead of printing a partial answer.
@@ -510,7 +551,7 @@ impl Worker<'_> {
                     }
                 }
             }
-            if callees_depth > 0 {
+            if degraded.is_none() && callees_depth > 0 {
                 // T163 (extra item): re-observe and re-resolve the position immediately before
                 // the request, exactly as `ide.graph`'s callees path does for every node it
                 // queries. The card's other sections (hover, usages, callers) already ran their
@@ -1030,9 +1071,15 @@ impl Worker<'_> {
                     let cause = exchange_cause(&error);
                     return Ok((outline, worktree_root, Some(Lexical::Exchange { cause })));
                 }
+                // This refusal is reached only for a language without source outlines or a file
+                // its scanner refuses, so no source outline answers for this call: the stage
+                // says so instead of promising one.
                 job.set_stage_failure(
                     &FailureCode::ProviderUnavailable,
-                    &format!("{}: documentSymbols request failed", server.name()),
+                    &format!(
+                        "{}: documentSymbols request failed; use native reads",
+                        server.name()
+                    ),
                 );
                 return Err(FailureCode::ProviderUnavailable);
             }

@@ -217,8 +217,11 @@ socket, and removes its runtime directory; the caches remain.
 
 Scheduling: triggers are a successful `ide.start`, Claude post hooks for `Edit`, `Write`,
 `MultiEdit`, `NotebookEdit`, and `Bash`, and a completed `ide.edit`. A trigger that names the
-changed file — a writer post's retained `tool_input.file_path`, the edited path of `ide.edit` —
-re-arms only that file's language, so a `.py` edit never starts a cargo check; a path no
+changed file — a writer post's retained `tool_input.file_path` (`notebook_path` for
+`NotebookEdit`), the edited path of `ide.edit` — makes that file's language the forced one (an
+edit reply waits only for it) while every other configured language keeps the ordinary
+fingerprint-gated re-arm, so a `.py` edit never forces a cargo check and a cross-language input
+still re-checks its consumer once the worktree fingerprint changed; a path no
 registered language owns (`Cargo.toml`, `README.md`) and a path-less trigger (`Bash`, `ide.start`)
 re-arm every configured language. Per `(worktree, language)`,
 runs are debounced by `debounce_ms`, at most one runs at a time, and at most two run concurrently

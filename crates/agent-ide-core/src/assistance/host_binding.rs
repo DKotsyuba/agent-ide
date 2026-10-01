@@ -14,7 +14,8 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 const MAX_IDENTIFIER_BYTES: usize = 256;
-/// Longest retained `tool_input.file_path` of a writer tool post event.
+/// Longest retained tool-input file path (`file_path`, or `notebook_path` for `NotebookEdit`)
+/// of a writer tool post event.
 const MAX_TOOL_FILE_BYTES: usize = 1024;
 const MAX_HOOK_METADATA_BYTES: usize = 64 * 1024;
 /// Bounds observed and settling calls within one exact channel, host, and actor scope.
@@ -262,10 +263,10 @@ pub struct HookEvent {
     /// host-specific project-check triggers (EYES-r2 §5, T29B §4) and never carries tool input
     /// or output.
     tool_name: Option<String>,
-    /// Bounded `tool_input.file_path` of a post-phase writer tool (Claude's
-    /// `Edit`/`Write`/`MultiEdit`/`NotebookEdit`), retained so the check trigger can re-arm only
-    /// the changed file's language. Everything else in `tool_input` — including file content —
-    /// stays discarded.
+    /// Bounded tool-input file path of a post-phase writer tool — `tool_input.file_path`, or
+    /// `tool_input.notebook_path` for Claude's `NotebookEdit`, which carries its file there —
+    /// retained so the check trigger can name the changed file's language. Everything else in
+    /// `tool_input` — including file content — stays discarded.
     tool_file: Option<String>,
 }
 
@@ -313,7 +314,8 @@ impl HookEvent {
         self.tool_name.as_deref()
     }
 
-    /// Returns the bounded `tool_input.file_path` of a post or post-failure writer event.
+    /// Returns the bounded tool-input file path (`file_path`, or `notebook_path` for
+    /// `NotebookEdit`) of a post or post-failure writer event.
     ///
     /// Absent for every other phase, for tools whose input names no file (`Bash`), and whenever
     /// the value is not a bounded non-empty string; an invalid value is dropped, never rejected.
@@ -1385,7 +1387,8 @@ pub fn parse_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnavailable>
 ///
 /// `session_id` is always retained. A subagent is identified by its exact optional `agent_id`,
 /// while a parent is identified by `session_id`; `agent_type` is descriptive only. `tool_name`
-/// and the bounded `tool_input.file_path` of a writer tool are retained only for
+/// and the bounded writer-tool file path of `tool_input` — its `file_path`, or its
+/// `notebook_path` for `NotebookEdit`, which carries the file there — are retained only for
 /// `PostToolUse`/`PostToolUseFailure` and only when valid; an invalid value is dropped rather
 /// than rejecting the event. The rest of tool input, all tool output, permission mode, other
 /// paths, source, and unknown fields are discarded. `PostToolBatch` deliberately has no
@@ -1429,7 +1432,12 @@ pub fn parse_claude_hook_event(payload: &[u8]) -> Result<HookEvent, BindingUnava
         HookPhase::Post | HookPhase::PostFailure => payload
             .tool_input
             .as_ref()
-            .and_then(|input| input.get("file_path"))
+            // `NotebookEdit` names its file `notebook_path`; every other writer names `file_path`.
+            .and_then(|input| {
+                input
+                    .get("file_path")
+                    .or_else(|| input.get("notebook_path"))
+            })
             .and_then(|value| value.as_str())
             .and_then(|path| checked_tool_file(path.to_owned())),
         _ => None,
@@ -1487,7 +1495,8 @@ struct ClaudeHookPayload {
     tool_use_id: Option<String>,
     /// Native tool name; retained only for the post phases after bounded validation.
     tool_name: Option<String>,
-    /// Whole native tool input; only its bounded `file_path` string is ever retained.
+    /// Whole native tool input; only its bounded `file_path`/`notebook_path` string is ever
+    /// retained.
     tool_input: Option<serde_json::Value>,
 }
 
@@ -1563,10 +1572,11 @@ mod tests {
         .expect("test hook is valid")
     }
 
-    /// A Claude writer post retains only the bounded `tool_input.file_path` — the one field the
-    /// check trigger uses to re-arm just the changed file's language. A tool whose input names
-    /// no file (`Bash`), a pre phase, and an over-limit path all contribute no file, and an
-    /// invalid value is dropped rather than rejecting the event.
+    /// A Claude writer post retains only the bounded tool-input file path — the one field the
+    /// check trigger uses to name the changed file's language. `NotebookEdit` carries its file
+    /// as `notebook_path` and is read there. A tool whose input names no file (`Bash`), a pre
+    /// phase, and an over-limit path all contribute no file, and an invalid value is dropped
+    /// rather than rejecting the event.
     #[test]
     fn claude_post_retains_only_the_bounded_tool_input_file_path() {
         let payload = |tool_name: &str, tool_input: serde_json::Value| {
@@ -1589,6 +1599,17 @@ mod tests {
         );
         assert_eq!(edit.tool_name(), Some("Edit"));
         assert_eq!(edit.tool_file(), Some("/worktree/src/module.rs"));
+
+        let notebook = payload(
+            "NotebookEdit",
+            json!({"notebook_path": "/worktree/notebooks/analysis.ipynb", "new_source": "pass"}),
+        );
+        assert_eq!(notebook.tool_name(), Some("NotebookEdit"));
+        assert_eq!(
+            notebook.tool_file(),
+            Some("/worktree/notebooks/analysis.ipynb"),
+            "NotebookEdit names its file notebook_path"
+        );
 
         let bash = payload("Bash", json!({"command": "cargo check", "timeout": 120}));
         assert_eq!(bash.tool_name(), Some("Bash"));

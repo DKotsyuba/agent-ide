@@ -877,23 +877,28 @@ mod tests {
             ),
             (
                 FailureCode::ProviderUnavailable,
-                "symbol:provider_unavailable (fixtureserver: workspace load failed)",
-                "error: provider_unavailable (symbol:provider_unavailable (fixtureserver: workspace load failed)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
+                "symbol:provider_unavailable (fixtureserver: workspace load failed; outline and read answer from source)",
+                "error: provider_unavailable (symbol:provider_unavailable (fixtureserver: workspace load failed; outline and read answer from source)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
             ),
             (
                 FailureCode::ProviderUnavailable,
-                "read:provider_unavailable (fixtureserver: transport gone)",
-                "error: provider_unavailable (read:provider_unavailable (fixtureserver: transport gone)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
+                "read:provider_unavailable (fixtureserver: transport gone; outline and read answer from source)",
+                "error: provider_unavailable (read:provider_unavailable (fixtureserver: transport gone; outline and read answer from source)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
             ),
             (
                 FailureCode::ProviderUnavailable,
-                "outline:provider_unavailable (fixtureserver: documentSymbols request failed)",
-                "error: provider_unavailable (outline:provider_unavailable (fixtureserver: documentSymbols request failed)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
+                "symbol:provider_unavailable (fixtureserver: references request failed; outline and read answer from source)",
+                "error: provider_unavailable (symbol:provider_unavailable (fixtureserver: references request failed; outline and read answer from source)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
             ),
             (
                 FailureCode::ProviderUnavailable,
-                "symbol:provider_unavailable (fixtureserver: references request failed)",
-                "error: provider_unavailable (symbol:provider_unavailable (fixtureserver: references request failed)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
+                "outline:provider_unavailable (fixtureserver: documentSymbols request failed; use native reads)",
+                "error: provider_unavailable (outline:provider_unavailable (fixtureserver: documentSymbols request failed; use native reads)); the language server cannot answer semantic requests. No source outline answers either; use native reads. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
+            ),
+            (
+                FailureCode::ProviderUnavailable,
+                "symbol:provider_unavailable (fixtureserver-plain: workspace load failed; use native reads)",
+                "error: provider_unavailable (symbol:provider_unavailable (fixtureserver-plain: workspace load failed; use native reads)); the language server cannot answer semantic requests. No source outline answers either; use native reads. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
             ),
             (
                 FailureCode::InvalidDetail,

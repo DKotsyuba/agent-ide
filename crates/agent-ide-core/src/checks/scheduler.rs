@@ -321,8 +321,10 @@ impl Scheduler {
         self.trigger_inner(repository_key, worktree, None, false, false);
     }
 
-    /// Like [`Scheduler::trigger`], naming the changed file when the trigger knows it: only that
-    /// file's language is re-armed, so a `.py` edit never starts a cargo check. A path no
+    /// Like [`Scheduler::trigger`], naming the changed file when the trigger knows it: that
+    /// file's language is the one a waiting caller expects, and every other configured language
+    /// is re-armed through the ordinary fingerprint-gated trigger, so a `.py` edit never forces
+    /// a cargo check while the worktree fingerprint still decides whether one runs. A path no
     /// registered language owns (for example `Cargo.toml` or `README.md`) re-arms every
     /// configured language, matching a path-less trigger.
     pub fn trigger_for_path(&self, repository_key: &str, worktree: &Path, path: &Path) {
@@ -332,7 +334,8 @@ impl Scheduler {
     /// Like [`Scheduler::trigger`], for a check a caller is waiting on (an edit reply): it forces
     /// a check of the requested inputs even when the unchanged-input fingerprint matches, and
     /// skips the cooldown after the previous run. `path` names the changed file when the caller
-    /// knows it; see [`Scheduler::trigger_for_path`] for how it narrows the armed languages.
+    /// knows it — only that file's language is forced; every other configured language keeps
+    /// the ordinary fingerprint-gated behaviour of [`Scheduler::trigger_for_path`].
     pub fn trigger_urgent(&self, repository_key: &str, worktree: &Path, path: Option<&Path>) {
         self.trigger_inner(repository_key, worktree, path, false, true);
     }
@@ -365,11 +368,13 @@ impl Scheduler {
     }
 
     /// Shared body of the trigger entry points. `path` names the changed file when the caller
-    /// knows it: only that file's language is re-armed, so one language's edit never starts
-    /// another language's check. A path whose language is registered but has no configured
-    /// checker arms nothing (the all-language path would not check it either); a path no
-    /// registered language owns — `Cargo.toml`, `README.md` — and a path-less trigger (Bash,
-    /// activation) keep the previous every-configured-language behaviour.
+    /// knows it: that file's language (when configured) is the one an urgent trigger forces —
+    /// the edit reply waits only for it — while every other configured language is armed
+    /// through the ordinary debounced, fingerprint-gated trigger, so a checker consuming
+    /// another language's file (`include_str!("../web/app.js")`) still re-checks once the
+    /// worktree inputs changed, and still elides the run when they did not. A path no
+    /// configured language owns — `Cargo.toml`, `README.md` — and a path-less trigger
+    /// (Bash, activation) keep the previous every-configured-language behaviour.
     fn trigger_inner(
         &self,
         repository_key: &str,
@@ -393,14 +398,12 @@ impl Scheduler {
         if activation {
             wt.activation_generation = wt.input_generation;
         }
-        let armed: Vec<Language> = match path.and_then(Language::for_path) {
-            Some(language) if self.inner.checkers.contains_key(&language) => vec![language],
-            Some(_) => Vec::new(),
-            None => self.inner.checkers.keys().copied().collect(),
-        };
-        for language in armed {
+        let own = path
+            .and_then(Language::for_path)
+            .filter(|language| self.inner.checkers.contains_key(language));
+        for language in self.inner.checkers.keys().copied().collect::<Vec<_>>() {
             let lang = wt.languages.entry(language).or_default();
-            if urgent {
+            if urgent && own.is_none_or(|own| own == language) {
                 lang.urgent = true;
             }
             if activation {
@@ -1493,14 +1496,20 @@ mod deny_tests {
         }
     }
 
-    /// A trigger that names the changed file re-arms only that file's language: a `.beta` edit
-    /// never starts the alpha check. A path no registered language owns (`Cargo.toml`) and a
-    /// path-less trigger (`Bash`, activation) keep arming every configured language.
+    /// A trigger that names the changed file forces that file's language (an urgent edit reply
+    /// waits only for it) and arms every other configured language through the ordinary
+    /// fingerprint-gated trigger: with the worktree inputs unchanged a `.beta` edit elides the
+    /// alpha check, and once they changed — the cross-language input an `include_str!` consumes
+    /// — it re-checks alpha too. A path no registered language owns (`Cargo.toml`) and a
+    /// path-less trigger (`Bash`, activation) arm every configured language.
     #[tokio::test]
-    async fn path_trigger_arms_only_the_changed_files_language() {
+    async fn path_trigger_forces_its_language_and_gates_the_others_on_the_fingerprint() {
         crate::lang::testing::install();
-        let root =
-            std::env::temp_dir().join(format!("agent-ide-path-trigger-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "agent-ide-path-trigger-{}-{}",
+            std::process::id(),
+            "gated"
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let root = std::fs::canonicalize(root).unwrap();
@@ -1517,44 +1526,95 @@ mod deny_tests {
             crate::lang::testing::BETA,
             ready(crate::lang::testing::BETA),
         ));
+        let fingerprint = Arc::new(std::sync::atomic::AtomicU64::new(7));
         let scheduler = Scheduler::new(
             vec![alpha.clone(), beta.clone()],
             Duration::from_millis(1),
             1,
             root.join("cache"),
-        );
+        )
+        .with_fingerprint({
+            let fingerprint = Arc::clone(&fingerprint);
+            Arc::new(move |_| Some(fingerprint.load(std::sync::atomic::Ordering::SeqCst)))
+        });
+        // Alpha already completed a Ready run at fingerprint 7, so the ordinary trigger may
+        // elide it; beta has no baseline yet, so its first check always runs.
+        {
+            let mut worktree = WorktreeState::new("repo");
+            worktree.input_generation = 1;
+            let language = LanguageState {
+                latest_snapshot: Some(ready(crate::lang::testing::ALPHA)),
+                last_stored_generation: 1,
+                completed_fingerprint: Some(7),
+                skip_eligible: true,
+                ..Default::default()
+            };
+            worktree
+                .languages
+                .insert(crate::lang::testing::ALPHA, language);
+            scheduler
+                .inner
+                .lock_state()
+                .worktrees
+                .insert(root.clone(), worktree);
+        }
+        /// Waits until `checker` has reached `want` checks, panicking as `label` otherwise.
+        async fn settle(checker: &Arc<FakeChecker>, want: usize, label: &str) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if checker.requests().len() >= want {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{label} reached {want} checks"));
+        }
 
+        // Unchanged inputs: the .beta edit checks beta only; alpha's matching fingerprint
+        // elides its re-arm.
         scheduler.trigger_for_path("repo", &root, Path::new("src/module.beta"));
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while beta.requests().is_empty() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the changed file's language is checked");
+        settle(&beta, 1, "the changed file's language is checked").await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             alpha.requests().is_empty(),
-            "a .beta edit must not start the alpha check"
+            "an unchanged fingerprint must elide the alpha check"
         );
 
-        for (label, path) in [
+        // Changed inputs (an edit of any file moves the worktree fingerprint): the .beta edit
+        // re-checks alpha too, the cross-language consumer of the edited file.
+        fingerprint.store(8, std::sync::atomic::Ordering::SeqCst);
+        scheduler.trigger_for_path("repo", &root, Path::new("src/module.beta"));
+        settle(&alpha, 1, "a changed fingerprint re-checks alpha").await;
+        settle(&beta, 2, "beta re-checks too").await;
+
+        // An urgent trigger (the edit reply) forces only the changed file's language: beta
+        // runs despite its matching fingerprint, alpha's still-matching one elides the run.
+        scheduler.trigger_urgent("repo", &root, Some(Path::new("src/module.beta")));
+        settle(&beta, 3, "the urgent edit forces the file's own language").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            alpha.requests().len(),
+            1,
+            "the urgent edit must not force the other languages"
+        );
+
+        for (step, (label, path)) in [
             ("unowned extension", Some(Path::new("Cargo.toml"))),
             ("path-less trigger", None),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            fingerprint.store(9 + step as u64, std::sync::atomic::Ordering::SeqCst);
             let (alpha_before, beta_before) = (alpha.requests().len(), beta.requests().len());
             match path {
                 Some(path) => scheduler.trigger_for_path("repo", &root, path),
                 None => scheduler.trigger("repo", &root),
             }
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while alpha.requests().len() <= alpha_before || beta.requests().len() <= beta_before
-                {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .unwrap_or_else(|_| panic!("{label} arms every configured language"));
+            settle(&alpha, alpha_before + 1, label).await;
+            settle(&beta, beta_before + 1, label).await;
         }
 
         scheduler.shutdown().await;

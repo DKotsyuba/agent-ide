@@ -156,8 +156,9 @@ pub(crate) fn default_stage(tool: AssistanceTool, code: &FailureCode) -> String 
 
 /// Composes the default `<tool>:<reason>` tag with the backend-reported session stage, the
 /// closed detail shape for a failed provider start or workspace load, e.g.
-/// `outline:provider_unavailable (<language>: workspace load failed)`. The stage names the
-/// failing step only — closed words, no paths or payloads.
+/// `outline:provider_unavailable (<language>: workspace load failed; outline and read answer
+/// from source)`. The stage names the failing step and what still answers without the server —
+/// closed words, no paths or payloads.
 pub(crate) fn stage_with_failure(tool: AssistanceTool, code: &FailureCode, stage: &str) -> String {
     format!("{} ({stage})", default_stage(tool, code))
 }

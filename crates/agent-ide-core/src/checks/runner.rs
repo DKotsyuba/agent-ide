@@ -102,17 +102,20 @@ static NESTED_SANDBOX_REFUSED: std::sync::atomic::AtomicBool =
 
 /// Reports whether one completed profiled run proves the host refused the nested profile.
 ///
-/// The refusal signature is a non-zero status, no checker output on stdout (a real failed check
-/// always says something there), and `sandbox_apply` in stderr — macOS prints
-/// `sandbox-exec: sandbox_apply: Operation not permitted` when the process applying the profile
-/// is itself already confined. Any other failure stays the checker's to report.
+/// The refusal signature is the wrapper's own: a non-zero status, no checker output on stdout (a
+/// real failed check always says something there), and a first non-empty stderr line that
+/// starts with `sandbox-exec: sandbox_apply:` — macOS prints exactly that when the process
+/// applying the profile is itself already confined, and the wrapper produces nothing else
+/// before `exec`. `sandbox_apply` anywhere later in stderr is the checker's own failure (a
+/// `build.rs` that itself invokes `sandbox-exec`, a workspace path containing the substring),
+/// so it stays the checker's to report.
 fn nested_sandbox_refusal(output: &RunOutput) -> bool {
     output.status.is_some_and(|code| code != 0)
         && output.stdout.is_empty()
-        && output
-            .stderr
-            .windows(13)
-            .any(|window| window == b"sandbox_apply")
+        && std::str::from_utf8(&output.stderr)
+            .ok()
+            .and_then(|stderr| stderr.lines().map(str::trim).find(|line| !line.is_empty()))
+            .is_some_and(|first| first.starts_with("sandbox-exec: sandbox_apply:"))
 }
 
 /// Production check runner: the Seatbelt profile of [`SeatbeltRunner`], with a one-time fallback
@@ -315,6 +318,56 @@ mod tests {
         assert_eq!(output.status, Some(101));
         assert_eq!(output.stderr, b"error: no test target named 'x'\n");
         assert_eq!(fake.specs().len(), 1);
+    }
+
+    /// Proves the refusal signature is the wrapper's own stderr, not the substring anywhere in
+    /// it: a checker failure whose stderr merely contains `sandbox_apply` — cargo quoting a
+    /// workspace path such as `/repos/sandbox_apply_lab`, or a `build.rs` that itself invokes
+    /// `sandbox-exec` and dies, mentioning it on a later line — is returned untouched, never
+    /// retried unprofiled, and leaves the daemon-lifetime fallback memory unset.
+    #[tokio::test]
+    async fn sandbox_apply_in_a_checker_failure_is_not_the_wrappers_refusal() {
+        let _state = isolated_fallback_state().await;
+        let stderrs = [
+            // A workspace search failure quoting a path that contains the substring.
+            &b"error: failed searching for potential workspace\nerror: current package \
+               believes it's in a workspace when it's not:\n/repos/sandbox_apply_lab/Cargo.toml\n"
+                [..],
+            // A build.rs-style failure that mentions `sandbox_apply` only on a later line.
+            b"warning: `build.rs` found at top level\nerror: custom build command for \
+              `lab v0.1.0` failed inside sandbox_apply context\n",
+        ];
+        for stderr in stderrs {
+            let fake = FakeRunner::new(vec![Ok(RunOutput {
+                status: Some(101),
+                stderr: stderr.to_vec(),
+                ..RunOutput::default()
+            })]);
+            let runner = NestedSandboxFallbackRunner::new(Arc::new(fake.clone()));
+            let spec = RunSpec {
+                program: PathBuf::from("/bin/cat"),
+                args: Vec::new(),
+                cwd: std::env::temp_dir(),
+                env: Vec::new(),
+                read_roots: Vec::new(),
+                write_roots: Vec::new(),
+                read_denies: Vec::new(),
+                timeout: Duration::from_secs(10),
+                max_output_bytes: 4096,
+            };
+            let output = runner.run(spec).await.expect("profiled result returned");
+            assert_eq!(output.status, Some(101), "{output:?}");
+            assert_eq!(output.stderr, stderr);
+            assert_eq!(
+                fake.specs().len(),
+                1,
+                "a checker failure must not be retried without the profile"
+            );
+            assert!(
+                !NESTED_SANDBOX_REFUSED.load(std::sync::atomic::Ordering::Acquire),
+                "a checker failure must not arm the daemon-wide fallback"
+            );
+        }
     }
 
     /// Proves scripted outputs replay in order, specifications are recorded, and exhaustion fails.

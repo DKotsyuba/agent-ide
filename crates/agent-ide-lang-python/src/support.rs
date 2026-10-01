@@ -51,19 +51,37 @@ const ROOT_MARKER_FILES: [&str; 5] = [
     "pyrightconfig.json",
 ];
 
+/// Vendor and build-output directories the depth-1 probe never enters: listing one is pure
+/// cost (a JS monorepo's `node_modules` holds thousands of entries), and none of them is a
+/// Python subproject of this worktree.
+const SKIPPED_PROBE_DIRECTORIES: [&str; 5] = ["node_modules", "target", "dist", "build", "vendor"];
+
 /// Reports whether `name` is a `requirements*.txt` marker file.
 fn is_requirements_txt(name: &str) -> bool {
     name.starts_with("requirements") && name.ends_with(".txt")
 }
 
+/// Names of the entries directly under `dir` in directory order — the probe decides by
+/// membership alone, so it never pays a sort; empty when it cannot be listed.
+fn dir_names(dir: &Path) -> Vec<String> {
+    fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect()
+}
+
 /// Reports whether `root` is a Python project, per the shared marker rule.
 ///
 /// Root markers: any of [`ROOT_MARKER_FILES`], any root `requirements*.txt`, or a `.venv`/`venv`
-/// directory. Plus a bounded depth-1 probe: nested `requirements*.txt` or `pyproject.toml` in
-/// immediate subdirectories — a repository whose Python dependencies live in
-/// `tools/requirements-ml.txt` still registers. No deeper tree is walked.
+/// directory. Plus a bounded depth-1 probe of immediate subdirectories — skipping dot and
+/// [`SKIPPED_PROBE_DIRECTORIES`] directories — where a nested `requirements*.txt` or
+/// `pyproject.toml` registers only when that same subdirectory holds at least one `.py` file, so
+/// a docs-only `docs/requirements.txt` (Sphinx in a Rust or Go repository) does not turn the
+/// worktree into a Python project. No deeper tree is walked.
 pub(crate) fn is_python_project(root: &Path) -> bool {
-    let names = entry_names(root);
+    let names = dir_names(root);
     if ROOT_MARKER_FILES
         .iter()
         .any(|name| root.join(name).is_file())
@@ -72,16 +90,19 @@ pub(crate) fn is_python_project(root: &Path) -> bool {
     {
         return true;
     }
-    names
-        .iter()
-        .filter(|name| !name.starts_with('.'))
-        .filter_map(|name| root.join(name).is_dir().then_some(root.join(name)))
-        .any(|dir| {
-            dir.join("pyproject.toml").is_file()
-                || entry_names(&dir)
-                    .iter()
-                    .any(|name| is_requirements_txt(name))
-        })
+    names.iter().any(|name| {
+        if name.starts_with('.') || SKIPPED_PROBE_DIRECTORIES.contains(&name.as_str()) {
+            return false;
+        }
+        let dir = root.join(name);
+        if !dir.is_dir() {
+            return false;
+        }
+        let entries = dir_names(&dir);
+        (entries.iter().any(|name| name == "pyproject.toml")
+            || entries.iter().any(|name| is_requirements_txt(name)))
+            && entries.iter().any(|name| name.ends_with(".py"))
+    })
 }
 
 impl LanguageSupport for Python {
@@ -1850,8 +1871,9 @@ FAILED tests/test_service.py::TestWorker::test_label
     #[test]
     /// The card's marker rule is the same shared list checks use: a root
     /// `requirements-dev.txt` registers (the old exact-`requirements.txt` check list missed it),
-    /// a nested `tools/requirements-ml.txt` registers through the depth-1 probe with the pytest
-    /// command, and a marker deeper than depth 1 does not.
+    /// a nested `tools/requirements-ml.txt` registers through the depth-1 probe only beside a
+    /// `.py` file in the same directory, a vendor directory is never probed, a marker deeper
+    /// than depth 1 does not register, and a docs-only `docs/requirements.txt` does not either.
     fn detect_uses_the_shared_marker_list_including_nested_requirements() {
         let root = scratch("requirements-dev-only");
         put(&root, "requirements-dev.txt", "pytest\n");
@@ -1866,10 +1888,14 @@ FAILED tests/test_service.py::TestWorker::test_label
 
         let root = scratch("tools-requirements");
         put(&root, "tools/requirements-ml.txt", "pandas\n");
+        assert!(
+            Python.detect(&root).is_none(),
+            "a nested marker with no .py file beside it does not register"
+        );
         put(&root, "tools/analyze.py", "import pandas\n");
         let project = Python
             .detect(&root)
-            .expect("tools/requirements-ml.txt registers via the depth-1 probe");
+            .expect("tools/requirements-ml.txt beside tools/analyze.py registers");
         assert_eq!(project.manifests, Vec::<PathBuf>::new());
         assert_eq!(
             project.commands.test.as_ref().unwrap().argv,
@@ -1877,8 +1903,26 @@ FAILED tests/test_service.py::TestWorker::test_label
         );
         fs::remove_dir_all(&root).unwrap();
 
+        let root = scratch("docs-requirements");
+        put(&root, "docs/requirements.txt", "sphinx\n");
+        assert!(
+            Python.detect(&root).is_none(),
+            "a docs-only requirements.txt does not register"
+        );
+        fs::remove_dir_all(&root).unwrap();
+
+        let root = scratch("vendor-requirements");
+        put(&root, "node_modules/pkg/requirements.txt", "");
+        put(&root, "node_modules/pkg/lib.py", "");
+        assert!(
+            Python.detect(&root).is_none(),
+            "vendor directories are never probed"
+        );
+        fs::remove_dir_all(&root).unwrap();
+
         let root = scratch("deep-requirements");
         put(&root, "nested/deep/requirements.txt", "");
+        put(&root, "nested/deep/lib.py", "");
         assert!(
             Python.detect(&root).is_none(),
             "the probe is depth-1, never a tree walk"
