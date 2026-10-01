@@ -1364,10 +1364,11 @@ impl WorkerHandle {
         }
     }
 
-    /// Signals revocation immediately and waits only for the bounded exact stop result.
+    /// Signals revocation immediately and waits up to 800 ms for the exact stop result. A timeout
+    /// reports that cleanup may still be running; callers should check with `ide.start` before editing.
     ///
-    /// The caller has already closed external admission; every queued job for this binding is
-    /// cancelled and removed while other bindings' jobs stay queued.
+    /// The caller has already closed external admission; every queued job for this session is
+    /// cancelled and removed while other sessions' jobs stay queued.
     pub async fn stop(&self, invocation: ValidatedInvocation, attachment: &str) -> PeerReply {
         let binding = invocation.binding_ref().clone();
         // Captured before `observe_binding` marks every run of this binding read, so the stop
@@ -1422,7 +1423,7 @@ impl WorkerHandle {
             Ok(Ok(reply)) => reply,
             _ => PeerReply::Error {
                 code: FailureCode::Deadline,
-                detail: None,
+                detail: Some("stop:deadline".to_owned()),
             },
         }
     }
@@ -1963,8 +1964,8 @@ struct Worker<'a> {
 
 impl<'a> Worker<'a> {
     /// Handles an explicit test start or a status request for a run the caller's own actor and
-    /// channel started in this worktree; another actor's run answers `unknown job`.
-    ///
+    /// channel started in this worktree; an unknown run id returns `invalid_detail` with the
+    /// `test:unknown_run` stage.
     /// Runs inside the queued job. The `symbol` branch resolves references through the live
     /// language server before selecting tests, so its caller already holds a `pending` reply (see
     /// [`WorkerHandle::submit`]) and reads the started/no-tests line through `ide.inspect`; the other
@@ -1990,12 +1991,9 @@ impl<'a> Worker<'a> {
         {
             let Some(job_status) = self.shared.test_runs.get(&root, id, &binding) else {
                 return Ok((
-                    PeerReply::Complete {
-                        kind: ResultKind::Test,
-                        text: format!("tests #{id}: unknown job"),
-                        detail_ref: None,
-                        truncated: false,
-                        continuation: false,
+                    PeerReply::Error {
+                        code: FailureCode::InvalidDetail,
+                        detail: Some(format!("test:unknown_run:{id}")),
                     },
                     Some(authority),
                     None,
@@ -2191,12 +2189,9 @@ impl<'a> Worker<'a> {
                 (selection.command, language, count)
             } else {
                 return Ok((
-                    PeerReply::Complete {
-                        kind: ResultKind::Test,
-                        text: "symbol test selection unavailable".into(),
-                        detail_ref: None,
-                        truncated: false,
-                        continuation: false,
+                    PeerReply::Error {
+                        code: FailureCode::ProviderUnavailable,
+                        detail: Some("test:selection_unavailable".to_owned()),
                     },
                     Some(authority),
                     None,
@@ -3294,6 +3289,7 @@ impl<'a> Worker<'a> {
             .as_str()
             .ok_or(FailureCode::SourceUnavailable)?
             .to_owned();
+        let path_detail = super::reply::bounded_utf8_prefix(&format!("{path:?}"), 256);
         let (observed, bytes) = self.observe(&binding, path.clone().into()).await?;
         let byte_offset = job.parameters.get("byte_offset").and_then(Value::as_u64);
         let query = byte_offset.map_or(ContextQuery::File, |byte_offset| ContextQuery::Symbol {
@@ -3306,7 +3302,7 @@ impl<'a> Worker<'a> {
         };
         let lexical = |job: &mut Job, reason: &'static str| {
             lexical_context(&observed, &bytes, query, reason).map_err(|_| {
-                job.failure_detail = Some("context:observation_failed".to_owned());
+                job.failure_detail = Some(format!("context:observation_failed:{path_detail}"));
                 FailureCode::SourceUnavailable
             })
         };
@@ -3337,7 +3333,8 @@ impl<'a> Worker<'a> {
                     .unwrap_or_else(|| "semantic project resolution is unverified".to_owned());
                 (
                     lexical_context(&observed, &bytes, query, &reason).map_err(|_| {
-                        job.failure_detail = Some("context:observation_failed".to_owned());
+                        job.failure_detail =
+                            Some(format!("context:observation_failed:{path_detail}"));
                         FailureCode::SourceUnavailable
                     })?,
                     None,
@@ -3371,7 +3368,7 @@ impl<'a> Worker<'a> {
         let authority = self.authority(&binding).await?;
         self.shared.active(&binding)?;
         if !source_matches(&observed) {
-            job.failure_detail = Some("context:source_changed".to_owned());
+            job.failure_detail = Some(format!("context:source_changed:{path_detail}"));
             return Err(FailureCode::SourceUnavailable);
         }
         let mode = match &context.mode {
@@ -4313,25 +4310,26 @@ impl InspectFailure {
 /// reference path, so a newly denied secondary file invalidates its cached page.
 async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, request: Inspection) {
     let result: Result<PeerReply, InspectFailure> = async {
-        // A test-run handle (`tests #N`, `tests-N`, `#N`, `N`) is what callers reach for first
-        // after `tests #N: started`; it names a background run, not a retained detail, so answer
-        // with that run's status instead of failing the lookup. The status belongs to the actor
-        // and channel, not one generation, so it answers before the liveness check — also after
-        // `ide.stop`, when the output detail is gone and its `full output` line is left out.
+        // A known test-run handle (`tests #N`, `tests-N`, `#N`, `N`) names a background
+        // run rather than a retained detail. Its status belongs to the actor and channel, so it
+        // answers before the liveness check, including after `ide.stop`; an unknown id is a
+        // distinct invalid-detail refusal.
         if let Some(id) = test_run_handle(&request.reference) {
-            let text = match shared.test_runs.find(id, &request.binding) {
-                Some(status) if status.result.is_some() => {
-                    shared
-                        .settled_test_reply(status.id, &request.binding, &status)
-                        .0
-                }
-                Some(status) => format!(
+            let Some(status) = shared.test_runs.find(id, &request.binding) else {
+                return Ok(PeerReply::Error {
+                    code: FailureCode::InvalidDetail,
+                    detail: Some(format!("test:unknown_run:{id}")),
+                });
+            };
+            let text = if status.result.is_some() {
+                shared
+                    .settled_test_reply(status.id, &request.binding, &status)
+                    .0
+            } else {
+                format!(
                     "tests #{id}: running {} s; poll: call ide.test with {{\"status\": {id}}}",
                     status.age.as_secs()
-                ),
-                None => format!(
-                    "tests #{id}: unknown job; poll: call ide.test with {{\"status\": {id}}}"
-                ),
+                )
             };
             return Ok(PeerReply::Complete {
                 kind: ResultKind::Test,
@@ -4460,10 +4458,11 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
         if let Some(source) = source
             && !source_matches(&source)
         {
-            return Err(InspectFailure::stage(
-                invalidate(FailureCode::SourceUnavailable),
-                "inspect:source_changed",
-            ));
+            let path = super::reply::bounded_utf8_prefix(&format!("{:?}", source.path()), 256);
+            return Err(InspectFailure {
+                code: invalidate(FailureCode::SourceUnavailable),
+                stage: format!("inspect:source_changed:{path}"),
+            });
         }
         // Context pages are frozen byte slices of the page-1 snapshot, so the exact-byte check
         // above is the whole staleness contract; the native epoch no longer discards a page
@@ -7442,12 +7441,15 @@ mod stop_retry_tests {
             text.starts_with("tests #1: 1 passed, 0 failed") && !text.contains("full output"),
             "{text}"
         );
-        // Another actor's identity on the same channel does not see the run.
+        // Another actor's identity on the same channel cannot inspect the run.
         let stranger = BindingRef::fixture("other-actor", "stop-channel", 1).channel_identity();
-        let PeerReply::Complete { text, .. } = inspect(stranger, "tests #1".into()).await else {
-            panic!("an unknown run still answers a status line")
-        };
-        assert!(text.starts_with("tests #1: unknown job"), "{text}");
+        assert_eq!(
+            inspect(stranger, "tests #1".into()).await,
+            PeerReply::Error {
+                code: FailureCode::InvalidDetail,
+                detail: Some("test:unknown_run:1".to_owned()),
+            }
+        );
         // Any other reference still requires the active generation.
         assert!(matches!(
             inspect(identity, "run-detail".into()).await,
@@ -7547,14 +7549,14 @@ mod stop_retry_tests {
             "{text}"
         );
 
-        // A number no run ever had answers unknown job, not invalid_detail.
+        // A run that cannot be found gets a distinct invalid-detail stage, not a useless poll hint.
         let unknown = inspect("tests-9".into()).await;
-        let PeerReply::Complete { text, .. } = &unknown else {
-            panic!("unknown run must answer a status line, got {unknown:?}")
-        };
         assert_eq!(
-            text,
-            "tests #9: unknown job; poll: call ide.test with {\"status\": 9}"
+            unknown,
+            PeerReply::Error {
+                code: FailureCode::InvalidDetail,
+                detail: Some("test:unknown_run:9".to_owned()),
+            }
         );
 
         // A reference this daemon minted but no longer retains reads expired; one it could

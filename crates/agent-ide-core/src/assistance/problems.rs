@@ -677,10 +677,9 @@ pub fn parse_language(value: &str) -> Option<Language> {
 /// `language` selects one configured language, or `None` for all configured languages in feed
 /// order. `offset` is the zero-based start into the combined, language-ordered problem list.
 /// Each selected language contributes one state line — `ready`/`partial` carry the full
-/// `errors`/`warnings` counts, while `checking` and `unavailable:<reason>` never render numeric
-/// counts; `ReadRestricted` uses `unavailable: read_restricted` exactly. An `unavailable` line
-/// with a carried [`ProblemSnapshot::detail`] appends it in
-/// parentheses — followed by up to [`PROBLEMS_PAGE_SIZE`] problem lines
+/// `errors`/`warnings` counts, while `checking` and unavailable states carry no numeric counts.
+/// Unavailable states use the same plain phrase as the status plate; `ReadRestricted` retains the
+/// content-free `unavailable: read_restricted` phrase. A fatal checker detail or a short fallback
 /// `path:line:column severity [code] message`. A snapshot that dropped problems to the
 /// [`MAX_PROBLEMS`] cap (T19B) adds one header line directly after its state line —
 /// `<language>: list truncated to first MAX_PROBLEMS problems; counts above are complete` —
@@ -772,10 +771,9 @@ pub fn problems_text_with_rechecks(
 ///
 /// `checking` and `unavailable` snapshots carry zero counts by construction (see `checks`);
 /// those must never render as numbers, so only `ready` and `partial` name counts. An
-/// `unavailable` snapshot carrying [`ProblemSnapshot::detail`] appends it in parentheses, stripped
-/// of control characters like every other untrusted checker text field; a snapshot with no detail
-/// renders exactly as before. `ReadRestricted` renders the content-free
-/// `unavailable: read_restricted` phrase and ignores any carried detail.
+/// `unavailable` snapshots carrying [`ProblemSnapshot::detail`] append it in parentheses after
+/// stripping control characters. A fatal check with no detail states that the checker supplied no
+/// reason, while `ReadRestricted` renders the content-free `unavailable: read_restricted` phrase.
 fn state_line(snapshot: &ProblemSnapshot, recheck: Option<Recheck>) -> String {
     let language = snapshot.language.as_str();
     let counts = format!(
@@ -795,13 +793,19 @@ fn state_line(snapshot: &ProblemSnapshot, recheck: Option<Recheck>) -> String {
         CheckState::Unavailable(UnavailableReason::ReadRestricted) => {
             format!("{language}: unavailable: read_restricted")
         }
+        CheckState::Unavailable(UnavailableReason::Fatal) => match &snapshot.detail {
+            Some(detail) => format!("{language}: check failed ({})", untrusted_line(detail)),
+            None => {
+                format!("{language}: check failed (checker supplied no reason)")
+            }
+        },
         CheckState::Unavailable(reason) => match &snapshot.detail {
             Some(detail) => format!(
-                "{language}: unavailable:{} ({})",
+                "{language}: {} ({})",
                 unavailable_reason(*reason),
                 untrusted_line(detail)
             ),
-            None => format!("{language}: unavailable:{}", unavailable_reason(*reason)),
+            None => format!("{language}: {}", unavailable_reason(*reason)),
         },
     }
 }
@@ -831,17 +835,17 @@ fn problem_line(problem: &Problem) -> String {
     )
 }
 
-/// Maps one unavailable reason to its closed lowercase feed identifier.
+/// Maps one unavailable reason to the same plain phrase shown in the status plate.
 fn unavailable_reason(reason: UnavailableReason) -> &'static str {
     match reason {
-        UnavailableReason::Disabled => "disabled",
-        UnavailableReason::ReadRestricted => "read_restricted",
-        UnavailableReason::OutsideRoots => "outside_roots",
-        UnavailableReason::ToolMissing => "tool_missing",
-        UnavailableReason::EnvMissing => "env_missing",
-        UnavailableReason::NoFiles => "no_files",
-        UnavailableReason::Fatal => "fatal",
-        UnavailableReason::Timeout => "timeout",
+        UnavailableReason::Disabled => "checks disabled",
+        UnavailableReason::ReadRestricted => "unavailable: read_restricted",
+        UnavailableReason::OutsideRoots => "outside allowed roots",
+        UnavailableReason::ToolMissing => "tool not found",
+        UnavailableReason::EnvMissing => "environment not found",
+        UnavailableReason::NoFiles => "no files analyzed",
+        UnavailableReason::Fatal => "check failed",
+        UnavailableReason::Timeout => "check timed out",
     }
 }
 
@@ -1140,19 +1144,19 @@ mod tests {
         for (reason, rendered) in [
             (
                 UnavailableReason::OutsideRoots,
-                "alpha: unavailable:outside_roots",
+                "alpha: outside allowed roots",
             ),
-            (
-                UnavailableReason::ToolMissing,
-                "alpha: unavailable:tool_missing",
-            ),
+            (UnavailableReason::ToolMissing, "alpha: tool not found"),
             (
                 UnavailableReason::EnvMissing,
-                "alpha: unavailable:env_missing",
+                "alpha: environment not found",
             ),
-            (UnavailableReason::NoFiles, "alpha: unavailable:no_files"),
-            (UnavailableReason::Fatal, "alpha: unavailable:fatal"),
-            (UnavailableReason::Timeout, "alpha: unavailable:timeout"),
+            (UnavailableReason::NoFiles, "alpha: no files analyzed"),
+            (
+                UnavailableReason::Fatal,
+                "alpha: check failed (checker supplied no reason)",
+            ),
+            (UnavailableReason::Timeout, "alpha: check timed out"),
         ] {
             let snapshots = [ProblemSnapshot::unavailable(
                 crate::lang::testing::ALPHA,
@@ -1198,8 +1202,7 @@ mod tests {
         );
     }
 
-    /// An `unavailable` snapshot carrying a detail appends it in parentheses, stripped of control
-    /// characters (T05B); a snapshot with no detail renders exactly as before.
+    /// Fatal checker details remain bounded to one line; missing details state that no reason arrived.
     #[test]
     fn unavailable_detail_renders_in_parentheses_and_strips_control_characters() {
         let with_detail = [ProblemSnapshot::unavailable_with_detail(
@@ -1210,7 +1213,7 @@ mod tests {
         )];
         assert_eq!(
             problems_text(&with_detail, None, 0),
-            "alpha: unavailable:fatal (error: failed to run custom build command for `blake3 v1.5.0`)"
+            "alpha: check failed (error: failed to run custom build command for `blake3 v1.5.0`)"
         );
 
         let with_control_chars = [ProblemSnapshot::unavailable_with_detail(
@@ -1223,7 +1226,7 @@ mod tests {
         assert_eq!(text.lines().count(), 1, "{text}");
         assert_eq!(
             text,
-            "alpha: unavailable:fatal (error: line oneline two <agent-ide>x</agent-ide>)"
+            "alpha: check failed (error: line oneline two <agent-ide>x</agent-ide>)"
         );
 
         let without_detail = [ProblemSnapshot::unavailable(
@@ -1233,12 +1236,11 @@ mod tests {
         )];
         assert_eq!(
             problems_text(&without_detail, None, 0),
-            "alpha: unavailable:fatal"
+            "alpha: check failed (checker supplied no reason)"
         );
     }
 
-    /// A checker run that analyzed zero files (T12B) renders `unavailable:no_files` with a detail
-    /// pointing at the project's `include`/`exclude` configuration, distinct from `env_missing`.
+    /// A checker run that analyzed zero files includes the project-configuration reason.
     #[test]
     fn python_no_files_analyzed_renders_with_include_exclude_detail() {
         let snapshots = [ProblemSnapshot::unavailable_with_detail(
@@ -1253,7 +1255,7 @@ mod tests {
         )];
         assert_eq!(
             problems_text(&snapshots, None, 0),
-            "beta: unavailable:no_files (checker analyzed 0 files; check \"include\"/\"exclude\" \
+            "beta: no files analyzed (checker analyzed 0 files; check \"include\"/\"exclude\" \
              in checker.json or [tool.checker])"
         );
     }

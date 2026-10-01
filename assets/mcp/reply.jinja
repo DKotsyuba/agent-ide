@@ -18,7 +18,39 @@ Contract:
   flush-left, so the only newlines in the output are the intentional ones.
 -#}
 {%- if state == "unavailable" -%}
+{%- if reason == "host_binding" and cause_tag == "invalid_metadata" -%}
+unavailable: host_binding (invalid_metadata); the host sent malformed call metadata. Send a new tool call, or continue with native tools
+{%- elif reason == "host_binding" and cause_tag == "missing_field" -%}
+unavailable: host_binding (missing_field); required host call metadata is missing. Send a new tool call, or continue with native tools
+{%- elif reason == "host_binding" and cause_tag == "invalid_field" -%}
+unavailable: host_binding (invalid_field); host call metadata contains an invalid field. Send a new tool call, or continue with native tools
+{%- elif reason == "host_binding" and cause_tag == "invalid_attachment" -%}
+unavailable: host_binding (invalid_attachment); the host attachment does not identify this call. Repeat the call, or continue with native tools
+{%- elif reason == "host_binding" and cause_tag == "unsupported_hook_phase" -%}
+unavailable: host_binding (unsupported_hook_phase); the host reported an unsupported tool-call phase. Repeat the call, or continue with native tools
+{%- elif reason == "host_binding" and cause_tag == "missing_invocation" -%}
+unavailable: host_binding (missing_invocation); the host's completion event arrived before its tool call was validated. Send a new tool call, or continue with native tools
+{%- elif reason == "host_binding" and cause_tag == "outside_allowed_roots" -%}
+unavailable: host_binding (outside_allowed_roots); the session project is outside the directories the IDE may open. Call ide.start with an allowed root, or continue with native tools
+{%- elif reason == "host_binding" and cause_tag == "hooks_not_delivered" -%}
+unavailable: host_binding (hooks_not_delivered); the daemon has received no host event for this session. Call ide.start with the same root, or continue with native tools
+{%- elif reason == "host_binding" and cause_tag == "missing_pre" -%}
+unavailable: host_binding (missing_pre); the host's before-tool event for this call did not reach the daemon. Repeat the call once, or continue with native tools
+{%- elif reason == "host_binding" and cause_tag == "replay" -%}
+unavailable: host_binding (replay); this exact call was already processed. Send it as a new tool call, or continue with native tools
+{%- elif reason == "host_binding" and cause_tag == "mismatch" -%}
+unavailable: host_binding (mismatch); the host event did not match this call. Repeat the call, or continue with native tools
+{%- elif reason == "host_binding" and cause_tag == "inactive_binding" -%}
+unavailable: host_binding (inactive_binding); this session's IDE activation has stopped. Call ide.start, then repeat this call, or continue with native tools
+{%- elif reason == "host_binding" and cause_tag == "capacity_exceeded" -%}
+unavailable: host_binding (capacity_exceeded); the daemon's session table is full. Call ide.stop, then ide.start, or continue with native tools
+{%- elif reason == "host_binding" and cause_tag == "host_unrecognized" -%}
+unavailable: host_binding (host_unrecognized); this host did not identify the call in a supported format. Continue with native tools
+{%- elif reason == "host_binding" and cause_tag is startingwith("project_moved:") -%}
+unavailable: host_binding ({{ cause_tag }}); the IDE could not move to the requested root. Call ide.start under the session's current root, or continue with native tools
+{%- else -%}
 unavailable: {{ reason }}{% if cause_tag %} ({{ cause_tag }}){% endif %}; continue with native tools
+{%- endif -%}
 {%- endif -%}
 {%- if state == "hook_observed" -%}
 hook_observed: native pre-hook retained
@@ -40,51 +72,137 @@ pending: use ide.inspect with detail_ref {{ detail_ref }}
 {%- endif -%}
 {%- if state == "error" -%}
 {%- if code == "resolution_unverified" -%}
-error: resolution_unverified; {{ resolution_detail if resolution_detail else "the nearest tsconfig.json or jsconfig.json did not prove membership: add the file to `files` or a literal `include` entry and use supported resolution settings" }}; retry ide.context
+error: resolution_unverified (context:resolution); {{ resolution_detail if resolution_detail else "the project configuration did not prove this file belongs to the project" }}. Fix the project configuration, then retry ide.context
 {%- elif code.no_such_file is defined -%}
-error: no_such_file: {{ code.no_such_file }}{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; check the path
+error: no_such_file: {{ code.no_such_file }}{% if resolution_detail %} ({{ resolution_detail }}){% else %} (read:no_such_file){% endif %}; this path does not exist in the worktree. Fix the path, or use ide.symbol with a bare name to find it
 {%- elif code is mapping -%}
-error: source_too_large; source is {{ code.source_too_large.size }} bytes, exceeding the {{ code.source_too_large.ceiling }} byte read ceiling; continue with native tools
+error: source_too_large (read:source_too_large); source is {{ code.source_too_large.size }} bytes, over the {{ code.source_too_large.ceiling }} byte read limit. Read it in pieces with native tools
+{%- elif code == "unknown_symbol" and resolution_detail is startingwith("edit:range_past_end:") -%}
+error: unknown_symbol (edit:range_past_end); {{ resolution_detail[21:] }}. Re-read the range with ide.read and retry with a fresh source_ref
 {%- elif code == "unknown_symbol" -%}
-error: unknown_symbol{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; no symbol matches that path or name; check the file with ide.outline or search a bare name with ide.symbol
+error: unknown_symbol{% if resolution_detail %} ({{ resolution_detail }}){% else %} (symbol:unknown_symbol){% endif %}; no symbol matches that path or name; check the file with ide.outline or search a bare name with ide.symbol
 {%- elif code == "provider_loading" -%}
-error: provider_loading{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; the language server is still loading the workspace; repeat the call in a few seconds
+error: provider_loading{% if resolution_detail %} ({{ resolution_detail }}){% else %} (symbol:provider_loading){% endif %}; the language server is still loading the workspace; repeat the call in a few seconds
 {%- elif code == "invalid_detail" and resolution_detail == "start:activation_conflict" -%}
 error: invalid_detail (start:activation_conflict); this activation_id was used with another root; use a new activation_id
+{%- elif code == "invalid_detail" and resolution_detail == "inspect:detail_mismatch" -%}
+error: invalid_detail (inspect:detail_mismatch); this detail_ref was issued for different arguments. Repeat the original call with its exact arguments, or make a fresh ide.* call
+{%- elif code == "invalid_detail" and resolution_detail is startingwith("test:unknown_run:") -%}
+error: invalid_detail (test:unknown_run); run #{{ resolution_detail[17:] }} is unknown or expired. Start a new run with ide.test
 {%- elif code == "invalid_detail" -%}
-error: invalid_detail{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; {% if resolution_detail == "inspect:detail_expired" %}this detail_ref has expired{% else %}this detail_ref was never issued{% endif %}; repeat the original ide.* call to get a fresh one, or continue with native tools
+error: invalid_detail{% if resolution_detail %} ({{ resolution_detail }}){% else %} (inspect:detail_unknown){% endif %}; {% if resolution_detail == "inspect:detail_expired" %}this detail_ref has expired{% else %}this detail_ref was never issued{% endif %}; repeat the original ide.* call to get a fresh one, or continue with native tools
+{%- elif code == "source_unavailable" and resolution_detail is startingwith("inspect:source_changed:") -%}
+error: source_unavailable (inspect:source_changed); {{ resolution_detail[23:] }} changed since this result was captured. Call ide.context with this path again for fresh bytes
 {%- elif code == "source_unavailable" and resolution_detail == "inspect:source_changed" -%}
-error: source_unavailable (inspect:source_changed); the file changed since this result was captured; read every page of a paged result before any write, then call ide.context again for fresh bytes
+error: source_unavailable (inspect:source_changed); the source changed since this result was captured. Call ide.context again for fresh bytes
 {%- elif code == "source_unavailable" and resolution_detail == "diff:not_a_git_repository" -%}
 error: source_unavailable (diff:not_a_git_repository); not a git repository: no git data
+{%- elif code == "source_unavailable" and resolution_detail is startingwith("context:source_changed:") -%}
+error: source_unavailable (context:source_changed); {{ resolution_detail[23:] }} changed since it was read. Re-read it with ide.context, then retry with the new source_ref
+{%- elif code == "source_unavailable" and (resolution_detail == "context:source_changed" or resolution_detail == "inspect:source_stale") -%}
+error: source_unavailable ({{ resolution_detail }}); the source changed since it was read. Re-read it with ide.context, then retry with the new source_ref
+{%- elif code == "source_unavailable" and resolution_detail is startingwith("context:observation_failed:") -%}
+error: source_unavailable (context:observation_failed); {{ resolution_detail[27:] }} could not be read through the confined reader. Retry ide.context, or continue with native tools
+{%- elif code == "source_unavailable" and resolution_detail is startingwith("diff:") -%}
+error: source_unavailable ({{ resolution_detail }}); Git evidence for this comparison became unusable. Call ide.diff again
 {%- elif code == "source_unavailable" -%}
-error: source_unavailable{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; continue with native tools
+error: source_unavailable{% if resolution_detail %} ({{ resolution_detail }}){% else %} (context:source_unavailable){% endif %}; the requested source could not be read. Retry ide.context, or continue with native tools
 {%- elif code == "outside_allowed_roots" and resolution_detail is startingwith("start:root_absent") -%}
 error: outside_allowed_roots ({{ resolution_detail }}); the requested root does not exist yet, so it cannot be activated; create it below the named ancestor or start from that ancestor, otherwise continue with native tools
 {%- elif code == "outside_allowed_roots" and resolution_detail is startingwith("start:worktree_unresolved") -%}
 error: outside_allowed_roots ({{ resolution_detail }}); the discovered worktree or Git directory is outside allowed_roots; start from an admitted worktree root
 {%- elif code == "outside_allowed_roots" -%}
-error: outside_allowed_roots{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; the working directory is not below any configured allowed root; start the IDE in an allowed directory or add this one to allowed_roots, otherwise continue with native tools
+error: outside_allowed_roots{% if resolution_detail %} ({{ resolution_detail }}){% else %} (start:outside_allowed_roots){% endif %}; the requested project root is outside every directory the IDE may open. Call ide.start with an allowed root, or continue with native tools
 {%- elif code == "workspace_activation" and resolution_detail is startingwith("start:git_discovery_failed") -%}
 error: workspace_activation ({{ resolution_detail }}); Git worktree discovery failed; check the Git checkout and retry ide.start
 {%- elif code == "workspace_activation" and resolution_detail is startingwith("start:worktree_unresolved") -%}
 error: workspace_activation ({{ resolution_detail }}); the worktree could not be resolved; retry ide.start from its root
 {%- elif code == "workspace_activation" and resolution_detail is startingwith("start:durable_state") -%}
-error: workspace_activation ({{ resolution_detail }}); durable activation state failed; retry ide.start, and continue with native tools if it repeats
+error: workspace_activation ({{ resolution_detail }}); saved workspace state could not be read. Retry ide.start, and continue with native tools if it repeats
 {%- elif code == "conflict" and resolution_detail == "start:worktree_held_by_another_actor" -%}
-error: conflict; another agent's binding owns this worktree and keeps its activation; that agent must run ide.stop before this one can activate here, otherwise continue with native tools
+error: conflict (start:worktree_held_by_another_actor); another agent session owns this worktree's IDE activation. Have that session call ide.stop, then retry ide.start, or continue with native tools
 {%- elif code == "conflict" and resolution_detail == "start:worktree_held_by_this_actor" -%}
-error: conflict; this actor's other channel binding owns this worktree; run ide.stop from that binding first, then ide.start again
+error: conflict (start:worktree_held_by_this_actor); another session for this actor owns this worktree. Call ide.stop from that session, then retry ide.start
 {%- elif code == "conflict" and resolution_detail == "start:actor_owns_another_worktree" -%}
-error: conflict; this actor already owns another worktree; call ide.stop first, then ide.start again for this root
+error: conflict (start:actor_owns_another_worktree); this actor's IDE activation is attached to another worktree. Call ide.stop there, then retry ide.start for this root
 {%- elif code == "conflict" and resolution_detail == "start:activation_conflict" -%}
 error: conflict (start:activation_conflict); this activation_id was already committed with different parameters; use a new activation_id
 {%- elif code == "conflict" and resolution_detail == "start:provider_cache_namespace_conflict" -%}
-error: conflict (start:provider_cache_namespace_conflict); another active IDE owns the provider cache namespace; call ide.stop in that activation, then retry ide.start
+error: conflict (start:provider_cache_namespace_conflict); another active session owns the language-server cache. Retry ide.start after that session stops
+{%- elif code == "conflict" and resolution_detail == "start:conflict" -%}
+error: conflict (start:conflict); this worktree or activation is already owned by another live session. Call ide.stop in that session, then retry ide.start
+{%- elif code == "provider_unavailable" and resolution_detail == "edit:rename_no_edits" -%}
+error: provider_unavailable (edit:rename_no_edits); the language server returned no edits for this rename. Check the symbol with ide.symbol, then retry
+{%- elif code == "provider_unavailable" and resolution_detail is startingwith("edit:rename_no_edits:") -%}
+error: provider_unavailable (edit:rename_no_edits); the language server returned no edits for symbol {{ resolution_detail[21:] }}. Check it with ide.symbol, then retry
+{%- elif code == "provider_unavailable" and resolution_detail == "edit:rename_request_failed" -%}
+error: provider_unavailable (edit:rename_request_failed); the language server failed to process this rename. Check the symbol with ide.symbol, then retry
+{%- elif code == "provider_unavailable" and resolution_detail is startingwith("edit:rename_request_failed:") -%}
+error: provider_unavailable (edit:rename_request_failed); the language server failed to rename symbol {{ resolution_detail[27:] }}. Check it with ide.symbol, then retry
+{%- elif code == "provider_unavailable" and resolution_detail == "edit:rename_unsupported_edits" -%}
+error: provider_unavailable (edit:rename_unsupported_edits); the language server returned edits the IDE cannot safely apply. Continue with native tools
+{%- elif code == "provider_unavailable" and resolution_detail is startingwith("edit:rename_unsupported_edits:") -%}
+error: provider_unavailable (edit:rename_unsupported_edits); the language server returned edits the IDE cannot safely apply for symbol {{ resolution_detail[30:] }}. Continue with native tools
+{%- elif code == "provider_unavailable" and resolution_detail == "test:selection_unavailable" -%}
+error: provider_unavailable (test:selection_unavailable); tests could not be selected from these arguments. Use ide.test with a pattern or path
+{%- elif code == "provider_unavailable" and resolution_detail is startingwith("outline:provider_unavailable ext=") -%}
+error: provider_unavailable (outline:no_server); no language server is configured for .{{ resolution_detail[33:] }} files in this project. Continue with native tools
+{%- elif code == "provider_unavailable" and resolution_detail is startingwith("read:provider_unavailable ext=") -%}
+error: provider_unavailable (read:no_server); no language server is configured for .{{ resolution_detail[30:] }} files in this project. Continue with native tools
+{%- elif code == "provider_unavailable" and resolution_detail is startingwith("symbol:provider_unavailable ext=") -%}
+error: provider_unavailable (symbol:no_server); no language server is configured for .{{ resolution_detail[32:] }} files in this project. Continue with native tools
+{%- elif code == "provider_unavailable" and resolution_detail is startingwith("context:provider_unavailable ext=") -%}
+error: provider_unavailable (context:no_server); no language server is configured for .{{ resolution_detail[33:] }} files in this project. Continue with native tools
+{%- elif code == "provider_unavailable" and resolution_detail is startingwith("context:") -%}
+error: provider_unavailable ({{ resolution_detail }}); the language server could not provide this result. Retry the same ide.* call later, or continue with native tools
+{%- elif code == "provider_unavailable" -%}
+error: provider_unavailable{% if resolution_detail %} ({{ resolution_detail }}){% else %} (provider:unavailable){% endif %}; no language server result is available for this request. Continue with native tools
+{%- elif code == "deadline" and resolution_detail == "stop:deadline" -%}
+error: deadline (stop:deadline); stopping exceeded 800 ms and cleanup may still be running. Call ide.start to check the session before editing, or continue with native tools
+{%- elif code == "unsupported_git" -%}
+error: unsupported_git{% if resolution_detail %} ({{ resolution_detail }}){% else %} (diff:unsupported_git){% endif %}; the configured Git lacks a required exact-capture option. Continue with native tools and git diff
+{%- elif code == "launcher_configuration" -%}
+error: launcher_configuration{% if resolution_detail %} ({{ resolution_detail }}){% else %} (start:launcher_configuration){% endif %}; the IDE could not match this session to its launch configuration. Call ide.start again, or continue with native tools
+{%- elif code == "workspace_authority" -%}
+error: workspace_authority{% if resolution_detail %} ({{ resolution_detail }}){% else %} (inspect:authority_stale){% endif %}; this result belongs to an older IDE activation. Call ide.start, then repeat with fresh references
+{%- elif code == "capacity" -%}
+error: capacity{% if resolution_detail %} ({{ resolution_detail }}){% else %} (worker:capacity){% endif %}; the IDE's bounded queue or result store is full. Wait for pending work, or call ide.stop and ide.start
+{%- elif code == "cancelled" -%}
+error: cancelled{% if resolution_detail %} ({{ resolution_detail }}){% else %} (worker:cancelled){% endif %}; ide.stop cancelled this call. Call ide.start, then repeat it, or continue with native tools
+{%- elif code == "deadline" -%}
+error: deadline{% if resolution_detail %} ({{ resolution_detail }}){% else %} (worker:deadline){% endif %}; the operation exceeded its time limit. Retry the call once, or continue with native tools
+{%- elif code == "workspace_activation" -%}
+error: workspace_activation{% if resolution_detail %} ({{ resolution_detail }}){% else %} (start:workspace_activation){% endif %}; the project could not be activated. Fix the Git checkout or saved workspace state, then retry ide.start
+{%- elif code == "execution_profile" and resolution_detail == "inspect:symlink_preflight" -%}
+error: execution_profile (inspect:symlink_preflight); this cached result crosses a symlink path the IDE cannot verify safely. Continue with native tools
+{%- elif code == "execution_profile" and not cause_tag -%}
+error: execution_profile{% if resolution_detail %} ({{ resolution_detail }}){% else %} (start:execution_profile){% endif %}; the IDE refused to run this operation under its accepted execution rules. Continue with native tools
 {%- elif code == "execution_profile" and cause_tag is defined -%}
-error: execution_profile ({{ cause_tag }}); continue with native tools
+{%- if cause_tag == "git_policy" -%}
+error: execution_profile (git_policy); the IDE could not establish the allowed Git commands for this call. Continue with native tools
+{%- elif cause_tag == "query_policy" -%}
+error: execution_profile (query_policy); the Git query was refused by the execution policy. Continue with native tools
+{%- elif cause_tag == "git_unsupported" -%}
+error: execution_profile (git_unsupported); the configured Git does not support a required operation. Continue with native tools
+{%- elif cause_tag == "spawn:io" -%}
+error: execution_profile (spawn:io); the IDE could not start the required process. Continue with native tools
+{%- elif cause_tag == "spawn:request" -%}
+error: execution_profile (spawn:request); the process request was invalid. Continue with native tools
+{%- elif cause_tag == "spawn:protocol_stdout_reserved" -%}
+error: execution_profile (spawn:protocol_stdout_reserved); the process tried to write data reserved for the IDE's reply. Continue with native tools
+{%- elif cause_tag == "spawn:reap_timed_out" -%}
+error: execution_profile (spawn:reap_timed_out); the failed process did not stop before its deadline. Continue with native tools
+{%- else -%}
+error: execution_profile ({{ cause_tag }}); the accepted execution profile refused this operation. Continue with native tools
+{%- endif -%}
+{%- else -%}
+{%- if code == "conflict" -%}
+error: conflict{% if resolution_detail %} ({{ resolution_detail }}){% else %} (start:conflict){% endif %}; a live IDE session owns a required resource. Retry after it stops, or continue with native tools
+{%- elif code == "internal" -%}
+error: internal{% if resolution_detail %} ({{ resolution_detail }}){% else %} (daemon:internal){% endif %}; the IDE could not complete this request. Retry once, or continue with native tools
 {%- else -%}
 error: {{ code }}{% if resolution_detail %} ({{ resolution_detail }}){% endif %}; continue with native tools
+{%- endif -%}
 {%- endif -%}
 {%- endif -%}
 {%- if state == "invalid_parameters" -%}
@@ -146,20 +264,20 @@ edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }};
 {%- if note %}{{ "\n" }}{{ note }}{%- endif %}
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "stale_source" -%}
-edit: stale_source; path {{ result.path }}. No write occurred. The source reference is incomplete or unavailable for this binding, or the file content/presence changed since it was read; a newer observation alone does not invalidate unchanged content. Use the newest source_ref below when present; otherwise re-read the lines (ide.read), read every page of a paged read (ide.inspect), and retry with that source_ref{% if note %}{{ "\n" }}{{ note }}{% endif %}
+edit: stale_source; path {{ result.path }}. No write occurred — this file changed or the source_ref missed part of its read. Retry with the newest source_ref below; if none is given, re-read with ide.read and inspect every page first{% if note %}{{ "\n" }}{{ note }}{% endif %}
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "conflicting_duplicate" -%}
 edit: conflicting_duplicate; path {{ result.path }}. No write occurred; use ide.context to inspect the target before a new operation_id
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "unsafe_target" -%}
-edit: unsafe_target; path {{ result.path }}. No write occurred; continue with native tools
+edit: unsafe_target; path {{ result.path }}. No write occurred — the target is a symlink or special file the IDE may not write. Continue with native tools
 {%- endif -%}
 {%- if state == "edit" and result.outcome in ("cancelled_no_effect", "deadline_no_effect", "capacity_no_effect") -%}
-edit: {{ result.outcome }}; path {{ result.path }}. No write occurred
+edit: {{ result.outcome }}; path {{ result.path }}. No write occurred. Retry with the same operation_id, or continue with native tools
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "outcome_unknown" -%}
 edit: outcome_unknown; path {{ result.path }}. Inspect this target with native tools before any later mutation; do not replay this operation
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "unavailable_before_dispatch" -%}
-edit: unavailable_before_dispatch; path {{ result.path }}. No write was dispatched; continue with native tools
+edit: unavailable_before_dispatch; path {{ result.path }}. No write was dispatched because the IDE session was not active. Call ide.start and retry, or continue with native tools
 {%- endif -%}

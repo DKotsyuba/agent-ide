@@ -21,7 +21,7 @@ Revision: v0.4. Provider: Agent IDE. Consumers: coding agents and IDE hosts.
 1. **Address symbols**, not lines or offsets. Lines are a fallback mode and are used in read output.
 2. A tool returns information an agent cannot get from `grep` or `cat` in a second: types, documentation, relationships, compiler errors, and project commands.
 3. **Keep responses compact.** Responses contain no internal bookkeeping fields (`authority_epoch`, hashes, generations). Lists have ceilings and report “N more”; retrieve the complete list through `detail_ref`.
-4. Errors use one line with the reason and next step, for example `error: unknown_symbol; no symbol matches that path or name`. Every failure also names its closed stage — `<tool>:<stage>` (`diff:too_large`, `symbol:anchor_missing`) — in parentheses after the reason when one is set, and the same tag lands in the daemon journal's `detail` field; a failure with no specific tag derives `<tool>:<reason>`, so no journal line is ever detail-less. Stage tags carry no payloads, paths, or user text — except the reason itself, ahead of the stage tag, which may (T163): a missing `ide.outline`/`ide.read` path answers `error: no_such_file: src/assistance/host_bindng.rs (outline:no_such_file); check the path`, naming the exact bounded path the model asked for while its parenthesized stage tag (`outline:no_such_file`, `read:no_such_file`) stays payload-free. One reply carries a closed cause the same way (T15B): `unavailable: host_binding (<cause>); continue with native tools`, where `<cause>` is `outside_allowed_roots` (the session's bound project is below no allowed root), `hooks_not_delivered` (this daemon received no hook on the calling channel since it started), `missing_pre`, `replay`, `mismatch`, `inactive_binding`, `capacity_exceeded`, or `project_moved: bound to <path>, asked <path>` — the single cause that names two bounded, home-shortened paths, because telling the agent which directory the session is bound to is the recovery — plus `host_unrecognized` when the caller's `_meta` names no supported host contract, so no invocation can correlate at all. The same tag is the daemon journal's `detail`.
+4. Errors keep the closed reason and stage, then name what happened and the next call. For example, a missing path answers `error: no_such_file: src/assistance/host_bindng.rs (outline:no_such_file); this path does not exist in the worktree. Fix the path, or use ide.symbol with a bare name to find it`. Host-correlation refusals retain a closed cause in parentheses and explain whether to retry, call `ide.start`, or continue with native tools. Causes include `invalid_metadata`, `missing_field`, `invalid_field`, `invalid_attachment`, `unsupported_hook_phase`, `missing_invocation`, `outside_allowed_roots`, `hooks_not_delivered`, `missing_pre`, `replay`, `mismatch`, `inactive_binding`, `capacity_exceeded`, `host_unrecognized`, and `project_moved: bound to <path>, asked <path>`. The same stage tag is recorded in the daemon journal's `detail` field.
 5. The language server runs as it would in a human's editor and remains alive for the session.
 6. Every host uses one path: return the result directly when it arrives within about 10 seconds; otherwise return `pending` and use `ide.inspect`.
 
@@ -156,7 +156,7 @@ src/assistance/host_binding.rs  (2292 lines, rust)
 
 The docstring is the first displayed line. Collapse test modules to a count. For Python, show decorators; for TypeScript, show `export` and overloads on one line.
 
-Errors: `no_such_file` (the requested path does not exist; check the path), `outside_allowed_roots`.
+Errors: `no_such_file` (the requested path does not exist in the worktree; fix the path or use `ide.symbol` with a bare name), `outside_allowed_roots`.
 
 ### 2.3 `ide.symbol` — symbol card and relationships (implemented)
 
@@ -279,9 +279,9 @@ src/assistance/host_binding.rs#HostBindingGuard/establish_start  (lines 906–93
 source_ref: sym-14
 ```
 
-`source_ref` is the reference currently called `detail_ref` by edit: it binds to the read content. A write using a stale reference is rejected as `stale_source` if the file has changed.
+`source_ref` is the reference currently called `detail_ref` by edit: it binds to the read content. A stale or incomplete read is refused as `stale_source` with no write; retry with the newest `source_ref` in the reply, or re-read every page before retrying.
 
-Errors: `no_such_file` (the requested path does not exist; check the path), `unknown_symbol`.
+Errors: `no_such_file` (the requested path does not exist in the worktree; fix the path or use `ide.symbol` with a bare name), `unknown_symbol`.
 
 ### 2.5 `ide.edit` — edit a symbol or range (implemented)
 
@@ -302,7 +302,7 @@ The whole-file form without `source_ref` only creates a file that does not exist
 
 For a symbol, `content` is the complete symbol including its header. The IDE derives indentation and blank lines from neighboring code. After writing, the project's formatter runs over the candidate (before the write), then the project check (cargo check / pyright / tsc) is scheduled at once and the reply carries the edited file's problems from it. `rename` is performed by the language server across the project.
 
-The line-range form **requires** `source_ref`, and it must name a retained read of the same file (an `ide.read` reply's `source_ref`, a completed paged read, or a prior edit's `source_ref`). The edit applies only while that observation's bytes are still the file's current bytes; anything else is refused as `stale_source` with no write. The reply names the newest `source_ref` for that path known to this binding, from its last successful edit or read, when available; retry with that reference without re-reading. The symbol form resolves the symbol again, so its `source_ref` is optional — but when one is given it is validated the same way. When the formatter changes the file's line count, every successful edit reply states the movement as its last line:
+The line-range form **requires** `source_ref`, and it must name a retained read of the same file (an `ide.read` reply's `source_ref`, a completed paged read, or a prior edit's `source_ref`). The edit applies only while that observation's bytes are still the file's current bytes; a stale or incomplete reference is refused as `stale_source` with no write. The reply names the newest `source_ref` for that path known to this session, from its last successful edit or read, when available; retry with that reference. If none is given, re-read with `ide.read` and inspect every page before retrying. The symbol form resolves the symbol again, so its `source_ref` is optional — but when one is given it is validated the same way. When the formatter changes the file's line count, every successful edit reply states the movement as its last line:
 
 ```text
 formatted: +3 lines after line 24; use source_ref sym-14 for the next edit

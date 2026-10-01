@@ -334,7 +334,7 @@ fn feed_detail(detail: &str) -> Option<String> {
 ///
 /// `last_counts` is the last delivered `(errors, warnings)` of the item's language, or `None` for
 /// a first numeric delivery or a non-numeric item; both render without deltas. `compact` drops
-/// the failure detail and the last-result text, the over-cap form.
+/// failure detail and last-result text; fatal checks without detail still say no reason was reported.
 fn render_item(item: &FeedItem, last_counts: Option<(u32, u32)>, compact: bool) -> String {
     let language = item.language.as_str();
     match &item.state {
@@ -376,6 +376,13 @@ fn render_item(item: &FeedItem, last_counts: Option<(u32, u32)>, compact: bool) 
                 render_count(*warnings, "warning", "warnings", None),
             ),
         },
+        ItemState::Unavailable(UnavailableReason::Fatal, None) => {
+            format!("{language}: check failed (checker supplied no reason)")
+        }
+        ItemState::Unavailable(UnavailableReason::Fatal, Some(detail)) if compact => format!(
+            "{language}: check failed ({})",
+            truncate_to_byte_len(detail, 48)
+        ),
         ItemState::Unavailable(reason, detail) => match detail {
             Some(detail) if !compact => {
                 format!("{language}: {} ({detail})", unavailable_text(*reason))
@@ -580,7 +587,10 @@ mod tests {
             (UnavailableReason::ToolMissing, "tool not found"),
             (UnavailableReason::EnvMissing, "environment not found"),
             (UnavailableReason::NoFiles, "no files analyzed"),
-            (UnavailableReason::Fatal, "check failed"),
+            (
+                UnavailableReason::Fatal,
+                "check failed (checker supplied no reason)",
+            ),
             (UnavailableReason::Timeout, "check timed out"),
         ];
         for (reason, phrase) in phrases {

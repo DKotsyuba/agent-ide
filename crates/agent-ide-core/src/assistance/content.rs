@@ -382,9 +382,15 @@ mod tests {
         let causes = vec![
             HostBindingCause::OutsideAllowedRoots,
             HostBindingCause::HooksNotDelivered,
+            HostBindingCause::InvalidMetadata,
+            HostBindingCause::MissingField,
+            HostBindingCause::InvalidField,
+            HostBindingCause::InvalidAttachment,
+            HostBindingCause::UnsupportedHookPhase,
             HostBindingCause::MissingPre,
             HostBindingCause::Replay,
             HostBindingCause::Mismatch,
+            HostBindingCause::MissingInvocation,
             HostBindingCause::InactiveBinding,
             HostBindingCause::CapacityExceeded,
             HostBindingCause::HostUnrecognized,
@@ -394,20 +400,66 @@ mod tests {
             ),
         ];
         for cause in causes {
+            let tag = cause.cause_tag();
+            let expected = match tag.as_str() {
+                "outside_allowed_roots" => {
+                    "the session project is outside the directories the IDE may open. Call ide.start with an allowed root, or continue with native tools"
+                }
+                "hooks_not_delivered" => {
+                    "the daemon has received no host event for this session. Call ide.start with the same root, or continue with native tools"
+                }
+                "invalid_metadata" => {
+                    "the host sent malformed call metadata. Send a new tool call, or continue with native tools"
+                }
+                "missing_field" => {
+                    "required host call metadata is missing. Send a new tool call, or continue with native tools"
+                }
+                "invalid_field" => {
+                    "host call metadata contains an invalid field. Send a new tool call, or continue with native tools"
+                }
+                "invalid_attachment" => {
+                    "the host attachment does not identify this call. Repeat the call, or continue with native tools"
+                }
+                "unsupported_hook_phase" => {
+                    "the host reported an unsupported tool-call phase. Repeat the call, or continue with native tools"
+                }
+                "missing_pre" => {
+                    "the host's before-tool event for this call did not reach the daemon. Repeat the call once, or continue with native tools"
+                }
+                "replay" => {
+                    "this exact call was already processed. Send it as a new tool call, or continue with native tools"
+                }
+                "mismatch" => {
+                    "the host event did not match this call. Repeat the call, or continue with native tools"
+                }
+                "missing_invocation" => {
+                    "the host's completion event arrived before its tool call was validated. Send a new tool call, or continue with native tools"
+                }
+                "inactive_binding" => {
+                    "this session's IDE activation has stopped. Call ide.start, then repeat this call, or continue with native tools"
+                }
+                "capacity_exceeded" => {
+                    "the daemon's session table is full. Call ide.stop, then ide.start, or continue with native tools"
+                }
+                "host_unrecognized" => {
+                    "this host did not identify the call in a supported format. Continue with native tools"
+                }
+                moved if moved.starts_with("project_moved:") => {
+                    "the IDE could not move to the requested root. Call ide.start under the session's current root, or continue with native tools"
+                }
+                _ => panic!("unrecognized host-binding cause: {tag}"),
+            };
             let rendered = render(
                 PeerReply::Unavailable {
                     reason: MissingPeer::HostBinding,
-                    cause: Some(cause.clone()),
+                    cause: Some(cause),
                 },
                 Envelope::WithStructured,
             )
             .unwrap();
             assert_eq!(
                 text_of(&rendered),
-                format!(
-                    "unavailable: host_binding ({}); continue with native tools",
-                    cause.cause_tag()
-                )
+                format!("unavailable: host_binding ({tag}); {expected}")
             );
             assert_eq!(
                 rendered.structured_content,
@@ -429,34 +481,49 @@ mod tests {
         );
     }
 
-    /// The changed-source recovery text appears only for the stage that means it; every other
-    /// source_unavailable stage keeps the neutral continuation hint (T m060 item 2).
+    /// Changed-source stages ask the caller to refresh; diff stages ask for new Git evidence.
     #[test]
-    fn source_unavailable_names_the_changed_file_only_for_the_changed_stage() {
-        let rendered = render(
-            PeerReply::Error {
-                code: FailureCode::SourceUnavailable,
-                detail: Some("diff:unsupported_entry".to_owned()),
-            },
-            Envelope::WithStructured,
-        )
-        .unwrap();
-        assert_eq!(
-            text_of(&rendered),
-            "error: source_unavailable (diff:unsupported_entry); continue with native tools"
-        );
-        let changed = render(
-            PeerReply::Error {
-                code: FailureCode::SourceUnavailable,
-                detail: Some("inspect:source_changed".to_owned()),
-            },
-            Envelope::WithStructured,
-        )
-        .unwrap();
-        assert_eq!(
-            text_of(&changed),
-            "error: source_unavailable (inspect:source_changed); the file changed since this result was captured; read every page of a paged result before any write, then call ide.context again for fresh bytes"
-        );
+    fn source_unavailable_names_the_recovery_for_its_stage() {
+        for (detail, expected) in [
+            (
+                "diff:unsupported_entry",
+                "error: source_unavailable (diff:unsupported_entry); Git evidence for this comparison became unusable. Call ide.diff again",
+            ),
+            (
+                "inspect:source_changed",
+                "error: source_unavailable (inspect:source_changed); the source changed since this result was captured. Call ide.context again for fresh bytes",
+            ),
+            (
+                "inspect:source_changed:\"src/main.rs\"",
+                "error: source_unavailable (inspect:source_changed); \"src/main.rs\" changed since this result was captured. Call ide.context with this path again for fresh bytes",
+            ),
+            (
+                "inspect:source_changed:\"src/main.rs\"",
+                "error: source_unavailable (inspect:source_changed); \"src/main.rs\" changed since this result was captured. Call ide.context with this path again for fresh bytes",
+            ),
+            (
+                "context:source_changed",
+                "error: source_unavailable (context:source_changed); the source changed since it was read. Re-read it with ide.context, then retry with the new source_ref",
+            ),
+            (
+                "context:source_changed:\"src/main.rs\"",
+                "error: source_unavailable (context:source_changed); \"src/main.rs\" changed since it was read. Re-read it with ide.context, then retry with the new source_ref",
+            ),
+            (
+                "context:observation_failed:\"src/main.rs\"",
+                "error: source_unavailable (context:observation_failed); \"src/main.rs\" could not be read through the confined reader. Retry ide.context, or continue with native tools",
+            ),
+        ] {
+            let rendered = render(
+                PeerReply::Error {
+                    code: FailureCode::SourceUnavailable,
+                    detail: Some(detail.to_owned()),
+                },
+                Envelope::WithStructured,
+            )
+            .unwrap();
+            assert_eq!(text_of(&rendered), expected);
+        }
         let bare = render(
             PeerReply::Error {
                 code: FailureCode::SourceUnavailable,
@@ -467,7 +534,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&bare),
-            "error: source_unavailable; continue with native tools"
+            "error: source_unavailable (context:source_unavailable); the requested source could not be read. Retry ide.context, or continue with native tools"
         );
     }
 
@@ -485,7 +552,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&rendered),
-            "error: no_such_file: src/assistance/host_bindng.rs (outline:no_such_file); check the path"
+            "error: no_such_file: src/assistance/host_bindng.rs (outline:no_such_file); this path does not exist in the worktree. Fix the path, or use ide.symbol with a bare name to find it"
         );
         let for_read = render(
             PeerReply::Error {
@@ -497,7 +564,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&for_read),
-            "error: no_such_file: src/missing.rs (read:no_such_file); check the path"
+            "error: no_such_file: src/missing.rs (read:no_such_file); this path does not exist in the worktree. Fix the path, or use ide.symbol with a bare name to find it"
         );
     }
 
@@ -513,40 +580,41 @@ mod tests {
         )
         .unwrap();
         let text = text_of(&expired);
-        assert!(text.starts_with("error: invalid_detail;"), "{text}");
+        assert!(
+            text.starts_with("error: invalid_detail (inspect:detail_unknown);"),
+            "{text}"
+        );
         assert!(text.contains("repeat the original ide.* call"), "{text}");
         assert_eq!(expired.is_error, Some(true));
     }
 
-    /// A never-issued reference and an expired one say which they are.
+    /// A never-issued, expired, or parameter-mismatched detail states the correct recovery.
     #[test]
-    fn invalid_detail_names_unknown_and_expired_separately() {
-        let unknown = render(
-            PeerReply::Error {
-                code: FailureCode::InvalidDetail,
-                detail: Some("inspect:detail_unknown".to_owned()),
-            },
-            Envelope::TextOnly,
-        )
-        .unwrap();
-        assert_eq!(
-            text_of(&unknown),
-            "error: invalid_detail (inspect:detail_unknown); this detail_ref was never issued; \
-             repeat the original ide.* call to get a fresh one, or continue with native tools"
-        );
-        let expired = render(
-            PeerReply::Error {
-                code: FailureCode::InvalidDetail,
-                detail: Some("inspect:detail_expired".to_owned()),
-            },
-            Envelope::TextOnly,
-        )
-        .unwrap();
-        assert_eq!(
-            text_of(&expired),
-            "error: invalid_detail (inspect:detail_expired); this detail_ref has expired; \
-             repeat the original ide.* call to get a fresh one, or continue with native tools"
-        );
+    fn invalid_detail_names_unknown_expired_and_mismatched_separately() {
+        for (detail, expected) in [
+            (
+                "inspect:detail_unknown",
+                "error: invalid_detail (inspect:detail_unknown); this detail_ref was never issued; repeat the original ide.* call to get a fresh one, or continue with native tools",
+            ),
+            (
+                "inspect:detail_expired",
+                "error: invalid_detail (inspect:detail_expired); this detail_ref has expired; repeat the original ide.* call to get a fresh one, or continue with native tools",
+            ),
+            (
+                "inspect:detail_mismatch",
+                "error: invalid_detail (inspect:detail_mismatch); this detail_ref was issued for different arguments. Repeat the original call with its exact arguments, or make a fresh ide.* call",
+            ),
+        ] {
+            let rendered = render(
+                PeerReply::Error {
+                    code: FailureCode::InvalidDetail,
+                    detail: Some(detail.to_owned()),
+                },
+                Envelope::TextOnly,
+            )
+            .unwrap();
+            assert_eq!(text_of(&rendered), expected);
+        }
     }
 
     /// A repeated activation under one id but another root names its own fix.
@@ -573,19 +641,19 @@ mod tests {
         for (detail, expected) in [
             (
                 "start:worktree_held_by_another_actor",
-                "another agent's binding owns this worktree",
+                "another agent session owns this worktree's IDE activation",
             ),
             (
                 "start:worktree_held_by_this_actor",
-                "this actor's other channel binding owns this worktree",
+                "another session for this actor owns this worktree",
             ),
             (
                 "start:actor_owns_another_worktree",
-                "this actor already owns another worktree",
+                "this actor's IDE activation is attached to another worktree",
             ),
             (
                 "start:provider_cache_namespace_conflict",
-                "another active IDE owns the provider cache namespace",
+                "another active session owns the language-server cache",
             ),
             (
                 "start:git_discovery_failed: not a Git worktree",
@@ -597,7 +665,7 @@ mod tests {
             ),
             (
                 "start:durable_state: activation state failed",
-                "durable activation state failed",
+                "saved workspace state could not be read",
             ),
         ] {
             let rendered = render(
@@ -635,10 +703,9 @@ mod tests {
         assert!(text_of(&absent).contains("/repo"));
     }
 
-    /// A generic failure carrying a stage tag names it after the reason, exactly the same tag
-    /// the daemon journal records; a failure without one renders the bare reason as before.
+    /// Capacity failures preserve their stage and explain how to free bounded result storage.
     #[test]
-    fn generic_error_names_its_stage_when_one_is_set() {
+    fn capacity_error_names_its_stage_and_recovery() {
         let staged = render(
             PeerReply::Error {
                 code: FailureCode::Capacity,
@@ -649,7 +716,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&staged),
-            "error: capacity (inspect:detail_unknown); continue with native tools"
+            "error: capacity (inspect:detail_unknown); the IDE's bounded queue or result store is full. Wait for pending work, or call ide.stop and ide.start"
         );
         let bare = render(
             PeerReply::Error {
@@ -661,8 +728,60 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&bare),
-            "error: capacity; continue with native tools"
+            "error: capacity (worker:capacity); the IDE's bounded queue or result store is full. Wait for pending work, or call ide.stop and ide.start"
         );
+    }
+
+    /// Split error stages preserve the cause and give the matching recovery for each refusal.
+    #[test]
+    fn split_error_causes_render_distinct_next_steps() {
+        for (code, detail, expected) in [
+            (
+                FailureCode::UnknownSymbol,
+                "edit:range_past_end: line 17 is past the end of src/a.rs (3 lines)",
+                "error: unknown_symbol (edit:range_past_end); line 17 is past the end of src/a.rs (3 lines). Re-read the range with ide.read and retry with a fresh source_ref",
+            ),
+            (
+                FailureCode::ProviderUnavailable,
+                "outline:provider_unavailable ext=md",
+                "error: provider_unavailable (outline:no_server); no language server is configured for .md files in this project. Continue with native tools",
+            ),
+            (
+                FailureCode::ProviderUnavailable,
+                "edit:rename_no_edits:foo",
+                "error: provider_unavailable (edit:rename_no_edits); the language server returned no edits for symbol foo. Check it with ide.symbol, then retry",
+            ),
+            (
+                FailureCode::ProviderUnavailable,
+                "edit:rename_request_failed:foo",
+                "error: provider_unavailable (edit:rename_request_failed); the language server failed to rename symbol foo. Check it with ide.symbol, then retry",
+            ),
+            (
+                FailureCode::ProviderUnavailable,
+                "edit:rename_unsupported_edits:foo",
+                "error: provider_unavailable (edit:rename_unsupported_edits); the language server returned edits the IDE cannot safely apply for symbol foo. Continue with native tools",
+            ),
+            (
+                FailureCode::ProviderUnavailable,
+                "test:selection_unavailable",
+                "error: provider_unavailable (test:selection_unavailable); tests could not be selected from these arguments. Use ide.test with a pattern or path",
+            ),
+            (
+                FailureCode::Deadline,
+                "stop:deadline",
+                "error: deadline (stop:deadline); stopping exceeded 800 ms and cleanup may still be running. Call ide.start to check the session before editing, or continue with native tools",
+            ),
+        ] {
+            let rendered = render(
+                PeerReply::Error {
+                    code,
+                    detail: Some(detail.to_owned()),
+                },
+                Envelope::TextOnly,
+            )
+            .unwrap();
+            assert_eq!(text_of(&rendered), expected);
+        }
     }
 
     /// A closed profile cause appears after the stable code; capture suffixes and unknown tags
@@ -670,24 +789,48 @@ mod tests {
     #[test]
     fn execution_profile_cause_is_closed_and_actionable() {
         use crate::assistance::reply::ExecutionProfileCause;
-        let cause = ExecutionProfileCause::from_log_tag("spawn:io; captured:deadbeef")
-            .expect("known cause");
-        let rendered = render(
-            PeerReply::Error {
-                code: FailureCode::ExecutionProfileCause(cause),
-                detail: None,
-            },
-            Envelope::WithStructured,
-        )
-        .unwrap();
-        assert_eq!(
-            text_of(&rendered),
-            "error: execution_profile (spawn:io); continue with native tools"
-        );
-        assert_eq!(
-            rendered.structured_content.unwrap()["code"],
-            "execution_profile"
-        );
+        for (tag, message) in [
+            (
+                "git_policy",
+                "the IDE could not establish the allowed Git commands for this call",
+            ),
+            (
+                "query_policy",
+                "the Git query was refused by the execution policy",
+            ),
+            (
+                "git_unsupported",
+                "the configured Git does not support a required operation",
+            ),
+            ("spawn:io", "the IDE could not start the required process"),
+            ("spawn:request", "the process request was invalid"),
+            (
+                "spawn:protocol_stdout_reserved",
+                "the process tried to write data reserved for the IDE's reply",
+            ),
+            (
+                "spawn:reap_timed_out",
+                "the failed process did not stop before its deadline",
+            ),
+        ] {
+            let cause = ExecutionProfileCause::from_log_tag(tag).expect("known cause");
+            let rendered = render(
+                PeerReply::Error {
+                    code: FailureCode::ExecutionProfileCause(cause),
+                    detail: None,
+                },
+                Envelope::WithStructured,
+            )
+            .unwrap();
+            assert_eq!(
+                text_of(&rendered),
+                format!("error: execution_profile ({tag}); {message}. Continue with native tools")
+            );
+            assert_eq!(
+                rendered.structured_content.unwrap()["code"],
+                "execution_profile"
+            );
+        }
         assert!(ExecutionProfileCause::from_log_tag("spawn:io:/private/path").is_none());
     }
 
@@ -741,7 +884,13 @@ mod tests {
             assert!(text.starts_with(&format!("edit: {}", outcome.as_str())));
             assert!(text.contains("src/lib.rs"));
             assert!(!text.contains("private-operation-id"));
-            if outcome != EditOutcome::ConflictingDuplicate {
+            if !matches!(
+                outcome,
+                EditOutcome::ConflictingDuplicate
+                    | EditOutcome::CancelledNoEffect
+                    | EditOutcome::DeadlineNoEffect
+                    | EditOutcome::CapacityNoEffect
+            ) {
                 assert!(!text.contains("operation_id"));
             }
             assert_eq!(rendered.structured_content, Some(expected));
@@ -809,24 +958,24 @@ mod tests {
         );
     }
 
-    /// Names both content changes and unusable references without claiming which one occurred.
+    /// Names the changed file or incomplete read and directs the caller to the newest usable reference.
     #[test]
     fn stale_edit_text_explains_why_no_write_occurred() {
         let reply = PeerReply::Edit {
             result: edit_result(EditOutcome::StaleSource).unwrap(),
             diagnostics: EditDiagnostics::Unknown {},
             note: None,
-
             operation: None,
         };
         let rendered = render(reply, Envelope::TextOnly).unwrap();
         let text = text_of(&rendered);
         assert!(text.contains("No write occurred"));
-        assert!(text.contains("content/presence changed"));
-        assert!(text.contains("newer observation alone does not invalidate"));
+        assert!(text.contains("this file changed or the source_ref missed part of its read"));
         assert!(
-            text.contains("Use the newest source_ref below when present")
-                && text.contains("otherwise re-read the lines (ide.read)"),
+            text.contains("Retry with the newest source_ref below")
+                && text.contains(
+                    "if none is given, re-read with ide.read and inspect every page first"
+                ),
             "{text}"
         );
     }

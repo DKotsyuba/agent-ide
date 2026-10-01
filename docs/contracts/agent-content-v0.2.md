@@ -29,13 +29,13 @@ Pending work names ide.inspect with the exact detail_ref. An oversized pending r
 
 Edit presents the closed outcome, public path and only the references needed for a safe next action. outcome_unknown requires inspecting the target and forbids replay. When an accepted Edit result carries post-edit diagnostics, current reported diagnostics may point to another ide.edit with its usable source_ref, current clean diagnostics point to ide.diff, and unknown or pending diagnostics point to ide.context or to ide.inspect only when a real detail_ref exists. The renderer never infers clean diagnostics from silence.
 
-For `stale_source`, content states that no write occurred and distinguishes changed target content or presence from an incomplete or unavailable reference. It also states that a newer observation alone does not invalidate identical content. The closed Edit result does not encode a finer stale reason, so the text does not claim which condition occurred.
+For `stale_source`, content names the path and says no write occurred because the file changed or the reference missed part of its read. It directs the caller to retry with the newest `source_ref` in the reply; when none is available, re-read the file and inspect every page first.
 
 Typed Error sets isError. A standalone `resolution_unverified` error names the supported configured-project requirement and a later Context retry without claiming that a native tool can substitute for closed TypeScript resolution. Path-proven Context answers use the lexical mode instead. Unavailable, pending, lifecycle, feedback and edit-result states do not become transport errors; each accepted typed reply has one compact content block, and unchanged structuredContent wherever the host-specific projection above includes it. Native fallback is named only when IDE work is unavailable, unsupported, declined or uncertain.
 
-An `execution_profile` refusal with a closed cause renders `error: execution_profile (<tag>); continue with native tools`, preserving the leading code. The tag is one of the fixed, path-free error-log details; for example, `query_policy`. Refusals without a closed cause retain `error: execution_profile; continue with native tools`.
+An `execution_profile` refusal with a closed cause renders the stable code and cause tag, then a plain explanation of the rejected operation and the native-tools recovery. For example: `error: execution_profile (query_policy); the Git query was refused by the execution policy. Continue with native tools`.
 
-An `outside_allowed_roots` error renders `error: outside_allowed_roots; the working directory is not below any configured allowed root; start the IDE in an allowed directory or add this one to allowed_roots, otherwise continue with native tools`, never naming the path.
+An `outside_allowed_roots` error keeps its stage tag and says to start under an allowed root or continue with native tools; an absent requested root also names its nearest admitted ancestor.
 
 ## Bounds and privacy
 

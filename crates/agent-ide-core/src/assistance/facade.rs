@@ -405,6 +405,13 @@ pub enum FieldRule {
     NoNul,
     /// The value must be an integer between zero and the carried inclusive maximum.
     NonNegativeInteger(u64),
+    /// The value must fall within one closed inclusive integer range.
+    IntegerRange {
+        /// Lowest accepted integer.
+        min: u64,
+        /// Highest accepted integer.
+        max: u64,
+    },
     /// The value must be one of the carried quoted alternatives.
     OneOf(&'static str),
     /// The value must be the identifier of a registered language with project checks.
@@ -441,6 +448,9 @@ impl FieldRule {
             Self::NoNul => "must not contain a NUL byte".to_string(),
             Self::NonNegativeInteger(limit) => {
                 format!("must be a non-negative integer up to {limit}")
+            }
+            Self::IntegerRange { min, max } => {
+                format!("must be an integer from {min} to {max}")
             }
             Self::OneOf(values) => format!("must be {values}"),
             Self::CheckedLanguage => format!(
@@ -702,7 +712,10 @@ pub fn validate_call(
                 .get("depth")
                 .is_some_and(|value| value.as_u64().is_none_or(|depth| !(1..=3).contains(&depth)))
             {
-                return Err(invalid_field("depth", FieldRule::NonNegativeInteger(3)));
+                return Err(invalid_field(
+                    "depth",
+                    FieldRule::IntegerRange { min: 1, max: 3 },
+                ));
             }
             if object.get("tests").is_some_and(|value| !value.is_boolean()) {
                 return Err(invalid_field("tests", FieldRule::Boolean));
@@ -771,7 +784,7 @@ pub fn validate_call(
             }) {
                 return Err(invalid_field(
                     "budget_s",
-                    FieldRule::NonNegativeInteger(600),
+                    FieldRule::IntegerRange { min: 1, max: 600 },
                 ));
             }
         }
@@ -1429,11 +1442,11 @@ impl FeedbackDelta {
         })
     }
 
-    /// Renders the one-fact envelope without claiming that a model read or acted on it.
+    /// Renders the model-facing fact, next action and freshness without exposing internal evidence provenance.
     pub fn render(&self) -> String {
         let mut rendered = format!(
-            "Fact: {}\nEvidence: {}\nNext: {}\nFreshness: {}",
-            self.fact, self.provenance, self.next_action, self.freshness
+            "Fact: {}\nNext: {}\nFreshness: {}",
+            self.fact, self.next_action, self.freshness
         );
         if let Some(detail_ref) = &self.detail_ref {
             rendered.push_str("\nDetail: ");
@@ -3246,6 +3259,18 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             "ide.edit takes one form: `symbol` with `op`, or `path` with `lines` and \
              `source_ref` — not both"
                 .to_string(),
+        ),
+        (
+            validate_call(AssistanceTool::Graph, json!({"symbol":"f","depth":0})).unwrap_err(),
+            AssistanceTool::Graph,
+            "invalid bounded parameters: \"depth\" must be an integer from 1 to 3".to_owned(),
+        ),
+        (
+            validate_call(AssistanceTool::Test, json!({"symbol":"a.rs#f","budget_s":0}))
+                .unwrap_err(),
+            AssistanceTool::Test,
+            "invalid bounded parameters: \"budget_s\" must be an integer from 1 to 600"
+                .to_owned(),
         ),
     ]
 }

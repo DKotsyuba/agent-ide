@@ -1122,6 +1122,18 @@ mod tests {
         );
         assert!(!text.contains("callers: 0"), "{text}");
 
+        for note in [
+            "unavailable (prepare call hierarchy request failed)",
+            "unavailable (incoming calls request failed)",
+            "unavailable (callers are not available yet because the language server is still indexing; repeat ide.symbol later)",
+        ] {
+            card.callers_note = Some(note.to_owned());
+            assert!(
+                symbol_card_text(&card).contains(&format!("callers: {note}\n")),
+                "{note}"
+            );
+        }
+
         // A note never suppresses a real callers list.
         card.callers.push(Call {
             name: "main.py#caller".into(),

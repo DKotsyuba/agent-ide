@@ -305,11 +305,8 @@ fn test_status_snapshot(reply: &PeerReply) -> Option<String> {
         return None;
     };
     let line = text.lines().next()?;
-    (line.starts_with("tests #")
-        && !line.contains("started —")
-        && !line.contains("still running")
-        && !line.ends_with("unknown job"))
-    .then(|| line.to_owned())
+    (line.starts_with("tests #") && !line.contains("started —") && !line.contains("still running"))
+        .then(|| line.to_owned())
 }
 
 impl std::fmt::Debug for ProductDispatcher {
