@@ -2,10 +2,12 @@
 
 An explicitly activated coding companion for Codex and Claude Code on macOS arm64. One coding agent owns one Git worktree. A local broker coordinates isolated analysis views, compatible shared language-server backends and bounded feedback. Linux remains explicitly `not_tested` and no Linux release artifact is published.
 
-Status (0.6.2): eleven MCP tools — `ide.start`, `ide.context`, `ide.outline`, `ide.read`,
+Status (0.6.5): eleven MCP tools — `ide.start`, `ide.context`, `ide.outline`, `ide.read`,
 `ide.symbol`, `ide.graph`, `ide.edit`, `ide.test`, `ide.diff`, `ide.inspect`, `ide.stop` — over
 Rust, Python and TypeScript/JavaScript language servers, a language-free core with one crate per
-language, and a cross-language name bridge (CSS selectors ↔ HTML/TSX class names). Every release
+language, a cross-language name bridge (CSS selectors ↔ HTML/TSX class names), and plain
+directories without Git (every tool except the Git views; those answer "not a git repository").
+Every release
 passes five live macOS acceptance routes (product, direct Codex, direct Claude, agent-run to Claude,
 agent-run to Codex). Go/gopls support is built in but outside the release scope and `not_tested`.
 
@@ -95,7 +97,7 @@ configuration, toolchains, install layout, plugin link, host hooks, daemons, rec
 and exits 2 when it reports errors. `agent-ide doctor --runtime-dir PATH` keeps querying a
 running repository daemon.
 
-The accepted language-server versions for 0.6.2 are rust-analyzer 1.98.1 (from the pinned
+The accepted language-server versions for 0.6.5 are rust-analyzer 1.98.1 (from the pinned
 Rust toolchain), pyright 1.1.413, typescript-language-server 6.0.0, TypeScript 5.9.3, and
 Node 24.4.0; the release workflow installs exactly these, and [docs/release.md](docs/release.md)
 lists them for the publication gate.

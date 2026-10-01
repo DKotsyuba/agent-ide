@@ -41,7 +41,7 @@ jobs:
           echo "AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER=$npm_root/typescript-language-server/lib/cli.mjs" >> "$GITHUB_ENV"
           echo "AGENT_IDE_TSSERVER=$npm_root/typescript/lib/tsserver.js" >> "$GITHUB_ENV"
       - name: Run complete quality gates
-        # Go and gopls are outside the v0.6.4 release scope: the runner installs no Go toolchain,
+        # Go and gopls are outside the v0.6.5 release scope: the runner installs no Go toolchain,
         # so the workspace gate skips exactly the three real-gopls toolchain contracts by name and
         # still runs every other workspace test.
         run: |

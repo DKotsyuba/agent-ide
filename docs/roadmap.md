@@ -1,6 +1,6 @@
 # Delivery roadmap
 
-This is the current delivery boundary. It supersedes the earlier all-at-once implementation order in the design documents. The repository ships an installable IDE: release 0.6.2 installs through the [one-line installer](../README.md#install) on macOS arm64 (eleven MCP tools, host plugins, managed launcher), and all five macOS acceptance routes pass at revision `2db699f` (see [docs/evidence](evidence/)). Linux remains explicitly `not_tested`. The older architecture and contract documents remain design input; they are not evidence that an interface is implemented or still agreed.
+This is the current delivery boundary. It supersedes the earlier all-at-once implementation order in the design documents. The repository ships an installable IDE: release 0.6.5 installs through the [one-line installer](../README.md#install) on macOS arm64 (eleven MCP tools, host plugins, managed launcher), and all five macOS acceptance routes pass at the release revision recorded in [docs/evidence](evidence/). Linux remains explicitly `not_tested`. The older architecture and contract documents remain design input; they are not evidence that an interface is implemented or still agreed.
 
 ## v0.1: working coding companion
 
@@ -79,8 +79,8 @@ These are roadmap boundaries, not authorization to scaffold their APIs now.
 The immediate product priority was one measured integrated coding loop rather than
 the previously ordered history-first increment. All four items below shipped: v0.2 delivered
 items 1–3 (see the version table), and item 4's acceptance was met — every macOS route in the
-matrix below now records `real_pass`/`product_pass` at one revision (`2db699f`, release 0.6.2;
-see [docs/evidence](evidence/)).
+matrix below now records `real_pass`/`product_pass` at one release revision (see
+[docs/evidence](evidence/)).
 
 1. Add bounded local usage telemetry to the existing five tools and native-change
    hooks. It records structured metadata for adoption, fallback reason, outcome,
@@ -112,7 +112,7 @@ see [docs/evidence](evidence/)).
 This matrix consumes the public [TELEMETRY-r1](contracts/telemetry-v0.2.md),
 [EDIT-r1](contracts/changes-v0.2.md), and [TYPESCRIPT-r3](contracts/intelligence-v0.2.md)
 contracts. The implementation and the real runs happened: every macOS route below now records
-`real_pass` (product `product_pass`) at one revision, `2db699f` — release 0.6.2, in
+`real_pass` (product `product_pass`) at one release revision, in
 [docs/evidence](evidence/). The table below is the historical first-run record (recorded
 2026-09-14), kept as the context for those routes' earlier failures. Public artifacts contain
 versions, route, scenario outcomes, bounded metrics, and explicit truncation only; private
@@ -136,7 +136,7 @@ after the collected events show that it is useful.
 | v0.3 | Project problem feed MVP (EYES-r2); the previously listed explicit checks/finish scope (`ide.check`, `ide.finish`) moves beyond the MVP |
 | v0.4 | Symbol tools (`ide.outline`, `ide.read`, `ide.symbol`, `ide.graph`, `ide.test`, symbol-addressed `ide.edit`); one `allowed_roots` rule instead of copied host sandbox rights; one-command installer (0.4.3) |
 | v0.5 | Language-free core with one crate per language |
-| v0.6 | Cross-language name bridge (CSS selectors ↔ HTML/TSX class names); symbol edits in Rust while rust-analyzer is still loading (0.6.2) |
+| v0.6 | Cross-language name bridge (CSS selectors ↔ HTML/TSX class names); symbol edits in Rust while rust-analyzer is still loading (0.6.2); plain directories without Git, `ide.diff {mode: "task"}` for everything changed since `ide.start`, refusals that name the cause and the next step (0.6.5) |
 | Not scheduled | Items of the original plan not taken up yet: computed criterion assessment and task context compiler, evaluator registry and verification planner, knowledge and publication adapters, multi-file edit journal and recovery, failure context and DAP debugging, independent evaluation |
 
 Scope remains the authority for agreed work. A local bundle can support standalone operation, but its shape is not approval, caller identity, or verification evidence. The daemon does not reinterpret the owner's agreed task. Future verified outcomes require current evidence; v0.1 cannot claim them.
