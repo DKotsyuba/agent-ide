@@ -15,6 +15,7 @@ use std::fmt::{self, Display};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -290,7 +291,7 @@ async fn run_daemon_inner(
             let accepted = tokio::select! {
                 accepted = listener.accept() => accepted,
                 _ = &mut termination => break,
-                _ = &mut idle_expired => { idle_exit = true; break; }
+                _ = &mut idle_expired => { idle_exit = !lease.stop_requested(); break; }
                 _ = connections.join_next(), if !connections.is_empty() => continue,
             };
             let (stream, _) = accepted?;
@@ -704,7 +705,7 @@ async fn serve_accepted_connection(
         Some(1) => {
             let _ = tokio::time::timeout_at(
                 connection_deadline,
-                serve_health(&mut stream, request, generation),
+                serve_v1_request(&mut stream, request, generation, &lease),
             )
             .await;
             None
@@ -854,6 +855,57 @@ pub async fn open_claude_client_lease(
         && ack.status == "ok"
         && ack.request_id == request.request_id)
         .then_some((stream, ack.attachment?))
+}
+
+/// Routes one version-one frame to its fixed method: health, or `daemon.stop` (0.6.7).
+///
+/// Every other method name is dropped without a reply, exactly as before; a pre-0.6.7 front
+/// therefore never learns `daemon.stop` existed, and a pre-0.6.7 daemon stays silent for it.
+async fn serve_v1_request(
+    stream: &mut UnixStream,
+    request: Value,
+    generation: String,
+    lease: &lease::LeaseController,
+) -> io::Result<()> {
+    match request.get("method").and_then(Value::as_str) {
+        Some("daemon.stop") => serve_daemon_stop(stream, request, lease).await,
+        _ => serve_health(stream, request, generation).await,
+    }
+}
+
+/// Answers one `daemon.stop` request: an idle daemon acknowledges and exits through its orderly
+/// shutdown path; a daemon still holding live client bindings or daemon-owned work refuses.
+///
+/// This is the graceful replacement path a version-checking front (0.6.7) uses after learning from
+/// the health exchange that this daemon is older than itself. The reply is sent before the exit
+/// begins, because the orderly path closes this connection with every other.
+async fn serve_daemon_stop(
+    stream: &mut UnixStream,
+    request: Value,
+    lease: &lease::LeaseController,
+) -> io::Result<()> {
+    let Ok(request) = serde_json::from_value::<HealthRequest>(request) else {
+        return Ok(());
+    };
+    if request.version != WIRE_VERSION
+        || request.request_id.is_empty()
+        || request.request_id.len() > MAX_REQUEST_ID_BYTES
+        || request.method != "daemon.stop"
+    {
+        return Ok(());
+    }
+    let status = if lease.is_idle() {
+        lease.request_stop();
+        "ok"
+    } else {
+        "busy"
+    };
+    let response = DaemonStopResponse {
+        version: WIRE_VERSION,
+        request_id: request.request_id,
+        status: status.to_owned(),
+    };
+    write_frame(stream, &response, MAX_V1_FRAME_BYTES).await
 }
 
 /// Validates the unchanged v1 health request and emits only its existing correlated health reply.
@@ -1235,11 +1287,111 @@ impl Drop for OwnedSocket {
     }
 }
 
-/// Produces a fresh opaque daemon-generation identifier from the OS random source.
+/// Produces a fresh daemon-generation identifier carrying this daemon's version and executable.
+///
+/// Since 0.6.7 the identifier is `<version>-<executable-hash>-<random>`, so a front learns the
+/// daemon's version and whether it runs from the same installed executable. A pre-0.6.7 daemon's
+/// bare random hex names neither and is therefore older than every version-reporting front. The
+/// identifier is opaque to older consumers, which compared generations only for equality.
 fn new_generation() -> Result<String, AppError> {
     let mut bytes = [0_u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    let random: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    match reported_version() {
+        Some(version) => {
+            let executable = std::env::current_exe()?;
+            let hash = blake3::hash(executable.as_os_str().as_bytes()).to_hex();
+            Ok(format!("{version}-{hash}-{random}"))
+        }
+        None => Ok(random),
+    }
+}
+
+/// The product version this daemon reports in its generation identifier.
+///
+/// The `AGENT_IDE_TEST_DAEMON_VERSION` seam lets a product test start a daemon that reports an
+/// older or newer version than the binary actually running — or, as `legacy`, no version at all,
+/// exactly the pre-0.6.7 shape — so upgrade decisions can be exercised without a second binary;
+/// production never sets it, and an unusable value is ignored.
+fn reported_version() -> Option<String> {
+    let seamed = std::env::var("AGENT_IDE_TEST_DAEMON_VERSION")
+        .ok()
+        .filter(|value| !value.is_empty() && value.len() <= 32 && value.is_ascii());
+    match seamed.as_deref() {
+        Some("legacy") => None,
+        Some(version) => Some(version.to_owned()),
+        None => Some(env!("CARGO_PKG_VERSION").to_owned()),
+    }
+}
+
+/// The daemon product version carried inside one health generation identifier, or `None` for a
+/// pre-0.6.7 daemon whose generation is bare random hex or carries no parseable version.
+pub fn reported_daemon_version(generation: &str) -> Option<&str> {
+    let (version, _) = generation.split_once('-')?;
+    version_segments(version).is_some().then_some(version)
+}
+
+/// Reports whether a daemon's version or executable requires replacement by `front`.
+///
+/// Older and unreported versions need an upgrade; equal-version binaries copied from another
+/// executable path also need replacement. A newer daemon always remains in service for a
+/// downgrade, regardless of its executable path.
+pub fn daemon_needs_replacement(generation: &str, front: &str) -> bool {
+    let Some(version) = reported_daemon_version(generation) else {
+        return true;
+    };
+    if version_older_than(version, front) {
+        return true;
+    }
+    !version_older_than(front, version) && !daemon_executable_matches_front(generation)
+}
+
+/// Reports whether `generation` came from the executable that is running this front.
+///
+/// Generations from pre-0.6.7 binaries and unrecognized identifier shapes return `false`, causing
+/// a current front to attempt the same safe replacement path as for a version mismatch.
+pub fn daemon_executable_matches_front(generation: &str) -> bool {
+    let mut parts = generation.splitn(3, '-');
+    let (Some(version), Some(hash), Some(_random)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    if version_segments(version).is_none() || hash.len() != 64 {
+        return false;
+    }
+    let Ok(executable) = std::env::current_exe() else {
+        return false;
+    };
+    let expected = blake3::hash(executable.as_os_str().as_bytes()).to_hex();
+    hash == expected.as_str()
+}
+
+/// Orders two product versions by numeric dot segments; missing segments count as zero and any
+/// `-suffix` is ignored, so `0.6` equals `0.6.0` and `0.6.10` is newer than `0.6.9`.
+pub fn version_older_than(daemon: &str, front: &str) -> bool {
+    let (Some(daemon), Some(front)) = (version_segments(daemon), version_segments(front)) else {
+        // A version that does not parse names no release this binary knows; treat it as older so a
+        // replacement is attempted rather than trusting an unparseable peer.
+        return true;
+    };
+    for index in 0..daemon.len().max(front.len()) {
+        let left = daemon.get(index).copied().unwrap_or(0);
+        let right = front.get(index).copied().unwrap_or(0);
+        if left != right {
+            return left < right;
+        }
+    }
+    false
+}
+
+/// Parses `version` into comparable numeric segments, ignoring any `-suffix`.
+fn version_segments(version: &str) -> Option<Vec<u64>> {
+    version
+        .split('-')
+        .next()?
+        .split('.')
+        .map(|segment| segment.parse::<u64>().ok())
+        .collect()
 }
 
 /// Returns this process's effective UID for local endpoint and directory checks.
@@ -1310,6 +1462,63 @@ struct HealthResponse {
     daemon_generation: String,
 }
 
+/// Represents the complete v1 `daemon.stop` response correlated to one accepted request.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DaemonStopResponse {
+    version: u8,
+    request_id: String,
+    status: String,
+}
+
+/// The outcome of asking a live daemon to shut down through `daemon.stop`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DaemonStop {
+    /// Acknowledged: the daemon began its orderly shutdown and removes its own runtime directory.
+    Stopped,
+    /// Refused: the daemon still holds live client bindings or daemon-owned work.
+    Busy,
+    /// No correlated acknowledgement: the daemon predates the request, or never answered in time.
+    Unanswered,
+}
+
+/// Asks the daemon at `runtime_dir` to shut down through its orderly path (0.6.7).
+///
+/// Any connect, framing, correlation, or timeout fault reports [`DaemonStop::Unanswered`], failing
+/// open exactly like [`open_client_lease`]; a pre-0.6.7 daemon never replies to this method, which
+/// is how a front distinguishes "cannot be asked" from "asked and refused".
+pub async fn request_daemon_stop(runtime_dir: &Path) -> DaemonStop {
+    let Ok(mut stream) = UnixStream::connect(runtime_dir.join(SOCKET_NAME)).await else {
+        return DaemonStop::Unanswered;
+    };
+    let request = HealthRequest {
+        version: WIRE_VERSION,
+        request_id: "daemon-stop".to_owned(),
+        method: "daemon.stop".to_owned(),
+    };
+    if write_frame(&mut stream, &request, MAX_V1_FRAME_BYTES)
+        .await
+        .is_err()
+    {
+        return DaemonStop::Unanswered;
+    }
+    let reply = async {
+        let response: DaemonStopResponse = read_frame(&mut stream, MAX_V1_FRAME_BYTES).await?;
+        io::Result::Ok(response)
+    };
+    let Ok(Ok(response)) = tokio::time::timeout(CLIENT_LEASE_OPEN_TIMEOUT, reply).await else {
+        return DaemonStop::Unanswered;
+    };
+    if response.version != WIRE_VERSION || response.request_id != request.request_id {
+        return DaemonStop::Unanswered;
+    }
+    match response.status.as_str() {
+        "ok" => DaemonStop::Stopped,
+        "busy" => DaemonStop::Busy,
+        _ => DaemonStop::Unanswered,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1324,6 +1533,69 @@ mod tests {
             METHOD_DISPATCH_BUDGET > crate::assistance::worker::INLINE_REPLY_WAIT,
             "the bridge must preserve the original invocation through the inline wait"
         );
+    }
+
+    /// A 0.6.7 generation carries version and executable identity, while a pre-0.6.7 bare random
+    /// generation names neither so every current front can identify it as old.
+    #[test]
+    fn generation_identifiers_carry_the_daemon_version() {
+        let generation = new_generation().expect("OS randomness is available");
+        let mut parts = generation.splitn(3, '-');
+        let version = parts.next().expect("version is first");
+        let executable_hash = parts.next().expect("executable hash follows version");
+        let random = parts.next().expect("random generation is last");
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(executable_hash.len(), 64);
+        assert!(executable_hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(random.len(), 32, "{generation}");
+        assert!(random.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(reported_daemon_version(&generation), Some(version));
+        assert!(daemon_executable_matches_front(&generation));
+        assert!(!daemon_needs_replacement(&generation, version));
+        assert!(daemon_needs_replacement(
+            &format!("{version}-{}-0123456789abcdef", "0".repeat(64)),
+            version
+        ));
+        assert!(!daemon_needs_replacement(
+            &format!("9.9.9-{}-0123456789abcdef", "0".repeat(64)),
+            version
+        ));
+        // The pre-0.6.7 shape: bare random hex, no version to learn.
+        assert_eq!(
+            reported_daemon_version("0123456789abcdef0123456789abcdef"),
+            None
+        );
+        assert_eq!(
+            reported_daemon_version("not-a-version-0123456789abcdef"),
+            None
+        );
+        assert!(daemon_needs_replacement(
+            "0.6.6-0123456789abcdef0123456789abcdef-0123456789abcdef",
+            "0.6.7"
+        ));
+    }
+
+    /// Versions order numerically per dot segment, with missing segments as zero, `-suffixes`
+    /// ignored, and anything unparseable older than every release this binary knows.
+    #[test]
+    fn versions_order_numerically_per_segment() {
+        assert!(version_older_than("0.6.6", "0.6.7"));
+        assert!(!version_older_than("0.6.7", "0.6.7"));
+        assert!(
+            !version_older_than("0.6.8", "0.6.7"),
+            "a newer daemon is used as is"
+        );
+        assert!(
+            version_older_than("0.6.9", "0.6.10"),
+            "numeric, not lexical"
+        );
+        assert!(
+            !version_older_than("0.6", "0.6.0"),
+            "missing segments are zero"
+        );
+        assert!(!version_older_than("0.7.0-rc1", "0.7.0"));
+        assert!(version_older_than("garbage", "0.6.7"));
+        assert!(version_older_than("", "0.6.7"));
     }
 
     /// Records whether daemon initialization and shutdown reached the owned dispatcher.

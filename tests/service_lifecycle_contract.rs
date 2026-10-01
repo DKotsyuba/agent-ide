@@ -17,7 +17,7 @@ use std::{
 use agent_ide::app::{
     self, DoctorLockState, DoctorStatus, RuntimeDir,
     config::EffectiveConfig,
-    doctor_report,
+    doctor_report, reported_daemon_version,
     transport::{
         AssistanceDispatch, AssistanceDispatchReply, AssistanceDispatchUnavailable,
         AssistanceDispatcher,
@@ -218,6 +218,12 @@ struct Mcp {
 impl Mcp {
     /// Starts the shipping self-contained Claude MCP using only its captured project environment.
     async fn start(template: &Path, project: &Path) -> Self {
+        Self::start_with_env(template, project, &[]).await
+    }
+
+    /// Like [`Self::start`], plus environment overrides for this MCP process and every daemon it
+    /// starts; `AGENT_IDE_TEST_DAEMON_VERSION` reaches only the daemon's version reporting.
+    async fn start_with_env(template: &Path, project: &Path, env: &[(&str, &str)]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
         command
             .env("TOKIO_WORKER_THREADS", "1")
@@ -231,6 +237,9 @@ impl Mcp {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        for (name, value) in env {
+            command.env(name, value);
+        }
         let mut child = command.spawn().unwrap();
         let mut mcp = Self {
             input: child.stdin.take().unwrap(),
@@ -238,11 +247,14 @@ impl Mcp {
             child,
         };
         let response = mcp
-            .exchange(
+            .exchange_bounded(
                 json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
                     "protocolVersion":"2025-03-26","capabilities":{},
                     "clientInfo":{"name":"service-lifecycle-contract","version":"1"}
                 }}),
+                // Startup includes the rendezvous, which may stop and replace an outdated daemon
+                // before serving begins; a plain spawn alone already consumes much of five seconds.
+                Duration::from_secs(30),
             )
             .await;
         assert!(response.get("result").is_some(), "{response}");
@@ -262,9 +274,14 @@ impl Mcp {
 
     /// Exchanges one request, ignoring notifications and enforcing a five-second test deadline.
     async fn exchange(&mut self, request: Value) -> Value {
+        self.exchange_bounded(request, Duration::from_secs(5)).await
+    }
+
+    /// Like [`Self::exchange`], with the caller's own bounded deadline.
+    async fn exchange_bounded(&mut self, request: Value, deadline: Duration) -> Value {
         let id = request["id"].clone();
         self.send(request).await;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(deadline, async {
             loop {
                 let mut line = String::new();
                 assert_ne!(
@@ -1076,4 +1093,273 @@ async fn a_served_hook_submit_restarts_the_idle_countdown() {
         .expect("one full silent window after the last hook must still end the daemon")
         .unwrap();
     assert!(!runtime.exists());
+}
+
+/// `daemon.stop` (0.6.7) refuses a daemon whose lease is still held and shuts an idle one down
+/// through the same orderly path as idle expiry, runtime-directory removal included.
+#[tokio::test]
+async fn daemon_stop_refuses_a_held_lease_and_exits_an_idle_daemon() {
+    let (runtime, task) = start_lease_test_daemon(Duration::from_secs(300)).await;
+
+    let lease = app::open_client_lease(&runtime, "stop-contract")
+        .await
+        .expect("the lease must open against the live daemon");
+    assert_eq!(
+        app::request_daemon_stop(&runtime).await,
+        agent_ide::app::DaemonStop::Busy,
+        "a daemon may never be stopped under a live binding"
+    );
+    assert!(
+        !task.is_finished(),
+        "the refused stop must not exit the daemon"
+    );
+
+    drop(lease);
+    assert_eq!(
+        app::request_daemon_stop(&runtime).await,
+        agent_ide::app::DaemonStop::Stopped,
+        "an idle daemon must acknowledge the stop"
+    );
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("an acknowledged stop must exit the daemon through its orderly path")
+        .unwrap();
+    assert!(
+        !runtime.exists(),
+        "an orderly stop must remove its own runtime directory"
+    );
+}
+
+/// Reports the daemon generation serving `runtime`, and the version that generation carries.
+async fn serving_generation(runtime: &Path) -> (String, Option<String>) {
+    let report = doctor_report(runtime).await.unwrap();
+    match report.status {
+        DoctorStatus::Healthy { daemon_generation } => {
+            let version = reported_daemon_version(&daemon_generation).map(str::to_owned);
+            (daemon_generation, version)
+        }
+        DoctorStatus::Unavailable => panic!("daemon must be healthy, not {report:?}"),
+    }
+}
+
+/// A front newer than an idle daemon replaces it at the rendezvous: the outdated daemon is asked
+/// to stop, the current binary serves instead, exactly one daemon remains, and the session's first
+/// start carries the same restart guidance a mid-call replacement gives (0.6.7).
+#[tokio::test]
+async fn newer_front_replaces_an_idle_outdated_daemon() {
+    let candidate = init_repo();
+    let runtime = expected_runtime_path(&candidate);
+    let _guard = DaemonGuard(runtime.clone());
+    let template = write_launcher_template(&candidate);
+
+    let older = Mcp::start_with_env(
+        &template,
+        &candidate,
+        &[("AGENT_IDE_TEST_DAEMON_VERSION", "0.6.4")],
+    )
+    .await;
+    wait_for_healthy_locked_daemon(&runtime).await;
+    let (outdated_generation, outdated_version) = serving_generation(&runtime).await;
+    assert_eq!(outdated_version.as_deref(), Some("0.6.4"));
+    older.close().await;
+    // Zero open leases: the daemon stays alive only until its idle timeout, well past this test.
+
+    let mut newer = Mcp::start_with_env(
+        &template,
+        &candidate,
+        &[
+            ("AGENT_IDE_TEST_FRONT_VERSION", "0.6.7"),
+            ("AGENT_IDE_TEST_DAEMON_VERSION", "0.6.7"),
+        ],
+    )
+    .await;
+    wait_for_healthy_locked_daemon(&runtime).await;
+    let (replaced_generation, replaced_version) = serving_generation(&runtime).await;
+    assert_ne!(replaced_generation, outdated_generation);
+    assert_eq!(
+        replaced_version.as_deref(),
+        Some("0.6.7"),
+        "the replacement must be the current binary's own daemon"
+    );
+    assert_eq!(
+        lock_holder_count(&runtime),
+        1,
+        "the replacement must leave exactly one daemon"
+    );
+
+    // The first start reaches the fresh daemon with no pre-hook observation for it, exactly like
+    // the retried dispatch after a mid-call restart, so it carries that same restart hint.
+    let reply = call_ide_start(&mut newer, 2, "replaced").await;
+    assert_reached_live_daemon_after_reconnect(&reply);
+
+    newer.close().await;
+    assert!(runtime.is_dir());
+    let _ = std::fs::remove_dir_all(candidate);
+}
+
+/// A front newer than a daemon another session still binds keeps serving that daemon — never
+/// stopping it under the live binding — and says so in one honest line on the start card (0.6.7).
+#[tokio::test]
+async fn newer_front_keeps_an_outdated_daemon_bound_by_another_session() {
+    let candidate = init_repo();
+    let runtime = expected_runtime_path(&candidate);
+    let _guard = DaemonGuard(runtime.clone());
+    let template = write_launcher_template(&candidate);
+
+    let bound = Mcp::start_with_env(
+        &template,
+        &candidate,
+        &[("AGENT_IDE_TEST_DAEMON_VERSION", "0.6.4")],
+    )
+    .await;
+    wait_for_healthy_locked_daemon(&runtime).await;
+    let (before, version) = serving_generation(&runtime).await;
+    assert_eq!(version.as_deref(), Some("0.6.4"));
+
+    let mut later = Mcp::start_with_env(
+        &template,
+        &candidate,
+        &[("AGENT_IDE_TEST_FRONT_VERSION", "0.6.7")],
+    )
+    .await;
+    wait_for_healthy_locked_daemon(&runtime).await;
+    let (after, _) = serving_generation(&runtime).await;
+    assert_eq!(
+        before, after,
+        "a daemon under a live binding must never be replaced"
+    );
+    assert_eq!(
+        lock_holder_count(&runtime),
+        1,
+        "keeping the outdated daemon must not start a second one"
+    );
+
+    let reply = call_ide_start(&mut later, 2, "kept").await;
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("daemon: 0.6.4 still serving (another session is active)"),
+        "the start card must carry the honest line: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "restart that session or wait for it to stop for {}",
+            "0.6.7"
+        )),
+        "the honest line must name the current version: {text}"
+    );
+
+    bound.close().await;
+    later.close().await;
+    assert!(runtime.is_dir());
+    let _ = std::fs::remove_dir_all(candidate);
+}
+
+/// A pre-0.6.7 daemon reports no version and cannot be asked to stop, so a newer front keeps
+/// serving it with the honest line naming that reason instead, until it idles out on its own.
+#[tokio::test]
+async fn newer_front_keeps_a_legacy_daemon_that_reports_no_version() {
+    let candidate = init_repo();
+    let runtime = expected_runtime_path(&candidate);
+    let _guard = DaemonGuard(runtime.clone());
+    let template = write_launcher_template(&candidate);
+
+    let legacy = Mcp::start_with_env(
+        &template,
+        &candidate,
+        &[("AGENT_IDE_TEST_DAEMON_VERSION", "legacy")],
+    )
+    .await;
+    wait_for_healthy_locked_daemon(&runtime).await;
+    let (before, version) = serving_generation(&runtime).await;
+    assert_eq!(version, None, "a pre-0.6.7 generation names no version");
+    legacy.close().await;
+
+    let mut newer = Mcp::start_with_env(
+        &template,
+        &candidate,
+        &[("AGENT_IDE_TEST_FRONT_VERSION", "0.6.7")],
+    )
+    .await;
+    wait_for_healthy_locked_daemon(&runtime).await;
+    let (after, _) = serving_generation(&runtime).await;
+    assert_eq!(
+        before, after,
+        "a daemon that cannot be asked to stop must keep serving unchanged"
+    );
+
+    let reply = call_ide_start(&mut newer, 2, "legacy").await;
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("daemon: older than 0.6.7 still serving (it reports no version"),
+        "the honest line must name the real reason: {text}"
+    );
+
+    newer.close().await;
+    assert!(runtime.is_dir());
+    let _ = std::fs::remove_dir_all(candidate);
+}
+
+/// A daemon of the front's own version, or newer, is adopted untouched: no replacement, no note.
+#[tokio::test]
+async fn equal_and_newer_daemons_are_adopted_untouched() {
+    let candidate = init_repo();
+    let runtime = expected_runtime_path(&candidate);
+    let _guard = DaemonGuard(runtime.clone());
+    let template = write_launcher_template(&candidate);
+
+    for reported in ["0.6.7", "9.9.9"] {
+        // The seam shapes only a daemon this MCP itself spawns, so the previous iteration's daemon
+        // is terminated first instead of being adopted as the loop's "new" one.
+        if runtime.exists() {
+            terminate_shared_daemon(&runtime);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while runtime.exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the terminated daemon must remove its own runtime directory");
+        }
+        let first = Mcp::start_with_env(
+            &template,
+            &candidate,
+            &[
+                ("AGENT_IDE_TEST_DAEMON_VERSION", reported),
+                ("AGENT_IDE_TEST_FRONT_VERSION", "0.6.7"),
+            ],
+        )
+        .await;
+        wait_for_healthy_locked_daemon(&runtime).await;
+        let (before, version) = serving_generation(&runtime).await;
+        assert_eq!(version.as_deref(), Some(reported));
+        first.close().await;
+
+        let mut second = Mcp::start_with_env(
+            &template,
+            &candidate,
+            &[("AGENT_IDE_TEST_FRONT_VERSION", "0.6.7")],
+        )
+        .await;
+        wait_for_healthy_locked_daemon(&runtime).await;
+        let (after, _) = serving_generation(&runtime).await;
+        assert_eq!(
+            before, after,
+            "a daemon at least as new as the front must be adopted untouched ({reported})"
+        );
+        assert_eq!(lock_holder_count(&runtime), 1);
+
+        let reply = call_ide_start(&mut second, 2, "adopted").await;
+        let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains("daemon:"),
+            "no daemon line is due for a current daemon: {text}"
+        );
+        assert!(
+            !text.contains("retry: daemon restarted"),
+            "no restart hint is due without a replacement: {text}"
+        );
+        second.close().await;
+    }
+
+    let _ = std::fs::remove_dir_all(candidate);
 }

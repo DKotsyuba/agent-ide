@@ -385,3 +385,106 @@ fn js_and_stderr_toolchains_report_versions_not_unresponsive() {
     );
     let _ = fs::remove_dir_all(&layout.root);
 }
+
+/// Spawns one health-only daemon at `runtime`, optionally reporting a test version, and waits for
+/// its socket to answer before returning the child for the caller to terminate.
+fn spawn_health_daemon(runtime: &std::path::Path, version: Option<&str>) -> std::process::Child {
+    use std::process::Stdio;
+    let mut command = agent_ide();
+    command
+        .args(["daemon", "--runtime-dir"])
+        .arg(runtime)
+        .env_remove("AGENT_IDE_LAUNCHER_CONFIG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(version) = version {
+        command.env("AGENT_IDE_TEST_DAEMON_VERSION", version);
+    }
+    let mut child = command.spawn().unwrap();
+    let socket = runtime.join("agent-ide.sock");
+    let mut answered = false;
+    for _ in 0..400 {
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            answered = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    if !answered {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("health daemon never answered on {}", socket.display());
+    }
+    child
+}
+
+/// Terminates a test-spawned daemon through the same orderly SIGTERM path as production.
+fn stop_health_daemon(mut child: std::process::Child) {
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    };
+    let _ = child.wait();
+}
+
+/// The daemons component lists this user's live daemons with their reported versions and flags
+/// the outdated one, while the install pieces stay at their own findings (0.6.7).
+#[test]
+fn live_daemons_are_listed_with_versions_and_outdated_ones_flagged() {
+    let layout = Layout::new("daemons");
+    layout.install(BINVER);
+    layout.shim();
+    layout.plugin(BINVER);
+    layout.hosts();
+    let temp_root = fs::canonicalize(std::env::temp_dir()).unwrap();
+    let unique = TEST_ID.fetch_add(2, Ordering::Relaxed);
+    let current_runtime = temp_root.join(format!(
+        "aide-doctor-live-{}-{unique}-current",
+        std::process::id()
+    ));
+    let outdated_runtime = temp_root.join(format!(
+        "aide-doctor-live-{}-{unique}-outdated",
+        std::process::id()
+    ));
+    let current = spawn_health_daemon(&current_runtime, None);
+    let outdated = spawn_health_daemon(&outdated_runtime, Some("0.6.4"));
+
+    let output = layout.doctor();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = report_of(&output);
+    let daemons: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["component"] == "daemons")
+        .collect();
+    let running = daemons
+        .iter()
+        .find(|finding| finding["code"] == "running")
+        .expect("a live daemon must be listed");
+    assert_eq!(running["severity"], "info");
+    let detail = running["detail"].as_str().unwrap();
+    assert!(detail.contains(BINVER), "current daemon listed: {detail}");
+    assert!(detail.contains("0.6.4"), "outdated daemon listed: {detail}");
+    let outdated_finding = daemons
+        .iter()
+        .find(|finding| finding["code"] == "outdated")
+        .expect("an outdated daemon must be flagged");
+    assert_eq!(outdated_finding["severity"], "warn");
+    assert!(
+        outdated_finding["detail"]
+            .as_str()
+            .unwrap()
+            .contains("outdated for this binary"),
+        "outdated finding names the comparison: {outdated_finding}"
+    );
+
+    stop_health_daemon(current);
+    stop_health_daemon(outdated);
+    assert!(!current_runtime.exists() && !outdated_runtime.exists());
+    let _ = fs::remove_dir_all(&layout.root);
+}

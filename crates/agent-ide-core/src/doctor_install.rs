@@ -6,7 +6,7 @@
 //! creates or mutates state, never starts a daemon, and only ever names paths below the effective
 //! user's own home (see [`crate::userhome`]).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::app::DoctorStatus;
 use crate::assistance::launcher::LauncherConfig;
 use crate::{errorlog, userhome};
 
@@ -75,7 +76,7 @@ pub async fn report() -> Report {
     check_install(&mut findings, &effective);
     check_plugin(&mut findings, &effective);
     check_hosts(&mut findings, &effective);
-    check_stale_runtimes(&mut findings).await;
+    check_running_daemons(&mut findings).await;
     check_error_journal(&mut findings, &home);
     finish(findings, home)
 }
@@ -469,13 +470,14 @@ fn check_hosts(findings: &mut Vec<Finding>, effective: &Path) {
     );
 }
 
-/// Counts this user's stale `ai-` runtime entries below the temp root; never names them.
+/// Lists this user's live daemons below the temp root with their versions, flags outdated ones
+/// (0.6.7), and counts stale abandoned runtime entries; never names their paths.
 ///
-/// Only entries owned by the effective user with a day-old modification time count, so other
-/// users' paths are never even read — and an entry counts only when nobody listens on its
-/// sockets: a live daemon answers on its socket no matter how old its runtime directory has
-/// grown, while an abandoned one refuses every connect.
-async fn check_stale_runtimes(findings: &mut Vec<Finding>) {
+/// A live daemon is one of this user's runtime directories whose daemon socket answers the
+/// side-effect-free health exchange, so its reported version is read from the reply the product
+/// itself uses for the same decision. Only versions are reported, never paths. Entries older than
+/// a day that answer on no socket count as stale exactly as before.
+async fn check_running_daemons(findings: &mut Vec<Finding>) {
     let Ok(root) = fs::canonicalize(std::env::temp_dir()) else {
         return;
     };
@@ -488,21 +490,73 @@ async fn check_stale_runtimes(findings: &mut Vec<Finding>) {
             continue;
         };
         let owned = metadata.uid() == unsafe { libc::geteuid() }
-            && (metadata.is_dir() || metadata.file_type().is_socket())
-            && metadata
-                .modified()
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age > STALE_RUNTIME_AGE);
+            && (metadata.is_dir() || metadata.file_type().is_socket());
         if owned {
             candidates.push((entry.path(), metadata.is_dir()));
         }
     }
+    let mut versions: BTreeMap<String, usize> = BTreeMap::new();
+    let mut outdated = 0usize;
     let mut stale = 0usize;
     for (path, is_dir) in candidates {
+        let stale_age = fs::symlink_metadata(&path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > STALE_RUNTIME_AGE);
         if !has_live_listener(&path, is_dir).await {
-            stale += 1;
+            if stale_age {
+                stale += 1;
+            }
+            continue;
         }
+        let Some((version, outdated_version)) = live_daemon_version(&path, is_dir).await else {
+            continue;
+        };
+        if outdated_version {
+            outdated += 1;
+        }
+        *versions
+            .entry(version.unwrap_or_else(|| "pre-0.6.7 (unknown)".to_owned()))
+            .or_default() += 1;
+    }
+    if !versions.is_empty() {
+        let listed = versions
+            .iter()
+            .map(|(version, count)| format!("{version} ({count})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        push(
+            findings,
+            "running",
+            "info",
+            "daemons",
+            format!(
+                "{} live agent-ide daemon{} serving: {listed}",
+                versions.values().sum::<usize>(),
+                if versions.values().sum::<usize>() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            ),
+        );
+    }
+    if outdated > 0 {
+        push(
+            findings,
+            "outdated",
+            "warn",
+            "daemons",
+            format!(
+                "{outdated} live daemon{} outdated for this binary ({}); a new front replaces {} \
+                 automatically once no session is bound, and serves on with a start-card notice \
+                 while one is",
+                if outdated == 1 { "" } else { "s" },
+                env!("CARGO_PKG_VERSION"),
+                if outdated == 1 { "it" } else { "them" },
+            ),
+        );
     }
     if stale > 0 {
         push(
@@ -515,6 +569,25 @@ async fn check_stale_runtimes(findings: &mut Vec<Finding>) {
             ),
         );
     }
+}
+
+/// Reads one live daemon's health-reported version and replacement status, or `None` when the
+/// entry is not a runtime directory this product can query.
+///
+/// `None` inside `Some` marks a daemon that reports no version: one older than 0.6.7, the exact
+/// case the outdated finding names.
+async fn live_daemon_version(path: &Path, is_dir: bool) -> Option<(Option<String>, bool)> {
+    if !is_dir {
+        return None;
+    }
+    let report = crate::app::doctor_report(path).await.ok()?;
+    let DoctorStatus::Healthy { daemon_generation } = report.status else {
+        return None;
+    };
+    Some((
+        crate::app::reported_daemon_version(&daemon_generation).map(str::to_owned),
+        crate::app::daemon_needs_replacement(&daemon_generation, env!("CARGO_PKG_VERSION")),
+    ))
 }
 
 /// Reports whether any socket at `path` — or directly inside it, for a runtime directory —
