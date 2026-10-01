@@ -1,6 +1,6 @@
 # Delivery roadmap
 
-This is the current delivery boundary. It supersedes the earlier all-at-once implementation order in the design documents. The repository ships an installable IDE: release 0.6.5 installs through the [one-line installer](../README.md#install) on macOS arm64 (eleven MCP tools, host plugins, managed launcher), and all five macOS acceptance routes pass at the release revision recorded in [docs/evidence](evidence/). Linux remains explicitly `not_tested`. The older architecture and contract documents remain design input; they are not evidence that an interface is implemented or still agreed.
+This is the current delivery boundary. It supersedes the earlier all-at-once implementation order in the design documents. The repository ships an installable IDE: release 0.6.6 installs through the [one-line installer](../README.md#install) on macOS arm64 (eleven MCP tools, host plugins, managed launcher), and all five macOS acceptance routes pass at the release revision recorded in [docs/evidence](evidence/). Linux remains explicitly `not_tested`. The older architecture and contract documents remain design input; they are not evidence that an interface is implemented or still agreed.
 
 ## v0.1: working coding companion
 
@@ -136,7 +136,7 @@ after the collected events show that it is useful.
 | v0.3 | Project problem feed MVP (EYES-r2); the previously listed explicit checks/finish scope (`ide.check`, `ide.finish`) moves beyond the MVP |
 | v0.4 | Symbol tools (`ide.outline`, `ide.read`, `ide.symbol`, `ide.graph`, `ide.test`, symbol-addressed `ide.edit`); one `allowed_roots` rule instead of copied host sandbox rights; one-command installer (0.4.3) |
 | v0.5 | Language-free core with one crate per language |
-| v0.6 | Cross-language name bridge (CSS selectors ↔ HTML/TSX class names); symbol edits in Rust while rust-analyzer is still loading (0.6.2); plain directories without Git, `ide.diff {mode: "task"}` for everything changed since `ide.start`, refusals that name the cause and the next step (0.6.5) |
+| v0.6 | Cross-language name bridge (CSS selectors ↔ HTML/TSX class names); symbol edits in Rust while rust-analyzer is still loading (0.6.2); plain directories without Git, `ide.diff {mode: "task"}` for everything changed since `ide.start`, refusals that name the cause and the next step (0.6.5); edit replies report only diagnostics computed from the post-edit bytes, an inserted then deleted symbol restores the file (0.6.6) |
 | Not scheduled | Items of the original plan not taken up yet: computed criterion assessment and task context compiler, evaluator registry and verification planner, knowledge and publication adapters, multi-file edit journal and recovery, failure context and DAP debugging, independent evaluation |
 
 Scope remains the authority for agreed work. A local bundle can support standalone operation, but its shape is not approval, caller identity, or verification evidence. The daemon does not reinterpret the owner's agreed task. Future verified outcomes require current evidence; v0.1 cannot claim them.
