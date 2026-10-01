@@ -876,6 +876,26 @@ mod tests {
                 "error: provider_unavailable (context:no_server); no language server is configured for .epsilon files in this project. Continue with native tools",
             ),
             (
+                FailureCode::ProviderUnavailable,
+                "symbol:provider_unavailable (fixtureserver: workspace load failed)",
+                "error: provider_unavailable (symbol:provider_unavailable (fixtureserver: workspace load failed)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
+            ),
+            (
+                FailureCode::ProviderUnavailable,
+                "read:provider_unavailable (fixtureserver: transport gone)",
+                "error: provider_unavailable (read:provider_unavailable (fixtureserver: transport gone)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
+            ),
+            (
+                FailureCode::ProviderUnavailable,
+                "outline:provider_unavailable (fixtureserver: documentSymbols request failed)",
+                "error: provider_unavailable (outline:provider_unavailable (fixtureserver: documentSymbols request failed)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
+            ),
+            (
+                FailureCode::ProviderUnavailable,
+                "symbol:provider_unavailable (fixtureserver: references request failed)",
+                "error: provider_unavailable (symbol:provider_unavailable (fixtureserver: references request failed)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
+            ),
+            (
                 FailureCode::InvalidDetail,
                 "test:unknown_run:42",
                 "error: invalid_detail (test:unknown_run); run #42 is unknown or expired. Start a new run with ide.test",

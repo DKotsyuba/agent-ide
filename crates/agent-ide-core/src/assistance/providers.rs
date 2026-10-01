@@ -389,17 +389,26 @@ impl Worker<'_> {
                 park_while_loading(job);
                 return Err(FailureCode::ProviderLoading);
             }
-            Err(ReadinessError::WorkspaceError) => return Err(FailureCode::ProviderUnavailable),
+            Err(ReadinessError::WorkspaceError) => {
+                job.set_stage_failure(
+                    &FailureCode::ProviderUnavailable,
+                    &format!("{}: workspace load failed", server.name()),
+                );
+                return Err(FailureCode::ProviderUnavailable);
+            }
             Err(ReadinessError::Gone) => {
                 let cancelled = *job.cancel.borrow();
                 let mut backend = self.providers.take_backend(index)?;
                 backend.release_live(self, &binding).await;
                 self.providers.put_backend(index, backend);
-                return Err(if cancelled {
-                    FailureCode::Cancelled
-                } else {
-                    FailureCode::ProviderUnavailable
-                });
+                if cancelled {
+                    return Err(FailureCode::Cancelled);
+                }
+                job.set_stage_failure(
+                    &FailureCode::ProviderUnavailable,
+                    &format!("{}: transport gone", server.name()),
+                );
+                return Err(FailureCode::ProviderUnavailable);
             }
         }
         self.providers.slots[index]

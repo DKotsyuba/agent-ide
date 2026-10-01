@@ -8831,9 +8831,10 @@ report();
 
 /// While the registered Rust server is unavailable (its workspace failed to load), `ide.outline`,
 /// `ide.read` and the symbol-addressed `ide.edit` answer at once from the exact lexical outline
-/// and mark it so; an address the lexical outline does not contain, a file it refuses and
-/// `ide.symbol` answer `provider_unavailable` instead of parking — and once the server
-/// recovers, the server path wins again.
+/// and mark it so; `ide.symbol` answers the definition-only card (its definition facts come from
+/// that outline) with each live-session section noting the failed workspace; an address the
+/// lexical outline does not contain and a file it refuses answer `provider_unavailable` instead
+/// of parking — and once the server recovers, the server path wins again.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_NODE environment"]
 async fn configured_product_unavailable_rust_symbol_tools_answer_from_the_lexical_outline() {
@@ -8974,13 +8975,29 @@ async fn configured_product_unavailable_rust_symbol_tools_answer_from_the_lexica
     assert_eq!(refused["code"], "provider_unavailable", "{refused}");
     assert_ne!(refused["state"], "pending", "{refused}");
 
-    // `ide.symbol` stays server-only: usages need the server, so it refuses rather than answer
-    // from the lexical outline.
+    // `ide.symbol` answers the definition-only card: signature, doc and definition come from the
+    // lexical outline, and every section a live session would answer names the failed workspace
+    // instead of failing the whole call.
     let symbol = actor
         .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#value"}))
         .await;
     let symbol = actor.settle(&fixture, symbol).await;
-    assert_eq!(symbol["code"], "provider_unavailable", "{symbol}");
+    assert_eq!(symbol["kind"], "symbol", "{symbol}");
+    let card = symbol["text"].as_str().unwrap_or_default();
+    assert!(card.contains("symbol: value"), "{symbol}");
+    assert!(
+        card.contains("signature: pub fn value() -> i32"),
+        "{symbol}"
+    );
+    assert!(card.contains("doc: Answers cold."), "{symbol}");
+    assert!(
+        card.contains("usages: unavailable (rust-analyzer workspace failed to load)"),
+        "{symbol}"
+    );
+    assert!(
+        card.contains("callers: unavailable (rust-analyzer workspace failed to load)"),
+        "{symbol}"
+    );
     assert_ne!(symbol["state"], "pending", "{symbol}");
 
     // The server recovers: its own answer wins again, and the marker disappears.
@@ -9007,6 +9024,186 @@ async fn configured_product_unavailable_rust_symbol_tools_answer_from_the_lexica
     let warm_text = warm["text"].as_str().unwrap();
     assert!(warm_text.contains("pub fn caller() -> i32"), "{warm}");
     assert!(!warm_text.contains("outline: from source"), "{warm}");
+    // The recovered server answers the full card again: no section notes the failed workspace.
+    let symbol = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#value"}))
+        .await;
+    let symbol = actor.settle(&fixture, symbol).await;
+    let card = symbol["text"].as_str().unwrap_or_default();
+    assert!(card.contains("symbol: value"), "{symbol}");
+    assert!(
+        !card.contains("workspace failed to load"),
+        "the recovered server must answer the full card: {symbol}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A rust-analyzer stand-in whose workspace reports healthy but whose documentSymbols and
+/// references exchanges fail: it completes the LSP handshake, reports the quiescent `ok` server
+/// status (so readiness passes), and answers those two requests with an LSP error reply.
+const EXCHANGE_STUB_SERVER: &str = r#"
+const send = (message) => {
+  const text = JSON.stringify(message);
+  process.stdout.write(`Content-Length: ${Buffer.byteLength(text)}\r\n\r\n${text}`);
+};
+const reply = (id, result) => send({ jsonrpc: '2.0', id, result });
+const fail = (id) => send({ jsonrpc: '2.0', id, error: { code: -32603, message: 'fixture exchange failure' } });
+let buffer = Buffer.alloc(0);
+process.stdin.on('data', (chunk) => {
+  buffer = Buffer.concat([buffer, chunk]);
+  for (;;) {
+    const header = buffer.indexOf('\r\n\r\n');
+    if (header < 0) return;
+    const length = parseInt(buffer.slice(0, header).toString().match(/Content-Length: (\d+)/)?.[1] ?? '0', 10);
+    if (buffer.length < header + 4 + length) return;
+    const message = JSON.parse(buffer.slice(header + 4, header + 4 + length).toString());
+    buffer = buffer.slice(header + 4 + length);
+    switch (message.method) {
+      case 'initialize':
+        reply(message.id, {
+          capabilities: {
+            textDocumentSync: 1,
+            documentSymbolProvider: true,
+            hoverProvider: true,
+            referencesProvider: true,
+          },
+          serverInfo: { name: 'rust-analyzer', version: '1.98.1 (48a229ce 2026-09-01)' },
+        });
+        break;
+      case 'shutdown':
+        reply(message.id, null);
+        break;
+      case 'exit':
+        process.exit(0);
+      case 'textDocument/documentSymbol':
+      case 'textDocument/references':
+        fail(message.id);
+        break;
+      default:
+        if (message.id !== undefined) reply(message.id, null);
+    }
+  }
+});
+const report = () => {
+  send({ jsonrpc: '2.0', method: 'experimental/serverStatus', params: { health: 'ok', quiescent: true } });
+  setTimeout(report, 100);
+};
+report();
+"#;
+
+/// While the registered Rust session passes readiness but its documentSymbols exchange fails,
+/// `ide.outline` answers from the exact lexical outline with a footer naming the failed request;
+/// `ide.read {symbol}` carries the same footer; a file the lexical scanner refuses and
+/// `ide.symbol` (whose references exchange also fails) answer `provider_unavailable`.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_NODE environment"]
+async fn configured_product_failed_exchange_rust_outline_answers_from_source() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let node = std::env::var("AGENT_IDE_NODE").unwrap();
+    let fixture = symbol_test_fixture();
+    let stub = fixture.base.join("exchange-stub-server.mjs");
+    std::fs::write(&stub, EXCHANGE_STUB_SERVER).unwrap();
+    let wrapper = fixture.base.join("exchange-rust-provider");
+    std::fs::write(
+        &wrapper,
+        format!("#!/bin/sh\nexec '{}' '{}'\n", node, stub.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN")
+        .unwrap_or_else(|_| "1.98.1-aarch64-apple-darwin".into());
+    fixture.write_config(json!([{
+        "executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
+        "settings":"rust_cache_priming_disabled_v1",
+        "toolchain":toolchain,
+        "cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),
+        "cargo_version":"cargo 1.98.1",
+        "rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),
+        "rustc_version":"rustc 1.98.1",
+        "trust":"fixture-disabled",
+        "cache_namespace":"fixture-exchange-lexical-cache"
+    }]));
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "/// Answers broken.\npub fn value() -> i32 { 7 }\n\npub fn caller() -> i32 { value() }\n",
+    )
+    .unwrap();
+    // A comment directly above an item: the lexical outline refuses this file, so its outline
+    // keeps the provider-unavailable refusal with the stage naming the failed request.
+    std::fs::write(
+        fixture.root.join("src/refused.rs"),
+        "// attached to the item below\npub fn refused() {}\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "src/refused.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "failed exchange fixture"]);
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "exchange-lexical").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"exchange-lexical-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    // Outline: the ready session's exchange failed, so the exact source outline answers at once
+    // with the footer naming the failed request (the first call may still race initialization
+    // and answer provider_loading, which the settle loop retries).
+    let outline = loop {
+        let reply = actor
+            .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+            .await;
+        let settled = actor.settle(&fixture, reply).await;
+        if settled["kind"] == "outline" {
+            break settled;
+        }
+        assert_eq!(settled["code"], "provider_loading", "{settled}");
+    };
+    let text = outline["text"].as_str().unwrap();
+    assert!(text.contains("pub fn value() -> i32"), "{outline}");
+    assert!(
+        text.contains("outline: from source, exact (rust-analyzer request failed: "),
+        "the exchange-failed outline must name the failed request: {outline}"
+    );
+    assert!(text.contains("; no need to repeat)"), "{outline}");
+    assert!(!text.contains("still indexing"), "{outline}");
+    assert!(!text.contains("unavailable"), "{outline}");
+
+    // Read of a symbol: numbered source with the same footer.
+    let read = actor
+        .call(&fixture, "ide.read", json!({"symbol":"src/lib.rs#value"}))
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let read_text = read["text"].as_str().unwrap_or_default();
+    assert!(read_text.contains("pub fn value()"), "{read}");
+    assert!(
+        read_text.contains("outline: from source, exact (rust-analyzer request failed: "),
+        "{read}"
+    );
+
+    // A file the lexical scanner refuses keeps the refusal instead of a lexical guess.
+    let refused = actor
+        .call(&fixture, "ide.outline", json!({"path":"src/refused.rs"}))
+        .await;
+    let refused = actor.settle(&fixture, refused).await;
+    assert_eq!(refused["code"], "provider_unavailable", "{refused}");
+    assert_ne!(refused["state"], "pending", "{refused}");
+
+    // `ide.symbol` finds the address in the lexical outline, but its usages section needs the
+    // references exchange, which also fails: the call refuses rather than guess.
+    let symbol = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#value"}))
+        .await;
+    let symbol = actor.settle(&fixture, symbol).await;
+    assert_eq!(symbol["code"], "provider_unavailable", "{symbol}");
+    assert_ne!(symbol["state"], "pending", "{symbol}");
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();

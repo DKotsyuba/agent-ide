@@ -97,14 +97,22 @@ Symbol paths are `file#Owner/name`: `#` separates the file, `/` is nesting (impl
 namespace, module → member). Inherent `impl Foo` members are addressed as `Foo/method`;
 trait impls keep `impl Trait for Foo` as the segment. A `provider_loading` error means
 the language server is still loading the workspace: repeat the same call in a few seconds.
-While it loads — and when it is unavailable (its workspace failed to load) — `ide.outline`,
-`ide.read {symbol}` and symbol edits of a Rust file may already answer from the lexical
-outline (the reply says `outline: from source, exact (<server> still indexing; no need to
-repeat)` while it loads, `outline: from source, exact (<server> unavailable; no need to
-repeat)` when it failed — the outline is exact, so do not repeat the call); a file the
-lexical outline cannot reproduce exactly, and an address it does not contain, wait for the
-server while it loads and answer `provider_unavailable` when it failed. `ide.symbol`,
-`ide.graph` and rename always wait for the server.
+While it loads — and when it is unavailable (its workspace failed to load) or its
+documentSymbols request failed — `ide.outline`, `ide.read {symbol}` and symbol edits of a
+Rust file may already answer from the lexical outline (the reply says `outline: from
+source, exact (<server> still indexing; no need to repeat)` while it loads, `outline:
+from source, exact (<server> unavailable; no need to repeat)` when it failed, `outline:
+from source, exact (<server> request failed: <short cause>; no need to repeat)` when the
+exchange did — the outline is exact, so do not repeat the call); a file the lexical
+outline cannot reproduce exactly, and an address it does not contain, wait for the
+server while it loads and answer `provider_unavailable` when it failed. `ide.symbol`
+waits while the server loads; when it is unavailable it answers the definition-only card
+(signature, doc, definition from the outline) with `unavailable (<server> workspace
+failed to load)` notes for usages and callers. `ide.graph` and rename always wait for
+the server. A `provider_unavailable` refusal on these paths names its stage — e.g.
+`(rust-analyzer: workspace load failed)`, `(rust-analyzer: documentSymbols request
+failed)` — and says what still works (outline/read from source), what does not
+(usages, callers) and how to recover (retry later; if it keeps failing, fix what stops the project from loading — `ide.context {"kind":"problems"}` shows the project check).
 
 ## Workflow
 
