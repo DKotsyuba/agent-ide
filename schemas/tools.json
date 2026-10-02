@@ -1,5 +1,9 @@
 [
   {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
     "description": "Bounded source with current diagnostics for one `path`, or with `kind: \"problems\"` the\nproject's latest check results (errors and warnings by file, paged). Use `problems` to\nsee what is broken right now instead of running the build yourself; use `path` before or\nafter editing a file natively.",
     "inputSchema": {
       "additionalProperties": false,
@@ -50,6 +54,10 @@
     "name": "ide.context"
   },
   {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
     "description": "Diff of what this task changed in the working tree (`head`, `staged`, `unstaged` or `task`),\npaged. Review it before finishing or handing off, instead of running `git diff` in a\nshell.",
     "inputSchema": {
       "additionalProperties": false,
@@ -82,6 +90,12 @@
     "name": "ide.diff"
   },
   {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
     "description": "Edit by symbol: `op` replace / insert / delete / rename on `file#Owner/name` (rename is\nproject-wide), or replace a `path` + `lines` range, or a full-file rewrite based on a\n`source_ref`. Formats the result with the project formatter, runs the project check\n(cargo check, pyright or tsc) and returns this file's errors and warnings in the reply.\nPrefer it over native edit/write for source: no line matching, no separate check step.",
     "inputSchema": {
       "additionalProperties": false,
@@ -208,6 +222,10 @@
     "name": "ide.edit"
   },
   {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
     "description": "Bounded call graph around one symbol: callers, callees or both, depth 1–3, at most 60\nnodes, every node a full symbol path, cycles marked `(seen)`, tests collapsed into `+N tests` per parent (set `tests: true` to list them). Use\nit to see the blast radius before changing a function or to trace how a call reaches a\nsymbol, instead of chained greps.",
     "inputSchema": {
       "additionalProperties": false,
@@ -249,6 +267,10 @@
     "name": "ide.graph"
   },
   {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
     "description": "Fetch the result behind a `detail_ref`: a `pending` reply that has since completed, or\nthe next page of a long result (outline, symbol, graph, diff, test output). Poll every\nfew seconds while it stays pending.",
     "inputSchema": {
       "additionalProperties": false,
@@ -268,6 +290,10 @@
     "name": "ide.inspect"
   },
   {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
     "description": "Skeleton of a file (every symbol with signature, doc line and line numbers, members\nindented, tests collapsed) or of a directory (files with line counts and first doc line).\nA fraction of the cost of reading the file — use it before any native read of a source\nfile longer than a screen. Answers inline on a warm language server; a cold one answers\n`pending` — poll ide.inspect.",
     "inputSchema": {
       "additionalProperties": false,
@@ -294,6 +320,10 @@
     "name": "ide.outline"
   },
   {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
     "description": "Body of one symbol (`file#Owner/name`) or an explicit line range, numbered, with its doc\nheader. The precise replacement for reading a whole file when you already know what you\nneed; its `source_ref` is what a full-file ide.edit is based on.",
     "inputSchema": {
       "additionalProperties": false,
@@ -342,6 +372,12 @@
     "name": "ide.read"
   },
   {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
     "description": "Activate Agent IDE for this project — once per task, before any other ide.* call. Returns\na project card: languages with sizes, the build/check/test/lint commands, layout by\ndirectory, entry points and docs. Use it to orient instead of reading README, Cargo.toml\nor package.json. Then use ide.outline / ide.symbol instead of native file reads.",
     "inputSchema": {
       "additionalProperties": false,
@@ -367,6 +403,12 @@
     "name": "ide.start"
   },
   {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
     "description": "End this task's IDE session; edited files stay on disk. Lists up to eight test runs started\nin this binding whose results were never collected. Call once when done or before handing off.",
     "inputSchema": {
       "additionalProperties": false,
@@ -376,6 +418,10 @@
     "name": "ide.stop"
   },
   {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
     "description": "Symbol card for `file#Owner/name` or a bare name: resolved signature, doc, definition\nlocation, usages split src/tests with the source line, callers and callees as full symbol\npaths, and with `history: true` the last commits touching the definition. Language-server\naccurate — replaces grep for usages and reading files to find callers. A bare name with\nseveral matches returns the candidate paths.",
     "inputSchema": {
       "additionalProperties": false,
@@ -419,6 +465,9 @@
     "name": "ide.symbol"
   },
   {
+    "annotations": {
+      "readOnlyHint": false
+    },
     "description": "Run tests selected by `symbol` (the tests that reference it), by `path`, by name\n`pattern`, or an explicit `command`; one background run per worktree under `budget_s`.\nReturns the pass/fail line with an exact rerun command; full output is paged through\nide.inspect (`status` re-reads a run). A summary-less explicit command waits briefly and\nincludes its exit code and bounded output inline when it finishes inside that window. Use\nit instead of running the test command in a shell: exact selection, bounded output.",
     "inputSchema": {
       "additionalProperties": false,
