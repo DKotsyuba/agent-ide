@@ -12,6 +12,12 @@ qualification evidence.
   `not_tested` and has no release artifact.
 - Hosts: Claude Code 2.1.280, Codex CLI 0.156.1 (each also reached through
   agent-run 0.19.4).
+- Protocol revisions: 2024-11-05, 2025-03-26, 2025-06-18, 2025-11-25 and
+  2026-07-28 (`family.toml` `[compatibility]`; exactly the revisions rmcp
+  3.4.0 accepts). The raw-wire tests prove the server side of 2026-07-28
+  (no initialize, catalog cache hints, per-request host selection); host
+  qualification for 2026-07-28 comes from the release routes
+  (`scripts/macos-acceptance.sh` against the installed plugin hosts).
 - Source: `main` at `e96830b` (0.6.9); evidence under `docs/evidence/`.
 
 ## Evidence
@@ -47,10 +53,10 @@ qualification evidence.
 - Rendezvous directories live under `/private/tmp/ai-r-<hash>` instead of
   `<home>/run/` (CFG-01 deviation): they are cross-client, keyed by the Git
   common directory, ownership- and mode-checked (see SECURITY.md).
-- Tool names are dotted (`ide.start` … MCP-05): a rename waits for per-host
-  normalization measurement.
-- `rmcp` is 3.2.0 against the family baseline candidate 3.4.0; the SDK bump is
-  its own compatibility wave.
+- Tool names are dotted (`ide.start` … MCP-05): measured, not an open
+  exception. Dotted names have been valid MCP tool-name characters since
+  revision 2025-11-25, and both qualified hosts accept them (Claude Code
+  renders `ide_start` in its tool surface); the names stay unchanged.
 - `release-manifest.json` follows the template's
   `schemas/release-manifest.schema.json` exactly (closed objects, no extra
   fields), so the archive profile's facts the schema has no field for are

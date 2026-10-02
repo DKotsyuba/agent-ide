@@ -207,7 +207,7 @@ The reference library uses the last option for more than 20 incoming rows. It ne
 
 **JINJA-01 — MUST.** Templates are trusted, versioned application assets. Embed them with `include_str!`; register a closed set when the process starts. User input, repository content, provider responses and runtime configuration must not become template source, a template name, an include path or an expression to evaluate.
 
-The normative baseline for this profile is the explicitly reviewed `minijinja =2.24.0` API. Keep a reviewed Cargo.lock. The compiler and `rmcp` baseline are not changed by this presentation-only extension. The crate's feature definitions and APIs were inspected in its tagged upstream source. [MJ-FEATURES] [MJ-TEMPLATE]
+The normative baseline for this profile is the explicitly reviewed `minijinja =2.24.0` API. Keep a reviewed Cargo.lock. The compiler and `rmcp =3.4.0` baseline remain unchanged. For MCP 2026-07-28, the catalog handler explicitly supplies `ttlMs = 60000` and `cacheScope = "private"`; legacy responses omit these fields. Raw stdio tests cover modern tools/list and server/discover without initialize, plus the legacy handshake route. Cacheable list/read results on any enabled prompts/resources surface require the same revision-appropriate hints. The crate's feature definitions and APIs were inspected in its tagged upstream source. [MJ-FEATURES] [MJ-TEMPLATE]
 
 ```toml
 [workspace.dependencies]

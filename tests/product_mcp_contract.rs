@@ -102,6 +102,33 @@ impl Mcp {
         Self::start_observed(runtime, attachment).await.0
     }
 
+    /// Starts the shipping binary with no handshake exchanged, optionally with an attachment.
+    ///
+    /// A modern MCP 2026-07-28 session never `initialize`s: every request carries its protocol
+    /// version and client capabilities in `_meta`, so the caller's own first frame opens the
+    /// session and proves the modern lifecycle on the raw wire (MCP-02).
+    async fn start_raw(runtime: &Path, attachment: Option<&str>) -> Self {
+        let mut command = Command::new(product_binary());
+        command.env("TOKIO_WORKER_THREADS", "1");
+        command
+            .args(["mcp", "--runtime-dir"])
+            .arg(runtime)
+            .env_remove("AGENT_IDE_HOST_ATTACHMENT")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(attachment) = attachment {
+            command.env("AGENT_IDE_HOST_ATTACHMENT", attachment);
+        }
+        let mut child = command.spawn().unwrap();
+        Self {
+            input: child.stdin.take().unwrap(),
+            output: BufReader::new(child.stdout.take().unwrap()),
+            child,
+        }
+    }
+
     /// Starts the shipping self-contained managed MCP in `candidate` from one launcher template.
     async fn start_managed(template: &Path, candidate: &Path) -> Self {
         Self::start_managed_with_home(template, candidate, None).await
@@ -221,6 +248,33 @@ impl Mcp {
         mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
             .await;
         mcp
+    }
+
+    /// [`Self::start_managed_claude`] with no handshake exchanged: the modern-era twin.
+    ///
+    /// A 2026-07-28 Claude Code session opens with its first request, so nothing is exchanged
+    /// before the caller's own frames; every per-request `_meta` carries the standard client
+    /// context beside the Claude tool-use id.
+    async fn start_managed_claude_raw(template: &Path, project: &Path) -> Self {
+        let mut command = Command::new(product_binary());
+        command
+            .env("TOKIO_WORKER_THREADS", "1")
+            .env("CLAUDE_PROJECT_DIR", project)
+            .env_remove("AGENT_IDE_HOST_ATTACHMENT")
+            .env_remove("AGENT_IDE_MANAGED_CODEX_ATTACHMENT")
+            .args(["mcp", "--claude-launcher-template"])
+            .arg(template)
+            .current_dir(project.parent().unwrap())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        Self {
+            input: child.stdin.take().unwrap(),
+            output: BufReader::new(child.stdout.take().unwrap()),
+            child,
+        }
     }
 
     /// Starts the auto-mode MCP with caller-selected startup evidence: a Claude child sets
@@ -729,6 +783,144 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
     assert!(!runtime.exists());
 }
 
+/// Builds the per-request `_meta` a modern MCP 2026-07-28 client sends on every request, with the
+/// caller's host-identity fields merged in beside the standard client-context keys.
+fn modern_meta(host: Value) -> Value {
+    let mut meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+    });
+    let object = meta.as_object_mut().expect("modern meta is an object");
+    for (key, value) in host.as_object().into_iter().flatten() {
+        object.insert(key.clone(), value.clone());
+    }
+    meta
+}
+
+/// Modern `tools/list` needs no handshake and carries the family catalog cache hints (MCP
+/// 2026-07-28, SEP-2549): `resultType` complete, a 60000 ms private TTL, and the exact reviewed
+/// snapshot catalog. Asserted on raw JSON because the SDK parses both cache fields as optional,
+/// so an SDK roundtrip cannot catch their absence.
+#[tokio::test]
+async fn modern_tools_list_carries_private_cache_hints_without_initialize() {
+    let runtime = runtime();
+    let mut mcp = Mcp::start_raw(&runtime, None).await;
+    let reply = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{
+                "_meta": modern_meta(json!({}))
+            }}),
+        )
+        .await;
+    let result = &reply["result"];
+    assert_eq!(result["resultType"], "complete", "{reply}");
+    assert_eq!(result["ttlMs"].as_u64(), Some(60_000), "{reply}");
+    assert_eq!(result["cacheScope"], "private", "{reply}");
+    let expected: Value = serde_json::from_str(include_str!("../schemas/tools.json")).unwrap();
+    assert_eq!(&result["tools"], &expected, "{reply}");
+    mcp.close().await;
+    assert!(!runtime.exists());
+}
+
+/// A legacy `initialize`/`initialized` session keeps its exact original catalog wire: none of the
+/// modern-only result fields appear, and the catalog is the same reviewed snapshot.
+#[tokio::test]
+async fn legacy_tools_list_omits_modern_result_fields() {
+    let runtime = runtime();
+    let mut mcp = Mcp::start_raw(&runtime, None).await;
+    let initialized = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "protocolVersion":"2025-11-25","capabilities":{},
+                "clientInfo":{"name":"raw-legacy-test","version":"1"}
+            }}),
+        )
+        .await;
+    assert_eq!(
+        initialized["result"]["protocolVersion"], "2025-11-25",
+        "{initialized}"
+    );
+    mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+        .await;
+    let reply = mcp
+        .exchange(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+        .await;
+    let result = &reply["result"];
+    for field in ["ttlMs", "cacheScope", "resultType"] {
+        assert!(
+            result.get(field).is_none(),
+            "legacy catalog must not carry {field}: {reply}"
+        );
+    }
+    let expected: Value = serde_json::from_str(include_str!("../schemas/tools.json")).unwrap();
+    assert_eq!(&result["tools"], &expected, "{reply}");
+    mcp.close().await;
+}
+
+/// Modern `server/discover` advertises the 2026-07-28 revision with the SDK's cache-hint defaults,
+/// guarding the rmcp defaults the catalog handler relies on for discovery.
+#[tokio::test]
+async fn modern_server_discover_advertises_modern_revision_with_cache_hints() {
+    let runtime = runtime();
+    let mut mcp = Mcp::start_raw(&runtime, None).await;
+    let reply = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{
+                "_meta": modern_meta(json!({}))
+            }}),
+        )
+        .await;
+    let result = &reply["result"];
+    assert!(result["ttlMs"].as_u64().is_some(), "{reply}");
+    assert_eq!(result["cacheScope"], "private", "{reply}");
+    assert!(
+        result["supportedVersions"]
+            .as_array()
+            .expect("supportedVersions array")
+            .iter()
+            .any(|version| version == "2026-07-28"),
+        "{reply}"
+    );
+    mcp.close().await;
+}
+
+/// Modern `tools/call` answers without initialize, and the per-call `_meta` still selects the
+/// host contract exactly as in a legacy session: a recognized Claude or Codex identity fails open
+/// on the missing attachment, while the standard client-context keys alone still name no supported
+/// host (the closed `host_unrecognized` refusal).
+#[tokio::test]
+async fn modern_tools_call_is_fail_open_and_selects_host_from_request_meta() {
+    let runtime = runtime();
+    let mut mcp = Mcp::start_raw(&runtime, None).await;
+    for (id, host, expected) in [
+        (
+            2,
+            json!({"claudecode/toolUseId":"modern-claude-call"}),
+            "Assistance host metadata or attachment is unavailable; continue with native tools",
+        ),
+        (
+            3,
+            json!({"threadId":"actor","callId":"call-3","x-codex-turn-metadata":{"turn":"test"}}),
+            "Assistance host metadata or attachment is unavailable; continue with native tools",
+        ),
+        (
+            4,
+            json!({}),
+            "unavailable: host_binding (host_unrecognized); this host did not identify the call in a supported format. Continue with native tools",
+        ),
+    ] {
+        let reply = mcp
+            .exchange(
+                json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+                    "name":"ide.diff","arguments":{},"_meta":modern_meta(host)
+                }}),
+            )
+            .await;
+        assert_eq!(reply["result"]["content"][0]["text"], expected, "{reply}");
+    }
+    mcp.close().await;
+}
+
 /// Managed startup failure remains a disconnected static ten-tool MCP with bounded fallback calls.
 #[tokio::test]
 async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
@@ -873,6 +1065,57 @@ async fn binary_routes_methods_to_typed_missing_peer_and_survives_daemon_loss() 
             .unwrap()
             .contains("daemon transport is unavailable")
     );
+    mcp.close().await;
+    std::fs::remove_dir_all(runtime).unwrap();
+}
+
+/// A modern Codex session (2026-07-28, no `initialize`) still receives the `structuredContent`
+/// duplicate: the Codex contract is selected from per-request `_meta`, never from the handshake,
+/// and ordinary calls route to the typed daemon reply exactly as the legacy twin above.
+#[tokio::test]
+async fn modern_codex_call_keeps_structured_content_without_initialize() {
+    let runtime = runtime();
+    let mut daemon = Command::new(product_binary())
+        .args(["daemon", "--runtime-dir"])
+        .arg(&runtime)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if UnixStream::connect(runtime.join("agent-ide.sock"))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                daemon.try_wait().unwrap().is_none(),
+                "daemon exited during startup"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut mcp = Mcp::start_raw(&runtime, Some("private-host-channel")).await;
+    let response = mcp
+        .exchange(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+            "name":"ide.diff","arguments":{},
+            "_meta":modern_meta(json!({"threadId":"actor","callId":"call-2","x-codex-turn-metadata":{"turn":"test"}}))
+        }}))
+        .await;
+    assert_ne!(response["result"]["isError"], json!(true), "{response}");
+    assert_eq!(
+        response["result"]["structuredContent"],
+        json!({"state":"unavailable","reason":"host_binding"}),
+        "{response}"
+    );
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
     mcp.close().await;
     std::fs::remove_dir_all(runtime).unwrap();
 }
@@ -2905,6 +3148,45 @@ async fn settle_managed_claude_start(
     reply
 }
 
+/// Runs exact managed Claude Pre→MCP→terminal-hook correlation for one root actor whose requests
+/// carry the modern client context: [`managed_claude_call`] for a 2026-07-28 session that never
+/// initialized, proving the pairing reads per-request `_meta` alone.
+async fn managed_claude_modern_call(
+    mcp: &mut Mcp,
+    project: &Path,
+    id: usize,
+    session: &str,
+    name: &str,
+    arguments: Value,
+) -> Value {
+    let call = format!("modern-claude-{id}");
+    let pre = managed_claude_hook(
+        Some(project),
+        managed_claude_event("PreToolUse", session, None, &call),
+    )
+    .await;
+    assert!(
+        pre.status.success() && pre.stdout.is_empty() && pre.stderr.is_empty(),
+        "managed pre-hook failed: {}",
+        String::from_utf8_lossy(&pre.stderr)
+    );
+    let reply = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+                "name":name,"arguments":arguments,
+                "_meta":modern_meta(json!({"claudecode/toolUseId":call}))
+            }}),
+        )
+        .await;
+    let post = managed_claude_hook(
+        Some(project),
+        managed_claude_event("PostToolUse", session, None, &call),
+    )
+    .await;
+    assert!(post.status.success() && post.stderr.is_empty());
+    claude_fields(assert_claude_envelope(&reply))
+}
+
 /// Lists live short managed runtime directories so EOF cleanup can be observed at the product edge.
 fn managed_runtime_paths() -> std::collections::BTreeSet<PathBuf> {
     std::fs::read_dir(std::fs::canonicalize(std::env::temp_dir()).unwrap())
@@ -3981,6 +4263,72 @@ async fn managed_claude_startup_requires_template() {
     // daemon ever started inside it; a later MCP simply reuses it through the same idempotent
     // ensure-or-adopt path.
     assert!(runtime.is_dir());
+}
+
+/// A modern managed Claude session (2026-07-28, no `initialize`) still pairs its hooks and keeps
+/// the text-only envelope (T14B): the host contract, the tool-use correlation and the envelope all
+/// come from per-request `_meta`, never from the handshake. The same call through the legacy
+/// handshake is covered by `managed_claude_root_child_rendezvous_shared_daemon_survives_eof`.
+#[tokio::test]
+async fn modern_managed_claude_keeps_hook_pairing_and_text_only_envelope() {
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let mut mcp = Mcp::start_managed_claude_raw(&fixture.config, &fixture.root).await;
+    // With no handshake to pace startup, wait for the shared daemon's socket before the first
+    // hook: a pre-hook that reaches no daemon fails open and the paired call would be refused.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if UnixStream::connect(runtime.join("agent-ide.sock"))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("managed Claude daemon socket");
+    let mut next = 30;
+    let pending = managed_claude_modern_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "modern-root-session",
+        "ide.start",
+        json!({"activation_id":"modern-root"}),
+    )
+    .await;
+    let mut started = pending;
+    while started["state"] == "pending" {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        next += 1;
+        started = managed_claude_modern_call(
+            &mut mcp,
+            &fixture.root,
+            next,
+            "modern-root-session",
+            "ide.inspect",
+            json!({"detail_ref":started["detail_ref"].clone()}),
+        )
+        .await;
+    }
+    assert_eq!(started["state"], "complete", "{started}");
+    assert_eq!(started["kind"], "activation", "{started}");
+    // An ordinary modern call on the activated binding stays text-only and answers inline.
+    next += 1;
+    let diff = managed_claude_modern_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "modern-root-session",
+        "ide.diff",
+        json!({}),
+    )
+    .await;
+    assert_eq!(diff["state"], "complete", "{diff}");
+    mcp.close().await;
 }
 
 /// The standard Claude MCP/hook pair activates root then child; a second MCP for the same

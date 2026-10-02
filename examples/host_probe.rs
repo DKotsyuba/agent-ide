@@ -301,10 +301,10 @@ async fn mcp(
     #[rmcp::tool_handler(router = self.router)]
     impl rmcp::ServerHandler for Probe {
         /// Describes only the diagnostic tool capability exposed by this test server.
-        fn get_info(&self) -> ServerInfo {
+        fn get_info(&self) -> ServerConfig {
             let mut experimental = ExperimentalCapabilities::new();
             experimental.insert(SANDBOX_STATE_META.to_owned(), Default::default());
-            ServerInfo::new(
+            ServerConfig::new(
                 ServerCapabilities::builder()
                     .enable_tools()
                     .enable_experimental_with(experimental)

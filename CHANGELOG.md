@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Changed
+
+- MCP 2026-07-28 ("modern": no `initialize`; every request carries its
+  protocol version and client capabilities in `_meta`) is served on
+  `rmcp =3.4.0` (from 3.2.0). Modern `tools/list` now returns
+  `resultType=complete`, `ttlMs=60000` and `cacheScope=private`, which
+  Claude Code requires or it drops every tool; legacy sessions keep their
+  exact original wire (no `ttlMs`, `cacheScope` or `resultType`).
+- Host identity never depended on the handshake: the Codex-vs-Claude
+  envelope, the tool-call correlation and the managed-Claude hook pairing
+  are all selected from per-request `_meta`, so modern sessions are
+  unchanged. Raw-wire tests pin each decision in both eras (modern
+  tools/list, legacy tools/list, modern `server/discover`, a modern
+  fail-open `tools/call`, a modern managed-Claude paired call and a modern
+  Codex call with `structuredContent`).
+
 ## 0.7.0 — 2026-10-02
 
 ### Added

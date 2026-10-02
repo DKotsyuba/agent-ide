@@ -14,7 +14,7 @@ use std::{
 };
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::model::{CacheScope, CallToolResult, ContentBlock, ListToolsResult, ProtocolVersion};
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, tool, tool_router};
 use serde_json::{Map, Value, json};
@@ -3602,13 +3602,29 @@ fn debug_redacts_trusted_transport_and_host_metadata() {
     }
 }
 
+/// Private catalog cache lifetime in milliseconds for modern MCP requests (SEP-2549).
+const TOOLS_LIST_TTL_MS: u64 = 60_000;
+
+/// Reports whether one request speaks MCP 2026-07-28 or newer.
+///
+/// Modern requests carry their protocol version per request in `_meta` instead of the legacy
+/// `initialize` handshake; `RequestContext::protocol_version` reads that first and falls back to
+/// the legacy negotiated version. Protocol versions are ISO dates, so string order equals
+/// version order. rmcp strips only `resultType` for legacy peers and never the cache hints, so
+/// this gate alone decides which era's wire shape `tools/list` answers with.
+fn modern_request(context: &RequestContext<RoleServer>) -> bool {
+    context
+        .protocol_version()
+        .is_some_and(|version| version.as_str() >= ProtocolVersion::V_2026_07_28.as_str())
+}
+
 #[rmcp::tool_handler(router = self.router)]
 impl rmcp::ServerHandler for StdioFacade {
     /// Advertises only the tool surface; no host sandbox metadata is requested. The identity is
-    /// the product, not the SDK: rmcp's `ServerInfo::new` would expand its own crate name and
-    /// version, so hosts would see `rmcp` `3.2.0` instead of the shipping binary.
-    fn get_info(&self) -> rmcp::model::ServerInfo {
-        rmcp::model::ServerInfo::new(
+    /// the product, not the SDK: rmcp's `ServerConfig::new` would expand its own crate name and
+    /// version, so hosts would see `rmcp` `3.4.0` instead of the shipping binary.
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
                 .build(),
@@ -3618,6 +3634,26 @@ impl rmcp::ServerHandler for StdioFacade {
                 .with_title("Agent IDE"),
         )
         .with_instructions(SERVER_INSTRUCTIONS)
+    }
+
+    /// Serves the static eleven-tool catalog, with private cache hints for modern requests only.
+    ///
+    /// The catalog is static per binary, but a short private TTL keeps a client from holding
+    /// stale schemas across an upgrade; `ttlMs` and `cacheScope` stay absent for legacy sessions
+    /// so their wire bytes never change. Overrides the `#[tool_handler]` default (which would
+    /// answer modern requests with `ttlMs: 0`, `cacheScope: "public"`).
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, rmcp::ErrorData> {
+        let mut result = ListToolsResult::with_all_items(self.router.list_all());
+        if modern_request(&context) {
+            result = result
+                .with_ttl_ms(TOOLS_LIST_TTL_MS)
+                .with_cache_scope(CacheScope::Private);
+        }
+        Ok(result)
     }
 }
 

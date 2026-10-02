@@ -2257,6 +2257,41 @@ mod tests {
         );
     }
 
+    /// Modern-era request metadata selects the same single host contract: the standard
+    /// `io.modelcontextprotocol/*` client-context keys a 2026-07-28 request carries on every call
+    /// ride beside the host fields without changing the selection, and alone they name no
+    /// supported host (the host never initialized, so nothing else identifies it).
+    #[test]
+    fn modern_client_context_still_selects_exactly_one_host_contract() {
+        let modern = |host: Value| {
+            let mut meta = json!({
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            });
+            let object = meta.as_object_mut().expect("test metadata is an object");
+            for (key, value) in host.as_object().into_iter().flatten() {
+                object.insert(key.clone(), value.clone());
+            }
+            meta
+        };
+        let kind =
+            |meta: Value| parse_host_kind(meta.as_object().expect("test metadata is an object"));
+        assert_eq!(
+            kind(modern(json!({"claudecode/toolUseId":"call"}))),
+            Ok(HostKind::Claude)
+        );
+        assert_eq!(
+            kind(modern(
+                json!({"threadId":"actor","callId":"call","x-codex-turn-metadata":{}})
+            )),
+            Ok(HostKind::Codex)
+        );
+        assert!(matches!(
+            kind(modern(json!({}))),
+            Err(BindingUnavailable::InvalidMetadata)
+        ));
+    }
+
     /// Consumes one unique same-channel Claude pre-hook and rejects missing or ambiguous matches.
     #[test]
     fn claude_start_recovers_one_exact_parent_or_child_pre_observation() {

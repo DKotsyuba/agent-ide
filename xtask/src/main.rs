@@ -166,6 +166,11 @@ fn standard(root: &Path) -> Result<()> {
             ("profiles", "transports", "stdio"),
             ("profiles", "host_adapter", "true"),
             ("compatibility", "qualified_targets", "aarch64-apple-darwin"),
+            (
+                "compatibility",
+                "supported_protocol_revisions",
+                "2024-11-05, 2025-03-26, 2025-06-18, 2025-11-25, 2026-07-28",
+            ),
             ("release", "workflow", "release.yml"),
             ("release", "delivery_profile", "archive-bundle-v1"),
             ("release", "trust_profile", "github-authenticated"),
