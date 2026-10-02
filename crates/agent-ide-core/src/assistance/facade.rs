@@ -2808,6 +2808,9 @@ pub(super) fn render_reply_with_status(
     status: Option<&str>,
     envelope: content::Envelope,
 ) -> CallToolResult {
+    // FAIL-01: the receipt is taken before the reply is consumed, so a render that cannot fit or
+    // complete still reports an executed edit's outcome, identifiers and no-replay rule.
+    let receipt = content::PresentationReceipt::of(&reply);
     content::render_with_status(reply, status, envelope).unwrap_or_else(|| {
         crate::errorlog::record(
             crate::errorlog::Method::Client,
@@ -2817,9 +2820,14 @@ pub(super) fn render_reply_with_status(
                 ..Default::default()
             },
         );
-        CallToolResult::error(vec![ContentBlock::text(
-            "Assistance result exceeds the bounded envelope; continue with native tools",
-        )])
+        receipt.map_or_else(
+            || {
+                CallToolResult::error(vec![ContentBlock::text(
+                    "Assistance result exceeds the bounded envelope; continue with native tools",
+                )])
+            },
+            content::PresentationReceipt::degraded,
+        )
     })
 }
 
@@ -3190,6 +3198,94 @@ fn inline_complete_kinds_keep_structured_content() {
     ));
 }
 
+/// FAIL-01: an edit reply too large for the bounded envelope still reports its outcome, path and
+/// operation_id from the presentation receipt, keeps the no-replay rule for `outcome_unknown`, and keeps
+/// the `is_error` value the normal projection would have set. An oversized note is the one
+/// non-shrinkable field an Edit reply carries, so it is the shape that cannot fit.
+#[test]
+fn oversized_edit_replies_keep_outcome_operation_id_and_no_replay() {
+    let oversized_note = |outcome| PeerReply::Edit {
+        result: crate::changes::edit::EditResult::new(
+            "operation-9".into(),
+            "src/lib.rs".into(),
+            outcome,
+            outcome
+                .has_post_source()
+                .then(|| "source-after-edit".to_owned()),
+        )
+        .unwrap(),
+        diagnostics: crate::assistance::reply::EditDiagnostics::Unknown {},
+        note: Some("n".repeat(crate::assistance::reply::MAX_REPLY_BYTES)),
+        operation: None,
+    };
+    let committed = render_reply_with_status(
+        oversized_note(crate::changes::edit::EditOutcome::Replaced),
+        None,
+        content::Envelope::WithStructured,
+    );
+    let ContentBlock::Text(text) = &committed.content[0] else {
+        panic!("sole content block must be text");
+    };
+    assert_eq!(
+        text.text,
+        "edit: replaced; path src/lib.rs; operation_id operation-9\n\
+         Presentation degraded (presentation_failed). Do not repeat the mutation to repair \
+         this response."
+    );
+    assert!(committed.structured_content.is_none());
+    assert_ne!(committed.is_error, Some(true));
+
+    // `outcome_unknown` renders no note, so the oversized carrier comes from a status plate the
+    // daemon-side fitter would never attach; the facade loop and receipt are the same path.
+    let unknown = render_reply_with_status(
+        PeerReply::Edit {
+            result: crate::changes::edit::EditResult::new(
+                "operation-9".into(),
+                "src/lib.rs".into(),
+                crate::changes::edit::EditOutcome::OutcomeUnknown,
+                None,
+            )
+            .unwrap(),
+            diagnostics: crate::assistance::reply::EditDiagnostics::Unknown {},
+            note: None,
+            operation: None,
+        },
+        Some(&"x".repeat(crate::assistance::reply::MAX_REPLY_BYTES)),
+        content::Envelope::TextOnly,
+    );
+    let ContentBlock::Text(text) = &unknown.content[0] else {
+        panic!("sole content block must be text");
+    };
+    assert!(
+        text.text
+            .starts_with("edit: outcome_unknown; path src/lib.rs; operation_id operation-9")
+    );
+    assert!(text.text.contains("do not replay this operation"));
+    assert_ne!(unknown.is_error, Some(true));
+
+    // A read that cannot be presented keeps the historical generic bounded-envelope error: it
+    // carries no effect whose outcome must survive, and shrinking owner text cannot rescue it.
+    let read = render_reply_with_status(
+        PeerReply::Complete {
+            kind: ResultKind::Context,
+            text: "bounded owner evidence".into(),
+            detail_ref: None,
+            truncated: false,
+            continuation: false,
+        },
+        Some(&"x".repeat(crate::assistance::reply::MAX_REPLY_BYTES)),
+        content::Envelope::TextOnly,
+    );
+    let ContentBlock::Text(text) = &read.content[0] else {
+        panic!("sole content block must be text");
+    };
+    assert_eq!(
+        text.text,
+        "Assistance result exceeds the bounded envelope; continue with native tools"
+    );
+    assert_eq!(read.is_error, Some(true));
+}
+
 /// Projects typed unavailable and stop lifecycle replies through the shared compact envelope.
 #[test]
 fn typed_lifecycle_replies_preserve_structured_content_without_transport_errors() {
@@ -3327,7 +3423,8 @@ impl StdioFacade {
     /// a project card: languages with sizes, the build/check/test/lint commands, layout by
     /// directory, entry points and docs. Use it to orient instead of reading README, {manifests_head}
     /// {manifests_tail}. Then use ide.outline / ide.symbol instead of native file reads.
-    #[tool(name = "ide.start", input_schema = tool_schemas()[0].input_schema.as_object().expect("tool schema is an object").clone())]
+    #[tool(name = "ide.start", input_schema = tool_schemas()[0].input_schema.as_object().expect("tool schema is an object").clone(),
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn start(
         &self,
         Parameters(parameters): Parameters<Value>,
@@ -3340,7 +3437,8 @@ impl StdioFacade {
     /// project's latest check results (errors and warnings by file, paged). Use `problems` to
     /// see what is broken right now instead of running the build yourself; use `path` before or
     /// after editing a file natively.
-    #[tool(name = "ide.context", input_schema = tool_schemas()[1].input_schema.as_object().expect("tool schema is an object").clone())]
+    #[tool(name = "ide.context", input_schema = tool_schemas()[1].input_schema.as_object().expect("tool schema is an object").clone(),
+        annotations(read_only_hint = true, open_world_hint = false))]
     async fn context(
         &self,
         Parameters(parameters): Parameters<Value>,
@@ -3353,7 +3451,8 @@ impl StdioFacade {
     /// Diff of what this task changed in the working tree (`head`, `staged`, `unstaged` or `task`),
     /// paged. Review it before finishing or handing off, instead of running `git diff` in a
     /// shell.
-    #[tool(name = "ide.diff", input_schema = tool_schemas()[2].input_schema.as_object().expect("tool schema is an object").clone())]
+    #[tool(name = "ide.diff", input_schema = tool_schemas()[2].input_schema.as_object().expect("tool schema is an object").clone(),
+        annotations(read_only_hint = true, open_world_hint = false))]
     async fn diff(
         &self,
         Parameters(parameters): Parameters<Value>,
@@ -3367,7 +3466,8 @@ impl StdioFacade {
     /// A fraction of the cost of reading the file — use it before any native read of a source
     /// file longer than a screen. Answers inline on a warm language server; a cold one answers
     /// `pending` — poll ide.inspect.
-    #[tool(name = "ide.outline", input_schema = tool_schemas()[6].input_schema.as_object().expect("tool schema is an object").clone())]
+    #[tool(name = "ide.outline", input_schema = tool_schemas()[6].input_schema.as_object().expect("tool schema is an object").clone(),
+        annotations(read_only_hint = true, open_world_hint = false))]
     async fn outline(
         &self,
         Parameters(parameters): Parameters<Value>,
@@ -3380,7 +3480,8 @@ impl StdioFacade {
     /// Body of one symbol (`file#Owner/name`) or an explicit line range, numbered, with its doc
     /// header. The precise replacement for reading a whole file when you already know what you
     /// need; its `source_ref` is what a full-file ide.edit is based on.
-    #[tool(name = "ide.read", input_schema = tool_schemas()[7].input_schema.as_object().expect("tool schema is an object").clone())]
+    #[tool(name = "ide.read", input_schema = tool_schemas()[7].input_schema.as_object().expect("tool schema is an object").clone(),
+        annotations(read_only_hint = true, open_world_hint = false))]
     async fn read(
         &self,
         Parameters(parameters): Parameters<Value>,
@@ -3394,7 +3495,8 @@ impl StdioFacade {
     /// paths, and with `history: true` the last commits touching the definition. Language-server
     /// accurate — replaces grep for usages and reading files to find callers. A bare name with
     /// several matches returns the candidate paths.
-    #[tool(name = "ide.symbol", input_schema = tool_schemas()[8].input_schema.as_object().expect("tool schema is an object").clone())]
+    #[tool(name = "ide.symbol", input_schema = tool_schemas()[8].input_schema.as_object().expect("tool schema is an object").clone(),
+        annotations(read_only_hint = true, open_world_hint = false))]
     async fn symbol(
         &self,
         Parameters(parameters): Parameters<Value>,
@@ -3407,7 +3509,8 @@ impl StdioFacade {
     /// nodes, every node a full symbol path, cycles marked `(seen)`, tests collapsed into `+N tests` per parent (set `tests: true` to list them). Use
     /// it to see the blast radius before changing a function or to trace how a call reaches a
     /// symbol, instead of chained greps.
-    #[tool(name = "ide.graph", input_schema = tool_schemas()[9].input_schema.as_object().expect("tool schema is an object").clone())]
+    #[tool(name = "ide.graph", input_schema = tool_schemas()[9].input_schema.as_object().expect("tool schema is an object").clone(),
+        annotations(read_only_hint = true, open_world_hint = false))]
     async fn graph(
         &self,
         Parameters(parameters): Parameters<Value>,
@@ -3422,7 +3525,8 @@ impl StdioFacade {
     /// ide.inspect (`status` re-reads a run). A summary-less explicit command waits briefly and
     /// includes its exit code and bounded output inline when it finishes inside that window. Use
     /// it instead of running the test command in a shell: exact selection, bounded output.
-    #[tool(name = "ide.test", input_schema = tool_schemas()[10].input_schema.as_object().expect("tool schema is an object").clone())]
+    #[tool(name = "ide.test", input_schema = tool_schemas()[10].input_schema.as_object().expect("tool schema is an object").clone(),
+        annotations(read_only_hint = false))]
     async fn test(
         &self,
         Parameters(parameters): Parameters<Value>,
@@ -3434,7 +3538,8 @@ impl StdioFacade {
     /// Fetch the result behind a `detail_ref`: a `pending` reply that has since completed, or
     /// the next page of a long result (outline, symbol, graph, diff, test output). Poll every
     /// few seconds while it stays pending.
-    #[tool(name = "ide.inspect", input_schema = tool_schemas()[3].input_schema.as_object().expect("tool schema is an object").clone())]
+    #[tool(name = "ide.inspect", input_schema = tool_schemas()[3].input_schema.as_object().expect("tool schema is an object").clone(),
+        annotations(read_only_hint = true, open_world_hint = false))]
     async fn inspect(
         &self,
         Parameters(parameters): Parameters<Value>,
@@ -3446,7 +3551,8 @@ impl StdioFacade {
 
     /// End this task's IDE session; edited files stay on disk. Lists up to eight test runs started
     /// in this binding whose results were never collected. Call once when done or before handing off.
-    #[tool(name = "ide.stop", input_schema = tool_schemas()[4].input_schema.as_object().expect("tool schema is an object").clone())]
+    #[tool(name = "ide.stop", input_schema = tool_schemas()[4].input_schema.as_object().expect("tool schema is an object").clone(),
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn stop(
         &self,
         Parameters(parameters): Parameters<Value>,
@@ -3460,7 +3566,8 @@ impl StdioFacade {
     /// `source_ref`. Formats the result with the project formatter, runs the project check
     /// ({project_checks}) and returns this file's errors and warnings in the reply.
     /// Prefer it over native edit/write for source: no line matching, no separate check step.
-    #[tool(name = "ide.edit", input_schema = tool_schemas()[5].input_schema.as_object().expect("tool schema is an object").clone())]
+    #[tool(name = "ide.edit", input_schema = tool_schemas()[5].input_schema.as_object().expect("tool schema is an object").clone(),
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false))]
     async fn edit(
         &self,
         Parameters(parameters): Parameters<Value>,
@@ -3497,12 +3604,18 @@ fn debug_redacts_trusted_transport_and_host_metadata() {
 
 #[rmcp::tool_handler(router = self.router)]
 impl rmcp::ServerHandler for StdioFacade {
-    /// Advertises only the tool surface; no host sandbox metadata is requested.
+    /// Advertises only the tool surface; no host sandbox metadata is requested. The identity is
+    /// the product, not the SDK: rmcp's `ServerInfo::new` would expand its own crate name and
+    /// version, so hosts would see `rmcp` `3.2.0` instead of the shipping binary.
     fn get_info(&self) -> rmcp::model::ServerInfo {
         rmcp::model::ServerInfo::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
                 .build(),
+        )
+        .with_server_info(
+            rmcp::model::Implementation::new("agent-ide", env!("CARGO_PKG_VERSION"))
+                .with_title("Agent IDE"),
         )
         .with_instructions(SERVER_INSTRUCTIONS)
     }

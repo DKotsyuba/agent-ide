@@ -5,7 +5,8 @@ use std::sync::OnceLock;
 use minijinja::{AutoEscape, Environment, UndefinedBehavior};
 use rmcp::model::{CallToolResult, ContentBlock};
 
-use super::reply::{FailureCode, MAX_REPLY_BYTES, MCP_RESERVE, PeerReply};
+use super::reply::{FailureCode, MAX_REPLY_BYTES, MCP_RESERVE, PeerReply, ResultKind};
+use crate::changes::edit::EditOutcome;
 
 /// Build-embedded MiniJinja source projecting every closed [`PeerReply`] state into its compact
 /// model-facing text; the template owns the presentation so daemon code never formats reply text.
@@ -148,6 +149,7 @@ fn project(
         }
         context["cause_tag"] = serde_json::Value::String(tag);
     }
+    escape_untrusted_labels(&mut context);
     let reply_text = render_text(&context)?;
     let structured = match status {
         Some(status) => match structured {
@@ -188,6 +190,74 @@ fn project(
     Some(rendered)
 }
 
+/// Escapes every untrusted label the template interpolates into reply text (SAFE-02): paths,
+/// symbol names, provider messages, and stage details may not forge structural lines or hide
+/// reordering behind bidi marks. Exact content (`Complete.text`, edit notes) and validated
+/// actionable references (`detail_ref`, `source_ref`) stay byte-exact; ordinary paths are not
+/// quoted.
+fn escape_untrusted_labels(context: &mut serde_json::Value) {
+    fn field(value: &mut serde_json::Value, key: &str) {
+        let Some(escaped) = value.get(key).and_then(|label| label.as_str()) else {
+            return;
+        };
+        let escaped = display_safe(escaped);
+        if let Some(slot) = value.as_object_mut().and_then(|fields| fields.get_mut(key)) {
+            *slot = serde_json::Value::String(escaped);
+        }
+    }
+    if context.get("state") == Some(&serde_json::Value::from("invalid_parameters")) {
+        field(context, "text");
+    }
+    if let Some(code) = context.get_mut("code") {
+        field(code, "no_such_file");
+    }
+    for key in ["resolution_detail", "resolution_message", "cause_tag"] {
+        field(context, key);
+    }
+    if let Some(result) = context.get_mut("result") {
+        field(result, "path");
+    }
+    if let Some(diagnostics) = context.get_mut("diagnostics") {
+        field(diagnostics, "reason");
+        if let Some(messages) = diagnostics
+            .get_mut("messages")
+            .and_then(|m| m.as_array_mut())
+        {
+            for message in messages {
+                if let Some(label) = message.as_str() {
+                    *message = serde_json::Value::String(display_safe(label));
+                }
+            }
+        }
+    }
+}
+
+/// Renders one untrusted label as visible single-line text: newline, carriage return, tab and
+/// the remaining control characters become their escapes, and bidirectional format marks become
+/// explicit `\u` escapes instead of silently reordering the line.
+fn display_safe(label: &str) -> String {
+    let mut escaped = String::with_capacity(label.len());
+    for character in label.chars() {
+        match character {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{8}' => escaped.push_str("\\b"),
+            '\u{c}' => escaped.push_str("\\f"),
+            control if control.is_control() => {
+                escaped.push_str(&format!("\\u{:04x}", control as u32));
+            }
+            '\u{61c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}' => escaped.push_str(&format!("\\u{:04x}", character as u32)),
+            visible => escaped.push(visible),
+        }
+    }
+    escaped
+}
+
 /// Extracts a producer's trailing detail payload without depending on prefix byte lengths.
 fn resolution_message(detail: &str) -> &str {
     let Some((_, stage_detail)) = detail.split_once(':') else {
@@ -212,15 +282,35 @@ fn resolution_message(detail: &str) -> &str {
 /// exercised by this module's tests, so construction failure is a programmatic bug.
 fn environment() -> &'static Environment<'static> {
     static ENVIRONMENT: OnceLock<Environment<'static>> = OnceLock::new();
-    ENVIRONMENT.get_or_init(|| {
-        let mut environment = Environment::new();
-        environment.set_undefined_behavior(UndefinedBehavior::Strict);
-        environment.set_auto_escape_callback(|_| AutoEscape::None);
-        environment
-            .add_template("reply.jinja", REPLY_TEMPLATE)
-            .expect("embedded reply template parses");
-        environment
-    })
+    ENVIRONMENT.get_or_init(|| reply_environment(Some(RENDER_FUEL)))
+}
+
+/// VM-instruction budget for one reply render; a render that exceeds it fails into the
+/// presentation-degraded fallback instead of looping.
+const RENDER_FUEL: u64 = 5_000;
+/// Deepest template nesting one render may reach; `reply.jinja` has no recursion at all.
+const RENDER_RECURSION_LIMIT: usize = 16;
+
+/// Builds the closed reply environment: no implicit filters, tests, functions or globals — only
+/// the helpers `reply.jinja` actually uses are registered, so an added template construct fails
+/// loudly here instead of silently widening the engine (JINJA-02).
+///
+/// Registered set: filter `join`; tests `defined`, `mapping`, `startingwith`, `endingwith`.
+fn reply_environment(fuel: Option<u64>) -> Environment<'static> {
+    let mut environment = Environment::empty();
+    environment.set_undefined_behavior(UndefinedBehavior::Strict);
+    environment.set_auto_escape_callback(|_| AutoEscape::None);
+    environment.add_filter("join", minijinja::filters::join);
+    environment.add_test("defined", minijinja::tests::is_defined);
+    environment.add_test("mapping", minijinja::tests::is_mapping);
+    environment.add_test("startingwith", minijinja::tests::is_startingwith);
+    environment.add_test("endingwith", minijinja::tests::is_endingwith);
+    environment.set_fuel(fuel);
+    environment.set_recursion_limit(RENDER_RECURSION_LIMIT);
+    environment
+        .add_template("reply.jinja", REPLY_TEMPLATE)
+        .expect("embedded reply template parses");
+    environment
 }
 
 /// Returns deterministic decision-facing text for one serialized validated reply.
@@ -245,11 +335,203 @@ pub(crate) fn call_tool_result_fits(rendered: &CallToolResult) -> bool {
     serde_json::to_vec(rendered).is_ok_and(|bytes| bytes.len() <= MAX_REPLY_BYTES - MCP_RESERVE)
 }
 
+/// Immutable execution receipt kept outside the template context (FAIL-01): when a mutating reply
+/// cannot be projected — the render exhausts its budget or the carrier cannot fit after shrinking
+/// only owner text — the effect already happened, so the reply still reports the outcome, the exact
+/// identifiers a retry must reuse, and whether the mutation may be repeated.
+pub(crate) enum PresentationReceipt {
+    /// One executed edit: durable outcome, display word, requested path, durable operation id,
+    /// and the retained diagnostics reference when matching-generation work is inspectable.
+    Edit {
+        /// Durable closed outcome; alone decides the no-replay recovery sentence.
+        outcome: EditOutcome,
+        /// Outcome word exactly as the compact first line would name it.
+        word: String,
+        /// Requested path, display-escaped but never quoted.
+        path: String,
+        /// Durable operation id a retry or reconciliation must reuse.
+        operation_id: String,
+        /// `ide.inspect` reference for pending post-edit diagnostics, when one was retained.
+        detail_ref: Option<String>,
+    },
+    /// Workspace authority was released; edited files stay on disk.
+    Stop,
+    /// A durable workspace activation now exists for this binding.
+    Activation,
+}
+
+impl PresentationReceipt {
+    /// Extracts the receipt only mutating replies carry; reads keep the historical generic
+    /// bounded-envelope error, because their requested answer, not an effect, is what was lost.
+    pub(crate) fn of(reply: &PeerReply) -> Option<Self> {
+        match reply {
+            PeerReply::Edit {
+                result,
+                diagnostics,
+                operation,
+                ..
+            } => Some(Self::Edit {
+                outcome: result.outcome,
+                word: operation
+                    .clone()
+                    .unwrap_or_else(|| result.outcome.as_str().to_owned()),
+                path: display_safe(&result.path),
+                operation_id: display_safe(&result.operation_id),
+                detail_ref: match diagnostics {
+                    super::reply::EditDiagnostics::Pending { detail_ref } => {
+                        Some(detail_ref.clone())
+                    }
+                    _ => None,
+                },
+            }),
+            PeerReply::Complete {
+                kind: ResultKind::Stop,
+                ..
+            } => Some(Self::Stop),
+            PeerReply::Complete {
+                kind: ResultKind::Activation,
+                ..
+            } => Some(Self::Activation),
+            _ => None,
+        }
+    }
+
+    /// Renders the small fixed-wording fallback from the receipt; `is_error` keeps the value the normal
+    /// projection of the same reply would set, so a confirmed mutation stays success-shaped.
+    pub(crate) fn degraded(self) -> CallToolResult {
+        let text = match self {
+            Self::Edit {
+                outcome,
+                word,
+                path,
+                operation_id,
+                detail_ref,
+            } => {
+                let recovery = match outcome {
+                    EditOutcome::Created | EditOutcome::Replaced | EditOutcome::Unchanged => {
+                        "Do not repeat the mutation to repair this response."
+                    }
+                    EditOutcome::OutcomeUnknown => {
+                        "Inspect this target with native tools before any later mutation; do \
+                         not replay this operation."
+                    }
+                    _ => "No write occurred.",
+                };
+                let diagnostics = detail_ref.as_ref().map_or_else(String::new, |reference| {
+                    format!(" Diagnostics pending: ide.inspect with detail_ref {reference}")
+                });
+                format!(
+                    "edit: {word}; path {path}; operation_id {operation_id}\n\
+                     Presentation degraded (presentation_failed). {recovery}{diagnostics}"
+                )
+            }
+            Self::Stop => "complete stop: presentation degraded (presentation_failed)\n\
+                 Workspace authority is released; native edits remain on disk"
+                .to_owned(),
+            Self::Activation => {
+                "complete activation: presentation degraded (presentation_failed)\n\
+                 The workspace is active; repeat ide.start with the same activation_id for the project card"
+                    .to_owned()
+            }
+        };
+        CallToolResult::success(vec![ContentBlock::text(text)])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::assistance::reply::{EditDiagnostics, MissingPeer, ResultKind};
     use crate::changes::edit::{EditOutcome, EditReceiptError, EditResult};
+
+    /// The render fuel budget keeps at least tenfold headroom above the largest real render this
+    /// module exercises, and one instruction below that render already fails the render — so a
+    /// template growth that outgrows the budget fails loudly here, and a starved render fails
+    /// into the presentation-degraded fallback rather than looping.
+    #[test]
+    fn fuel_bounds_every_real_render_with_tenfold_headroom() {
+        /// Returns the smallest fuel budget that renders `context` with the production engine.
+        fn consumed(context: &serde_json::Value) -> u64 {
+            let (mut low, mut high) = (1u64, RENDER_FUEL);
+            while low < high {
+                let middle = low + (high - low) / 2;
+                let rendered = reply_environment(Some(middle))
+                    .get_template("reply.jinja")
+                    .expect("embedded template")
+                    .render(minijinja::Value::from_serialize(context))
+                    .is_ok();
+                if rendered {
+                    high = middle;
+                } else {
+                    low = middle + 1;
+                }
+            }
+            low
+        }
+        // The deepest branch chains reply.jinja offers: the final error fallbacks, a tagged
+        // execution-profile refusal, an edit carrying eight joined messages, and a page-sized
+        // Complete text.
+        let contexts = [
+            serde_json::json!({
+                "state": "error", "code": "internal",
+                "resolution_detail": "", "resolution_message": "", "cause_tag": ""
+            }),
+            serde_json::json!({
+                "state": "error", "code": "conflict",
+                "resolution_detail": "", "resolution_message": "", "cause_tag": ""
+            }),
+            serde_json::json!({
+                "state": "error", "code": "execution_profile", "cause_tag": "spawn:reap_timed_out",
+                "resolution_detail": "", "resolution_message": ""
+            }),
+            serde_json::json!({
+                "state": "error", "code": "provider_unavailable",
+                "resolution_detail": "symbol:provider_unavailable (fixtureserver: workspace \
+                 load failed; outline and read answer from source)",
+                "resolution_message": "message", "cause_tag": ""
+            }),
+            serde_json::json!({
+                "state": "edit",
+                "result": {"outcome": "replaced", "path": "src/lib.rs",
+                           "operation_id": "op", "source_ref": "ref"},
+                "diagnostics": {"state": "current_reported",
+                    "messages": ["m1\nx", "m2", "m3", "m4", "m5", "m6", "m7", "m8"],
+                    "delta": "Provider reported 8 diagnostics for the exact source generation.",
+                    "truncated": true},
+                "note": "3 changes applied: change 1: lines 12-20 replaced",
+                "operation": "renamed"
+            }),
+            serde_json::json!({
+                "state": "complete", "kind": "context",
+                "text": "\u{0}\u{1f980}\"\\".repeat(16_000),
+                "detail_ref": "next-page", "truncated": true, "continuation": true
+            }),
+            serde_json::json!({
+                "state": "unavailable", "reason": "host_binding",
+                "cause_tag": "project_moved: bound to /a, asked /b",
+                "tool_name": "ide.test", "test_status_id": 7
+            }),
+        ];
+        let largest = contexts
+            .iter()
+            .map(consumed)
+            .enumerate()
+            .max_by_key(|&(_, cost)| cost)
+            .expect("representative contexts");
+        assert!(
+            RENDER_FUEL >= 10 * largest.1,
+            "largest real render costs {} fuel; budget is {RENDER_FUEL}",
+            largest.1
+        );
+        let starved = reply_environment(Some(largest.1 - 1));
+        assert!(
+            starved
+                .get_template("reply.jinja")
+                .expect("embedded template")
+                .render(minijinja::Value::from_serialize(&contexts[largest.0]))
+                .is_err()
+        );
+    }
 
     /// Renders with no carried status plate, the projection every reply had before T28B.
     fn render(reply: PeerReply, envelope: Envelope) -> Option<CallToolResult> {
@@ -1483,5 +1765,148 @@ mod tests {
         let structured = rendered.structured_content.unwrap();
         assert_eq!(structured["status"], plate);
         assert_eq!(structured["truncated"], true);
+    }
+
+    /// A path or provider message containing a newline or a bidi override cannot forge a
+    /// structural line of the reply: the label renders as one visible line with an explicit
+    /// escape, while the structured copy keeps the exact bytes (SAFE-02).
+    #[test]
+    fn untrusted_labels_cannot_forge_reply_lines() {
+        let newline_path = render(
+            PeerReply::Error {
+                code: FailureCode::NoSuchFile("src/li\ng.rs".to_owned()),
+                detail: Some("outline:no_such_file".to_owned()),
+            },
+            Envelope::WithStructured,
+        )
+        .unwrap();
+        let text = text_of(&newline_path);
+        assert!(text.contains("no_such_file: src/li\\ng.rs"), "{text}");
+        assert!(!text.contains('\n'), "{text}");
+        assert_eq!(
+            newline_path.structured_content.unwrap()["code"]["no_such_file"],
+            "src/li\ng.rs"
+        );
+
+        let bidi_path = render(
+            PeerReply::Edit {
+                result: EditResult::new(
+                    "op-9".into(),
+                    "src/\u{202e}evil.rs".into(),
+                    EditOutcome::Replaced,
+                    Some("source-after-edit".into()),
+                )
+                .unwrap(),
+                diagnostics: EditDiagnostics::CurrentClean {},
+                note: None,
+                operation: None,
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        let text = text_of(&bidi_path);
+        assert!(text.contains("path src/\\u202eevil.rs"), "{text}");
+        assert!(!text.contains('\u{202e}'), "{text}");
+    }
+
+    /// Literal template syntax arriving inside data is bound as data: neither a provider
+    /// diagnostic nor source text evaluates `{{ x }}` or `{% if %}`.
+    #[test]
+    fn literal_template_syntax_in_data_stays_data() {
+        let hostile = "{{ scope }} {% if state == \"unavailable\" %} {{ 7 * 7 }}";
+        let rendered = render(
+            PeerReply::Edit {
+                result: EditResult::new(
+                    "op-9".into(),
+                    "src/lib.rs".into(),
+                    EditOutcome::Replaced,
+                    Some("source-after-edit".into()),
+                )
+                .unwrap(),
+                diagnostics: EditDiagnostics::CurrentReported {
+                    messages: vec![hostile.to_owned()],
+                    delta: "Provider reported 1 diagnostic for the exact source generation.".into(),
+                    truncated: false,
+                },
+                note: None,
+                operation: None,
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        let text = text_of(&rendered);
+        assert!(text.contains(hostile), "{text}");
+        // `{{ 7 * 7 }}` stayed data: no evaluated arithmetic reached the reply.
+        assert!(!text.contains("49"), "{text}");
+
+        let source = render(
+            PeerReply::Complete {
+                kind: ResultKind::Context,
+                text: hostile.to_owned(),
+                detail_ref: None,
+                truncated: false,
+                continuation: false,
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        assert!(text_of(&source).contains(hostile));
+    }
+
+    /// The FAIL-01 receipt keeps the outcome word, exact path, operation id, pending
+    /// diagnostics reference and no-replay rule for every edit outcome class, with `is_error`
+    /// exactly as the normal projection would set it.
+    #[test]
+    fn degraded_edit_receipts_keep_outcome_identity_and_recovery() {
+        let mut reply = successful_edit_reply(EditDiagnostics::Pending {
+            detail_ref: "diag-detail".into(),
+        });
+        if let PeerReply::Edit { operation, .. } = &mut reply {
+            *operation = Some("renamed".to_owned());
+        }
+        let rendered = PresentationReceipt::of(&reply).unwrap().degraded();
+        assert_eq!(
+            text_of(&rendered),
+            "edit: renamed; path src/lib.rs; operation_id private-operation-id\n\
+             Presentation degraded (presentation_failed). Do not repeat the mutation to repair \
+             this response. Diagnostics pending: ide.inspect with detail_ref diag-detail"
+        );
+        assert_ne!(rendered.is_error, Some(true));
+
+        let unknown = PeerReply::Edit {
+            result: edit_result(EditOutcome::OutcomeUnknown).unwrap(),
+            diagnostics: EditDiagnostics::Unknown {},
+            note: None,
+            operation: None,
+        };
+        let rendered = PresentationReceipt::of(&unknown).unwrap().degraded();
+        let text = text_of(&rendered);
+        assert!(text.starts_with(
+            "edit: outcome_unknown; path src/lib.rs; operation_id private-operation-id"
+        ));
+        assert!(text.contains("do not replay this operation"), "{text}");
+        assert_ne!(rendered.is_error, Some(true));
+
+        let refused = PeerReply::Edit {
+            result: edit_result(EditOutcome::StaleSource).unwrap(),
+            diagnostics: EditDiagnostics::Unknown {},
+            note: None,
+            operation: None,
+        };
+        let refused_degraded = PresentationReceipt::of(&refused).unwrap().degraded();
+        let text = text_of(&refused_degraded);
+        assert!(text.contains("No write occurred."), "{text}");
+
+        // Reads carry no receipt: their loss is the requested answer, not an unreported effect.
+        assert!(
+            PresentationReceipt::of(&PeerReply::Complete {
+                kind: ResultKind::Context,
+                text: "evidence".into(),
+                detail_ref: None,
+                truncated: false,
+                continuation: false,
+            })
+            .is_none()
+        );
     }
 }
