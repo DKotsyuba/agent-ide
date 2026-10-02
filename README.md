@@ -222,6 +222,18 @@ supported `ide.edit` path when offered, refreshed context, diff, and stop.
 Native host editing remains available when `ide.edit` is inactive, unavailable,
 unsupported, declined, or uncertain.
 
+## Development
+
+Read [AGENTS.md](AGENTS.md) — it is the single agent contract (module map,
+safety invariants, workflow). The one gate is `cargo xtask check`: formatting,
+the locked workspace tests, the four ignored real-provider tests, clippy and
+rustdoc with `-D warnings`, the release build, the family standard checks and
+the tool-contract snapshot check, in one command. It reads the accepted
+toolchains from the `AGENT_IDE_*` environment exactly as CI prepares them.
+`cargo deny --locked check` guards the supply chain, and
+[docs/qualification.md](docs/qualification.md) records what is actually
+qualified.
+
 - [Current delivery roadmap](docs/roadmap.md)
 
 Earlier design documents (subject to the current roadmap and interface renegotiation):

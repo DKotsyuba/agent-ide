@@ -1,0 +1,33 @@
+schema_version = 1
+product = "agent-ide"
+repository = "DKotsyuba/agent-ide"
+env_prefix = "AGENT_IDE_"
+standard_version = "1.0.0-rc.2"
+response_profile = "rust-minijinja-v1"
+devkit_version = "0.2.0"
+baseline = "rust-macos-2026-09-candidate1"
+qualification = "verified"
+
+[profiles]
+process = "resident"
+state = "local"
+transports = ["stdio"]
+host_adapter = true
+
+[compatibility]
+candidate_targets = ["aarch64-apple-darwin"]
+qualified_targets = ["aarch64-apple-darwin"]
+qualified_hosts = ["claude-code", "codex"]
+
+# Release-qualified languages carry acceptance evidence (docs/qualification.md);
+# Go/gopls are built in but outside the release scope and stay experimental.
+[languages]
+qualified = ["rust", "python", "typescript"]
+shipped = ["css", "html"]
+experimental = ["go"]
+
+[release]
+enabled = true
+workflow = "release.yml"
+delivery_profile = "archive-bundle-v1"
+trust_profile = "github-authenticated"
