@@ -9,17 +9,22 @@ use std::{
 
 use serde_json::Value;
 
-/// Keeps the Rust package and both plugin manifests on the exact release version.
+/// Keeps the Rust package, its lock entry and the three plugin manifests on one release version
+/// (the version `cargo xtask release prepare` edits together).
 #[test]
 fn release_versions_are_synchronized() {
-    assert!(include_str!("../Cargo.toml").contains("version = \"0.6.9\""));
-    assert!(include_str!("../Cargo.lock").contains("name = \"agent-ide\"\nversion = \"0.6.9\""));
+    let version = env!("CARGO_PKG_VERSION");
+    assert!(include_str!("../Cargo.toml").contains(&format!("version = \"{version}\"")));
+    assert!(
+        include_str!("../Cargo.lock")
+            .contains(&format!("name = \"agent-ide\"\nversion = \"{version}\""))
+    );
     for manifest in [
         include_str!("../.codex-plugin/plugin.json"),
         include_str!("../.claude-plugin/plugin.json"),
     ] {
         let manifest: Value = serde_json::from_str(manifest).unwrap();
-        assert_eq!(manifest["version"], "0.6.9");
+        assert_eq!(manifest["version"], version);
     }
 }
 
@@ -42,50 +47,96 @@ fn version_flag_prints_the_package_version_and_exits_zero() {
     }
 }
 
-/// Requires every relevant CI, product-acceptance, evidence, package, and artifact-smoke gate
-/// to precede the only GitHub Release publication command without a continue-on-error escape.
-/// Go and gopls are outside the release scope, so no Go toolchain is installed and the workspace
-/// gate skips exactly the three real-gopls toolchain contracts while running every other test.
+/// Pins the release workflow to the family shape: a read-only workflow token; a build job that
+/// runs the complete gate (whose last step is the one release build), packages and verifies that
+/// exact payload, runs the product acceptance route against the packaged executable, validates the
+/// accepted host evidence and writes the release manifest before uploading the payload; and a
+/// tag-only publish job with the release environment that verifies hashes before any chmod,
+/// attests, and hands publication to `xtask release publish`. Go and gopls stay out of scope.
 #[test]
-fn release_workflow_requires_complete_gates_before_publication() {
+fn release_workflow_builds_once_then_publishes_a_verified_draft() {
     let workflow = include_str!("../.github/workflows/release.yml");
-    let publish = workflow.find("gh release create").unwrap();
-    for gate in [
+    let publish_job = workflow.find("\n  publish:\n").unwrap();
+    let (build, publish) = workflow.split_at(publish_job);
+    assert!(workflow.contains("permissions:\n  contents: read\n\nconcurrency:"));
+    assert!(workflow.contains("workflow_dispatch:"));
+    assert!(workflow.contains("dry_run:"));
+    let mut cursor = 0;
+    for step in [
         "fetch-depth: 0",
         "node-version: \"24.4.0\"",
+        "test \"$GITHUB_REF_NAME\" = \"v$version\"",
+        "test \"$DRY_RUN\" = true",
+        "jq -r .plugins[0].version .claude-plugin/marketplace.json",
         "rustup component add rustfmt clippy rust-analyzer rust-src",
         "pyright@1.1.413",
         "typescript-language-server@6.0.0",
         "typescript@5.9.3",
-        "cargo fmt --all --check",
-        "cargo test --locked --workspace -- --test-threads=1 --skip real_gopls_production_context_tracks_exact_observed_bytes --skip shared_gopls_isolates_divergent_worktrees_and_detaches_one_view --skip dropping_live_gopls_owner_closes_its_owned_listener",
-        "cargo clippy --locked --workspace --all-targets -- -D warnings",
-        "cargo doc --locked --workspace --no-deps",
-        "scripts/macos-acceptance.sh --route product",
+        "cargo fetch --locked",
+        "cargo xtask check",
+        "cargo xtask package target/release/agent-ide \"$RELEASE_TAG\" \"$PAYLOAD\"",
+        "cargo xtask package verify \"$asset\"",
+        "cp install.sh \"$PAYLOAD/install.sh\"",
+        "scripts/macos-acceptance.sh --route product --payload \"$ASSET\" --evidence \"$PAYLOAD/acceptance.json\"",
         "scripts/validate-release-evidence.sh \"$GITHUB_SHA\"",
-        "cargo build --locked --release --bin agent-ide",
-        "scripts/package-release.sh",
-        "scripts/release-smoke.sh \"$ASSET\"",
-        // The bootstrap installer ships as a release asset, checksummed with the tarball and
-        // covered by build-provenance attestation before publication.
-        "shasum -a 256 \"$(basename \"$ASSET\")\" install.sh > SHA256SUMS",
-        "actions/attest-build-provenance@",
-        "subject-checksums: SHA256SUMS",
+        "cargo xtask release manifest \"$PAYLOAD\"",
+        "cargo xtask package verify \"$ASSET\"",
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1",
+    ] {
+        let at = build[cursor..]
+            .find(step)
+            .unwrap_or_else(|| panic!("build job lacks, or misorders, {step}"));
+        cursor += at + step.len();
+    }
+    assert_eq!(
+        build.matches("cargo build").count(),
+        0,
+        "the release binary is built once, by the gate"
+    );
+    let mut cursor = 0;
+    for step in [
+        "needs: build",
+        "if: github.event_name == 'push'",
+        "contents: write",
         "id-token: write",
         "attestations: write",
+        "environment: release",
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1",
+        "cargo build --locked -p xtask",
+        "target/debug/xtask package verify",
+        "chmod 755",
+        "if: ${{ !github.event.repository.private }}",
+        "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2",
+        "subject-checksums: ${{ runner.temp }}/payload/SHA256SUMS",
+        "GH_TOKEN: ${{ github.token }}",
+        "target/debug/xtask release publish \"$RUNNER_TEMP/payload\"",
     ] {
-        assert!(workflow[..publish].contains(gate), "missing gate: {gate}");
+        let at = publish[cursor..]
+            .find(step)
+            .unwrap_or_else(|| panic!("publish job lacks, or misorders, {step}"));
+        cursor += at + step.len();
     }
-    assert!(
-        workflow[publish..]
-            .starts_with("gh release create \"$GITHUB_REF_NAME\" \"$ASSET\" install.sh SHA256SUMS"),
-        "the release must attach the tarball, install.sh, and SHA256SUMS"
-    );
+    assert!(!build.contains("contents: write") && !build.contains("id-token"));
+    assert!(!workflow.contains("gh release create"));
     assert!(!workflow.contains("continue-on-error"));
     assert!(!workflow.contains("setup-go"));
     assert!(!workflow.contains("go-version"));
     assert!(!workflow.contains("go install"));
     assert!(!workflow.contains("AGENT_IDE_GO"));
+    // Publication itself: a draft with every asset and generated notes, refused when any release
+    // or draft exists, verified after download, published, then checked once more when visible.
+    let release = include_str!("../xtask/src/release.rs");
+    for rule in [
+        "\"--verify-tag\"",
+        "\"--draft\"",
+        "\"--generate-notes\"",
+        "already exists; refusing to overwrite",
+        "left unpublished for inspection",
+        "\"--draft=false\"",
+        "does not carry exactly the verified assets",
+    ] {
+        assert!(release.contains(rule), "missing publish rule: {rule}");
+    }
 }
 
 /// Pins the CI workflow to SHA-pinned actions, the serialized PR gate, the fetch-before-gate
@@ -202,12 +253,12 @@ fn release_evidence_gate_requires_the_complete_candidate_matrix() {
     }
 }
 
-/// Ensures the release archive carries the complete two-host plugin surface and its smoke test
-/// executes the extracted binary directly without Cargo's integration-test executable shortcut.
+/// Ensures the release archive carries the complete two-host plugin surface, its verification
+/// executes the extracted binary directly without Cargo's integration-test executable shortcut,
+/// and the shell entry points stay thin wrappers over the one xtask implementation.
 #[test]
 fn release_archive_and_smoke_use_the_packaged_executable() {
-    let package = include_str!("../scripts/package-release.sh");
-    let smoke = include_str!("../scripts/release-smoke.sh");
+    let release = include_str!("../xtask/src/release.rs");
     for path in [
         ".agents/plugins/marketplace.json",
         ".claude-plugin/marketplace.json",
@@ -219,11 +270,31 @@ fn release_archive_and_smoke_use_the_packaged_executable() {
         "skills/agent-ide/SKILL.md",
         "skills/agent-ide/agents/openai.yaml",
     ] {
-        assert!(package.contains(path), "missing package input: {path}");
-        assert!(smoke.contains(path), "missing smoke assertion: {path}");
+        assert!(release.contains(path), "missing bundle path: {path}");
     }
-    assert!(smoke.contains("\"$RELEASE_BIN\" evidence executable"));
-    assert!(!smoke.contains("CARGO_BIN_EXE"));
+    assert!(release.contains("&[\"evidence\", \"executable\", \"--identity\""));
+    assert!(release.contains("\"self-install\", \"--release\""));
+    assert!(!release.contains("CARGO_BIN_EXE"));
+    for (script, task) in [
+        (
+            include_str!("../scripts/package-release.sh"),
+            "package \"$1\" \"$2\" \"$3\"",
+        ),
+        (
+            include_str!("../scripts/release-smoke.sh"),
+            "package verify \"$1\"",
+        ),
+        (
+            include_str!("../scripts/wait-release.sh"),
+            "release wait \"$@\"",
+        ),
+    ] {
+        assert!(
+            script.contains("--package xtask --"),
+            "not an xtask wrapper"
+        );
+        assert!(script.contains(task), "wrapper does not call {task}");
+    }
 }
 
 /// Verifies Claude hooks cannot select an ambient executable, the Claude plugin manifest
@@ -264,7 +335,7 @@ fn claude_marketplace_installs_the_root_plugin() {
         serde_json::from_str(include_str!("../.claude-plugin/marketplace.json")).unwrap();
     assert_eq!(claude["plugins"][0]["name"], "agent-ide");
     assert_eq!(claude["plugins"][0]["source"], "./");
-    assert_eq!(claude["plugins"][0]["version"], "0.6.9");
+    assert_eq!(claude["plugins"][0]["version"], env!("CARGO_PKG_VERSION"));
 }
 
 /// Distinguishes temporary install prefixes across scenarios inside one test-process run.

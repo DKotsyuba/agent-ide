@@ -29,6 +29,17 @@ fails with a contract drift message when the two diverge.
 `tests/contract_snapshot_contract.rs` asserts the same equality under plain
 `cargo test`.
 
+Release commands (the full flow is `docs/release.md`):
+
+| Command | Effect |
+|---|---|
+| `cargo xtask release prepare X.Y.Z [--apply]` | preview (default) or write the version edits: workspace version, three plugin manifests, `agent-ide*` lock entries, CHANGELOG heading; never commits, tags or pushes |
+| `cargo xtask package BINARY vX.Y.Z [OUT]` | seal the archive bundle and write the tarball + `SHA256SUMS` (`scripts/package-release.sh` wraps it) |
+| `cargo xtask package verify ARCHIVE` | the release smoke test, plus manifest ↔ files ↔ `SHA256SUMS` when a manifest sits next to the archive (`scripts/release-smoke.sh` wraps it) |
+| `cargo xtask release manifest DIR` | CI only: write `release-manifest.json` and the aggregate `SHA256SUMS` |
+| `cargo xtask release publish DIR` | CI only: draft with all assets → download-back verify → publish; refuses an existing release or draft |
+| `cargo xtask release wait --repo … --tag … --commit … [--run-id N]` | observe one exact tag/commit/run and verify its assets; never installs (`scripts/wait-release.sh` wraps it) |
+
 ## Module map
 
 | Files | Scope |
@@ -43,7 +54,7 @@ fails with a contract drift message when the two diverge.
 | `crates/agent-ide-core/src/app/` | daemon lifecycle/IPC, launcher configuration, SQLite store, transport |
 | `crates/agent-ide-core/src/lang/` | the language contract: registry, outlines, edits, rendering, name facts |
 | `crates/agent-ide-lang-*` | one crate per language; each depends only on the core |
-| `xtask/` | the development gate, standard checks and contract export (std-only) |
+| `xtask/` | the development gate, standard checks, contract export and the release flow (std + `serde_json`; own version) |
 | `scripts/`, `install.sh`, `.github/workflows/` | acceptance drivers, packaging, the installer, CI and release |
 
 The core depends on no language crate and names no language; a language crate
@@ -80,11 +91,13 @@ Rust 2024, resolver 3, pinned toolchain 1.98.1, committed application lock,
 embedded TypeScript adapter and test fixtures are declared product/test
 assets, not tooling). The profile is resident + local state over stdio with
 host adapters. Delivery is the existing sealed archive bundle
-(`scripts/package-release.sh`: binary, plugin manifests, hooks, skill,
-`metadata.json`, `SHA256SUMS`, `COMPLETE`), published by the tag workflow after
-the full gate, product acceptance, evidence validation and the release smoke
-test. Keep `scripts/macos-acceptance.sh` and the release scripts unchanged
-unless a change is the point of the task.
+(`cargo xtask package`: binary, plugin manifests, hooks, skill,
+`metadata.json`, `SHA256SUMS`, `COMPLETE`), built once by the tag workflow's
+build job after the full gate, verified, accepted on the packaged executable
+and described by `release-manifest.json`; the publish job stages a draft,
+verifies it and publishes. Keep the bundle format, `install.sh`,
+`scripts/macos-acceptance.sh` and `scripts/validate-release-evidence.sh`
+unchanged unless a change is the point of the task.
 
 ## Where the contract snapshot lives
 

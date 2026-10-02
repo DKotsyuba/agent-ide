@@ -51,6 +51,24 @@ qualification evidence.
   normalization measurement.
 - `rmcp` is 3.2.0 against the family baseline candidate 3.4.0; the SDK bump is
   its own compatibility wave.
+- `release-manifest.json` follows the template's
+  `schemas/release-manifest.schema.json` exactly (closed objects, no extra
+  fields), so the archive profile's facts the schema has no field for are
+  encoded in the closest schema-valid way (PKG-01 encoding exception):
+  the four mirrored versions (Cargo, two plugin manifests, the Claude
+  marketplace) are one `version`, because the build job's 4-way gate and
+  `cargo xtask package` refuse any divergence; the `archive-bundle-v1`
+  delivery profile is the single `bundle` artifact with `target`
+  `aarch64-apple-darwin` (the sealed tarball, verified by `package verify`);
+  and the evidence → payload binding is the `evidence` artifact
+  `acceptance.json`, whose own `payload.sha256` must equal the bundle digest.
+  `workflow.id` is read from the Actions API in the build job (it has no
+  environment variable).
+- Release evidence: the five checked-in host rows may name an ancestor
+  candidate revision (validated as before); the product route is re-run by
+  the release build job on the packaged executable and its evidence names
+  the exact archive SHA-256 (RLS-06 for the product route; host routes stay
+  manual).
 - Delivery is the existing sealed **archive bundle** (binary, plugin tree,
   manifests, hooks, skill, `metadata.json`, `SHA256SUMS`, `COMPLETE`), not
   `single-binary-v1`; `family.toml` records `delivery_profile =

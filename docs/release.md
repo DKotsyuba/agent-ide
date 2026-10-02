@@ -1,7 +1,7 @@
 # Release installation and update
 
-Agent IDE 0.6.9 publishes one `aarch64-apple-darwin` archive plus `install.sh` and
-`SHA256SUMS`. macOS arm64 is the only claimed platform; Linux remains explicitly `not_tested`
+Each Agent IDE release publishes one `aarch64-apple-darwin` archive plus `install.sh`,
+`SHA256SUMS`, `release-manifest.json` and `acceptance.json`. macOS arm64 is the only claimed platform; Linux remains explicitly `not_tested`
 and has no release artifact.
 
 Publication and installation are separate boundaries: a green publication workflow does not
@@ -118,7 +118,7 @@ tar -xzf "$release_root/agent-ide-v$version-aarch64-apple-darwin.tar.gz" -C "$re
 "$release_root/agent-ide-v$version/agent-ide" self-install --release "$release_root/agent-ide-v$version" --version "$version"
 ```
 
-`package-release.sh` verifies that the tag matches the plugin manifest versions and produces
+`package-release.sh` (a thin wrapper over `cargo xtask package`) verifies that the tag matches the plugin manifest versions and produces
 the bundle (`agent-ide`, plugin manifests, marketplace catalogs, hooks, skill, this guide,
 `metadata.json`, `SHA256SUMS`, `COMPLETE`) plus the tarball and its `SHA256SUMS`; it writes only
 those two files, so the tarball is extracted before `self-install` runs the installer's own code
@@ -184,41 +184,108 @@ method outcome reason worktree detail` line per event (bounded to `--limit`, def
 recent last), or with `--summary` grouped `(level, method, outcome, reason)` counts instead. See
 [`docs/contracts/error-log-v0.3.md`](contracts/error-log-v0.3.md).
 
+## Publishing a release
+
+Every step below is a command; nothing is published from a developer machine.
+
+1. **Prepare locally.** On a clean checkout of `main`, preview the edits, then apply them:
+
+   ```sh
+   cargo xtask release prepare X.Y.Z          # preview: lists every edit, writes nothing
+   cargo xtask release prepare X.Y.Z --apply  # writes them; refuses a dirty checkout
+   ```
+
+   `--apply` edits exactly the workspace version in `Cargo.toml`, the three plugin manifests
+   (`.codex-plugin/plugin.json`, `.claude-plugin/plugin.json`, `plugins[0]` of
+   `.claude-plugin/marketplace.json`), the `Cargo.lock` entries whose name starts with
+   `agent-ide` (a third-party crate may share the version string; `xtask` has its own version),
+   and turns `## Unreleased` into `## X.Y.Z — <date>` under a new empty `## Unreleased`. It
+   refuses a non-increasing version or an empty Unreleased section, ends with a locked
+   `cargo metadata` check, and never commits, tags or pushes. Update version mentions in prose
+   (for example the tag-pinned `claude plugin marketplace add` line above) by hand.
+2. **Review and merge.** Run `cargo xtask check`, commit, and merge the release PR through the
+   normal CI gate.
+3. **Rehearse (optional).** Run the Release workflow by hand (`workflow_dispatch`, `dry_run`
+   true) on the merge commit or any branch: it runs the whole build job — the gate, package,
+   verify, packaged-executable acceptance, evidence validation and the manifest — and uploads the
+   payload artifact, but never publishes. A dispatch with `dry_run` false is refused.
+4. **Tag.** Create an annotated `vX.Y.Z` tag on the accepted commit and push it. Tags are
+   immutable; corrections ship as a new patch version.
+5. **Build job** (`contents: read`, plus `actions: read` for the workflow id). It checks the tag
+   against the Cargo version and the three plugin manifests (the 4-way gate), prepares the
+   accepted toolchains, runs `cargo fetch --locked` and `cargo xtask check` — whose last step is
+   the one release build of `target/release/agent-ide` — then:
+   - `cargo xtask package target/release/agent-ide vX.Y.Z "$PAYLOAD"` seals the bundle and writes
+     the tarball (byte-identical to the former `scripts/package-release.sh`);
+   - `cargo xtask package verify` checks it as the former release smoke test did;
+   - `scripts/macos-acceptance.sh --route product --payload <tarball>` runs the product gates
+     against the executable extracted from that tarball and writes `acceptance.json`, which names
+     the tarball and its SHA-256;
+   - `scripts/validate-release-evidence.sh "$GITHUB_SHA"` validates the checked-in host evidence;
+   - `cargo xtask release manifest "$PAYLOAD"` writes `release-manifest.json` and the aggregate
+     `SHA256SUMS`, and `package verify` runs again against both;
+   - the payload directory (tarball, `install.sh`, `acceptance.json`, `release-manifest.json`,
+     `SHA256SUMS`) is uploaded as the `payload` artifact.
+6. **Publish job** (tag pushes only; `contents: write`, `id-token: write`, `attestations: write`,
+   environment `release`). It downloads the artifact, builds only `xtask` before any credential
+   is in the environment, verifies every hash with `package verify` before any `chmod`, attests
+   build provenance for `SHA256SUMS` (skipped while the repository is private: GitHub keeps
+   attestations for public repositories only), then runs `xtask release publish`, which:
+   - checks the manifest against the run (repository, tag, commit, run id and attempt) and the
+     checked-out tag;
+   - refuses when any release or draft already exists for the tag — nothing is overwritten;
+   - creates a **draft** with all five assets and generated notes;
+   - downloads the draft's assets back and verifies them against the manifest and `SHA256SUMS`;
+   - publishes the draft, then checks that the visible release carries exactly those assets.
+   A failure after the draft exists leaves it unpublished for inspection; delete it by hand
+   before re-running the workflow.
+7. **Observe.** Bind the published release to the exact tag, commit and run:
+
+   ```sh
+   scripts/wait-release.sh --repo DKotsyuba/agent-ide --tag vX.Y.Z --commit FULL_SHA \
+     [--run-id N] [--timeout 1800] [--result-file /absolute/new/result.json]
+   ```
+
+   (`cargo xtask release wait` with the same flags). It waits for the non-draft release, reads
+   its manifest, requires the workflow run of that commit, attempt, workflow id and path to have
+   concluded `success`, resolves the tag to the commit, downloads every asset the manifest names
+   and verifies sizes and digests. It prints the result and creates `--result-file` exclusively
+   (mode 0600); `installed` is always `false` — installing is the separate step above.
+
+### Release assets
+
+| Asset | Content |
+|---|---|
+| `agent-ide-vX.Y.Z-aarch64-apple-darwin.tar.gz` | the sealed bundle (unchanged format; `install.sh` and `self-install` read it) |
+| `install.sh` | the bootstrap installer |
+| `SHA256SUMS` | bare-name digests of the tarball, `install.sh`, `acceptance.json` and `release-manifest.json` (never itself) |
+| `release-manifest.json` | product, version, tag, full commit, workflow id/path/run/attempt, standard/devkit/baseline, trust profile and name/kind/size/SHA-256 of the tarball, `install.sh` and `acceptance.json` (never itself) |
+| `acceptance.json` | the CI product-acceptance evidence of the packaged executable, naming the tarball's SHA-256 |
+
 ## Publication gate
 
-The release workflow repeats formatting, locked workspace tests, Clippy, rustdoc, the complete
-product acceptance route, and the release build on macOS arm64. The accepted release languages are
-Rust, Python, and TypeScript/JavaScript; Go and gopls are outside the release scope. No Go
+The build job repeats formatting, locked workspace tests, Clippy, rustdoc, the four ignored
+real-provider tests and the release build (`cargo xtask check`), then the complete product
+acceptance route against the packaged executable, on macOS arm64. The accepted release languages
+are Rust, Python, and TypeScript/JavaScript; Go and gopls are outside the release scope. No Go
 toolchain is installed, the workspace gate skips exactly the three real-gopls toolchain contracts
 (`real_gopls_production_context_tracks_exact_observed_bytes`,
 `shared_gopls_isolates_divergent_worktrees_and_detaches_one_view`, and
 `dropping_live_gopls_owner_closes_its_owned_listener`) by name while running every other
 workspace test, and the runner records `go` and `gopls` evidence as `not_tested`. Publication
-additionally requires
-the checked-in product, direct Codex, direct Claude, installed agent-run-to-Claude, and
-installed agent-run-to-Codex evidence to
-name one ancestor candidate revision. Every host scenario must be `real_pass`, the product
-scenarios must be `product_pass`, and all rows must carry the accepted language toolchain versions
-with `go` and `gopls` pinned to `not_tested` and closed privacy fields. Missing drivers, `failed`,
-`not_tested` outside the go/gopls rows, mixed revisions, partial scenarios,
-and Linux evidence all block publication.
+additionally requires the checked-in product, direct Codex, direct Claude, installed
+agent-run-to-Claude, and installed agent-run-to-Codex evidence to name one ancestor candidate
+revision. Every host scenario must be `real_pass`, the product scenarios must be `product_pass`,
+and all rows must carry the accepted language toolchain versions with `go` and `gopls` pinned to
+`not_tested` and closed privacy fields. Missing drivers, `failed`, `not_tested` outside the
+go/gopls rows, mixed revisions, partial scenarios, and Linux evidence all block publication.
 
-The workflow runs the gates, then the product acceptance route
-(`scripts/macos-acceptance.sh --route product`), validates the checked-in host evidence
-(`scripts/validate-release-evidence.sh`), builds and packages the release
-(`scripts/package-release.sh`), and smoke-tests the packaged archive
-(`scripts/release-smoke.sh`, which checks the exact file set and executes the extracted
-executable). The toolchains prepared on the runner, and therefore the accepted versions in
-evidence rows, are rust-analyzer 1.98.1 (from the pinned Rust toolchain), pyright 1.1.413,
+The toolchains prepared on the runner, and therefore the accepted versions in evidence rows, are
+rust-analyzer 1.98.1 (from the pinned Rust toolchain), pyright 1.1.413,
 typescript-language-server 6.0.0, TypeScript 5.9.3, and Node 24.4.0
 (`.github/workflows/release.yml`). Raising the pinned rust-analyzer also means recording the
 lexical outline corpus again with the new build
 (`node crates/agent-ide-lang-rust/tests/fixtures/lexical/record.mjs "$AGENT_IDE_RUST_ANALYZER"`,
 which writes its version to `VERSION` there) and keeping the corpus test green: the outline Rust
-answers from while rust-analyzer loads must equal that build's document symbols. After the smoke test the workflow generates one
-`SHA256SUMS`, attests build provenance for it (`actions/attest-build-provenance`; GitHub keeps
-attestations for public repositories only, so the step is skipped while this repository is
-private), and publishes the tarball, `install.sh`, and `SHA256SUMS` to the GitHub Release only
-after every
-required job succeeds. A failed run leaves no public partial release. Tags are immutable;
-corrections ship as a new patch version.
+answers from while rust-analyzer loads must equal that build's document symbols. A failed run
+leaves no public partial release.

@@ -3,19 +3,30 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Exercises the build job (gate, package, verify, packaged-executable acceptance, manifest) on
+  # any ref before tagging; a dispatch never publishes.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run only the build job; nothing is published"
+        type: boolean
+        default: true
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  release:
+  build:
     runs-on: macos-26
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      # Reads this run's workflow id for the release manifest.
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -24,15 +35,23 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24.4.0"
-      - name: Verify tag and runner
+      - name: Verify tag, versions and runner
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           test "$(uname -m)" = arm64
-          version="${GITHUB_REF_NAME#v}"
-          manifest_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "agent-ide") | .version')"
-          test "$version" = "$manifest_version"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "agent-ide") | .version')"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            test "$GITHUB_REF_TYPE" = tag
+            test "$GITHUB_REF_NAME" = "v$version"
+          else
+            test "$DRY_RUN" = true
+          fi
           test "$version" = "$(jq -r .version .codex-plugin/plugin.json)"
           test "$version" = "$(jq -r .version .claude-plugin/plugin.json)"
           test "$version" = "$(jq -r .plugins[0].version .claude-plugin/marketplace.json)"
+          echo "RELEASE_TAG=v$version" >> "$GITHUB_ENV"
+          echo "PAYLOAD=$RUNNER_TEMP/payload" >> "$GITHUB_ENV"
       - name: Prepare accepted toolchains
         run: |
           rustup component add rustfmt clippy rust-analyzer rust-src
@@ -45,38 +64,79 @@ jobs:
           echo "AGENT_IDE_PYRIGHT=$(command -v pyright-langserver)" >> "$GITHUB_ENV"
           echo "AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER=$npm_root/typescript-language-server/lib/cli.mjs" >> "$GITHUB_ENV"
           echo "AGENT_IDE_TSSERVER=$npm_root/typescript/lib/tsserver.js" >> "$GITHUB_ENV"
-      - name: Run complete quality gates
-        # Go and gopls are outside the v0.6.9 release scope: the runner installs no Go toolchain,
-        # so the workspace gate skips exactly the three real-gopls toolchain contracts by name and
-        # still runs every other workspace test.
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+      - name: Run the complete gate
+        # Go and gopls are outside the release scope: the runner installs no Go toolchain and the
+        # gate skips exactly the three real-gopls toolchain contracts by name. The gate ends with
+        # the one release build of target/release/agent-ide that is packaged below.
+        run: cargo xtask check
+      - name: Package and verify the exact payload
         run: |
-          cargo fmt --all --check
-          cargo test --locked --workspace -- --test-threads=1 --skip real_gopls_production_context_tracks_exact_observed_bytes --skip shared_gopls_isolates_divergent_worktrees_and_detaches_one_view --skip dropping_live_gopls_owner_closes_its_owned_listener
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
-      - name: Run candidate product acceptance
-        run: scripts/macos-acceptance.sh --route product --evidence "$RUNNER_TEMP/product-evidence.json"
+          asset="$(cargo xtask package target/release/agent-ide "$RELEASE_TAG" "$PAYLOAD" | tail -n 1)"
+          cargo xtask package verify "$asset"
+          cp install.sh "$PAYLOAD/install.sh"
+          echo "ASSET=$asset" >> "$GITHUB_ENV"
+      - name: Run candidate product acceptance on the packaged executable
+        # The evidence names the archive and its SHA-256; it ships as acceptance.json.
+        run: scripts/macos-acceptance.sh --route product --payload "$ASSET" --evidence "$PAYLOAD/acceptance.json"
       - name: Validate accepted candidate host evidence
         run: scripts/validate-release-evidence.sh "$GITHUB_SHA"
-      - name: Build release executable
-        run: cargo build --locked --release --bin agent-ide
-      - name: Package
+      - name: Resolve the workflow id
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "RELEASE_WORKFLOW_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .workflow_id)" >> "$GITHUB_ENV"
+      - name: Write and verify the release manifest
+        # Writes release-manifest.json and the aggregate SHA256SUMS (bare asset names: the
+        # bootstrap looks the tarball up by its name), then re-verifies the payload against both.
         run: |
-          asset="$(scripts/package-release.sh target/release/agent-ide "$GITHUB_REF_NAME" .)"
-          echo "ASSET=$asset" >> "$GITHUB_ENV"
-      - name: Smoke packaged executable
-        run: scripts/release-smoke.sh "$ASSET"
-      - name: Build the aggregate release checksum manifest
-        # Manifest entries are bare asset names: the bootstrap looks the tarball up by its name.
-        run: shasum -a 256 "$(basename "$ASSET")" install.sh > SHA256SUMS
+          cargo xtask release manifest "$PAYLOAD"
+          cargo xtask package verify "$ASSET"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: payload
+          path: ${{ runner.temp }}/payload/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: macos-26
+    timeout-minutes: 40
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: payload
+          path: ${{ runner.temp }}/payload
+      - name: Build only tooling, without release credentials in its environment
+        run: |
+          cargo fetch --locked
+          cargo build --locked -p xtask
+      - name: Verify hashes before giving the payload executable permissions
+        run: |
+          target/debug/xtask package verify "$RUNNER_TEMP/payload/agent-ide-$GITHUB_REF_NAME-aarch64-apple-darwin.tar.gz"
+          chmod 755 "$RUNNER_TEMP/payload/install.sh"
       - name: Attest build provenance
         # GitHub keeps attestations for public repositories only ("Feature not available for
         # user-owned private repositories"); the step returns once the repository is public.
         if: ${{ !github.event.repository.private }}
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-checksums: SHA256SUMS
-      - name: Publish GitHub Release
+          subject-checksums: ${{ runner.temp }}/payload/SHA256SUMS
+      - name: Publish a complete draft, verify it, then make it visible
+        # Refuses an existing release or draft for the tag; a failure after the draft exists
+        # leaves it unpublished for inspection.
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" "$ASSET" install.sh SHA256SUMS --verify-tag --generate-notes --title "Agent IDE $GITHUB_REF_NAME"
+        run: target/debug/xtask release publish "$RUNNER_TEMP/payload"
+      # Configure required reviewers on the `release` environment; naming it here alone does not.

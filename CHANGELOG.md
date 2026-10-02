@@ -13,9 +13,23 @@
   (`cargo xtask check`, `standard check`, `contract check|update`), the
   exported `schemas/tools.json` tool-contract snapshot with drift tests, and
   SHA-pinned actions with concurrency groups in both workflows.
+- The family release flow: `cargo xtask package` (byte-identical to the
+  former shell packager) and `package verify` (the release smoke test plus
+  the manifest binding), `release prepare` (local version/CHANGELOG edits,
+  preview by default), `release manifest`, `release publish` (draft → verify
+  → publish, never overwriting) and `release wait` (REL-02 observer, wrapped
+  by `scripts/wait-release.sh`). Releases gain the `release-manifest.json`
+  and `acceptance.json` assets; the CI product acceptance runs on the
+  packaged executable and names the archive's SHA-256.
 
 ### Changed
 
+- The release workflow is split into a read-only build job and a tag-only
+  publish job (`release` environment); `workflow_dispatch` with `dry_run`
+  exercises the build job on any ref. `scripts/package-release.sh` and
+  `scripts/release-smoke.sh` are thin wrappers over the xtask commands, and
+  `xtask` carries its own version (0.1.0) so a release bump touches only the
+  `agent-ide*` packages.
 - `initialize` names the product: `serverInfo` is `agent-ide` with its
   version and title `Agent IDE` (it used to report the rmcp SDK).
 - Every tool carries truthful MCP annotations: the read tools are read-only,
