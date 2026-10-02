@@ -28,6 +28,12 @@ Run it with a new evidence path outside the repository, for example:
 scripts/macos-acceptance.sh --route product --evidence /absolute/output/evidence.json
 ```
 
+`--payload /absolute/agent-ide-vX.Y.Z-aarch64-apple-darwin.tar.gz` (product route only) runs the
+same gates against the executable extracted from that exact release archive — the product tests
+read `AGENT_IDE_PRODUCT_BINARY` instead of Cargo's build — and adds
+`"payload": {"name": …, "sha256": …}` to the evidence. The release workflow uses it so the CI
+evidence names the archive digest it shipped; the checked-in host evidence never carries it.
+
 ## Real host drivers
 
 The `codex`, `claude`, `agent-run-claude`, and `agent-run-codex` routes accept an optional absolute `--driver`

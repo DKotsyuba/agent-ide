@@ -32,6 +32,7 @@ fn evidence_schema_is_closed_and_privacy_explicit() {
         fields,
         BTreeSet::from([
             "host",
+            "payload",
             "platform",
             "privacy",
             "revision",
@@ -42,12 +43,26 @@ fn evidence_schema_is_closed_and_privacy_explicit() {
             "toolchains",
         ])
     );
-    for boundary in ["platform", "host", "toolchains", "scenarios", "privacy"] {
+    for boundary in [
+        "platform",
+        "host",
+        "payload",
+        "toolchains",
+        "scenarios",
+        "privacy",
+    ] {
         assert_eq!(
             schema["properties"][boundary]["additionalProperties"],
             false
         );
     }
+    // The payload binding is optional: checked-in host evidence never carries it.
+    assert!(
+        !schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::from("payload"))
+    );
     let privacy = schema["properties"]["privacy"]["properties"]
         .as_object()
         .unwrap();
@@ -108,6 +123,9 @@ fn runner_covers_all_cells_without_embedding_private_run_identifiers() {
         )
     );
     assert!(runner.contains("ACCEPTANCE_MAX_EVIDENCE_BYTES=16384"));
+    // The optional payload binding is product-only and runs the archive's own executable.
+    assert!(runner.contains("export AGENT_IDE_PRODUCT_BINARY"));
+    assert!(runner.contains("'only the product route accepts a payload'"));
     for forbidden in ["run_id", "session_id", "thread_id", "transcript"] {
         assert!(!runner.contains(forbidden));
     }

@@ -6,6 +6,8 @@ set -eu
 ACCEPTANCE_ROUTE=product
 ACCEPTANCE_EVIDENCE=
 ACCEPTANCE_DRIVER=
+ACCEPTANCE_PAYLOAD=
+ACCEPTANCE_PAYLOAD_JSON=
 ACCEPTANCE_SCHEMA=agent-ide.macos-acceptance.v1
 ACCEPTANCE_MAX_EVIDENCE_BYTES=16384
 ACCEPTANCE_TMP=
@@ -23,7 +25,7 @@ ACCEPTANCE_TYPESCRIPT_VERSION=not_tested
 # Prints the closed command-line interface. It performs no filesystem or process mutation.
 usage() {
     printf '%s\n' \
-        'usage: scripts/macos-acceptance.sh --evidence ABSOLUTE_PATH [--route product|codex|claude|agent-run-claude|agent-run-codex] [--driver ABSOLUTE_EXECUTABLE]'
+        'usage: scripts/macos-acceptance.sh --evidence ABSOLUTE_PATH [--route product|codex|claude|agent-run-claude|agent-run-codex] [--driver ABSOLUTE_EXECUTABLE] [--payload ABSOLUTE_RELEASE_ARCHIVE]'
 }
 
 # Rejects an empty, oversized, or non-public token before it can enter JSON evidence.
@@ -266,6 +268,7 @@ write_evidence() {
         "  \"status\": \"$1\"," \
         "  \"platform\": {\"os\": \"$ACCEPTANCE_OS\", \"version\": \"$ACCEPTANCE_OS_VERSION\", \"architecture\": \"$ACCEPTANCE_ARCH\"}," \
         "  \"host\": {\"version\": \"$ACCEPTANCE_HOST_VERSION\"}," \
+        ${ACCEPTANCE_PAYLOAD_JSON:+"$ACCEPTANCE_PAYLOAD_JSON"} \
         "  \"toolchains\": {\"go\": \"$ACCEPTANCE_GO_VERSION\", \"gopls\": \"$ACCEPTANCE_GOPLS_VERSION\", \"rust\": \"$ACCEPTANCE_RUST_VERSION\", \"rust_analyzer\": \"$ACCEPTANCE_RUST_ANALYZER_VERSION\", \"node\": \"$ACCEPTANCE_NODE_VERSION\", \"pyright\": \"$ACCEPTANCE_PYRIGHT_VERSION\", \"typescript_language_server\": \"$ACCEPTANCE_TYPESCRIPT_LANGUAGE_SERVER_VERSION\", \"typescript\": \"$ACCEPTANCE_TYPESCRIPT_VERSION\"}," \
         "  \"scenarios\": {\"edit_diagnostic_loop\": \"$2\", \"stale_edit_zero_write\": \"$2\", \"native_fallback\": \"$2\", \"telemetry_restart_query_export\": \"$2\", \"compact_content\": \"$2\", \"python_provider\": \"$2\", \"typescript_r3\": \"$2\", \"divergent_worktrees\": \"$2\"}," \
         '  "privacy": {"source": false, "prompts": false, "credentials": false, "commands": false, "paths": false, "diagnostic_messages": false, "private_ids": false}' \
@@ -288,6 +291,11 @@ while [ "$#" -gt 0 ]; do
         --driver)
             [ "$#" -ge 2 ] || { usage >&2; exit 2; }
             ACCEPTANCE_DRIVER=$2
+            shift 2
+            ;;
+        --payload)
+            [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+            ACCEPTANCE_PAYLOAD=$2
             shift 2
             ;;
         --help)
@@ -377,6 +385,24 @@ create_fixture "$ACCEPTANCE_RIGHT" right
 cd "$ACCEPTANCE_ROOT"
 if [ "$ACCEPTANCE_ROUTE" = product ]; then
     [ -z "$ACCEPTANCE_DRIVER" ] || { printf '%s\n' 'product route does not accept a driver' >&2; exit 2; }
+    # With --payload the gates run the executable extracted from that exact release archive (the
+    # tests read AGENT_IDE_PRODUCT_BINARY) and the evidence names the archive and its SHA-256.
+    if [ -n "$ACCEPTANCE_PAYLOAD" ]; then
+        require_file payload "$ACCEPTANCE_PAYLOAD" readable || exit 2
+        ACCEPTANCE_PAYLOAD_NAME=$(basename "$ACCEPTANCE_PAYLOAD")
+        safe_token "$ACCEPTANCE_PAYLOAD_NAME" || exit 2
+        case "$ACCEPTANCE_PAYLOAD_NAME" in
+            agent-ide-v*-aarch64-apple-darwin.tar.gz) ;;
+            *) printf '%s\n' 'payload is not a release archive' >&2; exit 2 ;;
+        esac
+        ACCEPTANCE_PAYLOAD_SHA256=$(shasum -a 256 "$ACCEPTANCE_PAYLOAD" | awk '{print $1}')
+        mkdir "$ACCEPTANCE_TMP/payload"
+        tar -xzf "$ACCEPTANCE_PAYLOAD" -C "$ACCEPTANCE_TMP/payload"
+        AGENT_IDE_PRODUCT_BINARY="$ACCEPTANCE_TMP/payload/${ACCEPTANCE_PAYLOAD_NAME%-aarch64-apple-darwin.tar.gz}/agent-ide"
+        require_file payload-executable "$AGENT_IDE_PRODUCT_BINARY" executable || exit 2
+        export AGENT_IDE_PRODUCT_BINARY
+        ACCEPTANCE_PAYLOAD_JSON="  \"payload\": {\"name\": \"$ACCEPTANCE_PAYLOAD_NAME\", \"sha256\": \"$ACCEPTANCE_PAYLOAD_SHA256\"},"
+    fi
     ACCEPTANCE_HOST_VERSION=product-contract
     if run_product_gates; then
         write_evidence product_pass product_pass
@@ -384,6 +410,9 @@ if [ "$ACCEPTANCE_ROUTE" = product ]; then
         write_evidence failed failed
         exit 1
     fi
+elif [ -n "$ACCEPTANCE_PAYLOAD" ]; then
+    printf '%s\n' 'only the product route accepts a payload' >&2
+    exit 2
 elif [ -z "$ACCEPTANCE_DRIVER" ]; then
     ACCEPTANCE_HOST_VERSION=not_tested
     write_evidence not_tested not_tested

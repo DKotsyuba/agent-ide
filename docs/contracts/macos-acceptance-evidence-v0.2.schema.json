@@ -20,6 +20,16 @@
         "architecture": {"enum": ["arm64", "x86_64", "other"]}
       }
     },
+    "payload": {
+      "description": "Optional, product route with --payload only: the release archive whose packaged executable ran the gates.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "sha256"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^agent-ide-v[0-9A-Za-z.+-]+-aarch64-apple-darwin\\.tar\\.gz$"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
     "host": {
       "type": "object",
       "additionalProperties": false,

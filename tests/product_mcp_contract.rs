@@ -18,6 +18,15 @@ use tokio::{
     process::{Child, ChildStdin, ChildStdout, Command},
 };
 
+/// The executable under test: `AGENT_IDE_PRODUCT_BINARY` when set — the release workflow points
+/// it at the executable extracted from the packaged archive — otherwise Cargo's build.
+fn product_binary() -> PathBuf {
+    std::env::var_os("AGENT_IDE_PRODUCT_BINARY").map_or_else(
+        || PathBuf::from(env!("CARGO_BIN_EXE_agent-ide")),
+        PathBuf::from,
+    )
+}
+
 /// Distinguishes temporary endpoints across concurrently running scenarios in this process.
 static NEXT_RUNTIME: AtomicUsize = AtomicUsize::new(0);
 /// Serializes tests that assert global managed-Codex runtime-directory counts.
@@ -60,7 +69,7 @@ struct Mcp {
 impl Mcp {
     /// Starts and initializes the shipping binary, also returning the initialize response.
     async fn start_observed(runtime: &Path, attachment: Option<&str>) -> (Self, Value) {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+        let mut command = Command::new(product_binary());
         command.env("TOKIO_WORKER_THREADS", "1");
         command
             .args(["mcp", "--runtime-dir"])
@@ -137,7 +146,7 @@ impl Mcp {
         rendezvous_root: Option<&Path>,
         seam: Option<(&str, &str)>,
     ) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+        let mut command = Command::new(product_binary());
         command
             .env("TOKIO_WORKER_THREADS", "1")
             .env_remove("CLAUDE_PROJECT_DIR")
@@ -183,7 +192,7 @@ impl Mcp {
         project: &Path,
         seam: Option<(&str, &str)>,
     ) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+        let mut command = Command::new(product_binary());
         command
             .env("TOKIO_WORKER_THREADS", "1")
             .env("CLAUDE_PROJECT_DIR", project)
@@ -222,7 +231,7 @@ impl Mcp {
         cwd: &Path,
         evidence: &[(&str, &str)],
     ) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+        let mut command = Command::new(product_binary());
         command
             .env("TOKIO_WORKER_THREADS", "1")
             .env_remove("CLAUDE_PROJECT_DIR")
@@ -557,7 +566,7 @@ fn metadata(call: usize) -> Value {
 async fn binary_rejects_invalid_launcher_attachments_before_serving() {
     let runtime = runtime();
     for attachment in [String::new(), "x".repeat(129)] {
-        let output = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        let output = Command::new(product_binary())
             .args(["mcp", "--runtime-dir"])
             .arg(&runtime)
             .env("AGENT_IDE_HOST_ATTACHMENT", attachment)
@@ -776,7 +785,7 @@ async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
 #[tokio::test]
 async fn binary_routes_methods_to_typed_missing_peer_and_survives_daemon_loss() {
     let runtime = runtime();
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+    let mut daemon = Command::new(product_binary())
         .args(["daemon", "--runtime-dir"])
         .arg(&runtime)
         .stdin(Stdio::null())
@@ -870,7 +879,7 @@ async fn binary_routes_methods_to_typed_missing_peer_and_survives_daemon_loss() 
 
 /// Starts the real hook process; callers own stdin closure and bounded completion checks.
 fn hook_process(runtime: &Path, attachment: Option<&str>) -> Child {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+    let mut command = Command::new(product_binary());
     // Bound fixture thread creation so the wall-clock deadline measures ingress, not CPU-sized pools.
     command.env("TOKIO_WORKER_THREADS", "1");
     command
@@ -889,7 +898,7 @@ fn hook_process(runtime: &Path, attachment: Option<&str>) -> Child {
 
 /// Starts the real Claude hook mode with the same bounded environment as [`hook_process`].
 fn claude_hook_process(runtime: &Path, attachment: Option<&str>) -> Child {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+    let mut command = Command::new(product_binary());
     command.env("TOKIO_WORKER_THREADS", "1");
     command
         .args(["claude-hook", "--runtime-dir"])
@@ -907,7 +916,7 @@ fn claude_hook_process(runtime: &Path, attachment: Option<&str>) -> Child {
 
 /// Starts the argument-free managed Claude hook with no caller-selected runtime or attachment.
 fn managed_claude_hook_process(project: Option<&Path>) -> Child {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+    let mut command = Command::new(product_binary());
     command
         .env("TOKIO_WORKER_THREADS", "1")
         .env_remove("CLAUDE_PROJECT_DIR")
@@ -1016,7 +1025,7 @@ fn fixture_runtime(base: &Path) -> (PathBuf, tokio::net::UnixListener) {
 
 /// Starts the real managed Codex hook: no runtime dir, no credential; discovery via the test root.
 fn managed_codex_hook_process(root: &Path, decoy_attachment: Option<&str>) -> Child {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+    let mut command = Command::new(product_binary());
     command.env("TOKIO_WORKER_THREADS", "1");
     command
         .args(["codex-hook", "--managed"])
@@ -1659,7 +1668,7 @@ async fn binary_managed_codex_hook_stalled_discovery_exits_within_the_deadline()
     let payload = json!({"hook_event_name":"PostToolUse","session_id":"root-session-1",
         "agent_id":"actor-1","tool_use_id":"call-1","tool_name":"Bash"});
     let started = std::time::Instant::now();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+    let mut command = Command::new(product_binary());
     command
         .env("TOKIO_WORKER_THREADS", "1")
         .args(["codex-hook", "--managed"])
@@ -1694,7 +1703,7 @@ async fn binary_managed_codex_hook_stalled_discovery_exits_within_the_deadline()
 /// `codex-hooks print` emits only the §6 JSON fragment for the running executable.
 #[tokio::test]
 async fn binary_codex_hooks_print_emits_only_the_managed_fragment() {
-    let output = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+    let output = Command::new(product_binary())
         .args(["codex-hooks", "print"])
         .env_remove("AGENT_IDE_CODEX_RENDEZVOUS_ROOT")
         .output()
@@ -1702,7 +1711,7 @@ async fn binary_codex_hooks_print_emits_only_the_managed_fragment() {
         .unwrap();
     assert!(output.status.success() && output.stderr.is_empty());
     let rendered: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let executable = std::fs::canonicalize(env!("CARGO_BIN_EXE_agent-ide")).unwrap();
+    let executable = std::fs::canonicalize(product_binary()).unwrap();
     let command = format!("{} codex-hook --managed", shell_quote_for_test(&executable));
     assert_eq!(
         rendered,
@@ -1814,7 +1823,7 @@ async fn telemetry_cli_continues_after_first_page_and_never_invents_drops() {
     transaction.commit().unwrap();
     drop(connection);
 
-    let first = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+    let first = Command::new(product_binary())
         .args(["telemetry", "query", "--database"])
         .arg(&database)
         .output()
@@ -1830,7 +1839,7 @@ async fn telemetry_cli_continues_after_first_page_and_never_invents_drops() {
     assert_eq!(first["next_cursor"], 1_000);
     assert_eq!(first["dropped"], Value::Null);
 
-    let second = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+    let second = Command::new(product_binary())
         .args(["telemetry", "query", "--database"])
         .arg(&database)
         .args(["--cursor", "1000"])
@@ -1842,7 +1851,7 @@ async fn telemetry_cli_continues_after_first_page_and_never_invents_drops() {
     assert_eq!(second["rows"].as_array().unwrap().len(), 1);
     assert_eq!(second["rows"][0]["sequence"], 1_001);
 
-    let export = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+    let export = Command::new(product_binary())
         .args(["telemetry", "export", "--database"])
         .arg(&database)
         .output()
@@ -2059,7 +2068,7 @@ async fn configured_daemon_opens_workspace_once_after_exclusive_lock() {
     let runtime = runtime();
     let config = runtime.with_extension("json");
     std::fs::write(&config,json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[]}).to_string()).unwrap();
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+    let mut daemon = Command::new(product_binary())
         .args(["daemon", "--runtime-dir"])
         .arg(&runtime)
         .env("AGENT_IDE_LAUNCHER_CONFIG", &config)
@@ -2090,7 +2099,7 @@ async fn configured_daemon_opens_workspace_once_after_exclusive_lock() {
         })
         .unwrap();
     assert_eq!(boot, 1);
-    let rejected = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+    let rejected = Command::new(product_binary())
         .args(["daemon", "--runtime-dir"])
         .arg(&runtime)
         .env("AGENT_IDE_LAUNCHER_CONFIG", &config)
@@ -2311,7 +2320,7 @@ impl ProductFixture {
         startup_timeout: Duration,
         substitute_home: Option<&Path>,
     ) -> Child {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+        let mut command = Command::new(product_binary());
         if let Some(home) = home {
             command.env(agent_ide::userhome::HOME_OVERRIDE_ENV, home);
         }
@@ -3861,7 +3870,7 @@ async fn managed_claude_hook_distinguishes_input_timeout_and_oversize() {
     std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
     let project = std::fs::canonicalize(project).unwrap();
     let launch = || {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
+        let mut command = Command::new(product_binary());
         command
             .arg("claude-hook")
             .env("AGENT_IDE_HOME", &home)
@@ -12078,7 +12087,7 @@ async fn configured_product_acceptance_edit_diagnostics_telemetry_and_fallback()
     );
 
     let telemetry = fixture.telemetry.clone();
-    let query = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+    let query = Command::new(product_binary())
         .args(["telemetry", "query", "--database"])
         .arg(&telemetry)
         .args(["--tag", "tool_completed"])
@@ -12101,7 +12110,7 @@ async fn configured_product_acceptance_edit_diagnostics_telemetry_and_fallback()
         })
     );
 
-    let export = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+    let export = Command::new(product_binary())
         .args(["telemetry", "export", "--database"])
         .arg(&telemetry)
         .args(["--tag", "tool_completed"])
@@ -14281,7 +14290,7 @@ async fn configured_product_rejects_changed_executable_before_opening_workspace(
     std::fs::write(&fixture.config, config.to_string()).unwrap();
     let output = tokio::time::timeout(
         Duration::from_secs(5),
-        Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        Command::new(product_binary())
             .args(["daemon", "--runtime-dir"])
             .arg(&fixture.runtime)
             .env("AGENT_IDE_LAUNCHER_CONFIG", &fixture.config)
@@ -15688,7 +15697,7 @@ fn release_checks_gate(fixture: &ProductFixture) {
 
 /// Counts completed project-check telemetry rows in one daemon's own database; 0 when absent.
 async fn completed_check_count(database: &Path) -> usize {
-    let Ok(output) = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+    let Ok(output) = Command::new(product_binary())
         .args(["telemetry", "query", "--database"])
         .arg(database)
         .args(["--tag", "project_check_completed"])
@@ -15868,7 +15877,7 @@ async fn eyes_claude_post_hook_delivers_problem_block_and_delta() {
     // Each completed check records one bucketed telemetry event without paths or messages.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let query = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        let query = Command::new(product_binary())
             .args(["telemetry", "query", "--database"])
             .arg(fixture.runtime.join("telemetry.sqlite"))
             .args(["--tag", "project_check_completed"])
