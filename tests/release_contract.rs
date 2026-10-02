@@ -88,6 +88,80 @@ fn release_workflow_requires_complete_gates_before_publication() {
     assert!(!workflow.contains("AGENT_IDE_GO"));
 }
 
+/// Pins the CI workflow to SHA-pinned actions, the serialized PR gate, the fetch-before-gate
+/// phase, the supply-chain job, and the xtask gate's exact rule set, so no former inline gate
+/// rule is silently dropped by the delegation to `cargo run --package xtask -- check`.
+#[test]
+fn ci_workflow_runs_the_xtask_gate_and_supply_chain_job() {
+    let workflow = include_str!("../.github/workflows/ci.yml");
+    for requirement in [
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+        "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0",
+        "node-version: \"24.4.0\"",
+        "test \"$(uname -m)\" = arm64",
+        "rustup component add rustfmt clippy rust-analyzer rust-src",
+        "pyright@1.1.413",
+        "typescript-language-server@6.0.0",
+        "typescript@5.9.3",
+        "AGENT_IDE_RUST_ANALYZER=",
+        "AGENT_IDE_RUST_TOOLCHAIN_DIR=",
+        "AGENT_IDE_PYRIGHT=",
+        "AGENT_IDE_NODE=",
+        "AGENT_IDE_TSSERVER=",
+        "AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER=",
+        "cargo fetch --locked",
+        "cargo xtask check",
+        "cancel-in-progress: true",
+        "cargo install cargo-deny --version 0.20.2 --locked",
+        "cargo deny --locked check",
+    ] {
+        assert!(
+            workflow.contains(requirement),
+            "missing CI requirement: {requirement}"
+        );
+    }
+    assert_eq!(
+        workflow.matches("persist-credentials: false").count(),
+        2,
+        "both jobs must check out without persisting credentials"
+    );
+    assert!(!workflow.contains("@v4"), "no unpinned action references");
+    let release = include_str!("../.github/workflows/release.yml");
+    for requirement in [
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+        "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0",
+        "cancel-in-progress: false",
+    ] {
+        assert!(
+            release.contains(requirement),
+            "missing release workflow requirement: {requirement}"
+        );
+    }
+    assert!(!release.contains("@v4"), "no unpinned action references");
+    let xtask = include_str!("../xtask/src/main.rs");
+    for rule in [
+        "\"fmt\", \"--all\", \"--check\"",
+        "\"test\", \"--locked\", \"--workspace\", \"--no-fail-fast\"",
+        "--test-threads=1",
+        "real_gopls_production_context_tracks_exact_observed_bytes",
+        "shared_gopls_isolates_divergent_worktrees_and_detaches_one_view",
+        "dropping_live_gopls_owner_closes_its_owned_listener",
+        "configured_product_rust_resolves_definition_across_a_crate_boundary",
+        "configured_product_returns_real_typescript_family_context_and_reaps",
+        "configured_product_returns_real_pyright_semantic_context_and_reaps",
+        "configured_product_claude_returns_real_pyright_semantic_context_diff_and_stop",
+        "--ignored",
+        "--nocapture",
+        "\"clippy\"",
+        "\"--all-targets\"",
+        "-D warnings",
+        "\"doc\", \"--locked\", \"--workspace\", \"--no-deps\"",
+        "\"build\", \"--locked\", \"--release\", \"--bin\", \"agent-ide\"",
+    ] {
+        assert!(xtask.contains(rule), "missing xtask gate rule: {rule}");
+    }
+}
+
 /// Pins the publication evidence gate to all five complete macOS arm64 candidate rows carrying
 /// the accepted Rust, Python, and TypeScript/JavaScript toolchain versions with honestly
 /// `not_tested` Go/gopls rows, while rejecting partial scenario values, mixed revisions, and

@@ -8,12 +8,18 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24.4.0"
       - name: Verify runner
@@ -30,12 +36,19 @@ jobs:
           echo "AGENT_IDE_NODE=$(command -v node)" >> "$GITHUB_ENV"
           echo "AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER=$npm_root/typescript-language-server/lib/cli.mjs" >> "$GITHUB_ENV"
           echo "AGENT_IDE_TSSERVER=$npm_root/typescript/lib/tsserver.js" >> "$GITHUB_ENV"
-      - run: cargo fmt --check
-      - run: cargo test --locked --workspace -- --test-threads=1 --skip real_gopls_production_context_tracks_exact_observed_bytes --skip shared_gopls_isolates_divergent_worktrees_and_detaches_one_view --skip dropping_live_gopls_owner_closes_its_owned_listener
-      - run: cargo test --locked --test product_mcp_contract configured_product_rust_resolves_definition_across_a_crate_boundary -- --ignored --nocapture --test-threads=1
-      - run: cargo test --locked --test product_mcp_contract configured_product_returns_real_typescript_family_context_and_reaps -- --ignored --nocapture --test-threads=1
-      - run: cargo test --locked --test product_mcp_contract configured_product_returns_real_pyright_semantic_context_and_reaps -- --ignored --nocapture --test-threads=1
-      - run: cargo test --locked --test product_mcp_contract configured_product_claude_helper_returns_real_pyright_semantic_context_diff_and_stop -- --ignored --nocapture --test-threads=1
-      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
-      - run: cargo build --locked --release --bin agent-ide
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+      - name: Gate
+        # The xtask gate is the exact former inline gate — fmt, the locked workspace tests with
+        # --test-threads=1 and the three named gopls skips, the four ignored provider tests,
+        # clippy -D warnings, rustdoc -D warnings, the release build — with --no-fail-fast,
+        # plus the family standard and contract-snapshot checks.
+        run: cargo xtask check
+  dependencies:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo install cargo-deny --version 0.20.2 --locked
+      - run: cargo deny --locked check
