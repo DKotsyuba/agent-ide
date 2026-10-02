@@ -1,8 +1,12 @@
 //! Development automation for Agent IDE: one gate (`check`), the declarative
-//! family standard checks (`standard check`) and the exported tool-contract
-//! snapshot (`contract check|update`). Std and `serde_json` only — no remote
-//! writes, no runtime interpreter.
+//! family standard checks (`standard check`), the exported tool-contract
+//! snapshot (`contract check|update`) and the release flow (`package`,
+//! `package verify`, `release prepare|manifest|publish|wait`, see `release.rs`).
+//! Std and `serde_json` only — no runtime interpreter; the only remote writes
+//! are `release publish` inside the release workflow.
 #![allow(clippy::print_stdout, reason = "Developer CLI, not MCP")]
+mod release;
+
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
@@ -428,7 +432,10 @@ fn contract(root: &Path, update: bool) -> Result<()> {
 }
 
 fn usage() -> &'static str {
-    "usage: cargo xtask check | standard check | contract check|update"
+    "usage: cargo xtask check | standard check | contract check|update
+       | package BINARY TAG [OUTPUT_DIR] | package verify ARCHIVE
+       | release prepare VERSION [--apply] | release manifest DIR | release publish DIR
+       | release wait --repo OWNER/NAME --tag vX.Y.Z --commit SHA [--run-id N] [--timeout S] [--result-file PATH]"
 }
 
 fn main_result() -> Result<()> {
@@ -439,6 +446,35 @@ fn main_result() -> Result<()> {
         [task, sub] if task == "standard" && sub == "check" => standard(&root),
         [task, sub] if task == "contract" && sub == "check" => contract(&root, false),
         [task, sub] if task == "contract" && sub == "update" => contract(&root, true),
+        [task, sub, asset] if task == "package" && sub == "verify" => {
+            release::verify(Path::new(asset))
+        }
+        [task, binary, tag, rest @ ..] if task == "package" && rest.len() <= 1 => {
+            let output = rest.first().map_or_else(
+                || target_dir(&root).join("package").join(tag),
+                PathBuf::from,
+            );
+            release::package(&root, Path::new(binary), tag, &output).map(|_| ())
+        }
+        [task, sub, version, rest @ ..]
+            if task == "release" && sub == "prepare" && rest.len() <= 1 =>
+        {
+            let apply = match rest {
+                [] => false,
+                [flag] if flag == "--apply" => true,
+                _ => return Err(usage().into()),
+            };
+            release::prepare(&root, version, apply, &release::today()?)
+        }
+        [task, sub, dir] if task == "release" && sub == "manifest" => {
+            release::manifest(&root, Path::new(dir))
+        }
+        [task, sub, dir] if task == "release" && sub == "publish" => {
+            release::publish_from_env(&root, Path::new(dir))
+        }
+        [task, sub, rest @ ..] if task == "release" && sub == "wait" => {
+            release::wait(Path::new("gh"), &release::wait_args(&root, rest)?)
+        }
         _ => Err(usage().into()),
     }
 }
