@@ -853,6 +853,13 @@ fn bump_lock(source: &str, from: &str, to: &str) -> (String, Vec<String>) {
 /// plugin manifests, the `agent-ide*` Cargo.lock entries and the CHANGELOG heading. Never commits,
 /// tags or pushes; `--apply` requires a clean checkout and ends with a locked metadata check.
 pub fn prepare(root: &Path, version: &str, apply: bool, date: &str) -> Result<()> {
+    if version.contains('-') {
+        return Err(
+            "agent-ide versions are MAJOR.MINOR.PATCH: self-install refuses pre-release \
+                    versions (docs/qualification.md)"
+                .into(),
+        );
+    }
     let old = workspace_version(root)?;
     let (Some(new_key), Some(old_key)) = (version_key(version), version_key(&old)) else {
         return Err("version must be MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-rc.N".into());
@@ -1409,6 +1416,17 @@ esac
             );
         }
         Ok(json!({"draft": draft, "prerelease": false, "assets": assets}))
+    }
+
+    #[test]
+    fn prepare_refuses_pre_release_versions_before_touching_the_checkout() {
+        let refused = prepare(Path::new("/nonexistent"), "0.7.1-rc.1", false, "2026-10-02")
+            .expect_err("pre-release refused");
+        assert!(
+            refused
+                .to_string()
+                .contains("self-install refuses pre-release")
+        );
     }
 
     #[test]

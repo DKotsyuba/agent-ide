@@ -69,6 +69,12 @@ qualification evidence.
   the release build job on the packaged executable and its evidence names
   the exact archive SHA-256 (RLS-06 for the product route; host routes stay
   manual).
+- Versions are numeric `MAJOR.MINOR.PATCH` only: self-install, the daemon
+  generation id and the doctor's version listing do not accept pre-release
+  versions, so there is no `-rc.N` release candidate tag (the family release
+  flow starts with one); `cargo xtask release prepare` refuses such a version.
+  The candidate is instead exercised by the `workflow_dispatch` dry run of the
+  release build job before tagging.
 - Delivery is the existing sealed **archive bundle** (binary, plugin tree,
   manifests, hooks, skill, `metadata.json`, `SHA256SUMS`, `COMPLETE`), not
   `single-binary-v1`; `family.toml` records `delivery_profile =
