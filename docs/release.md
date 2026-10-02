@@ -74,7 +74,7 @@ that the configured `command` still names the installer destination.
 Add the tag-pinned marketplace and install its plugin:
 
 ```sh
-claude plugin marketplace add DKotsyuba/agent-ide@v0.7.0
+claude plugin marketplace add DKotsyuba/agent-ide@v0.8.0
 claude plugin install agent-ide@agent-ide
 ```
 

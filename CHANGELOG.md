@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.0 — 2026-10-03
+
 ### Changed
 
 - MCP 2026-07-28 ("modern": no `initialize`; every request carries its
