@@ -58,8 +58,8 @@ struct Mcp {
 }
 
 impl Mcp {
-    /// Starts and initializes the shipping binary, optionally supplying a separate launcher attachment.
-    async fn start(runtime: &Path, attachment: Option<&str>) -> Self {
+    /// Starts and initializes the shipping binary, also returning the initialize response.
+    async fn start_observed(runtime: &Path, attachment: Option<&str>) -> (Self, Value) {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
         command.env("TOKIO_WORKER_THREADS", "1");
         command
@@ -85,7 +85,12 @@ impl Mcp {
         assert!(response.get("result").is_some(), "{response}");
         mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
             .await;
-        mcp
+        (mcp, response)
+    }
+
+    /// Starts and initializes the shipping binary, optionally supplying a separate launcher attachment.
+    async fn start(runtime: &Path, attachment: Option<&str>) -> Self {
+        Self::start_observed(runtime, attachment).await.0
     }
 
     /// Starts the shipping self-contained managed MCP in `candidate` from one launcher template.
@@ -562,6 +567,76 @@ async fn binary_rejects_invalid_launcher_attachments_before_serving() {
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
     }
+    assert!(!runtime.exists());
+}
+
+/// initialize advertises the product identity (not the SDK's) and tools/list carries exactly the
+/// truthful annotation set (MCP-06): every unset hint stays the MCP default, `readOnlyHint` is
+/// claimed only by the read tools, `destructiveHint` only by ide.edit, `idempotentHint` only by
+/// the operations whose durable receipts make a same-argument repeat a no-op, ide.test (arbitrary
+/// project commands) claims no relaxation at all, and nothing claims
+/// an open world.
+#[tokio::test]
+async fn server_identity_and_tool_annotations_are_pinned() {
+    let runtime = runtime();
+    let (mut mcp, initialized) = Mcp::start_observed(&runtime, None).await;
+    assert_eq!(
+        initialized["result"]["serverInfo"],
+        json!({
+            "name": "agent-ide",
+            "title": "Agent IDE",
+            "version": env!("CARGO_PKG_VERSION")
+        })
+    );
+    let discovery = mcp
+        .exchange(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+        .await;
+    let tools = discovery["result"]["tools"].as_array().unwrap();
+    let read_only = json!({"readOnlyHint": true, "openWorldHint": false});
+    let mut expected = std::collections::BTreeMap::from([
+        ("ide.context", read_only.clone()),
+        ("ide.diff", read_only.clone()),
+        ("ide.inspect", read_only.clone()),
+        ("ide.outline", read_only.clone()),
+        ("ide.read", read_only.clone()),
+        ("ide.symbol", read_only.clone()),
+        ("ide.graph", read_only),
+        (
+            "ide.start",
+            json!({
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }),
+        ),
+        (
+            "ide.stop",
+            json!({
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }),
+        ),
+        ("ide.test", json!({"readOnlyHint": false})),
+        (
+            "ide.edit",
+            json!({
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }),
+        ),
+    ]);
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap();
+        let expected = expected.remove(name).unwrap_or_else(|| panic!("{name}"));
+        assert_eq!(tool["annotations"], expected, "{name}");
+    }
+    assert!(expected.is_empty(), "tools missing: {expected:?}");
+    mcp.close().await;
     assert!(!runtime.exists());
 }
 
