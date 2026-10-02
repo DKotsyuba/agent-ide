@@ -2,8 +2,6 @@
 
 ## Unreleased
 
-## 0.7.0-rc.1 — 2026-10-02
-
 ### Added
 
 - The agent-* family shape: `AGENTS.md`/`CLAUDE.md`, this changelog,
