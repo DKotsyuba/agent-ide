@@ -2,6 +2,8 @@
 name = "agent-ide-lang-html"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "HTML for Agent IDE: element outlines and cross-language name facts."
 
@@ -9,5 +11,8 @@ description = "HTML for Agent IDE: element outlines and cross-language name fact
 path = "src/lib.rs"
 
 [dependencies]
-agent-ide-core = { path = "../agent-ide-core" }
-async-lsp = { version = "0.2.4", default-features = false, features = ["omni-trait", "tokio"] }
+agent-ide-core.workspace = true
+async-lsp.workspace = true
+
+[lints]
+workspace = true

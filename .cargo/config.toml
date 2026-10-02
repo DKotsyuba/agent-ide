@@ -2,3 +2,6 @@
 # `~/.agent-ide`: per-user state resolves from `AGENT_IDE_HOME` (see `agent_ide::userhome`).
 [env]
 AGENT_IDE_HOME = { value = "target/test-home", relative = true }
+
+[alias]
+xtask = "run --locked --package xtask --"

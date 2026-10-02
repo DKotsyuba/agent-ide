@@ -2,6 +2,8 @@
 name = "agent-ide-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "Language-independent core of Agent IDE: sessions, providers, checks, tools and storage."
 
@@ -9,17 +11,20 @@ description = "Language-independent core of Agent IDE: sessions, providers, chec
 path = "src/lib.rs"
 
 [dependencies]
-async-lsp = { version = "0.2.4", default-features = false, features = ["omni-trait", "tokio"] }
-blake3 = "1"
-libc = "0.2"
-minijinja = { version = "2.24.0", default-features = false, features = ["serde", "builtins"] }
-rmcp = { version = "3.2.0", features = ["server", "macros", "transport-io"] }
-rusqlite = { version = "0.37", features = ["backup", "bundled"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-util = { version = "0.7", features = ["compat"] }
-tower-service = "0.3"
+async-lsp.workspace = true
+blake3.workspace = true
+libc.workspace = true
+minijinja.workspace = true
+rmcp.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tower-service.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

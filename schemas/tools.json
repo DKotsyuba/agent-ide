@@ -1,0 +1,471 @@
+[
+  {
+    "description": "Bounded source with current diagnostics for one `path`, or with `kind: \"problems\"` the\nproject's latest check results (errors and warnings by file, paged). Use `problems` to\nsee what is broken right now instead of running the build yourself; use `path` before or\nafter editing a file natively.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "byte_offset": {
+          "description": "Continue a truncated source reply from this byte offset.",
+          "maximum": 1048576,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "detail_ref": {
+          "description": "Reference from an earlier reply: continue that result.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "description": "`problems`: the project check results instead of a file.",
+          "enum": [
+            "problems"
+          ],
+          "type": "string"
+        },
+        "language": {
+          "description": "With `problems`: limit to one language.",
+          "enum": [
+            "rust",
+            "python",
+            "typescript"
+          ],
+          "type": "string"
+        },
+        "offset": {
+          "description": "With `problems`: continue from this problem index (see `next_offset`).",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "description": "File relative to the project root; returns its source with diagnostics.",
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.context"
+  },
+  {
+    "description": "Diff of what this task changed in the working tree (`head`, `staged`, `unstaged` or `task`),\npaged. Review it before finishing or handing off, instead of running `git diff` in a\nshell.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "detail_ref": {
+          "description": "Reference from an earlier reply: continue that result.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "mode": {
+          "default": "head",
+          "description": "`head`: everything not yet committed; `staged` / `unstaged`: only that part; `task`: everything changed since activation, including commits.",
+          "enum": [
+            "head",
+            "staged",
+            "unstaged",
+            "task"
+          ],
+          "type": "string"
+        },
+        "provenance": {
+          "default": false,
+          "description": "Return the exact worktree/comparison identity header instead of the compact default; no hashes appear otherwise.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.diff"
+  },
+  {
+    "description": "Edit by symbol: `op` replace / insert / delete / rename on `file#Owner/name` (rename is\nproject-wide), or replace a `path` + `lines` range, or a full-file rewrite based on a\n`source_ref`. Formats the result with the project formatter, runs the project check\n(cargo check, pyright or tsc) and returns this file's errors and warnings in the reply.\nPrefer it over native edit/write for source: no line matching, no separate check step.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "changes": {
+          "items": {
+            "additionalProperties": false,
+            "description": "1–32 changes to ONE file (named by `path`), each addressed by exactly one of `lines`, `symbol` or `old`; every address resolves against the bytes `source_ref` names before anything is applied, and overlapping or unmatched addresses are refused together with nothing written. `lines` numbers are that version's, never shifted by other changes (empty `content` deletes the range); `old` must match exactly once (add `within` to scope it) and `new` replaces exactly the matched bytes, terminators included (`\"\"` deletes the match).",
+            "properties": {
+              "content": {
+                "type": "string"
+              },
+              "lines": {
+                "pattern": "^[0-9]+-[0-9]+$",
+                "type": "string"
+              },
+              "new": {
+                "type": "string"
+              },
+              "old": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "op": {
+                "enum": [
+                  "replace",
+                  "insert",
+                  "delete"
+                ],
+                "type": "string"
+              },
+              "symbol": {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              "where": {
+                "enum": [
+                  "before",
+                  "after",
+                  "first",
+                  "last"
+                ],
+                "type": "string"
+              },
+              "within": {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "type": "array"
+        },
+        "content": {
+          "description": "Replacement or inserted code, including the symbol's doc comment and attributes.",
+          "maxLength": 131072,
+          "type": "string"
+        },
+        "lines": {
+          "description": "With `path`: inclusive 1-based line range to replace.",
+          "pattern": "^[0-9]+-[0-9]+$",
+          "type": "string"
+        },
+        "new_name": {
+          "description": "For rename: the new identifier, applied project-wide.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "op": {
+          "default": "replace",
+          "description": "Symbol operation. replace: new body for `symbol` (or for `path`+`lines`); insert: new symbol placed `where` relative to `symbol`; delete: remove `symbol` with its header; rename: rename `symbol` project-wide to `new_name`.",
+          "enum": [
+            "replace",
+            "insert",
+            "delete",
+            "rename"
+          ],
+          "type": "string"
+        },
+        "operation_id": {
+          "description": "Any unique id for this edit; repeating it never applies the edit twice.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        },
+        "source_ref": {
+          "description": "The source_ref of the ide.read/ide.context this content is based on; required with `path`+`lines` and to replace an existing file with `path`+`content`, optional (but validated) with `symbol`. Omit it with `path`+`content` to create a new file.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "symbol": {
+          "description": "Symbol path `file#Owner/name`.",
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        },
+        "where": {
+          "description": "For insert: before/after the anchor symbol, or first/last member of a container anchor.",
+          "enum": [
+            "before",
+            "after",
+            "first",
+            "last"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation_id"
+      ],
+      "type": "object"
+    },
+    "name": "ide.edit"
+  },
+  {
+    "description": "Bounded call graph around one symbol: callers, callees or both, depth 1–3, at most 60\nnodes, every node a full symbol path, cycles marked `(seen)`, tests collapsed into `+N tests` per parent (set `tests: true` to list them). Use\nit to see the blast radius before changing a function or to trace how a call reaches a\nsymbol, instead of chained greps.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "depth": {
+          "default": 2,
+          "description": "Levels to expand; 2 is usually enough.",
+          "maximum": 3,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "direction": {
+          "default": "callers",
+          "description": "`callers`: who calls it (blast radius); `callees`: what it calls; `both`.",
+          "enum": [
+            "callers",
+            "callees",
+            "both"
+          ],
+          "type": "string"
+        },
+        "symbol": {
+          "description": "Symbol path `file#Owner/name`, or a bare name to search the project.",
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        },
+        "tests": {
+          "default": false,
+          "description": "Show test symbols as nodes (marked `[test]`) instead of collapsing them into one `+N tests` line per parent.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "symbol"
+      ],
+      "type": "object"
+    },
+    "name": "ide.graph"
+  },
+  {
+    "description": "Fetch the result behind a `detail_ref`: a `pending` reply that has since completed, or\nthe next page of a long result (outline, symbol, graph, diff, test output). Poll every\nfew seconds while it stays pending.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "detail_ref": {
+          "description": "Reference from an earlier reply: continue that result.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "detail_ref"
+      ],
+      "type": "object"
+    },
+    "name": "ide.inspect"
+  },
+  {
+    "description": "Skeleton of a file (every symbol with signature, doc line and line numbers, members\nindented, tests collapsed) or of a directory (files with line counts and first doc line).\nA fraction of the cost of reading the file — use it before any native read of a source\nfile longer than a screen. Answers inline on a warm language server; a cold one answers\n`pending` — poll ide.inspect.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "kinds": {
+          "description": "Comma list over the closed symbol-kind vocabulary; keeps a symbol whose kind is selected or a descendant's is, so a container of a selected member still shows.",
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol)(,(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol))*$",
+          "type": "string"
+        },
+        "path": {
+          "description": "File relative to the project root.",
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "ide.outline"
+  },
+  {
+    "description": "Body of one symbol (`file#Owner/name`) or an explicit line range, numbered, with its doc\nheader. The precise replacement for reading a whole file when you already know what you\nneed; its `source_ref` is what a full-file ide.edit is based on.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "lines": {
+          "description": "Inclusive 1-based line range such as `120-180`.",
+          "pattern": "^[0-9]+-[0-9]+$",
+          "type": "string"
+        },
+        "path": {
+          "description": "File relative to the project root, with `lines` or `ranges`.",
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        },
+        "ranges": {
+          "description": "Several line ranges of `path` in one reply, request order, with the same numbered gutter and one `source_ref`.",
+          "items": {
+            "pattern": "^[0-9]+-[0-9]+$",
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "symbol": {
+          "description": "Symbol path `file#Owner/name`; returns its body with the doc header.",
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        },
+        "symbols": {
+          "description": "Several bodies in one reply, request order, one `source_ref` valid for every file included: `[\"src/a.rs#Foo/bar\",\"src/b.rs#qux\"]`. Unknown symbols are reported per item without failing the rest.",
+          "items": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.read"
+  },
+  {
+    "description": "Activate Agent IDE for this project — once per task, before any other ide.* call. Returns\na project card: languages with sizes, the build/check/test/lint commands, layout by\ndirectory, entry points and docs. Use it to orient instead of reading README, Cargo.toml\nor package.json. Then use ide.outline / ide.symbol instead of native file reads.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "activation_id": {
+          "description": "Any stable id for this activation (e.g. the task name); repeating it returns the same activation.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "root": {
+          "description": "Absolute working directory to activate; defaults to the host's project directory. Must lie below a configured allowed root.",
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "activation_id"
+      ],
+      "type": "object"
+    },
+    "name": "ide.start"
+  },
+  {
+    "description": "End this task's IDE session; edited files stay on disk. Lists up to eight test runs started\nin this binding whose results were never collected. Call once when done or before handing off.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "ide.stop"
+  },
+  {
+    "description": "Symbol card for `file#Owner/name` or a bare name: resolved signature, doc, definition\nlocation, usages split src/tests with the source line, callers and callees as full symbol\npaths, and with `history: true` the last commits touching the definition. Language-server\naccurate — replaces grep for usages and reading files to find callers. A bare name with\nseveral matches returns the candidate paths.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "callees": {
+          "default": 0,
+          "description": "Callees to list, 0–3 (0 = none).",
+          "maximum": 3,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "callers": {
+          "default": 1,
+          "description": "Callers to list, 0–3 (0 = none); use ide.graph for deeper trees.",
+          "maximum": 3,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "history": {
+          "default": false,
+          "description": "Include the last commits touching the definition (opt-in).",
+          "type": "boolean"
+        },
+        "symbol": {
+          "description": "Symbol path `file#Owner/name`, or a bare name to search the project.",
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        },
+        "usages": {
+          "default": true,
+          "description": "Include usages (src/tests split, with source lines).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "symbol"
+      ],
+      "type": "object"
+    },
+    "name": "ide.symbol"
+  },
+  {
+    "description": "Run tests selected by `symbol` (the tests that reference it), by `path`, by name\n`pattern`, or an explicit `command`; one background run per worktree under `budget_s`.\nReturns the pass/fail line with an exact rerun command; full output is paged through\nide.inspect (`status` re-reads a run). A summary-less explicit command waits briefly and\nincludes its exit code and bounded output inline when it finishes inside that window. Use\nit instead of running the test command in a shell: exact selection, bounded output.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "budget_s": {
+          "default": 120,
+          "description": "Seconds before the run is stopped and reported as timed out.",
+          "maximum": 600,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "command": {
+          "description": "Explicit argv to run instead of the detected runner.",
+          "items": {
+            "maxLength": 512,
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "type": "array"
+        },
+        "path": {
+          "description": "Run the tests in this file or directory.",
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        },
+        "pattern": {
+          "description": "Run tests whose name matches this substring (runner filter).",
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        "status": {
+          "description": "Re-read run number N (from `tests #N`) instead of starting one.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "symbol": {
+          "description": "Run the tests that reference this symbol (`file#Owner/name`).",
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.test"
+  }
+]

@@ -1,38 +1,81 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/*", "xtask"]
+resolver = "3"
 
 [workspace.package]
 version = "0.6.9"
 edition = "2024"
+rust-version = "1.98.1"
+license = "MIT"
+
+[workspace.dependencies]
+agent-ide-core = { path = "crates/agent-ide-core" }
+agent-ide-lang-css = { path = "crates/agent-ide-lang-css" }
+agent-ide-lang-go = { path = "crates/agent-ide-lang-go" }
+agent-ide-lang-html = { path = "crates/agent-ide-lang-html" }
+agent-ide-lang-python = { path = "crates/agent-ide-lang-python" }
+agent-ide-lang-rust = { path = "crates/agent-ide-lang-rust" }
+agent-ide-lang-typescript = { path = "crates/agent-ide-lang-typescript" }
+async-lsp = { version = "0.2.4", default-features = false, features = ["omni-trait", "tokio"] }
+blake3 = "1"
+libc = "0.2"
+minijinja = { version = "2.24.0", default-features = false, features = ["serde", "builtins"] }
+proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
+quote = { version = "1", default-features = false }
+rmcp = { version = "3.2.0", features = ["server", "macros", "transport-io"] }
+rusqlite = { version = "0.37", features = ["backup", "bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+syn = { version = "=2.0.119", default-features = false, features = ["full", "parsing", "printing", "visit"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tower-service = "0.3"
 
 [package]
 name = "agent-ide"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 publish = false
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-agent-ide-core = { path = "crates/agent-ide-core" }
-agent-ide-lang-typescript = { path = "crates/agent-ide-lang-typescript" }
-agent-ide-lang-python = { path = "crates/agent-ide-lang-python" }
-agent-ide-lang-rust = { path = "crates/agent-ide-lang-rust" }
-agent-ide-lang-go = { path = "crates/agent-ide-lang-go" }
-agent-ide-lang-css = { path = "crates/agent-ide-lang-css" }
-agent-ide-lang-html = { path = "crates/agent-ide-lang-html" }
-async-lsp = { version = "0.2.4", default-features = false, features = ["omni-trait", "tokio"] }
-blake3 = "1"
-libc = "0.2"
-minijinja = { version = "2.24.0", default-features = false, features = ["serde", "builtins"] }
-rmcp = { version = "3.2.0", features = ["server", "macros", "transport-io"] }
-rusqlite = { version = "0.37", features = ["backup", "bundled"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-util = { version = "0.7", features = ["compat"] }
-tower-service = "0.3"
+agent-ide-core.workspace = true
+agent-ide-lang-typescript.workspace = true
+agent-ide-lang-python.workspace = true
+agent-ide-lang-rust.workspace = true
+agent-ide-lang-go.workspace = true
+agent-ide-lang-css.workspace = true
+agent-ide-lang-html.workspace = true
+async-lsp.workspace = true
+blake3.workspace = true
+libc.workspace = true
+minijinja.workspace = true
+rmcp.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tower-service.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util"] }
+
+# Lints the workspace passes today; the heavier agent-worktree set
+# (unwrap_used 4585, expect_used 586, missing_docs 92,
+# undocumented_unsafe_blocks 52, print_stdout 69 hits) is deliberately not
+# denied yet.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[lints]
+workspace = true
