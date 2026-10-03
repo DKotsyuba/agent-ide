@@ -4275,21 +4275,24 @@ async fn modern_managed_claude_keeps_hook_pairing_and_text_only_envelope() {
     let runtime = managed_claude_runtime_path(&fixture.root);
     let _guard = SharedClaudeDaemonGuard(runtime.clone());
     let mut mcp = Mcp::start_managed_claude_raw(&fixture.config, &fixture.root).await;
-    // With no handshake to pace startup, wait for the shared daemon's socket before the first
-    // hook: a pre-hook that reaches no daemon fails open and the paired call would be refused.
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            if UnixStream::connect(runtime.join("agent-ide.sock"))
-                .await
-                .is_ok()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("managed Claude daemon socket");
+    // Open exactly like a real modern Claude session: its first frame is tools/list, and the
+    // front only answers once its attach finished — lease open, attachment minted and published
+    // for the hooks (src/main.rs writes the candidate attachment before it serves stdio). The
+    // daemon socket alone is not readiness: it binds before the attachment exists, so a pre-hook
+    // fired that early fails open (`hook_no_candidate_attachment`) and the paired call would be
+    // refused with `hooks_not_delivered`.
+    let catalog = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{
+                "_meta": modern_meta(json!({}))
+            }}),
+        )
+        .await;
+    assert_eq!(
+        catalog["result"]["tools"].as_array().map(Vec::len),
+        Some(11),
+        "{catalog}"
+    );
     let mut next = 30;
     let pending = managed_claude_modern_call(
         &mut mcp,
