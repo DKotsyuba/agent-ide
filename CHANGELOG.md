@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.0 — 2026-10-04
+
 ### Added
 
 - Environment selection for Python. Each project root has one current
