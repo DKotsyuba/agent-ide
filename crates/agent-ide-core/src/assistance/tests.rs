@@ -36,8 +36,8 @@ struct State {
     next_id: u64,
     /// Retained jobs keyed by daemon-local id and partitioned by `Job::root`.
     jobs: BTreeMap<u64, Job>,
-    /// Last no-feed status plate delivered per worktree.
-    delivered_status: BTreeMap<PathBuf, String>,
+    /// Last no-feed status plate delivered per worktree and starting binding.
+    delivered_status: BTreeMap<(PathBuf, [u8; 32]), String>,
 }
 
 /// One job's worktree, command, timing, and optional completed report/output.
@@ -404,7 +404,7 @@ impl TestRuns {
             .rev()
             .find(|(_, job)| &job.owner == binding)?;
         let line = render_status_line(*id, job)?;
-        (state.delivered_status.get(&job.root) != Some(&line)).then_some(line)
+        (state.delivered_status.get(&(job.root.clone(), *binding)) != Some(&line)).then_some(line)
     }
 
     /// Marks one exact current status line delivered for its starting binding.
@@ -420,7 +420,7 @@ impl TestRuns {
         else {
             return false;
         };
-        let root = owner_job.root.clone();
+        let key = (owner_job.root.clone(), *binding);
         let owner_id = *owner_id;
         let is_current = state
             .jobs
@@ -428,7 +428,7 @@ impl TestRuns {
             .and_then(|job| render_status_line(owner_id, job))
             .as_deref()
             == Some(line);
-        state.delivered_status.insert(root, line.to_owned());
+        state.delivered_status.insert(key, line.to_owned());
         if is_current
             && let Some(job) = state.jobs.get_mut(&owner_id)
             && job.result.is_some()
@@ -443,12 +443,12 @@ impl TestRuns {
         let Ok(mut state) = self.0.lock() else {
             return false;
         };
-        let Some(id) = state
+        let Some((id, owner)) = state
             .jobs
             .iter()
             .rev()
             .find(|(_, job)| &job.root == root && job.result.is_some())
-            .map(|(id, _)| *id)
+            .map(|(id, job)| (*id, job.owner))
         else {
             return false;
         };
@@ -461,7 +461,9 @@ impl TestRuns {
         {
             return false;
         }
-        state.delivered_status.insert(root.clone(), line.to_owned());
+        state
+            .delivered_status
+            .insert((root.clone(), owner), line.to_owned());
         if let Some(job) = state.jobs.get_mut(&id) {
             job.observed = true;
         }
@@ -632,6 +634,17 @@ async fn run(root: &PathBuf, argv: &[String], language: Language, budget: Durati
     }
 }
 
+/// Prepends a pinned toolchain directory while preserving every caller-provided PATH entry.
+fn prepend_toolchain_path(
+    bin: &std::path::Path,
+    caller_path: &std::ffi::OsStr,
+) -> io::Result<std::ffi::OsString> {
+    std::env::join_paths(
+        std::iter::once(bin.to_path_buf()).chain(std::env::split_paths(caller_path)),
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
 /// Spawns an exact non-empty argv with inherited environment, overrides, and a private process group.
 ///
 /// When a registered language pins the toolchain of the command's program (see
@@ -659,11 +672,11 @@ fn spawn_command(
     let mut command = tokio::process::Command::new(executable);
     command.envs(env.iter().map(|(key, value)| (key, value)));
     if let Some((_, bin)) = &toolchain {
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let mut joined = std::ffi::OsString::from(bin);
-        joined.push(":");
-        joined.push(path);
-        command.env("PATH", joined);
+        let caller_path = env.iter().find(|(key, _)| key == "PATH").map_or_else(
+            || std::env::var_os("PATH").unwrap_or_default(),
+            |(_, value)| value.into(),
+        );
+        command.env("PATH", prepend_toolchain_path(bin, &caller_path)?);
     }
     command
         .args(args)
@@ -815,6 +828,55 @@ async fn kill_group(pid: u32) -> io::Result<std::process::ExitStatus> {
 mod runner_tests {
     //! Minimal process and parser checks for the test runner.
     use super::*;
+
+    /// A pinned toolchain leads PATH without discarding the caller's explicit override.
+    #[test]
+    fn pinned_toolchain_preserves_caller_path_override() {
+        let path = prepend_toolchain_path(
+            std::path::Path::new("/pinned/bin"),
+            std::ffi::OsStr::new("/custom/bin"),
+        )
+        .unwrap();
+        assert_eq!(
+            std::env::split_paths(&path).collect::<Vec<_>>(),
+            [PathBuf::from("/pinned/bin"), PathBuf::from("/custom/bin")]
+        );
+    }
+
+    /// Delivery for one actor does not make another actor's unchanged plate due again.
+    #[test]
+    fn status_delivery_is_partitioned_by_root_and_binding() {
+        let runs = TestRuns::default();
+        let root = PathBuf::from("/tmp/shared-worktree");
+        let first = [1; 32];
+        let second = [2; 32];
+        {
+            let mut state = runs.0.lock().unwrap();
+            for (id, owner) in [(1, first), (2, second)] {
+                state.jobs.insert(
+                    id,
+                    Job {
+                        root: root.clone(),
+                        owner,
+                        channel: [id as u8; 32],
+                        detail_ref: format!("detail-{id}"),
+                        command: vec!["check".to_owned()],
+                        explicit_command: true,
+                        started: tokio::time::Instant::now(),
+                        result: None,
+                        completed_at: None,
+                        observed: false,
+                    },
+                );
+            }
+        }
+        let first_line = runs.status_line_for_binding(&first).unwrap();
+        assert!(runs.mark_status_delivered(&first, &first_line));
+        let second_line = runs.status_line_for_binding(&second).unwrap();
+        assert!(runs.mark_status_delivered(&second, &second_line));
+        assert_eq!(runs.status_line_for_binding(&first), None);
+        assert_eq!(runs.status_line_for_binding(&second), None);
+    }
 
     /// Empty summaries surface the first error line, falling back to the final output line.
     #[test]

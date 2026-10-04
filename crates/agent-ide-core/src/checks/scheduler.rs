@@ -34,6 +34,9 @@ use super::fingerprint::git_worktree_fingerprint;
 use super::{CheckRequest, CheckState, Checker, Language, ProblemSnapshot, UnavailableReason};
 use crate::execution::seatbelt::ReadDeny;
 
+/// Maximum time an unchanged durable unavailable result suppresses a later check.
+const DURABLE_UNAVAILABLE_RETRY: Duration = Duration::from_secs(300);
+
 /// Name of the marker file written in each worktree-level cache directory, recording the
 /// worktree's canonical path so [`sweep_stale_caches`] can find directories to remove.
 const WORKTREE_MARKER_FILE_NAME: &str = "worktree.path";
@@ -638,7 +641,12 @@ impl Inner {
             }
             (
                 wt.activation_armed || lang.urgent,
-                lang.skip_eligible,
+                lang.skip_eligible
+                    && !durable_unavailable_expired(
+                        lang.latest_snapshot.as_ref(),
+                        lang.last_completion,
+                        Instant::now(),
+                    ),
                 lang.completed_fingerprint,
                 wt.input_generation,
             )
@@ -1302,10 +1310,9 @@ fn is_transient_failure(state: &CheckState) -> bool {
 /// than one bad run: checks disabled for the language, the worktree outside the allowed roots, a
 /// missing configured tool, a missing project environment, or a project configuration that
 /// analyzed no files. Such a completion arms the same skip-unchanged baseline as `Ready` (T20B):
-/// every re-probe with unchanged inputs would answer the same line again — the field's 182
-/// `check started` / `check unavailable` pairs in one session — while a manifest or environment
-/// directory change moves the worktree fingerprint and re-arms the check. `ReadRestricted`
-/// follows the host's sandbox policy, not the worktree, so it is never durable here.
+/// re-probes with unchanged inputs would answer the same line again, so the scheduler skips them
+/// until the worktree fingerprint changes or the five-minute retry interval expires.
+/// `ReadRestricted` follows the host's sandbox policy, not the worktree, so it is never durable here.
 fn is_durable_condition(reason: &UnavailableReason) -> bool {
     matches!(
         reason,
@@ -1315,6 +1322,23 @@ fn is_durable_condition(reason: &UnavailableReason) -> bool {
             | UnavailableReason::EnvMissing
             | UnavailableReason::NoFiles
     )
+}
+
+/// Reports whether a durable unavailable result is old enough to retry.
+fn durable_unavailable_expired(
+    snapshot: Option<&ProblemSnapshot>,
+    completed: Option<Instant>,
+    now: Instant,
+) -> bool {
+    let Some(completed) = completed else {
+        return false;
+    };
+    snapshot.is_some_and(|snapshot| {
+        matches!(
+            snapshot.state,
+            CheckState::Unavailable(ref reason) if is_durable_condition(reason)
+        ) && now.saturating_duration_since(completed) >= DURABLE_UNAVAILABLE_RETRY
+    })
 }
 
 /// Derives a 16 hex character cache key from `bytes`: the first 8 bytes of its blake3 digest,
@@ -1404,6 +1428,36 @@ mod deny_tests {
     use crate::execution::seatbelt::CredentialGlob;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A durable missing-environment result expires after five minutes, using the supplied clock.
+    #[test]
+    fn durable_unavailable_retries_after_bounded_interval() {
+        let snapshot = ProblemSnapshot::unavailable(
+            crate::lang::testing::BETA,
+            UnavailableReason::EnvMissing,
+            1,
+        );
+        let completed = Instant::now();
+        assert!(!durable_unavailable_expired(
+            Some(&snapshot),
+            Some(completed),
+            completed + DURABLE_UNAVAILABLE_RETRY - Duration::from_secs(1),
+        ));
+        assert!(durable_unavailable_expired(
+            Some(&snapshot),
+            Some(completed),
+            completed + DURABLE_UNAVAILABLE_RETRY,
+        ));
+        assert!(!durable_unavailable_expired(
+            Some(&ProblemSnapshot::unavailable(
+                crate::lang::testing::BETA,
+                UnavailableReason::Timeout,
+                1,
+            )),
+            Some(completed),
+            completed + DURABLE_UNAVAILABLE_RETRY,
+        ));
+    }
 
     /// An edit-triggered check must run when the prior ready result has the same cheap fingerprint:
     /// carrying its warning would falsely report `current_reported`, and carrying its clean result

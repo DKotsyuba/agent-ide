@@ -180,6 +180,82 @@ async fn activate(
     (guard, invocation, stamp, receipt)
 }
 
+/// Role changes with new activation IDs preserve authority and release the writer slot on stop.
+#[tokio::test]
+async fn role_switch_rebinds_active_start_to_new_activation_id() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let owner = DurableWorkspace::open(&store).await.unwrap();
+    let tree = fixture.resolve(&owner).await;
+    let (mut guard, invocation) = binding("actor", "call-a", "channel-a");
+
+    let reader = owner
+        .activate(request_mode(
+            "reader-a",
+            true,
+            &mut guard,
+            &invocation,
+            &tree,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reader.role(), StartRole::Reader);
+    let writer = owner
+        .activate(request("writer-b", &mut guard, &invocation, &tree))
+        .await
+        .unwrap();
+    assert_eq!(writer.role(), StartRole::Writer);
+    assert!(
+        owner
+            .authority(
+                &writer,
+                &guard.consume_active(invocation.binding_ref()).unwrap()
+            )
+            .await
+            .is_ok()
+    );
+    let reader = owner
+        .activate(request_mode(
+            "reader-c",
+            true,
+            &mut guard,
+            &invocation,
+            &tree,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reader.role(), StartRole::Reader);
+    assert!(
+        owner
+            .authority(
+                &reader,
+                &guard.consume_active(invocation.binding_ref()).unwrap()
+            )
+            .await
+            .is_ok()
+    );
+    owner
+        .revoke(
+            OperationId::new("stop-reader-c").unwrap(),
+            &reader,
+            StopBindingHandoff::Confirmed,
+        )
+        .await
+        .unwrap();
+
+    let (mut next_guard, next_invocation) = binding("next", "call-next", "channel-next");
+    let next_writer = owner
+        .activate(request(
+            "next-writer",
+            &mut next_guard,
+            &next_invocation,
+            &tree,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(next_writer.role(), StartRole::Writer);
+}
+
 /// Fences old boot stamps/bindings while preserving exact historical start and stop outcomes.
 #[tokio::test]
 async fn reopen_never_revives_authority_and_retries_preserve_committed_receipts() {

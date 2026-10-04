@@ -623,9 +623,9 @@ impl<'a> DurableWorkspace<'a> {
                 writer.as_ref().map_or_else(|| own.as_ref().map_or(0, |(_, _, epoch)| *epoch), |(_, _, epoch)| *epoch)
             };
             if outcome == "upgrade" {
-                tx.execute("UPDATE workspace_starts SET role='writer', epoch=?1 WHERE operation=?2 AND active=1", params![epoch, sql_id])?;
+                tx.execute("UPDATE workspace_starts SET operation=?1,digest=?2,role='writer',epoch=?3 WHERE actor=?4 AND binding=?5 AND active=1", params![sql_id,digest.as_slice(),epoch,sql_actor,sql_binding.as_slice()])?;
             } else if outcome == "downgrade" {
-                tx.execute("UPDATE workspace_starts SET role='reader', epoch=?1 WHERE operation=?2 AND active=1", params![epoch, sql_id])?;
+                tx.execute("UPDATE workspace_starts SET operation=?1,digest=?2,role='reader',epoch=?3 WHERE actor=?4 AND binding=?5 AND active=1", params![sql_id,digest.as_slice(),epoch,sql_actor,sql_binding.as_slice()])?;
             } else if outcome == "granted" || outcome == "reader" {
                 // Only authority-bearing outcomes need a start row. Refusals remain retryable,
                 // including after a boot or stop, and must not collide with the activation's

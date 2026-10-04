@@ -308,19 +308,19 @@ impl LanguageSupport for Python {
                 }
             }
         }
-        if roots.is_empty() {
-            // Only a root environment directory marks this worktree as Python: name it too.
-            if let Some(venv) = venv_directories(root).into_iter().next() {
-                let python = venv.join("bin").join("python");
-                interpreter = Some(std::path::absolute(&python).unwrap_or(python));
-                fact(
-                    "venv",
-                    venv.strip_prefix(root)
-                        .ok()
-                        .and_then(|path| path.to_str())
-                        .unwrap_or(".venv"),
-                );
-            }
+        if interpreter.is_none()
+            && let Some(venv) = venv_directories(root).into_iter().next()
+        {
+            // A worktree environment also covers nested roots without their own environment.
+            let python = venv.join("bin").join("python");
+            interpreter = Some(std::path::absolute(&python).unwrap_or(python));
+            fact(
+                "venv",
+                venv.strip_prefix(root)
+                    .ok()
+                    .and_then(|path| path.to_str())
+                    .unwrap_or(".venv"),
+            );
         }
         let uv = has("uv.lock");
         if uv {
@@ -2237,6 +2237,27 @@ FAILED tests/test_service.py::TestWorker::test_label
             )]
         );
         assert_eq!(project.commands, ProjectCommands::default());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A worktree venv supplies the interpreter to nested roots without their own environment.
+    #[test]
+    fn nested_root_uses_worktree_venv_fallback() {
+        let root = scratch("nested-root-worktree-venv");
+        put(&root, ".venv/bin/python", "");
+        put(&root, "svc/pyproject.toml", "[project]\nname = \"svc\"\n");
+        put(&root, "svc/app.py", "match value:\n    case 1: pass\n");
+        let project = Python.detect(&root).expect("nested project registers");
+        assert_eq!(
+            project.interpreter,
+            Some(std::path::absolute(root.join(".venv/bin/python")).unwrap())
+        );
+        assert!(
+            project
+                .environment
+                .iter()
+                .any(|(key, value)| { key == "venv" && value == ".venv" })
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 

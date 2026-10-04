@@ -3869,7 +3869,7 @@ impl<'a> Worker<'a> {
                     .project_feed
                     .as_ref()
                     .is_some_and(|feed| feed.is_read_restricted(&binding.fingerprint()));
-                let mut snapshots = if restricted {
+                let snapshots = if restricted {
                     self.shared
                         .project_feed
                         .as_ref()
@@ -3877,21 +3877,11 @@ impl<'a> Worker<'a> {
                 } else {
                     source.latest(authority.worktree().worktree_path())
                 };
-                let mut rechecks = if restricted {
+                let rechecks = if restricted {
                     Vec::new()
                 } else {
                     source.rechecks(authority.worktree().worktree_path())
                 };
-                if !restricted
-                    && rechecks
-                        .iter()
-                        .any(|(_, recheck)| *recheck == crate::checks::Recheck::FilesChanged)
-                    && tokio::time::Instant::now() + Duration::from_secs(3) < job.deadline
-                {
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                    snapshots = source.latest(authority.worktree().worktree_path());
-                    rechecks = source.rechecks(authority.worktree().worktree_path());
-                }
                 problems_text_with_rechecks(&snapshots, &rechecks, language, offset)
             }
             None => "checks disabled".to_owned(),
@@ -7398,9 +7388,9 @@ mod stop_retry_tests {
         assert_eq!(fake.queried(), vec![fixture.root.clone()]);
     }
 
-    /// A changed-check reply waits briefly and uses the refreshed result when it settles.
+    /// A changed-check reply returns its current running state without sleeping in the worker.
     #[tokio::test]
-    async fn context_problems_refreshes_a_running_changed_check() {
+    async fn context_problems_returns_running_changed_check_immediately() {
         let fixture = Fixture::new();
         let store = fixture.store();
         let workspace = DurableWorkspace::open(&store).await.unwrap();
@@ -7440,13 +7430,9 @@ mod stop_retry_tests {
         let PeerReply::Complete { text, .. } = reply else {
             panic!("problems context must complete: {reply:?}")
         };
-        assert!(
-            text.contains("alpha: ready; errors: 0; warnings: 0"),
-            "{text}"
-        );
-        assert!(!text.contains("checking"), "{text}");
-        assert_eq!(fake.latest_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(fake.recheck_calls.load(Ordering::SeqCst), 2);
+        assert!(text.contains("alpha: checking (files changed)"), "{text}");
+        assert_eq!(fake.latest_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.recheck_calls.load(Ordering::SeqCst), 1);
     }
 
     /// Builds a bounded, easily reasoned-about test job for the fixture worktree's `main.rs`.

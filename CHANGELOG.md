@@ -28,6 +28,7 @@
 
 ### Fixed
 
+- Switching a live start between reader and writer roles keeps its durable activation bound to the active host binding; problem checks return the current running state without stalling other queued work; the bundled reviewer starts read-only.
 - A fresh read is no longer evicted before the edit that uses it; a stale
   refusal never hints the reference it just refused.
 - Formatting an edited Rust module never rewrites its child files (regression

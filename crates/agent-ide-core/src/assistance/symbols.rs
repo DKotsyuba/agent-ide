@@ -686,10 +686,12 @@ impl Worker<'_> {
                     1 => Some(candidates[0].clone()),
                     0 => None,
                     _ => {
-                        let candidates = candidates
+                        let mut candidates = candidates
                             .iter()
                             .map(|candidate| candidate.path.to_string())
                             .collect::<Vec<_>>();
+                        candidates.sort();
+                        candidates.dedup();
                         return self.ambiguous(job, &binding, &requested, candidates).await;
                     }
                 }
@@ -1423,6 +1425,7 @@ impl Worker<'_> {
                     .unwrap_or_else(|| "semantic project resolution is unverified".to_owned());
                 return match support.outline_from_source(observed.path(), &source) {
                     Some(outline) => {
+                        job.failure_detail = None;
                         Ok((outline, worktree_root, Some(Lexical::Unverified { cause })))
                     }
                     None => Err(FailureCode::ResolutionUnverified),
