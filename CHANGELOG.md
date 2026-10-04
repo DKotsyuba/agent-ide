@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.1 — 2026-10-04
+
 ### Added
 
 - Reader and writer activations: `ide.start {"read_only": true}` admits any
