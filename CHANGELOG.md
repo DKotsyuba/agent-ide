@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### Added
+
+- Environment selection for Python. Each project root has one current
+  environment; the `ide.start` card shows it with its source (selected,
+  pinned by `pyrightconfig.json`/`[tool.pyright]`, or discovered), its version
+  from `pyvenv.cfg`, and the other candidates with a ready `choose:` hint.
+  `ide.start {"environment": {"python": ".venv-py314"}}` switches it
+  (`python:<root>` for a nested project root), `auto` resets it. The choice is
+  kept per worktree across daemon restarts and is not inherited by a
+  recreated worktree. A reader activation cannot change it.
+- One resolver answers for the card, the project check, the Pyright session,
+  test and format commands and the syntax probe. A change of the environment
+  (selection, recreation, disappearance) restarts the Pyright session, reruns
+  the check and shows a one-shot line on the plate.
+- Test and format commands run from the resolved environment
+  (`<venv>/bin/python -m pytest|black|ruff`) without `uv run`; explicit
+  commands get the environment's `bin` on `PATH` and `VIRTUAL_ENV`.
+  `uv run` stays only when no environment resolves at all.
+
+### Changed
+
+- Suffixed environments (`.venv-py314`) are listed in name order and count as
+  a Python project marker on their own. A `pyrightconfig.json` without venv
+  keys no longer lets `[tool.pyright]` pin an environment.
+- A missing selected or pinned environment is never silently replaced: the
+  check, tests, format and probe report the cause and the way out (recreate,
+  `auto`, or edit the pin). A broken environment (base interpreter gone) stays
+  listed and cannot be selected.
+
+### Known limitations
+
+- Nested project roots with diverging environments run tests and formatting in
+  the worktree root's environment; per-root routing comes with Rust toolchain
+  selection.
+
 ## 0.8.1 — 2026-10-04
 
 ### Added

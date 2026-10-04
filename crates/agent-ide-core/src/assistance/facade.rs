@@ -216,7 +216,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
         environment_languages.join("|")
     );
     let environment_description = format!(
-        "Pick the environment per language, optionally per project root (`{example_language}:packages/alpha`). Value: a candidate shown on the card (path relative to that root, or absolute), a toolchain/version (`1.99.0`, `22`), `project` (use the pin), `launcher` (operator default), or `auto` to clear. Stored for this worktree until changed."
+        "Pick the current environment per language, optionally per project root (`{example_language}:packages/alpha`). Value: a candidate the start card lists, or a path to one (relative to that root, or absolute), or `auto` to return to the default. Kept for this worktree until changed. Only languages whose card shows an environment line accept a choice."
     );
     [
         schema(
