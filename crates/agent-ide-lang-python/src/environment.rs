@@ -1,7 +1,7 @@
 //! The single Python environment resolver (environment-selection design §5.1).
 //!
 //! Every consumer — the project card, the project check, the Pyright session, test and format
-//! commands and the syntax probe — asks [`resolve`] (directly or through [`environments`]), so
+//! commands and the syntax probe — asks [`resolve`] (directly or through `environments`), so
 //! they can never disagree about which interpreter a project root uses. Precedence per root:
 //!
 //! 1. a Pyright config pin (`pyrightconfig.json` when it exists, else `[tool.pyright]`
@@ -399,7 +399,7 @@ pub(crate) fn resolve_with_denies(
     }
 }
 
-/// [`resolve_with_denies`] without host read denies.
+/// `resolve_with_denies` without host read denies.
 pub fn resolve(worktree: &Path, root: &Path, selector: Option<&str>) -> ResolvedEnv {
     resolve_with_denies(worktree, root, selector, &[]).env
 }

@@ -20,7 +20,6 @@ use async_lsp::lsp_types as lsp;
 /// Line and brace helpers shared by the support modules of brace-delimited languages.
 pub mod brace;
 pub mod edits;
-/// Project environments per language: resolved answers, stored choices, command environments.
 pub mod environment;
 /// Cross-language name facts: namespaces, facts, the fact sink and the `NameFacts` seam.
 pub mod names;

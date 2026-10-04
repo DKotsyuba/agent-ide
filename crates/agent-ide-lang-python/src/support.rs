@@ -626,7 +626,7 @@ impl LanguageSupport for Python {
     }
 
     /// `black <file>` or `ruff format <file>` as detected, run in the resolved environment like
-    /// the tests (see [`in_environment`]); `None` when the project configures neither.
+    /// the tests (see `in_environment`); `None` when the project configures neither.
     fn format_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>> {
         let file = file.display().to_string();
         match env_value(project, "formatter")? {
@@ -637,7 +637,7 @@ impl LanguageSupport for Python {
     }
 
     /// `ruff format --stdin-filename <file> -` or `black -q -` as detected (run in the resolved
-    /// environment, see [`in_environment`]), reading the candidate text on stdin and writing the formatted text to
+    /// environment, see `in_environment`), reading the candidate text on stdin and writing the formatted text to
     /// stdout. `None` for a non-`.py`/`.pyi` file or a project without either formatter.
     fn format_stdin_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>> {
         match file.extension().and_then(|ext| ext.to_str()) {
@@ -700,13 +700,13 @@ impl LanguageSupport for Python {
 
     /// A candidate label or a path to a directory holding `bin/python`; refused under a Pyright
     /// pin, for an unknown root, or for an unknown selector (see
-    /// [`crate::environment::check_selection`]).
+    /// `environment::check_selection`).
     fn check_selection(&self, worktree: &Path, root: &Path, selector: &str) -> Result<(), String> {
         crate::environment::check_selection(worktree, root, selector)
     }
 
     /// Activation of the resolved environment of the project root containing `cwd` (see
-    /// [`crate::environment::command_env`]).
+    /// `environment::command_env`).
     fn command_env(
         &self,
         worktree: &Path,
