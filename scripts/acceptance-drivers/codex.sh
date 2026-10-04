@@ -602,12 +602,19 @@ verify_r5() {
     forbid_text "$t" "left-python-bad" A_R5_LEFT_LEAK || return 1
     forbid_text "$t" "left-typescript-bad" A_R5_LEFT_LEAK_TS || return 1
     require_text "$t" "RIGHT_LOOP_OK" A_R5_FINAL || return 1
-    cmp -s "$RIGHT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l1.py" \
-        || return 1
+    # A mismatch keeps the actual file beside the diagnostics so the failing side is known.
+    if ! cmp -s "$RIGHT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l1.py"; then
+        cp -- "$RIGHT/acceptance-fixture/fixture.py" "$DIAG_DIR/r5-right-actual.py" 2>/dev/null || :
+        note A_R5_RIGHT_CONTENT "right fixture.py differs from expected-l1.py (kept as r5-right-actual.py)"
+        return 1
+    fi
     # Left isolation: compare against the snapshot taken right after the L2 checks,
     # not the idealized expected-l2.py (see verify_l2's native-tool formatting note).
-    cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/left-after-l2.py" \
-        || return 1
+    if ! cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/left-after-l2.py"; then
+        cp -- "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/r5-left-actual.py" 2>/dev/null || :
+        note A_R5_LEFT_CONTENT "left fixture.py changed since L2 (kept as r5-left-actual.py)"
+        return 1
+    fi
 }
 
 # Scenario R5: the complete loop in the divergent right worktree.
