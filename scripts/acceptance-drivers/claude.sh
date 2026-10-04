@@ -344,9 +344,8 @@ verify_r5() {
     require_transcript_text "$t" "RIGHT_LOOP_OK" A_R5_FINAL || return 1
     cmp -s "$RIGHT/acceptance-fixture/fixture.py" "$DIAG_DIR/expected-l1.py" \
         || return 1
-    # Left isolation: compare against the snapshot taken right after the L2 checks,
-    # not the idealized expected-l2.py (see verify_l2's native-tool formatting note).
-    cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/left-after-l2.py" \
+    # Left isolation: the left fixture is exactly as it was when R5 started.
+    cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/left-before-r5.py" \
         || return 1
 }
 
@@ -422,6 +421,10 @@ RIGHT_IDENTITY=$(project_identity "$BINARY" "$RIGHT") || fail E_RIGHT_IDENTITY
 resolve_rendezvous "$BINARY" "$RIGHT" || fail E_RIGHT_RUNTIME
 if selected r5; then
     cp -- "$DRIVER_DIR/$PROMPT_FAMILY/r5.txt" "$DIAG_DIR/prompt-r5.txt"
+    # Left isolation baseline: the left fixture as R5 starts. The L3 setup rewrites it with the
+    # canonical post-L2 text, which may differ from the model's own L2 native edit by a blank line.
+    cp -- "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/left-before-r5.py" \
+        || fail E_FIXTURE_SNAPSHOT "could not snapshot the left fixture before R5"
     run_scenario r5 "$RIGHT" "$DIAG_DIR/prompt-r5.txt" verify_r5 reset_fixture A_R5_SCENARIO
 fi
 

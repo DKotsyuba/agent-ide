@@ -608,11 +608,10 @@ verify_r5() {
         note A_R5_RIGHT_CONTENT "right fixture.py differs from expected-l1.py (kept as r5-right-actual.py)"
         return 1
     fi
-    # Left isolation: compare against the snapshot taken right after the L2 checks,
-    # not the idealized expected-l2.py (see verify_l2's native-tool formatting note).
-    if ! cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/left-after-l2.py"; then
+    # Left isolation: the left fixture is exactly as it was when R5 started.
+    if ! cmp -s "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/left-before-r5.py"; then
         cp -- "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/r5-left-actual.py" 2>/dev/null || :
-        note A_R5_LEFT_CONTENT "left fixture.py changed since L2 (kept as r5-left-actual.py)"
+        note A_R5_LEFT_CONTENT "left fixture.py changed during R5 (kept as r5-left-actual.py)"
         return 1
     fi
 }
@@ -620,6 +619,10 @@ verify_r5() {
 # Scenario R5: the complete loop in the divergent right worktree.
 if selected r5; then
     cp -- "$DRIVER_DIR/$PROMPT_FAMILY/r5.txt" "$DIAG_DIR/prompt-r5.txt"
+    # Left isolation baseline: the left fixture as R5 starts. The L3 setup rewrites it with the
+    # canonical post-L2 text, which may differ from the model's own L2 native edit by a blank line.
+    cp -- "$LEFT/acceptance-fixture/fixture.py" "$DIAG_DIR/left-before-r5.py" \
+        || fail E_FIXTURE_SNAPSHOT "could not snapshot the left fixture before R5"
     run_scenario r5 "$RIGHT" "$DIAG_DIR/prompt-r5.txt" verify_r5 reset_fixture A_R5_SCENARIO
 fi
 
