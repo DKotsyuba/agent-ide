@@ -173,7 +173,9 @@ failed)` — and says what still works (outline/read from source), what does not
    `{"symbol":"src/x.rs#Type/method"}` runs the tests that reference the symbol (including
    in-file `mod tests`), `{"path":"src/x.rs"}` the file's tests, `{"pattern":"name"}` a runner
    filter, `{"command":["cargo","test","--lib"]}` an exact argv; optional `budget_s` (default
-   120, max 600). A `path` or `symbol` target runs the runner of that file's language — in a
+   120, max 600). Explicit commands may also set `cwd` relative to the worktree root (it must
+   resolve to a directory inside the worktree) and `env` as up to 32 bounded environment
+   overrides. The combined command arguments are limited to 16 KiB. A `path` or `symbol` target runs the runner of that file's language — in a
    mixed worktree a `.py` test path selects pytest, never cargo — while a bare pattern or
    command uses the first detected project. The reply is
    `tests #N: started — <argv> (budget B s); poll: call ide.test with
@@ -183,9 +185,11 @@ failed)` — and says what still works (outline/read from source), what does not
    `tests-N`, `#N`, `N`) and answers that run's status line.
    After `ide.stop`, `ide.test {"status":N}` is refused; its reply names `ide.inspect
    {"detail_ref":"tests #N"}` as the way to read that run, which still answers.
-   When a run has no parsed test counts and exits non-zero, its status line includes the runner's
-   first error line (or final non-empty line), bounded to about 200 bytes, followed by the full
-   output inspection route.
+   Known pytest, cargo test, vitest/jest, and go test summaries are parsed from output regardless
+   of whether the command called the runner directly or through a wrapper. When no known test
+   summary appears, the result gives the exit code and a bounded output tail labelled `output`;
+   long output has a full-output inspection route. Status plates show only this activation's own
+   test jobs, so another actor's earlier run is not attributed to this session.
    One job per worktree at a time; a stopped budget says `stopped at budget`. The
    `<agent-ide>` block carries the job's line once while it runs and once when it ends.
 6. `ide.diff` before finishing the task, to review the accumulated change.

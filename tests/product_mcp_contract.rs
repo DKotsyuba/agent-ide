@@ -6858,6 +6858,88 @@ async fn configured_product_python_non_test_file_answers_no_tests() {
     daemon.wait().await.unwrap();
 }
 
+/// Runs a wrapped pytest-style summary from a package directory with explicit environment values.
+#[tokio::test]
+async fn configured_product_test_command_uses_cwd_env_and_parses_wrapped_pytest_summary() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
+    std::fs::remove_file(fixture.root.join("go.mod")).unwrap();
+    std::fs::remove_file(fixture.root.join("main.go")).unwrap();
+    std::fs::remove_file(fixture.root.join("src/lib.rs")).unwrap();
+    std::fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(fixture.root.join("packages/pkg")).unwrap();
+    std::fs::write(fixture.root.join("packages/pkg/cwd-marker"), "in package").unwrap();
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "python command fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "python-command-options").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"python-command-options"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let reply = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({
+                "command":["/bin/sh","-c","test -f cwd-marker && test \"$PYTHONPATH\" = packages/a:packages/b || exit 9; printf '2 passed, 1 failed in 0.02s\\n'"],
+                "cwd":"packages/pkg",
+                "env":{"PYTHONPATH":"packages/a:packages/b"}
+            }),
+        )
+        .await;
+    let reply = actor.settle(&fixture, reply).await;
+    assert_eq!(reply["kind"], "test", "{reply}");
+    let text = reply["text"].as_str().unwrap();
+    assert!(text.contains("2 passed, 1 failed"), "{text}");
+    assert!(text.contains("rerun:"), "{text}");
+    let outside = fixture.base.join("outside-package");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, fixture.root.join("escape")).unwrap();
+    let escaped = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"command":["true"],"cwd":"escape"}),
+        )
+        .await;
+    let escaped = actor.settle(&fixture, escaped).await;
+    assert_eq!(escaped["state"], "invalid_parameters", "{escaped}");
+    assert!(escaped.to_string().contains("cwd"), "{escaped}");
+    let command = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c","printf 'git diff output\\n'; exit 1"]}),
+        )
+        .await;
+    let command = actor.settle(&fixture, command).await;
+    assert_eq!(command["kind"], "test", "{command}");
+    let text = command["text"].as_str().unwrap();
+    assert!(text.starts_with("tests #"), "{text}");
+    assert!(
+        text.contains("exit 1") && text.contains("output (tail):\ngit diff output"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("no summary parsed") && !text.contains("runner said"),
+        "{text}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// `ide.test {path}` routes by the target file's language in a mixed worktree: with a root
 /// `Cargo.toml` (the first detected project) and a Python project registered only through the
 /// depth-1 `tools/requirements-ml.txt` marker beside a `.py` file, a `.py` test path selects
@@ -7245,14 +7327,14 @@ async fn configured_product_test_status_repeats_after_output_is_paged() {
         run["text"]
             .as_str()
             .unwrap()
-            .starts_with("tests #1: no summary parsed (exit 0)"),
+            .starts_with("tests #1: exit 0, "),
         "{run}"
     );
     assert!(
         run["text"]
             .as_str()
             .unwrap()
-            .contains("output:\nretained-output"),
+            .contains("output (tail):\nretained-output"),
         "{run}"
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -7263,11 +7345,7 @@ async fn configured_product_test_status_repeats_after_output_is_paged() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
         let status = actor.call(&fixture, "ide.test", json!({"status":1})).await;
-        if status["text"]
-            .as_str()
-            .unwrap()
-            .contains("no summary parsed")
-        {
+        if status["text"].as_str().unwrap().contains("exit 0") {
             break;
         }
     }
@@ -7278,7 +7356,7 @@ async fn configured_product_test_status_repeats_after_output_is_paged() {
             again["text"]
                 .as_str()
                 .unwrap()
-                .starts_with("tests #1: no summary parsed"),
+                .starts_with("tests #1: exit 0, "),
             "{again}"
         );
     }

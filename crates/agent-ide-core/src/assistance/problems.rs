@@ -509,7 +509,7 @@ impl ProjectProblemFeed {
             state
                 .test_runs
                 .as_ref()
-                .and_then(|runs| runs.status_line(&bound.worktree))
+                .and_then(|runs| runs.status_line_for_binding(binding))
         });
         let due_test = test_status
             .as_ref()
