@@ -8,6 +8,7 @@
 //! A few text helpers are `pub(super)` because the TypeScript module shares them.
 
 use std::{
+    collections::VecDeque,
     fs,
     path::{Path, PathBuf},
 };
@@ -17,7 +18,8 @@ use async_lsp::lsp_types as lsp;
 use agent_ide_core::lang::render::clip;
 use agent_ide_core::lang::text::{
     MAX_ATTRIBUTE_CHARS, MAX_NAMED_TESTS, distinct, distinct_files, entry_names, env_value,
-    indent_of, indent_unit, last_content_line, line_at, one_line, read_text, source_lines,
+    has_files_with, indent_of, indent_unit, last_content_line, line_at, one_line, read_text,
+    source_lines,
 };
 use agent_ide_core::lang::{
     CommandSource, InsertSite, InsertWhere, LangError, Language, LanguageProject, LanguageSupport,
@@ -52,10 +54,22 @@ const ROOT_MARKER_FILES: [&str; 5] = [
     "pyrightconfig.json",
 ];
 
-/// Vendor and build-output directories the depth-1 probe never enters: listing one is pure
+/// Vendor and build-output directories the nested-root probe never enters: listing one is pure
 /// cost (a JS monorepo's `node_modules` holds thousands of entries), and none of them is a
 /// Python subproject of this worktree.
 const SKIPPED_PROBE_DIRECTORIES: [&str; 5] = ["node_modules", "target", "dist", "build", "vendor"];
+
+/// Directory levels below the worktree root the nested-root probe descends to: a manifest two
+/// levels down (`packages/alpha/pyproject.toml`) is the deepest monorepo shape discovered.
+const PROBE_MAX_DEPTH: usize = 2;
+
+/// Upper bound on directories the nested-root probe enters, so a pathological tree cannot turn
+/// the cheap presence rule into a walk.
+const PROBE_MAX_DIRECTORIES: usize = 32;
+
+/// Cap on discovered Python roots; a monorepo beyond this many Python packages keeps the first
+/// `PROBE_MAX_ROOTS` in directory order and the card names what it found.
+pub(crate) const PROBE_MAX_ROOTS: usize = 8;
 
 /// Reports whether `name` is a `requirements*.txt` marker file.
 fn is_requirements_txt(name: &str) -> bool {
@@ -73,37 +87,112 @@ fn dir_names(dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Reports whether `dir` holds a Python manifest file: any [`ROOT_MARKER_FILES`] entry or a
+/// `requirements*.txt`.
+fn has_manifest(names: &[String]) -> bool {
+    names
+        .iter()
+        .any(|name| ROOT_MARKER_FILES.contains(&name.as_str()))
+        || names.iter().any(|name| is_requirements_txt(name))
+}
+
+/// The Python roots of `worktree`: the worktree itself when it declares a root marker, plus every
+/// subdirectory — down to [`PROBE_MAX_DEPTH`] levels, skipping dot, vendor and
+/// build-output directories, at most [`PROBE_MAX_DIRECTORIES`] of them — that holds its own
+/// manifest and at least one `.py` file within a bounded walk beneath it, so a docs-only
+/// `docs/requirements.txt` (Sphinx in a Rust or Go repository) is not a root. Sorted, and capped
+/// at [`PROBE_MAX_ROOTS`]. Empty when no manifest exists anywhere.
+///
+/// Shared by the project card, the presence rule and the per-root check runs, so the three can
+/// never disagree about which roots a worktree has.
+pub(crate) fn python_roots(worktree: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let root_names = dir_names(worktree);
+    if has_manifest(&root_names) {
+        roots.push(worktree.to_path_buf());
+    }
+    // Breadth-first over plain subdirectories: `packages/alpha` is found before `a/b/c` ever
+    // matters, and the caps bound both the width and the depth of the walk.
+    let mut queue: VecDeque<(PathBuf, usize)> = root_names
+        .iter()
+        .filter(|name| {
+            !name.starts_with('.') && !SKIPPED_PROBE_DIRECTORIES.contains(&name.as_str())
+        })
+        .filter_map(|name| {
+            let dir = worktree.join(name);
+            dir.is_dir().then_some((dir, 1usize))
+        })
+        .collect();
+    let mut visited = 0usize;
+    while let Some((dir, depth)) = queue.pop_front() {
+        visited += 1;
+        let names = dir_names(&dir);
+        if has_manifest(&names) && has_files_with(&dir, &["py", "pyi"]) {
+            roots.push(dir.clone());
+        }
+        if depth < PROBE_MAX_DEPTH && visited < PROBE_MAX_DIRECTORIES {
+            queue.extend(
+                names
+                    .iter()
+                    .filter(|name| {
+                        !name.starts_with('.')
+                            && !SKIPPED_PROBE_DIRECTORIES.contains(&name.as_str())
+                    })
+                    .filter_map(|name| {
+                        let child = dir.join(name);
+                        child.is_dir().then_some((child, depth + 1))
+                    }),
+            );
+        }
+        if visited >= PROBE_MAX_DIRECTORIES {
+            break;
+        }
+    }
+    roots.sort();
+    roots.truncate(PROBE_MAX_ROOTS);
+    roots
+}
+
 /// Reports whether `root` is a Python project, per the shared marker rule.
 ///
 /// Root markers: any of [`ROOT_MARKER_FILES`], any root `requirements*.txt`, or a `.venv`/`venv`
-/// directory. Plus a bounded depth-1 probe of immediate subdirectories — skipping dot and
-/// [`SKIPPED_PROBE_DIRECTORIES`] directories — where a nested `requirements*.txt` or
-/// `pyproject.toml` registers only when that same subdirectory holds at least one `.py` file, so
-/// a docs-only `docs/requirements.txt` (Sphinx in a Rust or Go repository) does not turn the
-/// worktree into a Python project. No deeper tree is walked.
+/// directory. Plus every root `python_roots` discovers from nested manifests — so a monorepo
+/// whose Python packages live two levels down, with no manifest at the worktree root, is a
+/// Python project whose every root the card lists.
 pub(crate) fn is_python_project(root: &Path) -> bool {
-    let names = dir_names(root);
     if ROOT_MARKER_FILES
         .iter()
         .any(|name| root.join(name).is_file())
-        || names.iter().any(|name| is_requirements_txt(name))
+        || dir_names(root).iter().any(|name| is_requirements_txt(name))
         || [".venv", "venv"].iter().any(|dir| root.join(dir).is_dir())
     {
         return true;
     }
-    names.iter().any(|name| {
-        if name.starts_with('.') || SKIPPED_PROBE_DIRECTORIES.contains(&name.as_str()) {
-            return false;
-        }
-        let dir = root.join(name);
-        if !dir.is_dir() {
-            return false;
-        }
-        let entries = dir_names(&dir);
-        (entries.iter().any(|name| name == "pyproject.toml")
-            || entries.iter().any(|name| is_requirements_txt(name)))
-            && entries.iter().any(|name| name.ends_with(".py"))
-    })
+    !python_roots(root).is_empty()
+}
+
+/// The virtual-environment directories beside `root`, most specific first: the conventional
+/// `.venv` and `venv`, then any sibling whose name extends them (`.venv-py314`, `venv310`), in
+/// directory order. Each must hold `bin/python` to count.
+pub(crate) fn venv_directories(root: &Path) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = [".venv", "venv"]
+        .iter()
+        .map(|name| root.join(name))
+        .collect();
+    candidates.extend(
+        dir_names(root)
+            .into_iter()
+            .filter(|name| {
+                (name.starts_with(".venv") && name != ".venv")
+                    || (name.starts_with("venv") && name != "venv")
+            })
+            .filter(|name| root.join(name).join("bin").join("python").is_file())
+            .map(|name| root.join(name)),
+    );
+    candidates
+        .into_iter()
+        .filter(|dir| dir.join("bin").join("python").is_file())
+        .collect()
 }
 
 /// `-c` program of the syntax probe: parses stdin with `ast` and prints `<lineno>: <msg>` on a
@@ -118,15 +207,33 @@ impl LanguageSupport for Python {
     }
 
     /// Establishes a Python project per the shared marker rule (`is_python_project`); `None`
-    /// when none of the markers exists. Environment facts recorded (in this order,
-    /// each only when present): `venv` (`.venv` or `venv`, whose `bin/python` becomes the absolute
-    /// `interpreter`), `tool` (`uv`, `poetry`), `python` (`.python-version`), `configured`
-    /// (`pyright`, `mypy`, `ruff`) and `formatter` (`black` or `ruff`, which `format_command`
-    /// reads back). Commands start from the manifests and are overridden by Makefile targets and
-    /// then by CI workflow `run:` lines, so CI wins.
+    /// when neither a marker exists nor any `.py`/`.pyi` file lies under `root` (a worktree with
+    /// Python files but no manifest still gets a project, with no manifests, no commands and a
+    /// `project` environment fact saying so, so the card can name it). Nested roots
+    /// (`python_roots`) are all listed: each nested root contributes its manifest paths
+    /// (relative to `root`), a `root` environment fact, and — when it holds a
+    /// virtual-environment directory — a `venv` fact whose `bin/python` becomes the absolute
+    /// `interpreter` of the first root that has one. Other environment facts recorded (in this
+    /// order, each only when present at the worktree root): `tool` (`uv`, `poetry`), `python`
+    /// (`.python-version`), `configured` (`pyright`, `mypy`, `ruff`) and `formatter` (`black` or
+    /// `ruff`, which `format_command` reads back). Commands start from the manifests and are
+    /// overridden by Makefile targets and then by CI workflow `run:` lines, so CI wins.
     fn detect(&self, root: &Path) -> Option<LanguageProject> {
-        if !is_python_project(root) {
-            return None;
+        let roots = python_roots(root);
+        if roots.is_empty() && !is_python_project(root) {
+            // Files without any manifest: the card still lists the language and says no project
+            // was found, instead of reporting nothing at all.
+            return has_files_with(root, &["py", "pyi"]).then(|| LanguageProject {
+                language: LANGUAGE,
+                manifests: Vec::new(),
+                environment: vec![(
+                    "project".to_owned(),
+                    "files present, no manifest found — checks unavailable".to_owned(),
+                )],
+                interpreter: None,
+                commands: ProjectCommands::default(),
+                entry_points: Vec::new(),
+            });
         }
         let names = entry_names(root);
         let has = |name: &str| root.join(name).is_file();
@@ -141,6 +248,33 @@ impl LanguageSupport for Python {
                 .filter(|name| name.starts_with("requirements") && name.ends_with(".txt"))
                 .map(PathBuf::from),
         );
+        // Every nested root contributes its own manifests, addressed relative to `root`, and a
+        // `root` fact so the card lists it.
+        let relative_manifests: Vec<PathBuf> = roots
+            .iter()
+            .filter(|project_root| project_root != &root)
+            .flat_map(|project_root| {
+                let project_names = entry_names(project_root);
+                let mut nested: Vec<PathBuf> = ["pyproject.toml", "setup.py", "setup.cfg"]
+                    .into_iter()
+                    .filter(|name| project_names.iter().any(|entry| entry == name))
+                    .map(|name| project_root.join(name))
+                    .collect();
+                nested.extend(
+                    project_names
+                        .iter()
+                        .filter(|name| is_requirements_txt(name))
+                        .map(|name| project_root.join(name)),
+                );
+                nested
+            })
+            .map(|path| {
+                path.strip_prefix(root)
+                    .map(Path::to_path_buf)
+                    .unwrap_or(path)
+            })
+            .collect();
+        manifests.extend(relative_manifests);
         let pyproject = read_text(root, "pyproject.toml");
         let setup_cfg = read_text(root, "setup.cfg");
 
@@ -148,13 +282,44 @@ impl LanguageSupport for Python {
         let mut fact =
             |name: &str, value: &str| environment.push((name.to_owned(), value.to_owned()));
         let mut interpreter = None;
-        for dir in [".venv", "venv"] {
-            let python = root.join(dir).join("bin").join("python");
-            if python.exists() {
+        for project_root in &roots {
+            let relative = project_root
+                .strip_prefix(root)
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if project_root != root {
+                fact("root", &relative);
+            }
+            if interpreter.is_none()
+                && let Some(venv) = venv_directories(project_root).into_iter().next()
+            {
+                let python = venv.join("bin").join("python");
                 // Not canonicalized: the venv's `python` is a symlink whose target loses the venv.
                 interpreter = Some(std::path::absolute(&python).unwrap_or(python));
-                fact("venv", dir);
-                break;
+                let venv_name = venv
+                    .strip_prefix(project_root)
+                    .ok()
+                    .and_then(|path| path.to_str())
+                    .unwrap_or(".venv");
+                if relative.is_empty() {
+                    fact("venv", venv_name);
+                } else {
+                    fact("venv", &format!("{relative}/{venv_name}"));
+                }
+            }
+        }
+        if roots.is_empty() {
+            // Only a root environment directory marks this worktree as Python: name it too.
+            if let Some(venv) = venv_directories(root).into_iter().next() {
+                let python = venv.join("bin").join("python");
+                interpreter = Some(std::path::absolute(&python).unwrap_or(python));
+                fact(
+                    "venv",
+                    venv.strip_prefix(root)
+                        .ok()
+                        .and_then(|path| path.to_str())
+                        .unwrap_or(".venv"),
+                );
             }
         }
         let uv = has("uv.lock");
@@ -1937,9 +2102,9 @@ FAILED tests/test_service.py::TestWorker::test_label
     #[test]
     /// The card's marker rule is the same shared list checks use: a root
     /// `requirements-dev.txt` registers (the old exact-`requirements.txt` check list missed it),
-    /// a nested `tools/requirements-ml.txt` registers through the depth-1 probe only beside a
-    /// `.py` file in the same directory, a vendor directory is never probed, a marker deeper
-    /// than depth 1 does not register, and a docs-only `docs/requirements.txt` does not either.
+    /// a nested `tools/requirements-ml.txt` registers through the nested-root probe only beside a
+    /// `.py` file in the same directory, a vendor directory is never probed, a marker two levels
+    /// down registers as a nested root, and a docs-only `docs/requirements.txt` does not.
     fn detect_uses_the_shared_marker_list_including_nested_requirements() {
         let root = scratch("requirements-dev-only");
         put(&root, "requirements-dev.txt", "pytest\n");
@@ -1962,7 +2127,10 @@ FAILED tests/test_service.py::TestWorker::test_label
         let project = Python
             .detect(&root)
             .expect("tools/requirements-ml.txt beside tools/analyze.py registers");
-        assert_eq!(project.manifests, Vec::<PathBuf>::new());
+        assert_eq!(
+            project.manifests,
+            [PathBuf::from("tools/requirements-ml.txt")]
+        );
         assert_eq!(
             project.commands.test.as_ref().unwrap().argv,
             argv(&["pytest"])
@@ -1989,9 +2157,135 @@ FAILED tests/test_service.py::TestWorker::test_label
         let root = scratch("deep-requirements");
         put(&root, "nested/deep/requirements.txt", "");
         put(&root, "nested/deep/lib.py", "");
+        let project = Python
+            .detect(&root)
+            .expect("a manifest two levels down registers as a nested root");
+        assert_eq!(
+            project.manifests,
+            [PathBuf::from("nested/deep/requirements.txt")]
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A monorepo with no manifest at the worktree root: the nested Python packages two levels
+    /// down are both discovered as roots (`python_roots`), every root is listed on the project
+    /// (one manifest per root, a `root` environment fact per package), and a sibling TypeScript
+    /// app neither adds nor hides a root. Files of the language with no manifest anywhere still
+    /// produce a project whose `project` fact says checks are unavailable.
+    #[test]
+    fn nested_packages_are_discovered_and_files_without_a_manifest_are_named() {
+        let root = scratch("nested-packages");
+        put(
+            &root,
+            "packages/alpha/pyproject.toml",
+            "[project]\nname = \"alpha\"\n",
+        );
+        put(&root, "packages/alpha/src/alpha/__init__.py", "");
+        put(
+            &root,
+            "packages/beta/pyproject.toml",
+            "[project]\nname = \"beta\"\n",
+        );
+        put(
+            &root,
+            "packages/beta/tests/test_beta.py",
+            "def test_beta():\n    pass\n",
+        );
+        put(&root, "apps/web/package.json", "{\"name\": \"web\"}\n");
+        assert_eq!(
+            python_roots(&root),
+            [root.join("packages/alpha"), root.join("packages/beta"),]
+        );
+        assert!(is_python_project(&root));
+        let project = Python.detect(&root).expect("nested roots register");
+        assert_eq!(
+            project.manifests,
+            [
+                PathBuf::from("packages/alpha/pyproject.toml"),
+                PathBuf::from("packages/beta/pyproject.toml"),
+            ]
+        );
+        let facts: Vec<&(String, String)> = project
+            .environment
+            .iter()
+            .filter(|(key, _)| key == "root")
+            .collect();
+        assert_eq!(
+            facts,
+            [
+                &("root".to_owned(), "packages/alpha".to_owned()),
+                &("root".to_owned(), "packages/beta".to_owned()),
+            ],
+            "every root is listed as an environment fact the card renders"
+        );
+        fs::remove_dir_all(&root).unwrap();
+
+        // Files of the language without any manifest: the card still lists Python and says no
+        // project was found, while the presence rule (and with it project checks) stays off.
+        let root = scratch("files-only");
+        put(&root, "scripts/analyze.py", "print('hi')\n");
+        assert!(!is_python_project(&root));
+        let project = Python
+            .detect(&root)
+            .expect("files alone still make a project");
+        assert!(project.manifests.is_empty());
+        assert_eq!(
+            project.environment,
+            vec![(
+                "project".to_owned(),
+                "files present, no manifest found — checks unavailable".to_owned()
+            )]
+        );
+        assert_eq!(project.commands, ProjectCommands::default());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Environment discovery beside a Python root: the conventional `.venv` wins, a suffixed
+    /// sibling (`.venv-py314`, `venv310`) is found when it holds `bin/python`, and a directory
+    /// without one is ignored. The first root with an environment names the `venv` fact and the
+    /// interpreter; a suffixed environment beside a nested root is named with the root prefix.
+    #[test]
+    fn suffixed_venv_directories_are_discovered_beside_each_root() {
+        let root = scratch("suffixed-venv");
+        put(&root, "pyproject.toml", "[project]\nname = \"svc\"\n");
+        put(&root, ".venv-py314/bin/python", "");
+        put(&root, "venv-empty/lib", "");
+        let venvs = venv_directories(&root);
+        assert_eq!(
+            venvs,
+            [root.join(".venv-py314")],
+            "only a directory holding bin/python counts"
+        );
+        let project = Python.detect(&root).expect("root manifest registers");
+        assert_eq!(
+            project.interpreter,
+            Some(root.join(".venv-py314/bin/python")),
+            "the suffixed environment's interpreter is used"
+        );
         assert!(
-            Python.detect(&root).is_none(),
-            "the probe is depth-1, never a tree walk"
+            project
+                .environment
+                .iter()
+                .any(|(key, value)| key == "venv" && value == ".venv-py314")
+        );
+        fs::remove_dir_all(&root).unwrap();
+
+        let root = scratch("nested-suffixed-venv");
+        put(&root, "packages/alpha/pyproject.toml", "");
+        put(&root, "packages/alpha/src/a.py", "");
+        put(&root, "packages/alpha/.venv-314/bin/python", "");
+        put(&root, "packages/beta/pyproject.toml", "");
+        put(&root, "packages/beta/tests/test_b.py", "");
+        let project = Python.detect(&root).expect("nested roots register");
+        assert_eq!(
+            project.interpreter,
+            Some(root.join("packages/alpha/.venv-314/bin/python"))
+        );
+        assert!(
+            project
+                .environment
+                .iter()
+                .any(|(key, value)| { key == "venv" && value == "packages/alpha/.venv-314" })
         );
         fs::remove_dir_all(&root).unwrap();
     }

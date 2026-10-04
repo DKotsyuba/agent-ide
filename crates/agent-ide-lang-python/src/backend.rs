@@ -203,7 +203,7 @@ impl PyrightBackend {
             cache_namespace,
         })
         .map_err(|_| FailureCode::ExecutionProfile)?
-        .with_interpreter(crate::checks::resolve_interpreter(
+        .with_interpreter(crate::checks::session_interpreter(
             authority.worktree().worktree_path(),
         ));
         let worktree = PyrightWorktree::new(
@@ -308,7 +308,10 @@ impl PyrightBackend {
     ///
     /// The exchange always waits (bounded) for the document's diagnostics push. A failed or
     /// cancelled exchange retires the session; cancellation maps to `Cancelled`, any other
-    /// failure to `ProviderUnavailable`.
+    /// failure to `ProviderUnavailable`. When the worktree has no Python environment at all, the
+    /// push's per-import `Import "..." could not be resolved` flood is collapsed into the single
+    /// line [`MISSING_ENVIRONMENT_IMPORTS`] (see [`summarize_missing_environment`]); every other
+    /// diagnostic survives untouched.
     async fn answer(
         &mut self,
         host: &mut dyn ProviderHost,
@@ -320,7 +323,7 @@ impl PyrightBackend {
     ) -> Result<ProviderContext, FailureCode> {
         let binding = job.binding().clone();
         self.ensure(host, job, launch, source).await?;
-        let (result, diagnostics) = {
+        let (result, mut diagnostics) = {
             let entry = self.live.get_mut(&binding).ok_or(FailureCode::Internal)?;
             server::exchange_context(&mut entry.live, job, source, bytes, query, true).await
         };
@@ -335,6 +338,9 @@ impl PyrightBackend {
                 };
             }
         };
+        if crate::checks::session_interpreter(source.worktree().worktree_path()).is_none() {
+            summarize_missing_environment(&mut diagnostics);
+        }
         let outcome = ProviderContext {
             context,
             diagnostics,
@@ -430,4 +436,49 @@ impl ServerBackend for PyrightBackend {
     fn live_bindings(&self) -> Vec<BindingRef> {
         self.live.keys().cloned().collect()
     }
+}
+
+/// The single line that replaces pyright's per-import resolution flood when the worktree has no
+/// Python environment: without one, no import is checked at all, so thirty `Import "numpy"
+/// could not be resolved` messages carry no signal.
+const MISSING_ENVIRONMENT_IMPORTS: &str = "python environment not found — imports are not checked";
+
+/// Pyright rules that only report an import the configured environment could not resolve.
+const IMPORT_RESOLUTION_RULES: [&str; 2] = ["reportMissingImports", "reportMissingModuleSource"];
+
+/// Collapses the import-resolution diagnostics of `diagnostics` into the one
+/// [`MISSING_ENVIRONMENT_IMPORTS`] line; the caller has already established that the worktree
+/// has no Python environment. Diagnostics of every other rule survive untouched, and the line is
+/// appended after them, so an edit reply says why its imports were not checked exactly once.
+fn summarize_missing_environment(
+    diagnostics: &mut agent_ide_core::intelligence::session::DiagnosticSnapshot,
+) {
+    if !diagnostics.diagnostics.iter().any(is_import_resolution) {
+        return;
+    }
+    let first = diagnostics
+        .diagnostics
+        .iter()
+        .find(|diagnostic| is_import_resolution(diagnostic))
+        .cloned();
+    diagnostics
+        .diagnostics
+        .retain(|diagnostic| !is_import_resolution(diagnostic));
+    let mut line = first.unwrap_or_default();
+    line.message = MISSING_ENVIRONMENT_IMPORTS.to_owned();
+    line.code = None;
+    diagnostics.diagnostics.push(line);
+    diagnostics.truncated = false;
+}
+
+/// Reports whether one pyright diagnostic only names an import the environment could not resolve.
+fn is_import_resolution(diagnostic: &async_lsp::lsp_types::Diagnostic) -> bool {
+    diagnostic
+        .code
+        .as_ref()
+        .and_then(|code| match code {
+            async_lsp::lsp_types::NumberOrString::String(rule) => Some(rule.as_str()),
+            _ => None,
+        })
+        .is_some_and(|rule| IMPORT_RESOLUTION_RULES.contains(&rule))
 }

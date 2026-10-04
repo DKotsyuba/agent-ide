@@ -108,6 +108,46 @@ impl PythonChecker {
     /// points. This function performs no process execution and no writes; it is deterministic for
     /// a fixed filesystem state, which is what its unit tests rely on.
     pub fn pyright_spec(&self, request: &CheckRequest, interpreter: &Path) -> RunSpec {
+        self.pyright_spec_for_root(request, &request.worktree.clone(), interpreter)
+    }
+
+    /// Builds the [`RunSpec`] for one pyright run against the Python root `project_root` — the
+    /// worktree itself, or one of `python_roots`'s nested package roots — using
+    /// the already-resolved `interpreter` (as returned by [`resolve_interpreter`], not yet
+    /// canonicalized).
+    ///
+    /// `interpreter` itself — not its canonical form — is what `--pythonpath` receives: a
+    /// uv-managed (or otherwise symlinked) venv's `bin/python` is a symlink to a base
+    /// installation's interpreter, and Python's own venv detection keys off `pyvenv.cfg` sitting
+    /// next to the symlink it was *invoked as* (`sys._base_executable`/`sys.prefix` resolution),
+    /// not next to whatever that symlink resolves to. Passing the canonical (resolved) path here
+    /// would make pyright run the base interpreter as if it had no venv, so it would never see
+    /// the venv's `site-packages`. `interpreter` still takes precedence over any `venvPath`/`venv`
+    /// pyright would otherwise read from `pyrightconfig.json`/`pyproject.toml` itself: pyright
+    /// gives an explicit `--pythonpath` priority over its own config-driven venv resolution, so
+    /// the two sources cannot disagree here.
+    ///
+    /// `--project` is `project_root`'s own `pyrightconfig.json` when one is readable there, else
+    /// `project_root` itself, so a nested package's own configuration governs its run. A nested
+    /// root is also added to `read_roots` (the worktree always is). `interpreter` is canonicalized
+    /// only to derive `read_roots` (falling back to the given path if canonicalization fails,
+    /// which only happens if the file was removed between resolution and this call): the canonical
+    /// path's installation prefix (its parent-of-parent) is added so the confinement profile
+    /// covers the real interpreter binary and its standard library — pyright starts `interpreter`
+    /// to enumerate its own search paths, and under Seatbelt that exec follows the symlink to a
+    /// location outside the venv — including the directory `pyvenv.cfg`'s `home` key names (the
+    /// base prefix's own `bin`, already inside that prefix). `interpreter`'s own parent-of-parent
+    /// (the venv root, e.g. a `.venv` directory) is added to `read_roots` unresolved, because
+    /// pyright reads the venv's own layout (for example `pyvenv.cfg` and `site-packages`)
+    /// independently of where its `python` symlink ultimately points. This function performs no
+    /// process execution and no writes; it is deterministic for a fixed filesystem state, which
+    /// is what its unit tests rely on.
+    pub fn pyright_spec_for_root(
+        &self,
+        request: &CheckRequest,
+        project_root: &Path,
+        interpreter: &Path,
+    ) -> RunSpec {
         let canonical_interpreter = if request.read_denies.is_empty() {
             fs::canonicalize(interpreter).unwrap_or_else(|_| interpreter.to_path_buf())
         } else {
@@ -116,11 +156,11 @@ impl PythonChecker {
         };
 
         let project = {
-            let config = request.worktree.join(PYRIGHT_CONFIG_FILE);
+            let config = project_root.join(PYRIGHT_CONFIG_FILE);
             if allowed_config(&config, &request.read_denies) {
                 config
             } else {
-                request.worktree.clone()
+                project_root.to_path_buf()
             }
         };
 
@@ -135,6 +175,13 @@ impl PythonChecker {
             .map(|home| home.to_string_lossy().into_owned())
             .unwrap_or_default();
         let path_env = format!("{}:/usr/bin:/bin", node_bin_dir.display());
+
+        let mut read_roots = vec![request.worktree.clone()];
+        if project_root != request.worktree {
+            read_roots.push(project_root.to_path_buf());
+        }
+        read_roots.extend([node_root, pyright_root, venv_root, base_prefix]);
+        read_roots.push(PathBuf::from("/private/etc"));
 
         RunSpec {
             program: self.node.clone(),
@@ -152,14 +199,7 @@ impl PythonChecker {
                 ("HOME".to_string(), home),
                 ("TMPDIR".to_string(), tmp_dir.display().to_string()),
             ],
-            read_roots: vec![
-                request.worktree.clone(),
-                node_root,
-                pyright_root,
-                venv_root,
-                base_prefix,
-                PathBuf::from("/private/etc"),
-            ],
+            read_roots,
             write_roots: vec![request.cache_dir.clone()],
             read_denies: request.read_denies.clone(),
             timeout: self.timeout,
@@ -186,15 +226,16 @@ impl Checker for PythonChecker {
                     generation,
                 );
             }
-            let Some(interpreter) =
-                resolve_interpreter_with_denies(&request.worktree, &request.read_denies)
-            else {
-                return ProblemSnapshot::unavailable(
-                    crate::LANGUAGE,
-                    UnavailableReason::EnvMissing,
-                    generation,
-                );
-            };
+            // One pyright run per Python root (`python_roots`: the worktree when it declares a
+            // manifest, else each nested package root; a worktree marked Python only by its root
+            // environment directory checks as a single root). A root with no resolvable
+            // environment is skipped — running pyright without an interpreter would only flood
+            // unresolved-import errors — and only a worktree whose every root lacks one reports
+            // `EnvMissing`.
+            let mut roots = crate::support::python_roots(&request.worktree);
+            if roots.is_empty() {
+                roots.push(request.worktree.clone());
+            }
             let tmp_dir = request.cache_dir.join("tmp");
             if let Err(error) = fs::create_dir_all(&tmp_dir) {
                 return ProblemSnapshot::unavailable_with_detail(
@@ -205,41 +246,112 @@ impl Checker for PythonChecker {
                     run_failure_cause(error.to_string().as_bytes(), None),
                 );
             }
-            let spec = self.pyright_spec(&request, &interpreter);
             let started = Instant::now();
-            let output = match self.runner.run(spec).await {
-                Ok(output) => output,
-                Err(error) => {
-                    return ProblemSnapshot::unavailable_with_detail(
+            let mut snapshots = Vec::new();
+            for root in &roots {
+                let Some(interpreter) = resolve_interpreter_with_denies(root, &request.read_denies)
+                    .or_else(|| {
+                        resolve_interpreter_with_denies(&request.worktree, &request.read_denies)
+                    })
+                else {
+                    continue;
+                };
+                let spec = self.pyright_spec_for_root(&request, root, &interpreter);
+                let output = match self.runner.run(spec).await {
+                    Ok(output) => output,
+                    Err(error) => {
+                        return ProblemSnapshot::unavailable_with_detail(
+                            crate::LANGUAGE,
+                            UnavailableReason::Fatal,
+                            generation,
+                            started.elapsed().as_millis() as u64,
+                            run_failure_cause(error.to_string().as_bytes(), None),
+                        );
+                    }
+                };
+                if output.timed_out {
+                    return ProblemSnapshot::unavailable(
                         crate::LANGUAGE,
-                        UnavailableReason::Fatal,
+                        UnavailableReason::Timeout,
                         generation,
-                        started.elapsed().as_millis() as u64,
-                        run_failure_cause(error.to_string().as_bytes(), None),
                     );
                 }
-            };
-            if output.timed_out {
+                let duration_ms = started.elapsed().as_millis() as u64;
+                let mut snapshot = parse_pyright_output_with_denies(
+                    output.status,
+                    &output.stdout,
+                    &output.stderr,
+                    generation,
+                    duration_ms,
+                    &request.worktree,
+                    &request.read_denies,
+                );
+                relativize_paths(&mut snapshot, &request.worktree);
+                snapshots.push(snapshot);
+            }
+            if snapshots.is_empty() {
+                // Every root lacked an environment (or there was no root at all): the durable
+                // condition, not a failed run.
                 return ProblemSnapshot::unavailable(
                     crate::LANGUAGE,
-                    UnavailableReason::Timeout,
+                    UnavailableReason::EnvMissing,
                     generation,
                 );
             }
-            let duration_ms = started.elapsed().as_millis() as u64;
-            let mut snapshot = parse_pyright_output_with_denies(
-                output.status,
-                &output.stdout,
-                &output.stderr,
-                generation,
-                duration_ms,
-                &request.worktree,
-                &request.read_denies,
-            );
-            relativize_paths(&mut snapshot, &request.worktree);
-            snapshot
+            if snapshots.len() == 1 {
+                return snapshots.pop().expect("one snapshot checked above");
+            }
+            merge_root_snapshots(snapshots, generation, started.elapsed().as_millis() as u64)
         })
     }
+}
+
+/// Folds the per-root pyright snapshots of one check run into the single snapshot the scheduler
+/// stores for `(worktree, python)`.
+///
+/// Problems are concatenated and rebuilt through [`ProblemSnapshot::from_problems`], so the
+/// merged result deduplicates, counts and caps exactly like a single run's. The state is the
+/// strongest any run proved: a transient `Fatal`/`Timeout` run alongside a usable `Ready`/
+/// `Partial` result downgrades that result to `Partial` (that root's files are uncovered), a
+/// usable result with no such run keeps its own state, and a worktree where no run was usable
+/// returns the first transient failure outright. `duration_ms` is the whole run's wall clock.
+fn merge_root_snapshots(
+    snapshots: Vec<ProblemSnapshot>,
+    generation: u64,
+    duration_ms: u64,
+) -> ProblemSnapshot {
+    let mut fatal: Option<ProblemSnapshot> = None;
+    let mut usable: Option<&ProblemSnapshot> = None;
+    for snapshot in &snapshots {
+        match &snapshot.state {
+            CheckState::Ready | CheckState::Partial => {
+                usable = Some(match usable {
+                    Some(existing) if existing.state == CheckState::Ready => existing,
+                    _ => snapshot,
+                });
+            }
+            CheckState::Unavailable(UnavailableReason::Fatal | UnavailableReason::Timeout) => {
+                fatal.get_or_insert(snapshot.clone());
+            }
+            CheckState::Unavailable(_) | CheckState::Checking => {}
+        }
+    }
+    let Some(usable) = usable else {
+        // No run produced a usable result: the first transient failure explains the run; with
+        // none, the shared durable state (every run e.g. `NoFiles`) stands.
+        return fatal.unwrap_or_else(|| snapshots[0].clone());
+    };
+    let state = if fatal.is_some() {
+        CheckState::Partial
+    } else {
+        usable.state.clone()
+    };
+    let problems = snapshots
+        .iter()
+        .filter(|snapshot| matches!(snapshot.state, CheckState::Ready | CheckState::Partial))
+        .flat_map(|snapshot| snapshot.problems.iter().cloned())
+        .collect();
+    ProblemSnapshot::from_problems(crate::LANGUAGE, state, problems, generation, duration_ms)
 }
 
 /// Returns `path`'s parent directory, or `path` itself when it has none (for example a bare
@@ -275,39 +387,55 @@ fn relativize_paths(snapshot: &mut ProblemSnapshot, worktree: &Path) {
     }
 }
 
-/// Resolves the Python interpreter pyright should use for `worktree`, per EYES-r2 §4.
+/// Resolves the Python interpreter pyright should use beside `root`, per EYES-r2 §4.
 ///
-/// Tries, in order: (1) `venvPath`/`venv` from `<worktree>/pyrightconfig.json`; (2) the same two
-/// keys from the `[tool.pyright]` table of `<worktree>/pyproject.toml`; (3)
-/// `<worktree>/.venv/bin/python`. Each source is authoritative once it defines both keys: if the
-/// resulting `<venvPath>/<venv>/bin/python` does not exist as a file, resolution stops there and
-/// returns `None` rather than silently falling through to a later source that might resolve to a
-/// different, unintended interpreter. Returns `None` when no source names an existing interpreter
-/// file, which the checker maps to [`UnavailableReason::EnvMissing`] without ever invoking
-/// pyright (a missing environment must never produce the flood of unresolved-import errors that
-/// running pyright without a venv would report).
-pub fn resolve_interpreter(worktree: &Path) -> Option<PathBuf> {
-    resolve_interpreter_with_denies(worktree, &[])
+/// Tries, in order: (1) `venvPath`/`venv` from `<root>/pyrightconfig.json`; (2) the same two
+/// keys from the `[tool.pyright]` table of `<root>/pyproject.toml`; (3) the environment
+/// directories beside `root` (`venv_directories`: `.venv`/`venv`, then any
+/// `.venv*`/`venv*` sibling such as `.venv-py314`). Each source is authoritative once it defines
+/// both keys: if the resulting `<venvPath>/<venv>/bin/python` does not exist as a file,
+/// resolution stops there and returns `None` rather than silently falling through to a later
+/// source that might resolve to a different, unintended interpreter. Returns `None` when no
+/// source names an existing interpreter file, which the checker maps to
+/// [`UnavailableReason::EnvMissing`] without ever invoking pyright (a missing environment must
+/// never produce the flood of unresolved-import errors that running pyright without a venv would
+/// report).
+pub fn resolve_interpreter(root: &Path) -> Option<PathBuf> {
+    resolve_interpreter_with_denies(root, &[])
 }
 
 /// Resolves the interpreter without probing any host-denied config or executable path.
 fn resolve_interpreter_with_denies(
-    worktree: &Path,
+    root: &Path,
     denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
 ) -> Option<PathBuf> {
     if [PYRIGHT_CONFIG_FILE, PYPROJECT_FILE]
         .iter()
-        .any(|name| denies.iter().any(|deny| deny.matches(&worktree.join(name))))
+        .any(|name| denies.iter().any(|deny| deny.matches(&root.join(name))))
     {
         return None;
     }
-    if let Some((venv_path, venv)) = read_pyrightconfig_venv_keys(worktree, denies) {
-        return existing_python(venv_interpreter_path(worktree, &venv_path, &venv), denies);
+    if let Some((venv_path, venv)) = read_pyrightconfig_venv_keys(root, denies) {
+        return existing_python(venv_interpreter_path(root, &venv_path, &venv), denies);
     }
-    if let Some((venv_path, venv)) = read_pyproject_venv_keys(worktree, denies) {
-        return existing_python(venv_interpreter_path(worktree, &venv_path, &venv), denies);
+    if let Some((venv_path, venv)) = read_pyproject_venv_keys(root, denies) {
+        return existing_python(venv_interpreter_path(root, &venv_path, &venv), denies);
     }
-    existing_python(worktree.join(".venv").join("bin").join("python"), denies)
+    crate::support::venv_directories(root)
+        .into_iter()
+        .find_map(|venv| existing_python(venv.join("bin").join("python"), denies))
+}
+
+/// The interpreter for the shared Pyright session of a worktree: the environment beside the
+/// worktree root when one exists, else the first nested Python root (`python_roots`) that has
+/// one, so a monorepo whose environments live beside its packages serves its Python files from
+/// the package environment rather than none at all.
+pub fn session_interpreter(worktree: &Path) -> Option<PathBuf> {
+    resolve_interpreter_with_denies(worktree, &[]).or_else(|| {
+        crate::support::python_roots(worktree)
+            .iter()
+            .find_map(|root| resolve_interpreter_with_denies(root, &[]))
+    })
 }
 
 /// Joins `venvPath`/`venv` into the `bin/python` interpreter path they name.
@@ -740,11 +868,41 @@ impl LanguageChecks for PythonChecks {
     /// Python is present iff the worktree matches the shared marker rule
     /// (`is_python_project`, the same list the project card uses): root
     /// `pyproject.toml`/`setup.py`/`setup.cfg`/`Pipfile`/`pyrightconfig.json`/`requirements*.txt`,
-    /// a `.venv`/`venv` directory, or a bounded depth-1 probe of immediate subdirectories whose
-    /// nested marker sits beside at least one `.py` file. This deliberately never walks the tree
-    /// for source files.
+    /// a `.venv`/`venv` directory, or any of the nested package roots
+    /// `python_roots` discovers from manifests two levels down. This
+    /// deliberately never walks the tree for source files.
     fn is_present(&self, worktree: &Path) -> bool {
         crate::support::is_python_project(worktree)
+    }
+
+    /// A Python file below no discovered root is never analyzed, and so is a file whose only
+    /// covering root declares no environment (its pyright run is skipped, not run half-blind).
+    /// `path` may arrive worktree-relative (the edit reply names files that way); it is joined
+    /// against `worktree` before the roots are compared.
+    fn not_analysed(&self, worktree: &Path, path: &Path) -> Option<&'static str> {
+        let roots = crate::support::python_roots(worktree);
+        if roots.is_empty() {
+            return None;
+        }
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            worktree.join(path)
+        };
+        let covering: Vec<&PathBuf> = roots
+            .iter()
+            .filter(|root| absolute.starts_with(root.as_path()))
+            .collect();
+        if covering.is_empty() {
+            return Some("no Python project root covers this file");
+        }
+        let worktree_environment = resolve_interpreter_with_denies(worktree, &[]).is_some();
+        covering
+            .iter()
+            .all(|root| {
+                resolve_interpreter_with_denies(root, &[]).is_none() && !worktree_environment
+            })
+            .then_some("the Python project root beside this file has no environment")
     }
 
     /// `pyright`.
@@ -987,13 +1145,13 @@ mod deny_tests {
         }
     }
 
-    /// The bounded depth-1 probe: a script directory such as `tools/` carrying
+    /// The bounded nested-root probe: a script directory such as `tools/` carrying
     /// `requirements-ml.txt` or a nested `pyproject.toml` registers Python when the same
     /// subdirectory holds at least one `.py` file; a marker alone — a Sphinx
     /// `docs/requirements.txt` in a non-Python repository — does not. The probe never recurses
     /// (`nested/deep/requirements.txt` stays invisible) and skips hidden and vendor directories.
     #[test]
-    fn is_present_python_accepts_depth_one_nested_markers_only() {
+    fn is_present_python_accepts_nested_markers_only() {
         let dir = scratch_dir("python-presence-nested-tools");
         assert!(!PythonChecks.is_present(&dir));
         std::fs::create_dir_all(dir.join("tools")).unwrap();
@@ -1030,8 +1188,8 @@ mod deny_tests {
         std::fs::write(dir.join("nested/deep/requirements.txt"), "").unwrap();
         std::fs::write(dir.join("nested/deep/lib.py"), "").unwrap();
         assert!(
-            !PythonChecks.is_present(&dir),
-            "the probe is depth-1 and never walks the tree"
+            PythonChecks.is_present(&dir),
+            "a manifest two levels down beside a .py file registers as a nested root"
         );
     }
 

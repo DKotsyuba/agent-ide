@@ -764,6 +764,21 @@ pub trait LanguageSupport: Send + Sync {
         false
     }
 
+    /// Whether [`LanguageSupport::outline_from_source`] answers `ide.outline`, `ide.read` and
+    /// symbol-addressed `ide.edit` when the language's registered server refused to verify the
+    /// file's project inputs (`resolution_unverified`, for example a project configuration the
+    /// exact-resolution rules refuse). `false` (the default) keeps the refusal.
+    ///
+    /// Unlike [`LanguageSupport::outline_while_loading`] this state is terminal for the file —
+    /// no later server answer is lost by answering now — so the obligation is only the equality
+    /// one: every `Some` outline must equal what [`LanguageSupport::normalize`] makes of the
+    /// server's symbols, and a text that cannot meet it must answer `None` (keeping the
+    /// refusal). An address the source outline does not contain answers `unknown_symbol`, which
+    /// names exactly what the source scan proved.
+    fn outline_when_resolution_unverified(&self) -> bool {
+        false
+    }
+
     /// Whether tests live only in files [`LanguageSupport::is_test_file`] accepts, so a path
     /// target that is not a test file can be answered "no tests" without running anything.
     /// Defaults to `false`: tests may sit next to the code they test.

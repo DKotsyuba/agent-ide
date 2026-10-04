@@ -12521,6 +12521,370 @@ async fn configured_product_pyright_semantics_and_checks() {
     daemon.wait().await.unwrap();
 }
 
+/// Builds the `pyvenv.cfg` + `bin/python` symlink pair of a fixture environment beside `dir`,
+/// pointing at the approved `AGENT_IDE_PYTHON` interpreter (the pattern of the root-venv test).
+fn python_venv_at(dir: &Path, name: &str) {
+    use std::os::unix::fs::symlink;
+
+    let python = PathBuf::from(std::env::var_os("AGENT_IDE_PYTHON").unwrap());
+    assert!(python.is_file(), "approved Python interpreter is available");
+    let venv = dir.join(name);
+    let interpreter = venv.join("bin/python");
+    std::fs::create_dir_all(interpreter.parent().unwrap()).unwrap();
+    symlink(&python, &interpreter).unwrap();
+    std::fs::write(
+        venv.join("pyvenv.cfg"),
+        format!(
+            "home = {}\ninclude-system-site-packages = false\nversion = 3.14.3\n",
+            python.parent().unwrap().display()
+        ),
+    )
+    .unwrap();
+}
+
+/// Adds the real confined-Pyright project check to a fixture's launcher configuration, using the
+/// accepted `AGENT_IDE_NODE` executable and the `dist/pyright.js` CLI module of the
+/// `AGENT_IDE_PYRIGHT` installation, so `ide.context {kind:"problems"}` exercises Python checks.
+fn enable_real_pyright_checks(fixture: &ProductFixture) {
+    let pyright = std::env::var("AGENT_IDE_PYRIGHT").unwrap();
+    let pyright_cli = std::path::Path::new(&pyright)
+        .parent()
+        .and_then(Path::parent)
+        .map(|bin| bin.join("lib/node_modules/pyright/dist/pyright.js"))
+        .map(|cli| std::fs::canonicalize(&cli).unwrap_or(cli))
+        .expect("the pyright CLI module sits beside the language server");
+    assert!(
+        pyright_cli.is_file(),
+        "pyright CLI module found: {pyright_cli:?}"
+    );
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    config["project_checks"] = json!({
+        "debounce_ms":100,
+        "python":{"node":std::env::var("AGENT_IDE_NODE").unwrap(),"pyright_cli":pyright_cli}
+    });
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+}
+
+/// A monorepo with no manifest at the worktree root: both nested Python package roots are
+/// listed on the card, the confined pyright check answers the language's problems page, and a
+/// `.py` edit inside a package answers `current_clean` for the exact post-edit source.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT, AGENT_IDE_NODE and AGENT_IDE_PYTHON environments"]
+async fn configured_product_nested_python_packages_are_listed_checked_and_edited() {
+    let fixture = ProductFixture::new(json!([accepted_pyright_provider("pyright-nested-cache")]));
+    enable_real_pyright_checks(&fixture);
+    for package in ["alpha", "beta"] {
+        let dir = fixture.root.join(format!("packages/{package}"));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            format!("[project]\nname = \"{package}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/lib.py"),
+            "def value() -> int:\n    return 8\n",
+        )
+        .unwrap();
+        python_venv_at(&dir, ".venv");
+    }
+    std::fs::create_dir_all(fixture.root.join("apps/web")).unwrap();
+    std::fs::write(
+        fixture.root.join("apps/web/package.json"),
+        "{\"name\": \"web\"}\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "packages"]);
+    fixture.git(&["commit", "--quiet", "-m", "nested packages fixture"]);
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "pyright-nested").await;
+    let start = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"pyright-nested-start"}),
+        )
+        .await;
+    let start = actor.settle(&fixture, start).await;
+    assert_eq!(start["kind"], "activation", "{start}");
+    let card = start["text"].as_str().unwrap();
+    assert!(
+        card.contains("python root packages/alpha") && card.contains("python root packages/beta"),
+        "every nested root is listed on the card:\n{card}"
+    );
+    assert!(
+        card.contains("python venv packages/alpha/.venv"),
+        "the card names the environment the session uses:\n{card}"
+    );
+
+    // The problems page names the language once the per-root checks land; every call re-arms
+    // them, so polling is the loop a real session drives through its hooks.
+    let mut problems_text = String::new();
+    for _ in 0..40 {
+        let problems = actor
+            .call(
+                &fixture,
+                "ide.context",
+                json!({"kind":"problems","language":"python"}),
+            )
+            .await;
+        let problems = actor.settle(&fixture, problems).await;
+        assert_eq!(problems["kind"], "context", "{problems}");
+        problems_text = problems["text"].as_str().unwrap().to_owned();
+        if problems_text.contains("python: ready") || problems_text.contains("python: partial") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert!(
+        problems_text.contains("python: ready; errors:")
+            || problems_text.contains("python: partial; errors:"),
+        "the nested roots' merged check answers the problems page:\n{problems_text}"
+    );
+
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"packages/beta/src/lib.py","lines":"2-2"}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    assert_eq!(read["kind"], "read", "{read}");
+    let edit = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"pyright-nested-edit",
+                "path":"packages/beta/src/lib.py",
+                "source_ref":read["detail_ref"],
+                "lines":"2-2",
+                "content":"    return 9"
+            }),
+        )
+        .await;
+    let edit = actor.settle(&fixture, edit).await;
+    assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
+    assert_eq!(
+        edit["diagnostics"]["state"], "current_clean",
+        "a .py edit inside a nested root answers current diagnostics: {edit}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A suffixed environment directory (`.venv-py314`) beside the manifest is discovered, named on
+/// the card, and used by the session: a stub package import resolves with no diagnostics.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT, AGENT_IDE_NODE and AGENT_IDE_PYTHON environments"]
+async fn configured_product_suffixed_venv_is_discovered_and_used() {
+    let fixture = ProductFixture::new(json!([accepted_pyright_provider(
+        "pyright-suffixed-venv-cache"
+    )]));
+    std::fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[project]\nname = \"svc\"\n",
+    )
+    .unwrap();
+    python_venv_at(&fixture.root, ".venv-py314");
+    let site_packages = fixture
+        .root
+        .join(".venv-py314/lib/python3.14/site-packages/stub_package");
+    std::fs::create_dir_all(&site_packages).unwrap();
+    std::fs::write(site_packages.join("__init__.py"), "VALUE: int = 42\n").unwrap();
+    std::fs::write(
+        fixture.root.join("src/svc.py"),
+        "from stub_package import VALUE\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "suffixed venv fixture"]);
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "pyright-suffixed").await;
+    let start = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"pyright-suffixed-start"}),
+        )
+        .await;
+    let start = actor.settle(&fixture, start).await;
+    assert_eq!(start["kind"], "activation", "{start}");
+    let card = start["text"].as_str().unwrap();
+    assert!(
+        card.contains("python venv .venv-py314"),
+        "the card names the suffixed environment it uses:\n{card}"
+    );
+    let response = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"src/svc.py","byte_offset":6}),
+        )
+        .await;
+    let response = actor.settle(&fixture, response).await;
+    assert_eq!(response["kind"], "context", "{response}");
+    let text = response["text"].as_str().unwrap();
+    assert!(text.contains("mode: semantic"), "{response}");
+    assert!(text.contains("diagnostic_count: 0"), "{response}");
+    assert!(!text.contains("reportMissingImports"), "{response}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Usages cross packages: a function defined in package `alpha` reports its call site in package
+/// `beta`'s tests, both nested roots of the same worktree — the sibling import resolves through
+/// the packages directory, and the session analyzes unopened files (the raw server default of
+/// open-files-only would answer `usages: 0`).
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
+async fn configured_product_pyright_usages_cross_nested_packages() {
+    let fixture = ProductFixture::new(json!([accepted_pyright_provider(
+        "pyright-cross-package-cache"
+    )]));
+    let alpha = fixture.root.join("packages/alpha");
+    let beta = fixture.root.join("packages/beta/tests");
+    std::fs::create_dir_all(&alpha).unwrap();
+    std::fs::create_dir_all(&beta).unwrap();
+    std::fs::write(
+        fixture.root.join("packages/alpha/pyproject.toml"),
+        "[project]\nname = \"alpha\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("packages/beta/pyproject.toml"),
+        "[project]\nname = \"beta\"\n",
+    )
+    .unwrap();
+    std::fs::write(alpha.join("__init__.py"), "").unwrap();
+    std::fs::write(
+        alpha.join("core.py"),
+        "def shared() -> int:\n    return 8\n",
+    )
+    .unwrap();
+    std::fs::write(
+        beta.join("test_beta.py"),
+        "from alpha.core import shared\n\ndef test_shared():\n    assert shared() == 8\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "packages"]);
+    fixture.git(&["commit", "--quiet", "-m", "cross-package fixture"]);
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "pyright-cross").await;
+    let start = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"pyright-cross-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, start).await["kind"], "activation");
+    // Pyright answers workspace-wide references only once its background analysis of the
+    // unopened files has completed; a session drives that with repeated calls, so poll.
+    let mut text = String::new();
+    for _ in 0..120 {
+        let symbol = actor
+            .call(
+                &fixture,
+                "ide.symbol",
+                json!({"symbol":"packages/alpha/core.py#shared"}),
+            )
+            .await;
+        let symbol = actor.settle(&fixture, symbol).await;
+        assert_eq!(symbol["kind"], "symbol", "{symbol}");
+        text = symbol["text"].as_str().unwrap().to_owned();
+        if text.contains("packages/beta/tests/test_beta.py") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(
+        text.contains("usages: 2 in 1 files"),
+        "usages answer for the definition:\n{text}"
+    );
+    assert!(
+        text.contains("packages/beta/tests/test_beta.py"),
+        "the call site in package beta's tests is reported:\n{text}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A `.tsx` document whose tsconfig restricts `compilerOptions.types` (a policy the exact
+/// resolution rules refuse) still answers `ide.read` by symbol from its source outline, exactly
+/// as `.ts` documents do, with the refusal reason in the lexical footer.
+#[tokio::test]
+#[ignore = "requires exact AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER environment"]
+async fn configured_product_tsx_read_falls_back_to_source_when_resolution_is_unverified() {
+    let fixture = ProductFixture::new(json!([accepted_typescript_provider()]));
+    let web = fixture.root.join("apps/web/src");
+    std::fs::create_dir_all(&web).unwrap();
+    std::fs::write(
+        fixture.root.join("apps/web/package.json"),
+        "{\"name\": \"web\", \"private\": true}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("apps/web/tsconfig.json"),
+        "{\n  \"compilerOptions\": {\n    \"types\": [\"node\"],\n    \"moduleResolution\": \"node10\"\n  },\n  \"include\": [\"src\"]\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        web.join("App.tsx"),
+        "export function Card({ title }: { title: string }) {\n  return <section>{title}</section>;\n}\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "apps"]);
+    fixture.git(&["commit", "--quiet", "-m", "tsx fixture"]);
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "tsx-restricted").await;
+    let start = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"tsx-restricted-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, start).await["kind"], "activation");
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"symbol":"apps/web/src/App.tsx#Card"}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    assert_eq!(read["kind"], "read", "{read}");
+    let text = read["text"].as_str().unwrap();
+    assert!(
+        text.contains("export function Card"),
+        "the component body answers instead of a refusal:\n{text}"
+    );
+    assert!(
+        text.contains("outline: from source, exact"),
+        "the reply marks the outline lexical with its cause:\n{text}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
 /// Exercises the integrated macOS product loop, stale-write fence, restart telemetry, and fallback.
 ///
 /// This ignored release gate uses the exact configured Pyright and Node files. It proves a known

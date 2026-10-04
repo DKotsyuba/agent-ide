@@ -236,6 +236,14 @@ impl LanguageSupport for TypeScript {
         }
     }
 
+    /// The source outline answers when the server refused the file's project inputs — a
+    /// terminal state, so nothing a later server answer would add is lost. Its top-level scan
+    /// is exact for top-level addresses; a nested one answers `unknown_symbol` naming what the
+    /// scan proved, and the reply's footer says why the server refused.
+    fn outline_when_resolution_unverified(&self) -> bool {
+        true
+    }
+
     /// Top-level declarations recognized from the text alone, for callers the server cannot
     /// answer (a file whose `tsconfig.json` lives below the worktree root). Each column-0
     /// `function`, `class`, `interface`, `type`, `enum`, `namespace` or `const`/`let`/`var`
