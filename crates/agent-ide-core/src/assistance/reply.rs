@@ -59,6 +59,8 @@ pub enum HostBindingCause {
     MissingInvocation,
     /// No active matching actor/channel-session binding existed for an ordinary call.
     InactiveBinding,
+    /// This session never held an IDE activation in this daemon boot.
+    NeverActivated,
     /// Bounded pending, binding, or replay storage is full for this scope.
     CapacityExceeded,
     /// The caller's `_meta` names no supported host contract, so no invocation can correlate.
@@ -88,6 +90,7 @@ impl HostBindingCause {
             super::host_binding::BindingUnavailable::Mismatch => Self::Mismatch,
             super::host_binding::BindingUnavailable::MissingInvocation => Self::MissingInvocation,
             super::host_binding::BindingUnavailable::InactiveBinding => Self::InactiveBinding,
+            super::host_binding::BindingUnavailable::NeverActivated => Self::NeverActivated,
             super::host_binding::BindingUnavailable::CapacityExceeded => Self::CapacityExceeded,
         })
     }
@@ -115,6 +118,7 @@ impl HostBindingCause {
             Self::Mismatch => "mismatch".to_owned(),
             Self::MissingInvocation => "missing_invocation".to_owned(),
             Self::InactiveBinding => "inactive_binding".to_owned(),
+            Self::NeverActivated => "never_activated".to_owned(),
             Self::CapacityExceeded => "capacity_exceeded".to_owned(),
             Self::HostUnrecognized => "host_unrecognized".to_owned(),
             Self::ProjectMoved { bound, asked } => {

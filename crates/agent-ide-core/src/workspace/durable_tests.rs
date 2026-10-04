@@ -93,6 +93,7 @@ async fn root_swap_at(checkpoint: CaptureCheckpoint) {
         .activate(
             ActivationRequest::new(
                 "capture-race",
+                false,
                 invocation.clone(),
                 guard.consume_active(invocation.binding_ref()).unwrap(),
                 tree,
@@ -130,7 +131,10 @@ async fn root_swap_at(checkpoint: CaptureCheckpoint) {
                 }
             )
             .await,
-        Err(DurableError::IdentityUnavailable)
+        Err(DurableError::IdentityUnavailable {
+            step: "identity_read",
+            holder: None,
+        })
     );
     assert_eq!(owner.committed_baseline(&id).await.unwrap(), None);
     assert_eq!(

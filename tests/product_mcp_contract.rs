@@ -421,6 +421,10 @@ fn assert_compact_envelope(reply: &Value) {
         None => text,
     };
     match (state, kind) {
+        ("error", _) if structured["code"] == "conflict" => assert!(
+            text.starts_with("error: conflict") || text.starts_with("refused: read_only ("),
+            "{reply}"
+        ),
         ("complete", Some("test")) => assert!(
             text.starts_with("tests #")
                 || text.starts_with("tests: could not start ")
@@ -489,7 +493,7 @@ fn assert_claude_envelope(reply: &Value) -> &str {
     );
     assert_eq!(
         result.get("isError") == Some(&json!(true)),
-        text.starts_with("error"),
+        text.starts_with("error") || text.starts_with("refused: read_only ("),
         "{reply}"
     );
     text
@@ -2935,6 +2939,42 @@ impl ProductActor {
         assert_compact_envelope(&reply);
         reply["result"]["structuredContent"].clone()
     }
+    /// Runs exact Pre→MCP→Post like [`Self::call`] but returns the whole raw MCP reply, for
+    /// assertions on the compact text an error's structured copy does not carry.
+    async fn call_raw(&mut self, fixture: &ProductFixture, name: &str, arguments: Value) -> Value {
+        self.next += 1;
+        let call = format!("call-{}", self.next);
+        self.lifecycle(fixture, "PreToolUse", &call).await;
+        let reply=self.mcp.exchange(json!({"jsonrpc":"2.0","id":self.next,"method":"tools/call","params":{"name":name,"arguments":arguments,"_meta":{"threadId":self.actor,"callId":call,"x-codex-turn-metadata":{},"codex/sandbox-state-meta":self.state}}})).await;
+        self.lifecycle(fixture, "PostToolUse", &call).await;
+        assert_compact_envelope(&reply);
+        reply
+    }
+
+    /// [`Self::settle`] for a raw reply: polls the retained detail through raw inspect calls.
+    async fn settle_raw(&mut self, fixture: &ProductFixture, mut reply: Value) -> Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+        let mut polls = 0;
+        let mut delay = PRODUCT_SETTLE_INITIAL_DELAY;
+        while reply["result"]["structuredContent"]["state"] == "pending" {
+            assert!(
+                tokio::time::Instant::now() < deadline && polls < PRODUCT_SETTLE_MAX_POLLS,
+                "product operation did not settle: {reply}"
+            );
+            let reference = reply["result"]["structuredContent"]["detail_ref"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            tokio::time::sleep(delay).await;
+            polls += 1;
+            reply = self
+                .call_raw(fixture, "ide.inspect", json!({"detail_ref":reference}))
+                .await;
+            delay = delay.saturating_mul(2).min(PRODUCT_SETTLE_MAX_DELAY);
+        }
+        reply
+    }
+
     /// Retrieves a same-binding result with fresh call IDs and bounded replay-safe backoff.
     ///
     /// Each inspection uses [`Self::call`], which advances the host correlation before both its
@@ -11818,6 +11858,48 @@ async fn configured_product_start_enforces_allowed_roots_and_accepts_root_argume
     daemon.wait().await.unwrap();
 }
 
+/// Resolves a linked worktree created after the daemon started under another admitted parent.
+#[tokio::test]
+async fn configured_product_resolves_a_new_linked_worktree_after_daemon_start() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "late-worktree").await;
+
+    let linked = fixture.base.join("different-parent").join("linked");
+    std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+    let output = std::process::Command::new("/usr/bin/git")
+        .env_clear()
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args(["-C"])
+        .arg(&fixture.root)
+        .args(["worktree", "add", "--detach"])
+        .arg(&linked)
+        .arg("HEAD")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "linked worktree creation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"late-linked-root","root":linked}),
+        )
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// The activation reply keeps its compact epoch line and appends the project card: one rendered
 /// block describing the fixture worktree (rust from Cargo.toml, typescript from package.json,
 /// plus the go module the shared fixture ships), with the layout, docs, and not-started server
@@ -14135,12 +14217,13 @@ async fn configured_product_rust_delete_does_not_report_cached_flycheck_diagnost
     daemon.wait().await.unwrap();
 }
 
-/// A real second actor on the same worktree is refused as a finite conflict, and hands off on stop.
+/// A real second actor on the same worktree activates as a reader and upgrades after the writer
+/// stops; its omitted activation id stays stable across both starts (E013 items 2 and 4).
 ///
-/// The refusal comes from durable activation itself (`AuthorityError::WorktreeOwned`), not from the
-/// cache map, so the important part is that the actor which already owns the worktree keeps working
-/// while the second one is told exactly why it cannot start, and that the same second actor starts
-/// successfully once the first has stopped.
+/// The second start succeeds while the first actor still holds the worktree — read tools answer,
+/// and its edit is refused naming the writer — and the same activation id upgrades to writer once
+/// that writer calls `ide.stop`. The writer is never disturbed: its context still resolves after
+/// the reader activated.
 #[tokio::test]
 async fn configured_product_reports_a_second_actor_on_one_worktree_as_a_conflict() {
     let fixture = ProductFixture::new(json!([]));
@@ -14148,10 +14231,12 @@ async fn configured_product_reports_a_second_actor_on_one_worktree_as_a_conflict
         serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
     let mut second_target = config["targets"][0].clone();
     second_target["attachment"] = json!("private-second-channel");
+    let mut third_target = config["targets"][0].clone();
+    third_target["attachment"] = json!("private-third-channel");
     config["targets"]
         .as_array_mut()
         .unwrap()
-        .push(second_target);
+        .extend([second_target, third_target]);
     std::fs::write(&fixture.config, config.to_string()).unwrap();
     let mut daemon = fixture.daemon().await;
     let mut first = ProductActor::new(&fixture, "owning-view").await;
@@ -14159,6 +14244,14 @@ async fn configured_product_reports_a_second_actor_on_one_worktree_as_a_conflict
         &fixture,
         "waiting-view",
         "private-second-channel",
+        "agent_id",
+        fixture.state(),
+    )
+    .await;
+    let mut third = ProductActor::new_at(
+        &fixture,
+        "third-reader",
+        "private-third-channel",
         "agent_id",
         fixture.state(),
     )
@@ -14174,20 +14267,114 @@ async fn configured_product_reports_a_second_actor_on_one_worktree_as_a_conflict
     let started = first.settle(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
 
-    let refused = second
-        .call(
-            &fixture,
-            "ide.start",
-            json!({"activation_id":"second-start"}),
-        )
+    // The second actor explicitly requests reader authority beside the first writer.
+    let read = second
+        .call(&fixture, "ide.start", json!({"read_only":true}))
         .await;
-    let refused = second.settle(&fixture, refused).await;
-    assert_eq!(
-        refused["code"], "conflict",
-        "a second live actor on one worktree must get the finite ownership conflict: {refused}"
+    let read = second.settle(&fixture, read).await;
+    assert_eq!(read["kind"], "activation", "{read}");
+    let reader_text = read["text"].as_str().unwrap();
+    assert!(
+        reader_text.contains("mode: read-only")
+            && reader_text.contains("current writer: activation"),
+        "the reader activation must name the writer: {read}"
     );
 
-    // The refusal must not have disturbed the owner: its context still resolves.
+    let third_read = third
+        .call(&fixture, "ide.start", json!({"read_only":true}))
+        .await;
+    let third_read = third.settle(&fixture, third_read).await;
+    assert_eq!(third_read["kind"], "activation", "{third_read}");
+    assert!(
+        third_read["text"]
+            .as_str()
+            .unwrap()
+            .contains("mode: read-only")
+    );
+
+    // The reader's read tools answer: outline resolves from source.
+    let outline = second
+        .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+        .await;
+    let outline = second.settle(&fixture, outline).await;
+    assert_eq!(outline["kind"], "outline", "{outline}");
+    assert!(
+        outline["text"].as_str().unwrap().contains("pub fn value"),
+        "{outline}"
+    );
+
+    // Mutating requests are refused before edit preparation or test command admission.
+    let marker = fixture.base.join("read-only-test-ran");
+    let edits = [
+        (
+            "ide.edit",
+            json!({"operation_id":"readonly-replace","op":"replace","symbol":"src/lib.rs#value","content":"pub fn value() -> i32 { 8 }"}),
+        ),
+        (
+            "ide.edit",
+            json!({"operation_id":"readonly-insert","op":"insert","symbol":"src/lib.rs#caller","where":"after","content":"fn probe() {}"}),
+        ),
+        (
+            "ide.edit",
+            json!({"operation_id":"readonly-delete","op":"delete","symbol":"src/lib.rs#caller"}),
+        ),
+        (
+            "ide.edit",
+            json!({"operation_id":"readonly-rename","op":"rename","symbol":"src/lib.rs#value","new_name":"renamed_value"}),
+        ),
+        (
+            "ide.edit",
+            json!({"operation_id":"readonly-lines","path":"src/lib.rs","lines":"1-1","source_ref":"stale-source","content":"pub fn value() -> i32 { 8 }"}),
+        ),
+        (
+            "ide.edit",
+            json!({"operation_id":"readonly-rewrite","path":"src/lib.rs","source_ref":"stale-source","content":"pub fn value() -> i32 { 8 }"}),
+        ),
+        (
+            "ide.edit",
+            json!({"operation_id":"readonly-create","path":"src/readonly_created.rs","content":"pub fn created() {}"}),
+        ),
+        (
+            "ide.edit",
+            json!({"operation_id":"readonly-batch","path":"src/lib.rs","source_ref":"stale-source","changes":[{"old":"pub fn value() -> i32 { 7 }","new":"pub fn value() -> i32 { 8 }"}]}),
+        ),
+        ("ide.test", json!({"command":["/usr/bin/touch",marker]})),
+    ];
+    for (index, (tool, arguments)) in edits.into_iter().enumerate() {
+        let refused = second.call_raw(&fixture, tool, arguments).await;
+        let refused = second.settle_raw(&fixture, refused).await;
+        assert_eq!(
+            refused["result"]["structuredContent"]["code"], "conflict",
+            "{refused}"
+        );
+        let text = refused["result"]["content"][0]["text"].as_str().unwrap();
+        let expected_tool = if tool == "ide.edit" {
+            "ide.edit"
+        } else {
+            "ide.test"
+        };
+        assert!(
+            text.starts_with(&format!("refused: read_only ({expected_tool});")),
+            "{index}: {text}"
+        );
+        assert!(
+            text.contains("started with read_only: true"),
+            "{index}: {text}"
+        );
+        assert!(
+            text.contains("current writer: activation"),
+            "{index}: {text}"
+        );
+        assert!(text.contains("last activity"), "{index}: {text}");
+    }
+    assert_eq!(
+        std::fs::read(fixture.root.join("src/lib.rs")).unwrap(),
+        b"pub fn value() -> i32 { 7 }\npub fn caller() -> i32 { value() }\n"
+    );
+    assert!(!fixture.root.join("src/readonly_created.rs").exists());
+    assert!(!marker.exists(), "ide.test must not start its command");
+
+    // The reader must not have disturbed the writer: its context still resolves.
     let live = first
         .call(
             &fixture,
@@ -14198,22 +14385,79 @@ async fn configured_product_reports_a_second_actor_on_one_worktree_as_a_conflict
     let live = first.settle(&fixture, live).await;
     assert_eq!(live["kind"], "context", "{live}");
 
-    let stopped = first.call(&fixture, "ide.stop", json!({})).await;
-    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    // A reader requesting writer mode is refused with the holder facts and the read-only next step.
+    let refused_writer = second.call_raw(&fixture, "ide.start", json!({})).await;
+    let refused_writer = second.settle_raw(&fixture, refused_writer).await;
+    assert_eq!(
+        refused_writer["result"]["structuredContent"]["code"], "conflict",
+        "{refused_writer}"
+    );
+    let writer_text = refused_writer["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(writer_text.contains("actor owning-view"), "{writer_text}");
+    assert!(writer_text.contains("since"), "{writer_text}");
+    assert!(writer_text.contains("last activity"), "{writer_text}");
+    assert!(
+        writer_text.contains("Start with {\"read_only\": true} to read alongside"),
+        "{writer_text}"
+    );
 
-    // Handoff after a successful stop: the same second actor now activates.
-    let handed = second
+    // The writer downgrades in place, freeing its slot while retaining read access.
+    let downgraded = first
         .call(
             &fixture,
             "ide.start",
-            json!({"activation_id":"second-handoff"}),
+            json!({"activation_id":"first-start","read_only":true}),
         )
+        .await;
+    let downgraded = first.settle(&fixture, downgraded).await;
+    assert!(
+        downgraded["text"]
+            .as_str()
+            .unwrap()
+            .contains("mode: read-only; current writer: none"),
+        "{downgraded}"
+    );
+
+    // The same reader activation upgrades to writer once the slot is free.
+    let handed = second
+        .call(&fixture, "ide.start", json!({"read_only":false}))
         .await;
     let handed = second.settle(&fixture, handed).await;
     assert_eq!(handed["kind"], "activation", "{handed}");
+    assert!(
+        handed["text"].as_str().unwrap().contains("mode: writer"),
+        "the upgraded start must report writer authority: {handed}"
+    );
+    let third_still_reader = third
+        .call(&fixture, "ide.start", json!({"read_only":true}))
+        .await;
+    let third_still_reader = third.settle(&fixture, third_still_reader).await;
+    assert!(
+        third_still_reader["text"]
+            .as_str()
+            .unwrap()
+            .contains("current writer: activation"),
+        "{third_still_reader}"
+    );
     let stopped = second.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
-    tokio::join!(first.mcp.close(), second.mcp.close());
+    let third_upgrade = third
+        .call(&fixture, "ide.start", json!({"read_only":false}))
+        .await;
+    let third_upgrade = third.settle(&fixture, third_upgrade).await;
+    assert!(
+        third_upgrade["text"]
+            .as_str()
+            .unwrap()
+            .contains("mode: writer")
+    );
+    let first_stop = first.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(first_stop["kind"], "stop", "{first_stop}");
+    let third_stop = third.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(third_stop["kind"], "stop", "{third_stop}");
+    tokio::join!(first.mcp.close(), second.mcp.close(), third.mcp.close());
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
 }
@@ -16060,7 +16304,7 @@ async fn claude_diff_pagination_delivers_every_hunk_across_repeated_inspect() {
 /// `ide.inspect` calls, including an escape-heavy Diff that must fit whole; Stop after an Edit
 /// that settled durably but was never inspected keeps its known replacement outcome.
 #[tokio::test]
-async fn configured_product_claude_activates_and_conflicts_a_second_actor_then_stops() {
+async fn configured_product_claude_activates_a_reader_then_stops() {
     /// Runs one complete Claude round trip: the minting call, then `ide.inspect` until settled.
     async fn claude_operation(
         actor: &mut ProductActor,
@@ -16125,8 +16369,8 @@ async fn configured_product_claude_activates_and_conflicts_a_second_actor_then_s
         "replaying the activation must not persist a second receipt"
     );
 
-    // A second actor targeting the same worktree is refused with Conflict while the first
-    // actor's own activation stays usable.
+    // A second Claude actor targeting the same worktree is admitted as a reader while the first
+    // actor's writer remains usable.
     let mut second = ProductActor::new_at(
         &fixture,
         "claude-second",
@@ -16135,15 +16379,18 @@ async fn configured_product_claude_activates_and_conflicts_a_second_actor_then_s
         fixture.state(),
     )
     .await;
-    let conflicted = claude_operation(
+    let reader = claude_operation(
         &mut second,
         &fixture,
         "ide.start",
-        json!({"activation_id":"start"}),
+        json!({"activation_id":"start","read_only":true}),
     )
     .await;
-    assert_eq!(conflicted["state"], "error", "{conflicted}");
-    assert_eq!(conflicted["code"], "conflict", "{conflicted}");
+    assert_eq!(reader["kind"], "activation", "{reader}");
+    assert!(
+        reader["text"].as_str().unwrap().contains("mode: read-only"),
+        "{reader}"
+    );
     assert!(
         database
             .query_row(
@@ -16152,7 +16399,18 @@ async fn configured_product_claude_activates_and_conflicts_a_second_actor_then_s
                 |row| row.get::<_, bool>(0),
             )
             .unwrap(),
-        "the refused actor must not replace the first durable owner"
+        "reader admission must not replace the first durable writer"
+    );
+    assert_eq!(
+        database
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_starts WHERE active=1 AND role='reader'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1,
+        "the second actor should hold a reader receipt"
     );
 
     let still_usable = claude_operation(
@@ -16339,9 +16597,8 @@ async fn configured_product_claude_activates_and_conflicts_a_second_actor_then_s
 
 /// Keeps a bounded Claude worker usable across repeated Diff finalization and repeated failures.
 ///
-/// One retained activation occupies the first slot. A second actor's settled-but-conflicting Start
-/// keeps its one failed detail until Stop, like every daemon-executed operation, and is inspected
-/// repeatedly without allocating another. A daemon-composed Diff retains a detail exactly like
+/// One retained activation occupies the first slot. A second actor is admitted as a reader and its
+/// refused edit remains compact. A daemon-composed Diff retains a detail exactly like
 /// Context (T13B), so capacity is sized for the activation, the failed Start, each of the three
 /// Diffs, and the trailing source-producing Context: any inspection or Diff that allocated more
 /// than its one detail would exhaust the bound before that trailing Context.
@@ -16353,7 +16610,7 @@ async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
     let fixture = ProductFixture::new(json!([]));
     let mut config: Value =
         serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
-    config["limits"]["details"] = json!(6);
+    config["limits"]["details"] = json!(7);
     std::fs::write(&fixture.config, config.to_string()).unwrap();
     let mut daemon = fixture.daemon().await;
     let mut first = ProductActor::new(&fixture, "claude-capacity-first").await;
@@ -16371,18 +16628,47 @@ async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
         fixture.state(),
     )
     .await;
-    let conflicting = second
-        .call_claude(&fixture, "ide.start", json!({"activation_id":"second"}))
+    let reader = second
+        .call_claude(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"second","read_only":true}),
+        )
         .await;
-    let detail_ref = conflicting["detail_ref"].clone();
-    let (conflict, _) = second.settle_claude(&fixture, conflicting).await;
-    assert_eq!(conflict["code"], "conflict", "{conflict}");
+    let (reader, _) = second.settle_claude(&fixture, reader).await;
+    assert_eq!(reader["kind"], "activation", "{reader}");
+    assert!(
+        reader["text"].as_str().unwrap().contains("mode: read-only"),
+        "{reader}"
+    );
+    let refused = second
+        .call_claude(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"capacity-reader-edit","op":"insert","symbol":"src/lib.rs#caller","where":"after","content":"fn blocked() {}"}),
+        )
+        .await;
+    let detail_ref = refused["detail_ref"].clone();
+    let (conflict, _) = second.settle_claude(&fixture, refused).await;
+    assert!(
+        conflict["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("refused: read_only (ide.edit);"),
+        "{conflict}"
+    );
     if let Some(reference) = detail_ref.as_str() {
         for _ in 0..2 {
             let conflict = second
                 .call_claude(&fixture, "ide.inspect", json!({"detail_ref":reference}))
                 .await;
-            assert_eq!(conflict["code"], "conflict", "{conflict}");
+            assert!(
+                conflict["text"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("refused: read_only (ide.edit);"),
+                "{conflict}"
+            );
         }
     }
 

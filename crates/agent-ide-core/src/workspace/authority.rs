@@ -125,6 +125,38 @@ impl WorktreeRef {
     }
 }
 
+/// The authority class one activation holds for its worktree.
+///
+/// One writer owns the worktree's mutable surface; explicitly requested readers coexist with it
+/// and with one another. A reader borrows the current writer's language-server sessions, refuses
+/// edit and test jobs, and can upgrade when it starts without `read_only`; a writer can downgrade
+/// by starting with `read_only: true` (E013 item 2).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartRole {
+    /// The one activation that may edit, test, and own the worktree's provider namespaces.
+    Writer,
+    /// A coexisting activation: read tools answer, writes require a writer start.
+    Reader,
+}
+
+impl StartRole {
+    /// The closed durable column value for this role.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Writer => "writer",
+            Self::Reader => "reader",
+        }
+    }
+    /// Parses the closed durable column value; anything else is corrupt state.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "writer" => Some(Self::Writer),
+            "reader" => Some(Self::Reader),
+            _ => None,
+        }
+    }
+}
+
 /// Carries one actor/binding/worktree authority claim.
 /// Registry-only claims are not product authority; every use requires DurableWorkspace validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -141,6 +173,8 @@ pub struct AuthorityStamp {
     pub(super) activation_id: String,
     /// Durable owner boot generation; absent for the non-authoritative in-process helper.
     pub(super) owner_boot: Option<u64>,
+    /// Authority class of the start that minted this stamp.
+    pub(super) role: StartRole,
 }
 
 impl AuthorityStamp {
@@ -168,6 +202,11 @@ impl AuthorityStamp {
     pub fn activation_id(&self) -> &str {
         &self.activation_id
     }
+
+    /// Returns the authority class of the start that minted this stamp.
+    pub const fn role(&self) -> StartRole {
+        self.role
+    }
 }
 
 /// Carries all Assistance-derived values that are required to request one authority grant.
@@ -175,6 +214,8 @@ impl AuthorityStamp {
 pub struct ActivationRequest {
     /// Stable bounded activation operation ID supplied by Assistance's start request.
     pub(super) activation_id: String,
+    /// Whether this activation explicitly requests read-only authority.
+    pub(super) read_only: bool,
     /// Exact host-validated invocation that established or reactivated this binding generation.
     pub(super) invocation: ValidatedInvocation,
     /// Fresh transient Assistance liveness evidence for the invocation binding.
@@ -184,12 +225,15 @@ pub struct ActivationRequest {
 }
 
 impl ActivationRequest {
-    /// Validates a bounded stable activation ID and pairs a fresh consumed binding with its invocation.
+    /// Validates a bounded activation ID, requested authority mode, and fresh consumed binding.
     ///
-    /// The caller must obtain `active_use` from Assistance immediately before this call. This type
-    /// verifies only binding equality; it cannot turn model input or an actor string into proof.
+    /// `read_only` requests reader authority explicitly; false requests writer authority and may
+    /// return [`AuthorityError::WorktreeOwned`] while another writer holds the worktree. The caller
+    /// must obtain `active_use` from Assistance immediately before this call. This type verifies
+    /// only binding equality; it cannot turn model input or an actor string into proof.
     pub fn new(
         activation_id: impl Into<String>,
+        read_only: bool,
         invocation: ValidatedInvocation,
         active_use: ActiveBindingUse,
         worktree: WorktreeRef,
@@ -203,6 +247,7 @@ impl ActivationRequest {
         }
         Ok(Self {
             activation_id,
+            read_only,
             invocation,
             active_use,
             worktree,
@@ -346,6 +391,7 @@ impl AuthorityRegistry {
             epoch: self.next_epoch,
             activation_id: request.activation_id,
             owner_boot: None,
+            role: StartRole::Writer,
         };
         self.active_actors
             .insert(stamp.actor_id.clone(), stamp.worktree.clone());

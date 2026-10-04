@@ -345,6 +345,10 @@ pub enum BindingUnavailable {
     MissingInvocation,
     /// An ordinary MCP invocation had no active matching actor/channel-session binding.
     InactiveBinding,
+    /// This actor/channel scope never held a binding in this daemon boot: the session has no
+    /// IDE activation to have stopped yet, so the remedy is a first `ide.start`, not a restart
+    /// (E013 item 5).
+    NeverActivated,
     /// The candidate was observed twice or after it was already validated.
     Replay,
     /// Bounded pending, binding, channel, scope, or replay storage is full.
@@ -451,6 +455,11 @@ pub struct HostBindingGuard {
     settling: BTreeMap<(CandidateInvocation, ChannelSessionRef), BindingRef>,
     /// Current generation for each host, actor and channel scope.
     bindings: BTreeMap<(HostKind, String, ChannelSessionRef), BindingRef>,
+    /// Bounded scopes that held a binding in this daemon boot, so recent refusals distinguish a
+    /// session that never activated from one whose activation already stopped (E013 item 5).
+    /// ponytail: history is capped at MAX_BINDINGS; after enough stopped sessions, an evicted
+    /// scope may be described as never activated, so raise this cap if longer history is needed.
+    ever_bound: BTreeSet<(HostKind, String, ChannelSessionRef)>,
     /// Bindings closed to external admission but retained for exact stop-time cleanup consumes.
     stopping: BTreeSet<BindingRef>,
     /// Last issued nonzero generation; exhaustion refuses a new binding instead of wrapping.
@@ -464,6 +473,23 @@ pub struct HostBindingGuard {
 }
 
 impl HostBindingGuard {
+    /// Remembers an established scope without exceeding the binding table's history ceiling.
+    fn record_ever_bound(&mut self, key: (HostKind, String, ChannelSessionRef)) {
+        if self.ever_bound.contains(&key) {
+            return;
+        }
+        if self.ever_bound.len() >= MAX_BINDINGS
+            && let Some(evicted) = self
+                .ever_bound
+                .iter()
+                .find(|scope| !self.bindings.contains_key(*scope))
+                .cloned()
+        {
+            self.ever_bound.remove(&evicted);
+        }
+        self.ever_bound.insert(key);
+    }
+
     /// Establishes a Codex binding directly from trusted managed-MCP metadata.
     ///
     /// This path is reserved for a fresh process-private attachment whose dispatcher explicitly
@@ -547,18 +573,41 @@ impl HostBindingGuard {
                     channel,
                     generation,
                 };
+                self.record_ever_bound(binding_key.clone());
                 self.bindings.insert(binding_key, binding.clone());
                 (binding, true)
             }
             None => {
                 self.record_replay(&invocation, ReplayDisposition::Rejected)
                     .expect("the checked managed replay scope has capacity");
-                return BindingStatus::Unavailable(BindingUnavailable::InactiveBinding);
+                return BindingStatus::Unavailable(self.inactive_or_never(
+                    candidate.host,
+                    &candidate.actor_id,
+                    &channel,
+                ));
             }
         };
         self.record_replay(&invocation, ReplayDisposition::Completed)
             .expect("the checked managed replay scope has capacity");
         BindingStatus::Validated(validated(candidate, binding, created_binding))
+    }
+
+    /// Names the refusal for a scope whose generation is absent: `NeverActivated` while this
+    /// daemon boot never held a binding for it, else `InactiveBinding` for a stopped one.
+    fn inactive_or_never(
+        &self,
+        host: HostKind,
+        actor_id: &str,
+        channel: &ChannelSessionRef,
+    ) -> BindingUnavailable {
+        if self
+            .ever_bound
+            .contains(&(host, actor_id.to_owned(), channel.clone()))
+        {
+            BindingUnavailable::InactiveBinding
+        } else {
+            BindingUnavailable::NeverActivated
+        }
     }
 
     /// Establishes an explicit start binding after its exact native pre-hook is already observed.
@@ -660,6 +709,7 @@ impl HostBindingGuard {
                 channel,
                 generation,
             };
+            self.record_ever_bound(binding_key.clone());
             self.bindings.insert(binding_key, binding.clone());
             (binding, true)
         };
@@ -724,7 +774,7 @@ impl HostBindingGuard {
             .filter(|binding| !self.stopping.contains(*binding))
             .cloned();
         let binding = match binding {
-            None if admission == Admission::ReadOnly => Some(identity(&candidate, channel)),
+            None if admission == Admission::ReadOnly => Some(identity(&candidate, channel.clone())),
             binding => binding,
         };
         let Some(binding) = binding else {
@@ -734,7 +784,11 @@ impl HostBindingGuard {
             {
                 return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
             }
-            return BindingStatus::Unavailable(BindingUnavailable::InactiveBinding);
+            return BindingStatus::Unavailable(self.inactive_or_never(
+                candidate.host,
+                &candidate.actor_id,
+                &channel,
+            ));
         };
         self.settling.insert(invocation, binding.clone());
         BindingStatus::Validated(validated(candidate, binding, false))
@@ -755,12 +809,15 @@ impl HostBindingGuard {
             if event.host == HostKind::Claude {
                 return BindingStatus::Unavailable(BindingUnavailable::UnsupportedHookPhase);
             }
+            let (host, actor_id) = (event.host, event.actor_id.clone());
             let Some(binding) = self
                 .bindings
-                .get(&(event.host, event.actor_id, channel))
+                .get(&(host, actor_id.clone(), channel.clone()))
                 .cloned()
             else {
-                return BindingStatus::Unavailable(BindingUnavailable::InactiveBinding);
+                return BindingStatus::Unavailable(
+                    self.inactive_or_never(host, &actor_id, &channel),
+                );
             };
             self.native_hints.insert(binding.clone());
             return BindingStatus::NativeObserved(binding);
@@ -1796,7 +1853,9 @@ mod tests {
                 codex_candidate("actor-b", "context"),
                 channel.clone()
             ),
-            BindingStatus::Unavailable(BindingUnavailable::InactiveBinding)
+            // Actor-b never held a binding on this channel: the refusal says so instead of
+            // claiming a stopped activation (E013 item 5).
+            BindingStatus::Unavailable(BindingUnavailable::NeverActivated)
         ));
         assert!(matches!(
             guard.establish_start(codex_candidate("actor-b", "legacy"), channel),
@@ -2393,7 +2452,9 @@ mod tests {
             assert!(
                 matches!(
                     guard.validate_active(codex_candidate(actor, &call), channel.clone()),
-                    BindingStatus::Unavailable(BindingUnavailable::InactiveBinding)
+                    // No binding exists yet in this scope, and none ever did: the refusal names
+                    // the missing first activation rather than a stopped one (E013 item 5).
+                    BindingStatus::Unavailable(BindingUnavailable::NeverActivated)
                 ),
                 "call {index} settles without a binding"
             );

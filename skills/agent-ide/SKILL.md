@@ -133,7 +133,11 @@ failed)` — and says what still works (outline/read from source), what does not
 ## Workflow
 
 1. `ide.start` once per actor per worktree, optionally with `"root": "/absolute/dir"`
-   to name the working directory (default: the host's project directory). Its reply
+   to name the working directory (default: the host's project directory), and optionally
+   with `"activation_id": "<stable id>"` — omitting it is fine: the session then keeps a
+   stable default, so repeating the start still returns the same activation. Orchestrators
+   and reviewers should start with `"read_only": true`; omit it or set `false` for the
+   worktree's one writer. Its reply
    carries the project card: Git state when available, languages with line counts, the project's build /
    check / test / lint commands with their provenance, toolchain, layout, entry points and
    docs — read it before exploring by hand. The root, the
@@ -145,6 +149,10 @@ failed)` — and says what still works (outline/read from source), what does not
    and provider-cache conflicts have separate recovery advice. A repeated start by the same actor
    and binding reuses and names the existing activation. Do not call it again for later edits in
    the same worktree.
+   A `read_only: true` activation can read alongside a writer and other readers. Its
+   `ide.edit` and `ide.test` calls are refused with one read-only message naming the current
+   writer when there is one. Starting the same activation without `read_only` upgrades it
+   when the writer slot is free; a writer can downgrade by starting with `read_only: true`.
    Directories without Git work; `ide.diff` and requested symbol history there answer
    `not a git repository: no git data`.
    `ide.diff {"mode": "task"}` includes committed and uncommitted changes since activation plus names of untracked paths that pass Git's standard ignore rules. If no activation commit was recorded, it directs the caller to `head`; when one result is too large, narrow with `head`, `staged`, or `unstaged`, or use native Git.

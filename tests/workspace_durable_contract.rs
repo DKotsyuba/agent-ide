@@ -11,7 +11,7 @@ use agent_ide::{
     },
     workspace::{
         authority::{
-            ActivationRequest, AuthorityError, AuthorityRegistry, AuthorityStamp,
+            ActivationRequest, AuthorityError, AuthorityRegistry, AuthorityStamp, StartRole,
             StopBindingHandoff, WorktreeRef,
         },
         durable::{DurableError, DurableWorkspace, StartReceipt},
@@ -28,6 +28,14 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
+
+/// The closed identity refusal with no holder, for legacy identity-failure assertions.
+fn identity_unavailable() -> DurableError {
+    DurableError::IdentityUnavailable {
+        step: "identity_read",
+        holder: None,
+    }
+}
 
 /// Separates disposable fixture roots within the current process.
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -124,8 +132,20 @@ fn request(
     invocation: &ValidatedInvocation,
     tree: &WorktreeRef,
 ) -> ActivationRequest {
+    request_mode(id, false, guard, invocation, tree)
+}
+
+/// Requests a writer or explicit read-only activation with a fresh consumed binding use.
+fn request_mode(
+    id: &str,
+    read_only: bool,
+    guard: &mut HostBindingGuard,
+    invocation: &ValidatedInvocation,
+    tree: &WorktreeRef,
+) -> ActivationRequest {
     ActivationRequest::new(
         id,
+        read_only,
         invocation.clone(),
         guard.consume_active(invocation.binding_ref()).unwrap(),
         tree.clone(),
@@ -387,7 +407,7 @@ async fn canonical_identity_and_sqlite_ownership_do_not_trust_caller_incarnation
         owner
             .activate(request("forged", &mut first, &one, &forged))
             .await,
-        Err(DurableError::IdentityUnavailable)
+        Err(identity_unavailable())
     );
     let alias = fixture.base.join("alias");
     std::os::unix::fs::symlink(&fixture.root, &alias).unwrap();
@@ -395,29 +415,37 @@ async fn canonical_identity_and_sqlite_ownership_do_not_trust_caller_incarnation
         owner
             .resolve_worktree(alias.clone(), alias.clone(), alias.join(".git"))
             .await,
-        Err(DurableError::IdentityUnavailable)
+        Err(identity_unavailable())
     );
     let (mut second, two) = binding("two", "two", "two");
     let (left, right) = tokio::join!(
         owner.activate(request("one", &mut first, &one, &tree)),
-        owner.activate(request("two", &mut second, &two, &tree))
+        owner.activate(request_mode("two", true, &mut second, &two, &tree))
     );
-    assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
-    assert!(matches!(
-        (&left, &right),
-        (
-            Ok(_),
-            Err(DurableError::Authority(AuthorityError::WorktreeOwned))
-        ) | (
-            Err(DurableError::Authority(AuthorityError::WorktreeOwned)),
-            Ok(_)
-        )
-    ));
-    let (receipt, guard, invocation) = if let Ok(receipt) = left {
-        (receipt, &mut first, &one)
-    } else {
-        (right.unwrap(), &mut second, &two)
-    };
+    // An explicit reader coexists with the writer without taking its unique slot (E013 item 2).
+    let (receipt, reader, guard, invocation, reader_guard, reader_invocation) =
+        match (&left, &right) {
+            (Ok(left), Ok(right)) if left.role() == StartRole::Writer => (
+                left.clone(),
+                right.clone(),
+                &mut first,
+                &one,
+                &mut second,
+                &two,
+            ),
+            (Ok(left), Ok(right)) => (
+                right.clone(),
+                left.clone(),
+                &mut second,
+                &two,
+                &mut first,
+                &one,
+            ),
+            _ => panic!("one writer and one reader must both be admitted: {left:?} {right:?}"),
+        };
+    assert_eq!(receipt.role(), StartRole::Writer);
+    assert_eq!(reader.role(), StartRole::Reader);
+    assert_eq!(reader.epoch(), receipt.epoch());
     let stamp = owner
         .authority(
             &receipt,
@@ -425,6 +453,16 @@ async fn canonical_identity_and_sqlite_ownership_do_not_trust_caller_incarnation
         )
         .await
         .unwrap();
+    let reader_stamp = owner
+        .authority(
+            &reader,
+            &reader_guard
+                .consume_active(reader_invocation.binding_ref())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reader_stamp.role(), StartRole::Reader);
     let mut registry = AuthorityRegistry::default();
     let helper = registry
         .activate(request("helper", guard, invocation, &tree))
@@ -447,16 +485,23 @@ async fn canonical_identity_and_sqlite_ownership_do_not_trust_caller_incarnation
                 &guard.consume_active(invocation.binding_ref()).unwrap()
             )
             .await,
-        Err(DurableError::IdentityUnavailable)
+        Err(identity_unavailable())
     );
-    assert_eq!(
+    // The moved directory matches the stored physical identity under another path: the closed
+    // step names that alias (E013 item 7).
+    assert!(matches!(
         owner
             .resolve_worktree(moved.clone(), moved.clone(), moved.join(".git"))
             .await,
-        Err(DurableError::IdentityUnavailable)
-    );
+        Err(DurableError::IdentityUnavailable {
+            step: "identity_alias",
+            holder: None,
+        })
+    ));
     fs::create_dir_all(fixture.root.join(".git")).unwrap();
-    assert_eq!(
+    // A recreated directory at the same path cannot replace an identity an active start still
+    // holds, and the refusal names that holder instead of one collapsed cause (E013 items 1/7).
+    assert!(matches!(
         owner
             .resolve_worktree(
                 fixture.root.clone(),
@@ -464,12 +509,38 @@ async fn canonical_identity_and_sqlite_ownership_do_not_trust_caller_incarnation
                 fixture.root.join(".git")
             )
             .await,
-        Err(DurableError::IdentityUnavailable)
-    );
+        Err(DurableError::IdentityUnavailable {
+            step: "identity_held",
+            holder: Some(_),
+        })
+    ));
     owner
         .revoke(
             OperationId::new("retire-replaced-grant").unwrap(),
             &receipt,
+            StopBindingHandoff::Confirmed,
+        )
+        .await
+        .unwrap();
+    // The reader's start alone still holds the replaced identity, so a replacement stays
+    // refused until that reader stops too.
+    assert!(matches!(
+        owner
+            .resolve_worktree(
+                fixture.root.clone(),
+                fixture.root.clone(),
+                fixture.root.join(".git")
+            )
+            .await,
+        Err(DurableError::IdentityUnavailable {
+            step: "identity_held",
+            holder: Some(_),
+        })
+    ));
+    owner
+        .revoke(
+            OperationId::new("retire-reader-grant").unwrap(),
+            &reader,
             StopBindingHandoff::Confirmed,
         )
         .await
@@ -819,7 +890,7 @@ async fn inactive_recreation_and_common_directory_replacement_change_identity() 
                 fixture.root.join(".git")
             )
             .await,
-        Err(DurableError::IdentityUnavailable)
+        Err(identity_unavailable())
     );
     fs::create_dir_all(fixture.root.join(".git")).unwrap();
     let recreated = fixture.resolve(&owner).await;
@@ -916,6 +987,6 @@ async fn independent_databases_have_distinct_nonces_and_reject_foreign_reference
         owner
             .activate(request("foreign-start", &mut guard, &invocation, &foreign))
             .await,
-        Err(DurableError::IdentityUnavailable)
+        Err(identity_unavailable())
     );
 }

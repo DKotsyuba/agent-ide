@@ -829,6 +829,7 @@ mod tests {
             epoch: 1,
             activation_id: "activation".into(),
             owner_boot: None,
+            role: crate::workspace::authority::StartRole::Writer,
         }
     }
 
