@@ -237,7 +237,7 @@ impl Checker for PythonChecker {
             let demanded: Vec<String> = resolutions
                 .iter()
                 .filter(|resolution| resolution.authoritative && resolution.env.chosen.is_none())
-                .filter_map(|resolution| root_detail(&resolution.env))
+                .filter_map(|resolution| crate::environment::root_detail(&resolution.env))
                 .collect();
             if !demanded.is_empty() {
                 return ProblemSnapshot::unavailable_with_detail(
@@ -264,7 +264,7 @@ impl Checker for PythonChecker {
             for env in resolutions.iter().map(|resolution| &resolution.env) {
                 let root = crate::environment::absolute_root(&request.worktree, env);
                 let Some(interpreter) = crate::environment::interpreter(env) else {
-                    missing.extend(root_detail(env));
+                    missing.extend(crate::environment::root_detail(env));
                     continue;
                 };
                 let spec = self.pyright_spec_for_root(&request, &root, &interpreter);
@@ -317,17 +317,6 @@ impl Checker for PythonChecker {
             merge_root_snapshots(snapshots, generation, started.elapsed().as_millis() as u64)
         })
     }
-}
-
-/// A root's missing-environment cause and next step, prefixed with the root when it is nested.
-fn root_detail(env: &agent_ide_core::lang::environment::ResolvedEnv) -> Option<String> {
-    env.missing_next_step.as_ref().map(|step| {
-        if env.root.as_os_str().is_empty() {
-            step.clone()
-        } else {
-            format!("{}: {step}", env.root.display())
-        }
-    })
 }
 
 /// Folds the per-root pyright snapshots of one check run into the single snapshot the scheduler
