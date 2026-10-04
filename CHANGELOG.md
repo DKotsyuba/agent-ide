@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.1 — 2026-10-05
+
 ### Fixed
 
 - `ide.outline`, `ide.read`, `ide.symbol` and `ide.graph` on a file no IDE
