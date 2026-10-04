@@ -131,6 +131,8 @@ enum JobStage {
         worktree: PathBuf,
         /// Normalized edited path matched against checker output.
         wanted: String,
+        /// Exact target-file problem identities present in the latest check before the edit.
+        preexisting: BTreeMap<String, u32>,
         /// Language-specific project feed slot.
         language: crate::checks::Language,
         /// Last time a matching check may affect the edit reply.
@@ -1827,7 +1829,9 @@ fn evict_binding_oldest(
         .details
         .iter()
         .filter(|(reference, detail)| {
-            detail.binding == *owner && detail_evictable(reference, &detail.reply, pinned)
+            detail.binding == *owner
+                && detail_evictable(reference, &detail.reply, pinned)
+                && !is_newest_source_detail(ledger, reference, detail)
         })
         .map(|(reference, _)| (detail_sequence(reference), reference.clone()))
         .collect();
@@ -1843,6 +1847,16 @@ fn evict_binding_oldest(
         removed += 1;
     }
     removed
+}
+
+/// Keeps the newest fully delivered source detail for each file available for an edit retry.
+fn is_newest_source_detail(ledger: &Ledger, reference: &str, detail: &Detail) -> bool {
+    detail
+        .source
+        .iter()
+        .chain(detail.extra_sources.iter())
+        .filter_map(|source| source.path().to_str())
+        .any(|path| newest_edit_source(ledger, &detail.binding, path).as_deref() == Some(reference))
 }
 
 /// Frees ledger room for one new operation by evicting only settled, uninspectable facts.
@@ -2545,33 +2559,20 @@ impl<'a> Worker<'a> {
                 )
             }
         };
-        // Every stale_source refusal names the newest source_ref this binding still holds for the
-        // file — its last successful edit or fully delivered read — so the retry needs no re-read.
+        // A stale source has already failed byte validation, so no retained reference can be
+        // promised as a valid retry; the reply leaves the caller to obtain a fresh read.
         let reply = match reply {
             PeerReply::Edit {
                 result,
                 diagnostics,
-                note: None,
                 operation,
-            } if result.outcome == ChangesEditOutcome::StaleSource => {
-                let newest = self
-                    .shared
-                    .ledger
-                    .lock()
-                    .ok()
-                    .and_then(|ledger| newest_edit_source(&ledger, &binding, &result.path));
-                PeerReply::Edit {
-                    note: newest.map(|reference| {
-                        format!(
-                            "newest source_ref for this file: {reference} (its last successful \
-                             edit or read); retry ide.edit with it, no re-read needed"
-                        )
-                    }),
-                    result,
-                    diagnostics,
-                    operation,
-                }
-            }
+                ..
+            } if result.outcome == ChangesEditOutcome::StaleSource => PeerReply::Edit {
+                note: None,
+                result,
+                diagnostics,
+                operation,
+            },
             other => other,
         };
         if let PeerReply::Error { code, .. } = &reply {
@@ -3782,6 +3783,7 @@ impl<'a> Worker<'a> {
                     .await;
             }
         };
+        let preexisting = self.pre_edit_problem_keys(&authority, &request.path);
         let active = match self.shared.active(&binding) {
             Ok(active) => active,
             Err(_) => {
@@ -3906,21 +3908,20 @@ impl<'a> Worker<'a> {
         } else {
             EditDiagnostics::Unknown {}
         };
-        // A matching provider report is already authoritative. Otherwise the scheduled project
-        // check verifies the settled write; its durable receipt is safe while this job is parked.
+        // A scheduled project check classifies new problems against the pre-write file result;
+        // its durable receipt is safe while this job is parked.
         // A multi-file operation (rename) never parks: it must write every file and answer once,
         // so it skips the wait and reports diagnostics as unknown until the next check lands.
         if await_check
             && result == expected
             && result.outcome.has_post_source()
-            && !matches!(diagnostics, EditDiagnostics::CurrentReported { .. })
             && let Some(stage) = self.edit_check_stage(
                 job,
                 &authority,
                 &request.path,
                 result.clone(),
                 refreshed.clone(),
-                diagnostics.clone(),
+                (diagnostics.clone(), preexisting),
             )
         {
             match self.check_diagnostics(&stage) {
@@ -3970,7 +3971,7 @@ impl<'a> Worker<'a> {
         path: &str,
         result: EditResult,
         refreshed: Option<SourceObservation>,
-        fallback: EditDiagnostics,
+        (fallback, preexisting): (EditDiagnostics, BTreeMap<String, u32>),
     ) -> Option<JobStage> {
         let feed = self.shared.project_feed.as_ref()?;
         let language = Language::for_path(std::path::Path::new(path))
@@ -3995,9 +3996,44 @@ impl<'a> Worker<'a> {
             generation,
             worktree,
             wanted: path.trim_start_matches("./").to_owned(),
+            preexisting,
             language,
             deadline,
         })
+    }
+
+    /// Captures problems already reported for the edited file before its write is dispatched.
+    fn pre_edit_problem_keys(
+        &self,
+        authority: &AuthorityStamp,
+        path: &str,
+    ) -> BTreeMap<String, u32> {
+        let Some(feed) = self.shared.project_feed.as_ref() else {
+            return BTreeMap::new();
+        };
+        let worktree = authority.worktree().worktree_path();
+        let Some(language) = Language::for_path(std::path::Path::new(path)) else {
+            return BTreeMap::new();
+        };
+        if language.checks().is_none() {
+            return BTreeMap::new();
+        }
+        feed.latest(worktree)
+            .into_iter()
+            .find(|snapshot| {
+                snapshot.language == language
+                    && matches!(
+                        snapshot.state,
+                        crate::checks::CheckState::Ready | crate::checks::CheckState::Partial
+                    )
+            })
+            .map(|snapshot| {
+                problem_counts(snapshot.problems.iter().filter(|problem| {
+                    normalized_problem_path(&problem.path, worktree)
+                        == path.trim_start_matches("./")
+                }))
+            })
+            .unwrap_or_default()
     }
 
     /// Returns the matching generation's diagnostics without waiting; absence means the job parks.
@@ -4010,6 +4046,7 @@ impl<'a> Worker<'a> {
             generation,
             worktree,
             wanted,
+            preexisting,
             language,
             ..
         } = stage;
@@ -4022,45 +4059,57 @@ impl<'a> Worker<'a> {
         if !matches!(snapshot.state, CheckState::Ready | CheckState::Partial) {
             return Some(EditDiagnostics::Unknown {});
         }
+        let mut preexisting = preexisting.clone();
         let mut errors = 0u32;
         let mut warnings = 0u32;
         let mut messages = Vec::new();
+        let mut old_messages = Vec::new();
+        let mut old_errors = 0u32;
+        let mut old_warnings = 0u32;
         let mut truncated = snapshot.truncated;
         for problem in &snapshot.problems {
-            let reported = problem.path.trim_start_matches("./");
-            let reported = std::path::Path::new(reported)
-                .strip_prefix(worktree)
-                .map(|relative| relative.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| reported.to_owned());
+            let reported = normalized_problem_path(&problem.path, worktree);
             if reported != *wanted {
                 continue;
             }
-            match problem.severity {
-                Severity::Error => errors += 1,
-                Severity::Warning => warnings += 1,
-            }
-            if messages.len() < 8 {
-                let code = problem
-                    .code
-                    .as_deref()
-                    .map(|code| format!("[{code}] "))
-                    .unwrap_or_default();
-                let severity = match problem.severity {
-                    Severity::Error => "error",
-                    Severity::Warning => "warning",
-                };
-                messages.push(super::reply::bounded_utf8_prefix(
-                    &format!(
-                        "{wanted}:{}:{} {severity} {code}{}",
-                        problem.line, problem.column, problem.message
-                    ),
-                    256,
-                ));
+            let identity = problem_identity(problem);
+            let severity = match problem.severity {
+                Severity::Error => "error",
+                Severity::Warning => "warning",
+            };
+            let code = problem
+                .code
+                .as_deref()
+                .map(|code| format!("[{code}] "))
+                .unwrap_or_default();
+            let message = super::reply::bounded_utf8_prefix(
+                &format!(
+                    "{wanted}:{}:{} {severity} {code}{}",
+                    problem.line, problem.column, problem.message
+                ),
+                256,
+            );
+            if take_preexisting_problem(&identity, &mut preexisting) {
+                match problem.severity {
+                    Severity::Error => old_errors += 1,
+                    Severity::Warning => old_warnings += 1,
+                }
+                if old_messages.len() < 3 {
+                    old_messages.push(message);
+                }
             } else {
-                truncated = true;
+                match problem.severity {
+                    Severity::Error => errors += 1,
+                    Severity::Warning => warnings += 1,
+                }
+                if messages.len() < 8 {
+                    messages.push(message);
+                } else {
+                    truncated = true;
+                }
             }
         }
-        Some(if messages.is_empty() {
+        Some(if messages.is_empty() && old_errors + old_warnings == 0 {
             // A capped snapshot that kept no problem of this file says nothing about it: the
             // file's problems may be among the dropped ones, so it is neither clean nor reported.
             if truncated {
@@ -4077,11 +4126,30 @@ impl<'a> Worker<'a> {
                 EditDiagnostics::CurrentClean {}
             }
         } else {
+            let old_summary = if old_errors + old_warnings > 3 {
+                String::new()
+            } else if old_errors + old_warnings > 0 {
+                format!("; pre-existing: {}", old_messages.join("; "))
+            } else {
+                String::new()
+            };
+            let mut displayed = messages
+                .into_iter()
+                .map(|message| format!("new: {message}"))
+                .collect::<Vec<_>>();
+            displayed.extend(
+                old_messages
+                    .iter()
+                    .take(8usize.saturating_sub(displayed.len()))
+                    .map(|message| format!("pre-existing: {message}")),
+            );
+            truncated |= old_errors + old_warnings > old_messages.len() as u32;
             EditDiagnostics::CurrentReported {
-                messages,
+                messages: displayed,
                 delta: format!(
-                    "project check {:.1}s: {errors} errors, {warnings} warnings in this file",
-                    snapshot.duration_ms as f64 / 1000.0
+                    "project check {:.1}s: {errors} new errors, {warnings} new warnings; \
+                     {old_errors} pre-existing errors, {old_warnings} pre-existing warnings{old_summary}",
+                    snapshot.duration_ms as f64 / 1000.0,
                 ),
                 truncated,
             }
@@ -4774,10 +4842,8 @@ fn admitted_edit_source(
         .flatten()
 }
 
-/// Returns the newest retained detail reference that already authorizes a full-file edit of
-/// `path` for this binding — its last successful edit or fully delivered read/context of that
-/// path. Detail references are minted monotonically, so the highest trailing number is the
-/// newest observation; a `stale_source` refusal names it so the retry needs no re-read.
+/// Returns the newest retained detail reference that authorizes a full-file edit of `path` for
+/// this binding, so eviction can protect that read or successful edit from removal.
 fn newest_edit_source(ledger: &Ledger, binding: &BindingRef, path: &str) -> Option<String> {
     ledger
         .details
@@ -4792,6 +4858,153 @@ fn newest_edit_source(ledger: &Ledger, binding: &BindingRef, path: &str) -> Opti
                 .unwrap_or(0)
         })
         .map(|(reference, _)| reference.clone())
+}
+
+/// Normalizes a checker path to the edited file's worktree-relative form.
+fn normalized_problem_path(reported: &str, worktree: &Path) -> String {
+    let reported = reported.trim_start_matches("./");
+    Path::new(reported)
+        .strip_prefix(worktree)
+        .map(|relative| relative.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| reported.to_owned())
+}
+
+/// Identity for diagnostic matching; positions stay display data because edits move lines.
+fn problem_identity(problem: &crate::checks::Problem) -> String {
+    format!(
+        "{:?}:{:?}:{}",
+        problem.severity, problem.code, problem.message
+    )
+}
+
+/// Counts each diagnostic identity so duplicates retain their before-edit multiplicity.
+fn problem_counts<'a>(
+    problems: impl Iterator<Item = &'a crate::checks::Problem>,
+) -> BTreeMap<String, u32> {
+    let mut counts = BTreeMap::new();
+    for problem in problems {
+        *counts.entry(problem_identity(problem)).or_default() += 1;
+    }
+    counts
+}
+
+/// Consumes one matching before-edit occurrence; surplus current occurrences are new problems.
+fn take_preexisting_problem(identity: &str, counts: &mut BTreeMap<String, u32>) -> bool {
+    let Some(count) = counts.get_mut(identity) else {
+        return false;
+    };
+    if *count == 0 {
+        false
+    } else {
+        *count -= 1;
+        true
+    }
+}
+
+/// Checks edit diagnostic attribution against the file's prior project-check snapshot.
+#[cfg(test)]
+mod edit_diagnostics_tests {
+    use super::*;
+    use crate::checks::{Problem, Severity};
+
+    /// Keeps shifted old errors pre-existing after inserted or deleted lines.
+    #[test]
+    fn inserted_and_deleted_lines_keep_old_problems_preexisting() {
+        let old = (1..=3)
+            .map(|line| {
+                Problem::new(
+                    "src/lib.rs".into(),
+                    line,
+                    1,
+                    Severity::Error,
+                    Some("E0308".into()),
+                    "mismatched types".into(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let inserted = old
+            .iter()
+            .map(|problem| {
+                Problem::new(
+                    problem.path.clone(),
+                    problem.line + 5,
+                    problem.column,
+                    problem.severity,
+                    problem.code.clone(),
+                    problem.message.clone(),
+                )
+            })
+            .chain(std::iter::once(Problem::new(
+                "src/lib.rs".into(),
+                9,
+                2,
+                Severity::Error,
+                Some("E0308".into()),
+                "expected `u32`, found `String`".into(),
+            )))
+            .collect::<Vec<_>>();
+        let before = problem_counts(old.iter());
+        let (old_count, new): (Vec<_>, Vec<_>) = classify(&inserted, before.clone());
+        assert_eq!(old_count.len(), 3);
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].line, 9);
+        assert_eq!(new[0].column, 2);
+
+        let before_deletion = old
+            .iter()
+            .map(|problem| {
+                Problem::new(
+                    problem.path.clone(),
+                    problem.line + 5,
+                    problem.column,
+                    problem.severity,
+                    problem.code.clone(),
+                    problem.message.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (old_count, new) = classify(&old, problem_counts(before_deletion.iter()));
+        assert_eq!(old_count.len(), 3);
+        assert!(new.is_empty());
+    }
+
+    /// Treats only occurrences beyond the prior duplicate count as newly introduced.
+    #[test]
+    fn duplicate_diagnostics_count_only_surplus_as_new() {
+        let make = |line| {
+            Problem::new(
+                "src/lib.rs".into(),
+                line,
+                1,
+                Severity::Error,
+                Some("E0308".into()),
+                "same diagnostic".into(),
+            )
+        };
+        let before = [make(10), make(11)];
+        let after = vec![make(1), make(2), make(3)];
+        let (old, new) = classify(&after, problem_counts(before.iter()));
+        assert_eq!(old.len(), 2);
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].line, 3);
+    }
+
+    /// Partitions current problems by consuming the corresponding prior multiset counts.
+    fn classify(
+        current: &[Problem],
+        mut before: BTreeMap<String, u32>,
+    ) -> (Vec<&Problem>, Vec<&Problem>) {
+        let mut old = Vec::new();
+        let mut new = Vec::new();
+        for problem in current {
+            if take_preexisting_problem(&problem_identity(problem), &mut before) {
+                old.push(problem);
+            } else {
+                new.push(problem);
+            }
+        }
+        (old, new)
+    }
 }
 
 /// Proves a refreshed observation is the exact Workspace post-read and no native write intervened.
@@ -6862,6 +7075,70 @@ mod stop_retry_tests {
             assert!(ledger.details.contains_key(&format!("detail-{n}")));
         }
         assert!(ledger.details.contains_key(&reference));
+    }
+
+    /// A source detail is pinned while newer jobs evict the binding's settled history.
+    #[tokio::test]
+    async fn newest_read_source_survives_more_than_eight_settled_details() {
+        let fixture = Fixture::new();
+        let handle = detail_handle(&fixture.root, 10);
+        let binding = validated_call(&handle.shared.bindings, "read-actor", "read-start")
+            .binding_ref()
+            .clone();
+        let worktree = crate::workspace::authority::WorktreeRef::from_discovery(
+            fixture.root.clone(),
+            fixture.root.clone(),
+            ".git".into(),
+            1,
+        )
+        .unwrap();
+        for n in 1..=10 {
+            let reference = format!("detail-{n}");
+            plant_detail(&handle, &reference, &binding, settled_detail(&reference));
+            handle
+                .shared
+                .ledger
+                .lock()
+                .unwrap()
+                .details
+                .get_mut(&reference)
+                .unwrap()
+                .source = Some(
+                SourceObservation::new(
+                    worktree.clone(),
+                    1,
+                    n,
+                    crate::workspace::observation::ObservationRef::new(format!("source-{n}"))
+                        .unwrap(),
+                    "main.rs".into(),
+                    Some(crate::workspace::observation::SourceBytes::from_bytes(b"x")),
+                    crate::workspace::observation::SourceRevision::new(format!("rev-{n}")).unwrap(),
+                    crate::workspace::observation::SourceCoverage::Complete,
+                    crate::workspace::observation::ObservedState::Present,
+                )
+                .unwrap(),
+            );
+        }
+        let mut ledger = handle.shared.ledger.lock().unwrap();
+        assert_eq!(
+            evict_binding_oldest(&mut ledger, 10, &binding, &BTreeSet::new()),
+            1
+        );
+        assert!(!ledger.details.contains_key("detail-1"));
+        assert!(ledger.details.contains_key("detail-10"));
+        assert_eq!(
+            newest_edit_source(&ledger, &binding, "main.rs").as_deref(),
+            Some("detail-10")
+        );
+        assert!(
+            admitted_edit_source(
+                &ledger.details["detail-10"],
+                &binding,
+                "detail-10",
+                "main.rs"
+            )
+            .is_some()
+        );
     }
 
     /// A retained test run's output detail is never evicted, so its full output stays readable

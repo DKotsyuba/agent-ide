@@ -278,7 +278,7 @@ edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }};
 {%- if note %}{{ "\n" }}{{ note }}{%- endif %}
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "stale_source" -%}
-edit: stale_source; path {{ result.path }}. No write occurred — this file changed or the source_ref missed part of its read. Retry with the newest source_ref below; if none is given, re-read with ide.read and inspect every page first{% if note %}{{ "\n" }}{{ note }}{% endif %}
+edit: stale_source; path {{ result.path }}. No write occurred — this file changed or the source_ref missed part of its read. Re-read with ide.read and inspect every page before retrying{% if note %}{{ "\n" }}{{ note }}{% endif %}
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "conflicting_duplicate" -%}
 edit: conflicting_duplicate; path {{ result.path }}. No write occurred; use ide.context to inspect the target before a new operation_id

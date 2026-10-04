@@ -3503,11 +3503,8 @@ async fn managed_context_problems_then_edit_tracks_content() {
     assert_eq!(stale["result"]["outcome"], "stale_source", "{stale}");
     assert_eq!(stale["result"]["source_ref"], Value::Null, "{stale}");
     assert!(
-        stale["note"]
-            .as_str()
-            .unwrap()
-            .contains(context["detail_ref"].as_str().unwrap()),
-        "stale edit should name this binding's newest known source_ref: {stale}"
+        stale["note"].is_null(),
+        "stale edit must not recommend its refused source_ref: {stale}"
     );
     assert_eq!(
         std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
@@ -5461,6 +5458,122 @@ async fn an_edit_to_an_undeclared_rust_module_is_not_analysed() {
     )
     .await;
     assert_eq!(orphan["diagnostics"]["state"], "current_clean", "{orphan}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Edit diagnostics list the new project problem and summarize the file's prior problems.
+#[tokio::test]
+async fn edit_diagnostics_separate_new_and_preexisting_file_problems() {
+    let fixture = ProductFixture::new(json!([]));
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let cargo = home.join(".rustup/toolchains/fake/bin/cargo");
+    let script = r#"#!/bin/sh
+source=$(/bin/cat src/lib.rs)
+case "$source" in
+  *introduced*)
+    i=0
+    while [ "$i" -lt 3 ]; do
+      i=$((i+1))
+      line=$((i+5))
+      printf '{"reason":"compiler-message","package_id":"fixture","message":{"level":"error","message":"fake %s","code":null,"spans":[{"file_name":"src/lib.rs","is_primary":true,"line_start":%s,"column_start":1}]}}\n' "$i" "$line"
+    done
+    printf '{"reason":"compiler-message","package_id":"fixture","message":{"level":"error","message":"fake 4","code":null,"spans":[{"file_name":"src/lib.rs","is_primary":true,"line_start":4,"column_start":1}]}}\n'
+    ;;
+  *)
+    n=3
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      i=$((i+1))
+      printf '{"reason":"compiler-message","package_id":"fixture","message":{"level":"error","message":"fake %s","code":null,"spans":[{"file_name":"src/lib.rs","is_primary":true,"line_start":%s,"column_start":1}]}}\n' "$i" "$i"
+    done
+    ;;
+esac
+printf '{"reason":"compiler-artifact","package_id":"fixture"}\n'
+printf '{"reason":"build-finished","success":true}\n'
+"#;
+    std::fs::write(&cargo, script).unwrap();
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "edit-diagnostic-delta").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"edit-diagnostic-delta"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let problems = actor
+            .call(&fixture, "ide.context", json!({"kind":"problems"}))
+            .await;
+        let problems = actor.settle(&fixture, problems).await;
+        if problems["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("rust: ready; errors: 3"))
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "initial check did not settle: {problems}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"src/lib.rs","lines":"1-2"}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let edited = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"diagnostic-delta-edit",
+                "path":"src/lib.rs",
+                "source_ref":read["detail_ref"],
+                "content":"// inserted line 1\n// inserted line 2\n// inserted line 3\n// inserted line 4\n// inserted line 5\npub fn value() -> i32 { 7 } // introduced\npub fn caller() -> i32 { value() }\n"
+            }),
+        )
+        .await;
+    let edited = actor.settle(&fixture, edited).await;
+    assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
+    assert_eq!(
+        edited["diagnostics"]["state"], "current_reported",
+        "{edited}"
+    );
+    let messages = edited["diagnostics"]["messages"].as_array().unwrap();
+    assert!(
+        messages.iter().any(|message| message
+            .as_str()
+            .unwrap()
+            .contains("new: src/lib.rs:4:1 error fake 4")),
+        "new problem should carry its location: {edited}"
+    );
+    assert!(
+        edited["diagnostics"]["delta"]
+            .as_str()
+            .unwrap()
+            .contains("3 pre-existing errors"),
+        "{edited}"
+    );
+    assert!(
+        messages
+            .iter()
+            .filter(|message| message.as_str().unwrap().starts_with("pre-existing:"))
+            .count()
+            == 3,
+        "the three old problems should be listed separately: {edited}"
+    );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();

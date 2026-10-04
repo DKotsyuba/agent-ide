@@ -98,8 +98,7 @@ which the reply says `unknown` and `ide.context` shows the result when it lands.
   replaces a line range when the target is not a symbol (imports, constants, configuration).
   `source_ref` is required: the `ide.read` the lines came from. The edit is refused
   `stale_source` (no write) when the file changed or the reference did not cover a complete read.
-  Retry with the newest `source_ref` in the reply; if none is given, re-read with `ide.read` and
-  inspect every page before retrying. The symbol forms take `source_ref` too
+  Re-read with `ide.read` and inspect every page before retrying. The symbol forms take `source_ref` too
   (optional; validated when given).
   After `ide.edit`, base the next edit of that file on the `source_ref` in the edit reply.
 - `ide.edit {"operation_id":"…","path":"src/new.rs","content":"…"}` — creates a file that does

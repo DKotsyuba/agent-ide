@@ -3441,8 +3441,9 @@ fn find_old(source: &str, old: &str, scope: Option<LineRange>) -> OldMatch {
     let mut best = (scope.start, 0usize);
     for number in scope.start..=scope.end.min(lines.len() as u32) {
         let shared = lines[(number - 1) as usize]
+            .trim_start()
             .chars()
-            .zip(first.trim().chars())
+            .zip(first.trim_start().chars())
             .take_while(|(a, b)| a == b)
             .count();
         if shared > best.1 {
@@ -4332,6 +4333,23 @@ mod batch_tests {
         assert!(
             candidate.starts_with("sym card\n1\nsYM BTN\n"),
             "{candidate}"
+        );
+    }
+
+    /// Suggests the nearby indented line when old text is indented differently.
+    #[test]
+    fn closest_old_line_ignores_leading_indentation() {
+        let source = "unrelated\n    let value = 1;\n";
+        let request = [ChangeRequest::Old {
+            old: "        let value = 2;".to_owned(),
+            new: "".to_owned(),
+            within: None,
+        }];
+        let refusal = resolve_changes(source, None, "a.rs", &request).unwrap_err();
+        assert!(
+            refusal
+                .detail()
+                .contains("closest line 2: \"let value = 1;\"")
         );
     }
 

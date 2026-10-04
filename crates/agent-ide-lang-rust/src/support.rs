@@ -1613,6 +1613,39 @@ mod tests {
         );
     }
 
+    /// Formatting edited module text through stdin leaves its unformatted child file byte-identical.
+    #[test]
+    fn formatting_module_stdin_does_not_rewrite_child_modules() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let root = std::env::temp_dir().join(format!("agent-ide-rustfmt-{}", std::process::id()));
+        let child = root.join("child.rs");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&child, "fn child( ){\nlet x=1;\n}\n").unwrap();
+        let before = fs::read(&child).unwrap();
+        let argv = RustSupport
+            .format_stdin_command(&project(), Path::new("mod.rs"))
+            .unwrap();
+        let mut rustfmt = Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(&root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        rustfmt
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"mod child;\nfn edited( ){let x=1;}\n")
+            .unwrap();
+        assert!(rustfmt.wait_with_output().unwrap().status.success());
+        assert_eq!(fs::read(&child).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn file_doc_reads_the_leading_module_comment() {
         assert_eq!(

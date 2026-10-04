@@ -336,7 +336,30 @@ impl EditDiagnostics {
                     .diagnostics
                     .iter()
                     .take(8)
-                    .map(|diagnostic| bounded_utf8_prefix(&diagnostic.message, 256))
+                    .map(|diagnostic| {
+                        let code = diagnostic
+                            .code
+                            .as_ref()
+                            .map(|code| match code {
+                                async_lsp::lsp_types::NumberOrString::Number(code) => {
+                                    format!("[{code}] ")
+                                }
+                                async_lsp::lsp_types::NumberOrString::String(code) => {
+                                    format!("[{code}] ")
+                                }
+                            })
+                            .unwrap_or_default();
+                        bounded_utf8_prefix(
+                            &format!(
+                                "{}:{}:{} {code}{}",
+                                context.uri.path(),
+                                diagnostic.range.start.line + 1,
+                                diagnostic.range.start.character + 1,
+                                diagnostic.message
+                            ),
+                            256,
+                        )
+                    })
                     .collect::<Vec<String>>();
                 Self::CurrentReported {
                     delta: format!(
