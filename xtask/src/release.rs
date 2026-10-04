@@ -52,11 +52,11 @@ const BUNDLE_FILES: [&str; 16] = [
     ".claude-plugin/marketplace.json",
     ".claude-plugin/plugin.json",
     ".codex-plugin/plugin.json",
-    "agents/ide-reviewer.md",
     "COMPLETE",
     "README.md",
     "SHA256SUMS",
     "agent-ide",
+    "agents/ide-reviewer.md",
     "docs/release.md",
     "hooks/claude-hook.sh",
     "hooks/hooks.json",
@@ -195,19 +195,12 @@ pub fn package(root: &Path, binary: &Path, tag: &str, output_dir: &Path) -> Resu
     let asset = asset_name(tag);
     let tmp = TempDir::new("agent-ide-package")?;
     let bundle = tmp.0.join(&name);
-    for dir in [
-        ".agents/plugins",
-        ".claude-plugin",
-        ".codex-plugin",
-        "docs",
-        "hooks",
-        "skills/agent-ide/agents",
-    ] {
-        fs::create_dir_all(bundle.join(dir))?;
-    }
+    fs::create_dir_all(bundle.join(".agents/plugins"))?;
     fs::copy(binary, bundle.join("agent-ide"))?;
     for file in COPIED {
-        fs::copy(root.join(file), bundle.join(file))?;
+        let target = bundle.join(file);
+        fs::create_dir_all(target.parent().ok_or("bundle file without a parent")?)?;
+        fs::copy(root.join(file), target)?;
     }
     fs::write(
         bundle.join(".agents/plugins/marketplace.json"),
