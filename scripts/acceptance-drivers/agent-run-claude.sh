@@ -152,22 +152,25 @@ mkdir -p -- "$DIAG_DIR"
 # Requires one complete agent-run transcript to pair each Agent IDE call with a bounded text reply.
 #
 # Agent-run stores ordered messages with string content, unlike the direct-host JSONL transcripts.
-# The first argument is its private JSON path; the second is a closed failure code. Empty or
-# malformed transcripts, missing results, and replies above 16 KiB fail the whole host cell.
+# One call may span a block-start row and continuation rows (agent-run 0.20.2), so each call is
+# paired with its result rows by their shared raw_ref. The first argument is its private JSON path;
+# the second is a closed failure code. Empty or malformed transcripts, missing results, and replies
+# above 16 KiB fail the whole host cell.
 require_agent_run_compact_replies() {
     jq -e --argjson bound 16384 '
+        def text: if type == "string" then . else (map(.text // "") | join("")) end;
         .complete == true and .next_cursor == null and (.messages | type == "array") and
-        ([.messages as $messages
-          | range(0; $messages | length) as $i
-          | select($messages[$i].role == "tool_call"
-              and (($messages[$i].name // "") | test("^mcp__agent[-_]ide__ide[._]")))
-          | $messages[$i + 1]] as $results
-         | ($results | length > 0)
-           and all($results[];
-               .role == "tool_result"
-               and ((.content
-                     | if type == "string" then . else (map(.text // "") | join("")) end)
-                    | utf8bytelength <= $bound)))
+        (.messages as $messages
+         | [$messages[]
+            | select(.role == "tool_call" and (.starts_block // true)
+                and ((.name // "") | test("^mcp__agent[-_]ide__ide[._]")))
+            | .raw_ref] as $calls
+         | ($calls | length > 0)
+           and all($calls[]; . as $ref
+               | $ref != null
+                 and ([$messages[] | select(.role == "tool_result" and .raw_ref == $ref)
+                       | .content | text]
+                      | length > 0 and (join("") | utf8bytelength <= $bound))))
     ' "$1" >/dev/null 2>>"$DIAG_LOG" \
         || { note "$2" "missing, malformed, or oversized Agent IDE reply"; return 1; }
 }
