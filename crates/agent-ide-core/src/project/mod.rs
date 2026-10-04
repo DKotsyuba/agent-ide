@@ -807,7 +807,8 @@ fn environment_line(language: Language, env: &crate::lang::environment::Resolved
         }
     };
     for warning in &env.warnings {
-        line.push_str(&format!(" ≠ {}", warning.trim_start_matches('≠').trim()));
+        line.push(' ');
+        line.push_str(warning);
     }
     let alternatives: Vec<_> = env
         .candidates
@@ -841,7 +842,7 @@ fn environment_line(language: Language, env: &crate::lang::environment::Resolved
         }
     }
     if env.candidates.len() >= 2
-        && let Some(candidate) = alternatives.first()
+        && let Some(candidate) = alternatives.iter().find(|candidate| !candidate.broken)
     {
         line.push_str(&format!(
             " — choose: ide.start environment {}",
@@ -1474,5 +1475,37 @@ mod tests {
             "alpha:packages/one missing — create an environment or choose auto ≠ requested version 2"
         );
         replace_selections(tree.path(), language, Vec::new());
+    }
+    /// Warning clauses keep their language wording, including an existing mismatch marker.
+    #[test]
+    fn review_environment_warning_and_healthy_hint() {
+        crate::lang::testing::install();
+        let tree = TempTree::new("review-environment-card");
+        tree.write("env.fixture", "one\nbroken\ntwo\n");
+        let language = crate::lang::testing::ALPHA;
+        let mut env = language.support().environments(tree.path()).remove(0);
+        env.warnings = vec![
+            "pin overrides the stored choice".into(),
+            "≠ requested version 2".into(),
+        ];
+        let line = environment_line(language, &env);
+        assert!(
+            line.contains(" pin overrides the stored choice ≠ requested version 2"),
+            "{line}"
+        );
+        assert_eq!(line.matches('≠').count(), 1);
+    }
+
+    /// Hints choose a runnable alternative and disappear when only broken alternatives remain.
+    #[test]
+    fn review_environment_hint_skips_broken_candidates() {
+        crate::lang::testing::install();
+        let tree = TempTree::new("review-healthy-hint");
+        tree.write("env.fixture", "one\nbroken\ntwo\n");
+        let language = crate::lang::testing::ALPHA;
+        let mut env = language.support().environments(tree.path()).remove(0);
+        assert!(environment_line(language, &env).ends_with("{\"alpha\":\"two\"}"));
+        env.candidates.pop();
+        assert!(!environment_line(language, &env).contains("choose:"));
     }
 }

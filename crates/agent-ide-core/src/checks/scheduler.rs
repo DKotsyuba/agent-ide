@@ -240,21 +240,32 @@ impl Scheduler {
         }
     }
 
-    /// Cancels and forgets one language's result and fingerprint baseline, then reruns urgently.
-    /// Selection and resolver-identity changes call this even when file fingerprints are unchanged.
-    /// Other languages keep their snapshots and running checks.
+    /// Invalidates and urgently reruns one known language after an effective environment change.
+    /// Unknown worktrees and languages are never admitted here; the feed owns that decision.
     pub fn environment_changed(&self, worktree: &Path, language: Language) {
+        self.invalidate_environment(worktree, language, true);
+    }
+
+    /// Drops stale environment-dependent state without scheduling any new run.
+    pub fn discard_environment(&self, worktree: &Path, language: Language) {
+        self.invalidate_environment(worktree, language, false);
+    }
+
+    /// Cancels a known pair, clears its snapshot/baseline, and restarts only when admitted by
+    /// the caller. Other languages keep their snapshots and running checks.
+    fn invalidate_environment(&self, worktree: &Path, language: Language, restart: bool) {
         let worktree = canonical_worktree(worktree);
         let mut state = self.inner.lock_state();
-        if state.shutting_down || !self.inner.checkers.contains_key(&language) {
+        if state.shutting_down {
             return;
         }
-        let wt = state
-            .worktrees
-            .entry(worktree.clone())
-            .or_insert_with(|| WorktreeState::new(""));
+        let Some(wt) = state.worktrees.get_mut(&worktree) else {
+            return;
+        };
+        let Some(lang) = wt.languages.get_mut(&language) else {
+            return;
+        };
         wt.input_generation += 1;
-        let lang = wt.languages.entry(language).or_default();
         if let Some(timer) = lang.timer_abort.take() {
             timer.abort();
         }
@@ -262,16 +273,19 @@ impl Scheduler {
             run.abort();
         }
         lang.running = false;
+        lang.dirty = false;
         lang.latest_snapshot = None;
         lang.completed_fingerprint = None;
         lang.skip_eligible = false;
-        lang.urgent = true;
+        lang.urgent = restart;
         lang.last_completion = None;
-        let inner = Arc::clone(&self.inner);
-        let handle = tokio::spawn(async move {
-            Inner::on_debounce_fire(inner, worktree, language).await;
-        });
-        lang.timer_abort = Some(handle.abort_handle());
+        if restart {
+            let inner = Arc::clone(&self.inner);
+            let handle = tokio::spawn(async move {
+                Inner::on_debounce_fire(inner, worktree, language).await;
+            });
+            lang.timer_abort = Some(handle.abort_handle());
+        }
     }
 
     /// Builds a scheduler with no worktrees registered yet.
@@ -2023,5 +2037,26 @@ mod deny_tests {
         assert_eq!(checker.requests().len(), 1);
         scheduler.shutdown().await;
         std::fs::remove_dir_all(root).unwrap();
+    }
+    /// Scheduler invalidation never grants an unknown worktree a check slot.
+    #[tokio::test]
+    async fn review_environment_unknown_worktree_is_not_created() {
+        crate::lang::testing::install();
+        let language = crate::lang::testing::ALPHA;
+        let ready = ProblemSnapshot::from_problems(language, CheckState::Ready, Vec::new(), 1, 0);
+        let checker = Arc::new(FakeChecker::new(language, ready));
+        let scheduler = Scheduler::new(
+            vec![checker.clone()],
+            Duration::from_millis(1),
+            1,
+            std::env::temp_dir(),
+        );
+        scheduler.environment_changed(Path::new("/unknown-review-worktree"), language);
+        assert_eq!(
+            scheduler.generation(Path::new("/unknown-review-worktree")),
+            0
+        );
+        assert!(checker.requests().is_empty());
+        scheduler.shutdown().await;
     }
 }

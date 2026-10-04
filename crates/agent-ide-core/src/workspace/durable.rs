@@ -496,7 +496,7 @@ impl<'a> DurableWorkspace<'a> {
         let incarnation = signed(tree.incarnation())?;
         let boot = signed(self.boot)?;
         let op = operation("environment", &random_nonce()?)?;
-        self.store.execute(op.clone(), move |tx| {
+        let result = self.store.execute(op.clone(), move |tx| {
             if current_boot(tx)? != boot { return Err(rusqlite::Error::InvalidQuery); }
             for (language, choice) in rows {
                 if choice.selector == "auto" {
@@ -506,7 +506,21 @@ impl<'a> DurableWorkspace<'a> {
                 }
             }
             Ok(())
-        }).await?;
+        }).await;
+        self.finish_environment_write(tree, &op, result).await
+    }
+
+    /// Reconciles an ambiguous write against its durable receipt, then reads the committed rows
+    /// into the process map without replaying SQL. Unconfirmed outcomes leave the map unchanged.
+    async fn finish_environment_write(
+        &self,
+        tree: &WorktreeRef,
+        op: &OperationId,
+        result: Result<(), StoreError>,
+    ) -> Result<(), DurableError> {
+        if let Err(error) = result {
+            self.require_committed(op, error).await?;
+        }
         self.load_environment(tree).await
     }
 

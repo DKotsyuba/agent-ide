@@ -23,9 +23,22 @@ pub(super) struct EnvironmentState {
 }
 
 impl EnvironmentState {
-    /// Associates a binding with its admitted worktree, independently of check configuration.
+    /// Associates an admitted worktree and establishes the current notice as a new binding's
+    /// baseline. Repeating a bind to the same root preserves any undelivered change.
     pub(super) fn bind(&mut self, binding: [u8; 32], root: &Path) {
-        self.bindings.insert(binding, root.to_path_buf());
+        if self.bindings.insert(binding, root.to_path_buf()).as_deref() != Some(root) {
+            if let Some(notice) = self.notices.get(root) {
+                self.delivered.insert(binding, notice.clone());
+            } else {
+                self.delivered.remove(&binding);
+            }
+        }
+    }
+
+    /// Releases the stopped binding's root and delivery state; shared worktree identities remain.
+    pub(super) fn forget(&mut self, binding: &[u8; 32]) {
+        self.bindings.remove(binding);
+        self.delivered.remove(binding);
     }
 
     /// Returns the worktree most recently activated by this binding.
@@ -83,8 +96,13 @@ impl EnvironmentState {
                     .any(|(new_language, env)| new_language == language && old.root == env.root)
                 {
                     changed.push(*language);
+                    let key = if old.root.as_os_str().is_empty() {
+                        language.to_string()
+                    } else {
+                        format!("{language}:{}", old.root.display())
+                    };
                     notices.push(format!(
-                        "{language}: environment now missing (was {}) — semantic session restarted",
+                        "{key}: environment now missing (was {}) — semantic session restarted",
                         old.chosen
                             .as_ref()
                             .map_or("missing", |chosen| chosen.label.as_str())
@@ -188,4 +206,50 @@ fn environment_identity_changes_and_notice_delivery() {
     );
     replace_selections(&root, ALPHA, Vec::new());
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A late binding establishes a notice baseline, while an existing binding keeps its due change.
+#[test]
+fn review_environment_new_binding_has_no_stale_notice() {
+    let root = Path::new("/review-notices");
+    let mut state = EnvironmentState::default();
+    state.bind([1; 32], root);
+    state.notices.insert(root.into(), "old change".into());
+    state.bind([2; 32], root);
+    assert_eq!(state.notice(root, &[2; 32]), None);
+    state.bind([1; 32], root);
+    assert_eq!(state.notice(root, &[1; 32]), Some("old change".into()));
+    state.forget(&[2; 32]);
+    assert!(!state.bindings.contains_key(&[2; 32]));
+    assert!(!state.delivered.contains_key(&[2; 32]));
+}
+
+/// Disappearance retains the project-root key used by the corresponding card line.
+#[test]
+fn review_environment_disappearance_keeps_nested_root() {
+    crate::lang::testing::install();
+    let root = Path::new("/review-missing-root");
+    let mut state = EnvironmentState::default();
+    state.resolved.insert(
+        root.into(),
+        vec![(
+            crate::lang::testing::ALPHA,
+            ResolvedEnv {
+                root: "packages/one".into(),
+                chosen: None,
+                source: None,
+                candidates: Vec::new(),
+                warnings: Vec::new(),
+                missing_next_step: None,
+                identity: "old".into(),
+            },
+        )],
+    );
+    state.refresh(root);
+    assert!(
+        state
+            .notice(root, &[1; 32])
+            .unwrap()
+            .starts_with("alpha:packages/one: environment now missing")
+    );
 }

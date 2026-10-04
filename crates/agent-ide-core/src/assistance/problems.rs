@@ -399,9 +399,20 @@ impl ProjectProblemFeed {
             .collect()
     }
 
-    /// Invalidates one language after a shared worktree environment changes.
+    /// Invalidates environment state under the binding admission lock. Only a worktree with an
+    /// admitted, unrestricted binding may restart; all others merely discard cached results.
     pub fn environment_changed(&self, worktree: &Path, language: Language) {
-        self.scheduler.environment_changed(worktree, language);
+        if let Ok(state) = self.state.lock() {
+            if state
+                .bindings
+                .values()
+                .any(|bound| bound.worktree == worktree && bound.admitted && !bound.read_restricted)
+            {
+                self.scheduler.environment_changed(worktree, language);
+            } else {
+                self.scheduler.discard_environment(worktree, language);
+            }
+        }
     }
 
     /// Schedules a check for `binding`'s admitted worktree after a native edit or `ide.edit`
@@ -1743,5 +1754,31 @@ mod tests {
             state_line(&snapshot, None),
             "alpha: environment two missing — choose auto"
         );
+    }
+    /// Environment changes cannot admit unknown worktrees or restart restricted bindings.
+    #[tokio::test(start_paused = true)]
+    async fn review_environment_respects_feed_admission() {
+        crate::lang::testing::install();
+        let (feed, _, root) = scripted_feed("review-environment-admission");
+        let worktree = root.join("wt");
+        let language = crate::lang::testing::ALPHA;
+        let binding = [41; 32];
+        feed.activated(binding, &worktree, Path::new("repo"), false);
+        settle().await;
+        assert_eq!(feed.scheduler.latest(&worktree).len(), 1);
+        feed.restrict(&binding);
+        feed.environment_changed(&worktree, language);
+        assert!(!feed.scheduler.is_busy());
+        settle().await;
+        assert!(!feed.scheduler.is_busy());
+        assert!(feed.scheduler.latest(&worktree).is_empty());
+        let unbound = root.join("unbound");
+        std::fs::create_dir_all(&unbound).unwrap();
+        std::fs::write(unbound.join("alpha.toml"), "").unwrap();
+        feed.environment_changed(&unbound, language);
+        assert_eq!(feed.scheduler.generation(&unbound), 0);
+        assert!(!feed.scheduler.is_busy());
+        feed.scheduler.shutdown().await;
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
