@@ -217,7 +217,15 @@ impl Worker<'_> {
                     .file()
                     .ok_or(FailureCode::UnknownSymbol)?
                     .to_path_buf();
-                let (observed, bytes) = self.observe(&binding, file.clone()).await?;
+                let (observed, bytes) =
+                    self.observe(&binding, file.clone())
+                        .await
+                        .inspect_err(|code| {
+                            if matches!(code, FailureCode::SourceUnavailable) {
+                                job.failure_detail =
+                                    Some(format!("read:source_unavailable:{}", file.display()));
+                            }
+                        })?;
                 let (outline, _, from_text) = self.outline_of(job, &observed, &bytes).await?;
                 let found = outline
                     .find(&symbol)
@@ -241,13 +249,25 @@ impl Worker<'_> {
                 (std::path::PathBuf::from(&path), range, path)
             }
         };
-        let (observed, bytes) = self.observe(&binding, path.clone()).await?;
+        let (observed, bytes) = self
+            .observe(&binding, path.clone())
+            .await
+            .inspect_err(|code| {
+                if matches!(code, FailureCode::SourceUnavailable) {
+                    job.failure_detail =
+                        Some(format!("read:source_unavailable:{}", path.display()));
+                }
+            })?;
         if let Some(code) = no_such_file(observed.state(), &path.to_string_lossy()) {
             return Err(code);
         }
         let source = observed_text(&observed, &bytes)?;
         let total = lang::line_count(source);
-        if range.start > total {
+        if range.start > total || range.end > total {
+            job.failure_detail = Some(format!(
+                "read:line_range:file has {total} lines; requested {}-{}",
+                range.start, range.end
+            ));
             return Err(FailureCode::SourceUnavailable);
         }
         let range = LineRange::new(range.start, range.end.min(total));
@@ -1465,8 +1485,8 @@ impl Worker<'_> {
             job.failure_detail = Some("symbol:anchor_missing".to_owned());
             return Err(FailureCode::ProviderUnavailable);
         }
-        // (relative file, candidate line) in language and provider order.
-        let mut matches: Vec<(std::path::PathBuf, String)> = Vec::new();
+        // (relative file, rendered candidate, is impl) in language and provider order.
+        let mut matches: Vec<(std::path::PathBuf, String, bool)> = Vec::new();
         // True once at least one language produced a definite empty-or-nonempty answer.
         let mut answered = false;
         for language_files in files.values() {
@@ -1520,7 +1540,7 @@ impl Worker<'_> {
                         Some(container) => format!("{}#{container}/{name}", path.display()),
                         None => format!("{}#{name}", path.display()),
                     };
-                    (path, candidate)
+                    (path, candidate, false)
                 }));
                 continue;
             }
@@ -1557,14 +1577,15 @@ impl Worker<'_> {
                     let source = String::from_utf8_lossy(bytes);
                     let outline = support.normalize(file, &source, symbols);
                     for candidate in outline.named(name) {
-                        let candidate = format!("{}#{}", file.display(), candidate.path);
-                        matches.push((file.clone(), candidate));
+                        let path = format!("{}#{}", file.display(), candidate.path);
+                        let implementation = candidate.kind == crate::lang::SymbolKind::Impl;
+                        matches.push((file.clone(), path, implementation));
                     }
                 }
             }
         }
         // Every language was searched: a name several languages share is ambiguous.
-        matches.dedup_by(|a, b| a.1 == b.1);
+        deduplicate_symbol_candidates(&mut matches);
         if !answered {
             job.failure_detail = Some("symbol:workspace_symbols".to_owned());
             return Err(FailureCode::ProviderUnavailable);
@@ -1578,7 +1599,7 @@ impl Worker<'_> {
             _ => Ok(Located::Many(
                 matches
                     .into_iter()
-                    .map(|(_, candidate)| candidate)
+                    .map(|(_, candidate, _)| candidate)
                     .collect(),
             )),
         }
@@ -1911,6 +1932,32 @@ const MAX_CANDIDATE_LINES: usize = 20;
 pub(super) enum Located {
     One(std::path::PathBuf),
     Many(Vec<String>),
+}
+
+/// Sorts same-name resolutions by rendered path, preferring declarations to impl blocks, then
+/// removes duplicate rendered paths so one exact address is never reported twice.
+fn deduplicate_symbol_candidates(matches: &mut Vec<(std::path::PathBuf, String, bool)>) {
+    matches.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)));
+    matches.dedup_by(|a, b| a.1 == b.1);
+}
+
+#[cfg(test)]
+mod symbol_candidate_tests {
+    use super::deduplicate_symbol_candidates;
+    use std::path::PathBuf;
+
+    /// A declaration and its impl sharing one rendered address collapse to the declaration.
+    #[test]
+    fn candidate_addresses_are_unique_and_prefer_the_type() {
+        let path = PathBuf::from("src/model.rs");
+        let mut candidates = vec![
+            (path.clone(), "src/model.rs#Outcome".to_owned(), true),
+            (path, "src/model.rs#Outcome".to_owned(), false),
+        ];
+        deduplicate_symbol_candidates(&mut candidates);
+        assert_eq!(candidates.len(), 1);
+        assert!(!candidates[0].2);
+    }
 }
 
 /// Directories the session-anchor walk never enters: VCS internals, virtual environments,

@@ -940,6 +940,14 @@ mod tests {
                 "error: source_unavailable (context:observation_failed); \"src/main.rs\" could not be read through the confined reader. Retry ide.context, or continue with native tools",
             ),
             (
+                "read:line_range:file has 249 lines; requested 286-334",
+                "error: source_unavailable (read:line_range); file has 249 lines; requested 286-334",
+            ),
+            (
+                "read:source_unavailable:src/main.rs",
+                "error: source_unavailable (read:source_unavailable); src/main.rs could not be read at that path. Retry ide.read, or continue with native tools",
+            ),
+            (
                 "diff:activation_commit_unknown; use mode: head",
                 "error: source_unavailable (diff:activation_commit_unknown); the start commit of this activation is unknown, so the task view is unavailable; use ide.diff {\"mode\": \"head\"}",
             ),

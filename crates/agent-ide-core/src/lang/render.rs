@@ -381,7 +381,7 @@ mod graph_tests {
     }
 }
 
-/// Renders a file skeleton: one line per symbol, members indented, test modules collapsed.
+/// Renders a file skeleton: one declaration line per symbol, members indented, tests collapsed.
 pub fn outline_text(outline: &Outline) -> String {
     let mut out = format!(
         "{}  ({} lines, {})\n",
@@ -580,6 +580,7 @@ fn first_file_doc(path: &Path, bytes: &[u8]) -> Option<String> {
         .file_doc(text)
 }
 
+/// Renders a symbol at its declaration line while its stored range keeps attached documentation.
 fn render_symbol_line(
     symbol: &Symbol,
     depth: usize,
@@ -594,7 +595,7 @@ fn render_symbol_line(
         *tests += members;
         out.push_str(&format!(
             "{:>5}  {}{} [{} tests collapsed]\n",
-            symbol.range.start,
+            symbol.body.start,
             "  ".repeat(depth),
             symbol.signature,
             members
@@ -611,7 +612,7 @@ fn render_symbol_line(
         .unwrap_or_default();
     out.push_str(&format!(
         "{:>5}  {}{}{}\n",
-        symbol.range.start,
+        symbol.body.start,
         "  ".repeat(depth),
         symbol.signature,
         doc

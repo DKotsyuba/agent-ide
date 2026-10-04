@@ -263,6 +263,7 @@ fn release_archive_and_smoke_use_the_packaged_executable() {
         ".agents/plugins/marketplace.json",
         ".claude-plugin/marketplace.json",
         ".claude-plugin/plugin.json",
+        "agents/ide-reviewer.md",
         ".codex-plugin/plugin.json",
         "docs/release.md",
         "hooks/claude-hook.sh",
@@ -391,6 +392,7 @@ fn assert_install_layout(prefix: &Path, installed_bin: &Path, version: &str) {
     }
     assert!(version_dir.join("hooks/hooks.json").is_file());
     assert!(version_dir.join("skills/agent-ide/SKILL.md").is_file());
+    assert!(version_dir.join("agents/ide-reviewer.md").is_file());
 
     let hook_path = version_dir.join("hooks/claude-hook.sh");
     let hook_contents = std::fs::read_to_string(&hook_path).unwrap();

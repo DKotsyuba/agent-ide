@@ -107,6 +107,12 @@ error: source_unavailable (context:source_changed); {{ resolution_message }} cha
 error: source_unavailable ({{ resolution_detail }}); the source changed since it was read. Re-read it with ide.context, then retry with the new source_ref
 {%- elif code == "source_unavailable" and resolution_detail is startingwith("context:observation_failed:") -%}
 error: source_unavailable (context:observation_failed); {{ resolution_message }} could not be read through the confined reader. Retry ide.context, or continue with native tools
+{%- elif code == "source_unavailable" and resolution_detail is startingwith("read:line_range:") -%}
+error: source_unavailable (read:line_range); {{ resolution_message }}
+{%- elif code == "source_unavailable" and resolution_detail is startingwith("read:source_unavailable:") -%}
+error: source_unavailable (read:source_unavailable); {{ resolution_message }} could not be read at that path. Retry ide.read, or continue with native tools
+{%- elif code == "source_unavailable" and resolution_detail is startingwith("read:observation_store:") -%}
+error: source_unavailable (read:observation_store); {{ resolution_message }} could not be retained. Retry ide.read, or continue with native tools
 {%- elif code == "source_unavailable" and resolution_detail == "diff:activation_commit_unknown; use mode: head" -%}
 error: source_unavailable (diff:activation_commit_unknown); the start commit of this activation is unknown, so the task view is unavailable; use ide.diff {"mode": "head"}
 {%- elif code == "source_unavailable" and resolution_detail is startingwith("diff:") -%}

@@ -31,12 +31,13 @@ const INSTALLER: &str = "install.sh";
 /// Upper bound for a manifest read from a directory or a published release.
 const MANIFEST_MAX_BYTES: u64 = 16384;
 /// Checkout files copied verbatim into the bundle (paths are identical on both sides).
-const COPIED: [&str; 10] = [
+const COPIED: [&str; 11] = [
     "install.sh",
     "README.md",
     "docs/release.md",
     ".claude-plugin/plugin.json",
     ".claude-plugin/marketplace.json",
+    "agents/ide-reviewer.md",
     ".codex-plugin/plugin.json",
     "hooks/hooks.json",
     "hooks/claude-hook.sh",
@@ -46,11 +47,12 @@ const COPIED: [&str; 10] = [
 /// Bundle files that are made executable after copying.
 const EXECUTABLES: [&str; 3] = ["agent-ide", "install.sh", "hooks/claude-hook.sh"];
 /// The complete archive file set, bundle-relative and in byte order.
-const BUNDLE_FILES: [&str; 15] = [
+const BUNDLE_FILES: [&str; 16] = [
     ".agents/plugins/marketplace.json",
     ".claude-plugin/marketplace.json",
     ".claude-plugin/plugin.json",
     ".codex-plugin/plugin.json",
+    "agents/ide-reviewer.md",
     "COMPLETE",
     "README.md",
     "SHA256SUMS",

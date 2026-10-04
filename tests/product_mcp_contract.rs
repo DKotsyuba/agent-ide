@@ -5963,10 +5963,9 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
     let started = actor.settle(&fixture, first).await;
     assert_eq!(started["kind"], "activation", "{started}");
     assert!(
-        started["text"]
-            .as_str()
-            .unwrap()
-            .contains("baseline: partial (Unverified; durable capture true; git metadata and source bytes are captured in separate steps"),
+        started["text"].as_str().unwrap().contains(
+            "baseline: partial (Unverified; durable capture true; git metadata and source bytes are captured in separate steps"
+        ),
         "{started}"
     );
     let retried = actor
@@ -6120,6 +6119,32 @@ async fn configured_product_activates_reads_diffs_invalidates_and_stops() {
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop");
     actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A clean Git tree gives the activation baseline a concise commit identity.
+#[tokio::test]
+async fn product_clean_activation_baseline_names_the_commit() {
+    let fixture = ProductFixture::new(json!([]));
+    fixture.git(&["add", "-A"]);
+    fixture.git(&["commit", "--quiet", "-m", "clean baseline fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "clean-baseline").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"clean-baseline"}),
+        )
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let text = started["text"].as_str().unwrap();
+    assert!(
+        text.contains("baseline: git ") && text.contains(" (clean)"),
+        "{text}"
+    );
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
 }
@@ -9371,6 +9396,7 @@ async fn product_directory_outline_lists_files_and_rejects_escaping_symlinks() {
 async fn product_outline_and_read_report_no_such_file() {
     let fixture = ProductFixture::new(json!([]));
     std::fs::write(fixture.root.join("real.rs"), "pub fn present() {}\n").unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", fixture.root.join("escape.rs")).unwrap();
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "no-such-file").await;
     let started = actor
@@ -9398,6 +9424,66 @@ async fn product_outline_and_read_report_no_such_file() {
         .await;
     let read = actor.settle(&fixture, read).await;
     assert_eq!(read["code"]["no_such_file"], "src/missing.rs", "{read}");
+    let (past_end, text) = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"path":"real.rs","lines":"286-334"}),
+    )
+    .await;
+    assert_eq!(
+        text, "error: source_unavailable (read:line_range); file has 1 lines; requested 286-334",
+        "{past_end}"
+    );
+    let (unreadable, text) = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"path":"escape.rs","lines":"1-1"}),
+    )
+    .await;
+    assert_eq!(unreadable["code"], "source_unavailable", "{unreadable}");
+    assert!(
+        text.contains("read:source_unavailable")
+            && text.contains("escape.rs")
+            && text.contains("Retry ide.read"),
+        "{text}"
+    );
+    actor.next += 1;
+    let call = format!("call-{}", actor.next);
+    actor.lifecycle(&fixture, "PreToolUse", &call).await;
+    let missing_outline_path = actor
+        .mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
+            "name":"ide.outline","arguments":{},"_meta":{"threadId":actor.actor,"callId":call,
+            "x-codex-turn-metadata":{},"codex/sandbox-state-meta":actor.state}}}),
+        )
+        .await;
+    actor.lifecycle(&fixture, "PostToolUse", &call).await;
+    assert_eq!(
+        missing_outline_path["result"]["content"][0]["text"],
+        "invalid bounded parameters: ide.outline needs \"path\" (a file or directory relative to the worktree root)",
+        "{missing_outline_path}"
+    );
+    actor.next += 1;
+    let call = format!("call-{}", actor.next);
+    actor.lifecycle(&fixture, "PreToolUse", &call).await;
+    let old_text_edit = actor
+        .mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
+            "name":"ide.edit","arguments":{"operation_id":"old-source","path":"real.rs",
+            "changes":[{"old":"present","new":"available"}]},"_meta":{"threadId":actor.actor,
+            "callId":call,"x-codex-turn-metadata":{},"codex/sandbox-state-meta":actor.state}}}),
+        )
+        .await;
+    actor.lifecycle(&fixture, "PostToolUse", &call).await;
+    assert_eq!(
+        old_text_edit["result"]["content"][0]["text"],
+        "invalid bounded parameters: \"source_ref\" is required for an old-text change; re-read this file with ide.read and retry with the new source_ref",
+        "{old_text_edit}"
+    );
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
 }

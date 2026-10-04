@@ -1130,7 +1130,8 @@ impl WorkerHandle {
     ///
     /// EYES-r2: the request runs as a bounded managed job inside the worker task — never as a
     /// Claude foreground helper — because only the worker owns the durable authority and its
-    /// authorized worktree. The caller waits on the job's bounded oneshot exactly like Stop; a
+    /// authorized worktree. The caller waits up to four seconds on its bounded oneshot, leaving
+    /// room for the worker's brief refresh of a changed project check; a
     /// lost wait still leaves the finished result retrievable through the retained detail
     /// reference until the ledger evicts it. A Codex `observed` state is rechecked before any
     /// snapshot lookup; Claude passes `None` because its hook path has no host sandbox metadata.
@@ -1151,7 +1152,7 @@ impl WorkerHandle {
         ) {
             return PeerReply::Error { code, detail: None };
         }
-        match tokio::time::timeout(Duration::from_millis(800), wait).await {
+        match tokio::time::timeout(Duration::from_secs(4), wait).await {
             Ok(Ok(reply)) => reply,
             _ => PeerReply::Error {
                 code: FailureCode::Deadline,
@@ -2963,7 +2964,14 @@ impl<'a> Worker<'a> {
             return Err(self.settle_revocation(&binding).await.err().unwrap_or(code));
         }
         self.shared.active(&binding)?;
-        let baseline = match baseline {
+        let git_metadata_captured = baseline.as_ref().is_some_and(|result| {
+            result
+                .as_ref()
+                .ok()
+                .and_then(|baseline| baseline.task_head())
+                .is_some()
+        });
+        let mut baseline = match baseline {
             Some(Ok(baseline)) => {
                 let description = format!(
                     "partial ({:?}; durable capture {}; {})",
@@ -3020,8 +3028,17 @@ impl<'a> Worker<'a> {
                     })
                     .collect();
                 let links = project_card::links_line(&languages);
-                let mut card =
-                    project_card::render(&project_card::collect(&root, languages, servers, None));
+                let project = project_card::collect(&root, languages, servers, None);
+                let clean_git = project.git.as_ref().and_then(|git| {
+                    if git.clean {
+                        git.last_commit
+                            .as_ref()
+                            .map(|(sha, _)| format!("git {sha} (clean)"))
+                    } else {
+                        None
+                    }
+                });
+                let mut card = project_card::render(&project);
                 if let Some(links) = links {
                     card.push('\n');
                     card.push_str(&links);
@@ -3033,13 +3050,17 @@ impl<'a> Worker<'a> {
                         card.push_str(&format!(" (indexed {files} files, {facts} facts)"));
                     }
                 }
-                card
+                (card, clean_git)
             });
             match tokio::time::timeout(PROJECT_CARD_BUDGET, walk).await {
                 Ok(Ok(card)) => card,
-                Ok(Err(_)) | Err(_) => String::new(),
+                Ok(Err(_)) | Err(_) => (String::new(), None),
             }
         };
+        if git_metadata_captured && let Some(clean_git) = card.1 {
+            baseline = clean_git;
+        }
+        let card = card.0;
         let mut text = if reused_activation {
             format!(
                 "activated: epoch {}; existing activation {activation_operation}; baseline: {baseline}",
@@ -3590,7 +3611,7 @@ impl<'a> Worker<'a> {
                     .project_feed
                     .as_ref()
                     .is_some_and(|feed| feed.is_read_restricted(&binding.fingerprint()));
-                let snapshots = if restricted {
+                let mut snapshots = if restricted {
                     self.shared
                         .project_feed
                         .as_ref()
@@ -3598,11 +3619,21 @@ impl<'a> Worker<'a> {
                 } else {
                     source.latest(authority.worktree().worktree_path())
                 };
-                let rechecks = if restricted {
+                let mut rechecks = if restricted {
                     Vec::new()
                 } else {
                     source.rechecks(authority.worktree().worktree_path())
                 };
+                if !restricted
+                    && rechecks
+                        .iter()
+                        .any(|(_, recheck)| *recheck == crate::checks::Recheck::FilesChanged)
+                    && tokio::time::Instant::now() + Duration::from_secs(3) < job.deadline
+                {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    snapshots = source.latest(authority.worktree().worktree_path());
+                    rechecks = source.rechecks(authority.worktree().worktree_path());
+                }
                 problems_text_with_rechecks(&snapshots, &rechecks, language, offset)
             }
             None => "checks disabled".to_owned(),
@@ -5518,7 +5549,7 @@ mod stop_retry_tests {
         checks::{CheckState, Problem, ProblemSnapshot, Severity},
         intelligence::freshness::{CacheIdentity, CacheLifecycle},
     };
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     /// Separates disposable fixture roots within the current process.
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -6478,6 +6509,44 @@ mod stop_retry_tests {
         }
     }
 
+    /// Returns an old snapshot while reporting a running recheck once, then the refreshed result.
+    struct RefreshingProblems {
+        /// Snapshot visible before the changed-input check finishes.
+        before: ProblemSnapshot,
+        /// Snapshot visible after the changed-input check finishes.
+        after: ProblemSnapshot,
+        /// Number of `latest` queries made by the context request.
+        latest_calls: AtomicUsize,
+        /// Number of recheck-state queries made by the context request.
+        recheck_calls: AtomicUsize,
+    }
+
+    impl ProblemSource for RefreshingProblems {
+        /// Returns `before` on the first read and `after` once the worker refreshes its snapshot.
+        fn latest(&self, _worktree: &std::path::Path) -> Vec<ProblemSnapshot> {
+            if self.latest_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                vec![self.before.clone()]
+            } else {
+                vec![self.after.clone()]
+            }
+        }
+
+        /// Reports one changed-file recheck, then no recheck after the worker's bounded wait.
+        fn rechecks(
+            &self,
+            _worktree: &std::path::Path,
+        ) -> Vec<(crate::checks::Language, crate::checks::Recheck)> {
+            if self.recheck_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                vec![(
+                    crate::lang::testing::ALPHA,
+                    crate::checks::Recheck::FilesChanged,
+                )]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
     /// Runs one problems-kind context job through the real production context entry point with
     /// the fixture Codex binding's current accepted unrestricted observation.
     async fn run_problems_context(
@@ -6582,6 +6651,57 @@ mod stop_retry_tests {
             "{text}"
         );
         assert_eq!(fake.queried(), vec![fixture.root.clone()]);
+    }
+
+    /// A changed-check reply waits briefly and uses the refreshed result when it settles.
+    #[tokio::test]
+    async fn context_problems_refreshes_a_running_changed_check() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        production_start(&mut worker, "refresh-actor", "refresh-start").await;
+        crate::lang::testing::install();
+        let fake = Arc::new(RefreshingProblems {
+            before: ProblemSnapshot::from_problems(
+                crate::lang::testing::ALPHA,
+                CheckState::Ready,
+                Vec::new(),
+                1,
+                0,
+            ),
+            after: ProblemSnapshot::from_problems(
+                crate::lang::testing::ALPHA,
+                CheckState::Ready,
+                Vec::new(),
+                0,
+                0,
+            ),
+            latest_calls: AtomicUsize::new(0),
+            recheck_calls: AtomicUsize::new(0),
+        });
+        Arc::get_mut(&mut worker.shared)
+            .expect("fixture worker owns its shared state exclusively")
+            .problem_source = Some(fake.clone());
+
+        let reply = run_problems_context(
+            &mut worker,
+            "refresh-actor",
+            "refresh-page",
+            serde_json::json!({"kind":"problems","language":"alpha"}),
+        )
+        .await;
+        let PeerReply::Complete { text, .. } = reply else {
+            panic!("problems context must complete: {reply:?}")
+        };
+        assert!(
+            text.contains("alpha: ready; errors: 0; warnings: 0"),
+            "{text}"
+        );
+        assert!(!text.contains("checking"), "{text}");
+        assert_eq!(fake.latest_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fake.recheck_calls.load(Ordering::SeqCst), 2);
     }
 
     /// Builds a bounded, easily reasoned-about test job for the fixture worktree's `main.rs`.
