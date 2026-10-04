@@ -230,8 +230,24 @@ impl Checker for PythonChecker {
             // root with none is skipped — running pyright without an interpreter would only
             // flood unresolved-import errors — and only a worktree whose every root lacks one
             // reports `EnvMissing`, carrying each root's cause and next step.
-            let environments =
-                crate::environment::environments(&request.worktree, &request.read_denies);
+            let resolutions =
+                crate::environment::resolutions(&request.worktree, &request.read_denies);
+            // A root whose selected or pinned environment is missing is never covered by the
+            // other roots' clean results: the whole check reports it, with its way out.
+            let demanded: Vec<String> = resolutions
+                .iter()
+                .filter(|resolution| resolution.authoritative && resolution.env.chosen.is_none())
+                .filter_map(|resolution| root_detail(&resolution.env))
+                .collect();
+            if !demanded.is_empty() {
+                return ProblemSnapshot::unavailable_with_detail(
+                    crate::LANGUAGE,
+                    UnavailableReason::EnvMissing,
+                    generation,
+                    0,
+                    Some(demanded.join("; ")),
+                );
+            }
             let tmp_dir = request.cache_dir.join("tmp");
             if let Err(error) = fs::create_dir_all(&tmp_dir) {
                 return ProblemSnapshot::unavailable_with_detail(
@@ -245,16 +261,10 @@ impl Checker for PythonChecker {
             let started = Instant::now();
             let mut snapshots = Vec::new();
             let mut missing = Vec::new();
-            for env in &environments {
+            for env in resolutions.iter().map(|resolution| &resolution.env) {
                 let root = crate::environment::absolute_root(&request.worktree, env);
                 let Some(interpreter) = crate::environment::interpreter(env) else {
-                    missing.extend(env.missing_next_step.as_ref().map(|step| {
-                        if env.root.as_os_str().is_empty() {
-                            step.clone()
-                        } else {
-                            format!("{}: {step}", env.root.display())
-                        }
-                    }));
+                    missing.extend(root_detail(env));
                     continue;
                 };
                 let spec = self.pyright_spec_for_root(&request, &root, &interpreter);
@@ -307,6 +317,17 @@ impl Checker for PythonChecker {
             merge_root_snapshots(snapshots, generation, started.elapsed().as_millis() as u64)
         })
     }
+}
+
+/// A root's missing-environment cause and next step, prefixed with the root when it is nested.
+fn root_detail(env: &agent_ide_core::lang::environment::ResolvedEnv) -> Option<String> {
+    env.missing_next_step.as_ref().map(|step| {
+        if env.root.as_os_str().is_empty() {
+            step.clone()
+        } else {
+            format!("{}: {step}", env.root.display())
+        }
+    })
 }
 
 /// Folds the per-root pyright snapshots of one check run into the single snapshot the scheduler
@@ -395,7 +416,7 @@ fn relativize_paths(snapshot: &mut ProblemSnapshot, worktree: &Path) {
 /// included, which the checker reports as [`UnavailableReason::EnvMissing`] without running
 /// pyright.
 pub fn resolve_interpreter(root: &Path) -> Option<PathBuf> {
-    crate::environment::interpreter(&crate::environment::resolve_root(root, root, &[]))
+    crate::environment::interpreter(&crate::environment::resolve_root(root, root, &[]).env)
 }
 
 /// The interpreter of the worktree's shared Pyright session: the first project root, the
@@ -846,6 +867,7 @@ impl LanguageChecks for PythonChecks {
             .iter()
             .all(|root| {
                 crate::environment::resolve_root(worktree, root, &[])
+                    .env
                     .chosen
                     .is_none()
             })
@@ -937,9 +959,9 @@ mod deny_tests {
             suffix: CredentialGlob::Key,
         }];
         let resolved = |denies: &[ReadDeny]| {
-            crate::environment::interpreter(&crate::environment::resolve_with_denies(
-                &root, &root, None, denies,
-            ))
+            crate::environment::interpreter(
+                &crate::environment::resolve_with_denies(&root, &root, None, denies).env,
+            )
         };
         assert_eq!(resolved(&denies), None);
         assert_eq!(read_config(&root.join(PYRIGHT_CONFIG_FILE), &denies), None);

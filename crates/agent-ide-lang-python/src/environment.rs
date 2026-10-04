@@ -4,24 +4,27 @@
 //! commands and the syntax probe — asks [`resolve`] (directly or through [`environments`]), so
 //! they can never disagree about which interpreter a project root uses. Precedence per root:
 //!
-//! 1. a Pyright config pin (`pyrightconfig.json`, then `[tool.pyright]` `venvPath`+`venv`); a
-//!    pinned environment that is missing resolves to nothing with a detail, never to a fallback;
-//! 2. the agent's stored selection ([`agent_ide_core::lang::environment::selections`]);
-//! 3. discovery: `.venv`, `venv`, then suffixed `.venv*`/`venv*` sorted by name, beside the
-//!    root, else (for a nested root) beside the worktree.
+//! 1. a Pyright config pin (`pyrightconfig.json` when it exists, else `[tool.pyright]`
+//!    `venvPath`+`venv`); a pinned environment that is missing or broken resolves to nothing with
+//!    a detail, never to a fallback;
+//! 2. the agent's stored selection ([`agent_ide_core::lang::environment::selections`]), with the
+//!    same no-fallback rule;
+//! 3. discovery: the first runnable of `.venv`, `venv`, then suffixed `.venv*`/`venv*` sorted by
+//!    name, beside the root, else (for a nested root) beside the worktree.
 //!
 //! `.python-version` is a version request only: a mismatch with the chosen environment becomes a
-//! warning and never switches it. Only files are read; no environment manager ever runs.
+//! warning and never switches it. Only files are read, under the host's read denies; no
+//! environment manager ever runs.
 
 use std::{
     ffi::OsString,
     fs,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
 use agent_ide_core::execution::seatbelt::ReadDeny;
 use agent_ide_core::lang::environment::{CommandEnv, EnvCandidate, EnvSource, ResolvedEnv};
-use agent_ide_core::lang::text::read_text;
 
 use crate::checks::{
     PYPROJECT_FILE, PYRIGHT_CONFIG_FILE, allowed_file, read_config, read_pyproject_venv_keys,
@@ -39,11 +42,18 @@ struct Pin {
     dir: PathBuf,
 }
 
-/// Reads the Pyright pin of `root`: `pyrightconfig.json` first, then `[tool.pyright]`.
+/// Reads the Pyright pin of `root`. Pyright reads `[tool.pyright]` only when no
+/// `pyrightconfig.json` exists, so an existing JSON config without the two keys pins nothing.
 fn pin(root: &Path, denies: &[ReadDeny]) -> Option<Pin> {
-    let (file, (venv_path, venv)) = read_pyrightconfig_venv_keys(root, denies)
-        .map(|keys| (PYRIGHT_CONFIG_FILE, keys))
-        .or_else(|| read_pyproject_venv_keys(root, denies).map(|keys| (PYPROJECT_FILE, keys)))?;
+    let (file, (venv_path, venv)) = if fs::symlink_metadata(root.join(PYRIGHT_CONFIG_FILE)).is_ok()
+    {
+        (
+            PYRIGHT_CONFIG_FILE,
+            read_pyrightconfig_venv_keys(root, denies)?,
+        )
+    } else {
+        (PYPROJECT_FILE, read_pyproject_venv_keys(root, denies)?)
+    };
     // A relative `venvPath` is relative to the config file's directory, as Pyright reads it.
     let dir = root.join(venv_path).join(&venv);
     Some(Pin { file, venv, dir })
@@ -57,6 +67,22 @@ fn python_of(dir: &Path) -> PathBuf {
 /// The interpreter of a resolved environment, when one is chosen.
 pub fn interpreter(env: &ResolvedEnv) -> Option<PathBuf> {
     env.chosen.as_ref().map(|chosen| python_of(&chosen.path))
+}
+
+/// Whether the environment `dir` has an interpreter: `Some(true)` when `bin/python` is a readable
+/// file, `Some(false)` when it is a dangling link (its base interpreter is gone), `None` when it
+/// is absent or hidden by host read denies.
+fn interpreter_state(dir: &Path, denies: &[ReadDeny]) -> Option<bool> {
+    let python = python_of(dir);
+    if allowed_file(&python, denies) {
+        Some(true)
+    } else if denies.is_empty()
+        && fs::symlink_metadata(&python).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// `X.Y.Z` from a `pyvenv.cfg` version value: CPython writes `3.12.7`, uv `3.14.0`, virtualenv
@@ -80,9 +106,16 @@ fn label(worktree: &Path, root: &Path, dir: &Path) -> String {
         .to_string()
 }
 
-/// Describes one environment directory from its `pyvenv.cfg` (PEP 405): the version from
-/// `version`, else `version_info`, else none; broken only when the `home` directory is gone.
-fn candidate(worktree: &Path, root: &Path, dir: &Path, denies: &[ReadDeny]) -> EnvCandidate {
+/// Describes one environment directory from its `pyvenv.cfg` (PEP 405), read under the host's
+/// denies: the version from `version`, else `version_info`, else none; broken when its
+/// interpreter is a dangling link (`runnable` false) or the `home` directory is gone.
+fn candidate(
+    worktree: &Path,
+    root: &Path,
+    dir: &Path,
+    runnable: bool,
+    denies: &[ReadDeny],
+) -> EnvCandidate {
     let config = read_config(&dir.join("pyvenv.cfg"), denies).unwrap_or_default();
     let value = |key: &str| {
         config.lines().find_map(|line| {
@@ -96,34 +129,32 @@ fn candidate(worktree: &Path, root: &Path, dir: &Path, denies: &[ReadDeny]) -> E
         version: value("version")
             .or_else(|| value("version_info"))
             .and_then(|version| release(&version)),
-        broken: value("home").is_some_and(|home| !Path::new(&home).is_dir()),
+        broken: !runnable || value("home").is_some_and(|home| !Path::new(&home).is_dir()),
     }
 }
 
-/// Discovered environments of `root` in discovery order; a nested root without its own falls
-/// back to the worktree's, which covers every package beneath it.
+/// Discovered environments of `root` in discovery order, broken ones included; a nested root
+/// without its own falls back to the worktree's, which covers every package beneath it.
 fn discovered(worktree: &Path, root: &Path, denies: &[ReadDeny]) -> Vec<EnvCandidate> {
     let mut dirs = venv_directories(root);
     if dirs.is_empty() && root != worktree {
         dirs = venv_directories(worktree);
     }
     dirs.iter()
-        .filter(|dir| allowed_file(&python_of(dir), denies))
-        .map(|dir| candidate(worktree, root, dir, denies))
+        .filter_map(|dir| {
+            interpreter_state(dir, denies)
+                .map(|runnable| candidate(worktree, root, dir, runnable, denies))
+        })
         .collect()
 }
 
 /// The directory `selector` names for `root`: a candidate label, else a path (relative to the
-/// root, or absolute) to a directory holding `bin/python`.
-fn selected_dir(root: &Path, selector: &str, candidates: &[EnvCandidate]) -> Option<PathBuf> {
-    if let Some(candidate) = candidates
+/// root, or absolute).
+fn selected_dir(root: &Path, selector: &str, candidates: &[EnvCandidate]) -> PathBuf {
+    candidates
         .iter()
         .find(|candidate| candidate.label == selector)
-    {
-        return Some(candidate.path.clone());
-    }
-    let dir = root.join(selector);
-    python_of(&dir).is_file().then_some(dir)
+        .map_or_else(|| root.join(selector), |candidate| candidate.path.clone())
 }
 
 /// The `ide.start environment` key that addresses `root`: `python`, or `python:<root>` for a
@@ -149,8 +180,8 @@ fn labels(candidates: &[EnvCandidate]) -> String {
         .join(", ")
 }
 
-/// Cause and next step when nothing resolves for `root`.
-fn nothing_found(worktree: &Path, root: &Path, key: &str) -> String {
+/// Cause and next step when discovery finds nothing runnable for `root`.
+fn nothing_found(worktree: &Path, root: &Path, key: &str, candidates: &[EnvCandidate]) -> String {
     let manifest = ROOT_MARKER_FILES
         .iter()
         .map(|name| root.join(name))
@@ -162,15 +193,22 @@ fn nothing_found(worktree: &Path, root: &Path, key: &str) -> String {
     } else {
         beside
     };
-    format!(
-        "no .venv* beside {beside}; create one (uv venv) or ide.start environment {{\"{key}\": \"<path>\"}}"
-    )
+    let cause = if candidates.is_empty() {
+        format!("no .venv* beside {beside}")
+    } else {
+        format!(
+            "every environment beside {beside} is broken (base interpreter gone): {}",
+            labels(candidates)
+        )
+    };
+    format!("{cause}; create one (uv venv) or ide.start environment {{\"{key}\": \"<path>\"}}")
 }
 
-/// The version `.python-version` requests for `root` (its own, else the worktree's).
-fn version_request(worktree: &Path, root: &Path) -> Option<String> {
+/// The version `.python-version` requests for `root` (its own, else the worktree's), read under
+/// the host's denies: a denied file is unreadable and says nothing.
+fn version_request(worktree: &Path, root: &Path, denies: &[ReadDeny]) -> Option<String> {
     [root, worktree].iter().find_map(|dir| {
-        read_text(dir, ".python-version")
+        read_config(&dir.join(".python-version"), denies)?
             .lines()
             .map(str::trim)
             .find(|line| !line.is_empty())
@@ -178,35 +216,106 @@ fn version_request(worktree: &Path, root: &Path) -> Option<String> {
     })
 }
 
-/// Modification time of `path` as opaque text, empty when it cannot be read.
-fn stamp(path: &Path) -> String {
-    fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .map(|time| format!("{time:?}"))
-        .unwrap_or_default()
-}
-
-/// Lists `candidate` first among `candidates` unless discovery already found it, and returns it.
-fn take(candidate: EnvCandidate, candidates: &mut Vec<EnvCandidate>) -> Option<EnvCandidate> {
+/// Lists `candidate` first among `candidates` unless discovery already found it.
+fn take(candidate: &EnvCandidate, candidates: &mut Vec<EnvCandidate>) {
     if !candidates.iter().any(|known| known.path == candidate.path) {
         candidates.insert(0, candidate.clone());
     }
-    Some(candidate)
+}
+
+/// What one root resolves to, as `(chosen, source, missing)`.
+type Outcome = (Option<EnvCandidate>, Option<EnvSource>, Option<String>);
+
+/// Settles an environment a selection or pin demands: chosen when it runs, else missing with
+/// `absent` (no interpreter at all) or a broken-interpreter cause followed by `next`. An existing
+/// one is listed among the candidates either way.
+fn settle(
+    (worktree, root, dir): (&Path, &Path, &Path),
+    source: EnvSource,
+    absent: String,
+    next: &str,
+    candidates: &mut Vec<EnvCandidate>,
+    denies: &[ReadDeny],
+) -> Outcome {
+    let Some(runnable) = interpreter_state(dir, denies) else {
+        return (None, None, Some(absent));
+    };
+    let found = candidate(worktree, root, dir, runnable, denies);
+    take(&found, candidates);
+    if found.broken {
+        let cause = format!(
+            "environment {} is broken (base interpreter gone) — {next}",
+            found.label
+        );
+        (None, None, Some(cause))
+    } else {
+        (Some(found), Some(source), None)
+    }
+}
+
+/// `ino.mtime` of `path` without following a final link, empty when it cannot be read.
+fn stamp(path: &Path) -> String {
+    fs::symlink_metadata(path)
+        .map(|metadata| {
+            format!(
+                "{}.{}.{}",
+                metadata.ino(),
+                metadata.mtime(),
+                metadata.mtime_nsec()
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// Opaque identity of a resolution: the chosen environment's path and version plus everything
+/// that changes when it is recreated in place (directory and interpreter inodes, the interpreter
+/// link's target, `pyvenv.cfg` stamp and content), or the missing cause. Why it won (`source`)
+/// is left out: selecting the current winner changes nothing a consumer depends on.
+fn identity(chosen: Option<&EnvCandidate>, missing: Option<&str>, denies: &[ReadDeny]) -> String {
+    let Some(chosen) = chosen else {
+        return format!("missing|{}", missing.unwrap_or_default());
+    };
+    let python = python_of(&chosen.path);
+    let config = chosen.path.join("pyvenv.cfg");
+    format!(
+        "{}|{:?}|{}|{}|{:?}|{}|{}",
+        chosen.path.display(),
+        chosen.version,
+        stamp(&chosen.path),
+        stamp(&python),
+        fs::read_link(&python).ok(),
+        stamp(&config),
+        blake3::hash(read_config(&config, denies).unwrap_or_default().as_bytes())
+    )
+}
+
+/// One root's resolution, with whether a selection or pin governs it: an authoritative
+/// environment that is missing must never be replaced by another interpreter.
+#[derive(Clone, Debug)]
+pub(crate) struct Resolution {
+    /// The resolver's answer for the root.
+    pub(crate) env: ResolvedEnv,
+    /// A selection, a pin, or an unreadable (denied) Pyright config decides this root.
+    pub(crate) authoritative: bool,
+    /// The environment directory the selection or pin names, whether or not it exists.
+    pub(crate) demanded: Option<PathBuf>,
 }
 
 /// Resolves the environment of the project `root` (absolute, inside `worktree`) with the agent's
-/// `selector`, per the module's precedence. Host read denies hide configs and interpreters.
+/// `selector`, per the module's precedence, reading every file under the host's `denies`.
 pub(crate) fn resolve_with_denies(
     worktree: &Path,
     root: &Path,
     selector: Option<&str>,
     denies: &[ReadDeny],
-) -> ResolvedEnv {
+) -> Resolution {
     let key = selector_key(worktree, root);
     let mut candidates = discovered(worktree, root, denies);
     let mut warnings = Vec::new();
-    let mut stamps = String::new();
-    let (chosen, source, missing) = if [PYRIGHT_CONFIG_FILE, PYPROJECT_FILE]
+    let mut authoritative = true;
+    let mut demanded = None;
+    let paths = (worktree, root);
+    let (chosen, source, missing): Outcome = if [PYRIGHT_CONFIG_FILE, PYPROJECT_FILE]
         .iter()
         .any(|name| denies.iter().any(|deny| deny.matches(&root.join(name))))
     {
@@ -215,55 +324,53 @@ pub(crate) fn resolve_with_denies(
         );
         (None, None, Some(cause))
     } else if let Some(pin) = pin(root, denies) {
-        stamps.push_str(&stamp(&root.join(pin.file)));
         if let Some(selector) = selector {
             warnings.push(format!(
                 "selection {selector} ignored: {} pins venv \"{}\"",
                 pin.file, pin.venv
             ));
         }
-        if allowed_file(&python_of(&pin.dir), denies) {
-            let pinned = candidate(worktree, root, &pin.dir, denies);
-            (
-                take(pinned, &mut candidates),
-                Some(EnvSource::Pin(pin.file.to_owned())),
-                None,
-            )
-        } else {
-            let cause = format!(
-                "{} pins venv \"{}\" ({}), which has no bin/python; candidates {}; create it, or edit venv there or remove the pin",
-                pin.file,
-                pin.venv,
-                label(worktree, root, &pin.dir),
-                labels(&candidates)
-            );
-            (None, None, Some(cause))
-        }
+        let absent = format!(
+            "{} pins venv \"{}\" ({}), which has no bin/python; candidates {}; create it, or edit venv there or remove the pin",
+            pin.file,
+            pin.venv,
+            label(worktree, root, &pin.dir),
+            labels(&candidates)
+        );
+        demanded = Some(pin.dir.clone());
+        settle(
+            (paths.0, paths.1, &pin.dir),
+            EnvSource::Pin(pin.file.to_owned()),
+            absent,
+            "recreate it, or edit venv there or remove the pin",
+            &mut candidates,
+            denies,
+        )
     } else if let Some(selector) = selector {
-        match selected_dir(root, selector, &candidates)
-            .filter(|dir| allowed_file(&python_of(dir), denies))
-        {
-            Some(dir) => {
-                let selected = candidate(worktree, root, &dir, denies);
-                (
-                    take(selected, &mut candidates),
-                    Some(EnvSource::Selected),
-                    None,
-                )
-            }
-            None => {
-                let cause = format!(
-                    "environment {selector} missing (selected) — recreate it or ide.start environment {{\"{key}\": \"auto\"}}"
-                );
-                (None, None, Some(cause))
-            }
-        }
-    } else if let Some(first) = candidates.first().cloned() {
-        (Some(first), Some(EnvSource::Discovered), None)
+        let dir = selected_dir(root, selector, &candidates);
+        let next = format!("recreate it or ide.start environment {{\"{key}\": \"auto\"}}");
+        let absent = format!("environment {selector} missing (selected) — {next}");
+        demanded = Some(dir.clone());
+        settle(
+            (paths.0, paths.1, &dir),
+            EnvSource::Selected,
+            absent,
+            &next,
+            &mut candidates,
+            denies,
+        )
     } else {
-        (None, None, Some(nothing_found(worktree, root, &key)))
+        authoritative = false;
+        match candidates.iter().find(|candidate| !candidate.broken) {
+            Some(first) => (Some(first.clone()), Some(EnvSource::Discovered), None),
+            None => (
+                None,
+                None,
+                Some(nothing_found(worktree, root, &key, &candidates)),
+            ),
+        }
     };
-    if let (Some(chosen), Some(request)) = (&chosen, version_request(worktree, root))
+    if let (Some(chosen), Some(request)) = (&chosen, version_request(worktree, root, denies))
         && let Some(version) = &chosen.version
         && request.starts_with(|first: char| first.is_ascii_digit())
         && *version != request
@@ -271,32 +378,28 @@ pub(crate) fn resolve_with_denies(
     {
         warnings.push(format!("≠ .python-version {request}"));
     }
-    if let Some(chosen) = &chosen {
-        stamps.push_str(&stamp(&chosen.path.join("pyvenv.cfg")));
-    }
-    let identity = format!(
-        "{:?}|{:?}|{:?}|{missing:?}|{stamps}",
-        chosen.as_ref().map(|chosen| &chosen.path),
-        chosen.as_ref().map(|chosen| &chosen.version),
-        source,
-    );
-    ResolvedEnv {
-        root: root
-            .strip_prefix(worktree)
-            .map(Path::to_path_buf)
-            .unwrap_or_default(),
-        chosen,
-        source,
-        candidates,
-        warnings,
-        missing_next_step: missing,
-        identity,
+    let identity = identity(chosen.as_ref(), missing.as_deref(), denies);
+    Resolution {
+        env: ResolvedEnv {
+            root: root
+                .strip_prefix(worktree)
+                .map(Path::to_path_buf)
+                .unwrap_or_default(),
+            chosen,
+            source,
+            candidates,
+            warnings,
+            missing_next_step: missing,
+            identity,
+        },
+        authoritative,
+        demanded,
     }
 }
 
 /// [`resolve_with_denies`] without host read denies.
 pub fn resolve(worktree: &Path, root: &Path, selector: Option<&str>) -> ResolvedEnv {
-    resolve_with_denies(worktree, root, selector, &[])
+    resolve_with_denies(worktree, root, selector, &[]).env
 }
 
 /// The project roots environments are resolved for: [`python_roots`], or the worktree alone
@@ -318,7 +421,7 @@ fn stored_selection(worktree: &Path, root: &Path) -> Option<String> {
 }
 
 /// Resolves `root` with whatever the agent stored for it.
-pub(crate) fn resolve_root(worktree: &Path, root: &Path, denies: &[ReadDeny]) -> ResolvedEnv {
+pub(crate) fn resolve_root(worktree: &Path, root: &Path, denies: &[ReadDeny]) -> Resolution {
     resolve_with_denies(
         worktree,
         root,
@@ -327,34 +430,55 @@ pub(crate) fn resolve_root(worktree: &Path, root: &Path, denies: &[ReadDeny]) ->
     )
 }
 
-/// One [`ResolvedEnv`] per project root of `worktree`, honouring stored selections.
-pub(crate) fn environments(worktree: &Path, denies: &[ReadDeny]) -> Vec<ResolvedEnv> {
+/// One [`Resolution`] per project root of `worktree`, honouring stored selections.
+pub(crate) fn resolutions(worktree: &Path, denies: &[ReadDeny]) -> Vec<Resolution> {
     roots(worktree)
         .iter()
         .map(|root| resolve_root(worktree, root, denies))
         .collect()
 }
 
-/// The environment the worktree's one Pyright session uses: the first root (the worktree
-/// itself sorts first) that resolves one. `ponytail:` one interpreter per session, because
-/// Pyright has no per-root interpreter; one session per interpreter if monorepos diverge.
-pub(crate) fn session_environment(worktree: &Path) -> Option<ResolvedEnv> {
-    environments(worktree, &[])
+/// One [`ResolvedEnv`] per project root of `worktree`, honouring stored selections.
+pub(crate) fn environments(worktree: &Path, denies: &[ReadDeny]) -> Vec<ResolvedEnv> {
+    resolutions(worktree, denies)
         .into_iter()
-        .find(|env| env.chosen.is_some())
+        .map(|resolution| resolution.env)
+        .collect()
+}
+
+/// The resolution that speaks for the whole worktree: the first root (the worktree itself sorts
+/// first) that chose an environment or whose selection or pin governs it, so a missing
+/// authoritative environment is never papered over by another root's. `ponytail:` one
+/// interpreter per session, because Pyright has no per-root interpreter; one session per
+/// interpreter if monorepos diverge.
+pub(crate) fn governing(worktree: &Path) -> Option<Resolution> {
+    resolutions(worktree, &[])
+        .into_iter()
+        .find(|resolution| resolution.env.chosen.is_some() || resolution.authoritative)
+}
+
+/// The resolution of the deepest project root containing `path` (absolute, or relative to
+/// `worktree`), else the [`governing`] one.
+pub(crate) fn for_path(worktree: &Path, path: &Path) -> Option<Resolution> {
+    let path = worktree.join(path);
+    resolutions(worktree, &[])
+        .into_iter()
+        .filter(|resolution| path.starts_with(absolute_root(worktree, &resolution.env)))
+        .max_by_key(|resolution| resolution.env.root.components().count())
+        .or_else(|| governing(worktree))
 }
 
 /// The session's interpreter and the identity a live session is compared against.
 pub(crate) fn session(worktree: &Path) -> (Option<PathBuf>, String) {
-    session_environment(worktree).map_or_else(
+    governing(worktree).map_or_else(
         || (None, "none".to_owned()),
-        |env| (interpreter(&env), env.identity),
+        |resolution| (interpreter(&resolution.env), resolution.env.identity),
     )
 }
 
 /// Accepts `selector` for the project root `root` (relative to `worktree`): `auto`, a candidate
-/// label, or a path to a directory holding `bin/python`; refuses an unknown root, a Pyright pin
-/// in force and an unknown selector, each with the way out.
+/// label, or a path to an environment directory; refuses an unknown root, a Pyright pin in force
+/// and an unknown selector, each with the way out.
 pub(crate) fn check_selection(worktree: &Path, root: &Path, selector: &str) -> Result<(), String> {
     let absolute = worktree.join(root);
     let known = roots(worktree);
@@ -382,7 +506,7 @@ pub(crate) fn check_selection(worktree: &Path, root: &Path, selector: &str) -> R
         ));
     }
     let candidates = discovered(worktree, &absolute, &[]);
-    match selected_dir(&absolute, selector, &candidates) {
+    match interpreter_state(&selected_dir(&absolute, selector, &candidates), &[]) {
         Some(_) => Ok(()),
         None => Err(format!(
             "\"{selector}\" not found; candidates {}",
@@ -422,12 +546,7 @@ fn owns(bin: &Path, program: &str) -> bool {
 /// `bin` first on `PATH` and `VIRTUAL_ENV` set. `None` for every other program (`cargo`, `make`),
 /// so another language's toolchain is never taken over, and when that root resolves nothing.
 pub(crate) fn command_env(worktree: &Path, cwd: &Path, program: &str) -> Option<CommandEnv> {
-    let cwd = worktree.join(cwd);
-    let env = environments(worktree, &[])
-        .into_iter()
-        .filter(|env| cwd.starts_with(absolute_root(worktree, env)))
-        .max_by_key(|env| env.root.components().count())?;
-    let venv = env.chosen?.path;
+    let venv = for_path(worktree, cwd)?.env.chosen?.path;
     let bin = venv.join("bin");
     let argv_prefix = if matches!(program, "python" | "python3") {
         vec![python_of(&venv).into_os_string()]
@@ -455,8 +574,8 @@ mod tests {
     use agent_ide_core::checks::{
         CheckRequest, CheckState, Checker, LanguageChecks, UnavailableReason,
     };
-    use agent_ide_core::lang::LanguageSupport;
     use agent_ide_core::lang::environment::{EnvSelection, replace_selections};
+    use agent_ide_core::lang::{LangError, LanguageSupport, TestTarget};
 
     use super::*;
     use crate::checks::{PythonChecker, PythonChecks};
@@ -683,7 +802,7 @@ mod tests {
             step,
             "pyrightconfig.json pins venv \".venv-gone\" (.venv-gone), which has no bin/python; candidates .venv-py314; create it, or edit venv there or remove the pin"
         );
-        assert_eq!(Python.detect(&root).unwrap().interpreter, None);
+        assert_eq!(Python.detect(&root).unwrap().commands.test, None);
         assert_eq!(crate::checks::session_interpreter(&root), None);
 
         let (checker, fake) = checker(&root, 0);
@@ -1050,6 +1169,218 @@ mod tests {
         let after = checker.check(request(&root, &root.join("cache"))).await;
         assert!(!unresolved(&after), "{after:?}");
         replace_selections(&root, crate::LANGUAGE, Vec::new());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Fix A: a selected or pinned environment that is missing never lets another interpreter
+    /// run: no card command, a test error with the way out, no formatter and no probe.
+    #[test]
+    fn demanded_missing_environment_never_runs_another_interpreter() {
+        for (name, pinned) in [("demanded-selected", false), ("demanded-pinned", true)] {
+            let root = scratch(name);
+            put(&root, "pyproject.toml", "[tool.ruff]\nline-length = 100\n");
+            put(&root, "uv.lock", "");
+            venv(&root, ".venv", "");
+            if pinned {
+                put(
+                    &root,
+                    "pyrightconfig.json",
+                    r#"{"venvPath": ".", "venv": ".venv-gone"}"#,
+                );
+            } else {
+                select(&root, "", ".venv-gone");
+            }
+            let project = Python.detect(&root).unwrap();
+            assert_eq!(project.commands.test, None, "{name}");
+            assert_eq!(project.commands.format, None, "{name}");
+            let error = Python
+                .test_selection(&project, &TestTarget::Pattern("x".to_owned()))
+                .unwrap_err();
+            assert!(
+                matches!(&error, LangError::Unsupported(message)
+                    if message.contains(".venv-gone is missing or broken")
+                        && message.contains("ide.start environment")),
+                "{name}: {error:?}"
+            );
+            assert_eq!(Python.format_command(&project, Path::new("a.py")), None);
+            assert_eq!(
+                Python.format_stdin_command(&project, Path::new("a.py")),
+                None
+            );
+            assert_eq!(
+                Python.syntax_probe_command(&project, &root, Path::new("a.py"), None),
+                None,
+                "{name}"
+            );
+            replace_selections(&root, crate::LANGUAGE, Vec::new());
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    /// Fix B: the worktree root's missing selection is reported by the check and leaves the
+    /// session without an interpreter, although a nested root's environment works.
+    #[tokio::test]
+    async fn missing_worktree_selection_is_not_hidden_by_a_nested_root() {
+        let root = scratch("hidden-by-nested");
+        put(&root, "pyproject.toml", "");
+        venv(&root, ".venv", "");
+        put(&root, "packages/alpha/pyproject.toml", "");
+        put(&root, "packages/alpha/a.py", "");
+        venv(&root, "packages/alpha/.venv-a", "");
+        select(&root, "", ".venv-gone");
+        assert_eq!(crate::checks::session_interpreter(&root), None);
+        let (checker, fake) = checker(&root, 2);
+        let snapshot = checker.check(request(&root, &root.join("cache"))).await;
+        assert_eq!(
+            snapshot.state,
+            CheckState::Unavailable(UnavailableReason::EnvMissing)
+        );
+        assert_eq!(
+            snapshot.detail.as_deref(),
+            Some(
+                "environment .venv-gone missing (selected) — recreate it or ide.start environment {\"python\": \"auto\"}"
+            )
+        );
+        assert!(fake.specs().is_empty());
+        replace_selections(&root, crate::LANGUAGE, Vec::new());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Fix C (probe): the syntax probe runs the interpreter of the root holding the file, a
+    /// nested root's selection included.
+    #[test]
+    fn probe_uses_the_environment_of_the_files_root() {
+        let root = scratch("probe-per-root");
+        put(&root, "pyproject.toml", "");
+        venv(&root, ".venv", "");
+        put(&root, "packages/alpha/pyproject.toml", "");
+        put(&root, "packages/alpha/a.py", "");
+        venv(&root, "packages/alpha/.venv-a", "");
+        venv(&root, "packages/alpha/.venv-b", "");
+        select(&root, "packages/alpha", ".venv-b");
+        let project = Python.detect(&root).unwrap();
+        let probe = |file: &str| {
+            Python
+                .syntax_probe_command(&project, &root, Path::new(file), None)
+                .unwrap()
+                .remove(0)
+        };
+        assert_eq!(
+            probe("packages/alpha/a.py"),
+            root.join("packages/alpha/.venv-b/bin/python")
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            probe("src/x.py"),
+            root.join(".venv/bin/python").display().to_string()
+        );
+        replace_selections(&root, crate::LANGUAGE, Vec::new());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Fix D: an existing `pyrightconfig.json` without `venv` keys pins nothing, even when
+    /// `[tool.pyright]` names a venv (Pyright never reads it then), so a selection is allowed.
+    #[test]
+    fn pyrightconfig_without_venv_keys_overrides_the_pyproject_pin() {
+        let root = scratch("json-wins");
+        put(
+            &root,
+            "pyproject.toml",
+            "[tool.pyright]\nvenvPath = \".\"\nvenv = \".venv\"\n",
+        );
+        put(&root, "pyrightconfig.json", r#"{"strict": ["src"]}"#);
+        venv(&root, ".venv", "");
+        venv(&root, ".venv-py314", "");
+        assert_eq!(
+            Python.check_selection(&root, Path::new(""), ".venv-py314"),
+            Ok(())
+        );
+        let env = resolve(&root, &root, Some(".venv-py314"));
+        assert_eq!(
+            (chosen(&env), env.source.clone()),
+            (Some(".venv-py314"), Some(EnvSource::Selected))
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Fix E: `.python-version` and `pyvenv.cfg` follow the host's read denies; denied files
+    /// are unreadable and their contents never reach a warning or a version.
+    #[test]
+    fn read_denies_hide_python_version_and_pyvenv_cfg() {
+        let root = fs::canonicalize(scratch("denied-files")).unwrap();
+        put(&root, "pyproject.toml", "");
+        venv(&root, ".venv", "version = 3.12.7\n");
+        put(&root, ".python-version", "3.99\n");
+        assert_eq!(
+            resolve(&root, &root, None).warnings,
+            ["≠ .python-version 3.99"]
+        );
+        let env = resolve_with_denies(
+            &root,
+            &root,
+            None,
+            &[ReadDeny::Path(root.join(".python-version"))],
+        )
+        .env;
+        assert_eq!(chosen(&env), Some(".venv"));
+        assert!(env.warnings.is_empty(), "{:?}", env.warnings);
+        assert_eq!(env.chosen.unwrap().version.as_deref(), Some("3.12.7"));
+        let env = resolve_with_denies(
+            &root,
+            &root,
+            None,
+            &[ReadDeny::Path(root.join(".venv/pyvenv.cfg"))],
+        )
+        .env;
+        assert_eq!(env.chosen.unwrap().version, None);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Fix F: selecting the current winner keeps the identity; recreating the environment at
+    /// the same path changes it.
+    #[test]
+    fn identity_ignores_source_and_tracks_recreation() {
+        let root = scratch("identity");
+        put(&root, "pyproject.toml", "");
+        venv(&root, ".venv", "");
+        let discovered = resolve(&root, &root, None).identity;
+        assert_eq!(resolve(&root, &root, Some(".venv")).identity, discovered);
+        fs::remove_dir_all(root.join(".venv")).unwrap();
+        venv(&root, ".venv", "");
+        assert_ne!(resolve(&root, &root, None).identity, discovered);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Fix G: an environment whose `bin/python` is a dangling link stays a candidate marked
+    /// broken; discovery passes over it, and selecting it reports it broken.
+    #[test]
+    fn dangling_interpreter_stays_a_broken_candidate() {
+        let root = scratch("dangling");
+        put(&root, "pyproject.toml", "");
+        fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        std::os::unix::fs::symlink(
+            "/nonexistent-agent-ide/python3",
+            root.join(".venv/bin/python"),
+        )
+        .unwrap();
+        venv(&root, ".venv-ok", "");
+        let env = resolve(&root, &root, None);
+        let broken: Vec<(&str, bool)> = env
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.label.as_str(), candidate.broken))
+            .collect();
+        assert_eq!(broken, [(".venv", true), (".venv-ok", false)]);
+        assert_eq!(chosen(&env), Some(".venv-ok"));
+        let selected = resolve(&root, &root, Some(".venv"));
+        assert_eq!(chosen(&selected), None);
+        assert_eq!(
+            selected.missing_next_step.as_deref(),
+            Some(
+                "environment .venv is broken (base interpreter gone) — recreate it or ide.start environment {\"python\": \"auto\"}"
+            )
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 }
