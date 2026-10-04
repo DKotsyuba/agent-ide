@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+### Added
+
+- Reader and writer activations: `ide.start {"read_only": true}` admits any
+  number of readers beside the single writer of a worktree; every call that can
+  change code (all `ide.edit` forms, `ide.test`) is refused for a reader before
+  any work, with one uniform message. A second writer is refused with the
+  holder's activation, start time and last activity. `activation_id` is optional.
+- `ide.test` explicit commands accept a worktree-relative `cwd` and bounded
+  `env`; the 16 KiB limit applies to the whole argv.
+- Python projects in nested directories (no root manifest) are discovered and
+  listed on the card with checks per root; suffixed environments such as
+  `.venv-py314` are found and named; usages cover sibling packages.
+- The plugin ships a read-only `ide-reviewer` agent with the IDE read tools.
+
+### Changed
+
+- Edit diagnostics carry `path:line:col` and separate problems the edit
+  introduced from those present before (shifted lines stay pre-existing).
+- A clean git baseline reads `git <sha> (clean)` on the start card.
+- Outlines show declaration lines; the Rust lexical outline names inline
+  struct-variant fields.
+
+### Fixed
+
+- A fresh read is no longer evicted before the edit that uses it; a stale
+  refusal never hints the reference it just refused.
+- Formatting an edited Rust module never rewrites its child files (regression
+  test).
+- The first `ide.start` waits longer for its hook instead of refusing
+  `missing_pre`; never-activated sessions are told to start; a stop after lost
+  authority answers "nothing active"; worktree resolution failures name their
+  stage.
+- A missing Python environment is reported once and not re-probed until inputs
+  change; import noise collapses to one line. `.tsx` outline and read fall back
+  to source when module resolution is unverified.
+- Known runner summaries (pytest, cargo test, vitest/jest, go test) are parsed
+  whatever launched them; other commands report their exit code and output
+  tail; status plates show the starting actor's own run.
+- Refusals name the cause and a working next step: reads past the end of a
+  file, stageless read failures, `ide.outline` without `path`, old-text edits
+  without `source_ref`, duplicate symbol candidates; problems context waits
+  briefly for a running check.
+
 ## 0.8.0 — 2026-10-03
 
 ### Changed
