@@ -818,6 +818,7 @@ mod tests {
             HostBindingCause::Mismatch,
             HostBindingCause::MissingInvocation,
             HostBindingCause::InactiveBinding,
+            HostBindingCause::NeverActivated,
             HostBindingCause::CapacityExceeded,
             HostBindingCause::HostUnrecognized,
             HostBindingCause::project_moved(
@@ -863,6 +864,9 @@ mod tests {
                 }
                 "inactive_binding" => {
                     "this session's IDE activation has stopped. Call ide.start, then repeat this call, or continue with native tools"
+                }
+                "never_activated" => {
+                    "no IDE activation in this session yet. Call ide.start, then repeat this call, or continue with native tools"
                 }
                 "capacity_exceeded" => {
                     "the daemon's session table is full. Call ide.stop, then ide.start, or continue with native tools"
@@ -1131,6 +1135,74 @@ mod tests {
         .unwrap();
         assert!(text_of(&absent).contains("requested root does not exist yet"));
         assert!(text_of(&absent).contains("/repo"));
+
+        let held = render(
+            PeerReply::Error {
+                code: FailureCode::Conflict,
+                detail: Some("start:worktree_held_by_another_actor: actor agent-a (activation task-7, writer, since 2026-10-04T10:00:00Z, last activity 2026-10-04T10:01:00Z)".to_owned()),
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        let held = text_of(&held);
+        for fact in [
+            "agent-a",
+            "task-7",
+            "since 2026-10-04T10:00:00Z",
+            "last activity 2026-10-04T10:01:00Z",
+            "Start with {\"read_only\": true} to read alongside",
+            "wait for the writer to stop",
+        ] {
+            assert!(held.contains(fact), "missing {fact:?}: {held}");
+        }
+
+        let unresolved = render(
+            PeerReply::Error {
+                code: FailureCode::WorkspaceActivation,
+                detail: Some("start:worktree_unresolved:identity_read".to_owned()),
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        assert!(text_of(&unresolved).contains("Check the path and retry ide.start from its root"));
+    }
+
+    /// Edit and test refusals share the exact read-only response shape and current-writer field.
+    #[test]
+    fn read_only_refusals_are_uniform_for_mutating_tools() {
+        for tool in ["ide.edit", "ide.test"] {
+            let rendered = render(
+                PeerReply::Error {
+                    code: FailureCode::Conflict,
+                    detail: Some(format!(
+                        "read_only:{tool}:activation task-7, since 2026-10-04T10:00:00Z, last activity 2026-10-04T10:01:00Z"
+                    )),
+                },
+                Envelope::TextOnly,
+            )
+            .unwrap();
+            let line = text_of(&rendered);
+            assert!(
+                line.starts_with(&format!("refused: read_only ({tool});")),
+                "{line}"
+            );
+            assert!(line.contains("started with read_only: true"), "{line}");
+            assert!(line.contains("call ide.start without read_only"), "{line}");
+            assert!(line.contains("one writer per worktree"), "{line}");
+            assert!(
+                line.contains("current writer: activation task-7, since"),
+                "{line}"
+            );
+        }
+        let none = render(
+            PeerReply::Error {
+                code: FailureCode::Conflict,
+                detail: Some("read_only:ide.edit:none".to_owned()),
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        assert!(text_of(&none).ends_with("current writer: none"));
     }
 
     /// Capacity failures preserve their stage and explain how to free bounded result storage.

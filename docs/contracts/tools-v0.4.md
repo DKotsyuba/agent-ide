@@ -90,7 +90,12 @@ The IDE's configured `allowed_roots` is the sole path rule and remains unchanged
 
 ### 2.1 `ide.start` — activation and project card (implemented, see status table for gaps)
 
-Input: `{activation_id, root?}`.
+Input: `{activation_id?, root?, read_only?}`. A start that names no `activation_id` keeps a stable
+default derived from its session binding, so repeating it returns the same activation. Omit
+`read_only` or set it to `false` for the one writer allowed per worktree; set it to `true` for a
+reader. Readers coexist with writers and other readers. A reader can upgrade by starting without
+`read_only` when the writer slot is free, and a writer can downgrade by starting with
+`read_only: true`.
 
 Output is a deterministic project card, without model-generated content:
 

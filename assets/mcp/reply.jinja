@@ -44,6 +44,8 @@ unavailable: host_binding (mismatch); the host event did not match this call. Re
 unavailable: host_binding (inactive_binding); this session's IDE activation has stopped; read run {{ test_status_id }} with ide.inspect {"detail_ref":"tests #{{ test_status_id }}"}, or call ide.start to run tests again
 {%- elif reason == "host_binding" and cause_tag == "inactive_binding" -%}
 unavailable: host_binding (inactive_binding); this session's IDE activation has stopped. Call ide.start, then repeat this call, or continue with native tools
+{%- elif reason == "host_binding" and cause_tag == "never_activated" -%}
+unavailable: host_binding (never_activated); no IDE activation in this session yet. Call ide.start, then repeat this call, or continue with native tools
 {%- elif reason == "host_binding" and cause_tag == "capacity_exceeded" -%}
 unavailable: host_binding (capacity_exceeded); the daemon's session table is full. Call ide.stop, then ide.start, or continue with native tools
 {%- elif reason == "host_binding" and cause_tag == "host_unrecognized" -%}
@@ -121,16 +123,36 @@ error: outside_allowed_roots ({{ resolution_detail }}); the discovered worktree 
 error: outside_allowed_roots{% if resolution_detail %} ({{ resolution_detail }}){% else %} (start:outside_allowed_roots){% endif %}; the requested project root is outside every directory the IDE may open. Call ide.start with an allowed root, or continue with native tools
 {%- elif code == "workspace_activation" and resolution_detail is startingwith("start:git_discovery_failed") -%}
 error: workspace_activation ({{ resolution_detail }}); Git worktree discovery failed; check the Git checkout and retry ide.start
+{%- elif code == "workspace_activation" and resolution_detail is startingwith("start:worktree_unresolved:identity_held") -%}
+error: workspace_activation ({{ resolution_detail }}); {{ resolution_message }} holds the previous identity of this replaced directory. Have that session call ide.stop (or retry after its session ends), then retry ide.start from its root
+{%- elif code == "workspace_activation" and resolution_detail is startingwith("start:worktree_unresolved:identity_read") -%}
+error: workspace_activation ({{ resolution_detail }}); the root could not be opened as a real directory (missing, moved, or a symlink). Check the path and retry ide.start from its root
+{%- elif code == "workspace_activation" and resolution_detail is startingwith("start:worktree_unresolved:identity_changed") -%}
+error: workspace_activation ({{ resolution_detail }}); the worktree's identity changed while it was being recorded. Retry ide.start from its root
+{%- elif code == "workspace_activation" and resolution_detail is startingwith("start:worktree_unresolved:identity_alias") -%}
+error: workspace_activation ({{ resolution_detail }}); an open identity for this physical directory sits under another path. Retry ide.start from its root
+{%- elif code == "workspace_activation" and resolution_detail is startingwith("start:worktree_unresolved:identity_commit") -%}
+error: workspace_activation ({{ resolution_detail }}); the durable worktree identity could not be recorded. Retry ide.start from its root, and continue with native tools if it repeats
 {%- elif code == "workspace_activation" and resolution_detail is startingwith("start:worktree_unresolved") -%}
 error: workspace_activation ({{ resolution_detail }}); the worktree could not be resolved; retry ide.start from its root
 {%- elif code == "workspace_activation" and resolution_detail is startingwith("start:durable_state") -%}
 error: workspace_activation ({{ resolution_detail }}); saved workspace state could not be read. Retry ide.start, and continue with native tools if it repeats
 {%- elif code == "conflict" and resolution_detail == "start:worktree_held_by_another_actor" -%}
 error: conflict (start:worktree_held_by_another_actor); another agent session owns this worktree's IDE activation. Have that session call ide.stop, then retry ide.start, or continue with native tools
+{%- elif code == "conflict" and resolution_detail is startingwith("start:worktree_held_by_another_actor") -%}
+error: conflict ({{ resolution_detail }}); {{ resolution_message }} holds the only writer slot. Start with {"read_only": true} to read alongside, or wait for the writer to stop
 {%- elif code == "conflict" and resolution_detail == "start:worktree_held_by_this_actor" -%}
 error: conflict (start:worktree_held_by_this_actor); another session for this actor owns this worktree. Call ide.stop from that session, then retry ide.start
+{%- elif code == "conflict" and resolution_detail is startingwith("start:worktree_held_by_this_actor") -%}
+error: conflict ({{ resolution_detail }}); another session of this actor — {{ resolution_message }} — owns this worktree. Call ide.stop from that session, then retry ide.start
 {%- elif code == "conflict" and resolution_detail == "start:actor_owns_another_worktree" -%}
 error: conflict (start:actor_owns_another_worktree); this actor's IDE activation is attached to another worktree. Call ide.stop there, then retry ide.start for this root
+{%- elif code == "conflict" and resolution_detail is startingwith("start:actor_owns_another_worktree") -%}
+error: conflict ({{ resolution_detail }}); this actor's IDE activation is attached to another worktree — {{ resolution_message }}. Call ide.stop there, then retry ide.start for this root
+{%- elif code == "conflict" and resolution_detail is startingwith("read_only:ide.edit:") -%}
+refused: read_only (ide.edit); this IDE activation is read-only (started with read_only: true). To change code, call ide.start without read_only — one writer per worktree; current writer: {{ resolution_message }}
+{%- elif code == "conflict" and resolution_detail is startingwith("read_only:ide.test:") -%}
+refused: read_only (ide.test); this IDE activation is read-only (started with read_only: true). To change code, call ide.start without read_only — one writer per worktree; current writer: {{ resolution_message }}
 {%- elif code == "conflict" and resolution_detail == "start:activation_conflict" -%}
 error: conflict (start:activation_conflict); this activation_id was already committed with different parameters; use a new activation_id
 {%- elif code == "conflict" and resolution_detail == "start:provider_cache_namespace_conflict" -%}

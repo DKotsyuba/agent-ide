@@ -216,7 +216,9 @@ fn stop_revokes_binding_before_workspace_and_old_expected_stamp_cannot_revoke_ne
     .unwrap();
     let mut authorities = AuthorityRegistry::default();
     let stamp = authorities
-        .activate(ActivationRequest::new("activate-1", invocation, active, worktree).unwrap())
+        .activate(
+            ActivationRequest::new("activate-1", false, invocation, active, worktree).unwrap(),
+        )
         .unwrap();
     let revoked = agent_ide::assistance::facade::stop_binding_then_revoke(
         &mut bindings,

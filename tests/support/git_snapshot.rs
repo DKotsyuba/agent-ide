@@ -225,7 +225,7 @@ pub fn authority_for(fixture: &GitFixture) -> agent_ide::workspace::authority::A
         1,
     )
     .expect("fixture worktree is valid");
-    let request = ActivationRequest::new("changes-real-git", invocation, active, worktree)
+    let request = ActivationRequest::new("changes-real-git", false, invocation, active, worktree)
         .expect("activation request is valid");
     AuthorityRegistry::default()
         .activate(request)

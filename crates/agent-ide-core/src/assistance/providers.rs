@@ -343,9 +343,12 @@ impl Worker<'_> {
             return Ok(None);
         };
         let mut backend = self.providers.take_backend(index)?;
+        // A reader's semantic call borrows the writer's session for this one backend call.
+        self.borrow_writer_session(job);
         let result = backend
             .context(self, job, &launch, source, bytes, query)
             .await;
+        job.session_binding = None;
         self.providers.put_backend(index, backend);
         result.map(Some)
     }
@@ -364,22 +367,41 @@ impl Worker<'_> {
         job: &mut Job,
         source: &SourceObservation,
     ) -> Result<&mut LiveSession, FailureCode> {
-        let binding = job.invocation.binding_ref().clone();
+        // A reader's semantic tools borrow the writer's session for this whole resolution; the
+        // mapping is cleared again below so no non-provider path of the same job ever sees it.
+        self.borrow_writer_session(job);
+        let binding = job
+            .session_binding
+            .clone()
+            .unwrap_or_else(|| job.invocation.binding_ref().clone());
         let server = self
             .providers
             .session_server(source.path())
-            .ok_or(FailureCode::ProviderUnavailable)?;
-        let index = self.providers.slot_of(server)?;
+            .ok_or_else(|| {
+                job.session_binding = None;
+                FailureCode::ProviderUnavailable
+            })?;
+        let index = match self.providers.slot_of(server) {
+            Ok(index) => index,
+            Err(code) => {
+                job.session_binding = None;
+                return Err(code);
+            }
+        };
         let launch = job
             .target
             .providers
             .iter()
             .find(|launch| launch.language == server.language())
             .cloned()
-            .ok_or(FailureCode::ProviderUnavailable)?;
+            .ok_or_else(|| {
+                job.session_binding = None;
+                FailureCode::ProviderUnavailable
+            })?;
         let mut backend = self.providers.take_backend(index)?;
         let ensured = backend.ensure_live(self, job, &launch, source).await;
         self.providers.put_backend(index, backend);
+        job.session_binding = None;
         ensured?;
         let budget = Duration::from_millis(100).min(
             job.deadline
@@ -897,9 +919,13 @@ impl ProviderHost for Worker<'_> {
 }
 
 impl ProviderJob for Job {
-    /// The job's validated binding.
+    /// The binding that owns this job's provider sessions: the invocation binding, or the
+    /// writer's while a reader's job borrows its sessions (`session_binding`, set only for the
+    /// duration of one provider call). Backends key sessions, caches, and spawn authority on it.
     fn binding(&self) -> &BindingRef {
-        self.invocation.binding_ref()
+        self.session_binding
+            .as_ref()
+            .unwrap_or(self.invocation.binding_ref())
     }
 
     /// The job's revocation channel.

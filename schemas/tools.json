@@ -383,10 +383,15 @@
       "additionalProperties": false,
       "properties": {
         "activation_id": {
-          "description": "Any stable id for this activation (e.g. the task name); repeating it returns the same activation.",
+          "description": "Any stable id for this activation (e.g. the task name); repeating it returns the same activation. Optional: a start that names none derives a stable id from this session, so repeating it also returns the same activation.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
+        },
+        "read_only": {
+          "default": false,
+          "description": "Start as a reader; the default is the one writer allowed per worktree.",
+          "type": "boolean"
         },
         "root": {
           "description": "Absolute working directory to activate; defaults to the host's project directory. Must lie below a configured allowed root.",
@@ -395,9 +400,6 @@
           "type": "string"
         }
       },
-      "required": [
-        "activation_id"
-      ],
       "type": "object"
     },
     "name": "ide.start"

@@ -201,10 +201,10 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Start,
             json!({
                 "type": "object", "additionalProperties": false,
-                "required": ["activation_id"],
                 "properties": {
-                    "activation_id": {"type": "string", "minLength": 1, "maxLength": MAX_ACTIVATION_ID_BYTES, "description": "Any stable id for this activation (e.g. the task name); repeating it returns the same activation."},
-                    "root": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Absolute working directory to activate; defaults to the host's project directory. Must lie below a configured allowed root."}
+                    "activation_id": {"type": "string", "minLength": 1, "maxLength": MAX_ACTIVATION_ID_BYTES, "description": "Any stable id for this activation (e.g. the task name); repeating it returns the same activation. Optional: a start that names none derives a stable id from this session, so repeating it also returns the same activation."},
+                    "root": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Absolute working directory to activate; defaults to the host's project directory. Must lie below a configured allowed root."},
+                    "read_only": {"type": "boolean", "default": false, "description": "Start as a reader; the default is the one writer allowed per worktree."}
                 }
             }),
         ),
@@ -612,7 +612,7 @@ const CONTEXT_TARGET_MESSAGE: &str =
 /// Returns the closed allowed field list for one logical tool.
 fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
     match tool {
-        AssistanceTool::Start => &["activation_id", "root"],
+        AssistanceTool::Start => &["activation_id", "root", "read_only"],
         AssistanceTool::Context => &[
             "path",
             "byte_offset",
@@ -889,8 +889,16 @@ pub fn validate_call(
             }
         }
         AssistanceTool::Start => {
-            required_string(object, "activation_id", MAX_ACTIVATION_ID_BYTES)?;
+            // `activation_id` is optional: a start that names none keeps a stable default derived
+            // from its binding server-side (E013 item 4); a present one stays bounded nonempty.
+            optional_string(object, "activation_id", MAX_ACTIVATION_ID_BYTES)?;
             optional_string(object, "root", MAX_RELATIVE_PATH_BYTES)?;
+            if object
+                .get("read_only")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                return Err(invalid_field("read_only", FieldRule::Boolean));
+            }
             if let Some(root) = object.get("root").and_then(Value::as_str)
                 && (!root.starts_with('/')
                     || root
@@ -3669,7 +3677,7 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Start,
-            "invalid bounded parameters: unknown field \"actor_id\"; allowed: activation_id, root"
+            "invalid bounded parameters: unknown field \"actor_id\"; allowed: activation_id, root, read_only"
                 .to_string(),
         ),
         (
@@ -4083,9 +4091,17 @@ fn start_root_must_be_absolute_and_normalized() {
     assert!(
         validate_call(
             AssistanceTool::Start,
-            json!({"activation_id":"a","root":"/private/tmp/work"})
+            json!({"activation_id":"a","root":"/private/tmp/work","read_only":true})
         )
         .is_ok()
+    );
+    assert!(validate_call(AssistanceTool::Start, json!({"read_only":false})).is_ok());
+    assert_eq!(
+        validate_call(AssistanceTool::Start, json!({"read_only":"yes"})).unwrap_err(),
+        ParameterError::InvalidField {
+            field: "read_only",
+            rule: FieldRule::Boolean,
+        }
     );
 }
 

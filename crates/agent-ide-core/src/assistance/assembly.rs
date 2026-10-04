@@ -78,8 +78,33 @@ const HOOK_INACTIVE_WINDOW_MS: u64 = 600_000;
 /// Generous against the observed ~405 ms submission stall, short enough to fit the client's
 /// one-second first-reply budget with room for the call itself.
 const PRE_ARRIVAL_WAIT: std::time::Duration = std::time::Duration::from_millis(600);
+/// Arrival window for an `ide.start` alone: a first start lost the race with its own pre-hook
+/// after 606 ms while the hooks flowed normally a moment later, and agents never repeat a call
+/// (E013 item 3). A start is idempotent by activation id, so waiting longer can only help.
+const START_PRE_ARRIVAL_WAIT: std::time::Duration = std::time::Duration::from_millis(2_500);
 /// Poll interval of the pre-arrival window.
 const PRE_ARRIVAL_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Selects the bounded host pre-hook arrival window for one dispatched tool method.
+fn pre_arrival_wait(method: AssistanceMethod) -> std::time::Duration {
+    if method == AssistanceMethod::Start {
+        START_PRE_ARRIVAL_WAIT
+    } else {
+        PRE_ARRIVAL_WAIT
+    }
+}
+
+#[test]
+fn first_start_waits_longer_for_its_pre_hook_than_other_calls() {
+    assert_eq!(
+        pre_arrival_wait(AssistanceMethod::Start),
+        std::time::Duration::from_millis(2_500)
+    );
+    assert_eq!(
+        pre_arrival_wait(AssistanceMethod::Context),
+        std::time::Duration::from_millis(600)
+    );
+}
 
 /// Returns the host contract one sanitized hook observation names, when it names a supported one.
 fn observed_host(object: &serde_json::Map<String, Value>) -> Option<HostKind> {
@@ -652,7 +677,8 @@ impl ProductDispatcher {
                         .lock()
                         .is_ok_and(|bindings| evidence(&bindings))
                     {
-                        let deadline = tokio::time::Instant::now() + PRE_ARRIVAL_WAIT;
+                        let deadline =
+                            tokio::time::Instant::now() + pre_arrival_wait(method.method());
                         while tokio::time::Instant::now() < deadline {
                             tokio::time::sleep(PRE_ARRIVAL_POLL).await;
                             if self

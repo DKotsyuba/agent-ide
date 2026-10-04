@@ -75,7 +75,7 @@ fn activation(
     let active_use = guard
         .consume_active(invocation.binding_ref())
         .expect("new start binding is active");
-    ActivationRequest::new(operation, invocation, active_use, worktree)
+    ActivationRequest::new(operation, false, invocation, active_use, worktree)
         .expect("matching fresh binding builds an activation")
 }
 

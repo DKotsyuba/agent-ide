@@ -402,6 +402,7 @@ impl From<BindingUnavailable> for ReasonCode {
             BindingUnavailable::MissingPre => Self::MissingPre,
             BindingUnavailable::MissingInvocation => Self::MissingInvocation,
             BindingUnavailable::InactiveBinding => Self::InactiveBinding,
+            BindingUnavailable::NeverActivated => Self::InactiveBinding,
             BindingUnavailable::Replay => Self::Replay,
             BindingUnavailable::CapacityExceeded => Self::CapacityExceeded,
         }

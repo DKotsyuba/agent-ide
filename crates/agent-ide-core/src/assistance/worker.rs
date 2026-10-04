@@ -109,6 +109,10 @@ struct Job {
     park_until: Option<tokio::time::Instant>,
     /// Retained in-memory continuation for work that cannot safely be repeated from its start.
     stage: Option<JobStage>,
+    /// The binding that owns this job's provider sessions: the writer's while this job's own
+    /// activation is a reader borrowing them, else absent (the invocation binding owns them).
+    /// Set only while a provider call runs; see [`Worker::borrow_writer_session`].
+    session_binding: Option<BindingRef>,
 }
 
 /// Resumable state for operations that have already performed an externally visible edit.
@@ -466,7 +470,7 @@ struct Ledger {
     /// policy of [`evict_settled_details`] (which journals every batch).
     details: BTreeMap<String, Detail>,
     /// Stable start requests under each immutable binding generation.
-    starts: BTreeMap<(BindingRef, String), String>,
+    starts: BTreeMap<(BindingRef, String, bool), String>,
     /// One cancellation sender per currently active binding.
     cancellation: BTreeMap<BindingRef, watch::Sender<bool>>,
     /// Nonzero monotonic detail identifiers within this daemon boot.
@@ -1285,6 +1289,7 @@ impl WorkerHandle {
                 providers: providers::Providers::new(),
                 names: Default::default(),
                 telemetry,
+                activity: BTreeMap::new(),
             }
             .run(receiver)
             .await;
@@ -1420,7 +1425,7 @@ impl WorkerHandle {
                 .queue
                 .retain(|job| job.invocation.binding_ref() != &binding);
             ledger.details.retain(|_, detail| detail.binding != binding);
-            ledger.starts.retain(|(owner, _), _| owner != &binding);
+            ledger.starts.retain(|(owner, _, _), _| owner != &binding);
             ledger.native_epoch.remove(&binding);
             ledger.feedback.remove(&binding);
             ledger.delivered.remove(&binding);
@@ -1639,16 +1644,26 @@ impl WorkerHandle {
                 binding.clone(),
                 parameters["activation_id"]
                     .as_str()
-                    .ok_or(FailureCode::Internal)?
-                    .to_owned(),
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| default_activation_id(&binding)),
+                parameters["read_only"].as_bool().unwrap_or(false),
             ))
         } else {
             None
         };
         if let Some(key) = &start
-            && let Some(reference) = ledger.starts.get(key)
+            && let Some(reference) = ledger.starts.get(key).cloned()
         {
-            return Ok(reference.clone());
+            if ledger
+                .details
+                .get(&reference)
+                .is_some_and(|detail| matches!(detail.reply, PeerReply::Pending { .. }))
+            {
+                return Ok(reference);
+            }
+            // Coalesce only concurrent submissions. Once settled, a repeated start must run
+            // admission again because a reader may upgrade or a writer may downgrade.
+            ledger.starts.remove(key);
         }
         let queue_cap = queue_capacity(self.shared.launcher.limits.queued, tool);
         let now = tokio::time::Instant::now();
@@ -1729,6 +1744,7 @@ impl WorkerHandle {
             check_scheduled: false,
             park_until: None,
             stage: None,
+            session_binding: None,
         };
         if tool == AssistanceTool::Stop {
             ledger.queue.push_front(job);
@@ -1981,6 +1997,9 @@ struct Worker<'a> {
     names: crate::intelligence::names::NameIndexes,
     /// Optional closed telemetry sink shared by Assistance producer boundaries.
     telemetry: Option<Telemetry>,
+    /// Wall-clock milliseconds of each active binding's last completed job, keyed by binding
+    /// fingerprint, so a refused activation can name the holder's last observed activity.
+    activity: BTreeMap<[u8; 32], u64>,
 }
 
 impl<'a> Worker<'a> {
@@ -2469,7 +2488,33 @@ impl<'a> Worker<'a> {
             .ok()
             .and_then(|ledger| ledger.native_epoch.get(&binding).copied())
             .unwrap_or(0);
-        let result = if job.tool == AssistanceTool::Stop {
+        // Mutating tools are refused before they reach edit preparation or process admission when
+        // this activation is read-only. Every edit form shares the same tool and refusal path.
+        let reader_refusal = if matches!(job.tool, AssistanceTool::Edit | AssistanceTool::Test)
+            && self.grants.get(&binding).is_some_and(|receipt| {
+                receipt.role() == crate::workspace::authority::StartRole::Reader
+            }) {
+            let tool = if job.tool == AssistanceTool::Edit {
+                "ide.edit"
+            } else {
+                "ide.test"
+            };
+            let current_writer = self
+                .grants
+                .get(&binding)
+                .map(|receipt| receipt.worktree().clone());
+            let holder = match current_writer {
+                Some(tree) => self.current_writer_facts(&tree).await,
+                None => "none".to_owned(),
+            };
+            job.failure_detail = Some(format!("read_only:{tool}:{holder}"));
+            Some(FailureCode::Conflict)
+        } else {
+            None
+        };
+        let result = if let Some(code) = reader_refusal {
+            Err(code)
+        } else if job.tool == AssistanceTool::Stop {
             let uncollected = job
                 .parameters
                 .get("uncollected_test_runs")
@@ -2657,6 +2702,12 @@ impl<'a> Worker<'a> {
             source,
             job.native_epoch,
         );
+        // Holder facts name the holder's last observed activity: record every settled job of an
+        // activated binding (E013 item 1).
+        if self.grants.contains_key(&binding) {
+            self.activity
+                .insert(binding.fingerprint(), crate::errorlog::now_ms());
+        }
         if let Some(sender) = job.stop_reply.take() {
             // The oneshot send is the actual submission boundary for this synchronous-wait path
             // (Claude Start/Context/Diff/Stop): it only succeeds while the caller's own `wait`
@@ -2710,6 +2761,12 @@ impl<'a> Worker<'a> {
             DiscoverWorktreeRequest, DiscoveryOperationRef, GitDiscoveryPolicy, GitDiscoveryQuery,
         };
         let binding = job.invocation.binding_ref().clone();
+        let read_only = job
+            .parameters
+            .get("read_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let previous_role = self.grants.get(&binding).map(StartReceipt::role);
         let candidate = activation_root(job, self.shared.launcher.allowed_roots())?;
         let operation = DiscoveryOperationRef::new(format!("discover-{}", job.reference))
             .map_err(|_| FailureCode::Internal)?;
@@ -2843,33 +2900,45 @@ impl<'a> Worker<'a> {
             FailureCode::OutsideAllowedRoots
         })?;
         self.shared.active(&binding)?;
-        let tree = self
-            .workspace
-            .resolve_worktree(root, repository, common)
-            .await
-            .map_err(|_| {
-                job.failure_detail = Some(
-                    "start:worktree_unresolved: the discovered worktree identity could not be resolved"
-                        .to_owned(),
-                );
-                FailureCode::WorkspaceActivation
-            })?;
+        let discovered = (root, repository, common);
+        let tree = match self.resolve_worktree_named(&discovered).await {
+            Ok(tree) => tree,
+            Err((detail, holder)) => {
+                // An active start whose session already died can still own a replaced directory's
+                // previous incarnation, permanently refusing every later start of that root until
+                // a daemon restart (E013 item 7: 22 refused starts on 03.10). Its durable revoke
+                // needs no live binding, so settle it here and resolve once more.
+                if let Some(holder) = holder
+                    && let Some(binding) = self.binding_of_holder(&holder)
+                    && self.shared.active(&binding).is_err()
+                    && self.settle_revocation(&binding).await.is_ok()
+                    && let Ok(tree) = self.resolve_worktree_named(&discovered).await
+                {
+                    tree
+                } else {
+                    job.failure_detail = Some(detail);
+                    return Err(FailureCode::WorkspaceActivation);
+                }
+            }
+        };
         let plain_directory = tree.is_plain_directory();
         self.reconcile_pending_revocations(&tree, job.invocation.actor_id())
             .await;
         let mut identity = blake3::Hasher::new();
         identity.update(&binding.fingerprint());
-        identity.update(
-            job.parameters["activation_id"]
-                .as_str()
-                .ok_or(FailureCode::Internal)?
-                .as_bytes(),
-        );
+        // `activation_id` is optional: a start that names none derives a stable id from its
+        // binding, so a repeated start without one returns the same activation (E013 item 4).
+        let activation_id = job.parameters["activation_id"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| default_activation_id(&binding));
+        identity.update(activation_id.as_bytes());
         let operation = identity.finalize().to_hex().to_string();
         let requested_operation = operation.clone();
         let requested_tree = tree.clone();
         let request = crate::workspace::authority::ActivationRequest::new(
             operation,
+            read_only,
             job.invocation.clone(),
             self.shared.active(&binding)?,
             tree,
@@ -2920,6 +2989,7 @@ impl<'a> Worker<'a> {
         // A receipt whose operation differs from the one this call requested is the same session's
         // existing activation, returned idempotently; the reply must report that activation.
         let reused_activation = receipt.operation() != requested_operation;
+        let next_role = receipt.role();
         let activation_operation = receipt.operation().to_owned();
         self.grants.insert(binding.clone(), receipt);
         // The one shared fact a hook ingress can check before emitting a native hint: this
@@ -2940,6 +3010,16 @@ impl<'a> Worker<'a> {
                     .unwrap_or(error));
             }
         };
+        if previous_role == Some(crate::workspace::authority::StartRole::Writer)
+            && next_role == crate::workspace::authority::StartRole::Reader
+        {
+            self.release_live(&binding).await;
+            if let Err(code) = self.close_provider(&binding).await {
+                job.failure_detail = Some("start:read_only_provider_cleanup".to_owned());
+                return Err(code);
+            }
+            self.quiesce_worktree_caches(&binding);
+        }
         // A plain directory has no Git state to capture, so no baseline run happens at all.
         let baseline = if plain_directory {
             None
@@ -2950,10 +3030,14 @@ impl<'a> Worker<'a> {
             )
         };
         let launches = job.target.providers.clone();
-        // A second concurrent actor on the same physical worktree cannot share a single-owner
-        // namespace: fail its activation with the finite reason and roll its own grant back, so the
-        // actor that already owns the cache keeps running and can hand off after it stops.
-        if let Err(code) = self.retain_worktree_caches(&binding, &authority, &launches, true) {
+        // A reader holds no provider namespace of its own: it borrows the writer's sessions for
+        // semantic reads (see `borrow_writer_session`), so the single-owner namespace stays with
+        // the writer. A second concurrent *writer* on the same physical worktree still cannot
+        // share one namespace: fail its activation with the finite reason and roll its own grant
+        // back, so the actor that already owns the cache keeps running and can hand off.
+        if authority.role() == crate::workspace::authority::StartRole::Writer
+            && let Err(code) = self.retain_worktree_caches(&binding, &authority, &launches, true)
+        {
             if code == FailureCode::Conflict {
                 job.failure_detail = Some("start:provider_cache_namespace_conflict".to_owned());
             }
@@ -3040,14 +3124,22 @@ impl<'a> Worker<'a> {
                 Ok(Err(_)) | Err(_) => String::new(),
             }
         };
-        let mut text = if reused_activation {
+        let reused = if reused_activation {
+            format!("existing activation {activation_operation}; ")
+        } else {
+            String::new()
+        };
+        let mut text = if authority.role() == crate::workspace::authority::StartRole::Reader {
+            let holder = self.current_writer_facts(authority.worktree()).await;
             format!(
-                "activated: epoch {}; existing activation {activation_operation}; baseline: {baseline}",
+                "activated: epoch {}; mode: read-only; {reused}current writer: {holder}; \
+                 read tools answer; call ide.start without read_only to edit or run tests; \
+                 baseline: {baseline}",
                 authority.epoch(),
             )
         } else {
             format!(
-                "activated: epoch {}; baseline: {baseline}",
+                "activated: epoch {}; mode: writer; {reused}baseline: {baseline}",
                 authority.epoch(),
             )
         };
@@ -3119,8 +3211,9 @@ impl<'a> Worker<'a> {
     /// Names the holder a refused activation collided with and the remedy that frees it.
     ///
     /// A same-actor holder never reaches this method as the same binding: [`DurableWorkspace::activate`]
-    /// answers that case idempotently with the existing activation. Everything here is closed tags;
-    /// the reply template supplies the plain-words remedy for each.
+    /// answers that case idempotently with the existing activation. Holder facts ride the closed
+    /// tag (actor, activation id, role, since when, last activity) so the refusal names who holds
+    /// what and since when; the reply template supplies the plain-words remedy for each tag.
     async fn conflict_detail(
         &self,
         tree: &crate::workspace::authority::WorktreeRef,
@@ -3132,14 +3225,134 @@ impl<'a> Worker<'a> {
             DurableError::OperationConflict => "start:activation_conflict".to_owned(),
             DurableError::Authority(
                 crate::workspace::authority::AuthorityError::ActorAlreadyOwnsWorktree,
-            ) => "start:actor_owns_another_worktree".to_owned(),
+            ) => match self.workspace.start_holder(tree, actor).await {
+                Ok(Some(holder)) => format!(
+                    "start:actor_owns_another_worktree: {}",
+                    self.holder_facts(&holder)
+                ),
+                Ok(None) | Err(_) => "start:actor_owns_another_worktree".to_owned(),
+            },
             _ => match self.workspace.start_holder(tree, actor).await {
-                Ok(Some(holder)) if holder.same_actor => {
-                    "start:worktree_held_by_this_actor".to_owned()
-                }
-                Ok(Some(_)) => "start:worktree_held_by_another_actor".to_owned(),
+                Ok(Some(holder)) if holder.same_actor => format!(
+                    "start:worktree_held_by_this_actor: {}",
+                    self.holder_facts(&holder)
+                ),
+                Ok(Some(holder)) => format!(
+                    "start:worktree_held_by_another_actor: {}",
+                    self.holder_facts(&holder)
+                ),
                 Ok(None) | Err(_) => "start:conflict".to_owned(),
             },
+        }
+    }
+
+    /// Renders one holder's closed facts: actor, activation id, role, since when, last activity.
+    /// The last activity comes from this worker's own completion records of the holder's binding,
+    /// which every tool call of this daemon flows through.
+    fn holder_facts(&self, holder: &crate::workspace::durable::StartHolder) -> String {
+        let since = timestamp_line(holder.started_ms);
+        let last = self
+            .activity
+            .get(&holder.binding)
+            .map(|ms| timestamp_line(*ms))
+            .unwrap_or_else(|| "unknown".to_owned());
+        format!(
+            "actor {} (activation {}, {}, since {}, last activity {})",
+            holder.actor,
+            holder.activation,
+            holder.role.as_str(),
+            since,
+            last
+        )
+    }
+
+    /// Reports the current writer's activation and activity facts for a read-only refusal.
+    async fn current_writer_facts(
+        &self,
+        tree: &crate::workspace::authority::WorktreeRef,
+    ) -> String {
+        match self.workspace.start_holder(tree, "").await {
+            Ok(Some(holder)) if holder.role == crate::workspace::authority::StartRole::Writer => {
+                let last = self
+                    .activity
+                    .get(&holder.binding)
+                    .map(|ms| timestamp_line(*ms))
+                    .unwrap_or_else(|| "unknown".to_owned());
+                format!(
+                    "activation {}, since {}, last activity {}",
+                    holder.activation,
+                    timestamp_line(holder.started_ms),
+                    last
+                )
+            }
+            _ => "none".to_owned(),
+        }
+    }
+
+    /// Points one read job of a reader activation at the writer's binding for provider sessions:
+    /// while a writer holds this worktree, its binding owns every live session and cache
+    /// namespace, so the reader borrows them instead of starting its own (E013 item 2). No-op
+    /// for a writer's or a writer-less reader's own jobs.
+    fn borrow_writer_session(&self, job: &mut Job) {
+        job.session_binding = self
+            .grants
+            .get(job.invocation.binding_ref())
+            .filter(|receipt| receipt.role() == crate::workspace::authority::StartRole::Reader)
+            .and_then(|receipt| {
+                self.grants
+                    .iter()
+                    .find(|(_, writer)| {
+                        writer.role() == crate::workspace::authority::StartRole::Writer
+                            && writer.worktree().id() == receipt.worktree().id()
+                    })
+                    .map(|(binding, _)| binding.clone())
+            });
+    }
+
+    /// Maps one durable holder record onto this daemon's live binding for it, when the worker
+    /// still holds its grant.
+    fn binding_of_holder(
+        &self,
+        holder: &crate::workspace::durable::StartHolder,
+    ) -> Option<BindingRef> {
+        self.grants
+            .iter()
+            .find(|(binding, receipt)| {
+                binding.fingerprint() == holder.binding && receipt.actor() == holder.actor
+            })
+            .map(|(binding, _)| binding.clone())
+    }
+
+    /// Resolves the discovered worktree, collapsing only the refusal's own facts: the closed
+    /// failing step and, when an active start blocks a replaced identity, that start's facts.
+    async fn resolve_worktree_named(
+        &self,
+        discovered: &(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf),
+    ) -> Result<
+        crate::workspace::authority::WorktreeRef,
+        (String, Option<Box<crate::workspace::durable::StartHolder>>),
+    > {
+        match self
+            .workspace
+            .resolve_worktree(
+                discovered.0.clone(),
+                discovered.1.clone(),
+                discovered.2.clone(),
+            )
+            .await
+        {
+            Ok(tree) => Ok(tree),
+            Err(crate::workspace::durable::DurableError::IdentityUnavailable { step, holder }) => {
+                let detail = match holder.as_deref() {
+                    Some(holder) => format!(
+                        "start:worktree_unresolved:{step}: {}",
+                        self.holder_facts(holder)
+                    ),
+                    None => format!("start:worktree_unresolved:{step}"),
+                };
+                Err((detail, holder))
+            }
+            Err(_) => Err(("start:worktree_unresolved:identity_commit".to_owned(), None)),
         }
     }
 
@@ -4140,30 +4353,46 @@ impl<'a> Worker<'a> {
     /// Settles one stop by positively closing this binding's providers first and only then durably
     /// revoking its grant, so a failed durable half keeps full retry authority.
     ///
-    /// On durable failure the receipt, this binding's cache keys (still non-quiescent), and its
+    /// Returns whether a grant this stop actually revoked was still held (`true`), or nothing was
+    /// active to revoke (`false`: no grant, or its authority was already released). On durable
+    /// failure the receipt, this binding's cache keys (still non-quiescent), and its
     /// registered paths are all deliberately retained and the binding is marked pending, so a later
     /// fresh start can commit the same revoke before minting a new grant. Nothing here restores the
     /// stopped binding's source or provider authority and no stop is ever replayed: the host
     /// binding was already stopped by the ingress path and stays unusable either way. A daemon
     /// restart boot-fences old grants independently, so pending state is intentionally in-memory.
-    async fn settle_revocation(&mut self, binding: &BindingRef) -> Result<(), FailureCode> {
+    async fn settle_revocation(&mut self, binding: &BindingRef) -> Result<bool, FailureCode> {
         self.close_provider(binding).await?;
         let Some(receipt) = self.grants.get(binding).cloned() else {
             self.pending_revocations.remove(binding);
             self.release_binding_state(binding);
-            return Ok(());
+            return Ok(false);
         };
         let operation = OperationId::new(format!(
             "stop-{}",
             blake3::Hash::from_bytes(binding.fingerprint()).to_hex()
         ))
         .map_err(|_| FailureCode::Internal)?;
-        if self
+        if let Err(error) = self
             .workspace
             .revoke(operation, &receipt, StopBindingHandoff::Confirmed)
             .await
-            .is_err()
         {
+            // Authority that durable state already retired (a newer boot fenced it, or the same
+            // grant was revoked before) is exactly what this stop asks for: answer the benign
+            // nothing-active outcome instead of demanding a fresh start just to stop (E013
+            // item 6). Only an uncertain application failure stays retryable.
+            if matches!(
+                error,
+                crate::workspace::durable::DurableError::Authority(
+                    crate::workspace::authority::AuthorityError::StaleAuthority
+                )
+            ) {
+                self.grants.remove(binding);
+                self.pending_revocations.remove(binding);
+                self.release_binding_state(binding);
+                return Ok(false);
+            }
             if self.pending_revocations.len() < MAX_PENDING_REVOCATIONS {
                 self.pending_revocations.insert(binding.clone());
             }
@@ -4173,7 +4402,7 @@ impl<'a> Worker<'a> {
         self.pending_revocations.remove(binding);
         self.release_live(binding).await;
         self.release_binding_state(binding);
-        Ok(())
+        Ok(true)
     }
 
     /// Compares the worktree's checked-out branch or detached commit with the one this binding
@@ -4262,13 +4491,19 @@ impl<'a> Worker<'a> {
         binding: &BindingRef,
         uncollected: &[String],
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
-        self.settle_revocation(binding).await?;
+        let revoked = self.settle_revocation(binding).await?;
         if self.uncertain.contains(binding) {
             return Err(FailureCode::Internal);
         }
-        let mut text =
+        let mut text = if revoked {
             "Assistance stopped for this binding; compatible shared peers remain eligible"
-                .to_owned();
+                .to_owned()
+        } else {
+            // Nothing was active to stop: no grant was ever held, or its authority was already
+            // released (E013 item 6) — starting just to stop would be waste.
+            "nothing active for this binding; its workspace authority was already released"
+                .to_owned()
+        };
         if !uncollected.is_empty() {
             text.push_str(
                 "\nuncollected test runs in this binding — their results were never read; each \
@@ -4993,6 +5228,27 @@ fn only_a_directory_without_any_git_is_plain() {
     std::fs::remove_dir_all(&folder).unwrap();
 }
 
+/// Renders one wall-clock millisecond instant as the journal's UTC second line, or `unknown`
+/// for the zero no-time-yet case.
+fn timestamp_line(ms: u64) -> String {
+    if ms == 0 {
+        return "unknown".to_owned();
+    }
+    crate::errorlog::format_rfc3339(ms / 1000)
+}
+
+/// The stable default activation id for one binding: a start that names no `activation_id`
+/// derives its operation from the binding alone, so repeating that start returns the same
+/// activation (E013 item 4).
+fn default_activation_id(binding: &BindingRef) -> String {
+    format!(
+        "binding-{}",
+        &blake3::Hash::from_bytes(binding.fingerprint())
+            .to_hex()
+            .as_str()[..24]
+    )
+}
+
 /// Refuses any existing symlink component of one relative path below the worktree root (T36B).
 ///
 /// This is a cached-disclosure preflight only — it cannot secure a later read against
@@ -5682,6 +5938,16 @@ mod stop_retry_tests {
         actor: &str,
         id: &str,
     ) -> (BindingRef, StartReceipt) {
+        production_start_mode(worker, actor, id, false).await
+    }
+
+    /// Runs `Worker::activate` using the requested explicit read-only mode.
+    async fn production_start_mode(
+        worker: &mut Worker<'_>,
+        actor: &str,
+        id: &str,
+        read_only: bool,
+    ) -> (BindingRef, StartReceipt) {
         let invocation = production_call(worker, actor, id);
         let binding = invocation.binding_ref().clone();
         let (_cancel_sender, cancel) = watch::channel(false);
@@ -5689,7 +5955,7 @@ mod stop_retry_tests {
             reference: format!("production-{id}"),
             invocation,
             tool: AssistanceTool::Start,
-            parameters: serde_json::json!({"activation_id":id}),
+            parameters: serde_json::json!({"activation_id":id,"read_only":read_only}),
             target: production_target(&worker.runtime),
             deadline: tokio::time::Instant::now() + Duration::from_secs(5),
             cancel,
@@ -5700,10 +5966,262 @@ mod stop_retry_tests {
             check_scheduled: false,
             park_until: None,
             stage: None,
+            session_binding: None,
         };
         worker.activate(&mut job).await.unwrap();
         let receipt = worker.grants.get(&binding).cloned().unwrap();
         (binding, receipt)
+    }
+
+    /// Explicit readers coexist with one writer, and same-id starts upgrade or downgrade roles.
+    #[tokio::test]
+    async fn explicit_readers_coexist_and_writer_slot_upgrades_and_downgrades() {
+        use crate::workspace::authority::StartRole;
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        worker.edits.install_schema().await.unwrap();
+
+        let (writer_binding, writer_receipt) =
+            production_start(&mut worker, "writer-actor", "writer-start").await;
+        assert_eq!(writer_receipt.role(), StartRole::Writer);
+
+        let (reader_binding, reader_receipt) =
+            production_start_mode(&mut worker, "reader-actor", "reader-start", true).await;
+        assert_eq!(reader_receipt.role(), StartRole::Reader);
+        assert_eq!(
+            reader_receipt.epoch(),
+            writer_receipt.epoch(),
+            "a reader shares the writer's epoch and advances no authority clock"
+        );
+
+        let (_, second_reader) =
+            production_start_mode(&mut worker, "reader-two", "reader-two-start", true).await;
+        assert_eq!(second_reader.role(), StartRole::Reader);
+
+        // An explicit reader stays a reader when repeated in read-only mode.
+        let (mut repeat, _repeat_cancel) = start_job(
+            &worker,
+            "reader-actor",
+            "reader-repeat",
+            serde_json::json!({"activation_id":"reader-start","read_only":true}),
+        );
+        worker.activate(&mut repeat).await.unwrap();
+        let repeated = worker.grants.get(&reader_binding).cloned().unwrap();
+        assert_eq!(
+            repeated.role(),
+            StartRole::Reader,
+            "an idempotent reader retry must not mint writer authority"
+        );
+
+        // A second writer is refused while the first holds the slot; the holder is named.
+        let (mut refused_writer, _refused_cancel) = start_job(
+            &worker,
+            "third-actor",
+            "third-writer-refused",
+            serde_json::json!({"activation_id":"third-writer"}),
+        );
+        assert_eq!(
+            worker.activate(&mut refused_writer).await,
+            Err(FailureCode::Conflict)
+        );
+        assert!(
+            refused_writer
+                .failure_detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("start:worktree_held_by_another_actor:")),
+            "second writer names the existing writer: {:?}",
+            refused_writer.failure_detail
+        );
+
+        // The writer can downgrade in place, freeing its index slot for a third actor.
+        let (mut downgrade, _downgrade_cancel) = start_job(
+            &worker,
+            "writer-actor",
+            "writer-downgrade",
+            serde_json::json!({"activation_id":"writer-start","read_only":true}),
+        );
+        worker.activate(&mut downgrade).await.unwrap();
+        let downgraded = worker.grants.get(&writer_binding).cloned().unwrap();
+        assert_eq!(downgraded.role(), StartRole::Reader);
+        let (third_binding, third_writer) =
+            production_start(&mut worker, "third-actor", "third-writer").await;
+        assert_eq!(third_writer.role(), StartRole::Writer);
+
+        // The same reader now asks for writer authority and upgrades when the slot is released.
+        assert!(worker.settle_revocation(&third_binding).await.unwrap());
+        let (mut upgrade, _upgrade_cancel) = start_job(
+            &worker,
+            "reader-actor",
+            "reader-upgrade",
+            serde_json::json!({"activation_id":"reader-start","read_only":false}),
+        );
+        worker.activate(&mut upgrade).await.unwrap();
+        let upgraded = worker.grants.get(&reader_binding).cloned().unwrap();
+        assert_eq!(upgraded.role(), StartRole::Writer);
+        assert!(
+            upgraded.epoch() > writer_receipt.epoch(),
+            "an upgrade mints a fresh authority epoch"
+        );
+        assert_eq!(
+            upgraded.operation(),
+            reader_receipt.operation(),
+            "the upgrade keeps the reader's activation operation"
+        );
+        assert!(worker.settle_revocation(&writer_binding).await.unwrap());
+    }
+
+    /// A second stop after authority release is a benign completion, not a workspace refusal.
+    #[tokio::test]
+    async fn stopping_after_lost_authority_is_nothing_active() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        let (binding, _) = production_start(&mut worker, "stopped-actor", "stopped-start").await;
+        assert!(worker.settle_revocation(&binding).await.unwrap());
+        let (reply, _, _) = worker.revoke(&binding, &[]).await.unwrap();
+        assert!(matches!(
+            reply,
+            PeerReply::Complete { text, .. }
+                if text == "nothing active for this binding; its workspace authority was already released"
+        ));
+    }
+
+    /// A start that names no `activation_id` keeps a stable binding-derived default, so the
+    /// repeat returns the same activation instead of an invalid-parameters refusal (E013 item 4).
+    #[tokio::test]
+    async fn start_without_activation_id_is_stable_for_the_binding() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        let (mut first, _first_cancel) = start_job(
+            &worker,
+            "default-id-actor",
+            "call-one",
+            serde_json::json!({}),
+        );
+        worker.activate(&mut first).await.unwrap();
+        let first_binding = first.invocation.binding_ref().clone();
+        let first = worker.grants.get(&first_binding).cloned().unwrap();
+        let (mut second, _second_cancel) = start_job(
+            &worker,
+            "default-id-actor",
+            "call-two",
+            serde_json::json!({}),
+        );
+        worker.activate(&mut second).await.unwrap();
+        let second = worker.grants.get(&first_binding).cloned().unwrap();
+        assert_eq!(
+            second.operation(),
+            first.operation(),
+            "a start without activation_id keeps one stable default for its binding"
+        );
+        assert_ne!(
+            first.operation(),
+            default_activation_id(&first_binding),
+            "the stored operation stays the hashed activation id"
+        );
+        assert_eq!(
+            default_activation_id(&first_binding),
+            default_activation_id(&first_binding),
+            "the default id is stable for one binding"
+        );
+    }
+
+    /// A start whose actor already owns another worktree is refused naming that activation's
+    /// holder facts — actor, activation, role, since when, last activity (E013 item 1).
+    #[tokio::test]
+    async fn actor_owned_refusal_names_the_holder_facts() {
+        let fixture = Fixture::new();
+        let other = fixture.base.join("other-root");
+        std::fs::create_dir_all(&other).unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        let (holder_binding, _holder) =
+            production_start(&mut worker, "holding-actor", "holding-start").await;
+        worker
+            .activity
+            .insert(holder_binding.fingerprint(), crate::errorlog::now_ms() - 1);
+
+        let (mut refused, _cancel) = start_job(
+            &worker,
+            "holding-actor",
+            "second-start",
+            serde_json::json!({"activation_id":"second-start","root":other}),
+        );
+        assert!(matches!(
+            worker.activate(&mut refused).await,
+            Err(FailureCode::Conflict)
+        ));
+        let detail = refused.failure_detail.unwrap();
+        assert!(
+            detail
+                .starts_with("start:actor_owns_another_worktree: actor holding-actor (activation "),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("writer, since 20"),
+            "the holder facts name the role and the start time: {detail}"
+        );
+        assert!(
+            detail.contains("last activity 20"),
+            "the holder facts name the last observed activity: {detail}"
+        );
+    }
+
+    /// A replaced directory whose active start belongs to an already-dead session no longer
+    /// refuses every later start: the stale grant is settled and the resolve retried once
+    /// (E013 item 7).
+    #[tokio::test]
+    async fn replaced_directory_start_recovers_after_the_dead_holder_settles() {
+        let fixture = Fixture::new();
+        let plain = fixture.base.join("plain-root");
+        std::fs::create_dir_all(&plain).unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        let (mut plain_job, _plain_cancel) = start_job(
+            &worker,
+            "plain-actor",
+            "plain-start",
+            serde_json::json!({"activation_id":"plain-start","root":plain}),
+        );
+        worker.activate(&mut plain_job).await.unwrap();
+        let plain_binding = plain_job.invocation.binding_ref().clone();
+        // Kill that session without a stop: its binding disappears while its grant stays active.
+        {
+            let mut guard = worker.shared.bindings.lock().unwrap();
+            guard.stop_binding(&plain_binding).unwrap();
+        }
+        // Replace the directory: a fresh identity at the same path, held by the dead session.
+        std::fs::remove_dir_all(&plain).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+
+        // A second actor's start must succeed by settling the dead holder's stale grant instead
+        // of refusing every start until a daemon restart.
+        let (mut fresh, _cancel) = start_job(
+            &worker,
+            "fresh-actor",
+            "fresh-start",
+            serde_json::json!({"activation_id":"fresh-start","root":plain}),
+        );
+        worker
+            .activate(&mut fresh)
+            .await
+            .expect("a dead holder's stale grant must not refuse a fresh start forever");
     }
 
     /// Activation rejects an out-of-root override and accepts an explicit in-root override.
@@ -5762,6 +6280,7 @@ mod stop_retry_tests {
             check_scheduled: false,
             park_until: None,
             stage: None,
+            session_binding: None,
         };
         (job, cancel_sender)
     }
@@ -5831,6 +6350,7 @@ mod stop_retry_tests {
             providers: providers::Providers::new(),
             names: Default::default(),
             telemetry: None,
+            activity: BTreeMap::new(),
         }
     }
 
@@ -5863,6 +6383,7 @@ mod stop_retry_tests {
             check_scheduled: false,
             park_until: None,
             stage: None,
+            session_binding: None,
         };
         let (context_reply, authority, source) = worker.context(&mut context_job).await.unwrap();
         worker.shared.ledger.lock().unwrap().details.insert(
@@ -5905,6 +6426,7 @@ mod stop_retry_tests {
             check_scheduled: false,
             park_until: None,
             stage: None,
+            session_binding: None,
         };
         let (reply, authority, source) = worker.edit(&mut edit_job).await.unwrap();
         assert!(matches!(
@@ -6503,6 +7025,7 @@ mod stop_retry_tests {
             check_scheduled: false,
             park_until: None,
             stage: None,
+            session_binding: None,
         };
         let (reply, _, source) = worker.context(&mut job).await.unwrap();
         assert!(matches!(
@@ -6606,6 +7129,7 @@ mod stop_retry_tests {
                 check_scheduled: false,
                 park_until: None,
                 stage: None,
+                session_binding: None,
             },
             cancel_sender,
         )
@@ -7931,6 +8455,7 @@ mod stop_retry_tests {
                 check_scheduled: false,
                 park_until: None,
                 stage: None,
+                session_binding: None,
             },
             cancel_sender,
         )
@@ -8024,6 +8549,7 @@ mod stop_retry_tests {
                 check_scheduled: false,
                 park_until: None,
                 stage: None,
+                session_binding: None,
             },
             cancel_sender,
         )
@@ -8235,6 +8761,7 @@ mod stop_retry_tests {
                         check_scheduled: false,
                         park_until: None,
                         stage: None,
+                        session_binding: None,
                     },
                     cancel_sender,
                 )

@@ -559,7 +559,7 @@ fn authority_revocation_returns_logical_drain_not_reap_claim() {
     let active = guard.consume_active(invocation.binding_ref()).unwrap();
     let mut workspace = AuthorityRegistry::default();
     let stamp = workspace
-        .activate(ActivationRequest::new("activate", invocation, active, worktree).unwrap())
+        .activate(ActivationRequest::new("activate", false, invocation, active, worktree).unwrap())
         .unwrap();
     let authority = WorkspaceAuthority::from_workspace(
         stamp.worktree().id(),
