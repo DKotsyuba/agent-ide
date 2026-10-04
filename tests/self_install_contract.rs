@@ -34,6 +34,7 @@ fn sealed_bundle_named(root: &Path, name: &str, version: &str, payload: &str) ->
     for dir in [
         ".claude-plugin",
         ".codex-plugin",
+        "agents",
         "hooks",
         "skills/agent-ide",
     ] {
@@ -50,6 +51,7 @@ fn sealed_bundle_named(root: &Path, name: &str, version: &str, payload: &str) ->
         format!(r#"{{"version":"{version}"}}"#),
     )
     .unwrap();
+    fs::write(bundle.join("agents/ide-reviewer.md"), "reviewer\n").unwrap();
     fs::write(bundle.join("hooks/hooks.json"), "{}").unwrap();
     fs::write(bundle.join("hooks/claude-hook.sh"), "#!/bin/sh\n").unwrap();
     fs::write(
@@ -139,7 +141,13 @@ fn assert_layout(root: &Path, version: &str, _home: &Path) {
         "prefix current must select the release"
     );
     let plugin_version = share.join("plugin").join(version);
-    for part in [".claude-plugin", ".codex-plugin", "hooks", "skills"] {
+    for part in [
+        ".claude-plugin",
+        ".codex-plugin",
+        "agents",
+        "hooks",
+        "skills",
+    ] {
         assert!(
             plugin_version.join(part).is_dir(),
             "missing plugin part {part}"

@@ -37,7 +37,13 @@ const BINARY_NAME: &str = "agent-ide";
 const LAUNCHER_MARKER: &str = "# agent-ide managed launcher v1";
 
 /// Plugin parts staged into `<share-dir>/plugin/<version>/`, in the fixed bundle order.
-const PLUGIN_PARTS: &[&str] = &[".claude-plugin", ".codex-plugin", "hooks", "skills"];
+const PLUGIN_PARTS: &[&str] = &[
+    ".claude-plugin",
+    ".codex-plugin",
+    "agents",
+    "hooks",
+    "skills",
+];
 
 /// Distinguishes temporary staging names created by one process.
 static UNIQUE: AtomicU64 = AtomicU64::new(0);

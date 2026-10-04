@@ -372,7 +372,7 @@ fn run_install_local(script: &Path, prefix: &Path) {
 }
 
 /// Asserts the installed layout under `prefix` for `version`: the mode-0755 binary, the plugin
-/// bundle's four copied directories plus its two contract files, the baked absolute-path hook
+/// bundle's five copied directories plus its two contract files, the baked absolute-path hook
 /// naming that exact binary, and the `current` symlink pointing at `version`.
 fn assert_install_layout(prefix: &Path, installed_bin: &Path, version: &str) {
     assert!(installed_bin.is_file(), "missing installed binary");
@@ -384,7 +384,13 @@ fn assert_install_layout(prefix: &Path, installed_bin: &Path, version: &str) {
     assert_eq!(bin_mode, 0o755, "installed binary must be mode 0755");
 
     let version_dir = prefix.join("share/agent-ide/plugin").join(version);
-    for part in [".claude-plugin", ".codex-plugin", "hooks", "skills"] {
+    for part in [
+        ".claude-plugin",
+        ".codex-plugin",
+        "agents",
+        "hooks",
+        "skills",
+    ] {
         assert!(
             version_dir.join(part).is_dir(),
             "missing installed bundle part: {part}"
