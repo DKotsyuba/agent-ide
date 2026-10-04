@@ -47,6 +47,8 @@
   file, stageless read failures, `ide.outline` without `path`, old-text edits
   without `source_ref`, duplicate symbol candidates; problems context waits
   briefly for a running check.
+- A same-version source reinstall (`scripts/install-local.sh`, `self-install
+  --replace`) restages the plugin instead of keeping the previous one.
 
 ## 0.8.0 — 2026-10-03
 
