@@ -223,13 +223,23 @@ impl PyrightProfile {
 }
 
 impl agent_ide_core::intelligence::session::SessionProfile for PyrightProfile {
-    /// Returns Pyright defaults, adding `python.pythonPath` only when the shared resolver found one.
+    /// Returns Pyright defaults, adding `python.pythonPath` only when the shared resolver found
+    /// one, and always `pyright.openFilesOnly: false`.
+    ///
+    /// Pyright's raw language server defaults to checking only opened files, so a references
+    /// request would silently miss every call site in an unopened file — usages of a function
+    /// in one package reported none of its callers in a sibling package's tests. Analyzing the
+    /// whole workspace costs startup time on large repositories, but it is what makes `usages`
+    /// an answer about the project rather than about the currently open document. The same
+    /// object serves both sections pyright requests: the `python` section reads `pythonPath`,
+    /// the `pyright` section reads `openFilesOnly`, and each ignores the other's keys.
     fn workspace_configuration(&self) -> serde_json::Value {
         match &self.interpreter {
-            Some(interpreter) => {
-                serde_json::json!({"pythonPath": interpreter.to_string_lossy()})
-            }
-            None => serde_json::json!({}),
+            Some(interpreter) => serde_json::json!({
+                "pythonPath": interpreter.to_string_lossy(),
+                "openFilesOnly": false
+            }),
+            None => serde_json::json!({"openFilesOnly": false}),
         }
     }
 
@@ -606,8 +616,8 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    /// Pyright defaults stay empty without an interpreter and add `python.pythonPath` when one is
-    /// selected; the profile accepts an omitted or `pyright` identity and opens `.py`/`.pyi` files.
+    /// Pyright disables open-files-only mode with or without an interpreter, adds
+    /// `python.pythonPath` when one is selected, and accepts an omitted or `pyright` identity.
     #[test]
     fn pyright_session_profile_is_closed_and_allows_omitted_server_info() {
         use agent_ide_core::intelligence::session::SessionProfile;
@@ -628,13 +638,19 @@ mod tests {
             cache_namespace: "/private/tmp/agent-ide-pyright-session-test-cache".into(),
         })
         .unwrap();
-        assert_eq!(profile.workspace_configuration(), serde_json::json!({}));
+        assert_eq!(
+            profile.workspace_configuration(),
+            serde_json::json!({"openFilesOnly": false})
+        );
         assert_eq!(
             profile
                 .clone()
                 .with_interpreter(Some(PathBuf::from("/repo/.venv/bin/python")))
                 .workspace_configuration(),
-            serde_json::json!({"pythonPath":"/repo/.venv/bin/python"})
+            serde_json::json!({
+                "pythonPath":"/repo/.venv/bin/python",
+                "openFilesOnly": false
+            })
         );
         assert!(profile.accepts_server(None));
         assert!(

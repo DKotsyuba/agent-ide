@@ -185,9 +185,10 @@ struct LanguageState {
     /// `true` when an edit reply is waiting for the next run: that run skips unchanged-input
     /// elision and the EYES-r2 cooldown so it checks the requested post-edit source.
     urgent: bool,
-    /// `true` only when the last completed run ended `Ready` (T20B): any other outcome —
-    /// `Partial`, `Checking`, or an `Unavailable` failure or condition — must be re-checked on
-    /// the next trigger, so only a `Ready` completion arms the skip-unchanged rule.
+    /// `true` only when the last completed run ended `Ready` or in a durable `Unavailable`
+    /// condition ([`is_durable_condition`]; T20B): any other outcome — `Partial`, `Checking`, a
+    /// transient failure, or a host-policy `ReadRestricted` — must be re-checked on the next
+    /// trigger, so only those completions arm the skip-unchanged rule.
     skip_eligible: bool,
 }
 
@@ -966,11 +967,15 @@ impl Inner {
     /// Records `duration` as the wall-clock time `(worktree, language)`'s most recently
     /// completed run took, together with the completion instant, for the next iteration's
     /// [`Inner::cooldown_remaining`] check, and moves that run's start fingerprint into the
-    /// skip-unchanged baseline (T20B). Only a `Ready` completion arms the skip rule: a `Partial`
-    /// result still has incomplete coverage and every `Unavailable` outcome — transient failure
-    /// or durable condition — must be re-checked on the next trigger, so any non-`Ready` state
-    /// (and the stale baseline with it) is dropped here. A changed policy generation rejects
-    /// this bookkeeping update.
+    /// skip-unchanged baseline (T20B). A `Ready` completion arms the skip rule, and so does a
+    /// completion whose `Unavailable` reason is a durable condition of the worktree
+    /// ([`is_durable_condition`]): a missing environment, tool or manifest answers the same on
+    /// every re-probe until the worktree inputs change, so an unchanged fingerprint skips the
+    /// re-probe instead of logging the same `check unavailable` pair after every hook. A
+    /// `Partial` result still has incomplete coverage, `ReadRestricted` follows the host's
+    /// sandbox rather than the worktree, and transient failures must be retried, so every other
+    /// state (and the stale baseline with it) is dropped here. A changed policy generation
+    /// rejects this bookkeeping update.
     fn record_completion(
         &self,
         worktree: &Path,
@@ -989,7 +994,11 @@ impl Inner {
             lang.last_completion = Some(Instant::now());
             lang.last_duration = duration;
             lang.completed_fingerprint = lang.run_start_fingerprint.take();
-            lang.skip_eligible = matches!(completed_state, CheckState::Ready);
+            lang.skip_eligible = matches!(completed_state, CheckState::Ready)
+                || matches!(
+                    completed_state,
+                    CheckState::Unavailable(reason) if is_durable_condition(reason)
+                );
         }
     }
 
@@ -1286,6 +1295,25 @@ fn is_transient_failure(state: &CheckState) -> bool {
         state,
         CheckState::Unavailable(UnavailableReason::Fatal)
             | CheckState::Unavailable(UnavailableReason::Timeout)
+    )
+}
+
+/// Reports whether an `Unavailable` reason describes a durable condition of the worktree rather
+/// than one bad run: checks disabled for the language, the worktree outside the allowed roots, a
+/// missing configured tool, a missing project environment, or a project configuration that
+/// analyzed no files. Such a completion arms the same skip-unchanged baseline as `Ready` (T20B):
+/// every re-probe with unchanged inputs would answer the same line again — the field's 182
+/// `check started` / `check unavailable` pairs in one session — while a manifest or environment
+/// directory change moves the worktree fingerprint and re-arms the check. `ReadRestricted`
+/// follows the host's sandbox policy, not the worktree, so it is never durable here.
+fn is_durable_condition(reason: &UnavailableReason) -> bool {
+    matches!(
+        reason,
+        UnavailableReason::Disabled
+            | UnavailableReason::OutsideRoots
+            | UnavailableReason::ToolMissing
+            | UnavailableReason::EnvMissing
+            | UnavailableReason::NoFiles
     )
 }
 
@@ -1619,6 +1647,105 @@ mod deny_tests {
 
         scheduler.shutdown().await;
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A durable `Unavailable` completion (the field's `env_missing`: 182 `check started` /
+    /// `check unavailable` pairs in one session) arms the same skip-unchanged baseline as
+    /// `Ready`: an unchanged worktree fingerprint elides the re-probe — no checker process, no
+    /// error-log pair — while the stored snapshot still tracks the current generation, and a
+    /// changed fingerprint (a manifest edit, an environment directory appearing) re-arms the
+    /// check. A transient `Fatal` completion keeps re-checking on every trigger.
+    #[tokio::test]
+    async fn durable_unavailable_completions_skip_reprobes_until_inputs_change() {
+        crate::lang::testing::install();
+        for (reason, durable) in [
+            (UnavailableReason::EnvMissing, true),
+            (UnavailableReason::ToolMissing, true),
+            (UnavailableReason::NoFiles, true),
+            (UnavailableReason::ReadRestricted, false),
+            (UnavailableReason::Fatal, false),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "agent-ide-durable-skip-{}-{:?}",
+                std::process::id(),
+                reason
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let root = std::fs::canonicalize(&root).unwrap();
+            std::fs::write(root.join("beta.toml"), "").unwrap();
+            assert!(crate::lang::testing::BETA.is_present(&root));
+            let snapshot = ProblemSnapshot::unavailable(crate::lang::testing::BETA, reason, 1);
+            let checker = Arc::new(FakeChecker::new(crate::lang::testing::BETA, snapshot));
+            let fingerprint = Arc::new(std::sync::atomic::AtomicU64::new(7));
+            let scheduler = Scheduler::new(
+                vec![checker.clone()],
+                Duration::from_millis(1),
+                1,
+                root.join("cache"),
+            )
+            .with_fingerprint({
+                let fingerprint = Arc::clone(&fingerprint);
+                Arc::new(move |_| Some(fingerprint.load(std::sync::atomic::Ordering::SeqCst)))
+            });
+            scheduler.trigger("repo", &root);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if checker.requests().len() == 1
+                        && scheduler
+                            .latest(&root)
+                            .first()
+                            .is_some_and(|snapshot| snapshot.input_generation >= 1)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{reason:?} first check must complete"));
+
+            // Unchanged inputs: a second trigger must not re-probe a durable condition, and the
+            // stored snapshot must still answer the newer generation.
+            scheduler.trigger("repo", &root);
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let after_unchanged = checker.requests().len();
+            if durable {
+                assert_eq!(
+                    after_unchanged, 1,
+                    "{reason:?} with unchanged inputs must not re-probe"
+                );
+                assert!(
+                    scheduler
+                        .latest(&root)
+                        .first()
+                        .is_some_and(|snapshot| snapshot.input_generation >= 2),
+                    "{reason:?} skipped re-probe still tracks the current generation"
+                );
+            } else {
+                assert_eq!(
+                    after_unchanged, 2,
+                    "{reason:?} keeps re-checking on every trigger"
+                );
+            }
+
+            // Changed inputs (the environment directory or manifest moved): the check re-runs.
+            fingerprint.store(8, std::sync::atomic::Ordering::SeqCst);
+            scheduler.trigger("repo", &root);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if checker.requests().len() > after_unchanged {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{reason:?} changed inputs must re-check"));
+
+            scheduler.shutdown().await;
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     /// A check already running when an edit arrives must also run its dirty follow-up even when

@@ -1389,6 +1389,25 @@ impl Worker<'_> {
                     None => Err(FailureCode::ProviderUnavailable),
                 };
             }
+            Err(FailureCode::ResolutionUnverified)
+                if support.outline_when_resolution_unverified() =>
+            {
+                // The server could not verify this file's project inputs (a tsconfig policy the
+                // exact-resolution rules refuse, a config outside the observed set): the file
+                // itself still scans, so its outline answers from source exactly as a language
+                // without a server answers, with the refusal reason in the footer. A file that
+                // does not scan cleanly keeps the refusal.
+                let cause = job
+                    .failure_detail
+                    .clone()
+                    .unwrap_or_else(|| "semantic project resolution is unverified".to_owned());
+                return match support.outline_from_source(observed.path(), &source) {
+                    Some(outline) => {
+                        Ok((outline, worktree_root, Some(Lexical::Unverified { cause })))
+                    }
+                    None => Err(FailureCode::ResolutionUnverified),
+                };
+            }
             Err(other) => return Err(other),
         };
         let symbols = match live.session.document_symbols(observed, bytes).await {
@@ -1426,16 +1445,17 @@ impl Worker<'_> {
     }
 
     /// One compact line marking a reply that was built from the lexical outline because the
-    /// file's registered server did not answer it (`why`: still loading, unavailable, or its
-    /// documentSymbols exchange failed): the outline is exact, so the call needs no repeat, but
-    /// semantic facts (usages, callers) are not included. `None` when no server owns the file
-    /// (nothing is loading, failed or refused).
+    /// file's registered server did not answer it (`why`: still loading, unavailable, its
+    /// documentSymbols exchange failed, or it refused the file's project inputs): the outline
+    /// is exact, so the call needs no repeat, but semantic facts (usages, callers) are not
+    /// included. `None` when no server owns the file (nothing is loading, failed or refused).
     fn lexical_note(&self, path: &Path, why: &Lexical) -> Option<String> {
         let server = self.session_server(path)?;
         let state = match why {
             Lexical::Loading => "still indexing".to_owned(),
             Lexical::Unavailable => "unavailable".to_owned(),
             Lexical::Exchange { cause } => format!("request failed: {cause}"),
+            Lexical::Unverified { cause } => format!("project resolution unverified: {cause}"),
         };
         Some(format!(
             "outline: from source, exact ({} {state}; no need to repeat)",
@@ -1983,6 +2003,12 @@ pub(super) enum Lexical {
         /// First line of the failed exchange's error, cut to [`EXCHANGE_CAUSE_LIMIT`] bytes.
         cause: String,
     },
+    /// The registered server refused to verify this file's project inputs, a terminal state for
+    /// the file; the bounded cause names the refused input in the outline footer.
+    Unverified {
+        /// The server's bounded refusal reason, cut to [`EXCHANGE_CAUSE_LIMIT`] bytes.
+        cause: String,
+    },
 }
 
 /// Longest cause of a failed documentSymbols exchange an outline footer quotes; the footer is
@@ -2005,10 +2031,12 @@ fn exchange_cause(error: &std::io::Error) -> String {
 /// or `provider_loading` at once for an edit (see
 /// [`park_while_loading`](super::providers::park_while_loading)). An unavailable server will
 /// not answer either — and a session whose exchange failed just did not — so the miss refuses
-/// `provider_unavailable` at once instead of parking.
+/// `provider_unavailable` at once instead of parking. A source outline that answered because
+/// the server refused the file's project inputs scanned exactly what it reported, so a miss
+/// there names the address unknown rather than refusing again.
 pub(super) fn missing_symbol(job: &mut Job, lexical: Option<Lexical>) -> FailureCode {
     match lexical {
-        None => FailureCode::UnknownSymbol,
+        None | Some(Lexical::Unverified { .. }) => FailureCode::UnknownSymbol,
         Some(Lexical::Unavailable | Lexical::Exchange { .. }) => FailureCode::ProviderUnavailable,
         Some(Lexical::Loading) => {
             super::providers::park_while_loading(job);

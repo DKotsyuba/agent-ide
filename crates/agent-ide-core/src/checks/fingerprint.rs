@@ -36,6 +36,12 @@ const MISSING_FILE_MARKER: u64 = u64::MAX;
 /// from a synchronous `Fn` (the scheduler off-threads it); the stdout pipe is drained on a helper
 /// thread so a path list larger than the pipe buffer cannot deadlock the child while this thread
 /// waits for its exit.
+///
+/// Besides every listed file's path, size and mtime, the digest also mixes the path and mtime of
+/// every untracked directory git reports collapsed — including ignored ones, which never appear
+/// in the plain listing. A project environment directory (a virtual environment, a build cache)
+/// is usually gitignored, so without this the scheduler's skip-unchanged rule would keep a
+/// durable `env missing` result even after the environment appeared.
 pub fn git_worktree_fingerprint(worktree: &Path) -> Option<u64> {
     let listed = git_listed_paths(worktree)?;
     let mut hasher = blake3::Hasher::new();
@@ -49,6 +55,36 @@ pub fn git_worktree_fingerprint(worktree: &Path) -> Option<u64> {
         match std::fs::metadata(&full) {
             Ok(metadata) => {
                 hasher.update(&metadata.len().to_le_bytes());
+                let mtime_ns = i128::from(metadata.mtime()) * 1_000_000_000
+                    + i128::from(metadata.mtime_nsec());
+                hasher.update(&(mtime_ns as u64).to_le_bytes());
+            }
+            Err(_) => {
+                hasher.update(&MISSING_FILE_MARKER.to_le_bytes());
+            }
+        }
+    }
+    // Untracked directories, ignored ones included, as git's `--directory` collapses them: one
+    // entry per directory (`env/`), stat'ed as the directory itself. An environment directory
+    // that appears, disappears or rebuilds its top level therefore moves the fingerprint even
+    // though none of its files is ever listed.
+    for path in git_output(
+        worktree,
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--directory",
+            "--no-empty-directory",
+        ],
+    )?
+    .split(|byte| *byte == 0)
+    .filter(|path| path.last() == Some(&b'/'))
+    {
+        hasher.update(path);
+        hasher.update(&[0]);
+        match std::fs::metadata(worktree.join(OsStr::from_bytes(path))) {
+            Ok(metadata) => {
                 let mtime_ns = i128::from(metadata.mtime()) * 1_000_000_000
                     + i128::from(metadata.mtime_nsec());
                 hasher.update(&(mtime_ns as u64).to_le_bytes());
@@ -197,6 +233,40 @@ mod tests {
     fn git_fingerprint_is_none_outside_a_git_checkout() {
         let dir = scratch_dir("no-repo");
         assert_eq!(git_worktree_fingerprint(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A gitignored environment directory still moves the fingerprint: it is listed collapsed
+    /// (`--directory`) with its own mtime, so a skip-unchanged baseline held against a durable
+    /// `env missing` result ends the moment the environment directory appears or disappears.
+    #[test]
+    fn git_fingerprint_tracks_ignored_environment_directories() {
+        let dir = scratch_dir("git-env-dir");
+        git(&["init", "-q"], &dir);
+        std::fs::write(dir.join(".gitignore"), ".venv/\ntracked.txt\n").unwrap();
+        std::fs::write(dir.join("tracked.txt"), "one\n").unwrap();
+        git(&["add", "."], &dir);
+
+        let before = git_worktree_fingerprint(&dir).expect("a git repo has a fingerprint");
+        let executable = dir.join(".venv/bin/interpreter");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, "stub\n").unwrap();
+        let with_env = git_worktree_fingerprint(&dir).expect("fingerprint");
+        assert_ne!(
+            with_env, before,
+            "an ignored environment directory appearing must move the fingerprint"
+        );
+
+        std::fs::remove_dir_all(dir.join(".venv")).unwrap();
+        let without_env = git_worktree_fingerprint(&dir).expect("fingerprint");
+        assert_ne!(
+            without_env, with_env,
+            "removing the environment directory must move the fingerprint"
+        );
+        assert_eq!(
+            without_env, before,
+            "an empty worktree returns to its earlier fingerprint"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

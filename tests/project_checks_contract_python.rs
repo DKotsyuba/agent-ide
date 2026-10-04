@@ -223,6 +223,71 @@ fn python_resolve_interpreter_none_when_nothing_present() {
     let _ = fs::remove_dir_all(&worktree);
 }
 
+/// A suffixed environment directory beside the manifest (`.venv-py314`) is discovered exactly
+/// like the conventional `.venv`, and `session_interpreter` finds an environment that lives
+/// beside a nested root when the worktree root has none.
+#[test]
+fn python_resolve_interpreter_from_suffixed_and_nested_venv() {
+    let worktree = fixture("interpreter_suffixed_venv");
+    let resolved = resolve_interpreter(&worktree).expect("suffixed .venv-py314 resolves");
+    assert_eq!(resolved, worktree.join(".venv-py314/bin/python"));
+
+    let root = unique_temp_dir("nested-session-interpreter");
+    for package in ["alpha", "beta"] {
+        fs::create_dir_all(root.join(format!("packages/{package}/src"))).unwrap();
+        fs::write(root.join(format!("packages/{package}/pyproject.toml")), "").unwrap();
+        fs::write(root.join(format!("packages/{package}/src/lib.py")), "").unwrap();
+    }
+    let python = root.join("packages/beta/.venv/bin/python");
+    fs::create_dir_all(python.parent().unwrap()).unwrap();
+    fs::write(&python, "").unwrap();
+    assert_eq!(
+        agent_ide::checks::python::session_interpreter(&root),
+        Some(python),
+        "the first nested root with an environment serves the session"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// `not_analysed` names a file below no discovered root, and a file whose only covering root has
+/// no environment (its pyright run is skipped); a covered root with an environment analyzes it.
+#[test]
+fn python_not_analysed_names_uncovered_and_environmentless_roots() {
+    use agent_ide::checks::LanguageChecks;
+    use agent_ide::checks::python::PythonChecks;
+
+    let root = unique_temp_dir("not-analysed");
+    for package in ["alpha", "beta"] {
+        fs::create_dir_all(root.join(format!("packages/{package}/src"))).unwrap();
+        fs::write(root.join(format!("packages/{package}/pyproject.toml")), "").unwrap();
+        fs::write(root.join(format!("packages/{package}/src/lib.py")), "").unwrap();
+    }
+    fs::create_dir_all(root.join("tools")).unwrap();
+    fs::write(root.join("tools/one_off.py"), "").unwrap();
+    let python = root.join("packages/alpha/.venv/bin/python");
+    fs::create_dir_all(python.parent().unwrap()).unwrap();
+    fs::write(&python, "").unwrap();
+
+    assert_eq!(
+        PythonChecks.not_analysed(&root, &root.join("tools/one_off.py")),
+        Some("no Python project root covers this file")
+    );
+    // The edit reply names files worktree-relative; the answer must be the same.
+    assert_eq!(
+        PythonChecks.not_analysed(&root, Path::new("tools/one_off.py")),
+        Some("no Python project root covers this file")
+    );
+    assert_eq!(
+        PythonChecks.not_analysed(&root, &root.join("packages/beta/src/lib.py")),
+        Some("the Python project root beside this file has no environment")
+    );
+    assert_eq!(
+        PythonChecks.not_analysed(&root, &root.join("packages/alpha/src/lib.py")),
+        None
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
 // -- PythonChecker::check / pyright_spec -------------------------------------------------------
 
 #[tokio::test]
@@ -343,6 +408,119 @@ async fn python_checker_ready_snapshot_counts_from_real_fixture_json_with_relati
             .iter()
             .any(|problem| problem.path == "src/pkg/c.py")
     );
+}
+
+#[tokio::test]
+async fn python_checker_runs_one_pyright_per_nested_root_and_merges() {
+    let (node, pyright_cli) = toolchain_paths();
+    let worktree = unique_temp_dir("nested-roots");
+    for package in ["alpha", "beta"] {
+        fs::create_dir_all(worktree.join(format!("packages/{package}/src"))).unwrap();
+        fs::write(
+            worktree.join(format!("packages/{package}/pyproject.toml")),
+            "[project]\n",
+        )
+        .unwrap();
+        fs::write(worktree.join(format!("packages/{package}/src/lib.py")), "").unwrap();
+        let python = worktree.join(format!("packages/{package}/.venv/bin/python"));
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(python, "").unwrap();
+    }
+    let clean = br#"{"generalDiagnostics": [], "summary": {"errorCount": 0, "warningCount": 0, "filesAnalyzed": 1}}"#;
+    let error_file = worktree.join("packages/beta/src/lib.py");
+    let error_run = format!(
+        r#"{{"generalDiagnostics": [{{"file": "{}", "severity": "error", "message": "boom", "range": {{"start": {{"line": 0, "character": 0}}}}}}], "summary": {{"errorCount": 1, "warningCount": 0, "filesAnalyzed": 1}}}}"#,
+        error_file.display()
+    );
+    let fake = Arc::new(FakeRunner::new(vec![
+        Ok(RunOutput {
+            status: Some(0),
+            stdout: clean.to_vec(),
+            ..RunOutput::default()
+        }),
+        Ok(RunOutput {
+            status: Some(1),
+            stdout: error_run.into_bytes(),
+            ..RunOutput::default()
+        }),
+    ]));
+    let runner: Arc<dyn ConfinedRunner> = fake.clone();
+    let checker = PythonChecker::new(runner, node, pyright_cli, Duration::from_secs(60));
+    let request = CheckRequest {
+        worktree: worktree.clone(),
+        cache_dir: unique_temp_dir("nested-roots-cache"),
+        input_generation: 11,
+        read_denies: Vec::new(),
+    };
+    let snapshot = checker.check(request).await;
+    assert_eq!(snapshot.state, CheckState::Ready, "{snapshot:?}");
+    assert_eq!(snapshot.errors, 1);
+    assert_eq!(
+        snapshot.problems,
+        vec![agent_ide::checks::Problem::new(
+            "packages/beta/src/lib.py".into(),
+            1,
+            1,
+            Severity::Error,
+            None,
+            "boom".into(),
+        )],
+        "the nested root's own report is relativized and merged"
+    );
+
+    let specs = fake.specs();
+    assert_eq!(specs.len(), 2, "one pyright run per discovered root");
+    let project = |spec: usize| specs[spec].args[3].to_str().unwrap().to_owned();
+    let interpreter = |spec: usize| specs[spec].args[5].to_str().unwrap().to_owned();
+    assert_eq!(
+        project(0),
+        worktree.join("packages/alpha").display().to_string()
+    );
+    assert_eq!(
+        project(1),
+        worktree.join("packages/beta").display().to_string()
+    );
+    assert_eq!(
+        interpreter(0),
+        worktree
+            .join("packages/alpha/.venv/bin/python")
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        interpreter(1),
+        worktree
+            .join("packages/beta/.venv/bin/python")
+            .display()
+            .to_string()
+    );
+    let _ = fs::remove_dir_all(&worktree);
+}
+
+/// Nested roots without any environment stay `EnvMissing`: pyright is never run half-blind, and
+/// the durable condition arms the scheduler's skip rule instead of a checker process per hook.
+#[tokio::test]
+async fn python_checker_nested_roots_without_environments_are_env_missing() {
+    let (node, pyright_cli) = toolchain_paths();
+    let worktree = unique_temp_dir("nested-no-env");
+    fs::create_dir_all(worktree.join("packages/alpha/src")).unwrap();
+    fs::write(worktree.join("packages/alpha/pyproject.toml"), "").unwrap();
+    fs::write(worktree.join("packages/alpha/src/lib.py"), "").unwrap();
+    let runner: Arc<dyn ConfinedRunner> = Arc::new(FakeRunner::new(Vec::new()));
+    let checker = PythonChecker::new(runner, node, pyright_cli, Duration::from_secs(60));
+    let snapshot = checker
+        .check(CheckRequest {
+            worktree: worktree.clone(),
+            cache_dir: unique_temp_dir("nested-no-env-cache"),
+            input_generation: 12,
+            read_denies: Vec::new(),
+        })
+        .await;
+    assert_eq!(
+        snapshot.state,
+        CheckState::Unavailable(UnavailableReason::EnvMissing)
+    );
+    let _ = fs::remove_dir_all(&worktree);
 }
 
 #[tokio::test]
