@@ -152,6 +152,17 @@ struct PyrightLive {
     view: PyrightView,
     /// Transport driver and synchronized document state.
     live: LiveSession,
+    /// Interpreter the session was started with, `None` when no environment resolved.
+    interpreter: Option<PathBuf>,
+    /// Shared-resolver identity of that environment; a different identity at use restarts.
+    environment: String,
+}
+
+/// Whether a live session started for `started` may keep serving a worktree whose environment
+/// now resolves to `current`: only while it is alive and the identity is unchanged, the same
+/// reuse rule as TypeScript's `same_project`.
+fn keeps_session(alive: bool, started: &str, current: &str) -> bool {
+    alive && started == current
 }
 
 /// Every binding's retained Pyright session.
@@ -165,9 +176,11 @@ impl PyrightBackend {
     /// Starts the accepted Pyright session for this binding, or keeps its live session.
     ///
     /// `job` supplies cancellation and binding ownership; `launch` is the accepted executable
-    /// profile; `source` fixes the worktree and authority epoch. A replaced child is shut down
-    /// before another is admitted. Profile, authority, capacity, spawn, handshake, and
-    /// cancellation failures return their bounded `FailureCode`.
+    /// profile; `source` fixes the worktree and authority epoch. The environment is resolved at
+    /// every use: a session whose interpreter identity no longer matches is released and
+    /// restarted with the new one. A replaced child is shut down before another is admitted.
+    /// Profile, authority, capacity, spawn, handshake, and cancellation failures return their
+    /// bounded `FailureCode`.
     async fn ensure(
         &mut self,
         host: &mut dyn ProviderHost,
@@ -176,11 +189,11 @@ impl PyrightBackend {
         source: &SourceObservation,
     ) -> Result<(), FailureCode> {
         let binding = job.binding().clone();
-        if self
-            .live
-            .get(&binding)
-            .is_some_and(|entry| entry.live.is_alive())
-        {
+        let (interpreter, environment) =
+            crate::environment::session(source.worktree().worktree_path());
+        if self.live.get(&binding).is_some_and(|entry| {
+            keeps_session(entry.live.is_alive(), &entry.environment, &environment)
+        }) {
             return Ok(());
         }
         self.release(host, &binding).await;
@@ -203,9 +216,7 @@ impl PyrightBackend {
             cache_namespace,
         })
         .map_err(|_| FailureCode::ExecutionProfile)?
-        .with_interpreter(crate::checks::session_interpreter(
-            authority.worktree().worktree_path(),
-        ));
+        .with_interpreter(interpreter.clone(), environment.clone());
         let worktree = PyrightWorktree::new(
             authority.worktree().clone(),
             server::execution_authority(&authority)?,
@@ -290,7 +301,16 @@ impl PyrightBackend {
         };
         match opened {
             Ok(live) => {
-                self.live.insert(binding, PyrightLive { child, view, live });
+                self.live.insert(
+                    binding,
+                    PyrightLive {
+                        child,
+                        view,
+                        live,
+                        interpreter,
+                        environment,
+                    },
+                );
                 Ok(())
             }
             Err(_) => {
@@ -323,9 +343,11 @@ impl PyrightBackend {
     ) -> Result<ProviderContext, FailureCode> {
         let binding = job.binding().clone();
         self.ensure(host, job, launch, source).await?;
-        let (result, mut diagnostics) = {
+        let (result, mut diagnostics, no_environment) = {
             let entry = self.live.get_mut(&binding).ok_or(FailureCode::Internal)?;
-            server::exchange_context(&mut entry.live, job, source, bytes, query, true).await
+            let (result, diagnostics) =
+                server::exchange_context(&mut entry.live, job, source, bytes, query, true).await;
+            (result, diagnostics, entry.interpreter.is_none())
         };
         let context = match result {
             Ok(context) => context,
@@ -338,7 +360,9 @@ impl PyrightBackend {
                 };
             }
         };
-        if crate::checks::session_interpreter(source.worktree().worktree_path()).is_none() {
+        // The session's own interpreter, not a fresh resolution: the summary must describe what
+        // the server analysed with.
+        if no_environment {
             summarize_missing_environment(&mut diagnostics);
         }
         let outcome = ProviderContext {
@@ -356,7 +380,10 @@ impl PyrightBackend {
 
     /// Shuts down and reaps `binding`'s Pyright session, if any.
     async fn release(&mut self, host: &mut dyn ProviderHost, binding: &BindingRef) {
-        if let Some(PyrightLive { child, view, live }) = self.live.remove(binding) {
+        if let Some(PyrightLive {
+            child, view, live, ..
+        }) = self.live.remove(binding)
+        {
             let _ = live.shutdown().await;
             self.reap(host, binding, child, view).await;
         }
@@ -481,4 +508,59 @@ fn is_import_resolution(diagnostic: &async_lsp::lsp_types::Diagnostic) -> bool {
             _ => None,
         })
         .is_some_and(|rule| IMPORT_RESOLUTION_RULES.contains(&rule))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::Path};
+
+    use agent_ide_core::lang::environment::{EnvSelection, replace_selections};
+
+    use super::*;
+
+    /// Writes an empty `bin/python` for the environment `name` under `root`.
+    fn venv(root: &Path, name: &str) {
+        let bin = root.join(name).join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("python"), "").unwrap();
+    }
+
+    /// The live session is kept while the resolved environment is unchanged and released when
+    /// a selection switches the interpreter, or when it died.
+    #[test]
+    fn session_restarts_when_the_resolved_interpreter_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-ide-pyright-session-env-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        venv(&root, ".venv");
+        venv(&root, ".venv-py314");
+
+        let (interpreter, started) = crate::environment::session(&root);
+        assert_eq!(interpreter, Some(root.join(".venv/bin/python")));
+        assert!(keeps_session(
+            true,
+            &started,
+            &crate::environment::session(&root).1
+        ));
+
+        replace_selections(
+            &root,
+            crate::LANGUAGE,
+            vec![EnvSelection {
+                root: PathBuf::new(),
+                selector: ".venv-py314".to_owned(),
+            }],
+        );
+        let (interpreter, current) = crate::environment::session(&root);
+        assert_eq!(interpreter, Some(root.join(".venv-py314/bin/python")));
+        assert!(!keeps_session(true, &started, &current));
+        assert!(!keeps_session(false, &current, &current));
+
+        replace_selections(&root, crate::LANGUAGE, Vec::new());
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

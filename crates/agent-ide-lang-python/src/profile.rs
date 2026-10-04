@@ -64,6 +64,8 @@ pub struct PyrightProfile {
     cache_namespace: String,
     /// Shared-resolver interpreter supplied to Pyright for package import resolution, when found.
     interpreter: Option<PathBuf>,
+    /// Shared-resolver identity of that environment, retained in the compatibility key.
+    environment: String,
 }
 
 impl PyrightProfile {
@@ -92,6 +94,7 @@ impl PyrightProfile {
             trust: identity.trust,
             cache_namespace: identity.cache_namespace,
             interpreter: None,
+            environment: String::new(),
         };
         profile
             .valid()
@@ -99,10 +102,16 @@ impl PyrightProfile {
             .ok_or(PyrightProfileError::InvalidProfile)
     }
 
-    /// Adds an optional absolute interpreter selected by the shared worktree resolver; `None`
-    /// retains Pyright's defaults, and the consumed profile is returned with the setting applied.
-    pub(crate) fn with_interpreter(mut self, interpreter: Option<PathBuf>) -> Self {
+    /// Adds an optional absolute interpreter selected by the shared worktree resolver and that
+    /// resolution's identity; `None` retains Pyright's defaults, and the consumed profile is
+    /// returned with the setting applied.
+    pub(crate) fn with_interpreter(
+        mut self,
+        interpreter: Option<PathBuf>,
+        environment: String,
+    ) -> Self {
         self.interpreter = interpreter;
+        self.environment = environment;
         self
     }
 
@@ -185,11 +194,12 @@ impl PyrightProfile {
         }
     }
 
-    /// Returns a worktree-incarnation-scoped key so Pyright processes are never shared.
+    /// Returns a worktree-incarnation-scoped key so Pyright processes are never shared, and a
+    /// session for one interpreter never serves another.
     fn compatibility_key(&self, worktree: &PyrightWorktree) -> String {
         blake3::hash(
             format!(
-                "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{:?}\0{}",
                 self.binary.display(),
                 self.accepted_script_digest,
                 self.version,
@@ -199,6 +209,8 @@ impl PyrightProfile {
                 self.trust,
                 self.cache_namespace,
                 worktree.worktree().incarnation(),
+                self.interpreter,
+                self.environment,
             )
             .as_bytes(),
         )
@@ -459,9 +471,12 @@ mod tests {
 
     /// Creates one unique temporary directory for a test-owned executable fixture.
     fn temporary_directory() -> PathBuf {
+        // Parallel tests may read the same clock tick; the counter keeps their names apart.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let directory = std::env::temp_dir().join(format!(
-            "agent-ide-pyright-profile-{}-{}",
+            "agent-ide-pyright-profile-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -645,7 +660,7 @@ mod tests {
         assert_eq!(
             profile
                 .clone()
-                .with_interpreter(Some(PathBuf::from("/repo/.venv/bin/python")))
+                .with_interpreter(Some(PathBuf::from("/repo/.venv/bin/python")), String::new())
                 .workspace_configuration(),
             serde_json::json!({
                 "pythonPath":"/repo/.venv/bin/python",
@@ -668,5 +683,27 @@ mod tests {
         assert_eq!(profile.language_id(Path::new("module.py")), "python");
         assert_eq!(profile.language_id(Path::new("module.pyi")), "python");
         assert_eq!(profile.language_id(Path::new("module.txt")), "plaintext");
+    }
+
+    /// A session for one interpreter never serves another: the compatibility key differs per
+    /// interpreter and per resolved environment identity.
+    #[test]
+    fn compatibility_key_differs_per_interpreter() {
+        let directory = temporary_directory();
+        let script = executable(&directory, "pyright", b"#!/bin/sh\nexit 0\n");
+        let node = executable(&directory, "node", b"#!/bin/sh\nexit 0\n");
+        let worktree = worktree();
+        let key = |interpreter: Option<&str>, identity: &str| {
+            profile(&script, &node)
+                .unwrap()
+                .with_interpreter(interpreter.map(PathBuf::from), identity.to_owned())
+                .compatibility_key(&worktree)
+        };
+        let venv = key(Some("/repo/.venv/bin/python"), "a");
+        assert_eq!(venv, key(Some("/repo/.venv/bin/python"), "a"));
+        assert_ne!(venv, key(Some("/repo/.venv-py314/bin/python"), "a"));
+        assert_ne!(venv, key(Some("/repo/.venv/bin/python"), "b"));
+        assert_ne!(venv, key(None, "a"));
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

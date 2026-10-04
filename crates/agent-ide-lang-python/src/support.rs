@@ -40,13 +40,13 @@ pub struct Python;
 /// makes pytest print no summary line at all, which the parser then cannot read.
 const PYTEST_FLAGS: [&str; 3] = ["--no-header", "-p", "no:cacheprovider"];
 
-/// Root marker files (besides any root `requirements*.txt` and a `.venv`/`venv` directory, both
+/// Root marker files (besides any root `requirements*.txt` and an environment directory, both
 /// matched separately) whose presence identifies a worktree as a Python project.
 ///
 /// This is the ONE marker list shared by the project card ([`Python::detect`]) and project
 /// checks ([`crate::checks::PythonChecks::is_present`]); the two must never diverge again — a
 /// root `requirements-dev.txt` used to register the card while checks stayed silent.
-const ROOT_MARKER_FILES: [&str; 5] = [
+pub(crate) const ROOT_MARKER_FILES: [&str; 5] = [
     "pyproject.toml",
     "setup.py",
     "setup.cfg",
@@ -155,8 +155,8 @@ pub(crate) fn python_roots(worktree: &Path) -> Vec<PathBuf> {
 
 /// Reports whether `root` is a Python project, per the shared marker rule.
 ///
-/// Root markers: any of [`ROOT_MARKER_FILES`], any root `requirements*.txt`, or a `.venv`/`venv`
-/// directory. Plus every root `python_roots` discovers from nested manifests — so a monorepo
+/// Root markers: any of [`ROOT_MARKER_FILES`], any root `requirements*.txt`, a `.venv`/`venv`
+/// directory, or a suffixed environment such as `.venv-py314` holding `bin/python`. Plus every root `python_roots` discovers from nested manifests — so a monorepo
 /// whose Python packages live two levels down, with no manifest at the worktree root, is a
 /// Python project whose every root the card lists.
 pub(crate) fn is_python_project(root: &Path) -> bool {
@@ -165,6 +165,7 @@ pub(crate) fn is_python_project(root: &Path) -> bool {
         .any(|name| root.join(name).is_file())
         || dir_names(root).iter().any(|name| is_requirements_txt(name))
         || [".venv", "venv"].iter().any(|dir| root.join(dir).is_dir())
+        || !venv_directories(root).is_empty()
     {
         return true;
     }
@@ -172,26 +173,25 @@ pub(crate) fn is_python_project(root: &Path) -> bool {
 }
 
 /// The virtual-environment directories beside `root`, most specific first: the conventional
-/// `.venv` and `venv`, then any sibling whose name extends them (`.venv-py314`, `venv310`), in
-/// directory order. Each must hold `bin/python` to count.
+/// `.venv` and `venv`, then any sibling whose name extends them (`.venv-py314`, `venv310`),
+/// sorted by name so the order never depends on the directory listing. Each must hold
+/// `bin/python` to count.
 pub(crate) fn venv_directories(root: &Path) -> Vec<PathBuf> {
-    let mut candidates: Vec<PathBuf> = [".venv", "venv"]
-        .iter()
-        .map(|name| root.join(name))
-        .collect();
-    candidates.extend(
-        dir_names(root)
-            .into_iter()
-            .filter(|name| {
-                (name.starts_with(".venv") && name != ".venv")
-                    || (name.starts_with("venv") && name != "venv")
-            })
-            .filter(|name| root.join(name).join("bin").join("python").is_file())
-            .map(|name| root.join(name)),
-    );
-    candidates
+    let mut suffixed: Vec<String> = dir_names(root)
         .into_iter()
-        .filter(|dir| dir.join("bin").join("python").is_file())
+        .filter(|name| {
+            (name.starts_with(".venv") && name != ".venv")
+                || (name.starts_with("venv") && name != "venv")
+        })
+        .collect();
+    suffixed.sort();
+    [".venv".to_owned(), "venv".to_owned()]
+        .into_iter()
+        .chain(suffixed)
+        .map(|name| root.join(name))
+        // A dangling `bin/python` link still marks an environment, one the resolver reports as
+        // broken rather than losing it.
+        .filter(|dir| fs::symlink_metadata(dir.join("bin").join("python")).is_ok())
         .collect()
 }
 
@@ -211,12 +211,12 @@ impl LanguageSupport for Python {
     /// Python files but no manifest still gets a project, with no manifests, no commands and a
     /// `project` environment fact saying so, so the card can name it). Nested roots
     /// (`python_roots`) are all listed: each nested root contributes its manifest paths
-    /// (relative to `root`), a `root` environment fact, and — when it holds a
-    /// virtual-environment directory — a `venv` fact whose `bin/python` becomes the absolute
-    /// `interpreter` of the first root that has one. Other environment facts recorded (in this
-    /// order, each only when present at the worktree root): `tool` (`uv`, `poetry`), `python`
-    /// (`.python-version`), `configured` (`pyright`, `mypy`, `ruff`) and `formatter` (`black` or
-    /// `ruff`, which `format_command` reads back). Commands start from the manifests and are
+    /// (relative to `root`) and a `root` environment fact. The `interpreter` is the first root's
+    /// environment from the shared resolver ([`crate::environment`]), which the core renders as
+    /// the card's environment line, so no venv fact is recorded here. Other environment facts
+    /// recorded (in this order, each only when present at the worktree root): `tool` (`uv`,
+    /// `poetry`, which the no-environment command fallback reads back), `configured` (`pyright`,
+    /// `mypy`, `ruff`) and `formatter` (`black` or `ruff`, which `format_command` reads back). Commands start from the manifests and are
     /// overridden by Makefile targets and then by CI workflow `run:` lines, so CI wins.
     fn detect(&self, root: &Path) -> Option<LanguageProject> {
         let roots = python_roots(root);
@@ -281,60 +281,38 @@ impl LanguageSupport for Python {
         let mut environment = Vec::new();
         let mut fact =
             |name: &str, value: &str| environment.push((name.to_owned(), value.to_owned()));
-        let mut interpreter = None;
         for project_root in &roots {
-            let relative = project_root
-                .strip_prefix(root)
-                .map(|path| path.to_string_lossy().into_owned())
-                .unwrap_or_default();
             if project_root != root {
+                let relative = project_root
+                    .strip_prefix(root)
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 fact("root", &relative);
             }
-            if interpreter.is_none()
-                && let Some(venv) = venv_directories(project_root).into_iter().next()
-            {
-                let python = venv.join("bin").join("python");
-                // Not canonicalized: the venv's `python` is a symlink whose target loses the venv.
-                interpreter = Some(std::path::absolute(&python).unwrap_or(python));
-                let venv_name = venv
-                    .strip_prefix(project_root)
-                    .ok()
-                    .and_then(|path| path.to_str())
-                    .unwrap_or(".venv");
-                if relative.is_empty() {
-                    fact("venv", venv_name);
-                } else {
-                    fact("venv", &format!("{relative}/{venv_name}"));
-                }
-            }
         }
-        if interpreter.is_none()
-            && let Some(venv) = venv_directories(root).into_iter().next()
-        {
-            // A worktree environment also covers nested roots without their own environment.
-            let python = venv.join("bin").join("python");
-            interpreter = Some(std::path::absolute(&python).unwrap_or(python));
-            fact(
-                "venv",
-                venv.strip_prefix(root)
-                    .ok()
-                    .and_then(|path| path.to_str())
-                    .unwrap_or(".venv"),
-            );
-        }
+        // The worktree-level environment: the chosen one, or — when a selection or pin demands
+        // one that is missing — that environment's absent interpreter, so commands fail closed
+        // instead of running another Python.
+        let governing = crate::environment::governing(root);
+        let chosen = governing
+            .as_ref()
+            .and_then(|resolution| crate::environment::interpreter(&resolution.env));
+        let demanded_missing = governing
+            .as_ref()
+            .is_some_and(|resolution| resolution.authoritative && resolution.env.chosen.is_none());
+        let interpreter = chosen.clone().or_else(|| {
+            governing
+                .as_ref()
+                .and_then(|resolution| resolution.demanded.as_ref())
+                .filter(|_| demanded_missing)
+                .map(|dir| dir.join("bin").join("python"))
+        });
         let uv = has("uv.lock");
         if uv {
             fact("tool", "uv");
         }
         if has("poetry.lock") {
             fact("tool", "poetry");
-        }
-        if let Some(version) = read_text(root, ".python-version")
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-        {
-            fact("python", version);
         }
         let pyright = toml_has_table(&pyproject, "tool.pyright") || has("pyrightconfig.json");
         let mypy = toml_has_table(&pyproject, "tool.mypy")
@@ -358,21 +336,43 @@ impl LanguageSupport for Python {
             fact("formatter", formatter);
         }
 
-        let manifest = |args: &[&str]| ProjectCommand {
-            argv: with_uv(uv, args),
-            source: CommandSource::Manifest,
+        // The card names what runs: the environment's interpreter (relative to the worktree when
+        // inside it), nothing while a demanded environment is missing, and the tools from `PATH`
+        // (behind `uv run` in uv projects) only when no environment resolves at all.
+        let card_python = chosen.map(|python| {
+            python
+                .strip_prefix(root)
+                .map(Path::to_path_buf)
+                .unwrap_or(python)
+                .display()
+                .to_string()
+        });
+        let manifest = |args: &[&str]| {
+            let argv = match &card_python {
+                Some(python) => [python.as_str(), "-m"]
+                    .iter()
+                    .chain(args)
+                    .map(|arg| (*arg).to_owned())
+                    .collect(),
+                None if demanded_missing => return None,
+                None => with_uv(uv, args),
+            };
+            Some(ProjectCommand {
+                argv,
+                source: CommandSource::Manifest,
+            })
         };
         let mut commands = ProjectCommands {
-            test: Some(manifest(&["pytest"])),
-            lint: ruff.then(|| manifest(&["ruff", "check", "."])),
-            format: formatter.map(|formatter| match formatter {
+            test: manifest(&["pytest"]),
+            lint: ruff.then(|| manifest(&["ruff", "check", "."])).flatten(),
+            format: formatter.and_then(|formatter| match formatter {
                 "black" => manifest(&["black", "."]),
                 _ => manifest(&["ruff", "format", "."]),
             }),
             typecheck: if pyright {
-                Some(manifest(&["pyright"]))
+                manifest(&["pyright"])
             } else if mypy {
-                Some(manifest(&["mypy", "."]))
+                manifest(&["mypy", "."])
             } else {
                 None
             },
@@ -515,7 +515,9 @@ impl LanguageSupport for Python {
                     part == "tests" || part == "test"
                 }))
     }
-    /// pytest with `--no-header -p no:cacheprovider`, prefixed by `uv run` in uv projects.
+    /// pytest with `--no-header -p no:cacheprovider`, run as `<venv>/bin/python -m pytest` in the
+    /// resolved environment (never `uv run`, which syncs the environment first); only without one
+    /// it is `pytest` from `PATH`, prefixed by `uv run` in uv projects.
     /// A symbol target names each distinct referencing test as a node id (`file::Class::test`;
     /// `/` in a name is read as nesting) or, beyond `MAX_NAMED_TESTS`, their distinct files; a
     /// symbol no test references is [`LangError::Unsupported`]. A file target runs whole only
@@ -527,10 +529,6 @@ impl LanguageSupport for Python {
         project: &LanguageProject,
         target: &TestTarget,
     ) -> Result<TestSelection, LangError> {
-        let uv = project
-            .environment
-            .iter()
-            .any(|(name, value)| name == "tool" && value == "uv");
         let (tests, args) = match target {
             TestTarget::Symbol {
                 path,
@@ -563,7 +561,7 @@ impl LanguageSupport for Python {
             }
             TestTarget::Pattern(pattern) => (Vec::new(), vec!["-k".to_owned(), pattern.clone()]),
         };
-        let mut command = with_uv(uv, &["pytest"]);
+        let mut command = in_environment(project, &["pytest"]).map_err(LangError::Unsupported)?;
         command.extend(args);
         command.extend(PYTEST_FLAGS.map(String::from));
         Ok(TestSelection { tests, command })
@@ -626,40 +624,31 @@ impl LanguageSupport for Python {
         report
     }
 
-    /// `black <file>` or `ruff format <file>` as detected (`uv run` prefixed in uv projects);
-    /// `None` when the project configures neither.
+    /// `black <file>` or `ruff format <file>` as detected, run in the resolved environment like
+    /// the tests (see [`in_environment`]); `None` when the project configures neither.
     fn format_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>> {
-        let uv = project
-            .environment
-            .iter()
-            .any(|(name, value)| name == "tool" && value == "uv");
         let file = file.display().to_string();
         match env_value(project, "formatter")? {
-            "black" => Some(with_uv(uv, &["black", &file])),
-            "ruff" => Some(with_uv(uv, &["ruff", "format", &file])),
+            "black" => in_environment(project, &["black", &file]).ok(),
+            "ruff" => in_environment(project, &["ruff", "format", &file]).ok(),
             _ => None,
         }
     }
 
-    /// `ruff format --stdin-filename <file> -` or `black -q -` as detected (`uv run` prefixed in
-    /// uv projects), reading the candidate text on stdin and writing the formatted text to
+    /// `ruff format --stdin-filename <file> -` or `black -q -` as detected (run in the resolved
+    /// environment, see [`in_environment`]), reading the candidate text on stdin and writing the formatted text to
     /// stdout. `None` for a non-`.py`/`.pyi` file or a project without either formatter.
     fn format_stdin_command(&self, project: &LanguageProject, file: &Path) -> Option<Vec<String>> {
         match file.extension().and_then(|ext| ext.to_str()) {
             Some("py" | "pyi") => {}
             _ => return None,
         }
-        let uv = project
-            .environment
-            .iter()
-            .any(|(name, value)| name == "tool" && value == "uv");
         let file = file.display().to_string();
         match env_value(project, "formatter")? {
-            "black" => Some(with_uv(uv, &["black", "-q", "-"])),
-            "ruff" => Some(with_uv(
-                uv,
-                &["ruff", "format", "--stdin-filename", &file, "-"],
-            )),
+            "black" => in_environment(project, &["black", "-q", "-"]).ok(),
+            "ruff" => {
+                in_environment(project, &["ruff", "format", "--stdin-filename", &file, "-"]).ok()
+            }
             _ => None,
         }
     }
@@ -669,16 +658,17 @@ impl LanguageSupport for Python {
         true
     }
 
-    /// The project's own interpreter (the detected venv, else `python3` on PATH like the
-    /// formatter's tools) runs `ast.parse` over the candidate on stdin and prints
-    /// `<lineno>: <msg>` on a syntax error — exactly the probe line
-    /// `SyntaxVerdict::from_probe` maps. A missing interpreter fails the spawn, which the
-    /// caller maps to `Unchecked`, never a refusal. Python has no launcher-configured probe
-    /// programs, so `configured` is ignored.
+    /// The interpreter of the project root containing `file` (the shared resolver's, else the
+    /// project's, else `python3` on PATH like the formatter's tools) runs `ast.parse` over the
+    /// candidate on stdin and prints `<lineno>: <msg>` on a syntax error — exactly the probe line
+    /// `SyntaxVerdict::from_probe` maps. No probe (`Unchecked`) when that root's selected or
+    /// pinned environment is missing: another interpreter never stands in. A missing interpreter
+    /// fails the spawn, which the caller maps to `Unchecked`, never a refusal. Python has no
+    /// launcher-configured probe programs, so `configured` is ignored.
     fn syntax_probe_command(
         &self,
         project: &LanguageProject,
-        _root: &Path,
+        root: &Path,
         file: &Path,
         _configured: Option<&ProbePrograms>,
     ) -> Option<Vec<String>> {
@@ -686,13 +676,43 @@ impl LanguageSupport for Python {
             Some("py" | "pyi") => {}
             _ => return None,
         }
-        let interpreter = project
-            .interpreter
-            .clone()
+        let resolution = crate::environment::for_path(root, file);
+        if resolution
+            .as_ref()
+            .is_some_and(|resolution| resolution.authoritative && resolution.env.chosen.is_none())
+        {
+            return None;
+        }
+        let interpreter = resolution
+            .and_then(|resolution| crate::environment::interpreter(&resolution.env))
+            .or_else(|| project.interpreter.clone())
             .unwrap_or_else(|| std::path::PathBuf::from("python3"))
             .display()
             .to_string();
         Some(vec![interpreter, "-c".to_owned(), PY_AST_PROBE.to_owned()])
+    }
+
+    /// One environment per project root from the shared resolver ([`crate::environment`]).
+    fn environments(&self, worktree: &Path) -> Vec<agent_ide_core::lang::environment::ResolvedEnv> {
+        crate::environment::environments(worktree, &[])
+    }
+
+    /// A candidate label or a path to a directory holding `bin/python`; refused under a Pyright
+    /// pin, for an unknown root, or for an unknown selector (see
+    /// [`crate::environment::check_selection`]).
+    fn check_selection(&self, worktree: &Path, root: &Path, selector: &str) -> Result<(), String> {
+        crate::environment::check_selection(worktree, root, selector)
+    }
+
+    /// Activation of the resolved environment of the project root containing `cwd` (see
+    /// [`crate::environment::command_env`]).
+    fn command_env(
+        &self,
+        worktree: &Path,
+        cwd: &Path,
+        program: &str,
+    ) -> Option<agent_ide_core::lang::environment::CommandEnv> {
+        crate::environment::command_env(worktree, cwd, program)
     }
 
     /// The module docstring's first line (or the line after an empty opening quote).
@@ -1223,6 +1243,37 @@ pub(super) fn ci_run_lines(root: &Path) -> Vec<String> {
         }
     }
     runs
+}
+
+/// The Python tool `args` (`pytest …`, `black …`) as `<venv>/bin/python -m <args>` when the
+/// project's environment resolved; without one, `args` from `PATH`, behind `uv run` when the
+/// project is managed by uv. A demanded (selected or pinned) environment that is missing or
+/// broken is an error with the way out, never a run of another interpreter.
+///
+/// `ponytail:` tests and formatting run in the worktree-level environment, so nested roots with
+/// diverging environments use the worktree root's; the upgrade is routing per target root once
+/// `LanguageProject` carries its root (planned with P2 Rust toolchains, which need the same).
+fn in_environment(project: &LanguageProject, args: &[&str]) -> Result<Vec<String>, String> {
+    match &project.interpreter {
+        Some(python) if python.is_file() => Ok([python.display().to_string(), "-m".to_owned()]
+            .into_iter()
+            .chain(args.iter().map(|arg| (*arg).to_owned()))
+            .collect()),
+        Some(python) => {
+            let venv = python.parent().and_then(Path::parent).unwrap_or(python);
+            Err(format!(
+                "python environment {} is missing or broken — recreate it or ide.start environment {{\"python\": \"auto\"}}",
+                venv.display()
+            ))
+        }
+        None => Ok(with_uv(
+            project
+                .environment
+                .iter()
+                .any(|(name, value)| name == "tool" && value == "uv"),
+            args,
+        )),
+    }
 }
 
 /// `args` as argv, behind `uv run` when the project is managed by uv.
@@ -1955,7 +2006,8 @@ FAILED tests/test_service.py::TestWorker::test_label
     }
 
     #[test]
-    /// Manifest facts, venv interpreter, uv prefixing, Makefile and CI overrides, entry points.
+    /// Manifest facts, venv interpreter, Makefile and CI overrides, entry points; with uv.lock
+    /// and a resolved venv, test and format commands run the venv's python and never `uv`.
     fn detect_reads_manifests_environment_and_overrides() {
         let root = scratch("full");
         put(
@@ -1982,7 +2034,6 @@ FAILED tests/test_service.py::TestWorker::test_label
              uv sync\n          uv run pytest -x\n",
         );
         let project = Python.detect(&root).unwrap();
-        fs::remove_dir_all(&root).unwrap();
 
         assert_eq!(
             project.manifests,
@@ -2000,9 +2051,7 @@ FAILED tests/test_service.py::TestWorker::test_label
         assert_eq!(
             facts,
             [
-                ("venv", ".venv"),
                 ("tool", "uv"),
-                ("python", "3.12"),
                 ("configured", "pyright"),
                 ("configured", "ruff"),
                 ("formatter", "ruff"),
@@ -2025,9 +2074,10 @@ FAILED tests/test_service.py::TestWorker::test_label
         assert_eq!(
             (format.argv.clone(), format.source),
             (
-                argv(&["uv", "run", "ruff", "format", "."]),
+                argv(&[".venv/bin/python", "-m", "ruff", "format", "."]),
                 CommandSource::Manifest
-            )
+            ),
+            "the card names the venv's interpreter, never uv run, once a venv resolves"
         );
         assert_eq!(commands.build, None);
         assert_eq!(
@@ -2037,10 +2087,21 @@ FAILED tests/test_service.py::TestWorker::test_label
                 PathBuf::from("src/svc/cli.py")
             ]
         );
+        let python = root.join(".venv/bin/python").display().to_string();
         assert_eq!(
             Python.format_command(&project, Path::new("src/svc/cli.py")),
-            Some(argv(&["uv", "run", "ruff", "format", "src/svc/cli.py"]))
+            Some(argv(&[&python, "-m", "ruff", "format", "src/svc/cli.py"]))
         );
+        let tests = Python
+            .test_selection(&project, &TestTarget::Pattern("load".to_owned()))
+            .unwrap()
+            .command;
+        assert_eq!(tests[..3], argv(&[&python, "-m", "pytest"]));
+        assert!(
+            !tests.iter().any(|word| word == "uv"),
+            "no uv run: it would sync the environment"
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -2252,19 +2313,12 @@ FAILED tests/test_service.py::TestWorker::test_label
             project.interpreter,
             Some(std::path::absolute(root.join(".venv/bin/python")).unwrap())
         );
-        assert!(
-            project
-                .environment
-                .iter()
-                .any(|(key, value)| { key == "venv" && value == ".venv" })
-        );
         fs::remove_dir_all(&root).unwrap();
     }
 
     /// Environment discovery beside a Python root: the conventional `.venv` wins, a suffixed
     /// sibling (`.venv-py314`, `venv310`) is found when it holds `bin/python`, and a directory
-    /// without one is ignored. The first root with an environment names the `venv` fact and the
-    /// interpreter; a suffixed environment beside a nested root is named with the root prefix.
+    /// without one is ignored. The first root with an environment supplies the interpreter.
     #[test]
     fn suffixed_venv_directories_are_discovered_beside_each_root() {
         let root = scratch("suffixed-venv");
@@ -2283,12 +2337,6 @@ FAILED tests/test_service.py::TestWorker::test_label
             Some(root.join(".venv-py314/bin/python")),
             "the suffixed environment's interpreter is used"
         );
-        assert!(
-            project
-                .environment
-                .iter()
-                .any(|(key, value)| key == "venv" && value == ".venv-py314")
-        );
         fs::remove_dir_all(&root).unwrap();
 
         let root = scratch("nested-suffixed-venv");
@@ -2301,12 +2349,6 @@ FAILED tests/test_service.py::TestWorker::test_label
         assert_eq!(
             project.interpreter,
             Some(root.join("packages/alpha/.venv-314/bin/python"))
-        );
-        assert!(
-            project
-                .environment
-                .iter()
-                .any(|(key, value)| { key == "venv" && value == "packages/alpha/.venv-314" })
         );
         fs::remove_dir_all(&root).unwrap();
     }
