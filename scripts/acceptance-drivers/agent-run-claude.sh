@@ -153,7 +153,8 @@ mkdir -p -- "$DIAG_DIR"
 #
 # Agent-run stores ordered messages with string content, unlike the direct-host JSONL transcripts.
 # One call may span a block-start row and continuation rows (agent-run 0.20.2), so each call is
-# paired with its result rows by their shared raw_ref. The first argument is its private JSON path;
+# paired with its result rows by their shared raw_ref. Claude names the tools `mcp__agent_ide__…`,
+# Codex (agent-run 0.20.3 exports its tool rows) `agent_ide/ide.…`. The first argument is its private JSON path;
 # the second is a closed failure code. Empty or malformed transcripts, missing results, and replies
 # above 16 KiB fail the whole host cell.
 require_agent_run_compact_replies() {
@@ -163,7 +164,7 @@ require_agent_run_compact_replies() {
         (.messages as $messages
          | [$messages[]
             | select(.role == "tool_call" and (.starts_block // true)
-                and ((.name // "") | test("^mcp__agent[-_]ide__ide[._]")))
+                and ((.name // "") | test("^(mcp__agent[-_]ide__|agent[-_]ide/)ide[._]")))
             | .raw_ref] as $calls
          | ($calls | length > 0)
            and all($calls[]; . as $ref
