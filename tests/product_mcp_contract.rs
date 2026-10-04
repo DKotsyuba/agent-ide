@@ -18826,3 +18826,165 @@ async fn configured_product_batch_typescript_tsx_gate_parses_jsx_in_the_real_lau
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
 }
+
+/// Repeating a real MCP start keeps owned provider namespaces and the same activation while
+/// switching environments. Fixture interpreters emit runner output without requiring Python/Node.
+#[tokio::test]
+async fn configured_product_environment_repeat_start_keeps_own_cache_and_binding() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = ProductFixture::new(json!([]));
+    fixture.write_config(json!([
+        {"executable":accepted_program("/bin/sh","pyright-fixture"),"settings":"pyright_defaults_v1","toolchain":"node-fixture","node":accepted_program("/bin/sh","node-fixture"),"cargo":null,"cargo_version":null,"rustc":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"repeat-environment-cache"},
+        {"executable":accepted_program("/bin/sh","gopls-fixture"),"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"repeat-shared-cache"}
+    ]));
+    std::fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[project]\nname = 'repeat-environment'\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(fixture.root.join("tests")).unwrap();
+    std::fs::write(fixture.root.join("tests/test_env.py"), "pass\n").unwrap();
+    for label in [".venv", ".venv-py314"] {
+        let env = fixture.root.join(label);
+        std::fs::create_dir_all(env.join("bin")).unwrap();
+        std::fs::write(env.join("pyvenv.cfg"), "home = /bin\nversion = 3.14.3\n").unwrap();
+        std::fs::write(
+            env.join("bin/python"),
+            "#!/bin/sh\nprintf '%s\\n1 passed in 0.01s\\n' \"$VIRTUAL_ENV\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            env.join("bin/python"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "repeat-environment").await;
+    let first = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"repeat-environment"}),
+        )
+        .await;
+    let first = actor.settle(&fixture, first).await;
+    assert_eq!(first["kind"], "activation", "{first}");
+    let epoch = first["text"]
+        .as_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let mut namespaces = std::fs::read_dir(fixture.runtime.join("cache"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    namespaces.sort();
+    assert_eq!(namespaces.len(), 3);
+    let run = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"path":"tests/test_env.py","budget_s":5}),
+        )
+        .await;
+    let run = actor.settle(&fixture, run).await;
+    assert_eq!(run["kind"], "test", "{run}");
+    for selector in [".venv-py314", "auto"] {
+        let next = actor
+            .call(
+                &fixture,
+                "ide.start",
+                json!({"activation_id":"repeat-environment","environment":{"python":selector}}),
+            )
+            .await;
+        let next = actor.settle(&fixture, next).await;
+        assert_eq!(next["kind"], "activation", "{next}");
+        assert!(next["text"].as_str().unwrap().starts_with(&epoch), "{next}");
+        let chosen = if selector == "auto" {
+            ".venv"
+        } else {
+            selector
+        };
+        assert!(
+            next["text"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("environment: python {chosen} (")),
+            "{next}"
+        );
+        let context = actor
+            .call(
+                &fixture,
+                "ide.context",
+                json!({"kind":"problems","language":"python"}),
+            )
+            .await;
+        assert_eq!(context["kind"], "context", "{context}");
+        let run = actor
+            .call(
+                &fixture,
+                "ide.test",
+                json!({"path":"tests/test_env.py","budget_s":5}),
+            )
+            .await;
+        let run = actor.settle(&fixture, run).await;
+        assert_eq!(run["kind"], "test", "{run}");
+        let mut actual = std::fs::read_dir(fixture.runtime.join("cache"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        actual.sort();
+        assert_eq!(actual, namespaces);
+    }
+    let invalid = actor
+        .call_raw(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"repeat-environment","environment":{"python":".venv-absent"}}),
+        )
+        .await;
+    let invalid = actor.settle_raw(&fixture, invalid).await;
+    assert_eq!(
+        invalid["result"]["structuredContent"]["code"], "invalid_detail",
+        "{invalid}"
+    );
+    let text = invalid["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("choose one of the listed candidates or \"auto\""),
+        "{text}"
+    );
+    assert!(!text.contains("detail_ref"), "{text}");
+    let again = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"repeat-environment"}),
+        )
+        .await;
+    let again = actor.settle(&fixture, again).await;
+    assert_eq!(again["kind"], "activation", "{again}");
+    assert!(
+        again["text"]
+            .as_str()
+            .unwrap()
+            .contains("environment: python .venv (3.14.3, discovered)")
+    );
+    assert_eq!(
+        actor.call(&fixture, "ide.stop", json!({})).await["kind"],
+        "stop"
+    );
+    actor.mcp.close().await;
+    let mut successor = ProductActor::new(&fixture, "repeat-successor").await;
+    let start = successor
+        .call(&fixture, "ide.start", json!({"activation_id":"successor"}))
+        .await;
+    let start = successor.settle(&fixture, start).await;
+    assert_eq!(start["kind"], "activation", "{start}");
+    successor.call(&fixture, "ide.stop", json!({})).await;
+    successor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}

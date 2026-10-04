@@ -172,7 +172,8 @@ impl Worker<'_> {
 
     /// Retains or reopens each configured provider cache under canonical worktree identity.
     ///
-    /// A quiescent compatible lifecycle is handed to the incoming binding. Preparation is
+    /// Repeating the same binding/plan keeps its live ownership and shared reference counts.
+    /// A quiescent compatible lifecycle is handed to a different incoming binding. Preparation is
     /// transactional (see `retain_cache_plan`), and `binding_caches` records the incoming binding's
     /// keys only once every launch succeeded. Returns the finite reason instead of a bare failure:
     /// `Conflict` when another actor still actively owns this worktree's namespace, `Capacity` when
@@ -231,6 +232,22 @@ impl Worker<'_> {
                     shared: true,
                 });
             }
+        }
+        if let Some(owned) = self.providers.binding_caches.get(binding) {
+            let keys: Vec<_> = plan.iter().map(|request| request.key.clone()).collect();
+            if owned != &keys {
+                return Err(FailureCode::Conflict);
+            }
+            return if owned.iter().all(|key| {
+                self.providers
+                    .caches
+                    .get(key)
+                    .is_some_and(|cache| cache.retained() && !cache.quiescent())
+            }) {
+                Ok(())
+            } else {
+                Err(FailureCode::ProviderUnavailable)
+            };
         }
         let keys = retain_cache_plan(
             &mut self.providers.caches,
