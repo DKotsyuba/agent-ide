@@ -5487,7 +5487,7 @@ async fn an_edit_to_an_undeclared_rust_module_is_not_analysed() {
     assert_eq!(orphan["diagnostics"]["state"], "not_analysed", "{orphan}");
     assert_eq!(
         orphan["diagnostics"]["reason"],
-        "rust check may not have compiled this file — no unconditional `mod` declaration reaches it",
+        "rust check may not have compiled this file — no unconditional `mod` declaration reaches it; declare it, then edit again",
         "{orphan}"
     );
     let declared = edit(
@@ -7168,13 +7168,15 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
         .unwrap_or_else(|| panic!("{started}"))
         .to_owned();
     assert!(
-        start_text.starts_with("tests #1: started — cargo test --workspace --lib (budget 120 s)"),
+        start_text.starts_with(
+            "tests #1: started — cargo test --manifest-path Cargo.toml --lib (budget 120 s)"
+        ),
         "{start_text}"
     );
     assert_eq!(
         start_text.trim_end(),
-        "tests #1: started — cargo test --workspace --lib (budget 120 s); poll: call ide.test with \
-         {\"status\": 1}",
+        "tests #1: started — cargo test --manifest-path Cargo.toml --lib (budget 120 s); poll: call \
+         ide.test with {\"status\": 1}",
         "{start_text}"
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
@@ -8072,9 +8074,9 @@ async fn batch_wait_semantic_outline(
 fn batch_diagnostics_segment(edit: &Value) -> String {
     match edit["diagnostics"]["state"].as_str().unwrap_or_default() {
         "current_clean" => "diagnostics: current_clean. Next: use ide.diff".to_owned(),
-        "unknown" => "diagnostics: unknown. Next: use ide.context".to_owned(),
+        "unknown" => "diagnostics: unknown. Next: use ide.context with kind problems".to_owned(),
         "not_analysed" => format!(
-            "diagnostics: not_analysed ({}); declare it, then edit again",
+            "diagnostics: not_analysed ({})",
             edit["diagnostics"]["reason"].as_str().unwrap_or_default()
         ),
         other => panic!("unexpected diagnostics state {other}: {edit}"),

@@ -375,12 +375,15 @@ enum RustHealth {
 
 impl agent_ide_core::intelligence::session::SessionProfile for RustProfile {
     /// Disables rust-analyzer's cargo check-on-save and cache priming, enabling proc-macro
-    /// expansion unless this profile suppresses it.
+    /// expansion unless this profile suppresses it. Workspace symbol search covers every symbol
+    /// kind: rust-analyzer's default lists types only, so a bare function or method name found
+    /// nothing (or one stray match from the shallow fallback scan).
     fn workspace_configuration(&self) -> serde_json::Value {
         serde_json::json!({
             "cachePriming":{"enable":false},
             "checkOnSave":false,
-            "procMacro":{"enable":!self.proc_macros_disabled()}
+            "procMacro":{"enable":!self.proc_macros_disabled()},
+            "workspace":{"symbol":{"search":{"kind":"all_symbols"}}}
         })
     }
 
@@ -908,7 +911,8 @@ mod linked_project_tests {
             serde_json::json!({
                 "cachePriming":{"enable":false},
                 "checkOnSave":false,
-                "procMacro":{"enable":false}
+                "procMacro":{"enable":false},
+                "workspace":{"symbol":{"search":{"kind":"all_symbols"}}}
             })
         );
         assert_eq!(
@@ -916,7 +920,8 @@ mod linked_project_tests {
             serde_json::json!({
                 "cachePriming":{"enable":false},
                 "checkOnSave":false,
-                "procMacro":{"enable":true}
+                "procMacro":{"enable":true},
+                "workspace":{"symbol":{"search":{"kind":"all_symbols"}}}
             })
         );
     }

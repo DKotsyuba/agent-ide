@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Fixed
+
+- `ide.outline`, `ide.read`, `ide.symbol` and `ide.graph` on a file no IDE
+  language reads (`Cargo.toml`, a shell script) answer
+  `unsupported_file: <path>` with the read that works (`ide.read` `path` and
+  `lines`) instead of a misleading `provider_unavailable`; a batch read names
+  such a file per item.
+- An edit of a Rust file reached only behind a gate — an integration test with
+  `#![cfg(feature = "…")]`, a `cfg`-gated `mod` — says it is built only under
+  that condition instead of advising to declare it. A `#[path = "…"]`
+  declaration naming a file beside the declaring file now reaches it, so such
+  files get their project check. `not_analysed` reasons carry their own next
+  step; Python's name the missing root or environment.
+- An edit of a file no language checks (a template, a manifest) answers
+  `not_analysed (no IDE language checks this file type)`; `unknown`
+  diagnostics point at `ide.context` with `kind: "problems"`.
+- A test run stopped with its activation no longer appears on the plate of the
+  next activation in the same session; its status still answers by number.
+- `ide.stop` accepts an optional `activation_id` instead of refusing it.
+- `ide.symbol`/`ide.graph` with a bare Rust function or method name find every
+  definition: rust-analyzer's workspace symbol search now covers all symbol
+  kinds, not types only.
+- `ide.test {"path": …}` for a Rust file runs in that file's package
+  (`--manifest-path <package>/Cargo.toml`) instead of building every target in
+  the workspace; a file under `src/tests/` is a module, not an integration test.
+- A failed Rust test's summary keeps up to four message lines (an assertion's
+  `left:`/`right:` values), not just the first.
+
 ## 0.9.0 — 2026-10-04
 
 ### Added

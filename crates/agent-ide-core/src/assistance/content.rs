@@ -210,6 +210,7 @@ fn escape_untrusted_labels(context: &mut serde_json::Value) {
     }
     if let Some(code) = context.get_mut("code") {
         field(code, "no_such_file");
+        field(code, "unsupported_file");
     }
     for key in ["resolution_detail", "resolution_message", "cause_tag"] {
         field(context, key);
@@ -1010,6 +1011,27 @@ mod tests {
         );
     }
 
+    /// A file no language reads is named as the caller's wrong tool, not a server outage.
+    #[test]
+    fn unsupported_file_names_the_path_and_the_read_that_works() {
+        let rendered = render(
+            PeerReply::Error {
+                code: FailureCode::UnsupportedFile("Cargo.toml".to_owned()),
+                detail: Some("outline:unsupported_file".to_owned()),
+            },
+            Envelope::WithStructured,
+        )
+        .unwrap();
+        assert_eq!(
+            text_of(&rendered),
+            "error: unsupported_file: Cargo.toml (outline:unsupported_file); no IDE language reads this file type, so it has no outline or symbols. Read it with ide.read `path` and `lines`, or with native tools"
+        );
+        assert_eq!(
+            rendered.structured_content.unwrap()["code"]["unsupported_file"],
+            "Cargo.toml"
+        );
+    }
+
     /// An expired or unknown detail says to repeat the original call.
     #[test]
     fn expired_detail_explains_the_recovery() {
@@ -1507,20 +1529,21 @@ mod tests {
         }
     }
 
-    /// A file the project check never analysed says so with the language's reason and the next
-    /// step, never `current_clean`.
+    /// A file the project check never analysed says so with the language's reason, which carries
+    /// its own next step (a gated file must not be told to declare itself), never
+    /// `current_clean`.
     #[test]
     fn not_analysed_diagnostics_render_the_reason_and_next_step() {
         let reply = successful_edit_reply(EditDiagnostics::NotAnalysed {
-            reason: "the check did not compile this file".into(),
+            reason: "the check did not compile this file; enable its feature".into(),
         });
         let rendered = render(reply, Envelope::TextOnly).unwrap();
         let text = text_of(&rendered);
         assert!(
-            text.contains(
-                "diagnostics: not_analysed (the check did not compile this file); declare it, \
-                 then edit again"
-            ) && !text.contains("current_clean"),
+            text.ends_with(
+                "diagnostics: not_analysed (the check did not compile this file; enable its feature)"
+            ) && !text.contains("declare it")
+                && !text.contains("current_clean"),
             "{text}"
         );
     }

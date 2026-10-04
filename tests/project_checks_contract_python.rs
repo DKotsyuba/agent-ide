@@ -270,16 +270,18 @@ fn python_not_analysed_names_uncovered_and_environmentless_roots() {
 
     assert_eq!(
         PythonChecks.not_analysed(&root, &root.join("tools/one_off.py")),
-        Some("no Python project root covers this file")
+        Some("no Python project root covers this file, so pyright skips it")
     );
     // The edit reply names files worktree-relative; the answer must be the same.
     assert_eq!(
         PythonChecks.not_analysed(&root, Path::new("tools/one_off.py")),
-        Some("no Python project root covers this file")
+        Some("no Python project root covers this file, so pyright skips it")
     );
     assert_eq!(
         PythonChecks.not_analysed(&root, &root.join("packages/beta/src/lib.py")),
-        Some("the Python project root beside this file has no environment")
+        Some(
+            "the Python project root beside this file has no environment; create one or pick it with ide.start environment"
+        )
     );
     assert_eq!(
         PythonChecks.not_analysed(&root, &root.join("packages/alpha/src/lib.py")),

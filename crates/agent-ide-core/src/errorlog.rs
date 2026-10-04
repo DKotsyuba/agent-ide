@@ -288,6 +288,8 @@ pub enum ReasonCode {
     Internal,
     /// [`FailureCode::NoSuchFile`].
     NoSuchFile,
+    /// [`FailureCode::UnsupportedFile`].
+    UnsupportedFile,
 
     // `checks::UnavailableReason`.
     /// [`UnavailableReason::Disabled`].
@@ -367,6 +369,7 @@ impl ReasonCode {
             Self::Conflict => "conflict",
             Self::Internal => "internal",
             Self::NoSuchFile => "no_such_file",
+            Self::UnsupportedFile => "unsupported_file",
             Self::ChecksDisabled => "checks_disabled",
             Self::OutsideRoots => "outside_roots",
             Self::ToolMissing => "tool_missing",
@@ -425,6 +428,7 @@ impl From<FailureCode> for ReasonCode {
             FailureCode::UnknownSymbol => Self::UnknownSymbol,
             FailureCode::EditRefused => Self::EditRefused,
             FailureCode::NoSuchFile(_) => Self::NoSuchFile,
+            FailureCode::UnsupportedFile(_) => Self::UnsupportedFile,
             FailureCode::ResolutionUnverified => Self::ResolutionUnverified,
             FailureCode::Cancelled => Self::Cancelled,
             FailureCode::Deadline => Self::Deadline,

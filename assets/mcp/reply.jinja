@@ -79,6 +79,8 @@ pending: use ide.inspect with detail_ref {{ detail_ref }}
 error: resolution_unverified (context:resolution); {{ resolution_detail if resolution_detail else "the project configuration did not prove this file belongs to the project" }}. Fix the project configuration, then retry ide.context
 {%- elif code.no_such_file is defined -%}
 error: no_such_file: {{ code.no_such_file }}{% if resolution_detail %} ({{ resolution_detail }}){% else %} (read:no_such_file){% endif %}; this path does not exist in the worktree. Fix the path, or use ide.symbol with a bare name to find it
+{%- elif code.unsupported_file is defined -%}
+error: unsupported_file: {{ code.unsupported_file }}{% if resolution_detail %} ({{ resolution_detail }}){% else %} (read:unsupported_file){% endif %}; no IDE language reads this file type, so it has no outline or symbols. Read it with ide.read `path` and `lines`, or with native tools
 {%- elif code is mapping -%}
 error: source_too_large (read:source_too_large); source is {{ code.source_too_large.size }} bytes, over the {{ code.source_too_large.ceiling }} byte read limit. Read it in pieces with native tools
 {%- elif code == "unknown_symbol" and resolution_detail is startingwith("edit:range_past_end:") -%}
@@ -299,9 +301,9 @@ Next: use ide.edit with source_ref {{ result.source_ref }}
 {%- elif diagnostics.state == "current_clean" -%}
 edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: current_clean. Next: use ide.diff
 {%- elif diagnostics.state == "unknown" -%}
-edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: unknown. Next: use ide.context
+edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: unknown. Next: use ide.context with kind problems
 {%- elif diagnostics.state == "not_analysed" -%}
-edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: not_analysed ({{ diagnostics.reason }}); declare it, then edit again
+edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: not_analysed ({{ diagnostics.reason }})
 {%- elif diagnostics.state == "pending" -%}
 edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: pending. Next: use ide.inspect with detail_ref {{ diagnostics.detail_ref }}
 {%- endif -%}

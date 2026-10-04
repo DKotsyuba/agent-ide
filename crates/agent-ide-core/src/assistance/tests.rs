@@ -64,6 +64,9 @@ struct Job {
     completed_at: Option<tokio::time::Instant>,
     /// True after an explicit `status` request has retrieved the completed result.
     observed: bool,
+    /// True once the owner's `ide.stop` ended the activation that started the run: its status is
+    /// still readable by handle, but no later plate of the same session announces it.
+    retired: bool,
 }
 
 /// Captured parser summary, bounded output, and whether the budget killed the child.
@@ -250,6 +253,7 @@ impl TestRuns {
                 result: None,
                 completed_at: None,
                 observed: false,
+                retired: false,
             },
         );
         let environment_language = command_language.or_else(|| {
@@ -368,11 +372,13 @@ impl TestRuns {
         })
     }
 
-    /// Marks every job started by `binding` observed so stopping that actor cannot pin idle exit.
+    /// Marks every job started by `binding` observed so stopping that actor cannot pin idle exit,
+    /// and retired so a later activation of the same session is not shown its status.
     pub fn observe_binding(&self, binding: &[u8; 32]) {
         if let Ok(mut state) = self.0.lock() {
             for job in state.jobs.values_mut().filter(|job| &job.owner == binding) {
                 job.observed = true;
+                job.retired = true;
             }
         }
     }
@@ -417,7 +423,9 @@ impl TestRuns {
         render_status_line(*id, job)
     }
 
-    /// Returns an undelivered current status line for the newest run owned by one binding.
+    /// Returns an undelivered current status line for the newest run owned by one binding. A run
+    /// its `ide.stop` retired ([`TestRuns::observe_binding`]) belongs to the ended activation: a
+    /// later activation of the same session is not told about it.
     pub fn status_line_for_binding(&self, binding: &[u8; 32]) -> Option<String> {
         let state = self.0.lock().ok()?;
         let (id, job) = state
@@ -425,6 +433,9 @@ impl TestRuns {
             .iter()
             .rev()
             .find(|(_, job)| &job.owner == binding)?;
+        if job.retired {
+            return None;
+        }
         let line = render_status_line(*id, job)?;
         (state.delivered_status.get(&(job.root.clone(), *binding)) != Some(&line)).then_some(line)
     }
@@ -937,6 +948,7 @@ mod runner_tests {
                         result: None,
                         completed_at: None,
                         observed: false,
+                        retired: false,
                     },
                 );
             }
@@ -1220,6 +1232,44 @@ mod runner_tests {
         }
         assert!(runs.uncollected(&binding).is_empty());
     }
+
+    /// A run settled after its owner's `ide.stop` is never announced to a later activation of the
+    /// same session (same binding), while a run that activation starts is.
+    #[tokio::test]
+    async fn stop_retires_runs_from_later_status_plates() {
+        let runs = TestRuns::default();
+        let root = std::env::temp_dir().to_path_buf();
+        let owner = BindingRef::fixture("retired-actor", "retired-channel", 1);
+        let binding = owner.fingerprint();
+        let start = |detail: &str| {
+            runs.start(
+                root.clone(),
+                vec!["/bin/echo".into(), "done".into()],
+                crate::lang::testing::ALPHA,
+                Duration::from_secs(10),
+                detail.into(),
+                &owner,
+            )
+        };
+        assert!(matches!(start("retired-old"), StartResult::Started(1)));
+        runs.observe_binding(&binding);
+        // Waits through the worktree status line, which reads nothing on the owner's behalf.
+        for _ in 0..100 {
+            if runs
+                .status_line(&root)
+                .is_some_and(|line| !line.contains("running"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!runs.status_line(&root).unwrap().contains("running"));
+        assert_eq!(runs.status_line_for_binding(&binding), None);
+        assert!(matches!(start("retired-new"), StartResult::Started(2)));
+        let fresh = runs.status_line_for_binding(&binding).unwrap();
+        assert!(fresh.starts_with("tests #2:"), "{fresh}");
+    }
+
     /// Both command modes apply prefix argv, resolved variables and PATH ahead of caller values.
     #[tokio::test]
     async fn environment_command_prefix_path_vars_and_language_ownership() {

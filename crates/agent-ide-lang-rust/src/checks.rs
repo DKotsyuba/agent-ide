@@ -837,12 +837,14 @@ impl LanguageChecks for RustChecks {
         Some("target")
     }
 
-    /// A `.rs` file no build target of its package reaches through `mod` declarations is never
-    /// compiled by `cargo check` (see the private `module_graph` walk).
+    /// A `.rs` file no build target of its package reaches through `mod` declarations, or reaches
+    /// only behind a `cfg`/`path` gate, may never be compiled by `cargo check` (see the private
+    /// `module_graph` walk, which names which of the two it is).
     fn not_analysed(&self, worktree: &Path, path: &Path) -> Option<&'static str> {
-        (path.extension().is_some_and(|extension| extension == "rs")
-            && !crate::module_graph::reached(worktree, path))
-        .then_some(crate::module_graph::UNREACHED)
+        path.extension()
+            .is_some_and(|extension| extension == "rs")
+            .then(|| crate::module_graph::unreached(worktree, path))
+            .flatten()
     }
 
     /// Decodes [`ProjectRustChecksConfig`].

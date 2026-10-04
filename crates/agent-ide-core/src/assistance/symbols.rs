@@ -330,9 +330,11 @@ impl Worker<'_> {
                         .await
                     {
                         Ok(index) => index,
-                        Err(FailureCode::NoSuchFile(_)) => {
+                        Err(
+                            code @ (FailureCode::NoSuchFile(_) | FailureCode::UnsupportedFile(_)),
+                        ) => {
                             items.push((
-                                format!("no such file: {}\n", file.display()),
+                                format!("{}: {}\n", batch_file_refusal(&code), file.display()),
                                 None,
                                 address.to_owned(),
                             ));
@@ -370,9 +372,11 @@ impl Worker<'_> {
                         .await
                     {
                         Ok(index) => index,
-                        Err(FailureCode::NoSuchFile(_)) => {
+                        Err(
+                            code @ (FailureCode::NoSuchFile(_) | FailureCode::UnsupportedFile(_)),
+                        ) => {
                             items.push((
-                                format!("no such file: {path}\n"),
+                                format!("{}: {path}\n", batch_file_refusal(&code)),
                                 None,
                                 address.to_owned(),
                             ));
@@ -1369,7 +1373,14 @@ impl Worker<'_> {
         observed: &SourceObservation,
         bytes: &[u8],
     ) -> Result<(Outline, std::path::PathBuf, Option<Lexical>), FailureCode> {
-        let language = Lang::for_path(observed.path()).ok_or(FailureCode::ProviderUnavailable)?;
+        // A file no registered language reads (`Cargo.toml`, a script) has no outline at all: the
+        // caller asked the wrong tool, which a provider-unavailable answer would hide.
+        let language = Lang::for_path(observed.path()).ok_or_else(|| {
+            FailureCode::UnsupportedFile(bounded_utf8_prefix(
+                &observed.path().to_string_lossy(),
+                MAX_NO_SUCH_FILE_PATH_BYTES,
+            ))
+        })?;
         let support = language.support();
         let source = observed_text(observed, bytes)?.to_owned();
         let worktree_root = observed.worktree().worktree_path().to_path_buf();
@@ -1590,7 +1601,9 @@ impl Worker<'_> {
                 ) else {
                     continue;
                 };
-                let language = Lang::for_path(file).ok_or(FailureCode::ProviderUnavailable)?;
+                let Some(language) = Lang::for_path(file) else {
+                    continue;
+                };
                 let support = language.support();
                 let Ok(live) = self.live_session_for(job, &observed).await else {
                     continue;
@@ -2136,6 +2149,16 @@ fn observed_text<'a>(
         return Err(FailureCode::SourceUnavailable);
     }
     std::str::from_utf8(bytes).map_err(|_| FailureCode::SourceUnavailable)
+}
+
+/// Names one file a batch read could not use, in the item's own line.
+fn batch_file_refusal(code: &FailureCode) -> &'static str {
+    match code {
+        FailureCode::UnsupportedFile(_) => {
+            "no symbols in this file type (read it with path and lines)"
+        }
+        _ => "no such file",
+    }
 }
 
 /// Maps a registered path's observed state to the closed `no_such_file` failure with its bounded

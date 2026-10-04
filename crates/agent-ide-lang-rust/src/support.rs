@@ -239,10 +239,12 @@ impl LanguageSupport for RustSupport {
     ///   their common module prefix when it is longer than `tests`; otherwise the workspace
     ///   filter is unfiltered. Tests in one integration binary use `--test`; mixed binaries use
     ///   the workspace filter. No referencing tests is [`LangError::Unsupported`].
-    /// * File: `tests/<name>.rs` or `tests/<name>/…` → `cargo test --test <name>`;
-    ///   `src/lib.rs` → `--lib`, `src/main.rs` → `--bins`, `src/bin/<x>.rs` → `--bin <x>`, any
-    ///   other `src` file → its module path filter (`src/a/b.rs` → `a::b::`, `mod.rs` dropped),
-    ///   all with `--workspace`. Other files are [`LangError::Unsupported`].
+    /// * File: scoped to the package whose directory precedes the last `tests`/`src` segment
+    ///   (`--manifest-path <dir>/Cargo.toml`, the root `Cargo.toml` when none), so one file's tests
+    ///   build one package instead of every target in the workspace. `tests/<name>.rs` or
+    ///   `tests/<name>/…` → `--test <name>`; `src/lib.rs` → `--lib`, `src/main.rs` → `--bins`,
+    ///   `src/bin/<x>.rs` → `--bin <x>`, any other `src` file → its module path filter
+    ///   (`src/a/b.rs` → `a::b::`, `mod.rs` dropped). Other files are [`LangError::Unsupported`].
     /// * Pattern: `cargo test --workspace <pattern>`.
     ///
     /// Only the symbol form lists the tests it expects to cover.
@@ -290,16 +292,25 @@ impl LanguageSupport for RustSupport {
             TestTarget::File(file) => {
                 let parts: Vec<&str> = file.iter().filter_map(|part| part.to_str()).collect();
                 let stem = |part: &str| part.strip_suffix(".rs").unwrap_or(part).to_owned();
-                if let Some(at) = parts.iter().rposition(|part| *part == "tests")
-                    && at + 1 < parts.len()
-                {
-                    command = vec![
+                let package = |at: usize| {
+                    let manifest: PathBuf = parts[..at].iter().collect();
+                    vec![
                         "cargo".to_owned(),
                         "test".to_owned(),
-                        "--test".to_owned(),
-                        stem(parts[at + 1]),
-                    ];
-                } else if let Some(at) = parts.iter().rposition(|part| *part == "src") {
+                        "--manifest-path".to_owned(),
+                        manifest.join("Cargo.toml").display().to_string(),
+                    ]
+                };
+                let source_at = parts.iter().rposition(|part| *part == "src");
+                // `src/tests/x.rs` is a module of the crate, not an integration test.
+                if let Some(at) = parts.iter().rposition(|part| *part == "tests")
+                    && at + 1 < parts.len()
+                    && source_at.is_none_or(|source| source > at)
+                {
+                    command = package(at);
+                    command.extend(["--test".to_owned(), stem(parts[at + 1])]);
+                } else if let Some(at) = source_at {
+                    command = package(at);
                     match &parts[at + 1..] {
                         ["lib.rs"] => command.push("--lib".to_owned()),
                         ["main.rs"] => command.push("--bins".to_owned()),
@@ -342,7 +353,8 @@ impl LanguageSupport for RustSupport {
     /// lines instead and makes the report `incomplete`, as does output with no summary at all
     /// (e.g. a compile error). Failures follow the order of the `FAILED` lines; each takes its
     /// location and message from the `---- <name> stdout ----` block: the first
-    /// `panicked at <file>:<line>:<col>:` line and the line after it, or else the block's first
+    /// `panicked at <file>:<line>:<col>:` line and up to four message lines after it (an
+    /// assertion's `left:`/`right:` values included) joined with ` | `, or else the block's first
     /// non-empty line. Only the post-1.73 panic format carries a location.
     fn parse_test_output(&self, stdout: &str, stderr: &str) -> TestReport {
         let text = format!("{stdout}\n{stderr}");
@@ -887,8 +899,18 @@ fn panic_of(block: &[&str]) -> Located {
         let location = file
             .zip(line_no.and_then(|number| number.parse().ok()))
             .map(|(file, number)| (PathBuf::from(file), number));
-        let message = block.get(index + 1).map_or("", |line| line.trim());
-        return (location, message.to_owned());
+        let message = block[index + 1..]
+            .iter()
+            .map(|line| line.trim())
+            .take_while(|line| {
+                !line.is_empty()
+                    && !line.starts_with("note: run with `RUST_BACKTRACE")
+                    && !line.starts_with("stack backtrace:")
+            })
+            .take(4)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return (location, message);
     }
     let message = block
         .iter()
@@ -1533,14 +1555,38 @@ mod tests {
             Err(LangError::Unsupported(_))
         ));
         let file = |path: &str| command(TestTarget::File(PathBuf::from(path)));
-        assert_eq!(file("tests/lang.rs"), "cargo test --test lang");
+        assert_eq!(
+            file("tests/lang.rs"),
+            "cargo test --manifest-path Cargo.toml --test lang"
+        );
+        assert_eq!(
+            file("crates/core/tests/it/main.rs"),
+            "cargo test --manifest-path crates/core/Cargo.toml --test it"
+        );
         assert_eq!(
             file("src/assistance/worker.rs"),
-            "cargo test --workspace assistance::worker::"
+            "cargo test --manifest-path Cargo.toml assistance::worker::"
         );
-        assert_eq!(file("src/lang/mod.rs"), "cargo test --workspace lang::");
-        assert_eq!(file("src/lib.rs"), "cargo test --workspace --lib");
-        assert_eq!(file("src/bin/tool.rs"), "cargo test --workspace --bin tool");
+        assert_eq!(
+            file("crates/core/src/assistance/tests.rs"),
+            "cargo test --manifest-path crates/core/Cargo.toml assistance::tests::"
+        );
+        assert_eq!(
+            file("src/tests/fixtures.rs"),
+            "cargo test --manifest-path Cargo.toml tests::fixtures::"
+        );
+        assert_eq!(
+            file("src/lang/mod.rs"),
+            "cargo test --manifest-path Cargo.toml lang::"
+        );
+        assert_eq!(
+            file("src/lib.rs"),
+            "cargo test --manifest-path Cargo.toml --lib"
+        );
+        assert_eq!(
+            file("src/bin/tool.rs"),
+            "cargo test --manifest-path Cargo.toml --bin tool"
+        );
         assert_eq!(
             command(TestTarget::Pattern("lang::".into())),
             "cargo test --workspace lang::"
@@ -1609,7 +1655,7 @@ mod tests {
             vec![TestFailure {
                 name: "tests::bad".to_owned(),
                 location: Some((PathBuf::from("src/lib.rs"), 12)),
-                message: "assertion `left == right` failed".to_owned(),
+                message: "assertion `left == right` failed | left: 1 | right: 2".to_owned(),
             }]
         );
     }

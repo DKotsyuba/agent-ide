@@ -502,7 +502,8 @@ pub struct TestFailure {
     pub name: String,
     /// `file:line` when the runner names one.
     pub location: Option<(PathBuf, u32)>,
-    /// First line of the assertion or panic message.
+    /// The assertion or panic message: its first line, or a few lines joined with ` | ` when the
+    /// runner's parser keeps the values that explain it.
     pub message: String,
 }
 

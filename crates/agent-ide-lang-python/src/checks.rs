@@ -850,7 +850,7 @@ impl LanguageChecks for PythonChecks {
             .filter(|root| absolute.starts_with(root.as_path()))
             .collect();
         if covering.is_empty() {
-            return Some("no Python project root covers this file");
+            return Some("no Python project root covers this file, so pyright skips it");
         }
         covering
             .iter()
@@ -860,7 +860,9 @@ impl LanguageChecks for PythonChecks {
                     .chosen
                     .is_none()
             })
-            .then_some("the Python project root beside this file has no environment")
+            .then_some(
+                "the Python project root beside this file has no environment; create one or pick it with ide.start environment",
+            )
     }
 
     /// `pyright`.

@@ -427,7 +427,14 @@
     "description": "End this task's IDE session; edited files stay on disk. Lists up to eight test runs started\nin this binding whose results were never collected. Call once when done or before handing off.",
     "inputSchema": {
       "additionalProperties": false,
-      "properties": {},
+      "properties": {
+        "activation_id": {
+          "description": "Optional, accepted for symmetry with ide.start; stop always ends this session's activation.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
       "type": "object"
     },
     "name": "ide.stop"

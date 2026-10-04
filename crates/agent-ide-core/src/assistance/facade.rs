@@ -264,7 +264,9 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Stop,
             json!({
                 "type": "object", "additionalProperties": false,
-                "properties": {}
+                "properties": {
+                    "activation_id": {"type": "string", "minLength": 1, "maxLength": MAX_ACTIVATION_ID_BYTES, "description": "Optional, accepted for symmetry with ide.start; stop always ends this session's activation."}
+                }
             }),
         ),
         schema(
@@ -658,7 +660,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
         ],
         AssistanceTool::Diff => &["mode", "detail_ref", "provenance"],
         AssistanceTool::Inspect => &["detail_ref"],
-        AssistanceTool::Stop => &[],
+        AssistanceTool::Stop => &["activation_id"],
         AssistanceTool::Edit => &[
             "operation_id",
             "path",
@@ -1126,7 +1128,9 @@ pub fn validate_call(
         AssistanceTool::Inspect => {
             required_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
         }
-        AssistanceTool::Stop => {}
+        AssistanceTool::Stop => {
+            optional_string(object, "activation_id", MAX_ACTIVATION_ID_BYTES)?;
+        }
         AssistanceTool::Edit if object.contains_key("changes") => {
             required_string(object, "operation_id", 128)?;
             for field in ["symbol", "lines", "op", "where", "new_name", "content"] {
@@ -3822,7 +3826,8 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             validate_call(AssistanceTool::Stop, json!({"authority":1}))
                 .unwrap_err(),
             AssistanceTool::Stop,
-            "invalid bounded parameters: unknown field \"authority\"".to_string(),
+            "invalid bounded parameters: unknown field \"authority\"; allowed: activation_id"
+                .to_string(),
         ),
         (
             validate_call(AssistanceTool::Context, json!({"../escape":1})).unwrap_err(),

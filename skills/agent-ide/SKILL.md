@@ -171,8 +171,10 @@ failed)` — and says what still works (outline/read from source), what does not
    names the operation instead when it was an insert, delete or rename), follow
    its closed diagnostic state: `current_reported` → `ide.edit` with the
    returned `source_ref`; `current_clean` → `ide.diff`; `unknown` diagnostics
-   → `ide.context`; `not_analysed` means the project check never compiled the
-   file (a Rust file no `mod` declares) — declare it, then edit again. A pending diagnostic still requires `ide.inspect` with its
+   → `ide.context` with `kind: "problems"`; `not_analysed` means the project
+   check never compiled the file — follow the next step its reason names (a
+   Rust file no `mod` declares: declare it; a feature-gated test: run it with
+   that feature). A pending diagnostic still requires `ide.inspect` with its
    returned `detail_ref`. An `outcome_unknown` *result* is a different unknown
    from `unknown` *diagnostics*: the edit's own effect, not just its
    diagnostics, is unproven, so inspect the named path with native host tools

@@ -8,8 +8,12 @@
 //! declares `mod name;` unconditionally and is itself reached. Files are judged on code only:
 //! comments and string/char literals are blanked first ([`code`]).
 //!
-//! Ceilings, each answered "unreached" (a redundant notice, never a false clean): a `mod` with a
-//! `#[path]` attribute; a `mod` gated by any `cfg` or `cfg_attr`, `#[cfg(test)]` included, since
+//! A `#[path = "…"]` declaration reaches the file its literal names relative to the declaring
+//! file's directory, when that file sits in the same directory as the target.
+//!
+//! Ceilings, each answered "unreached" (a redundant notice, never a false clean): any other
+//! `#[path]` declaration (another directory, `..`, a literal continued on a later line, one inside
+//! an inline `mod` block); a `mod` gated by any `cfg` or `cfg_attr`, `#[cfg(test)]` included, since
 //! the check may not meet the condition (`cfg(windows)` on macOS, a target built without its test
 //! harness); a file on the chain with an inner `#![cfg…]` attribute, which makes that whole file
 //! conditional; a module declared inside an inline `mod x { … }` block or a macro; and a module
@@ -24,45 +28,90 @@ const MAX_FILE_BYTES: u64 = 1 << 20;
 /// Upper bound on walk steps; each step moves to the declaring parent module file.
 const MAX_STEPS: usize = 64;
 
-/// Reason reported for a file no build target reaches.
-pub const UNREACHED: &str =
-    "rust check may not have compiled this file — no unconditional `mod` declaration reaches it";
+/// Reason reported for a file no `mod` declaration reaches from a build target at all.
+pub const UNREACHED: &str = "rust check may not have compiled this file — no unconditional `mod` declaration reaches it; declare it, then edit again";
+
+/// Reason reported for a file reached only through a `cfg`/`cfg_attr`/`path` gate: an inner
+/// `#![cfg]` (an integration test behind `feature = "…"`) or a gated `mod` on its chain. Declaring
+/// it again would not help; a build that meets the condition does.
+pub const GATED: &str = "rust check may not have compiled this file — it is built only under a `cfg` condition (feature, platform or test) or through a `#[path]` module; check it with a build or ide.test command that enables it";
 
 /// Reports whether the worktree-relative `path` is reached from a build target of its nearest
-/// package; a file under no package manifest inside `worktree` counts as reached. The edited file
-/// itself and every file on its chain must be readable and free of inner `cfg` attributes.
-pub fn reached(worktree: &Path, path: &Path) -> bool {
+/// package (see [`unreached`]).
+#[cfg(test)]
+fn reached(worktree: &Path, path: &Path) -> bool {
+    unreached(worktree, path).is_none()
+}
+
+/// Returns why the worktree-relative `path` may not be compiled — [`GATED`] when a `cfg`/`path`
+/// gate stands on its chain, [`UNREACHED`] otherwise — or `None` when a build target of its nearest
+/// package reaches it; a file under no package manifest inside `worktree` counts as reached. The
+/// edited file itself and every file on its chain must be readable and free of inner `cfg`
+/// attributes.
+pub fn unreached(worktree: &Path, path: &Path) -> Option<&'static str> {
     let file = worktree.join(path);
-    let Some(package) = file
+    let package = file
         .ancestors()
         .skip(1)
         .take_while(|dir| dir.starts_with(worktree))
         .find(|dir| dir.join("Cargo.toml").is_file())
-        .map(Path::to_path_buf)
-    else {
-        return true;
-    };
-    if code(&file).is_none_or(|text| conditional_file(&text)) {
-        return false;
+        .map(Path::to_path_buf)?;
+    match code(&file) {
+        None => return Some(UNREACHED),
+        Some(text) if conditional_file(&text) => return Some(GATED),
+        Some(_) => {}
     }
     let manifest = std::fs::read_to_string(package.join("Cargo.toml")).unwrap_or_default();
     let mut current = file;
-    for _ in 0..MAX_STEPS {
+    'walk: for _ in 0..MAX_STEPS {
         if is_root(&package, &manifest, &current) {
-            return true;
+            return None;
         }
-        let Some((name, declarers)) = parent_module(&package, &manifest, &current) else {
-            return false;
-        };
-        match declarers
+        let (name, declarers) = parent_module(&package, &manifest, &current)?;
+        // Files beside `current` may name it through `#[path = "…"]` only, never by name.
+        let mut siblings: Vec<PathBuf> = current
+            .parent()
+            .and_then(|dir| std::fs::read_dir(dir).ok())
             .into_iter()
-            .find(|declarer| declares(declarer, &name))
-        {
-            Some(declarer) => current = declarer,
-            None => return false,
+            .flatten()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path != &current
+                    && path.extension().is_some_and(|extension| extension == "rs")
+                    && !declarers.contains(path)
+                    && path.is_file()
+            })
+            .collect();
+        siblings.sort();
+        let candidates = declarers
+            .into_iter()
+            .map(|declarer| (declarer, Some(name.as_str())))
+            .chain(siblings.into_iter().map(|sibling| (sibling, None)));
+        let mut gated = false;
+        for (declarer, by_name) in candidates {
+            match declares(&declarer, by_name, &current) {
+                Declared::Yes => {
+                    current = declarer;
+                    continue 'walk;
+                }
+                Declared::Gated => gated = true,
+                Declared::No => {}
+            }
         }
+        return Some(if gated { GATED } else { UNREACHED });
     }
-    false
+    Some(UNREACHED)
+}
+
+/// Whether one file declares a module: unconditionally, only behind a gate, or not at all.
+enum Declared {
+    /// An unconditional `mod name;` in an unconditional file.
+    Yes,
+    /// `mod name;` is there, but behind a `cfg`/`cfg_attr`/`path` attribute or in a file with an
+    /// inner `#![cfg]`.
+    Gated,
+    /// No `mod name;` at all, or the file is unreadable or too large.
+    No,
 }
 
 /// Reports whether `file` is a crate root of `package`: an auto-discovered target or a target
@@ -119,23 +168,27 @@ fn parent_module(package: &Path, manifest: &str, file: &Path) -> Option<(String,
     Some((name, declarers))
 }
 
-/// Reports whether `file` declares `mod name;` unconditionally: any visibility, with outer
-/// attributes on the same or preceding lines (blank and comment lines between them keep them in
-/// force), none of which is a `cfg`, `cfg_attr` or `path` — an attribute continued over several
-/// lines is judged by its first line. A file that is unreadable, too large, or conditional as a
-/// whole ([`conditional_file`]) declares nothing.
-fn declares(file: &Path, name: &str) -> bool {
-    let Some(text) = code(file) else {
-        return false;
+/// Reports whether `file` declares `target`: by `mod name;` (when `name` is given) or by a
+/// `#[path = "…"] mod x;` whose literal, relative to `file`'s directory, is `target`. Any
+/// visibility, with outer attributes on the same or preceding lines (blank and comment lines
+/// between them keep them in force) — an attribute continued over several lines is judged by its
+/// first line. A declaration under a `cfg`/`cfg_attr` attribute, a by-name declaration redirected
+/// by `path`, or any declaration in a file that is conditional as a whole ([`conditional_file`])
+/// is [`Declared::Gated`]; an unreadable or too large file declares nothing.
+fn declares(file: &Path, name: Option<&str>, target: &Path) -> Declared {
+    let Some((raw, text)) = source(file) else {
+        return Declared::No;
     };
-    if conditional_file(&text) {
-        return false;
-    }
-    // An attribute read so far for the next item makes it conditional or redirects it.
+    let conditional = conditional_file(&text);
+    let dir = file.parent().unwrap_or(Path::new(""));
+    let mut found_gated = false;
+    // A `cfg`/`cfg_attr` attribute read so far for the next item makes it conditional.
     let mut unproven = false;
+    // A `path` attribute read so far for the next item: its literal when on the attribute's line.
+    let mut redirect: Option<Option<String>> = None;
     // Bracket depth of an attribute continued from an earlier line; zero outside one.
     let mut depth = 0;
-    for line in text.lines() {
+    for (line, raw_line) in text.lines().zip(raw.lines()) {
         let mut rest = line.trim();
         if depth > 0 {
             let Some(end) = attribute_end(rest, &mut depth) else {
@@ -149,7 +202,10 @@ fn declares(file: &Path, name: &str) -> bool {
             .and_then(|after| after.strip_prefix('['))
         {
             let head: String = attribute.split_whitespace().collect();
-            unproven |= head.starts_with("cfg") || head.starts_with("path");
+            unproven |= head.starts_with("cfg");
+            if head.starts_with("path") {
+                redirect = Some(path_literal(raw_line));
+            }
             depth = 1;
             let Some(end) = attribute_end(attribute, &mut depth) else {
                 rest = "";
@@ -161,6 +217,7 @@ fn declares(file: &Path, name: &str) -> bool {
             continue;
         }
         let gated = std::mem::take(&mut unproven);
+        let redirect = redirect.take();
         let Some(declaration) = without_visibility(rest).strip_prefix("mod ") else {
             continue;
         };
@@ -168,11 +225,23 @@ fn declares(file: &Path, name: &str) -> bool {
             continue;
         };
         let ident = ident.trim();
-        if !gated && ident.strip_prefix("r#").unwrap_or(ident) == name {
-            return true;
+        let named = name.is_some_and(|name| ident.strip_prefix("r#").unwrap_or(ident) == name);
+        let declared = match &redirect {
+            None => named,
+            Some(Some(literal)) => dir.join(literal) == target,
+            Some(None) => false,
+        };
+        if declared && !gated && !conditional {
+            return Declared::Yes;
         }
+        // A by-name declaration redirected elsewhere leaves the default file unproven, too.
+        found_gated |= declared || named;
     }
-    false
+    if found_gated {
+        Declared::Gated
+    } else {
+        Declared::No
+    }
 }
 
 /// Scans `text` for the `]` that closes an attribute at bracket `depth` (1 right after `#[`),
@@ -217,11 +286,29 @@ fn without_visibility(item: &str) -> &str {
 /// string or char literal replaced by spaces and every line break kept, so a `mod`, `//`, `]` or
 /// `#![cfg` inside one is not syntax. `None` when the file is missing, larger, or not UTF-8.
 fn code(file: &Path) -> Option<String> {
+    source(file).map(|(_, code)| code)
+}
+
+/// `file`'s text and its [`code`] view, line for line.
+fn source(file: &Path) -> Option<(String, String)> {
     if std::fs::metadata(file).map_or(true, |meta| meta.len() > MAX_FILE_BYTES) {
         return None;
     }
-    let text: Vec<char> = std::fs::read_to_string(file).ok()?.chars().collect();
-    Some(blanked_code(&text).into_iter().collect())
+    let raw = std::fs::read_to_string(file).ok()?;
+    let text: Vec<char> = raw.chars().collect();
+    Some((raw, blanked_code(&text).into_iter().collect()))
+}
+
+/// The literal of the first `path = "…"` on one source line (no escapes), `None` when the line
+/// holds none — an attribute whose literal continues on a later line stays unproven.
+fn path_literal(line: &str) -> Option<String> {
+    line.match_indices("path").find_map(|(index, _)| {
+        let rest = line[index + 4..].trim_start().strip_prefix('=')?;
+        let literal = rest.trim_start().strip_prefix('"')?;
+        literal
+            .split_once('"')
+            .map(|(literal, _)| literal.to_owned())
+    })
 }
 
 /// `text` as code only: every comment and string or char literal replaced by spaces, every line
@@ -419,10 +506,12 @@ mod tests {
         assert!(!reached(&root, Path::new("scripts/loose.rs")));
     }
 
-    /// A `#[path]`-redirected declaration is a documented ceiling: the default-named file it
-    /// shadows reads unreached, never guessed clean; a manifest target `path` is a root.
+    /// A `#[path]` declaration reaches the file its literal names beside the declaring file (a
+    /// `./` prefix allowed, other attributes on the line too); the default-named file it shadows,
+    /// a `cfg`-gated one and a by-name `mod` in an unrelated sibling do not. A manifest target
+    /// `path` is a root.
     #[test]
-    fn path_attributes_are_a_ceiling_and_manifest_paths_are_roots() {
+    fn path_attributes_reach_their_literal_and_manifest_paths_are_roots() {
         let root = package(
             "path-attribute",
             &[
@@ -430,7 +519,18 @@ mod tests {
                     "Cargo.toml",
                     "[package]\nname = \"p\"\n[[bin]]\nname = \"extra\"\npath = \"tools/extra.rs\"\n",
                 ),
-                ("src/lib.rs", "#[path = \"elsewhere.rs\"]\nmod shadowed;\n"),
+                (
+                    "src/lib.rs",
+                    "#[path = \"elsewhere.rs\"]\nmod shadowed;\n#[cfg(windows)] #[path = \"gated.rs\"] mod gated_one;\nmod sub;\n",
+                ),
+                (
+                    "src/sub.rs",
+                    "#[allow(dead_code)] #[path = \"./also.rs\"] mod also;\nmod plain;\n",
+                ),
+                ("src/also.rs", ""),
+                ("src/sub/plain.rs", "mod same_name;\n"),
+                ("src/sub/same_name.rs", ""),
+                ("src/gated.rs", ""),
                 ("src/shadowed.rs", ""),
                 ("src/elsewhere.rs", ""),
                 ("tools/extra.rs", "mod util;\n"),
@@ -438,7 +538,11 @@ mod tests {
             ],
         );
         assert!(!reached(&root, Path::new("src/shadowed.rs")));
-        assert!(!reached(&root, Path::new("src/elsewhere.rs")));
+        assert!(reached(&root, Path::new("src/elsewhere.rs")));
+        assert!(reached(&root, Path::new("src/also.rs")));
+        assert!(reached(&root, Path::new("src/sub/plain.rs")));
+        assert!(!reached(&root, Path::new("src/gated.rs")));
+        assert!(!reached(&root, Path::new("src/sub/same_name.rs")));
         assert!(reached(&root, Path::new("tools/extra.rs")));
         assert!(reached(&root, Path::new("tools/util.rs")));
     }
@@ -576,5 +680,34 @@ mod tests {
         );
         assert!(!reached(&example, Path::new("src/tests.rs")));
         assert!(reached(&example, Path::new("src/always.rs")));
+    }
+
+    /// A gate names itself: a feature-gated integration test, a module under it and a `cfg`-gated
+    /// `mod` answer [`GATED`], never the "declare it" advice; an undeclared file keeps
+    /// [`UNREACHED`].
+    #[test]
+    fn gated_files_are_told_apart_from_undeclared_ones() {
+        let root = package(
+            "gated-reason",
+            &[
+                ("Cargo.toml", "[package]\nname = \"g\"\n"),
+                ("src/lib.rs", "#[cfg(windows)]\nmod win;\n"),
+                ("src/win.rs", ""),
+                ("src/orphan.rs", ""),
+                (
+                    "tests/fake_engine.rs",
+                    "#![cfg(feature = \"test-fixtures\")]\nmod common;\n",
+                ),
+                ("tests/common/mod.rs", ""),
+            ],
+        );
+        for gated in ["tests/fake_engine.rs", "tests/common/mod.rs", "src/win.rs"] {
+            assert_eq!(unreached(&root, Path::new(gated)), Some(GATED), "{gated}");
+        }
+        assert_eq!(
+            unreached(&root, Path::new("src/orphan.rs")),
+            Some(UNREACHED)
+        );
+        assert_eq!(unreached(&root, Path::new("src/lib.rs")), None);
     }
 }

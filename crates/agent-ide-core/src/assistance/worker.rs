@@ -4278,7 +4278,15 @@ impl<'a> Worker<'a> {
             .settle_prepared_edit(prepared, &request, expected.clone())
             .await;
         let mut diagnostics = if result == expected && result.outcome.has_post_source() {
-            diagnostics
+            if crate::lang::Language::for_path(Path::new(&request.path)).is_none() {
+                // No language checks this file type (a template, a manifest): nothing will ever
+                // report on it, so `unknown` would send the caller looking for a result.
+                EditDiagnostics::NotAnalysed {
+                    reason: "no IDE language checks this file type".to_owned(),
+                }
+            } else {
+                diagnostics
+            }
         } else {
             EditDiagnostics::Unknown {}
         };
