@@ -1612,7 +1612,7 @@ mod tests {
         assert_eq!(at("Guard").signature, "pub struct Guard");
         assert_eq!(at("Guard/id").signature, "pub id: u32");
         assert_eq!(at("State/Off").signature, "Off");
-        assert_eq!(at("State/Off/why").signature, "Off");
+        assert_eq!(at("State/Off/why").signature, "why: String");
     }
 
     /// The lexical outline is the one the edit path places inserts against.

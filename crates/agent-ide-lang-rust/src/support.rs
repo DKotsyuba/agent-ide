@@ -549,7 +549,8 @@ fn rustfmt_edition(project: &LanguageProject) -> Option<String> {
 }
 
 /// Converts one rust-analyzer symbol (and its children) under `owner`, whose kind is `owner_kind`
-/// (`None` at file level). Line numbers outside `lines` read as empty lines, never panic.
+/// (`None` at file level). Field signatures come from their exact source span so multiple inline
+/// fields on one line remain distinct. Line numbers outside `lines` read as empty lines, never panic.
 fn convert(
     lines: &[&str],
     symbol: lsp::DocumentSymbol,
@@ -559,16 +560,19 @@ fn convert(
     let reported = lines_of(&symbol.range);
     let name_line = (symbol.selection_range.start.line + 1).max(reported.start);
     let decl = declaration_line(lines, reported.start, name_line, true);
-    let start = header_start(lines, decl).min(reported.start);
-    let header: Vec<&str> = (start..decl)
-        .map(|line| line_at(lines, line).trim())
-        .collect();
-
     let server_kind = if symbol.kind == lsp::SymbolKind::INTERFACE {
         SymbolKind::Trait
     } else {
         kind_of(symbol.kind)
     };
+    let start = if server_kind == SymbolKind::Field {
+        reported.start
+    } else {
+        header_start(lines, decl).min(reported.start)
+    };
+    let header: Vec<&str> = (start..decl)
+        .map(|line| line_at(lines, line).trim())
+        .collect();
     let kind = match server_kind {
         SymbolKind::Function | SymbolKind::Method if header.iter().any(|l| is_test_attr(l)) => {
             SymbolKind::Test
@@ -586,13 +590,27 @@ fn convert(
         }
         other => other,
     };
+    let body = LineRange::new(decl, reported.end);
+    let signature = if server_kind == SymbolKind::Field {
+        field_signature(lines, &symbol)
+            .map(|source| {
+                let field_lines = source_lines(&source);
+                signature(
+                    &field_lines,
+                    LineRange::new(1, field_lines.len() as u32),
+                    true,
+                )
+            })
+            .unwrap_or_else(|| signature(lines, body, true))
+    } else {
+        signature(lines, body, true)
+    };
     let name = if server_kind == SymbolKind::Impl {
         impl_segment(&symbol.name)
     } else {
         symbol.name
     };
     let path = owner.child(&name);
-    let body = LineRange::new(decl, reported.end);
     let children = symbol
         .children
         .unwrap_or_default()
@@ -600,7 +618,7 @@ fn convert(
         .map(|child| convert(lines, child, &path, Some(server_kind)))
         .collect();
     Symbol {
-        signature: signature(lines, body, true),
+        signature,
         doc: first_paragraph(header.iter().filter_map(|line| {
             line.strip_prefix("///")
                 .filter(|_| !line.starts_with("////"))
@@ -612,6 +630,62 @@ fn convert(
         body,
         children,
     }
+}
+
+/// Extracts a field from its selected name through its type, retaining visibility before the name
+/// while excluding field attributes and comments from the signature.
+fn field_signature(lines: &[&str], symbol: &lsp::DocumentSymbol) -> Option<String> {
+    let name_line = line_at(lines, symbol.selection_range.start.line + 1);
+    let name_byte = utf16_column_byte(name_line, symbol.selection_range.start.character)?;
+    let prefix = name_line.get(..name_byte)?;
+    let after_attributes = prefix.rsplit_once(']').map_or(prefix, |(_, suffix)| suffix);
+    let visibility = after_attributes.trim();
+    let visibility = if visibility.starts_with("pub") {
+        format!("{visibility} ")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{visibility}{}",
+        source_span(lines, symbol.selection_range.start, symbol.range.end)?
+    ))
+}
+
+/// Returns the UTF-8 source slice covered by LSP positions, converting their UTF-16 columns.
+fn source_span(lines: &[&str], start: lsp::Position, end: lsp::Position) -> Option<String> {
+    if start.line > end.line {
+        return None;
+    }
+    let start_line = line_at(lines, start.line + 1);
+    let start_byte = utf16_column_byte(start_line, start.character)?;
+    let end_line = line_at(lines, end.line + 1);
+    let end_byte = utf16_column_byte(end_line, end.character)?;
+    if start.line == end.line {
+        return Some(start_line.get(start_byte..end_byte)?.to_owned());
+    }
+    let mut text = String::from(start_line.get(start_byte..)?);
+    for line in (start.line + 1)..end.line {
+        text.push('\n');
+        text.push_str(line_at(lines, line + 1));
+    }
+    text.push('\n');
+    text.push_str(end_line.get(..end_byte)?);
+    Some(text)
+}
+
+/// Converts an LSP UTF-16 column on one line to a UTF-8 byte offset, or `None` inside a codepoint.
+fn utf16_column_byte(line: &str, column: u32) -> Option<usize> {
+    let mut units = 0;
+    for (byte, character) in line.char_indices() {
+        if units == column {
+            return Some(byte);
+        }
+        units += character.len_utf16() as u32;
+        if units > column {
+            return None;
+        }
+    }
+    (units == column).then_some(line.len())
 }
 
 /// Caps a server-provided impl path segment while retaining a digest of its original label.
@@ -984,6 +1058,105 @@ fn task_targets(root: &Path) -> Vec<(&'static str, &'static str)> {
 mod tests {
     use super::*;
     use agent_ide_core::lang::TestId;
+
+    /// Inline named-variant fields remain distinct lexical children with declaration-line output.
+    #[test]
+    fn inline_variant_fields_have_exact_names_and_lines() {
+        let source = "\n\n\n\n\n\n#[derive(clap::Subcommand)]\npub enum Release {\n    /// Show version/CHANGELOG edits; --apply performs local edits only.\n    Prepare { version: String, #[arg(long)] apply: bool },\n    /// Publish an accepted CI bundle through a complete draft; never replace a release.\n    Publish { directory: PathBuf },\n    /// Observe one exact tag/commit and validate its run and bytes. No install or wake claim.\n    Wait { #[arg(long)] repo: String, #[arg(long)] tag: String, #[arg(long)] commit: String,\n        #[arg(long, default_value_t=1800)] timeout: u64, #[arg(long)] result_file: Option<PathBuf> },\n}\n";
+        let lexical = crate::lexical::lexical_outline(Path::new("src/release.rs"), source)
+            .expect("clap-style enum can be outlined from source");
+        let release = &lexical.symbols[0];
+        assert_eq!(release.name, "Release");
+        assert_eq!(release.body.start, 8);
+        assert_eq!(
+            release
+                .children
+                .iter()
+                .map(|variant| variant.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Prepare", "Publish", "Wait"]
+        );
+        assert_eq!(
+            release
+                .children
+                .iter()
+                .map(|variant| variant.body.start)
+                .collect::<Vec<_>>(),
+            [10, 12, 14]
+        );
+        assert_eq!(
+            release.children[0]
+                .children
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>(),
+            ["version", "apply"]
+        );
+        assert_eq!(
+            release.children[1]
+                .children
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>(),
+            ["directory"]
+        );
+        assert_eq!(
+            release.children[2]
+                .children
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>(),
+            ["repo", "tag", "commit", "timeout", "result_file"]
+        );
+        assert_eq!(
+            release.children[0].doc.as_deref(),
+            Some("Show version/CHANGELOG edits; --apply performs local edits only.")
+        );
+        assert!(
+            release
+                .children
+                .iter()
+                .flat_map(|variant| &variant.children)
+                .all(|field| field.doc.is_none()),
+            "variant docs must not be copied to fields"
+        );
+
+        let rendered = agent_ide_core::lang::render::outline_text(&lexical);
+        for expected in [
+            "    8  pub enum Release\n",
+            "   10    Prepare    // Show version/CHANGELOG edits; --apply performs local edits only.\n",
+            "   10      version: String\n",
+            "   10      apply: bool\n",
+            "   12    Publish    // Publish an accepted CI bundle through a complete draft; never replace a…\n",
+            "   12      directory: PathBuf\n",
+            "   14    Wait    // Observe one exact tag/commit and validate its run and bytes. No install…\n",
+            "   14      repo: String\n",
+            "   14      tag: String\n",
+            "   14      commit: String\n",
+            "   15      timeout: u64\n",
+            "   15      result_file: Option<PathBuf>\n",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?} in:\n{rendered}"
+            );
+        }
+        assert_eq!(rendered.matches("    Prepare    ").count(), 1, "{rendered}");
+        assert_eq!(rendered.matches("    Publish    ").count(), 1, "{rendered}");
+        assert_eq!(rendered.matches("    Wait    ").count(), 1, "{rendered}");
+
+        let documented_fn = crate::lexical::lexical_outline(
+            Path::new("src/documented.rs"),
+            "/// Function docs.\npub fn documented() {}\n",
+        )
+        .expect("documented function can be outlined from source");
+        assert!(
+            agent_ide_core::lang::render::outline_text(&documented_fn)
+                .contains("    2  pub fn documented()    // Function docs."),
+            "{}",
+            agent_ide_core::lang::render::outline_text(&documented_fn)
+        );
+    }
 
     /// Builds a document symbol spanning 0-based lines `start..=end` with its name on `name_line`.
     #[allow(deprecated)]

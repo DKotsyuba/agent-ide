@@ -460,6 +460,8 @@ pub enum ParameterError {
     /// The published schema stays a plain object (providers such as GLM drop a tool whose schema
     /// uses `allOf`/`if`/`else`), so this either-or rule lives here instead of in the schema.
     ContextTarget,
+    /// `ide.outline` requires a relative file or directory path.
+    OutlineTarget,
     /// `ide.read` needs exactly one of: `symbol`, `path` with `lines`, `path` with `ranges`, or
     /// `symbols`.
     ReadTarget,
@@ -514,6 +516,8 @@ pub enum FieldRule {
     LineRange,
     /// The closed method cannot proceed without the `source_ref` of the read its lines came from.
     RangeEditSourceRef,
+    /// Exact-text changes require a source observation from the file that contains the text.
+    OldTextSourceRef,
     /// A full-file edit without `source_ref` named a file that already exists: it may only create
     /// a missing one, so replacing needs the `source_ref` of a read of that file. The worker, not
     /// the facade, applies this rule, since only it observes whether the path exists.
@@ -561,6 +565,9 @@ impl FieldRule {
                  the new source_ref"
                     .to_string()
             }
+            Self::OldTextSourceRef => {
+                "is required for an old-text change; re-read this file with ide.read and retry with the new source_ref".to_string()
+            }
             Self::ReplaceSourceRef => {
                 "is required to replace an existing file: read it first (ide.read)".to_string()
             }
@@ -595,6 +602,7 @@ impl ParameterError {
                 format!("invalid bounded parameters: \"{field}\" {}", rule.text())
             }
             Self::ContextTarget => CONTEXT_TARGET_MESSAGE.to_string(),
+            Self::OutlineTarget => OUTLINE_TARGET_MESSAGE.to_string(),
             Self::ReadTarget => {
                 "ide.read needs one form: `symbol`, or `path` with `lines`, or `path` with \
                  `ranges`, or `symbols` — exactly one"
@@ -620,6 +628,8 @@ impl ParameterError {
 /// Model-facing text for a context request that names neither a path nor the problems kind.
 const CONTEXT_TARGET_MESSAGE: &str =
     "invalid bounded parameters: ide.context needs either \"path\" or \"kind\":\"problems\"";
+/// Model-facing text for an outline request without its required path.
+const OUTLINE_TARGET_MESSAGE: &str = "invalid bounded parameters: ide.outline needs \"path\" (a file or directory relative to the worktree root)";
 
 /// Returns the closed allowed field list for one logical tool.
 fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
@@ -740,6 +750,9 @@ pub fn validate_call(
     }
     match tool {
         AssistanceTool::Outline => {
+            if !object.contains_key("path") {
+                return Err(ParameterError::OutlineTarget);
+            }
             let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
             if let Some(rule) = path_shape_rule(path.strip_suffix('/').unwrap_or(path)) {
                 return Err(invalid_field("path", rule));
@@ -1198,7 +1211,12 @@ pub fn validate_call(
                 // Line numbers and exact text name the read they came from; the refusal teaches
                 // the re-read the way the single line-range form's does.
                 if !object.contains_key("source_ref") {
-                    return Err(invalid_field("source_ref", FieldRule::RangeEditSourceRef));
+                    let rule = if changes.iter().any(|entry| entry.get("old").is_some()) {
+                        FieldRule::OldTextSourceRef
+                    } else {
+                        FieldRule::RangeEditSourceRef
+                    };
+                    return Err(invalid_field("source_ref", rule));
                 }
                 required_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?;
             } else {
@@ -3868,6 +3886,11 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
                 .to_string(),
         ),
         (
+            validate_call(AssistanceTool::Outline, json!({})).unwrap_err(),
+            AssistanceTool::Outline,
+            "invalid bounded parameters: ide.outline needs \"path\" (a file or directory relative to the worktree root)".to_string(),
+        ),
+        (
             validate_call(
                 AssistanceTool::Edit,
                 json!({"operation_id":"o","path":"a.rs","lines":"1-2","content":"x"}),
@@ -3877,6 +3900,15 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             "invalid bounded parameters: \"source_ref\" is required for a line-range edit; \
              re-read the lines (ide.read) and retry with the new source_ref"
                 .to_string(),
+        ),
+        (
+            validate_call(
+                AssistanceTool::Edit,
+                json!({"operation_id":"o","path":"a.rs","changes":[{"old":"x","new":"y"}]}),
+            )
+            .unwrap_err(),
+            AssistanceTool::Edit,
+            "invalid bounded parameters: \"source_ref\" is required for an old-text change; re-read this file with ide.read and retry with the new source_ref".to_string(),
         ),
         (
             validate_call(
@@ -4037,7 +4069,7 @@ fn edit_changes_shape_matrix() {
     );
     assert_eq!(
         batch(false, json!([{"old":"a","new":"b"}])).unwrap_err(),
-        invalid_field("source_ref", FieldRule::RangeEditSourceRef)
+        invalid_field("source_ref", FieldRule::OldTextSourceRef)
     );
     // No address, two addresses, a bad op, a bad where, a missing payload.
     assert!(batch(true, json!([{"content":"x"}])).is_err());

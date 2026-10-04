@@ -272,3 +272,7 @@ current daemon.
 
 Do not assume `ide.check` or `ide.finish` exist. Discover whether `ide.edit` is
 offered for this session; its absence never blocks the truthful native fallback.
+
+Claude Code's built-in read-only reviewer agents have a fixed tool list. To let a custom agent use
+Agent IDE, add the `mcp__agent-ide__ide_*` tools it needs to that agent's `tools:` frontmatter and
+include `ide.start` when it needs an activation. The bundled `ide-reviewer` agent is an example.
