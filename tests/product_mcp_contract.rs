@@ -5336,7 +5336,7 @@ async fn a_pending_edit_is_collected_by_inspect_once_its_check_settles() {
     // characters of "é" are 600 bytes, so a character-bound truncation used to leave a message
     // no closed reply could carry.
     let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 12");
-    std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
+    write_problems_count(&fixture.root, "1");
     {
         let cargo = home.join(".rustup/toolchains/fake/bin/cargo");
         let script = std::fs::read_to_string(&cargo).unwrap();
@@ -5405,7 +5405,7 @@ async fn a_pending_edit_is_collected_by_inspect_once_its_check_settles() {
 async fn a_pending_edit_under_a_capped_check_of_other_files_settles_unknown() {
     let fixture = ProductFixture::new(json!([]));
     let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 12");
-    std::fs::write(fixture.root.join("problems.count"), "600").unwrap();
+    write_problems_count(&fixture.root, "600");
     {
         let cargo = home.join(".rustup/toolchains/fake/bin/cargo");
         let script = std::fs::read_to_string(&cargo).unwrap();
@@ -17126,7 +17126,7 @@ async fn eyes_claude_post_hook_delivers_problem_block_and_delta() {
     // settled, however long the inspect polls take.
     let home =
         enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
-    std::fs::write(fixture.root.join("problems.count"), "2").unwrap();
+    write_problems_count(&fixture.root, "2");
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
     let (mut actor, checking) = eyes_claude_actor(&fixture, "claude-eyes").await;
     // The first due plate reaches the first post hook after activation (T22B).
@@ -17149,7 +17149,7 @@ async fn eyes_claude_post_hook_delivers_problem_block_and_delta() {
             .starts_with("rust: ready; errors: 2; warnings: 0")
     );
 
-    std::fs::write(fixture.root.join("problems.count"), "5").unwrap();
+    write_problems_count(&fixture.root, "5");
     let _ = actor.claude_native_post(&fixture, "Edit").await;
     let changed = await_eyes_result(&mut actor, &fixture).await;
     assert_eq!(
@@ -17340,7 +17340,7 @@ async fn eyes_codex_reply_carries_due_plate_and_delta() {
     let fixture = ProductFixture::new(json!([]));
     // The fake cargo holds its first run briefly so the activation reply cannot carry the result.
     let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 1");
-    std::fs::write(fixture.root.join("problems.count"), "2").unwrap();
+    write_problems_count(&fixture.root, "2");
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
     let mut actor = ProductActor::new(&fixture, "codex-eyes").await;
 
@@ -17446,7 +17446,7 @@ async fn eyes_codex_managed_reply_carries_due_plate_after_native_edit() {
     let fixture = ProductFixture::new(json!([]));
     // The fake cargo holds its first run briefly so the activation reply cannot carry the result.
     let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 1");
-    std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
+    write_problems_count(&fixture.root, "1");
     let mut mcp = Mcp::start_managed_with_home(&fixture.config, &fixture.root, Some(&home)).await;
     let state = fixture.state();
     let actor = "managed-eyes";
@@ -17502,7 +17502,7 @@ async fn eyes_codex_managed_reply_carries_due_plate_after_native_edit() {
     }
 
     // A native edit between two tool calls is noticed without any hook stream.
-    std::fs::write(fixture.root.join("problems.count"), "3").unwrap();
+    write_problems_count(&fixture.root, "3");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let delta = loop {
         next += 1;
@@ -17596,9 +17596,23 @@ fn managed_hook_context(stdout: &str) -> String {
         .to_owned()
 }
 
+/// Publishes the fake checker's problem count atomically (staged beside the worktree, then
+/// renamed): a check running concurrently reads the old or the new count, never the empty file a
+/// truncating write briefly leaves, which the fake checker would report as zero problems.
+fn write_problems_count(root: &Path, count: &str) {
+    let staged = root.with_file_name("problems.count.staged");
+    std::fs::write(&staged, count).unwrap();
+    std::fs::rename(&staged, root.join("problems.count")).unwrap();
+}
+
 /// Polls one actor's paired managed native post hooks until one delivers exactly `expected`
 /// (T29B §7). No `ide.*` call participates in this loop: the hook carrier is the only channel.
 /// Intermediate `checking (…)` plates are legitimately delivered once each and simply consumed.
+///
+/// Only the first post is a writer (`Bash`), scheduling the check for the caller's native change;
+/// the rest are the inert `clocksleep`, which still carries due plates. A writer every 150 ms
+/// re-arms the debounce faster than debounce plus fingerprint can finish on a slow runner, so the
+/// awaited check would never start.
 async fn await_eyes_codex_hook_plate(
     root: &Path,
     session: &str,
@@ -17606,18 +17620,27 @@ async fn await_eyes_codex_hook_plate(
     expected: &str,
     poll: &mut usize,
 ) -> String {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs(30);
+    let first = *poll + 1;
+    let mut delivered = Vec::new();
     loop {
         *poll += 1;
+        let tool = if *poll == first { "Bash" } else { "clocksleep" };
         let stdout =
-            managed_native_post(root, session, actor, &format!("native-{poll}"), "Bash").await;
+            managed_native_post(root, session, actor, &format!("native-{poll}"), tool).await;
         let context = managed_hook_context(&stdout);
         if context == expected {
             return context;
         }
+        if !context.is_empty() {
+            delivered.push(format!("{}ms {context:?}", started.elapsed().as_millis()));
+        }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "no problem block was delivered on a managed hook: {context:?}"
+            "no problem block was delivered on a managed hook: actor {actor}, expected \
+             {expected:?}, {} polls, delivered instead: {delivered:?}",
+            *poll + 1 - first
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
@@ -17668,7 +17691,7 @@ async fn eyes_codex_managed_native_post_delivers_plate_and_delta_without_ide_cal
     // releases it, so no activation reply can ever consume it before a hook polls.
     let home =
         enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
-    std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
+    write_problems_count(&fixture.root, "1");
     let base = rendezvous_area("eyes-hooks");
     let root = base.join("rendezvous");
     let mut mcp =
@@ -17708,7 +17731,7 @@ async fn eyes_codex_managed_native_post_delivers_plate_and_delta_without_ide_cal
     );
 
     // A native edit that no `ide.*` call ever observes still produces the (+1) delta, on a hook.
-    std::fs::write(fixture.root.join("problems.count"), "2").unwrap();
+    write_problems_count(&fixture.root, "2");
     let delta = await_eyes_codex_hook_plate(
         &root,
         session,
@@ -17760,7 +17783,7 @@ async fn eyes_codex_reply_carrier_consumes_the_plate_before_the_native_hook() {
     // below is the first carrier to run after the release.
     let home =
         enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
-    std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
+    write_problems_count(&fixture.root, "1");
     let base = rendezvous_area("eyes-reply-first");
     let root = base.join("rendezvous");
     let mut mcp =
@@ -17833,7 +17856,7 @@ async fn eyes_codex_concurrent_hook_and_reply_deliver_exactly_one_plate() {
     let fixture = ProductFixture::new(json!([]));
     let home =
         enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
-    std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
+    write_problems_count(&fixture.root, "1");
     let base = rendezvous_area("eyes-concurrent");
     let root = base.join("rendezvous");
     let mut mcp =
@@ -17938,7 +17961,7 @@ async fn eyes_codex_parent_and_two_children_are_isolated_without_route_fallback(
     let fixture = ProductFixture::new(json!([]));
     let home =
         enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
-    std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
+    write_problems_count(&fixture.root, "1");
     let base = rendezvous_area("eyes-family");
     let root = base.join("rendezvous");
     let state = fixture.state();
@@ -18028,7 +18051,7 @@ async fn eyes_codex_parent_and_two_children_are_isolated_without_route_fallback(
 
     // One shared native edit: every actor's own hooks deliver the same delta exactly once,
     // each through its own binding — an entangled route would consume a sibling's due plate.
-    std::fs::write(fixture.root.join("problems.count"), "2").unwrap();
+    write_problems_count(&fixture.root, "2");
     for actor in [parent, children[0], children[1]] {
         let delta = await_eyes_codex_hook_plate(
             &root,
@@ -18075,7 +18098,7 @@ async fn eyes_codex_two_sessions_on_one_repository_deliver_once_across_routes() 
     let fixture = ProductFixture::new(json!([]));
     let home =
         enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
-    std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
+    write_problems_count(&fixture.root, "1");
     let base = rendezvous_area("eyes-sessions");
     let root = base.join("rendezvous");
     let mut mcp =
@@ -18136,7 +18159,7 @@ async fn eyes_codex_two_sessions_on_one_repository_deliver_once_across_routes() 
         "<agent-ide>\nrust: 1 error, 0 warnings\n</agent-ide>"
     );
 
-    std::fs::write(fixture.root.join("problems.count"), "2").unwrap();
+    write_problems_count(&fixture.root, "2");
     let expected = "<agent-ide>\nrust: 2 errors (+1), 0 warnings\n</agent-ide>";
     let delta = await_eyes_codex_hook_plate(&root, session_a, actor, expected, &mut next).await;
     assert_eq!(delta, expected);
@@ -18172,7 +18195,7 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
     // Gate-held checks: the first result cannot be consumed by any activation reply.
     let home =
         enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
-    std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
+    write_problems_count(&fixture.root, "1");
     let base = rendezvous_area("eyes-lifecycle");
     let root = base.join("rendezvous");
     let mut mcp =
@@ -18334,7 +18357,7 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
 
     // A real native Pre→Post still works after the rejected self call: the edited check inputs
     // rerun and the paired native post delivers the (+1) delta (T29B final review 4).
-    std::fs::write(fixture.root.join("problems.count"), "2").unwrap();
+    write_problems_count(&fixture.root, "2");
     let delta = await_eyes_codex_hook_plate(
         &root,
         session,
@@ -18426,7 +18449,7 @@ async fn eyes_claude_method_replies_never_carry_the_plate() {
     let fixture = ProductFixture::new(json!([]));
     let home =
         enable_fake_rust_checks_holding(&fixture, &fixture.base, &hold_checks_at_gate(&fixture));
-    std::fs::write(fixture.root.join("problems.count"), "2").unwrap();
+    write_problems_count(&fixture.root, "2");
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
     let (mut actor, checking) = eyes_claude_actor(&fixture, "claude-eyes-replies").await;
     assert_eq!(checking.matches("<agent-ide>").count(), 1, "{checking}");
@@ -18510,7 +18533,7 @@ async fn eyes_claude_native_post_delivers_due_first_check_plate_once() {
 
     let fixture = ProductFixture::new(json!([]));
     let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 20");
-    std::fs::write(fixture.root.join("problems.count"), "1").unwrap();
+    write_problems_count(&fixture.root, "1");
     let mut daemon = fixture.daemon_with_home(Some(&home)).await;
     let mut actor = ProductActor::new(&fixture, "claude-eyes-native-post").await;
 
