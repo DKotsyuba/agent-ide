@@ -1459,10 +1459,8 @@ mod tests {
         assert!(text.contains("No write occurred"));
         assert!(text.contains("this file changed or the source_ref missed part of its read"));
         assert!(
-            text.contains("Retry with the newest source_ref below")
-                && text.contains(
-                    "if none is given, re-read with ide.read and inspect every page first"
-                ),
+            text.contains("Re-read with ide.read and inspect every page before retrying")
+                && !text.contains("newest source_ref"),
             "{text}"
         );
     }
