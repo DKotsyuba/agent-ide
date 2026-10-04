@@ -13,6 +13,8 @@ use crate::lang::{Language, TestReport};
 
 /// Maximum combined stdout and stderr retained for `ide.inspect`.
 const MAX_OUTPUT: usize = 256 * 1024;
+/// Maximum output tail retained beside the paged full result.
+const OUTPUT_TAIL_BYTES: usize = 4 * 1024;
 /// Completed results stay queryable for ten minutes unless observed earlier.
 const COMPLETED_TTL: Duration = Duration::from_secs(600);
 /// Pipe drain grace after a budget kill; never extends a run indefinitely for an orphan reader.
@@ -117,6 +119,20 @@ pub struct JobStatus {
     pub explicit_command: bool,
 }
 
+/// Execution settings for one exact test command after facade validation.
+pub struct TestCommandOptions {
+    /// Working directory already verified beneath the worktree root by the caller.
+    pub cwd: PathBuf,
+    /// Validated environment overrides, applied over the inherited environment.
+    pub env: Vec<(String, String)>,
+    /// Language whose parser is tried before the registered runner parsers.
+    pub language: Language,
+    /// Maximum wall-clock runtime before the process group is killed.
+    pub budget: Duration,
+    /// Owner-scoped detail reference retaining the command's full output.
+    pub detail_ref: String,
+}
+
 /// Sends a best-effort process-group kill if daemon shutdown drops a running task.
 #[cfg(unix)]
 struct KillOnDrop {
@@ -151,6 +167,42 @@ impl TestRuns {
         detail_ref: String,
         owner: &BindingRef,
     ) -> StartResult {
+        self.start_with_options(
+            root.clone(),
+            argv,
+            owner,
+            TestCommandOptions {
+                cwd: root,
+                env: Vec::new(),
+                language,
+                budget,
+                detail_ref,
+            },
+        )
+    }
+
+    /// Starts the command described by `options`, reserving one live job for `root`.
+    ///
+    /// `root` partitions job exclusion and status; `argv` is the exact command; `owner` scopes
+    /// status and output access. `options.cwd` is the execution directory already resolved beneath
+    /// `root`; its `env` replaces inherited values with the same names, its `language` selects the
+    /// primary output parser, its `budget` bounds runtime, and its `detail_ref` retains full output.
+    /// Returns whether the command started, an existing job is running, or spawn failed; facade
+    /// bounds and worktree containment are the caller's responsibility.
+    pub fn start_with_options(
+        &self,
+        root: PathBuf,
+        argv: Vec<String>,
+        owner: &BindingRef,
+        options: TestCommandOptions,
+    ) -> StartResult {
+        let TestCommandOptions {
+            cwd,
+            env,
+            language,
+            budget,
+            detail_ref,
+        } = options;
         let mut state = match self.0.lock() {
             Ok(state) => state,
             Err(error) => {
@@ -167,7 +219,7 @@ impl TestRuns {
         {
             return StartResult::Running(*id, job.started.elapsed());
         }
-        let child = match spawn_command(&root, &argv) {
+        let child = match spawn_command(&cwd, &argv, &env) {
             Ok(child) => child,
             Err(error) => {
                 return StartResult::Failed {
@@ -304,7 +356,7 @@ impl TestRuns {
     }
 
     /// Drops buffered output after its paged copy is retained by the owner's detail ledger,
-    /// keeping only the bounded runner line later status lines quote.
+    /// keeping only a bounded output tail for later status lines.
     /// Identifiers are daemon-unique, so the run needs no worktree to be named again.
     pub fn clear_output(&self, id: u64, binding: &[u8; 32]) {
         if let Ok(mut state) = self.0.lock()
@@ -312,11 +364,7 @@ impl TestRuns {
             && &job.owner == binding
             && let Some(result) = &mut job.result
         {
-            result.output = if result.output.trim().is_empty() {
-                String::new()
-            } else {
-                runner_excerpt(&result.output)
-            };
+            result.output = output_tail(&result.output);
             result.output.shrink_to_fit();
             result.output_paged = true;
         }
@@ -347,18 +395,16 @@ impl TestRuns {
         render_status_line(*id, job)
     }
 
-    /// Returns an undelivered current status line owned by one binding.
+    /// Returns an undelivered current status line for the newest run owned by one binding.
     pub fn status_line_for_binding(&self, binding: &[u8; 32]) -> Option<String> {
         let state = self.0.lock().ok()?;
-        let (_, owner_job) = state
+        let (id, job) = state
             .jobs
             .iter()
             .rev()
             .find(|(_, job)| &job.owner == binding)?;
-        let root = &owner_job.root;
-        let (id, job) = state.jobs.iter().rev().find(|(_, job)| &job.root == root)?;
         let line = render_status_line(*id, job)?;
-        (state.delivered_status.get(root) != Some(&line)).then_some(line)
+        (state.delivered_status.get(&job.root) != Some(&line)).then_some(line)
     }
 
     /// Marks one exact current status line delivered for its starting binding.
@@ -378,10 +424,8 @@ impl TestRuns {
         let owner_id = *owner_id;
         let is_current = state
             .jobs
-            .iter()
-            .rev()
-            .find(|(_, job)| job.root == root)
-            .and_then(|(id, job)| render_status_line(*id, job))
+            .get(&owner_id)
+            .and_then(|job| render_status_line(owner_id, job))
             .as_deref()
             == Some(line);
         state.delivered_status.insert(root, line.to_owned());
@@ -554,30 +598,54 @@ pub(super) fn runner_excerpt(output: &str) -> String {
     excerpt
 }
 
-/// Reports whether a settled run has no parsed test counts and was not budget-stopped. The
-/// explicit-command caller treats this as a shell command rather than a test runner, including
-/// successful zero-output commands, and quotes its output instead of a runner's failure list.
+/// Keeps the output's final bounded bytes without splitting a UTF-8 character.
+pub(super) fn output_tail(output: &str) -> String {
+    let mut start = output.len().saturating_sub(OUTPUT_TAIL_BYTES);
+    while !output.is_char_boundary(start) {
+        start += 1;
+    }
+    if start > 0
+        && let Some(newline) = output[start..].find('\n')
+        && newline + 1 < output.len() - start
+    {
+        start += newline + 1;
+    }
+    output[start..].to_owned()
+}
+
+/// Reports whether a run lacks a recognized summary with test counts and was not budget-stopped.
+/// Explicit commands and selected runners both use this to return the exit status and output tail.
 pub fn summary_absent(result: &RunResult) -> bool {
-    !result.stopped && result.report.passed == 0 && result.report.failed == 0
+    !result.stopped
+        && result.report.incomplete
+        && result.report.passed == 0
+        && result.report.failed == 0
 }
 
 /// Runs one command with inherited environment, bounded output, a process-group budget kill,
 /// and language-native output parsing.
 #[cfg(test)]
 async fn run(root: &PathBuf, argv: &[String], language: Language, budget: Duration) -> RunResult {
-    match spawn_command(root, argv) {
+    match spawn_command(root, argv, &[]) {
         Ok(child) => run_child(language, budget, child).await,
         Err(error) => failed_run(budget, error.to_string()),
     }
 }
 
-/// Spawns an exact argv from the worktree with inherited environment and a private process group.
+/// Spawns an exact non-empty argv with inherited environment, overrides, and a private process group.
 ///
 /// When a registered language pins the toolchain of the command's program (see
 /// [`LanguageSupport::test_toolchain`](crate::lang::LanguageSupport::test_toolchain)), that
 /// executable runs instead and its directory leads `PATH`, so the tools it starts resolve from
-/// the same toolchain rather than through a version-manager proxy.
-fn spawn_command(root: &PathBuf, argv: &[String]) -> io::Result<tokio::process::Child> {
+/// the same toolchain rather than through a version-manager proxy. `cwd` is the working directory,
+/// already checked against the worktree by the worker; `env` replaces inherited values with the
+/// same names. The child's stdin is closed and stdout/stderr are captured; empty argv and OS spawn
+/// failures are returned, while the caller owns the execution budget and reaping.
+fn spawn_command(
+    cwd: &PathBuf,
+    argv: &[String],
+    env: &[(String, String)],
+) -> io::Result<tokio::process::Child> {
     let Some((program, args)) = argv.split_first() else {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty argv"));
     };
@@ -589,6 +657,7 @@ fn spawn_command(root: &PathBuf, argv: &[String]) -> io::Result<tokio::process::
         |(executable, _)| executable.clone(),
     );
     let mut command = tokio::process::Command::new(executable);
+    command.envs(env.iter().map(|(key, value)| (key, value)));
     if let Some((_, bin)) = &toolchain {
         let path = std::env::var_os("PATH").unwrap_or_default();
         let mut joined = std::ffi::OsString::from(bin);
@@ -598,7 +667,7 @@ fn spawn_command(root: &PathBuf, argv: &[String]) -> io::Result<tokio::process::
     }
     command
         .args(args)
-        .current_dir(root)
+        .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -662,6 +731,17 @@ async fn run_child(
     let bytes = combined.lock().await.iter().copied().collect::<Vec<_>>();
     let output = String::from_utf8_lossy(&bytes).into_owned();
     let mut report = language.support().parse_test_output(&output, "");
+    if report.passed == 0 && report.failed == 0 {
+        for candidate in crate::lang::registered() {
+            let parsed = candidate.support().parse_test_output(&output, "");
+            if (report.incomplete && !parsed.incomplete)
+                || parsed.passed.saturating_add(parsed.failed)
+                    > report.passed.saturating_add(report.failed)
+            {
+                report = parsed;
+            }
+        }
+    }
     report.incomplete |= stopped || status.is_none();
     RunResult {
         report,
@@ -784,6 +864,25 @@ mod runner_tests {
         assert_eq!(result.report.failed, 0);
     }
 
+    /// Applies explicit cwd and environment options to a launched process.
+    #[tokio::test]
+    async fn explicit_command_uses_working_directory_and_environment() {
+        let cwd = std::env::temp_dir().canonicalize().unwrap();
+        let child = spawn_command(
+            &cwd,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf '%s\\npass\\n' \"$RUN_MARKER\"".into(),
+            ],
+            &[("RUN_MARKER".into(), "from-env".into())],
+        )
+        .unwrap();
+        let result = run_child(crate::lang::testing::ALPHA, Duration::from_secs(2), child).await;
+        assert!(result.output.starts_with("from-env\n"), "{}", result.output);
+        assert_eq!((result.report.passed, result.report.failed), (1, 0));
+    }
+
     /// Kills and reaps a sleeping process group when the budget expires.
     #[cfg(unix)]
     #[tokio::test]
@@ -891,7 +990,8 @@ mod runner_tests {
 
     /// A status lookup answers the run's own actor and channel in any binding generation, and
     /// refuses another actor's retained run in the same worktree, whose failures and rerun
-    /// command stay with the actor that started it.
+    /// command stay with the actor that started it. Plates continue to show the owner's run when
+    /// a later activation starts another actor's job in the same worktree.
     #[tokio::test]
     async fn status_lookup_is_scoped_to_the_starting_actor() {
         let runs = TestRuns::default();
@@ -926,6 +1026,30 @@ mod runner_tests {
             runs.get(&root, 1, &other).is_none(),
             "another actor in the same worktree does not read the run"
         );
+        assert!(matches!(
+            runs.start(
+                root.clone(),
+                vec!["/bin/echo".into(), "pass".into()],
+                crate::lang::testing::ALPHA,
+                Duration::from_secs(10),
+                "rb".into(),
+                &other,
+            ),
+            StartResult::Started(2)
+        ));
+        for _ in 0..500 {
+            if runs
+                .get(&root, 2, &other)
+                .is_some_and(|status| status.result.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let owner_plate = runs.status_line_for_binding(&owner.fingerprint()).unwrap();
+        let other_plate = runs.status_line_for_binding(&other.fingerprint()).unwrap();
+        assert!(owner_plate.starts_with("tests #1:"), "{owner_plate}");
+        assert!(other_plate.starts_with("tests #2:"), "{other_plate}");
     }
 
     /// Reports an uncollected run with its command until the owner reads the settled result.

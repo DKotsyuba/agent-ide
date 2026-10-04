@@ -46,6 +46,16 @@ use crate::{
 
 const MAX_PARAMETER_BYTES: usize = 4 * 1024;
 const MAX_TEXT_BYTES: usize = 512;
+/// Maximum combined UTF-8 bytes across explicit `ide.test` argv entries.
+const MAX_COMMAND_BYTES: usize = 16 * 1024;
+/// Larger envelope for `ide.test` argv and its optional command environment.
+const MAX_TEST_PARAMETERS_BYTES: usize = 24 * 1024;
+/// Maximum variables accepted by the explicit test-command environment.
+const MAX_ENV_ENTRIES: usize = 32;
+/// Maximum UTF-8 bytes in one environment variable name.
+const MAX_ENV_NAME_BYTES: usize = 128;
+/// Maximum UTF-8 bytes in one environment variable value.
+const MAX_ENV_VALUE_BYTES: usize = 4 * 1024;
 const MAX_DETAIL_REF_BYTES: usize = 128;
 /// Maximum UTF-8 relative source path accepted from a model request.
 const MAX_RELATIVE_PATH_BYTES: usize = 1024;
@@ -322,7 +332,9 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "symbol": {"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES, "description":"Run the tests that reference this symbol (`file#Owner/name`)."},
                     "path": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"Run the tests in this file or directory."},
                     "pattern": {"type":"string", "minLength":1, "maxLength":MAX_TEXT_BYTES, "description":"Run tests whose name matches this substring (runner filter)."},
-                    "command": {"type":"array", "minItems":1, "maxItems":64, "items":{"type":"string", "maxLength":MAX_TEXT_BYTES}, "description":"Explicit argv to run instead of the detected runner."},
+                    "command": {"type":"array", "minItems":1, "maxItems":64, "items":{"type":"string", "maxLength":MAX_COMMAND_BYTES}, "description":"Explicit argv to run instead of the detected runner; all argument bytes together are limited to 16 KiB."},
+                    "cwd": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"Working directory relative to the worktree root; must resolve inside the worktree. Only with `command`."},
+                    "env": {"type":"object", "maxProperties":MAX_ENV_ENTRIES, "additionalProperties":{"type":"string", "maxLength":MAX_ENV_VALUE_BYTES}, "description":"Environment variables added to the inherited environment for this explicit command. Only with `command`; names are bounded environment identifiers."},
                     "status": {"type":"integer", "minimum":1, "description":"Re-read run number N (from `tests #N`) instead of starting one."},
                     "budget_s": {"type":"integer", "minimum":1, "maximum":600, "default":120, "description":"Seconds before the run is stopped and reported as timed out."}
                 }
@@ -640,16 +652,18 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
         AssistanceTool::Read => &["symbol", "path", "lines", "symbols", "ranges"],
         AssistanceTool::Symbol => &["symbol", "usages", "callers", "callees", "history"],
         AssistanceTool::Graph => &["symbol", "direction", "depth", "tests"],
-        AssistanceTool::Test => &["symbol", "path", "pattern", "command", "status", "budget_s"],
+        AssistanceTool::Test => &[
+            "symbol", "path", "pattern", "command", "cwd", "env", "status", "budget_s",
+        ],
     }
 }
 
 /// Returns the hard argument-object byte limit for one logical tool.
 fn parameter_limit(tool: AssistanceTool) -> usize {
-    if tool == AssistanceTool::Edit {
-        crate::changes::edit::MAX_EDIT_ARGUMENT_BYTES
-    } else {
-        MAX_PARAMETER_BYTES
+    match tool {
+        AssistanceTool::Edit => crate::changes::edit::MAX_EDIT_ARGUMENT_BYTES,
+        AssistanceTool::Test => MAX_TEST_PARAMETERS_BYTES,
+        _ => MAX_PARAMETER_BYTES,
     }
 }
 
@@ -848,6 +862,52 @@ pub fn validate_call(
                 }
             }
             optional_string(object, "pattern", MAX_TEXT_BYTES)?;
+            if object.contains_key("cwd") || object.contains_key("env") {
+                if !object.contains_key("command") {
+                    return Err(invalid_field("cwd", FieldRule::OneOf("only with command")));
+                }
+                if let Some(cwd) = object.get("cwd") {
+                    let cwd = cwd
+                        .as_str()
+                        .ok_or_else(|| invalid_field("cwd", FieldRule::String))?;
+                    if cwd.len() > MAX_RELATIVE_PATH_BYTES
+                        || (cwd != "." && path_shape_rule(cwd).is_some())
+                    {
+                        return Err(invalid_field("cwd", FieldRule::RelativePath));
+                    }
+                }
+                if let Some(env) = object.get("env") {
+                    let values = env
+                        .as_object()
+                        .filter(|env| env.len() <= MAX_ENV_ENTRIES)
+                        .ok_or_else(|| {
+                            invalid_field(
+                                "env",
+                                FieldRule::OneOf("an object with at most 32 environment entries"),
+                            )
+                        })?;
+                    for (name, value) in values {
+                        let valid_name = !name.is_empty()
+                            && name.len() <= MAX_ENV_NAME_BYTES
+                            && (name.as_bytes()[0].is_ascii_alphabetic() || name.starts_with('_'))
+                            && name
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+                        if !valid_name
+                            || value.as_str().is_none_or(|value| {
+                                value.len() > MAX_ENV_VALUE_BYTES || value.contains('\0')
+                            })
+                        {
+                            return Err(invalid_field(
+                                "env",
+                                FieldRule::OneOf(
+                                    "environment names and values must be bounded strings without NUL",
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
             if let Some(command) = object.get("command") {
                 let argv = command
                     .as_array()
@@ -858,13 +918,17 @@ pub fn validate_call(
                             FieldRule::OneOf("a non-empty argv array with at most 64 entries"),
                         )
                     })?;
+                let mut command_bytes = 0usize;
                 if argv.iter().any(|arg| {
-                    arg.as_str()
-                        .is_none_or(|arg| arg.len() > MAX_TEXT_BYTES || arg.contains('\0'))
+                    let Some(arg) = arg.as_str() else { return true };
+                    command_bytes = command_bytes.saturating_add(arg.len());
+                    arg.len() > MAX_COMMAND_BYTES
+                        || arg.contains('\0')
+                        || command_bytes > MAX_COMMAND_BYTES
                 }) {
                     return Err(invalid_field(
                         "command",
-                        FieldRule::OneOf("strings up to 512 bytes without NUL"),
+                        FieldRule::OneOf("argv strings without NUL totaling at most 16384 bytes"),
                     ));
                 }
             }
@@ -3521,10 +3585,12 @@ impl StdioFacade {
 
     /// Run tests selected by `symbol` (the tests that reference it), by `path`, by name
     /// `pattern`, or an explicit `command`; one background run per worktree under `budget_s`.
+    /// Explicit commands may set a worktree-relative `cwd` and bounded inherited-environment
+    /// overrides through `env`; their argv is limited to 16 KiB in total.
     /// Returns the pass/fail line with an exact rerun command; full output is paged through
-    /// ide.inspect (`status` re-reads a run). A summary-less explicit command waits briefly and
-    /// includes its exit code and bounded output inline when it finishes inside that window. Use
-    /// it instead of running the test command in a shell: exact selection, bounded output.
+    /// ide.inspect (`status` re-reads a run). Known runner summaries are parsed regardless of how
+    /// the runner was launched; otherwise the result includes the exit code and bounded output
+    /// tail. Use it instead of running the test command in a shell: bounded selection and output.
     #[tool(name = "ide.test", input_schema = tool_schemas()[10].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false))]
     async fn test(
@@ -3858,6 +3924,41 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
                 .to_owned(),
         ),
     ]
+}
+
+/// Keeps explicit test commands useful for package work while enforcing their aggregate bounds.
+#[cfg(test)]
+#[test]
+fn explicit_test_command_accepts_cwd_env_and_16k_argv() {
+    let command = "x".repeat(MAX_COMMAND_BYTES);
+    assert!(
+        validate_call(
+            AssistanceTool::Test,
+            json!({"command":[command],"cwd":"packages/pkg","env":{"PYTHONPATH":"src:vendor"}}),
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Test,
+            json!({"command":["x".repeat(MAX_COMMAND_BYTES + 1)]}),
+        )
+        .is_err()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Test,
+            json!({"command":["echo"],"cwd":"../../outside"}),
+        )
+        .is_err()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Test,
+            json!({"command":["echo"],"env":{"bad-name":"value"}}),
+        )
+        .is_err()
+    );
 }
 
 /// A line-range edit carrying the read it came from validates; the symbol form's `source_ref`

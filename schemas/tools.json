@@ -468,7 +468,7 @@
     "annotations": {
       "readOnlyHint": false
     },
-    "description": "Run tests selected by `symbol` (the tests that reference it), by `path`, by name\n`pattern`, or an explicit `command`; one background run per worktree under `budget_s`.\nReturns the pass/fail line with an exact rerun command; full output is paged through\nide.inspect (`status` re-reads a run). A summary-less explicit command waits briefly and\nincludes its exit code and bounded output inline when it finishes inside that window. Use\nit instead of running the test command in a shell: exact selection, bounded output.",
+    "description": "Run tests selected by `symbol` (the tests that reference it), by `path`, by name\n`pattern`, or an explicit `command`; one background run per worktree under `budget_s`.\nExplicit commands may set a worktree-relative `cwd` and bounded inherited-environment\noverrides through `env`; their argv is limited to 16 KiB in total.\nReturns the pass/fail line with an exact rerun command; full output is paged through\nide.inspect (`status` re-reads a run). Known runner summaries are parsed regardless of how\nthe runner was launched; otherwise the result includes the exit code and bounded output\ntail. Use it instead of running the test command in a shell: bounded selection and output.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -480,14 +480,29 @@
           "type": "integer"
         },
         "command": {
-          "description": "Explicit argv to run instead of the detected runner.",
+          "description": "Explicit argv to run instead of the detected runner; all argument bytes together are limited to 16 KiB.",
           "items": {
-            "maxLength": 512,
+            "maxLength": 16384,
             "type": "string"
           },
           "maxItems": 64,
           "minItems": 1,
           "type": "array"
+        },
+        "cwd": {
+          "description": "Working directory relative to the worktree root; must resolve inside the worktree. Only with `command`.",
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "description": "Environment variables added to the inherited environment for this explicit command. Only with `command`; names are bounded environment identifiers.",
+          "maxProperties": 32,
+          "type": "object"
         },
         "path": {
           "description": "Run the tests in this file or directory.",

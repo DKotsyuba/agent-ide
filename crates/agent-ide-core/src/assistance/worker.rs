@@ -2033,6 +2033,8 @@ impl<'a> Worker<'a> {
             }
         } else {
             let mut explicit_command = false;
+            let mut command_cwd = root.clone();
+            let mut command_env = Vec::new();
             let (argv, language, selected_count) = if let Some(path) =
                 job.parameters.get("path").and_then(Value::as_str)
             {
@@ -2091,6 +2093,32 @@ impl<'a> Worker<'a> {
                     Err(_) => return Err(FailureCode::ProviderUnavailable),
                 }
             } else if let Some(args) = job.parameters.get("command").and_then(Value::as_array) {
+                if let Some(cwd) = job.parameters.get("cwd").and_then(Value::as_str) {
+                    let root_path = root
+                        .canonicalize()
+                        .map_err(|_| FailureCode::ProviderUnavailable)?;
+                    let requested = root.join(cwd).canonicalize();
+                    let Ok(requested) = requested else {
+                        return Ok((
+                            PeerReply::InvalidParameters { message: "invalid bounded parameters: \"cwd\" must resolve to a directory inside the worktree".to_owned() },
+                            Some(authority),
+                            None,
+                        ));
+                    };
+                    if !requested.starts_with(&root_path) || !requested.is_dir() {
+                        return Ok((
+                            PeerReply::InvalidParameters { message: "invalid bounded parameters: \"cwd\" must resolve to a directory inside the worktree".to_owned() },
+                            Some(authority),
+                            None,
+                        ));
+                    }
+                    command_cwd = requested;
+                }
+                if let Some(env) = job.parameters.get("env").and_then(Value::as_object) {
+                    command_env.extend(env.iter().filter_map(|(key, value)| {
+                        value.as_str().map(|value| (key.clone(), value.to_owned()))
+                    }));
+                }
                 let Some(language) = detect_test_language(&root)
                     .or_else(|| crate::lang::registered().first().copied())
                 else {
@@ -2231,14 +2259,30 @@ impl<'a> Worker<'a> {
             };
             let mut started_id = None;
             if own_run.is_none() {
-                match self.shared.test_runs.start(
-                    root.clone(),
-                    argv.clone(),
-                    language,
-                    budget,
-                    job.reference.clone(),
-                    &binding,
-                ) {
+                let start = if explicit_command {
+                    self.shared.test_runs.start_with_options(
+                        root.clone(),
+                        argv.clone(),
+                        &binding,
+                        super::tests::TestCommandOptions {
+                            cwd: command_cwd,
+                            env: command_env,
+                            language,
+                            budget,
+                            detail_ref: job.reference.clone(),
+                        },
+                    )
+                } else {
+                    self.shared.test_runs.start(
+                        root.clone(),
+                        argv.clone(),
+                        language,
+                        budget,
+                        job.reference.clone(),
+                        &binding,
+                    )
+                };
+                match start {
                     StartResult::Started(id) => {
                         if explicit_command {
                             self.shared.test_runs.mark_explicit_command(id, &binding);
@@ -5174,12 +5218,10 @@ fn test_result_text(
     id: u64,
     result: &super::tests::RunResult,
     owns_detail: bool,
-    explicit_command: bool,
+    _explicit_command: bool,
 ) -> String {
-    // A run that parsed no test summary is an arbitrary command, not a runner: its reply carries
-    // the exit code and a bounded head of the output itself, so reading it costs no extra
-    // `ide.inspect` round trip.
-    if explicit_command && super::tests::summary_absent(result) {
+    // Without recognized test counts, show the process result and its bounded output tail.
+    if super::tests::summary_absent(result) {
         return command_result_text(id, result, owns_detail);
     }
     let report = &result.report;
@@ -5210,66 +5252,28 @@ fn test_result_text(
     text
 }
 
-/// Bytes of a summary-less command's output quoted inline in its terminal reply; a longer output
-/// stays in the run's paged detail behind its `full output` line.
-const TEST_OUTPUT_HEAD_BYTES: usize = 4096;
-
-/// Renders one summary-less command run: the exit code, a bounded head of its output, the rerun
-/// line, and — only when that head cut something, or the whole output already lives in the run's
+/// Renders one summary-less run: its exit code, a bounded output tail, the rerun line, and —
+/// only when that tail cut something, or the whole output already lives in the run's
 /// paged detail — the pointer to the full output.
 fn command_result_text(id: u64, result: &super::tests::RunResult, owns_detail: bool) -> String {
     let seconds = result.elapsed.as_secs();
-    let mut text = match result.exit.filter(|code| *code != 0) {
-        Some(code) => format!(
-            "tests #{id}: no test results (exit {code}), {seconds} s — runner said: {}; full output: ide.inspect {}",
-            super::tests::runner_excerpt(&result.output),
-            result.detail_ref
-        ),
-        None => match result.exit {
-            Some(code) => format!("tests #{id}: no summary parsed (exit {code}), {seconds} s"),
-            None => format!("tests #{id}: no summary parsed, {seconds} s"),
-        },
-    };
-    // A paged run keeps only its runner line, which is not the output's head.
-    let head = if result.output_paged {
-        String::new()
-    } else {
-        output_head(&result.output)
-    };
-    if !head.is_empty() {
-        text.push_str("\n  output:\n");
-        text.push_str(&head);
+    let exit = result
+        .exit
+        .map_or_else(|| "unknown".to_owned(), |code| code.to_string());
+    let mut text = format!("tests #{id}: exit {exit}, {seconds} s");
+    let tail = super::tests::output_tail(&result.output);
+    if !tail.is_empty() {
+        text.push_str("\n  output (tail):\n");
+        text.push_str(&tail);
     }
     text.push_str(&format!("\n  rerun: {}", display_argv(&result.command)));
-    if owns_detail
-        && (head.len() < result.output.len() || result.output_paged)
-        && !(result.exit.is_some_and(|code| code != 0)
-            && result.report.passed == 0
-            && result.report.failed == 0)
-    {
+    if owns_detail && (tail.len() < result.output.len() || result.output_paged) {
         text.push_str(&format!(
             "\n  full output: ide.inspect {}",
             result.detail_ref
         ));
     }
     text
-}
-
-/// Cuts the first [`TEST_OUTPUT_HEAD_BYTES`] bytes of a command's output at a UTF-8 boundary, so
-/// the quoted head never splits a character; an output that fits is kept whole. Returns the empty
-/// string for an empty or already-paged-away output.
-fn output_head(output: &str) -> String {
-    let mut cut = TEST_OUTPUT_HEAD_BYTES.min(output.len());
-    while !output.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    if output.len() > TEST_OUTPUT_HEAD_BYTES
-        && let Some(newline) = output[..cut].rfind('\n')
-        && newline > 0
-    {
-        cut = newline + 1;
-    }
-    output[..cut].to_owned()
 }
 
 /// Checks the bounded command reply, poll-hint parsing and the user-facing relationship limits.
@@ -5281,7 +5285,10 @@ mod tool_reply_fix_tests {
     /// Builds a minimal explicit-command result for reply-rendering checks.
     fn command_result(output: String) -> super::super::tests::RunResult {
         super::super::tests::RunResult {
-            report: TestReport::default(),
+            report: TestReport {
+                incomplete: true,
+                ..TestReport::default()
+            },
             output,
             output_paged: false,
             elapsed: Duration::from_secs(1),
@@ -5293,18 +5300,18 @@ mod tool_reply_fix_tests {
         }
     }
 
-    /// Quotes an explicit command's successful output, while test-runner replies keep their form.
+    /// Quotes output when no known runner summary exists, regardless of how the runner was launched.
     #[test]
-    fn explicit_summaryless_command_quotes_output_only_for_command_form() {
+    fn summaryless_output_is_labeled_for_any_launch_form() {
         let result = command_result("hello\n".into());
         let command = test_result_text(3, &result, true, true);
-        assert!(command.contains("no summary parsed (exit 0)"), "{command}");
-        assert!(command.contains("output:\nhello\n"), "{command}");
+        assert!(command.contains("exit 0, 1 s"), "{command}");
+        assert!(command.contains("output (tail):\nhello\n"), "{command}");
         assert!(command.contains("rerun: echo hello"), "{command}");
 
         let runner = test_result_text(3, &result, true, false);
-        assert!(runner.contains("0 passed, 0 failed"), "{runner}");
-        assert!(!runner.contains("\n  output:\n"), "{runner}");
+        assert!(runner.contains("exit 0, 1 s"), "{runner}");
+        assert!(runner.contains("output (tail):\nhello\n"), "{runner}");
     }
 
     /// A missing runner says what is missing and the next step instead of quoting errno — a bare
@@ -5340,33 +5347,35 @@ mod tool_reply_fix_tests {
         );
     }
 
-    /// A failed summary-less command surfaces its error line and retained output handle.
+    /// A failed summary-less command surfaces the exit and bounded output with an explicit label.
     #[test]
-    fn explicit_failed_command_names_runner_reason() {
+    fn explicit_failed_command_labels_output_instead_of_claiming_runner_reason() {
         let mut result = command_result("noise\nERROR: no collectors\n".into());
         result.exit = Some(4);
         let reply = command_result_text(4, &result, true);
-        assert!(reply.starts_with("tests #4: no test results (exit 4), 1 s — runner said: ERROR: no collectors; full output: ide.inspect test-detail"), "{reply}");
+        assert!(
+            reply.starts_with(
+                "tests #4: exit 4, 1 s\n  output (tail):\nnoise\nERROR: no collectors\n"
+            ),
+            "{reply}"
+        );
+        assert!(!reply.contains("runner said"), "{reply}");
     }
 
     /// Limits inline output at a UTF-8 boundary and points to the retained full output.
     #[test]
     fn command_reply_bounds_output_and_names_full_detail() {
-        let line = format!("{}\n", "é".repeat(TEST_OUTPUT_HEAD_BYTES / 2 + 50));
+        let line = format!("{}\n", "é".repeat(4096 / 2 + 50));
         let result = command_result(line);
         let reply = command_result_text(4, &result, true);
         let quoted = reply
-            .split("  output:\n")
+            .split("  output (tail):\n")
             .nth(1)
             .unwrap()
             .split("\n  rerun:")
             .next()
             .unwrap();
-        assert!(
-            quoted.len() <= TEST_OUTPUT_HEAD_BYTES,
-            "{} bytes",
-            quoted.len()
-        );
+        assert!(quoted.len() <= 4096, "{} bytes", quoted.len());
         assert!(quoted.is_char_boundary(quoted.len()));
         assert!(
             reply.contains("full output: ide.inspect test-detail"),
