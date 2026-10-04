@@ -301,11 +301,12 @@ impl LanguageSupport for Python {
             .as_ref()
             .is_some_and(|resolution| resolution.authoritative && resolution.env.chosen.is_none());
         let interpreter = chosen.clone().or_else(|| {
-            governing
-                .as_ref()
-                .and_then(|resolution| resolution.demanded.as_ref())
-                .filter(|_| demanded_missing)
-                .map(|dir| dir.join("bin").join("python"))
+            let resolution = governing.as_ref().filter(|_| demanded_missing)?;
+            let python = resolution.demanded.as_ref()?.join("bin").join("python");
+            if let Some(step) = crate::environment::root_detail(&resolution.env) {
+                crate::environment::remember_missing(&python, step);
+            }
+            Some(python)
         });
         let uv = has("uv.lock");
         if uv {
@@ -1248,7 +1249,8 @@ pub(super) fn ci_run_lines(root: &Path) -> Vec<String> {
 /// The Python tool `args` (`pytest …`, `black …`) as `<venv>/bin/python -m <args>` when the
 /// project's environment resolved; without one, `args` from `PATH`, behind `uv run` when the
 /// project is managed by uv. A demanded (selected or pinned) environment that is missing or
-/// broken is an error with the way out, never a run of another interpreter.
+/// broken is an error carrying the resolver's own way out (recorded by `detect`, since the
+/// project carries no worktree), never a run of another interpreter.
 ///
 /// `ponytail:` tests and formatting run in the worktree-level environment, so nested roots with
 /// diverging environments use the worktree root's; the upgrade is routing per target root once
@@ -1259,13 +1261,14 @@ fn in_environment(project: &LanguageProject, args: &[&str]) -> Result<Vec<String
             .into_iter()
             .chain(args.iter().map(|arg| (*arg).to_owned()))
             .collect()),
-        Some(python) => {
+        Some(python) => Err(crate::environment::missing_step(python).unwrap_or_else(|| {
+            // A project `detect` never saw: name the environment and both ways out.
             let venv = python.parent().and_then(Path::parent).unwrap_or(python);
-            Err(format!(
-                "python environment {} is missing or broken — recreate it or ide.start environment {{\"python\": \"auto\"}}",
+            format!(
+                "python environment {} is missing or broken — recreate it, or change the selection or Pyright pin that names it",
                 venv.display()
-            ))
-        }
+            )
+        })),
         None => Ok(with_uv(
             project
                 .environment

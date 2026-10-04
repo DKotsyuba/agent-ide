@@ -17,10 +17,12 @@
 //! environment manager ever runs.
 
 use std::{
+    collections::HashMap,
     ffi::OsString,
     fs,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
+    sync::{LazyLock, Mutex},
 };
 
 use agent_ide_core::execution::seatbelt::ReadDeny;
@@ -507,12 +509,53 @@ pub(crate) fn check_selection(worktree: &Path, root: &Path, selector: &str) -> R
     }
     let candidates = discovered(worktree, &absolute, &[]);
     match interpreter_state(&selected_dir(&absolute, selector, &candidates), &[]) {
-        Some(_) => Ok(()),
+        Some(true) => Ok(()),
+        Some(false) => Err(format!(
+            "\"{selector}\" is broken (base interpreter gone); candidates {}",
+            labels(&candidates)
+        )),
         None => Err(format!(
             "\"{selector}\" not found; candidates {}",
             labels(&candidates)
         )),
     }
+}
+
+/// A root's missing-environment cause and next step, prefixed with the root when it is nested.
+pub(crate) fn root_detail(env: &ResolvedEnv) -> Option<String> {
+    env.missing_next_step.as_ref().map(|step| {
+        if env.root.as_os_str().is_empty() {
+            step.clone()
+        } else {
+            format!("{}: {step}", env.root.display())
+        }
+    })
+}
+
+/// Absent demanded interpreter → the resolver's cause and next step for it.
+type MissingSteps = HashMap<PathBuf, String>;
+
+/// The resolver's way out for each demanded interpreter `detect` found absent. A
+/// `LanguageProject` carries that interpreter path but no worktree, so test and format commands
+/// built from it look the text up here instead of guessing whether a pin or a selection (and
+/// which `python:<root>` key) is in force. Entries are a few short strings per worktree.
+static MISSING_STEPS: LazyLock<Mutex<MissingSteps>> = LazyLock::new(Mutex::default);
+
+/// Records `step` as the way out for the absent demanded interpreter `python`.
+pub(crate) fn remember_missing(python: &Path, step: String) {
+    MISSING_STEPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(python.to_path_buf(), step);
+}
+
+/// The way out recorded for the absent demanded interpreter `python`, if `detect` saw it.
+pub(crate) fn missing_step(python: &Path) -> Option<String> {
+    MISSING_STEPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(python)
+        .cloned()
 }
 
 /// The absolute project root of `env`: the worktree itself (without a trailing separator) for
@@ -1196,12 +1239,11 @@ mod tests {
             let error = Python
                 .test_selection(&project, &TestTarget::Pattern("x".to_owned()))
                 .unwrap_err();
-            assert!(
-                matches!(&error, LangError::Unsupported(message)
-                    if message.contains(".venv-gone is missing or broken")
-                        && message.contains("ide.start environment")),
-                "{name}: {error:?}"
-            );
+            let step = environments(&root, &[])[0]
+                .missing_next_step
+                .clone()
+                .unwrap();
+            assert_eq!(error, LangError::Unsupported(step), "{name}");
             assert_eq!(Python.format_command(&project, Path::new("a.py")), None);
             assert_eq!(
                 Python.format_stdin_command(&project, Path::new("a.py")),
@@ -1381,6 +1423,69 @@ mod tests {
                 "environment .venv is broken (base interpreter gone) — recreate it or ide.start environment {\"python\": \"auto\"}"
             )
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A broken environment (dangling `bin/python`) is refused with its cause, since selecting
+    /// it could only end in a missing environment.
+    #[test]
+    fn check_selection_refuses_a_broken_environment() {
+        let root = scratch("select-broken");
+        put(&root, "pyproject.toml", "");
+        venv(&root, ".venv", "");
+        fs::create_dir_all(root.join(".venv-old/bin")).unwrap();
+        std::os::unix::fs::symlink(
+            "/nonexistent-agent-ide/python3",
+            root.join(".venv-old/bin/python"),
+        )
+        .unwrap();
+        assert_eq!(
+            Python.check_selection(&root, Path::new(""), ".venv-old"),
+            Err(
+                "\".venv-old\" is broken (base interpreter gone); candidates .venv, .venv-old"
+                    .to_owned()
+            )
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The test command's error is the resolver's own way out: for a pin, editing or removing
+    /// the pin (a selection cannot help); for a nested root's selection, its `python:<root>` key.
+    #[test]
+    fn missing_environment_error_is_the_resolvers_next_step() {
+        let root = scratch("next-step-pin");
+        put(&root, "pyproject.toml", "");
+        venv(&root, ".venv", "");
+        put(
+            &root,
+            "pyrightconfig.json",
+            r#"{"venvPath": ".", "venv": ".venv-gone"}"#,
+        );
+        let project = Python.detect(&root).unwrap();
+        let Err(LangError::Unsupported(message)) =
+            Python.test_selection(&project, &TestTarget::Pattern("x".to_owned()))
+        else {
+            panic!("a missing pinned environment refuses the test run");
+        };
+        assert!(
+            message.contains("edit venv there or remove the pin") && !message.contains("auto"),
+            "{message}"
+        );
+        fs::remove_dir_all(&root).unwrap();
+
+        let root = scratch("next-step-nested");
+        put(&root, "packages/alpha/pyproject.toml", "");
+        put(&root, "packages/alpha/a.py", "");
+        select(&root, "packages/alpha", ".venv-gone");
+        let project = Python.detect(&root).unwrap();
+        assert_eq!(
+            Python.test_selection(&project, &TestTarget::Pattern("x".to_owned())),
+            Err(LangError::Unsupported(
+                "packages/alpha: environment .venv-gone missing (selected) — recreate it or ide.start environment {\"python:packages/alpha\": \"auto\"}"
+                    .to_owned()
+            ))
+        );
+        replace_selections(&root, crate::LANGUAGE, Vec::new());
         fs::remove_dir_all(&root).unwrap();
     }
 }
