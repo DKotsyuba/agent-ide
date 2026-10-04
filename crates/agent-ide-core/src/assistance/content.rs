@@ -1987,4 +1987,23 @@ mod tests {
             .is_none()
         );
     }
+    /// Invalid environment candidates teach selection recovery rather than detail-handle recovery.
+    #[test]
+    fn environment_refusal_names_selection_recovery() {
+        let result = render(
+            PeerReply::Error {
+                code: FailureCode::InvalidDetail,
+                detail: Some("environment: alpha: candidate absent; candidates one, two".into()),
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        let text = text_of(&result);
+        assert!(
+            text.contains("choose one of the listed candidates or \"auto\""),
+            "{text}"
+        );
+        assert!(!text.contains("detail_ref"), "{text}");
+        assert_eq!(result.is_error, Some(true));
+    }
 }

@@ -2847,7 +2847,9 @@ impl<'a> Worker<'a> {
             }
         }
     }
-    /// Runs only the fixed discovery commands, settling each child before parsing.
+    /// Discovers and activates a worktree, settling fixed discovery commands before parsing.
+    /// Repeats reuse durable authority and cache ownership. Validated environment choices are
+    /// stored only after cache admission; cache refusals preserve an existing binding and choice.
     ///
     /// The activation root (the model's `root` or the launcher candidate) and the discovered Git
     /// worktree root and common directory must all lie below a configured allowed root.
@@ -3147,6 +3149,29 @@ impl<'a> Worker<'a> {
             }
             self.quiesce_worktree_caches(&binding);
         }
+        let launches = job.target.providers.clone();
+        // A reader holds no provider namespace of its own: it borrows the writer's sessions for
+        // semantic reads (see `borrow_writer_session`), so the single-owner namespace stays with
+        // the writer. A second concurrent *writer* on the same physical worktree still cannot
+        // share one namespace: fail its activation with the finite reason and roll its own grant
+        // back, so the actor that already owns the cache keeps running and can hand off.
+        if authority.role() == crate::workspace::authority::StartRole::Writer
+            && let Err(code) = self.retain_worktree_caches(&binding, &authority, &launches, true)
+        {
+            if code == FailureCode::Conflict {
+                job.failure_detail = Some("start:provider_cache_namespace_conflict".to_owned());
+            }
+            if previous_role.is_some() {
+                return Err(code);
+            }
+            if let Ok(mut guard) = self.shared.bindings.lock() {
+                let _ = guard.stop_binding(&binding);
+            }
+            return Err(self.settle_revocation(&binding).await.err().unwrap_or(code));
+        }
+        // Cache admission must succeed before a choice becomes durable. A repeated activation
+        // reuses the caller's ownership; a cache refusal never stops its existing binding.
+        self.shared.active(&binding)?;
         if !choices.is_empty() {
             self.workspace
                 .set_environment(authority.worktree(), choices)
@@ -3164,24 +3189,6 @@ impl<'a> Worker<'a> {
                     .await,
             )
         };
-        let launches = job.target.providers.clone();
-        // A reader holds no provider namespace of its own: it borrows the writer's sessions for
-        // semantic reads (see `borrow_writer_session`), so the single-owner namespace stays with
-        // the writer. A second concurrent *writer* on the same physical worktree still cannot
-        // share one namespace: fail its activation with the finite reason and roll its own grant
-        // back, so the actor that already owns the cache keeps running and can hand off.
-        if authority.role() == crate::workspace::authority::StartRole::Writer
-            && let Err(code) = self.retain_worktree_caches(&binding, &authority, &launches, true)
-        {
-            if code == FailureCode::Conflict {
-                job.failure_detail = Some("start:provider_cache_namespace_conflict".to_owned());
-            }
-            if let Ok(mut guard) = self.shared.bindings.lock() {
-                let _ = guard.stop_binding(&binding);
-            }
-            return Err(self.settle_revocation(&binding).await.err().unwrap_or(code));
-        }
-        self.shared.active(&binding)?;
         let git_metadata_captured = baseline.as_ref().is_some_and(|result| {
             result
                 .as_ref()
@@ -6390,6 +6397,51 @@ mod stop_retry_tests {
         worker.activate(&mut job).await.unwrap();
         let receipt = worker.grants.get(&binding).cloned().unwrap();
         (binding, receipt)
+    }
+
+    /// Failed cache admission preserves the caller's existing activation and never persists a choice.
+    #[tokio::test]
+    async fn environment_repeat_cache_failure_preserves_activation_and_selection() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("env.fixture"), "one\ntwo\n").unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, receipt) =
+            production_start(&mut worker, "cache-failure-env", "cache-env-start").await;
+        let cache = worker.runtime.join("cache");
+        std::fs::remove_dir_all(&cache).unwrap();
+        std::fs::write(&cache, "not a cache directory").unwrap();
+        let (mut job, _cancel) = start_job(
+            &worker,
+            "cache-failure-env",
+            "cache-env-again",
+            serde_json::json!({"activation_id":"cache-env-start","environment":{"alpha":"two"}}),
+        );
+        assert_eq!(
+            worker.activate(&mut job).await.unwrap_err(),
+            FailureCode::ProviderUnavailable
+        );
+        assert!(worker.shared.active(&binding).is_ok());
+        assert_eq!(
+            worker.authority(&binding).await.unwrap().epoch(),
+            receipt.epoch()
+        );
+        assert!(
+            crate::lang::environment::selections(&fixture.root, crate::lang::testing::ALPHA)
+                .is_empty()
+        );
+        worker
+            .workspace
+            .load_environment(receipt.worktree())
+            .await
+            .unwrap();
+        assert!(
+            crate::lang::environment::selections(&fixture.root, crate::lang::testing::ALPHA)
+                .is_empty()
+        );
     }
 
     /// Relative escapes and symlink escapes are refused before language resolution; plain labels work.

@@ -95,6 +95,8 @@ error: invalid_detail (start:activation_conflict); this activation_id was used w
 error: invalid_detail (inspect:detail_mismatch); this detail_ref was issued for different arguments. Repeat the original call with its exact arguments, or make a fresh ide.* call
 {%- elif code == "invalid_detail" and resolution_detail is startingwith("test:unknown_run:") -%}
 error: invalid_detail (test:unknown_run); run #{{ resolution_message }} is unknown or expired. Start a new run with ide.test
+{%- elif code == "invalid_detail" and resolution_detail is startingwith("environment:") -%}
+error: invalid_detail ({{ resolution_detail }}); choose one of the listed candidates or "auto" with ide.start environment
 {%- elif code == "invalid_detail" -%}
 error: invalid_detail{% if resolution_detail %} ({{ resolution_detail }}){% else %} (inspect:detail_unknown){% endif %}; {% if resolution_detail == "inspect:detail_expired" %}this detail_ref has expired{% else %}this detail_ref was never issued{% endif %}; repeat the original ide.* call to get a fresh one, or continue with native tools
 {%- elif code == "source_unavailable" and resolution_detail is startingwith("inspect:source_changed:") -%}
