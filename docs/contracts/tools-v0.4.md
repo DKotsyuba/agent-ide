@@ -90,12 +90,25 @@ The IDE's configured `allowed_roots` is the sole path rule and remains unchanged
 
 ### 2.1 `ide.start` — activation and project card (implemented, see status table for gaps)
 
-Input: `{activation_id?, root?, read_only?}`. A start that names no `activation_id` keeps a stable
+Input: `{activation_id?, root?, read_only?, environment?}`. A start that names no `activation_id` keeps a stable
 default derived from its session binding, so repeating it returns the same activation. Omit
 `read_only` or set it to `false` for the one writer allowed per worktree; set it to `true` for a
 reader. Readers coexist with writers and other readers. A reader can upgrade by starting without
 `read_only` when the writer slot is free, and a writer can downgrade by starting with
 `read_only: true`.
+
+`environment` selects the current environment per project root: for example,
+`{"environment":{"python":".venv-py314","python:packages/alpha":".venv"}}`.
+The object has at most eight entries, with nonempty string selectors of at most
+1,024 characters. Root suffixes are relative to the worktree. Absolute selectors
+must pass the launcher's `allowed_roots` admission; the language validates candidates
+and reports pin conflicts as `invalid_detail` with its reason. `"auto"` clears that
+key. Readers cannot pass this property. Choices persist in the daemon store for
+the worktree incarnation, survive restart, and are shared by its sessions. Repeating
+the same activation ID applies a new choice and returns a refreshed card without
+changing activation identity. Resolved environment lines replace that language's
+generic facts, show at most four candidates, and offer a choice when alternatives
+exist. Changes invalidate checks and emit a one-shot environment-change plate line.
 
 Output is a deterministic project card, without model-generated content:
 

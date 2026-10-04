@@ -12702,11 +12702,13 @@ async fn configured_product_nested_python_packages_are_listed_checked_and_edited
     assert_eq!(start["kind"], "activation", "{start}");
     let card = start["text"].as_str().unwrap();
     assert!(
-        card.contains("python root packages/alpha") && card.contains("python root packages/beta"),
+        card.contains("environment: python:packages/alpha .venv (")
+            && card.contains("environment: python:packages/beta .venv ("),
         "every nested root is listed on the card:\n{card}"
     );
     assert!(
-        card.contains("python venv packages/alpha/.venv"),
+        card.contains("environment: python:packages/alpha .venv (")
+            && card.contains(", discovered)"),
         "the card names the environment the session uses:\n{card}"
     );
 
@@ -12810,7 +12812,7 @@ async fn configured_product_suffixed_venv_is_discovered_and_used() {
     assert_eq!(start["kind"], "activation", "{start}");
     let card = start["text"].as_str().unwrap();
     assert!(
-        card.contains("python venv .venv-py314"),
+        card.contains("environment: python .venv-py314 (") && card.contains(", discovered)"),
         "the card names the suffixed environment it uses:\n{card}"
     );
     let response = actor

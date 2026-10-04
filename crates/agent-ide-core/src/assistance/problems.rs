@@ -399,6 +399,11 @@ impl ProjectProblemFeed {
             .collect()
     }
 
+    /// Invalidates one language after a shared worktree environment changes.
+    pub fn environment_changed(&self, worktree: &Path, language: Language) {
+        self.scheduler.environment_changed(worktree, language);
+    }
+
     /// Schedules a check for `binding`'s admitted worktree after a native edit or `ide.edit`
     /// that cannot name the changed file, so every configured language is re-armed.
     ///
@@ -808,6 +813,12 @@ fn state_line(snapshot: &ProblemSnapshot, recheck: Option<Recheck>) -> String {
         CheckState::Checking => format!("{language}: checking (first check in this session)"),
         CheckState::Unavailable(UnavailableReason::ReadRestricted) => {
             format!("{language}: unavailable: read_restricted")
+        }
+        CheckState::Unavailable(UnavailableReason::EnvMissing) if snapshot.detail.is_some() => {
+            format!(
+                "{language}: {}",
+                untrusted_line(snapshot.detail.as_deref().unwrap_or_default())
+            )
         }
         CheckState::Unavailable(UnavailableReason::Fatal) => match &snapshot.detail {
             Some(detail) => format!("{language}: check failed ({})", untrusted_line(detail)),
@@ -1717,5 +1728,20 @@ mod tests {
         assert_eq!(feed.next_block_when(&hook, |_| true), None);
         assert_eq!(feed.next_block_when(&hook, |_| false), None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+    /// Missing-environment problem state reports the resolver's remedy with sanitized text.
+    #[test]
+    fn environment_missing_detail_reaches_problems() {
+        let snapshot = ProblemSnapshot::unavailable_with_detail(
+            crate::lang::testing::ALPHA,
+            UnavailableReason::EnvMissing,
+            0,
+            0,
+            Some("environment two missing — choose auto".into()),
+        );
+        assert_eq!(
+            state_line(&snapshot, None),
+            "alpha: environment two missing — choose auto"
+        );
     }
 }

@@ -34,6 +34,9 @@ pub mod reply;
 /// Runs one bounded daemon-owned job/detail worker with durable authority gates.
 pub mod worker;
 
+/// Tracks environment resolution changes across worktree bindings.
+mod environment;
+
 /// Replaceable nonblocking sink for privacy-safe edit and native-fallback facts.
 pub mod telemetry;
 

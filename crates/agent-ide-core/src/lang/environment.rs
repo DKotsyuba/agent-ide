@@ -62,7 +62,7 @@ pub struct ResolvedEnv {
     pub source: Option<EnvSource>,
     /// Every environment found for the root, `chosen` included, in the language's order.
     pub candidates: Vec<EnvCandidate>,
-    /// Short facts worth one clause on the card: `≠ .python-version 3.14`.
+    /// Short facts worth one clause on the card, such as a mismatch with a version-request file.
     pub warnings: Vec<String>,
     /// When nothing resolves (or the chosen one is missing): the cause and a working next step.
     pub missing_next_step: Option<String>,
@@ -74,7 +74,7 @@ pub struct ResolvedEnv {
 /// How one command (a test or formatter run) must start inside a resolved environment.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CommandEnv {
-    /// Replaces the command's program: `[<venv>/bin/python, -m, pytest]` for `pytest`. The
+    /// Replaces the command's program with an interpreter/module or pinned executable. The
     /// command's remaining arguments follow unchanged.
     pub argv_prefix: Vec<OsString>,
     /// Directory put first on the command's `PATH`.
@@ -83,11 +83,13 @@ pub struct CommandEnv {
     pub vars: Vec<(OsString, OsString)>,
 }
 
+/// Current choices partitioned by worktree and registered language.
+type SelectionMap = HashMap<(PathBuf, Language), Vec<EnvSelection>>;
+
 /// Selections in force, keyed by canonical worktree and language. The durable store is the
 /// source of truth; the worker loads a worktree's rows into this map when it resolves the
 /// worktree and rewrites them whenever `ide.start environment` changes them.
-static SELECTIONS: LazyLock<Mutex<HashMap<(PathBuf, Language), Vec<EnvSelection>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static SELECTIONS: LazyLock<Mutex<SelectionMap>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// The selections in force for one language in one worktree, in no particular order.
 pub fn selections(worktree: &Path, language: Language) -> Vec<EnvSelection> {

@@ -203,7 +203,8 @@ fn is_problems_context(method: AssistanceMethod, parameters: &Value) -> bool {
 
 /// Returns the due `<agent-ide>` status plate for one hook-delivering host's post phase, or `None`.
 ///
-/// Reads only in-memory snapshots and never waits for a running check. The plate is skipped, and
+/// Refreshes file-resolved environment identities, then reads in-memory snapshots without waiting
+/// for a running check. The plate is skipped, and
 /// stays due for a later hook, whenever it could not fit beside `feedback` inside one bounded hook
 /// context (EYES-r2 §5/§6). Hosts whose [`super::host_binding::FeedDelivery`] is
 /// [`super::host_binding::FeedDelivery::Replies`] never take
@@ -214,6 +215,9 @@ fn due_plate(
     fingerprint: &[u8; 32],
     feedback: Option<&str>,
 ) -> Option<String> {
+    if let Some(worker) = worker {
+        let _ = worker.git_notice(fingerprint);
+    }
     let reserved = feedback.map_or(0, |text| text.len() + 1);
     if reserved + crate::feed::MAX_BLOCK_BYTES > super::reply::MAX_FEEDBACK_BYTES {
         return None;
@@ -229,7 +233,7 @@ fn due_plate(
     .then_some(plate)
 }
 
-/// Leads `plate` with the binding's one-shot `git: HEAD moved …` line when one is due and the
+/// Leads `plate` with due one-shot git and environment notices when the
 /// merged plate still `fits`; the line is consumed only when delivered, otherwise it stays due
 /// and `plate` is returned unchanged. A due line with no other plate becomes a plate of its own.
 fn with_git_notice(
@@ -851,6 +855,7 @@ impl ProductDispatcher {
                     && method.method() != AssistanceMethod::Stop
                     && !stopped
                 {
+                    let _ = worker.git_notice(&fingerprint);
                     let test_status = test_status_snapshot(&reply);
                     if let Some(feed) = worker.project_feed() {
                         feed.changed(&fingerprint);

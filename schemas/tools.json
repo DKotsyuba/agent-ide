@@ -388,6 +388,19 @@
           "minLength": 1,
           "type": "string"
         },
+        "environment": {
+          "additionalProperties": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          },
+          "description": "Pick the environment per language, optionally per project root (`python:packages/alpha`). Value: a candidate shown on the card (path relative to that root, or absolute), a toolchain/version (`1.99.0`, `22`), `project` (use the pin), `launcher` (operator default), or `auto` to clear. Stored for this worktree until changed.",
+          "maxProperties": 8,
+          "propertyNames": {
+            "pattern": "^(python|rust|typescript)(:[^\\u0000]{1,512})?$"
+          },
+          "type": "object"
+        },
         "read_only": {
           "default": false,
           "description": "Start as a reader; the default is the one writer allowed per worktree.",

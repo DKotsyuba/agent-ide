@@ -50,6 +50,8 @@ const MAX_TEXT_BYTES: usize = 512;
 const MAX_COMMAND_BYTES: usize = 16 * 1024;
 /// Larger envelope for `ide.test` argv and its optional command environment.
 const MAX_TEST_PARAMETERS_BYTES: usize = 24 * 1024;
+/// Envelope for eight selectors, including worst-case JSON escaping and project-root keys.
+const MAX_START_PARAMETERS_BYTES: usize = 64 * 1024;
 /// Maximum variables accepted by the explicit test-command environment.
 const MAX_ENV_ENTRIES: usize = 32;
 /// Maximum UTF-8 bytes in one environment variable name.
@@ -206,6 +208,16 @@ fn describe_languages(description: &str) -> String {
 
 /// Returns exactly the eleven current Assistance schemas regardless of daemon availability.
 pub fn tool_schemas() -> [ToolSchema; 11] {
+    let mut environment_languages = checked_language_ids();
+    environment_languages.sort_unstable();
+    let example_language = environment_languages.first().copied().unwrap_or("language");
+    let environment_pattern = format!(
+        r"^({})(:[^\u0000]{{1,512}})?$",
+        environment_languages.join("|")
+    );
+    let environment_description = format!(
+        "Pick the environment per language, optionally per project root (`{example_language}:packages/alpha`). Value: a candidate shown on the card (path relative to that root, or absolute), a toolchain/version (`1.99.0`, `22`), `project` (use the pin), `launcher` (operator default), or `auto` to clear. Stored for this worktree until changed."
+    );
     [
         schema(
             AssistanceTool::Start,
@@ -214,7 +226,8 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "properties": {
                     "activation_id": {"type": "string", "minLength": 1, "maxLength": MAX_ACTIVATION_ID_BYTES, "description": "Any stable id for this activation (e.g. the task name); repeating it returns the same activation. Optional: a start that names none derives a stable id from this session, so repeating it also returns the same activation."},
                     "root": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Absolute working directory to activate; defaults to the host's project directory. Must lie below a configured allowed root."},
-                    "read_only": {"type": "boolean", "default": false, "description": "Start as a reader; the default is the one writer allowed per worktree."}
+                    "read_only": {"type": "boolean", "default": false, "description": "Start as a reader; the default is the one writer allowed per worktree."},
+                    "environment": {"type": "object", "maxProperties": 8, "propertyNames": {"pattern": environment_pattern}, "additionalProperties": {"type": "string", "minLength": 1, "maxLength": 1024}, "description": environment_description}
                 }
             }),
         ),
@@ -634,7 +647,7 @@ const OUTLINE_TARGET_MESSAGE: &str = "invalid bounded parameters: ide.outline ne
 /// Returns the closed allowed field list for one logical tool.
 fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
     match tool {
-        AssistanceTool::Start => &["activation_id", "root", "read_only"],
+        AssistanceTool::Start => &["activation_id", "root", "read_only", "environment"],
         AssistanceTool::Context => &[
             "path",
             "byte_offset",
@@ -673,6 +686,7 @@ fn parameter_limit(tool: AssistanceTool) -> usize {
     match tool {
         AssistanceTool::Edit => crate::changes::edit::MAX_EDIT_ARGUMENT_BYTES,
         AssistanceTool::Test => MAX_TEST_PARAMETERS_BYTES,
+        AssistanceTool::Start => MAX_START_PARAMETERS_BYTES,
         _ => MAX_PARAMETER_BYTES,
     }
 }
@@ -969,6 +983,46 @@ pub fn validate_call(
             // `activation_id` is optional: a start that names none keeps a stable default derived
             // from its binding server-side (E013 item 4); a present one stays bounded nonempty.
             optional_string(object, "activation_id", MAX_ACTIVATION_ID_BYTES)?;
+            if let Some(environment) = object.get("environment") {
+                let choices = environment.as_object().ok_or_else(|| {
+                    invalid_field(
+                        "environment",
+                        FieldRule::OneOf("an object with at most 8 environment selections"),
+                    )
+                })?;
+                if choices.len() > 8 {
+                    return Err(invalid_field(
+                        "environment",
+                        FieldRule::OneOf("at most 8 environment selections"),
+                    ));
+                }
+                for (key, value) in choices {
+                    let (language, root) = key
+                        .split_once(':')
+                        .map_or((key.as_str(), None), |(language, root)| {
+                            (language, Some(root))
+                        });
+                    if language.is_empty()
+                        || language.len() > 128
+                        || !language
+                            .bytes()
+                            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == b'_')
+                        || root.is_some_and(|root| {
+                            root.is_empty() || root.len() > 512 || path_shape_rule(root).is_some()
+                        })
+                        || value.as_str().is_none_or(|value| {
+                            value.is_empty() || value.chars().count() > 1024 || value.contains('\0')
+                        })
+                    {
+                        return Err(invalid_field(
+                            "environment",
+                            FieldRule::OneOf(
+                                "language[:relative root] keys and nonempty selectors of at most 1024 characters",
+                            ),
+                        ));
+                    }
+                }
+            }
             optional_string(object, "root", MAX_RELATIVE_PATH_BYTES)?;
             if object
                 .get("read_only")
@@ -3761,7 +3815,7 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Start,
-            "invalid bounded parameters: unknown field \"actor_id\"; allowed: activation_id, root, read_only"
+            "invalid bounded parameters: unknown field \"actor_id\"; allowed: activation_id, root, read_only, environment"
                 .to_string(),
         ),
         (
@@ -4322,4 +4376,33 @@ fn unknown_field_names_are_echoed_only_when_safe() {
         };
         assert_eq!(carried.as_deref(), echoed.then_some(name.as_str()));
     }
+}
+
+/// Environment maps accept bounded selectors and relative roots while refusing malformed payloads.
+#[test]
+fn start_environment_parameter_validation() {
+    let accepted = [
+        json!({"alpha":"two"}),
+        json!({"alpha:packages/one":"auto"}),
+        json!({"unknown":"two"}),
+    ];
+    for environment in accepted {
+        assert!(validate_call(AssistanceTool::Start, json!({"environment":environment})).is_ok());
+    }
+    for environment in [
+        json!([]),
+        json!({"alpha":42}),
+        json!({"alpha":""}),
+        json!({"alpha:../escape":"two"}),
+        json!({"alpha:/absolute":"two"}),
+        json!({"alpha:":"two"}),
+        json!({"alpha":"x".repeat(1025)}),
+        json!({"alpha":"nul\u{0}"}),
+    ] {
+        assert!(validate_call(AssistanceTool::Start, json!({"environment":environment})).is_err());
+    }
+    let choices: serde_json::Map<String, Value> = (0..9)
+        .map(|i| (format!("alpha:root{i}"), json!("two")))
+        .collect();
+    assert!(validate_call(AssistanceTool::Start, json!({"environment":choices})).is_err());
 }

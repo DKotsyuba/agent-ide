@@ -11,6 +11,84 @@ use crate::{
 use serde_json::json;
 use std::time::Duration;
 
+/// Selections survive a daemon reboot, auto deletes only its key, and a replacement root
+/// receives a fresh incarnation with no inherited selection.
+#[tokio::test]
+async fn environment_roundtrip_auto_and_new_incarnation() {
+    use crate::lang::{
+        environment::{EnvSelection, replace_selections, selections},
+        testing::ALPHA,
+    };
+    crate::lang::testing::install();
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let owner = DurableWorkspace::open(&store).await.unwrap();
+    let root = fixture.root();
+    let tree = owner
+        .resolve_worktree(root.clone(), root.clone(), root.join(".git"))
+        .await
+        .unwrap();
+    owner
+        .set_environment(
+            &tree,
+            vec![
+                (
+                    ALPHA,
+                    EnvSelection {
+                        root: PathBuf::new(),
+                        selector: "two".into(),
+                    },
+                ),
+                (
+                    ALPHA,
+                    EnvSelection {
+                        root: "nested".into(),
+                        selector: "one".into(),
+                    },
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(selections(&root, ALPHA).len(), 2);
+    replace_selections(&root, ALPHA, Vec::new());
+    drop(owner);
+    let owner = DurableWorkspace::open(&store).await.unwrap();
+    let rebooted = owner
+        .resolve_worktree(root.clone(), root.clone(), root.join(".git"))
+        .await
+        .unwrap();
+    assert_eq!(rebooted.incarnation(), tree.incarnation());
+    assert_eq!(selections(&root, ALPHA).len(), 2);
+    owner
+        .set_environment(
+            &rebooted,
+            vec![(
+                ALPHA,
+                EnvSelection {
+                    root: PathBuf::new(),
+                    selector: "auto".into(),
+                },
+            )],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        selections(&root, ALPHA),
+        vec![EnvSelection {
+            root: "nested".into(),
+            selector: "one".into()
+        }]
+    );
+    fixture.replace_root();
+    let recreated = owner
+        .resolve_worktree(root.clone(), root.clone(), root.join(".git"))
+        .await
+        .unwrap();
+    assert_ne!(recreated.incarnation(), tree.incarnation());
+    assert!(selections(&root, ALPHA).is_empty());
+}
+
 /// Keeps one collision-resistant native test tree and its database under a nonsymlinked temporary root.
 struct Fixture(PathBuf);
 impl Fixture {

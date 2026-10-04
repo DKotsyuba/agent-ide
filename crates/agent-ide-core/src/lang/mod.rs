@@ -908,11 +908,13 @@ pub(crate) mod testing {
                 })
                 .expect("a test language")
         }
-        /// Never detects a project, except gamma: a root `fmt.toml` marks a project whose only
+        /// Detects marker-based environment fixtures and a root `fmt.toml` project whose only
         /// command is the stdin formatter below, so core tests can exercise a formatting edit
         /// without a real toolchain.
         fn detect(&self, root: &Path) -> Option<LanguageProject> {
-            (self.0 == "gamma" && root.join("fmt.toml").exists()).then(|| LanguageProject {
+            ((self.0 == "gamma" && root.join("fmt.toml").exists())
+                || (self.0 == "alpha" && root.join("env.fixture").exists()))
+            .then(|| LanguageProject {
                 language: self.language(),
                 manifests: vec![PathBuf::from("fmt.toml")],
                 environment: Vec::new(),
@@ -921,6 +923,103 @@ pub(crate) mod testing {
                 entry_points: Vec::new(),
             })
         }
+        /// Resolves the test-only `env.fixture` list; absent markers preserve existing tests.
+        fn environments(&self, worktree: &Path) -> Vec<environment::ResolvedEnv> {
+            if self.0 != "alpha" {
+                return Vec::new();
+            }
+            let Ok(labels) = std::fs::read_to_string(worktree.join("env.fixture")) else {
+                return Vec::new();
+            };
+            let candidates: Vec<_> = labels
+                .lines()
+                .map(|label| environment::EnvCandidate {
+                    label: label.to_owned(),
+                    path: worktree.join(label),
+                    version: Some("1.2.3".to_owned()),
+                    broken: label == "broken",
+                })
+                .collect();
+            let selection = environment::selections(worktree, self.language())
+                .into_iter()
+                .find(|choice| choice.root.as_os_str().is_empty());
+            let chosen = selection
+                .as_ref()
+                .and_then(|choice| {
+                    candidates
+                        .iter()
+                        .find(|candidate| candidate.label == choice.selector)
+                })
+                .or_else(|| {
+                    if selection.is_none() {
+                        candidates.first()
+                    } else {
+                        None
+                    }
+                })
+                .cloned();
+            let source = chosen.as_ref().map(|_| {
+                if selection.is_some() {
+                    environment::EnvSource::Selected
+                } else {
+                    environment::EnvSource::Discovered
+                }
+            });
+            let identity = format!(
+                "{labels}:{}",
+                selection
+                    .as_ref()
+                    .map_or("", |choice| choice.selector.as_str())
+            );
+            vec![environment::ResolvedEnv {
+                root: PathBuf::new(),
+                chosen,
+                source,
+                candidates,
+                warnings: Vec::new(),
+                missing_next_step: Some("create an environment or choose auto".into()),
+                identity,
+            }]
+        }
+
+        /// Accepts a listed test candidate, otherwise exposes a stable refusal reason.
+        fn check_selection(
+            &self,
+            worktree: &Path,
+            _root: &Path,
+            selector: &str,
+        ) -> Result<(), String> {
+            if self.environments(worktree).iter().any(|env| {
+                env.candidates
+                    .iter()
+                    .any(|candidate| candidate.label == selector)
+            }) {
+                Ok(())
+            } else {
+                Err("candidate absent; choose a listed environment".into())
+            }
+        }
+
+        /// Replaces only the fake runner with a shell probe for prefix, PATH and variables.
+        fn command_env(
+            &self,
+            worktree: &Path,
+            _cwd: &Path,
+            program: &str,
+        ) -> Option<environment::CommandEnv> {
+            (self.0 == "alpha" && program == "env-fixture-runner").then(|| {
+                environment::CommandEnv {
+                    argv_prefix: vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "printf '%s\\n%s\\npass\\n' \"$ENV_FIXTURE\" \"$PATH\"".into(),
+                    ],
+                    path_prefix: Some(worktree.join("env-bin")),
+                    vars: vec![("ENV_FIXTURE".into(), "resolved".into())],
+                }
+            })
+        }
+
         /// An outline with no symbols.
         fn normalize(
             &self,

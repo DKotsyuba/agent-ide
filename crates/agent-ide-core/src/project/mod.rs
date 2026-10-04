@@ -745,25 +745,110 @@ fn render_commands(card: &ProjectCard) -> Option<String> {
     ))
 }
 
-/// Renders every language's environment facts as `"<language> <key> <value>"`, in language then
-/// declaration order, joined with `" · "`.
+/// Renders resolved environments per project root; languages without a resolver retain
+/// their generic facts. Candidate lists are bounded to four and selection hints use card labels.
 fn render_environment(card: &ProjectCard) -> Option<String> {
-    let parts: Vec<String> = card
-        .languages
+    let mut facts = Vec::new();
+    let mut lines = Vec::new();
+    for summary in &card.languages {
+        let environments = summary.language.support().environments(&card.root);
+        if environments.is_empty() {
+            facts.extend(
+                summary
+                    .project
+                    .environment
+                    .iter()
+                    .map(|(key, value)| format!("{} {key} {value}", summary.language)),
+            );
+        } else {
+            for environment in environments {
+                lines.push(format!(
+                    "environment: {}",
+                    environment_line(summary.language, &environment)
+                ));
+            }
+        }
+    }
+    if !facts.is_empty() {
+        lines.insert(0, format!("environment: {}", facts.join(" · ")));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// Renders one resolver answer with its source, warnings, alternatives and a reusable choice.
+fn environment_line(language: Language, env: &crate::lang::environment::ResolvedEnv) -> String {
+    use crate::lang::environment::EnvSource;
+    let key = if env.root.as_os_str().is_empty() {
+        language.to_string()
+    } else {
+        format!("{language}:{}", env.root.display())
+    };
+    let mut line = match &env.chosen {
+        None => format!(
+            "{key} missing — {}",
+            env.missing_next_step
+                .as_deref()
+                .unwrap_or("choose an environment with ide.start")
+        ),
+        Some(candidate) => {
+            let source = match &env.source {
+                Some(EnvSource::Selected) => "selected".to_owned(),
+                Some(EnvSource::Pin(file)) => format!("{file} pin"),
+                Some(EnvSource::Discovered) => "discovered".to_owned(),
+                Some(EnvSource::Launcher) => "launcher".to_owned(),
+                None => "unknown".to_owned(),
+            };
+            let version = candidate.version.as_deref().unwrap_or("version unknown");
+            format!(
+                "{key} {} ({version}, {source}{})",
+                candidate.label,
+                if candidate.broken { ", broken" } else { "" }
+            )
+        }
+    };
+    for warning in &env.warnings {
+        line.push_str(&format!(" ≠ {}", warning.trim_start_matches('≠').trim()));
+    }
+    let alternatives: Vec<_> = env
+        .candidates
         .iter()
-        .flat_map(|summary| {
-            summary
-                .project
-                .environment
-                .iter()
-                .map(move |(key, value)| format!("{} {key} {value}", summary.language))
+        .filter(|candidate| {
+            env.chosen
+                .as_ref()
+                .is_none_or(|chosen| chosen.path != candidate.path)
         })
         .collect();
-    if parts.is_empty() {
-        None
-    } else {
-        Some(format!("environment: {}", parts.join(" · ")))
+    let limit = 4usize.saturating_sub(usize::from(env.chosen.is_some()));
+    if !alternatives.is_empty() {
+        line.push_str(" · also ");
+        line.push_str(
+            &alternatives
+                .iter()
+                .take(limit)
+                .map(|candidate| {
+                    format!(
+                        "{} ({}{})",
+                        candidate.label,
+                        candidate.version.as_deref().unwrap_or("version unknown"),
+                        if candidate.broken { ", broken" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        if alternatives.len() > limit {
+            line.push_str(&format!(" +{}", alternatives.len() - limit));
+        }
     }
+    if env.candidates.len() >= 2
+        && let Some(candidate) = alternatives.first()
+    {
+        line.push_str(&format!(
+            " — choose: ide.start environment {}",
+            serde_json::json!({key: candidate.label})
+        ));
+    }
+    line
 }
 
 fn render_layout(card: &ProjectCard, show_children: bool) -> String {
@@ -1350,5 +1435,44 @@ mod tests {
         assert_eq!(format_count(1_000), "1k");
         assert_eq!(format_count(1_235), "1.2k");
         assert_eq!(format_count(47_000), "47k");
+    }
+    /// A fake resolver replaces generic facts, bounds alternatives, and renders source and warnings.
+    #[test]
+    fn environment_card_golden_lines() {
+        use crate::lang::environment::{EnvSelection, EnvSource, replace_selections};
+        crate::lang::testing::install();
+        let tree = TempTree::new("environments");
+        tree.write("env.fixture", "one\ntwo\nbroken\nfour\nfive\n");
+        let language = crate::lang::testing::ALPHA;
+        let card = collect(tree.path(), vec![alpha_project()], Vec::new(), None);
+        assert_eq!(
+            render_environment(&card).unwrap(),
+            "environment: alpha one (1.2.3, discovered) · also two (1.2.3), broken (1.2.3, broken), four (1.2.3) +1 — choose: ide.start environment {\"alpha\":\"two\"}"
+        );
+        replace_selections(
+            tree.path(),
+            language,
+            vec![EnvSelection {
+                root: PathBuf::new(),
+                selector: "two".into(),
+            }],
+        );
+        let mut env = language.support().environments(tree.path()).remove(0);
+        assert!(environment_line(language, &env).starts_with("alpha two (1.2.3, selected)"));
+        env.root = "packages/one".into();
+        env.source = Some(EnvSource::Pin("project.conf".into()));
+        env.warnings.push("≠ requested version 2".into());
+        assert!(
+            environment_line(language, &env).starts_with(
+                "alpha:packages/one two (1.2.3, project.conf pin) ≠ requested version 2"
+            )
+        );
+        env.chosen = None;
+        env.candidates.clear();
+        assert_eq!(
+            environment_line(language, &env),
+            "alpha:packages/one missing — create an environment or choose auto ≠ requested version 2"
+        );
+        replace_selections(tree.path(), language, Vec::new());
     }
 }

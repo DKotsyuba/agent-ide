@@ -472,7 +472,7 @@ struct Ledger {
     /// policy of [`evict_settled_details`] (which journals every batch).
     details: BTreeMap<String, Detail>,
     /// Stable start requests under each immutable binding generation.
-    starts: BTreeMap<(BindingRef, String, bool), String>,
+    starts: BTreeMap<(BindingRef, String, bool, [u8; 32]), String>,
     /// One cancellation sender per currently active binding.
     cancellation: BTreeMap<BindingRef, watch::Sender<bool>>,
     /// Nonzero monotonic detail identifiers within this daemon boot.
@@ -578,12 +578,26 @@ struct Shared {
     test_runs: TestRuns,
     /// Undelivered one-shot `git: HEAD moved …` plate lines keyed by binding fingerprint.
     git_notices: Mutex<BTreeMap<[u8; 32], String>>,
+    /// Shared environment identities and one-shot notices.
+    environments: Mutex<super::environment::EnvironmentState>,
     /// Binding fingerprints whose channel currently holds an activation, so the hook ingress can
     /// stay silent for a channel that never started (or already stopped) instead of emitting
     /// native hints nothing can consume.
     activated: Mutex<BTreeSet<[u8; 32]>>,
 }
 impl Shared {
+    /// Refreshes file-resolved identities and invalidates checks for changed languages.
+    fn refresh_environments(&self, worktree: &Path) {
+        if let Ok(mut state) = self.environments.lock() {
+            let changed = state.refresh(worktree);
+            if let Some(feed) = &self.project_feed {
+                for language in changed {
+                    feed.environment_changed(worktree, language);
+                }
+            }
+        }
+    }
+
     /// Acquires a new transient binding use at one exact admission/return boundary.
     fn active(&self, binding: &BindingRef) -> Result<ActiveBindingUse, FailureCode> {
         self.bindings
@@ -1058,6 +1072,7 @@ impl WorkerHandle {
                 project_feed: None,
                 test_runs: TestRuns::default(),
                 git_notices: Mutex::new(BTreeMap::new()),
+                environments: Mutex::default(),
                 activated: Mutex::new(BTreeSet::new()),
             }),
             inspect,
@@ -1110,17 +1125,50 @@ impl WorkerHandle {
         self.shared.test_runs.mark_status_delivered(binding, line)
     }
 
-    /// Returns the binding's undelivered `git: HEAD moved …` plate line, if any.
+    /// Refreshes environment identities before plate rendering and returns due git/environment notices.
     pub fn git_notice(&self, binding: &[u8; 32]) -> Option<String> {
-        self.shared.git_notices.lock().ok()?.get(binding).cloned()
+        let mut lines = Vec::new();
+        if let Some(root) = self
+            .shared
+            .environments
+            .lock()
+            .ok()
+            .and_then(|state| state.root(binding))
+        {
+            self.shared.refresh_environments(&root);
+            if let Some(notice) = self.shared.environments.lock().ok()?.notice(&root, binding) {
+                lines.push(notice);
+            }
+        }
+        if let Some(notice) = self.shared.git_notices.lock().ok()?.get(binding) {
+            lines.push(notice.clone());
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
-    /// Consumes exactly `line` once it was delivered; a newer notice stays due.
+    /// Consumes the exact delivered notice; a newer notice remains due for this binding.
     pub fn consume_git_notice(&self, binding: &[u8; 32], line: &str) -> bool {
-        self.shared.git_notices.lock().is_ok_and(|mut notices| {
-            notices.get(binding).map(String::as_str) == Some(line)
-                && notices.remove(binding).is_some()
-        })
+        if self.git_notice(binding).as_deref() != Some(line) {
+            return false;
+        }
+        if let Some(root) = self
+            .shared
+            .environments
+            .lock()
+            .ok()
+            .and_then(|state| state.root(binding))
+            && let Ok(mut state) = self.shared.environments.lock()
+        {
+            state.consume(&root, binding, line);
+        }
+        if let Ok(mut notices) = self.shared.git_notices.lock()
+            && notices
+                .get(binding)
+                .is_some_and(|notice| line.contains(notice))
+        {
+            notices.remove(binding);
+        }
+        true
     }
 
     /// Returns the shared slot that holds the telemetry owner once startup has opened it.
@@ -1428,7 +1476,9 @@ impl WorkerHandle {
                 .queue
                 .retain(|job| job.invocation.binding_ref() != &binding);
             ledger.details.retain(|_, detail| detail.binding != binding);
-            ledger.starts.retain(|(owner, _, _), _| owner != &binding);
+            ledger
+                .starts
+                .retain(|(owner, _, _, _), _| owner != &binding);
             ledger.native_epoch.remove(&binding);
             ledger.feedback.remove(&binding);
             ledger.delivered.remove(&binding);
@@ -1650,6 +1700,7 @@ impl WorkerHandle {
                     .map(str::to_owned)
                     .unwrap_or_else(|| default_activation_id(&binding)),
                 parameters["read_only"].as_bool().unwrap_or(false),
+                selection(&parameters["environment"]),
             ))
         } else {
             None
@@ -2302,6 +2353,7 @@ impl<'a> Worker<'a> {
                             cwd: command_cwd,
                             env: command_env,
                             language,
+                            command_language: None,
                             budget,
                             detail_ref: job.reference.clone(),
                         },
@@ -2812,6 +2864,14 @@ impl<'a> Worker<'a> {
             .get("read_only")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        if read_only && job.parameters.get("environment").is_some() {
+            let holder = match self.grants.get(&binding) {
+                Some(receipt) => self.current_writer_facts(receipt.worktree()).await,
+                None => "none".to_owned(),
+            };
+            job.failure_detail = Some(format!("read_only:ide.start:{holder}"));
+            return Err(FailureCode::Conflict);
+        }
         let previous_role = self.grants.get(&binding).map(StartReceipt::role);
         let candidate = activation_root(job, self.shared.launcher.allowed_roots())?;
         let operation = DiscoveryOperationRef::new(format!("discover-{}", job.reference))
@@ -2967,6 +3027,24 @@ impl<'a> Worker<'a> {
                 }
             }
         };
+        self.shared.refresh_environments(tree.worktree_path());
+        let choices = match validate_environment(
+            job.parameters.get("environment"),
+            tree.worktree_path(),
+            self.shared.launcher.allowed_roots(),
+        ) {
+            Ok(choices) => choices,
+            Err((code, detail)) => {
+                return Ok((
+                    PeerReply::Error {
+                        code,
+                        detail: Some(detail),
+                    },
+                    None,
+                    None,
+                ));
+            }
+        };
         let plain_directory = tree.is_plain_directory();
         self.reconcile_pending_revocations(&tree, job.invocation.actor_id())
             .await;
@@ -3056,6 +3134,9 @@ impl<'a> Worker<'a> {
                     .unwrap_or(error));
             }
         };
+        if let Ok(mut state) = self.shared.environments.lock() {
+            state.bind(binding.fingerprint(), authority.worktree().worktree_path());
+        }
         if previous_role == Some(crate::workspace::authority::StartRole::Writer)
             && next_role == crate::workspace::authority::StartRole::Reader
         {
@@ -3066,6 +3147,37 @@ impl<'a> Worker<'a> {
             }
             self.quiesce_worktree_caches(&binding);
         }
+        if !choices.is_empty() {
+            let changed: BTreeSet<_> = choices
+                .iter()
+                .filter(|(language, choice)| {
+                    let old = crate::lang::environment::selections(
+                        authority.worktree().worktree_path(),
+                        *language,
+                    )
+                    .into_iter()
+                    .find(|old| old.root == choice.root);
+                    if choice.selector == "auto" {
+                        old.is_some()
+                    } else {
+                        old.as_ref()
+                            .is_none_or(|old| old.selector != choice.selector)
+                    }
+                })
+                .map(|(language, _)| *language)
+                .collect();
+            self.workspace
+                .set_environment(authority.worktree(), choices)
+                .await
+                .map_err(|_| FailureCode::Internal)?;
+            if let Some(feed) = &self.shared.project_feed {
+                for language in changed {
+                    feed.environment_changed(authority.worktree().worktree_path(), language);
+                }
+            }
+        }
+        self.shared
+            .refresh_environments(authority.worktree().worktree_path());
         // A plain directory has no Git state to capture, so no baseline run happens at all.
         let baseline = if plain_directory {
             None
@@ -4795,8 +4907,8 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 .as_ref()
                 .is_some_and(|expected| expected != &detail.selection)
             {
-                // A repeated ide.start under one activation_id whose parameters differ can only
-                // name another root: the enqueue dedup returned the earlier start's reference,
+                // An inspected ide.start whose parameters differ may name another root or choice:
+                // the retained reference describes the earlier request,
                 // so say what actually happened instead of a generic mismatch.
                 return Err(InspectFailure::stage(
                     FailureCode::InvalidDetail,
@@ -5449,6 +5561,78 @@ fn discovery_failure_detail(
     }
 }
 
+/// Validates all requested selections before any shared state changes. Absolute selectors use
+/// launcher admission; root suffixes stay below the worktree, and language refusals retain reasons.
+fn validate_environment(
+    value: Option<&Value>,
+    worktree: &Path,
+    allowed_roots: &[PathBuf],
+) -> Result<
+    Vec<(
+        crate::lang::Language,
+        crate::lang::environment::EnvSelection,
+    )>,
+    (FailureCode, String),
+> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let invalid = |reason: String| (FailureCode::InvalidDetail, format!("environment: {reason}"));
+    let choices = value
+        .as_object()
+        .ok_or_else(|| invalid("expected an object".to_owned()))?;
+    if choices.len() > 8 {
+        return Err(invalid("at most 8 selections".to_owned()));
+    }
+    let mut result = Vec::new();
+    for (key, value) in choices {
+        let (id, root) = key.split_once(':').unwrap_or((key.as_str(), ""));
+        let language = crate::lang::Language::by_id(id)
+            .ok_or_else(|| invalid(format!("unknown language {id}")))?;
+        let root = PathBuf::from(root);
+        if root.is_absolute()
+            || root
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(invalid(format!(
+                "{key}: root must be relative to the worktree"
+            )));
+        }
+        let selector = value
+            .as_str()
+            .filter(|value| {
+                !value.is_empty() && value.chars().count() <= 1024 && !value.contains('\0')
+            })
+            .ok_or_else(|| invalid(format!("{key}: invalid selector")))?;
+        let project_root = worktree.join(&root);
+        super::launcher::admit_path(&[worktree.to_path_buf()], &project_root)
+            .map_err(|_| invalid(format!("{key}: root leaves the worktree")))?;
+        if Path::new(selector).is_absolute() {
+            super::launcher::admit_path(allowed_roots, Path::new(selector)).map_err(|_| {
+                (
+                    FailureCode::OutsideAllowedRoots,
+                    format!("environment {key} {selector}"),
+                )
+            })?;
+        }
+        if selector != "auto" {
+            language
+                .support()
+                .check_selection(worktree, &root, selector)
+                .map_err(|reason| invalid(format!("{key}: {reason}")))?;
+        }
+        result.push((
+            language,
+            crate::lang::environment::EnvSelection {
+                root,
+                selector: selector.to_owned(),
+            },
+        ));
+    }
+    Ok(result)
+}
+
 /// Refuses a discovered Git worktree root or common directory outside every allowed root.
 ///
 /// Git may resolve a candidate to a repository above it, or a linked worktree to a common
@@ -5742,7 +5926,7 @@ fn test_result_text(
     text
 }
 
-/// Renders one summary-less run: its exit code, a bounded output tail, the rerun line, and —
+/// Renders one summary-less run: exit code, chosen environment, bounded output tail, rerun, and —
 /// only when that tail cut something, or the whole output already lives in the run's
 /// paged detail — the pointer to the full output.
 fn command_result_text(id: u64, result: &super::tests::RunResult, owns_detail: bool) -> String {
@@ -5751,6 +5935,9 @@ fn command_result_text(id: u64, result: &super::tests::RunResult, owns_detail: b
         .exit
         .map_or_else(|| "unknown".to_owned(), |code| code.to_string());
     let mut text = format!("tests #{id}: exit {exit}, {seconds} s");
+    if let Some(label) = &result.environment_label {
+        text.push_str(&format!(" · env {label}"));
+    }
     let tail = super::tests::output_tail(&result.output);
     if !tail.is_empty() {
         text.push_str("\n  output (tail):\n");
@@ -5787,6 +5974,7 @@ mod tool_reply_fix_tests {
             budget: Duration::from_secs(30),
             detail_ref: "test-detail".into(),
             command: vec!["echo".into(), "hello".into()],
+            environment_label: None,
         }
     }
 
@@ -5802,6 +5990,12 @@ mod tool_reply_fix_tests {
         let runner = test_result_text(3, &result, true, false);
         assert!(runner.contains("exit 0, 1 s"), "{runner}");
         assert!(runner.contains("output (tail):\nhello\n"), "{runner}");
+        let mut selected = result;
+        selected.environment_label = Some("two".into());
+        assert!(
+            test_result_text(3, &selected, true, false)
+                .starts_with("tests #3: exit 0, 1 s · env two")
+        );
     }
 
     /// A missing runner says what is missing and the next step instead of quoting errno — a bare
@@ -6216,6 +6410,113 @@ mod stop_retry_tests {
         (binding, receipt)
     }
 
+    /// Selection validation retains language reasons, admission policy and the uniform reader refusal.
+    #[tokio::test]
+    async fn environment_start_validation_and_same_activation_changes() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("env.fixture"), "one\ntwo\n").unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, receipt) = production_start(&mut worker, "env-actor", "env-start").await;
+        for selector in ["two", "one", "auto"] {
+            let (mut job, _cancel) = start_job(
+                &worker,
+                "env-actor",
+                &format!("env-call-{selector}"),
+                serde_json::json!({"activation_id":"env-start","environment":{"alpha":selector}}),
+            );
+            let (reply, authority, _) = worker.activate(&mut job).await.unwrap();
+            assert_eq!(
+                authority.unwrap().epoch(),
+                receipt.epoch(),
+                "environment is excluded from activation identity"
+            );
+            let PeerReply::Complete { text, .. } = reply else {
+                panic!("{reply:?}")
+            };
+            if selector == "auto" {
+                assert!(
+                    crate::lang::environment::selections(
+                        &fixture.root,
+                        crate::lang::testing::ALPHA
+                    )
+                    .is_empty()
+                );
+                assert!(text.contains("alpha one (1.2.3, discovered)"), "{text}");
+            } else {
+                assert!(
+                    text.contains(&format!("alpha {selector} (1.2.3, selected)")),
+                    "{text}"
+                );
+            }
+        }
+        for (index, (environment, code, reason)) in [
+            (
+                serde_json::json!({"unknown":"two"}),
+                FailureCode::InvalidDetail,
+                "unknown language",
+            ),
+            (
+                serde_json::json!({"alpha":"absent"}),
+                FailureCode::InvalidDetail,
+                "candidate absent; choose a listed environment",
+            ),
+            (
+                serde_json::json!({"beta":"two"}),
+                FailureCode::InvalidDetail,
+                "candidate absent",
+            ),
+            (
+                serde_json::json!({"alpha":"/outside/environment"}),
+                FailureCode::OutsideAllowedRoots,
+                "environment alpha /outside/environment",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (mut job, _cancel) = start_job(
+                &worker,
+                "env-actor",
+                &format!("env-invalid-{index}"),
+                serde_json::json!({"activation_id":"env-start","environment":environment}),
+            );
+            let (reply, _, _) = worker.activate(&mut job).await.unwrap();
+            let PeerReply::Error {
+                code: actual,
+                detail: Some(detail),
+            } = reply
+            else {
+                panic!("{reply:?}")
+            };
+            assert_eq!(actual, code);
+            assert!(detail.contains(reason), "{detail}");
+        }
+        let (mut reader, _cancel) = start_job(
+            &worker,
+            "env-actor",
+            "env-reader-call",
+            serde_json::json!({"activation_id":"env-start","read_only":true,"environment":{}}),
+        );
+        assert_eq!(
+            worker.activate(&mut reader).await.unwrap_err(),
+            FailureCode::Conflict
+        );
+        assert!(
+            reader
+                .failure_detail
+                .unwrap()
+                .starts_with("read_only:ide.start:")
+        );
+        assert_eq!(
+            worker.grants[&binding].role(),
+            crate::workspace::authority::StartRole::Writer
+        );
+    }
+
     /// Explicit readers coexist with one writer, and same-id starts upgrade or downgrade roles.
     #[tokio::test]
     async fn explicit_readers_coexist_and_writer_slot_upgrades_and_downgrades() {
@@ -6575,6 +6876,7 @@ mod stop_retry_tests {
                 project_feed: None,
                 test_runs: TestRuns::default(),
                 git_notices: Mutex::new(BTreeMap::new()),
+                environments: Mutex::default(),
                 activated: Mutex::new(BTreeSet::new()),
             }),
             workspace,
@@ -7571,6 +7873,35 @@ mod stop_retry_tests {
                 extra_sources: Vec::new(),
             },
         );
+    }
+
+    /// Concurrent start retries coalesce only when their environment selections are identical.
+    #[tokio::test]
+    async fn environment_start_coalescing_preserves_new_choices() {
+        let fixture = Fixture::new();
+        let handle = detail_handle(&fixture.root, 8);
+        let mut refs = Vec::new();
+        for (index, choice) in ["one", "two", "two"].into_iter().enumerate() {
+            let invocation = validated_call(
+                &handle.shared.bindings,
+                "env-coalesce",
+                &format!("call-{index}"),
+            );
+            refs.push(
+                handle
+                    .enqueue(
+                        invocation,
+                        AssistanceTool::Start,
+                        serde_json::json!({"activation_id":"same","environment":{"alpha":choice}}),
+                        "stop-retry",
+                        None,
+                    )
+                    .unwrap(),
+            );
+        }
+        assert_ne!(refs[0], refs[1]);
+        assert_eq!(refs[1], refs[2]);
+        assert_eq!(handle.shared.ledger.lock().unwrap().queue.len(), 2);
     }
 
     /// Builds one settled `Complete{Context}` reply so a planted detail looks job-settled.

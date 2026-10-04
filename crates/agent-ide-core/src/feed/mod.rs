@@ -301,9 +301,12 @@ fn build_items(snapshots: &[ProblemSnapshot], rechecks: &[(Language, Recheck)]) 
             },
             (CheckState::Unavailable(reason), None) => ItemState::Unavailable(
                 *reason,
-                matches!(reason, UnavailableReason::Fatal)
-                    .then(|| snapshot.detail.as_deref().and_then(feed_detail))
-                    .flatten(),
+                matches!(
+                    reason,
+                    UnavailableReason::Fatal | UnavailableReason::EnvMissing
+                )
+                .then(|| snapshot.detail.as_deref().and_then(feed_detail))
+                .flatten(),
             ),
         };
         items.push(FeedItem { language, state });
@@ -376,6 +379,9 @@ fn render_item(item: &FeedItem, last_counts: Option<(u32, u32)>, compact: bool) 
                 render_count(*warnings, "warning", "warnings", None),
             ),
         },
+        ItemState::Unavailable(UnavailableReason::EnvMissing, Some(detail)) => {
+            format!("{language}: {detail}")
+        }
         ItemState::Unavailable(UnavailableReason::Fatal, None) => {
             format!("{language}: check failed (checker supplied no reason)")
         }
@@ -1105,5 +1111,21 @@ mod tests {
             Some(block)
         );
         assert_eq!(state.next_block(&hook, &snapshots, &[]), None);
+    }
+    /// Missing-environment details retain the cause and next step rather than a generic refusal.
+    #[test]
+    fn environment_missing_detail_reaches_feed() {
+        let snapshot = ProblemSnapshot::unavailable_with_detail(
+            crate::lang::testing::ALPHA,
+            UnavailableReason::EnvMissing,
+            0,
+            0,
+            Some("environment two missing — choose auto".into()),
+        );
+        let item = build_items(&[snapshot], &[]).remove(0);
+        assert_eq!(
+            render_item(&item, None, false),
+            "alpha: environment two missing — choose auto"
+        );
     }
 }

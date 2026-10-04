@@ -239,6 +239,41 @@ impl Scheduler {
             }
         }
     }
+
+    /// Cancels and forgets one language's result and fingerprint baseline, then reruns urgently.
+    /// Selection and resolver-identity changes call this even when file fingerprints are unchanged.
+    /// Other languages keep their snapshots and running checks.
+    pub fn environment_changed(&self, worktree: &Path, language: Language) {
+        let worktree = canonical_worktree(worktree);
+        let mut state = self.inner.lock_state();
+        if state.shutting_down || !self.inner.checkers.contains_key(&language) {
+            return;
+        }
+        let wt = state
+            .worktrees
+            .entry(worktree.clone())
+            .or_insert_with(|| WorktreeState::new(""));
+        wt.input_generation += 1;
+        let lang = wt.languages.entry(language).or_default();
+        if let Some(timer) = lang.timer_abort.take() {
+            timer.abort();
+        }
+        if let Some(run) = lang.run_abort.take() {
+            run.abort();
+        }
+        lang.running = false;
+        lang.latest_snapshot = None;
+        lang.completed_fingerprint = None;
+        lang.skip_eligible = false;
+        lang.urgent = true;
+        lang.last_completion = None;
+        let inner = Arc::clone(&self.inner);
+        let handle = tokio::spawn(async move {
+            Inner::on_debounce_fire(inner, worktree, language).await;
+        });
+        lang.timer_abort = Some(handle.abort_handle());
+    }
+
     /// Builds a scheduler with no worktrees registered yet.
     ///
     /// `checkers` supplies one [`Checker`] per language the scheduler runs; a duplicate language
@@ -1939,5 +1974,54 @@ mod deny_tests {
         assert_eq!(completed.load(Ordering::SeqCst), 0);
         scheduler.shutdown().await;
         let _ = std::fs::remove_dir_all(root);
+    }
+    /// Environment changes discard the stale snapshot and bypass an unchanged fingerprint.
+    #[tokio::test]
+    async fn environment_change_forces_unchanged_fingerprint_and_drops_snapshot() {
+        crate::lang::testing::install();
+        let language = crate::lang::testing::ALPHA;
+        let root =
+            std::env::temp_dir().join(format!("environment-scheduler-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("alpha.toml"), "").unwrap();
+        let ready = ProblemSnapshot::from_problems(language, CheckState::Ready, Vec::new(), 1, 0);
+        let checker = Arc::new(FakeChecker::new(language, ready.clone()));
+        let scheduler = Scheduler::new(
+            vec![checker.clone()],
+            Duration::from_millis(1),
+            1,
+            root.join("cache"),
+        )
+        .with_fingerprint(Arc::new(|_| Some(7)));
+        let mut wt = WorktreeState::new("repo");
+        wt.input_generation = 1;
+        wt.languages.insert(
+            language,
+            LanguageState {
+                latest_snapshot: Some(ready),
+                last_stored_generation: 1,
+                completed_fingerprint: Some(7),
+                skip_eligible: true,
+                ..Default::default()
+            },
+        );
+        scheduler
+            .inner
+            .lock_state()
+            .worktrees
+            .insert(root.clone(), wt);
+        scheduler.environment_changed(&root, language);
+        assert!(scheduler.latest(&root).is_empty());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while checker.requests().is_empty() || scheduler.latest(&root).is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(checker.requests().len(), 1);
+        scheduler.shutdown().await;
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

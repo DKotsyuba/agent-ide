@@ -57,6 +57,11 @@ DROP INDEX workspace_one_worktree_owner;
 CREATE UNIQUE INDEX workspace_one_worktree_owner ON workspace_starts(incarnation) WHERE active=1 AND role='writer';
 ";
 
+/// Stores one current selection per language and project root in a worktree incarnation.
+const ENVIRONMENT_SQL: &str = "
+CREATE TABLE workspace_environment (incarnation INTEGER NOT NULL REFERENCES workspace_worktrees(incarnation), language TEXT NOT NULL, root TEXT NOT NULL, selector TEXT NOT NULL, PRIMARY KEY(incarnation,language,root));
+";
+
 /// Explains an unavailable native identity, failed durable admission, or conflicting stable operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DurableError {
@@ -269,6 +274,29 @@ impl<'a> DurableWorkspace<'a> {
         ) {
             return Err(DurableError::Migration(admission));
         }
+        let sql = TrustedUpSql::new(ENVIRONMENT_SQL)?;
+        let domain = DomainName::new("workspace")?;
+        let key = MigrationKey::new("environment_selections_v4")?;
+        let admission = match store
+            .admit_migration(DomainMigration {
+                domain: domain.clone(),
+                key: key.clone(),
+                expected_digest: MigrationDigest::from_sql(&sql),
+                up_sql: sql,
+            })
+            .await?
+        {
+            MigrationAdmission::OutcomeUnknown { .. } => {
+                store.migration_admission(domain, key).await?
+            }
+            value => value,
+        };
+        if !matches!(
+            admission,
+            MigrationAdmission::Applied { .. } | MigrationAdmission::AlreadyApplied { .. }
+        ) {
+            return Err(DurableError::Migration(admission));
+        }
         let nonce = random_nonce()?;
         let operation = operation("boot", &nonce)?;
         let boot = store
@@ -423,7 +451,63 @@ impl<'a> DurableWorkspace<'a> {
             .lock()
             .map_err(|_| DurableError::CorruptState)?
             .insert(incarnation, (nonce, native));
+        self.load_environment(&tree).await?;
         Ok(tree)
+    }
+
+    /// Rehydrates all choices for this incarnation, clearing stale process state for a recreated
+    /// directory. Reads bounded pages; unknown language rows remain durable for future registrations.
+    pub async fn load_environment(&self, tree: &WorktreeRef) -> Result<(), DurableError> {
+        let mut rows = Vec::new();
+        loop {
+            let page = self.store.read_many("SELECT language,root,selector FROM workspace_environment WHERE incarnation=?1 ORDER BY language,root LIMIT 1000 OFFSET ?2", vec![Value::Integer(signed(tree.incarnation())?), Value::Integer(rows.len() as i64)], 1000, |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?))).await?;
+            let complete = page.len() < 1000;
+            rows.extend(page);
+            if complete {
+                break;
+            }
+        }
+        for language in crate::lang::registered() {
+            let choices = rows
+                .iter()
+                .filter(|(id, _, _)| id == language.as_str())
+                .map(
+                    |(_, root, selector)| crate::lang::environment::EnvSelection {
+                        root: root.into(),
+                        selector: selector.clone(),
+                    },
+                )
+                .collect();
+            crate::lang::environment::replace_selections(tree.worktree_path(), *language, choices);
+        }
+        Ok(())
+    }
+
+    /// Atomically applies validated choices (including `auto` deletions), then publishes the committed
+    /// rows to language resolvers. A failed commit never changes the in-memory choices.
+    pub async fn set_environment(
+        &self,
+        tree: &WorktreeRef,
+        rows: Vec<(
+            crate::lang::Language,
+            crate::lang::environment::EnvSelection,
+        )>,
+    ) -> Result<(), DurableError> {
+        let incarnation = signed(tree.incarnation())?;
+        let boot = signed(self.boot)?;
+        let op = operation("environment", &random_nonce()?)?;
+        self.store.execute(op.clone(), move |tx| {
+            if current_boot(tx)? != boot { return Err(rusqlite::Error::InvalidQuery); }
+            for (language, choice) in rows {
+                if choice.selector == "auto" {
+                    tx.execute("DELETE FROM workspace_environment WHERE incarnation=?1 AND language=?2 AND root=?3", params![incarnation,language.as_str(),choice.root.to_string_lossy()])?;
+                } else {
+                    tx.execute("INSERT INTO workspace_environment(incarnation,language,root,selector) VALUES (?1,?2,?3,?4) ON CONFLICT(incarnation,language,root) DO UPDATE SET selector=excluded.selector", params![incarnation, language.as_str(), choice.root.to_string_lossy(), choice.selector])?;
+                }
+            }
+            Ok(())
+        }).await?;
+        self.load_environment(tree).await
     }
 
     /// Commits explicit lifecycle closure only for an exact verified directory with no active grant.
