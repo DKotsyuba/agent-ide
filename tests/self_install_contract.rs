@@ -321,6 +321,16 @@ fn replace_reinstalls_a_byte_different_source_build_of_the_same_version() {
         installed, candidate,
         "the replaced release must carry the new manifest"
     );
+    assert_eq!(
+        fs::read_to_string(
+            root.join("share/plugin")
+                .join(VERSION)
+                .join("skills/agent-ide/SKILL.md")
+        )
+        .unwrap(),
+        "rebuilt bytes\n",
+        "the replaced release must restage its plugin"
+    );
     assert!(
         !fs::read_dir(root.join("prefix/releases"))
             .unwrap()

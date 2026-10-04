@@ -314,6 +314,8 @@ fn install(options: &Options) -> Result<Summary, String> {
     let plugin_root = options.share_dir.join(PLUGIN_DIR);
     create_dir(&plugin_root)?;
 
+    // A replaced release restages its plugin too, even when `current` already selects it.
+    let replaced = matches!(reinstall, Reinstall::Replace);
     // Writes, in order: release dir → launcher shim → plugin stage → both `current` swaps.
     match reinstall {
         Reinstall::Fresh => install_release(&options.release, &selected, &options.version)?,
@@ -339,16 +341,17 @@ fn install(options: &Options) -> Result<Summary, String> {
     let current = options.prefix.join("current");
     // `current` names the versioned release below `releases/`; the link target stays relative.
     let current_target_name = format!("{RELEASES_DIR}/{}", options.version);
-    let action = if current_target(&current).as_deref() == Some(current_target_name.as_str()) {
-        // Same version already selected: the immutable release and the plugin are already in
-        // place, so only the launcher above is refreshed.
-        "refreshed"
-    } else {
-        stage_plugin_parts(options, &plugin_root)?;
-        swap_symlink(&current, &current_target_name)?;
-        swap_symlink(&plugin_root.join("current"), &options.version)?;
-        "installed"
-    };
+    let action =
+        if !replaced && current_target(&current).as_deref() == Some(current_target_name.as_str()) {
+            // Same version already selected: the immutable release and the plugin are already in
+            // place, so only the launcher above is refreshed.
+            "refreshed"
+        } else {
+            stage_plugin_parts(options, &plugin_root)?;
+            swap_symlink(&current, &current_target_name)?;
+            swap_symlink(&plugin_root.join("current"), &options.version)?;
+            "installed"
+        };
     Ok(Summary {
         version: options.version.clone(),
         prefix: options.prefix.clone(),
@@ -407,7 +410,7 @@ fn identical_release(existing: &Path, candidate: &Path, version: &str) -> Result
     Ok(())
 }
 
-/// Stages the four plugin parts into `plugin_root/<version>`, regenerating the Claude hook to
+/// Stages the plugin parts into `plugin_root/<version>`, regenerating the Claude hook to
 /// exec the managed launcher (the `scripts/install-local.sh` contract). Expects `<share>/plugin`
 /// to exist (the check phase created it); the caller owns both `current` swaps.
 fn stage_plugin_parts(options: &Options, plugin_root: &Path) -> Result<(), String> {
