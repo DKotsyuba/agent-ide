@@ -967,9 +967,9 @@ pub(crate) mod testing {
             });
             let identity = format!(
                 "{labels}:{}",
-                selection
+                chosen
                     .as_ref()
-                    .map_or("", |choice| choice.selector.as_str())
+                    .map_or("", |candidate| candidate.label.as_str())
             );
             vec![environment::ResolvedEnv {
                 root: PathBuf::new(),

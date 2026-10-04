@@ -89,6 +89,118 @@ async fn environment_roundtrip_auto_and_new_incarnation() {
     assert!(selections(&root, ALPHA).is_empty());
 }
 
+/// A committed write whose acknowledgement was lost is read back without replaying the write.
+#[tokio::test]
+async fn review_environment_unknown_commit_rehydrates_selections() {
+    crate::lang::testing::install();
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let owner = DurableWorkspace::open(&store).await.unwrap();
+    let root = fixture.root();
+    let tree = owner
+        .resolve_worktree(root.clone(), root.clone(), root.join(".git"))
+        .await
+        .unwrap();
+    let incarnation = signed(tree.incarnation()).unwrap();
+    let op = OperationId::new("review-environment-unknown").unwrap();
+    store.execute(op.clone(), move |tx| {
+        tx.execute("INSERT INTO workspace_environment(incarnation,language,root,selector) VALUES (?1,'alpha','','two')", [incarnation])?;
+        Ok(())
+    }).await.unwrap();
+    assert!(crate::lang::environment::selections(&root, crate::lang::testing::ALPHA).is_empty());
+    owner
+        .finish_environment_write(
+            &tree,
+            &op,
+            Err(StoreError::OutcomeUnknown {
+                operation: op.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::lang::environment::selections(&root, crate::lang::testing::ALPHA)[0].selector,
+        "two"
+    );
+    let count = store
+        .read_one(
+            "SELECT count(*) FROM workspace_environment",
+            Vec::new(),
+            |row| row.get::<_, i64>(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count, Some(1));
+    crate::lang::environment::replace_selections(&root, crate::lang::testing::ALPHA, Vec::new());
+}
+
+/// Adding the environment migration to an existing v3 database preserves worktree/start rows.
+#[tokio::test]
+async fn review_environment_upgrade_preserves_v3_rows() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    for (key, source) in [
+        ("identity_authority_baseline_v1", SQL),
+        ("creation_identity_v2", IDENTITY_SQL),
+        ("reader_starts_v3", READER_SQL),
+    ] {
+        let sql = TrustedUpSql::new(source).unwrap();
+        let admission = store
+            .admit_migration(DomainMigration {
+                domain: DomainName::new("workspace").unwrap(),
+                key: MigrationKey::new(key).unwrap(),
+                expected_digest: MigrationDigest::from_sql(&sql),
+                up_sql: sql,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(admission, MigrationAdmission::Applied { .. }));
+    }
+    let root = fixture.root().as_os_str().as_bytes().to_vec();
+    store.execute(OperationId::new("review-v3-seed").unwrap(), move |tx| {
+        tx.execute("INSERT INTO workspace_worktrees(incarnation,physical_key,native_key,root,repository,common_dir,nonce,root_object,root_identity) VALUES (7,?1,?1,?2,?2,?2,?1,?1,?1)", params![vec![7u8;32], root])?;
+        tx.execute("INSERT INTO workspace_starts(operation,digest,incarnation,actor,binding,boot,epoch,outcome,active,role,started_ms) VALUES ('v3-start',?1,7,'v3-actor',?1,0,1,'granted',0,'reader',123)", [vec![7u8;32]])?;
+        Ok(())
+    }).await.unwrap();
+    let before = store
+        .read_one(
+            "SELECT count(*) FROM sqlite_master WHERE name='workspace_environment'",
+            Vec::new(),
+            |row| row.get::<_, i64>(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(before, Some(0));
+    let _owner = DurableWorkspace::open(&store).await.unwrap();
+    let preserved = store.read_one("SELECT incarnation,actor,role,started_ms FROM workspace_starts WHERE operation='v3-start'", Vec::new(), |row| Ok((row.get::<_,i64>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?, row.get::<_,i64>(3)?))).await.unwrap();
+    assert_eq!(
+        preserved,
+        Some((7, "v3-actor".into(), "reader".into(), 123))
+    );
+    assert_eq!(
+        store
+            .read_one(
+                "SELECT count(*) FROM workspace_worktrees WHERE incarnation=7",
+                Vec::new(),
+                |row| row.get::<_, i64>(0)
+            )
+            .await
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        store
+            .read_one(
+                "SELECT count(*) FROM workspace_environment",
+                Vec::new(),
+                |row| row.get::<_, i64>(0)
+            )
+            .await
+            .unwrap(),
+        Some(0)
+    );
+}
+
 /// Keeps one collision-resistant native test tree and its database under a nonsymlinked temporary root.
 struct Fixture(PathBuf);
 impl Fixture {

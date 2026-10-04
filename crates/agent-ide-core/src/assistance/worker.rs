@@ -3148,33 +3148,10 @@ impl<'a> Worker<'a> {
             self.quiesce_worktree_caches(&binding);
         }
         if !choices.is_empty() {
-            let changed: BTreeSet<_> = choices
-                .iter()
-                .filter(|(language, choice)| {
-                    let old = crate::lang::environment::selections(
-                        authority.worktree().worktree_path(),
-                        *language,
-                    )
-                    .into_iter()
-                    .find(|old| old.root == choice.root);
-                    if choice.selector == "auto" {
-                        old.is_some()
-                    } else {
-                        old.as_ref()
-                            .is_none_or(|old| old.selector != choice.selector)
-                    }
-                })
-                .map(|(language, _)| *language)
-                .collect();
             self.workspace
                 .set_environment(authority.worktree(), choices)
                 .await
                 .map_err(|_| FailureCode::Internal)?;
-            if let Some(feed) = &self.shared.project_feed {
-                for language in changed {
-                    feed.environment_changed(authority.worktree().worktree_path(), language);
-                }
-            }
         }
         self.shared
             .refresh_environments(authority.worktree().worktree_path());
@@ -4683,7 +4660,8 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// Releases the binding-owned state that only a committed durable revoke makes safe to clear.
+    /// Releases binding-owned state only after a committed revoke, including environment notice
+    /// baselines, so stopped bindings cannot retain roots or suppress a future binding's notices.
     fn release_binding_state(&mut self, binding: &BindingRef) {
         self.quiesce_worktree_caches(binding);
         self.registered.remove(binding);
@@ -4694,6 +4672,9 @@ impl<'a> Worker<'a> {
         }
         if let Ok(mut notices) = self.shared.git_notices.lock() {
             notices.remove(&binding.fingerprint());
+        }
+        if let Ok(mut environments) = self.shared.environments.lock() {
+            environments.forget(&binding.fingerprint());
         }
         if let Ok(mut ledger) = self.shared.ledger.lock() {
             ledger.feedback.remove(binding);
@@ -5561,8 +5542,9 @@ fn discovery_failure_detail(
     }
 }
 
-/// Validates all requested selections before any shared state changes. Absolute selectors use
-/// launcher admission; root suffixes stay below the worktree, and language refusals retain reasons.
+/// Validates choices before shared state changes. Every non-auto selector is admitted as a
+/// project-relative or absolute path; symlink and relative escapes retain the closed refusal.
+/// Project-root suffixes stay in the worktree, and language refusals preserve their reasons.
 fn validate_environment(
     value: Option<&Value>,
     worktree: &Path,
@@ -5585,6 +5567,8 @@ fn validate_environment(
         return Err(invalid("at most 8 selections".to_owned()));
     }
     let mut result = Vec::new();
+    let mut roots = allowed_roots.to_vec();
+    roots.push(worktree.to_path_buf());
     for (key, value) in choices {
         let (id, root) = key.split_once(':').unwrap_or((key.as_str(), ""));
         let language = crate::lang::Language::by_id(id)
@@ -5608,15 +5592,13 @@ fn validate_environment(
         let project_root = worktree.join(&root);
         super::launcher::admit_path(&[worktree.to_path_buf()], &project_root)
             .map_err(|_| invalid(format!("{key}: root leaves the worktree")))?;
-        if Path::new(selector).is_absolute() {
-            super::launcher::admit_path(allowed_roots, Path::new(selector)).map_err(|_| {
+        if selector != "auto" {
+            super::launcher::admit_path(&roots, &project_root.join(selector)).map_err(|_| {
                 (
                     FailureCode::OutsideAllowedRoots,
                     format!("environment {key} {selector}"),
                 )
             })?;
-        }
-        if selector != "auto" {
             language
                 .support()
                 .check_selection(worktree, &root, selector)
@@ -6408,6 +6390,155 @@ mod stop_retry_tests {
         worker.activate(&mut job).await.unwrap();
         let receipt = worker.grants.get(&binding).cloned().unwrap();
         (binding, receipt)
+    }
+
+    /// Relative escapes and symlink escapes are refused before language resolution; plain labels work.
+    #[test]
+    fn review_environment_selector_admission() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        std::fs::create_dir_all(fixture.base.join("outside")).unwrap();
+        std::os::unix::fs::symlink(fixture.base.join("outside"), fixture.root.join("linked"))
+            .unwrap();
+        std::fs::write(
+            fixture.root.join("env.fixture"),
+            "one\n../outside\nlinked\n",
+        )
+        .unwrap();
+        let allowed = vec![fixture.root.clone()];
+        for selector in ["../outside", "linked"] {
+            let error = validate_environment(
+                Some(&serde_json::json!({"alpha":selector})),
+                &fixture.root,
+                &allowed,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                (
+                    FailureCode::OutsideAllowedRoots,
+                    format!("environment alpha {selector}")
+                )
+            );
+        }
+        assert!(
+            validate_environment(
+                Some(&serde_json::json!({"alpha":"one"})),
+                &fixture.root,
+                &[]
+            )
+            .is_ok()
+        );
+        for key in ["alpha:../outside", "alpha:/absolute"] {
+            assert_eq!(
+                validate_environment(
+                    Some(&serde_json::json!({key:"one"})),
+                    &fixture.root,
+                    &allowed
+                )
+                .unwrap_err()
+                .0,
+                FailureCode::InvalidDetail
+            );
+        }
+    }
+
+    /// Choosing the discovered winner leaves its identity and check count unchanged.
+    #[tokio::test]
+    async fn review_environment_winner_selection_is_a_noop() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("env.fixture"), "one\ntwo\n").unwrap();
+        std::fs::write(fixture.root.join("alpha.toml"), "").unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let language = crate::lang::testing::ALPHA;
+        let checker = Arc::new(crate::checks::FakeChecker::new(
+            language,
+            crate::checks::ProblemSnapshot::from_problems(
+                language,
+                crate::checks::CheckState::Ready,
+                Vec::new(),
+                1,
+                0,
+            ),
+        ));
+        let scheduler = crate::checks::scheduler::Scheduler::new(
+            vec![checker.clone()],
+            Duration::from_millis(1),
+            1,
+            fixture.base.join("cache"),
+        );
+        let feed = Arc::new(ProjectProblemFeed::new(
+            scheduler.clone(),
+            vec![fixture.root.clone()],
+            vec![language],
+        ));
+        Arc::get_mut(&mut worker.shared).unwrap().project_feed = Some(feed.clone());
+        let (binding, _) = production_start(&mut worker, "review-env", "review-env-start").await;
+        feed.activated(
+            binding.fingerprint(),
+            &fixture.root,
+            Path::new("repo"),
+            false,
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while scheduler.latest(&fixture.root).is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let before = checker.requests().len();
+        let (mut job, _cancel) = start_job(
+            &worker,
+            "review-env",
+            "review-env-select",
+            serde_json::json!({"activation_id":"review-env-start","environment":{"alpha":"one"}}),
+        );
+        worker.activate(&mut job).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(checker.requests().len(), before);
+        worker.settle_revocation(&binding).await.unwrap();
+        assert!(
+            worker
+                .shared
+                .environments
+                .lock()
+                .unwrap()
+                .root(&binding.fingerprint())
+                .is_none()
+        );
+        scheduler.shutdown().await;
+    }
+
+    /// Stop cleanup releases both the binding's root and its environment delivery bookkeeping.
+    #[tokio::test]
+    async fn review_environment_binding_is_pruned_on_stop() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        let invocation = production_call(&worker, "review-prune", "review-prune-call");
+        let binding = invocation.binding_ref();
+        worker
+            .shared
+            .environments
+            .lock()
+            .unwrap()
+            .bind(binding.fingerprint(), &fixture.root);
+        worker.release_binding_state(binding);
+        assert!(
+            worker
+                .shared
+                .environments
+                .lock()
+                .unwrap()
+                .root(&binding.fingerprint())
+                .is_none()
+        );
     }
 
     /// Selection validation retains language reasons, admission policy and the uniform reader refusal.
