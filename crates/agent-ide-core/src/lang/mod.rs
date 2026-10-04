@@ -20,6 +20,8 @@ use async_lsp::lsp_types as lsp;
 /// Line and brace helpers shared by the support modules of brace-delimited languages.
 pub mod brace;
 pub mod edits;
+/// Project environments per language: resolved answers, stored choices, command environments.
+pub mod environment;
 /// Cross-language name facts: namespaces, facts, the fact sink and the `NameFacts` seam.
 pub mod names;
 pub mod path;
@@ -722,6 +724,43 @@ pub trait LanguageSupport: Send + Sync {
     fn test_toolchain(&self, program: &str) -> Option<(PathBuf, PathBuf)> {
         let _ = program;
         None
+    }
+
+    /// Every project root's environment in `worktree`, honouring the stored selections
+    /// ([`environment::selections`]): the language's single resolver, which the card, project
+    /// checks, the language server session and test and format commands all use. Reads files
+    /// only and never runs an environment manager. Empty (the default) when the language has no
+    /// selectable environment.
+    fn environments(&self, worktree: &Path) -> Vec<environment::ResolvedEnv> {
+        let _ = worktree;
+        Vec::new()
+    }
+
+    /// Accepts or refuses `selector` for the project `root` (relative to `worktree`) before it
+    /// is stored. `Err` carries the cause and the way out: an unknown candidate with the
+    /// candidates, or a project pin that overrides any selection. Admission of absolute paths
+    /// against the allowed roots is the caller's. The default refuses: nothing to choose.
+    fn check_selection(&self, worktree: &Path, root: &Path, selector: &str) -> Result<(), String> {
+        let _ = (worktree, root, selector);
+        Err("this language has no selectable environment".to_owned())
+    }
+
+    /// How a test or format command whose program is `program`, started in `cwd` inside
+    /// `worktree`, runs in the resolved environment; `None` runs it as given with the inherited
+    /// environment. The default keeps the pinned toolchain of [`Self::test_toolchain`].
+    fn command_env(
+        &self,
+        worktree: &Path,
+        cwd: &Path,
+        program: &str,
+    ) -> Option<environment::CommandEnv> {
+        let _ = (worktree, cwd);
+        self.test_toolchain(program)
+            .map(|(executable, directory)| environment::CommandEnv {
+                argv_prefix: vec![executable.into_os_string()],
+                path_prefix: Some(directory),
+                vars: Vec::new(),
+            })
     }
 
     /// First module documentation line of a file's `text` (a directory outline shows it next to
