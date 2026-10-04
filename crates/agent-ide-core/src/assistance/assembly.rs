@@ -875,12 +875,14 @@ impl ProductDispatcher {
                                 test_status.as_deref(),
                             ),
                         };
+                        // The facade decodes a carried plate up to the hook feedback ceiling.
                         *status = with_git_notice(worker, &fingerprint, status.take(), |plate| {
-                            super::content::fits_with_status(
-                                &reply,
-                                plate,
-                                super::content::Envelope::WithStructured,
-                            )
+                            plate.len() <= super::reply::MAX_FEEDBACK_BYTES
+                                && super::content::fits_with_status(
+                                    &reply,
+                                    plate,
+                                    super::content::Envelope::WithStructured,
+                                )
                         });
                     }
                 }

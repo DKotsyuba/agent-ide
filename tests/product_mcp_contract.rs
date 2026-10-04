@@ -18988,3 +18988,95 @@ async fn configured_product_environment_repeat_start_keeps_own_cache_and_binding
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
 }
+
+/// A repeated start that switches environments while a failed run's long status line is due
+/// still answers with its activation card: the environment notice joins the plate, which
+/// together exceed the feed's 256-byte block yet must not make the facade refuse the reply.
+#[tokio::test]
+async fn configured_product_environment_switch_plate_with_due_test_line_keeps_the_card() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = ProductFixture::new(json!([]));
+    fixture.write_config(json!([
+        {"executable":accepted_program("/bin/sh","pyright-fixture"),"settings":"pyright_defaults_v1","toolchain":"node-fixture","node":accepted_program("/bin/sh","node-fixture"),"cargo":null,"cargo_version":null,"rustc":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"switch-plate-cache"}
+    ]));
+    std::fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[project]\nname = 'switch-plate'\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(fixture.root.join("tests")).unwrap();
+    std::fs::write(fixture.root.join("tests/test_env.py"), "pass\n").unwrap();
+    // `.venv` fails like an interpreter without pytest, with a runner line long enough to fill
+    // the test status line's 160-character plate share.
+    let failure = format!("ERROR: No module named pytest {}", "x".repeat(170));
+    for (label, script) in [
+        (
+            ".venv",
+            format!("#!/bin/sh\nprintf '%s\\n' '{failure}'\nexit 1\n"),
+        ),
+        (
+            ".venv-py314",
+            "#!/bin/sh\nprintf '1 passed in 0.01s\\n'\n".to_owned(),
+        ),
+    ] {
+        let env = fixture.root.join(label);
+        std::fs::create_dir_all(env.join("bin")).unwrap();
+        std::fs::write(env.join("pyvenv.cfg"), "home = /bin\nversion = 3.14.3\n").unwrap();
+        std::fs::write(env.join("bin/python"), script).unwrap();
+        std::fs::set_permissions(
+            env.join("bin/python"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "switch-plate").await;
+    let first = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"switch-plate"}),
+        )
+        .await;
+    let first = actor.settle(&fixture, first).await;
+    assert_eq!(first["kind"], "activation", "{first}");
+    let run = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"path":"tests/test_env.py","budget_s":5}),
+        )
+        .await;
+    assert_eq!(run["kind"], "test", "{run}");
+    // Let the failing run settle without polling it, so its status line stays due.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let switched = actor
+        .call_raw(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"switch-plate","environment":{"python":".venv-py314"}}),
+        )
+        .await;
+    let switched = actor.settle_raw(&fixture, switched).await;
+    let text = switched["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(
+        switched["result"]["structuredContent"]["kind"], "activation",
+        "{switched}"
+    );
+    assert!(
+        text.contains("python: environment now .venv-py314 (was .venv; selected)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("tests #1: no test results (exit 1)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("environment: python .venv-py314 (3.14.3, selected)"),
+        "{text}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}

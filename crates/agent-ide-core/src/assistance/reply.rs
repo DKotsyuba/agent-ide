@@ -574,8 +574,10 @@ impl PeerReply {
     ///
     /// Accepts the bare closed reply (`status` absent, the historical wire form) and the
     /// [`StatusCarriedReply`] wrapper. Both forms enforce the same byte bound; a carried plate
-    /// must be a nonempty block within [`crate::feed::MAX_BLOCK_BYTES`] and its reply must pass
-    /// the same closed-reference validation as a bare one.
+    /// must be a nonempty block within [`MAX_FEEDBACK_BYTES`] — the ceiling a hook-delivered
+    /// plate has too, since due git and environment notices join the feed's
+    /// [`crate::feed::MAX_BLOCK_BYTES`] block — and its reply must pass the same
+    /// closed-reference validation as a bare one.
     pub(crate) fn decode_delivered(value: &str) -> Option<(Self, Option<String>)> {
         if let Ok(carried) = serde_json::from_str::<StatusCarriedReply>(value) {
             if value.len() > MAX_REPLY_BYTES {
@@ -583,7 +585,7 @@ impl PeerReply {
             }
             let valid = carried.reply.valid_reference()
                 && !carried.status.is_empty()
-                && carried.status.len() <= crate::feed::MAX_BLOCK_BYTES;
+                && carried.status.len() <= MAX_FEEDBACK_BYTES;
             return valid.then_some((carried.reply, Some(carried.status)));
         }
         Some((Self::decode(value)?, None))
@@ -675,10 +677,17 @@ fn status_carried_replies_round_trip_and_stay_closed() {
     .to_string();
     assert!(PeerReply::decode_delivered(&forged).is_none());
 
-    // A plate over the feed's block cap never decodes.
-    let overlong = format!(
+    // A feed block led by due notices may exceed the feed's block cap and still decodes; a plate
+    // over the hook feedback ceiling never does.
+    let noticed = format!(
         "<agent-ide>\n{}\n</agent-ide>",
         "x".repeat(crate::feed::MAX_BLOCK_BYTES)
+    );
+    let encoded = PeerReply::encode_with_status(&reply, &noticed).unwrap();
+    assert!(PeerReply::decode_delivered(encoded.as_str()).is_some());
+    let overlong = format!(
+        "<agent-ide>\n{}\n</agent-ide>",
+        "x".repeat(MAX_FEEDBACK_BYTES)
     );
     let encoded = PeerReply::encode_with_status(&reply, &overlong).unwrap();
     assert!(PeerReply::decode_delivered(encoded.as_str()).is_none());
