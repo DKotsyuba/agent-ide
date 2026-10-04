@@ -26,11 +26,11 @@ use agent_ide_core::checks::{
 };
 
 /// Name of the pyright project config file consulted at a worktree's root.
-const PYRIGHT_CONFIG_FILE: &str = "pyrightconfig.json";
+pub(crate) const PYRIGHT_CONFIG_FILE: &str = "pyrightconfig.json";
 
 /// Name of the PEP 518 project file whose `[tool.pyright]` table is the second interpreter
 /// resolution source.
-const PYPROJECT_FILE: &str = "pyproject.toml";
+pub(crate) const PYPROJECT_FILE: &str = "pyproject.toml";
 
 /// Detail attached to an [`UnavailableReason::NoFiles`] snapshot (T12B), naming the project
 /// configuration a fix should start from.
@@ -82,7 +82,7 @@ impl PythonChecker {
     }
 
     /// Builds the [`RunSpec`] for one pyright run against `request`, using the already-resolved
-    /// `interpreter` (as returned by [`resolve_interpreter`], not yet canonicalized).
+    /// `interpreter` (as the shared resolver returns it, not yet canonicalized).
     ///
     /// `interpreter` itself — not its canonical form — is what `--pythonpath` receives: a
     /// uv-managed (or otherwise symlinked) venv's `bin/python` is a symlink to a base
@@ -90,10 +90,10 @@ impl PythonChecker {
     /// next to the symlink it was *invoked as* (`sys._base_executable`/`sys.prefix` resolution),
     /// not next to whatever that symlink resolves to. Passing the canonical (resolved) path here
     /// would make pyright run the base interpreter as if it had no venv, so it would never see
-    /// the venv's `site-packages`. `interpreter` still takes precedence over any `venvPath`/`venv`
-    /// pyright would otherwise read from `pyrightconfig.json`/`pyproject.toml` itself: pyright
-    /// gives an explicit `--pythonpath` priority over its own config-driven venv resolution, so
-    /// the two sources cannot disagree here.
+    /// the venv's `site-packages`. A `venvPath`/`venv` pin in `pyrightconfig.json`/`pyproject.toml`
+    /// outranks `--pythonpath` inside pyright (the pin supplies the site-packages; pythonPath adds
+    /// only non-site-packages roots), so the resolver reads that pin first and hands exactly its
+    /// interpreter here: the two sources cannot disagree.
     ///
     /// `interpreter` is canonicalized only to derive `read_roots` (falling back to the given path
     /// if canonicalization fails, which only happens if the file was removed between resolution
@@ -113,7 +113,7 @@ impl PythonChecker {
 
     /// Builds the [`RunSpec`] for one pyright run against the Python root `project_root` — the
     /// worktree itself, or one of `python_roots`'s nested package roots — using
-    /// the already-resolved `interpreter` (as returned by [`resolve_interpreter`], not yet
+    /// the already-resolved `interpreter` (as the shared resolver returns it, not yet
     /// canonicalized).
     ///
     /// `interpreter` itself — not its canonical form — is what `--pythonpath` receives: a
@@ -122,10 +122,10 @@ impl PythonChecker {
     /// next to the symlink it was *invoked as* (`sys._base_executable`/`sys.prefix` resolution),
     /// not next to whatever that symlink resolves to. Passing the canonical (resolved) path here
     /// would make pyright run the base interpreter as if it had no venv, so it would never see
-    /// the venv's `site-packages`. `interpreter` still takes precedence over any `venvPath`/`venv`
-    /// pyright would otherwise read from `pyrightconfig.json`/`pyproject.toml` itself: pyright
-    /// gives an explicit `--pythonpath` priority over its own config-driven venv resolution, so
-    /// the two sources cannot disagree here.
+    /// the venv's `site-packages`. A `venvPath`/`venv` pin in `pyrightconfig.json`/`pyproject.toml`
+    /// outranks `--pythonpath` inside pyright (the pin supplies the site-packages; pythonPath adds
+    /// only non-site-packages roots), so the resolver reads that pin first and hands exactly its
+    /// interpreter here: the two sources cannot disagree.
     ///
     /// `--project` is `project_root`'s own `pyrightconfig.json` when one is readable there, else
     /// `project_root` itself, so a nested package's own configuration governs its run. A nested
@@ -226,16 +226,12 @@ impl Checker for PythonChecker {
                     generation,
                 );
             }
-            // One pyright run per Python root (`python_roots`: the worktree when it declares a
-            // manifest, else each nested package root; a worktree marked Python only by its root
-            // environment directory checks as a single root). A root with no resolvable
-            // environment is skipped — running pyright without an interpreter would only flood
-            // unresolved-import errors — and only a worktree whose every root lacks one reports
-            // `EnvMissing`.
-            let mut roots = crate::support::python_roots(&request.worktree);
-            if roots.is_empty() {
-                roots.push(request.worktree.clone());
-            }
+            // One pyright run per Python root, each with the shared resolver's environment. A
+            // root with none is skipped — running pyright without an interpreter would only
+            // flood unresolved-import errors — and only a worktree whose every root lacks one
+            // reports `EnvMissing`, carrying each root's cause and next step.
+            let environments =
+                crate::environment::environments(&request.worktree, &request.read_denies);
             let tmp_dir = request.cache_dir.join("tmp");
             if let Err(error) = fs::create_dir_all(&tmp_dir) {
                 return ProblemSnapshot::unavailable_with_detail(
@@ -248,15 +244,20 @@ impl Checker for PythonChecker {
             }
             let started = Instant::now();
             let mut snapshots = Vec::new();
-            for root in &roots {
-                let Some(interpreter) = resolve_interpreter_with_denies(root, &request.read_denies)
-                    .or_else(|| {
-                        resolve_interpreter_with_denies(&request.worktree, &request.read_denies)
-                    })
-                else {
+            let mut missing = Vec::new();
+            for env in &environments {
+                let root = crate::environment::absolute_root(&request.worktree, env);
+                let Some(interpreter) = crate::environment::interpreter(env) else {
+                    missing.extend(env.missing_next_step.as_ref().map(|step| {
+                        if env.root.as_os_str().is_empty() {
+                            step.clone()
+                        } else {
+                            format!("{}: {step}", env.root.display())
+                        }
+                    }));
                     continue;
                 };
-                let spec = self.pyright_spec_for_root(&request, root, &interpreter);
+                let spec = self.pyright_spec_for_root(&request, &root, &interpreter);
                 let output = match self.runner.run(spec).await {
                     Ok(output) => output,
                     Err(error) => {
@@ -292,10 +293,12 @@ impl Checker for PythonChecker {
             if snapshots.is_empty() {
                 // Every root lacked an environment (or there was no root at all): the durable
                 // condition, not a failed run.
-                return ProblemSnapshot::unavailable(
+                return ProblemSnapshot::unavailable_with_detail(
                     crate::LANGUAGE,
                     UnavailableReason::EnvMissing,
                     generation,
+                    started.elapsed().as_millis() as u64,
+                    (!missing.is_empty()).then(|| missing.join("; ")),
                 );
             }
             if snapshots.len() == 1 {
@@ -387,78 +390,18 @@ fn relativize_paths(snapshot: &mut ProblemSnapshot, worktree: &Path) {
     }
 }
 
-/// Resolves the Python interpreter pyright should use beside `root`, per EYES-r2 §4.
-///
-/// Tries, in order: (1) `venvPath`/`venv` from `<root>/pyrightconfig.json`; (2) the same two
-/// keys from the `[tool.pyright]` table of `<root>/pyproject.toml`; (3) the environment
-/// directories beside `root` (`venv_directories`: `.venv`/`venv`, then any
-/// `.venv*`/`venv*` sibling such as `.venv-py314`). Each source is authoritative once it defines
-/// both keys: if the resulting `<venvPath>/<venv>/bin/python` does not exist as a file,
-/// resolution stops there and returns `None` rather than silently falling through to a later
-/// source that might resolve to a different, unintended interpreter. Returns `None` when no
-/// source names an existing interpreter file, which the checker maps to
-/// [`UnavailableReason::EnvMissing`] without ever invoking pyright (a missing environment must
-/// never produce the flood of unresolved-import errors that running pyright without a venv would
-/// report).
+/// The interpreter the shared resolver chooses for a worktree whose root is `root` (honouring
+/// a stored selection), or `None` when nothing resolves — a pinned environment that is missing
+/// included, which the checker reports as [`UnavailableReason::EnvMissing`] without running
+/// pyright.
 pub fn resolve_interpreter(root: &Path) -> Option<PathBuf> {
-    resolve_interpreter_with_denies(root, &[])
+    crate::environment::interpreter(&crate::environment::resolve_root(root, root, &[]))
 }
 
-/// Resolves the interpreter without probing any host-denied config or executable path.
-fn resolve_interpreter_with_denies(
-    root: &Path,
-    denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
-) -> Option<PathBuf> {
-    if [PYRIGHT_CONFIG_FILE, PYPROJECT_FILE]
-        .iter()
-        .any(|name| denies.iter().any(|deny| deny.matches(&root.join(name))))
-    {
-        return None;
-    }
-    if let Some((venv_path, venv)) = read_pyrightconfig_venv_keys(root, denies) {
-        return existing_python(venv_interpreter_path(root, &venv_path, &venv), denies);
-    }
-    if let Some((venv_path, venv)) = read_pyproject_venv_keys(root, denies) {
-        return existing_python(venv_interpreter_path(root, &venv_path, &venv), denies);
-    }
-    crate::support::venv_directories(root)
-        .into_iter()
-        .find_map(|venv| existing_python(venv.join("bin").join("python"), denies))
-}
-
-/// The interpreter for the shared Pyright session of a worktree: the environment beside the
-/// worktree root when one exists, else the first nested Python root (`python_roots`) that has
-/// one, so a monorepo whose environments live beside its packages serves its Python files from
-/// the package environment rather than none at all.
+/// The interpreter of the worktree's shared Pyright session: the first project root, the
+/// worktree itself first, whose environment resolves.
 pub fn session_interpreter(worktree: &Path) -> Option<PathBuf> {
-    resolve_interpreter_with_denies(worktree, &[]).or_else(|| {
-        crate::support::python_roots(worktree)
-            .iter()
-            .find_map(|root| resolve_interpreter_with_denies(root, &[]))
-    })
-}
-
-/// Joins `venvPath`/`venv` into the `bin/python` interpreter path they name.
-///
-/// `venv_path` is resolved relative to `worktree` when it is not already absolute, matching
-/// pyright's own resolution of a config-relative `venvPath`.
-fn venv_interpreter_path(worktree: &Path, venv_path: &str, venv: &str) -> PathBuf {
-    let base = Path::new(venv_path);
-    let base = if base.is_absolute() {
-        base.to_path_buf()
-    } else {
-        worktree.join(base)
-    };
-    base.join(venv).join("bin").join("python")
-}
-
-/// Returns an existing interpreter outside host denies, including a bounded venv symlink chain
-/// when every hop is allowed; denied paths and symlinked parents return `None`.
-fn existing_python(
-    candidate: PathBuf,
-    denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
-) -> Option<PathBuf> {
-    allowed_file(&candidate, denies).then_some(candidate)
+    crate::environment::session(worktree).0
 }
 
 /// Follows at most 32 interpreter or tool links with no-follow metadata, proving each normalized
@@ -520,7 +463,10 @@ fn lexical_link_target(
 }
 
 /// Accepts an existing regular file without following an unproved link under host read denies.
-fn allowed_file(path: &Path, denies: &[agent_ide_core::execution::seatbelt::ReadDeny]) -> bool {
+pub(crate) fn allowed_file(
+    path: &Path,
+    denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
+) -> bool {
     if denies.is_empty() {
         path.is_file()
     } else {
@@ -538,7 +484,7 @@ fn allowed_config(path: &Path, denies: &[agent_ide_core::execution::seatbelt::Re
 }
 
 /// Reads a project config through an `O_NOFOLLOW` descriptor under host read exclusions.
-fn read_config(
+pub(crate) fn read_config(
     path: &Path,
     denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
 ) -> Option<String> {
@@ -602,7 +548,7 @@ struct PyrightConfigVenvKeys {
 ///
 /// Under host denies the read uses `O_NOFOLLOW`; denied or linked configs, absent or invalid JSON,
 /// and configs without both keys return `None`.
-fn read_pyrightconfig_venv_keys(
+pub(crate) fn read_pyrightconfig_venv_keys(
     worktree: &Path,
     denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
 ) -> Option<(String, String)> {
@@ -626,7 +572,7 @@ fn read_pyrightconfig_venv_keys(
 /// those forms for `venvPath`/`venv` is treated as not specifying them (falls through to the next
 /// resolution source) rather than being mis-parsed into a wrong path. Under host denies the read
 /// uses `O_NOFOLLOW` and refuses denied or linked config files.
-fn read_pyproject_venv_keys(
+pub(crate) fn read_pyproject_venv_keys(
     worktree: &Path,
     denies: &[agent_ide_core::execution::seatbelt::ReadDeny],
 ) -> Option<(String, String)> {
@@ -896,11 +842,12 @@ impl LanguageChecks for PythonChecks {
         if covering.is_empty() {
             return Some("no Python project root covers this file");
         }
-        let worktree_environment = resolve_interpreter_with_denies(worktree, &[]).is_some();
         covering
             .iter()
             .all(|root| {
-                resolve_interpreter_with_denies(root, &[]).is_none() && !worktree_environment
+                crate::environment::resolve_root(worktree, root, &[])
+                    .chosen
+                    .is_none()
             })
             .then_some("the Python project root beside this file has no environment")
     }
@@ -989,17 +936,19 @@ mod deny_tests {
             base: root.clone(),
             suffix: CredentialGlob::Key,
         }];
-        assert_eq!(resolve_interpreter_with_denies(&root, &denies), None);
+        let resolved = |denies: &[ReadDeny]| {
+            crate::environment::interpreter(&crate::environment::resolve_with_denies(
+                &root, &root, None, denies,
+            ))
+        };
+        assert_eq!(resolved(&denies), None);
         assert_eq!(read_config(&root.join(PYRIGHT_CONFIG_FILE), &denies), None);
         assert_eq!(read_config(&root.join(PYPROJECT_FILE), &denies), None);
         std::fs::remove_file(root.join(".venv/bin/python3")).unwrap();
         let allowed = root.join("python-real");
         std::fs::write(&allowed, "allowed").unwrap();
         symlink(&allowed, root.join(".venv/bin/python3")).unwrap();
-        assert_eq!(
-            resolve_interpreter_with_denies(&root, &denies),
-            Some(root.join(".venv/bin/python"))
-        );
+        assert_eq!(resolved(&denies), Some(root.join(".venv/bin/python")));
         let _ = std::fs::remove_dir_all(root);
     }
 
