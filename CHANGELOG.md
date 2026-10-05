@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.10.1 — 2026-10-05
+
 ### Fixed
 
 - A Rust file with a plain comment separated from the next item by an empty line (a
