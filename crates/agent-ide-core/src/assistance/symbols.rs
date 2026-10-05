@@ -3928,17 +3928,29 @@ fn apply_changes(
     }
     for (earlier, other) in changes.iter().enumerate() {
         for change in &changes[earlier + 1..] {
-            let clash = match (other.inserts(), change.inserts()) {
-                (true, true) => false,
-                (true, false) => {
-                    change.base.start < other.base.start && other.base.start <= change.base.end
-                }
-                (false, true) => {
-                    other.base.start < change.base.start && change.base.start <= other.base.end
-                }
-                (false, false) => {
-                    other.base.start <= change.base.end && change.base.start <= other.base.end
-                }
+            let clash = match (&other.action, &change.action) {
+                // Exact-text changes clash only when their matched bytes intersect: separate
+                // matches on one line (two substrings of one string literal) apply independently.
+                (
+                    ChangeAction::Splice { start, end, .. },
+                    ChangeAction::Splice {
+                        start: other_start,
+                        end: other_end,
+                        ..
+                    },
+                ) => start < other_end && other_start < end,
+                _ => match (other.inserts(), change.inserts()) {
+                    (true, true) => false,
+                    (true, false) => {
+                        change.base.start < other.base.start && other.base.start <= change.base.end
+                    }
+                    (false, true) => {
+                        other.base.start < change.base.start && change.base.start <= other.base.end
+                    }
+                    (false, false) => {
+                        other.base.start <= change.base.end && change.base.start <= other.base.end
+                    }
+                },
             };
             if clash {
                 refusal.refused.insert(other.number);
@@ -3960,6 +3972,14 @@ fn apply_changes(
             .base
             .start
             .cmp(&changes[a].base.start)
+            // Exact-text changes sharing a line apply right to left, so each one's base byte
+            // offsets still address the buffer when it applies.
+            .then_with(|| match (&changes[a].action, &changes[b].action) {
+                (ChangeAction::Splice { start: a, .. }, ChangeAction::Splice { start: b, .. }) => {
+                    b.cmp(a)
+                }
+                _ => std::cmp::Ordering::Equal,
+            })
             // At one start line the span change applies first and an insert anchored there
             // applies after it, so the inserted text ends up immediately before the span's
             // result whichever order the array listed them in; two inserts at one anchor keep
@@ -4012,10 +4032,18 @@ fn apply_changes(
             }
         };
         let shift = i64::from(lang::line_count(&buffer)) - i64::from(before);
-        for (_, span) in &mut recorded {
+        for (applied_index, span) in &mut recorded {
+            // An exact-text change applied earlier further right on this change's line moves
+            // with this change's line count, too.
+            let right_of_this = matches!(
+                (&change.action, &changes[*applied_index].action),
+                (ChangeAction::Splice { start, .. }, ChangeAction::Splice { start: applied, .. })
+                    if applied > start
+            );
             // An insert lands before its anchor line, so a span at that line moves too.
             let moves = match (&change.action, span.as_ref()) {
                 (ChangeAction::Insert(..), Some(span)) => span.start >= change.base.start,
+                (_, Some(span)) if right_of_this => span.start >= change.base.start,
                 (_, Some(span)) => span.start > change.base.end,
                 (_, None) => false,
             };
@@ -4591,6 +4619,40 @@ mod batch_tests {
         let changes = resolve_changes(source, Some(&outline), "a.gamma", &requests).unwrap();
         let (candidate, _) = apply_changes(source, "a.gamma", &changes).unwrap();
         assert_eq!(candidate, "abcd");
+    }
+
+    /// Exact-text changes on one line clash only when their matched bytes intersect: separate
+    /// substrings of one line apply together (right to left, each landing where its text ends up),
+    /// while intersecting matches are refused together with nothing applied.
+    #[test]
+    fn old_texts_on_one_line_clash_only_when_their_bytes_intersect() {
+        let source = "a\nlet s = \"before-one / before-two\";\nc\n";
+        let outline = gamma_outline(source);
+        let old = |old: &str, new: &str| ChangeRequest::Old {
+            old: old.to_owned(),
+            new: new.to_owned(),
+            within: None,
+        };
+        let requests = [
+            old("before-one", "after-one\nwrapped"),
+            old("before-two", "after-two"),
+        ];
+        let changes = resolve_changes(source, Some(&outline), "a.gamma", &requests).unwrap();
+        let (candidate, landing) = apply_changes(source, "a.gamma", &changes).unwrap();
+        assert_eq!(
+            candidate,
+            "a\nlet s = \"after-one\nwrapped / after-two\";\nc\n"
+        );
+        assert_eq!(
+            landing,
+            vec![Some(LineRange::new(2, 3)), Some(LineRange::new(3, 3))]
+        );
+        let overlapping = [old("before-one / ", "x"), old("one / before", "y")];
+        let changes = resolve_changes(source, Some(&outline), "a.gamma", &overlapping).unwrap();
+        let Err(refusal) = apply_changes(source, "a.gamma", &changes) else {
+            panic!("intersecting matches are refused");
+        };
+        assert_eq!(refusal.refused.len(), 2);
     }
 
     /// Every substring of a multi-line text — with and without a trailing newline, LF and CRLF —

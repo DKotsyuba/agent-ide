@@ -4524,7 +4524,10 @@ impl<'a> Worker<'a> {
                 // Naming no problem in a file the check never compiled proves nothing about it.
                 unchecked_file_diagnostics(fallback, Some(reason))
             } else {
-                EditDiagnostics::CurrentClean {}
+                // The file is clean; every error the check reported lies elsewhere.
+                EditDiagnostics::CurrentClean {
+                    project_errors: snapshot.errors,
+                }
             }
         } else {
             let old_summary = if old_errors + old_warnings > 3 {
@@ -5392,13 +5395,16 @@ mod edit_diagnostics_tests {
             }
         );
         assert_eq!(
-            unchecked_file_diagnostics(&EditDiagnostics::CurrentClean {}, Some("no environment")),
+            unchecked_file_diagnostics(
+                &EditDiagnostics::CurrentClean { project_errors: 0 },
+                Some("no environment")
+            ),
             EditDiagnostics::NotAnalysed {
                 reason: "no environment".into()
             }
         );
         assert_eq!(
-            unchecked_file_diagnostics(&EditDiagnostics::CurrentClean {}, None),
+            unchecked_file_diagnostics(&EditDiagnostics::CurrentClean { project_errors: 0 }, None),
             EditDiagnostics::Unknown {}
         );
     }

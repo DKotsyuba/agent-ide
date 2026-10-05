@@ -299,7 +299,7 @@ edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }};
 {{ diagnostics.messages|join("\n") }}
 Next: use ide.edit with source_ref {{ result.source_ref }}
 {%- elif diagnostics.state == "current_clean" -%}
-edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: current_clean. Next: use ide.diff
+edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: current_clean{% if diagnostics.project_errors is defined and diagnostics.project_errors %} for this file; the project check reports {{ diagnostics.project_errors }} errors in other files. Next: use ide.context with kind problems{% else %}. Next: use ide.diff{% endif %}
 {%- elif diagnostics.state == "unknown" -%}
 edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: unknown. Next: use ide.context with kind problems
 {%- elif diagnostics.state == "not_analysed" -%}

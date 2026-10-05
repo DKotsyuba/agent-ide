@@ -278,6 +278,11 @@ pub enum ResultKind {
     Test,
 }
 
+/// Serde's skip test for a zero count.
+fn is_zero(count: &u32) -> bool {
+    *count == 0
+}
+
 /// Closed diagnostic evidence attached to one successful Assistance edit reply.
 ///
 /// Assistance owns this projection because it describes a bounded provider observation for the
@@ -288,7 +293,13 @@ pub enum ResultKind {
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EditDiagnostics {
     /// A matching versioned provider result explicitly reported no diagnostics.
-    CurrentClean {},
+    CurrentClean {
+        /// Errors the completed project check reported in other files; `0` (omitted) when there
+        /// are none or no project check ran. A clean file in a failing project must not read as
+        /// a passing build.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        project_errors: u32,
+    },
     /// A matching versioned provider result reported bounded diagnostics.
     CurrentReported {
         /// At most eight provider messages, each limited to 256 UTF-8 bytes.
@@ -340,7 +351,7 @@ impl EditDiagnostics {
         }
         match diagnostics.readiness {
             DiagnosticReadiness::Clean if diagnostics.diagnostics.is_empty() => {
-                Self::CurrentClean {}
+                Self::CurrentClean { project_errors: 0 }
             }
             DiagnosticReadiness::Reported if !diagnostics.diagnostics.is_empty() => {
                 let messages = diagnostics
@@ -366,7 +377,7 @@ impl EditDiagnostics {
     /// Reports whether all model-visible fields satisfy the closed response bounds.
     pub(super) fn valid(&self) -> bool {
         match self {
-            Self::CurrentClean {} | Self::Unknown {} => true,
+            Self::CurrentClean { .. } | Self::Unknown {} => true,
             Self::NotAnalysed { reason } => {
                 !reason.is_empty() && reason.len() <= 256 && !reason.chars().any(char::is_control)
             }

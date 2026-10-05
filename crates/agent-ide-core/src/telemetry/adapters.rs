@@ -40,7 +40,7 @@ pub fn tool_reply(
     let method = reply_method(tool, reply);
     let diagnostics = match reply {
         PeerReply::Edit {
-            diagnostics: EditDiagnostics::CurrentClean {},
+            diagnostics: EditDiagnostics::CurrentClean { project_errors: 0 },
             ..
         } => DiagnosticState::Clean,
         PeerReply::Edit {

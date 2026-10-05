@@ -579,7 +579,7 @@ mod tests {
     fn edit_operation_word_replaces_the_outcome_word() {
         let reply = PeerReply::Edit {
             result: edit_result(EditOutcome::Replaced).unwrap(),
-            diagnostics: EditDiagnostics::CurrentClean {},
+            diagnostics: EditDiagnostics::CurrentClean { project_errors: 0 },
             note: Some(
                 "renamed c → cee; 3 sites in 2 files: src/lib.rs (2), tests/x.rs (1)".into(),
             ),
@@ -643,7 +643,7 @@ mod tests {
     fn batch_landing_note_lines_render_after_the_edit_line() {
         let reply = PeerReply::Edit {
             result: edit_result(EditOutcome::Replaced).unwrap(),
-            diagnostics: EditDiagnostics::CurrentClean {},
+            diagnostics: EditDiagnostics::CurrentClean { project_errors: 0 },
             note: Some(
                 "3 changes applied: change 1: lines 12–20 replaced (now 12–24); change 2: \
                  src/x.rs#Foo/bar inserted after #Foo (now 26–33); change 3: old text at line \
@@ -1504,7 +1504,7 @@ mod tests {
                 "ide.edit",
             ),
             (
-                EditDiagnostics::CurrentClean {},
+                EditDiagnostics::CurrentClean { project_errors: 0 },
                 "current_clean",
                 "ide.diff",
             ),
@@ -1548,6 +1548,30 @@ mod tests {
         );
     }
 
+    /// A clean file in a project whose check reports errors elsewhere says so and points at the
+    /// problems instead of the diff, so it never reads as a passing build; without such errors
+    /// the reply is unchanged.
+    #[test]
+    fn clean_file_names_project_errors_elsewhere() {
+        let failing = successful_edit_reply(EditDiagnostics::CurrentClean { project_errors: 7 });
+        let rendered = render(failing, Envelope::TextOnly).unwrap();
+        let text = text_of(&rendered);
+        assert!(
+            text.ends_with(
+                "diagnostics: current_clean for this file; the project check reports 7 errors in \
+                 other files. Next: use ide.context with kind problems"
+            ),
+            "{text}"
+        );
+        let passing = successful_edit_reply(EditDiagnostics::CurrentClean { project_errors: 0 });
+        let rendered = render(passing, Envelope::TextOnly).unwrap();
+        let text = text_of(&rendered);
+        assert!(
+            text.ends_with("diagnostics: current_clean. Next: use ide.diff"),
+            "{text}"
+        );
+    }
+
     /// Names the changed file or incomplete read and directs the caller to the newest usable reference.
     #[test]
     fn stale_edit_text_explains_why_no_write_occurred() {
@@ -1572,7 +1596,7 @@ mod tests {
     /// next edit must use.
     #[test]
     fn edit_reply_states_formatter_line_movement() {
-        let mut reply = successful_edit_reply(EditDiagnostics::CurrentClean {});
+        let mut reply = successful_edit_reply(EditDiagnostics::CurrentClean { project_errors: 0 });
         if let PeerReply::Edit { note, .. } = &mut reply {
             *note = Some(
                 "formatted: +3 lines after line 24; use source_ref sym-9 for the next edit"
@@ -1588,7 +1612,7 @@ mod tests {
             "{text}"
         );
         // A reply whose formatter moved nothing carries no movement line at all.
-        let unchanged = successful_edit_reply(EditDiagnostics::CurrentClean {});
+        let unchanged = successful_edit_reply(EditDiagnostics::CurrentClean { project_errors: 0 });
         assert!(!text_of(&render(unchanged, Envelope::TextOnly).unwrap()).contains("formatted:"));
     }
 
@@ -1898,7 +1922,7 @@ mod tests {
                     Some("source-after-edit".into()),
                 )
                 .unwrap(),
-                diagnostics: EditDiagnostics::CurrentClean {},
+                diagnostics: EditDiagnostics::CurrentClean { project_errors: 0 },
                 note: None,
                 operation: None,
             },
