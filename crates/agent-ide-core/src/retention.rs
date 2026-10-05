@@ -576,8 +576,9 @@ impl Identity {
         Self {
             own: std::env::current_exe().ok().and_then(|exe| file_id(&exe)),
             releases: fs::canonicalize(&releases).unwrap_or(releases),
-            floor: parse_version(env!("CARGO_PKG_VERSION"))
-                .map_or(LEGACY_BOUNDARY, |own| own.max(LEGACY_BOUNDARY)),
+            // Every release after the boundary takes leases, older than this build or not: a
+            // session started before an upgrade must not pause the upgraded sweeper.
+            floor: LEGACY_BOUNDARY,
         }
     }
 

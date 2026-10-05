@@ -390,12 +390,17 @@ fn only_this_binary_and_strictly_newer_releases_participate() {
     );
 }
 
-/// The participation floor is at least this build's version and the legacy boundary.
+/// The participation floor is the legacy boundary whatever this build's version: every release
+/// after it takes leases, so an older lease-taking release still in use (a session started before
+/// an upgrade) never pauses the newer one's sweep.
 #[test]
-fn the_floor_is_never_below_this_build_or_the_legacy_boundary() {
-    let identity = Identity::current(&scratch("floor"));
-    assert!(identity.floor >= LEGACY_BOUNDARY);
-    assert!(identity.floor >= parse_version(env!("CARGO_PKG_VERSION")).unwrap());
+fn every_release_after_the_legacy_boundary_participates() {
+    let home = scratch("floor");
+    let identity = Identity::current(&home);
+    assert_eq!(identity.floor, LEGACY_BOUNDARY);
+    let first_leasing = identity.releases.join("0.10.0/agent-ide");
+    assert!(identity.participates(&first_leasing));
+    assert!(!identity.participates(&identity.releases.join("0.9.1/agent-ide")));
 }
 
 /// A gone telemetry store is kept while its writer lock is held and removed after.

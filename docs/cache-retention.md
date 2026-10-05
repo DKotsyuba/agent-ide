@@ -90,8 +90,9 @@ daemons run, and a failed or skipped sweep is retried an hour later. Errors neve
    live processes whose name starts with `agent-ide` (`proc_listallpids`, `proc_pidinfo`,
    `proc_pidpath`). Such a process *participates* only if its executable is the sweeper's own
    file (same device and inode) or `standalone/releases/X.Y.Z/agent-ide` with `X.Y.Z` strictly
-   newer than both 0.9.1 and the sweeper's own version. Any other — an older release, a dev
-   build, a renamed backup, one whose executable was deleted or cannot be read — is legacy, and
+   newer than 0.9.1 — older than the sweeper or not, so a session started before an upgrade
+   never pauses the upgraded sweeper. Any other — 0.9.1 or older, a dev build, a renamed
+   backup, one whose executable was deleted or cannot be read — is legacy, and
    while one is alive **no A or B entry is removed, gone ones and trash included**. The snapshot
    is unknown (and pauses everything the same way) when the process list cannot be read or is
    truncated, or a process other than an exited one cannot be inspected. `cache status` names them. Eviction starts once old sessions end.
