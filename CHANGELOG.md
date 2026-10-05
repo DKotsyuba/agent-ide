@@ -11,6 +11,10 @@
 - `ide.edit` inserts count the blank lines already beside the insertion point toward the
   spacing, so inserting next to a neighbour that is already separated (two blank lines before a
   comment, say) no longer doubles the separation; the landing line numbers follow.
+- Readers whose activation predates the current writer can borrow its live language session:
+  `ide.outline`, symbol reads, symbol cards and semantic context retain the reader's source
+  authority instead of failing on the writer's different epoch, including nested Python packages
+  without a virtual environment.
 
 ## 0.10.0 — 2026-10-05
 

@@ -331,6 +331,8 @@ impl Worker<'_> {
     ///
     /// The server is chosen by `source`'s extension ([`LanguageServer::context_extensions`]);
     /// `Ok(None)` when no server owns the extension or the target configures none for it.
+    /// Persistent sessions admit the source under fresh invoking-actor authority, even when
+    /// borrowing the writer's transport; a mismatched source returns `WorkspaceAuthority`.
     pub(super) async fn semantic_context(
         &mut self,
         job: &mut Job,
@@ -359,12 +361,25 @@ impl Worker<'_> {
         else {
             return Ok(None);
         };
+        let source_authority = self.authority(job.invocation.binding_ref()).await?;
         let mut backend = self.providers.take_backend(index)?;
         // A reader's semantic call borrows the writer's session for this one backend call.
         self.borrow_writer_session(job);
-        let result = backend
-            .context(self, job, &launch, source, bytes, query)
-            .await;
+        let result = async {
+            if server.session_extensions().contains(&extension) {
+                backend.ensure_live(self, job, &launch, source).await?;
+                backend
+                    .live_session(job.binding())
+                    .ok_or(FailureCode::Internal)?
+                    .session
+                    .authorize_source(&source_authority, source)
+                    .map_err(|_| FailureCode::WorkspaceAuthority)?;
+            }
+            backend
+                .context(self, job, &launch, source, bytes, query)
+                .await
+        }
+        .await;
         job.session_binding = None;
         self.providers.put_backend(index, backend);
         result.map(Some)
@@ -378,12 +393,14 @@ impl Worker<'_> {
     /// settings return `ProviderUnavailable`; loading returns `ProviderLoading` and parks eligible
     /// jobs, while edit diagnostics return `ProviderLoading` without parking so a prior write can
     /// settle. Workspace failure and dead transport remain errors; a dead transport retires the
-    /// session.
+    /// session. The invoking actor's fresh authority admits `source` into the selected transport;
+    /// borrowing a writer session does not replace the reader's source identity or its epoch.
     pub(super) async fn live_session_for(
         &mut self,
         job: &mut Job,
         source: &SourceObservation,
     ) -> Result<&mut LiveSession, FailureCode> {
+        let source_authority = self.authority(job.invocation.binding_ref()).await?;
         // A reader's semantic tools borrow the writer's session for this whole resolution; the
         // mapping is cleared again below so no non-provider path of the same job ever sees it.
         self.borrow_writer_session(job);
@@ -475,11 +492,15 @@ impl Worker<'_> {
                 return Err(FailureCode::ProviderUnavailable);
             }
         }
-        self.providers.slots[index]
+        let live = self.providers.slots[index]
             .backend
             .as_mut()
             .and_then(|backend| backend.live_session(&binding))
-            .ok_or(FailureCode::Internal)
+            .ok_or(FailureCode::Internal)?;
+        live.session
+            .authorize_source(&source_authority, source)
+            .map_err(|_| FailureCode::WorkspaceAuthority)?;
+        Ok(live)
     }
 
     /// Returns the language server whose live session answers `path`, for capability checks.

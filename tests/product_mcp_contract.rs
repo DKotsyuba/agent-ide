@@ -12379,6 +12379,136 @@ async fn configured_product_pyright_resolves_root_venv_for_nested_python_file() 
     daemon.wait().await.unwrap();
 }
 
+/// Verifies readers borrow live semantic tools across nested packages without environments.
+/// A reader activated before its writer retains a different authority epoch.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
+async fn configured_product_pyright_reader_borrows_writer_session() {
+    let fixture = ProductFixture::new(json!([accepted_pyright_provider("pyright-reader-cache")]));
+    for package in ["alpha", "beta"] {
+        let dir = fixture.root.join(format!("packages/{package}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            format!("[project]\nname = \"{package}\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("main.py"),
+            "def value() -> int:\n    return 8\n\ndef caller() -> int:\n    return value()\n",
+        )
+        .unwrap();
+    }
+    std::fs::write(fixture.root.join("package.json"), "{\"private\":true}\n").unwrap();
+    fixture.git(&["add", "--", "packages", "package.json"]);
+    fixture.git(&["commit", "--quiet", "-m", "reader nested packages fixture"]);
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    let mut reader_target = config["targets"][0].clone();
+    reader_target["attachment"] = json!("private-reader-channel");
+    config["targets"]
+        .as_array_mut()
+        .unwrap()
+        .push(reader_target);
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut writer = ProductActor::new(&fixture, "pyright-writer").await;
+    let mut reader = ProductActor::new_at(
+        &fixture,
+        "pyright-reader",
+        "private-reader-channel",
+        "agent_id",
+        fixture.state(),
+    )
+    .await;
+    // A reader can already be active when the writer takes the worktree.
+    let start = reader
+        .call(&fixture, "ide.start", json!({"read_only":true}))
+        .await;
+    assert_eq!(reader.settle(&fixture, start).await["kind"], "activation");
+    let start = writer.call(&fixture, "ide.start", json!({})).await;
+    let start = writer.settle(&fixture, start).await;
+    assert_eq!(start["kind"], "activation", "{start}");
+    let start = reader
+        .call(&fixture, "ide.start", json!({"read_only":true}))
+        .await;
+    let start = reader.settle(&fixture, start).await;
+    assert!(
+        start["text"]
+            .as_str()
+            .unwrap()
+            .contains("mode: read-only; current writer: activation"),
+        "{start}"
+    );
+
+    // Warm the writer on alpha; the reader opens beta, then switches back to alpha.
+    let outline = writer
+        .call(
+            &fixture,
+            "ide.outline",
+            json!({"path":"packages/alpha/main.py"}),
+        )
+        .await;
+    let outline = writer.settle(&fixture, outline).await;
+    assert_eq!(outline["kind"], "outline", "{outline}");
+    for path in ["packages/beta/main.py", "packages/alpha/main.py"] {
+        let outline = reader
+            .call(&fixture, "ide.outline", json!({"path":path}))
+            .await;
+        let outline = reader.settle(&fixture, outline).await;
+        assert_eq!(outline["kind"], "outline", "{outline}");
+        assert!(
+            outline["text"].as_str().unwrap().contains("def value()"),
+            "{outline}"
+        );
+        let symbol = format!("{path}#value");
+        let read = reader
+            .call(&fixture, "ide.read", json!({"symbol":symbol}))
+            .await;
+        let read = reader.settle(&fixture, read).await;
+        assert_eq!(read["kind"], "read", "{read}");
+        assert!(
+            read["text"].as_str().unwrap().contains("return 8"),
+            "{read}"
+        );
+        let source = std::fs::read_to_string(fixture.root.join(path)).unwrap();
+        for actor in [&mut reader, &mut writer] {
+            let context = actor
+                .call(
+                    &fixture,
+                    "ide.context",
+                    json!({"path":path,"byte_offset":source.rfind("value()").unwrap()}),
+                )
+                .await;
+            let context = actor.settle(&fixture, context).await;
+            assert_eq!(context["kind"], "context", "{context}");
+            assert!(
+                context["text"].as_str().unwrap().contains("mode: semantic"),
+                "{context}"
+            );
+            let card = actor
+                .call(&fixture, "ide.symbol", json!({"symbol":symbol}))
+                .await;
+            let card = actor.settle(&fixture, card).await;
+            assert_eq!(card["kind"], "symbol", "{card}");
+            assert!(
+                card["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("usages: 1 in 1 files"),
+                "{card}"
+            );
+        }
+    }
+    for actor in [&mut reader, &mut writer] {
+        let stop = actor.call(&fixture, "ide.stop", json!({})).await;
+        assert_eq!(actor.settle(&fixture, stop).await["kind"], "stop");
+    }
+    tokio::join!(reader.mcp.close(), writer.mcp.close());
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Exercises persistent Pyright symbol tools and a symbol-addressed replacement through binding stop.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
