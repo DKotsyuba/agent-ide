@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.10.0 — 2026-10-05
+
 ### Added
 
 - Automatic cache retention (`docs/cache-retention.md`): each daemon sweeps `~/.agent-ide` 60 s
