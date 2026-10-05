@@ -54,6 +54,20 @@ fn verdict<'a>(report: &'a Report, path: &Path) -> &'a Verdict {
         .unwrap_or_else(|| panic!("{} not selected: {report:?}", path.display()))
 }
 
+/// Sweeps until `path` is no longer in use and returns its fate. A lock just released stays held
+/// while a process another test is spawning still has the inherited descriptor between its fork
+/// and exec (milliseconds under a parallel run); the product sweep simply waits for its next hour.
+fn sweep_released(home: &Path, at: SystemTime, path: &Path) -> Fate {
+    for _ in 0..300 {
+        let fate = verdict(&sweep_with(home, true, at, &nobody), path).fate;
+        if fate != Fate::InUse {
+            return fate;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("{} stayed in use for 3 s after its release", path.display())
+}
+
 /// Builds a synthetic entry for the pure policy.
 fn synthetic(name: &str, bytes: u64, age_days: u64) -> Entry {
     Entry {
@@ -278,8 +292,7 @@ fn sweep_never_claims_a_cache_whose_lease_is_held() {
     assert!(dir.exists());
 
     drop(lease);
-    let report = sweep_with(&home, true, later, &nobody);
-    assert_eq!(verdict(&report, &dir).fate, Fate::Removed);
+    assert_eq!(sweep_released(&home, later, &dir), Fate::Removed);
     assert!(!dir.exists());
 }
 
@@ -401,8 +414,10 @@ fn telemetry_stores_follow_their_writer_lock_and_marker() {
     assert!(store.exists());
 
     drop(writer);
-    let report = sweep_with(&home, true, SystemTime::now(), &nobody);
-    assert_eq!(verdict(&report, &store).fate, Fate::Removed);
+    assert_eq!(
+        sweep_released(&home, SystemTime::now(), &store),
+        Fate::Removed
+    );
     assert!(!store.exists());
 }
 
@@ -421,8 +436,10 @@ fn a_telemetry_store_below_an_activated_worktree_is_kept() {
     assert_eq!(verdict(&report, &store).fate, Fate::InUse);
     assert!(store.exists());
     drop(activation);
-    let report = sweep_with(&home, true, SystemTime::now() + DAY * 60, &nobody);
-    assert_eq!(verdict(&report, &store).fate, Fate::Removed);
+    assert_eq!(
+        sweep_released(&home, SystemTime::now() + DAY * 60, &store),
+        Fate::Removed
+    );
 }
 
 /// A worktree lease taken after the scan still keeps a telemetry store launched below it.
@@ -469,8 +486,10 @@ fn a_telemetry_store_without_a_marker_waits_until_no_lease_is_held_anywhere() {
     let report = sweep_with(&home, true, SystemTime::now() + DAY * 60, &nobody);
     assert_eq!(verdict(&report, &store).fate, Fate::InUse);
     drop(elsewhere);
-    let report = sweep_with(&home, true, SystemTime::now() + DAY * 60, &nobody);
-    assert_eq!(verdict(&report, &store).fate, Fate::Removed);
+    assert_eq!(
+        sweep_released(&home, SystemTime::now() + DAY * 60, &store),
+        Fate::Removed
+    );
 }
 
 /// Symlinked cache roots and entries are never traversed or removed.
