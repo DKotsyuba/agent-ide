@@ -11,6 +11,11 @@
   used to treat any release older than itself as lease-unaware and keep every check and
   telemetry cache until those sessions ended (29 GiB kept against a 20 GiB budget).
 
+### Changed
+
+- The check caches' budget is 10 GiB (was 20 GiB): least recently used worktrees past it are
+  removed and their next project check builds again from cold.
+
 ## 0.10.1 — 2026-10-05
 
 ### Fixed
