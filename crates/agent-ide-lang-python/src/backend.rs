@@ -216,7 +216,10 @@ impl PyrightBackend {
             cache_namespace,
         })
         .map_err(|_| FailureCode::ExecutionProfile)?
-        .with_interpreter(interpreter.clone(), environment.clone());
+        .with_interpreter(interpreter.clone(), environment.clone())
+        .with_extra_paths(crate::support::import_roots(
+            source.worktree().worktree_path(),
+        ));
         let worktree = PyrightWorktree::new(
             authority.worktree().clone(),
             server::execution_authority(&authority)?,
