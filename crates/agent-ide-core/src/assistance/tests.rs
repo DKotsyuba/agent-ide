@@ -228,9 +228,18 @@ impl TestRuns {
         {
             return StartResult::Running(*id, job.started.elapsed());
         }
+        // Held until the child settles, independent of `ide.stop`; no lease, no run.
+        let Some(lease) = crate::retention::Lease::for_worktree(&root) else {
+            return StartResult::Failed {
+                error: "the worktree's cache retention lease could not be taken".to_owned(),
+                not_found: false,
+            };
+        };
+        let lease = crate::retention::SettledLease::new(Some(lease));
         let child = match spawn_command(&root, &cwd, &argv, &env, command_language) {
             Ok(child) => child,
             Err(error) => {
+                lease.settled();
                 return StartResult::Failed {
                     not_found: error.kind() == std::io::ErrorKind::NotFound,
                     error: error.to_string(),
@@ -274,6 +283,7 @@ impl TestRuns {
         let registry = self.0.clone();
         tokio::spawn(async move {
             let mut result = run_child(language, budget, child).await;
+            lease.settled();
             result.detail_ref = detail_ref;
             result.command = argv;
             result.environment_label = environment_label;

@@ -302,6 +302,7 @@ async fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Ok(Command::Cache { prune }) => run_cache(prune).await,
         Ok(Command::DoctorInstall) => {
             let report = agent_ide::doctor_install::report().await;
             match serde_json::to_string(&report) {
@@ -527,6 +528,11 @@ enum Command {
     },
     /// Reports installation health read-only as bounded JSON findings (no daemon is contacted).
     DoctorInstall,
+    /// Reports (`status`, a dry run) or applies now (`prune`) the cache retention policy.
+    Cache {
+        /// `true` for `prune`: remove what the policy selects; `false` for `status`.
+        prune: bool,
+    },
     /// Verifies and installs one sealed release bundle into the standalone layout, offline.
     SelfInstall {
         /// Explicit flags; the documented home, prefix, bin, and share defaults resolve at run time.
@@ -643,6 +649,7 @@ commands:
                                           accepted-executable launcher fragment
   launcher check <file>                   validate a launcher configuration
   telemetry query|export --database <file> [--tag <tag>] [--cursor <n>]
+  cache status|prune                      show or apply the cache retention policy
   -v, --version, version                  print the version
   -h, --help, help                        print this listing
 ";
@@ -662,6 +669,7 @@ const SUBCOMMANDS: &[&str] = &[
     "launcher",
     "telemetry",
     "self-install",
+    "cache",
 ];
 
 /// How a command line asks for the usage listing instead of a real command.
@@ -723,6 +731,14 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
         && mode == "doctor"
     {
         return Ok(Command::DoctorInstall);
+    }
+    if let [mode, action] = arguments.as_slice()
+        && mode == "cache"
+        && (action == "status" || action == "prune")
+    {
+        return Ok(Command::Cache {
+            prune: action == "prune",
+        });
     }
     // `init` accepts its flags in any order, like `errors`.
     if let [mode, rest @ ..] = arguments.as_slice()
@@ -1537,6 +1553,40 @@ fn prepare_private_persistent_directory(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Prints the cache retention report for the real per-user state root (`docs/cache-retention.md`).
+///
+/// `status` only reports; `prune` sweeps now under the machine-wide sweep lock (exit 2 when
+/// another sweep holds it), ignoring the hourly spacing but every lease and rule, and records its
+/// removals in the error log of the current directory's repository (the one `errors` reads).
+async fn run_cache(prune: bool) -> ExitCode {
+    let Some(root) = agent_ide::retention::state_root() else {
+        eprintln!("agent-ide: cannot resolve the user home");
+        return ExitCode::from(2);
+    };
+    if !prune {
+        print!(
+            "{}",
+            agent_ide::retention::sweep(&root, false).render(false)
+        );
+        return ExitCode::SUCCESS;
+    }
+    let Some(_lock) = agent_ide::retention::SweepLock::try_acquire(&root, None) else {
+        eprintln!("agent-ide: another cache sweep is running");
+        return ExitCode::from(2);
+    };
+    if let (Ok(directory), Some(logs)) = (
+        std::env::current_dir().and_then(fs::canonicalize),
+        agent_ide::errorlog::log_root(),
+    ) && let Some(key) = error_log_dir(&logs, &directory).await.file_name()
+    {
+        agent_ide::errorlog::init_repository(&key.to_string_lossy());
+    }
+    let report = agent_ide::retention::sweep(&root, true);
+    report.record();
+    print!("{}", report.render(true));
+    ExitCode::SUCCESS
+}
+
 /// Derives one candidate database below an explicitly supplied private Application state root.
 ///
 /// The application, telemetry, and digest directories are created or validated as `0700`. The
@@ -1554,6 +1604,11 @@ fn managed_telemetry_database_in(
             .as_str(),
     );
     prepare_private_persistent_directory(&candidate_state)?;
+    // Names the launch directory so cache retention can tell when it is gone.
+    let marker = candidate_state.join(agent_ide::retention::MARKER_FILE_NAME);
+    if fs::symlink_metadata(&marker).is_err() {
+        let _ = fs::write(&marker, candidate.as_os_str().as_bytes());
+    }
     Ok(candidate_state.join("state.sqlite"))
 }
 

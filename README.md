@@ -192,7 +192,10 @@ runs under `sandbox-exec` with no network, a read-only worktree, reads limited t
 toolchains, and one private cache under
 `$HOME/.agent-ide/checks/<repository>/<worktree>/<policy digest>/<language>`; the environment is rebuilt from an
 allowlist (`CARGO_NET_OFFLINE=true`, private `CARGO_TARGET_DIR` and temp). Runs are debounced,
-bounded by `check_timeout_s`, and their process groups are killed on cancel or timeout. See the
+bounded by `check_timeout_s`, and their process groups are killed on cancel or timeout. Unused
+check caches, telemetry stores and old installed releases are removed automatically; `agent-ide
+cache status` shows what would go and why, `agent-ide cache prune` applies it now
+([cache retention](docs/cache-retention.md)). See the
 [EYES-r2 contract](docs/contracts/eyes-v0.3.md), the
 [symbol-addressed tools v0.4 contract](docs/contracts/tools-v0.4.md), and the
 [launcher configuration](docs/assistance-launcher.md).

@@ -81,6 +81,8 @@ pub enum Method {
     Client,
     /// An `<agent-ide>` problems feed block was emitted into a reply.
     Feed,
+    /// A cache retention sweep removed an entry or was paused (`docs/cache-retention.md`).
+    Retention,
 }
 
 impl Method {
@@ -103,6 +105,7 @@ impl Method {
             Self::Daemon => "daemon",
             Self::Client => "client",
             Self::Feed => "feed",
+            Self::Retention => "retention",
         }
     }
 }

@@ -14,8 +14,9 @@
 //! (T20B) A debounce firing whose worktree inputs are unchanged since the pair's last completed
 //! `Ready` run skips the run entirely; an activation-requested check is never skipped.
 //! Cache directories live under a caller-supplied `cache_root` (for example
-//! `$HOME/.agent-ide/checks`) and record enough to let [`sweep_stale_caches`](crate::checks::scheduler::sweep_stale_caches) reclaim caches for
-//! worktrees that no longer exist.
+//! `$HOME/.agent-ide/checks`); every run holds its worktree's retention lease (see
+//! [`crate::retention`]) from before its cache directory is prepared until it completes, so a
+//! retention sweep never claims a cache a check is using.
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -38,8 +39,8 @@ use crate::execution::seatbelt::ReadDeny;
 const DURABLE_UNAVAILABLE_RETRY: Duration = Duration::from_secs(300);
 
 /// Name of the marker file written in each worktree-level cache directory, recording the
-/// worktree's canonical path so [`sweep_stale_caches`] can find directories to remove.
-const WORKTREE_MARKER_FILE_NAME: &str = "worktree.path";
+/// worktree's canonical path so a retention sweep can tell a gone worktree.
+const WORKTREE_MARKER_FILE_NAME: &str = crate::retention::MARKER_FILE_NAME;
 
 /// Fingerprint of one worktree's check-relevant inputs: `Some(hash)` when the inputs could be
 /// fingerprinted cheaply, `None` when unknown (the scheduler then assumes "changed" and runs).
@@ -652,6 +653,21 @@ impl Inner {
         (wt.policy_generation == policy_generation)
             .then(|| (wt.input_generation, wt.read_denies.clone()))
     }
+
+    /// Returns the retention state root whose `locks/` hold the worktree leases: the parent of
+    /// `cache_root` (`~/.agent-ide` for the production `~/.agent-ide/checks`).
+    fn lease_root(&self) -> Option<&Path> {
+        self.cache_root.parent()
+    }
+
+    /// Takes `worktree`'s retention lease, keyed exactly like its cache directory name.
+    fn lease(&self, worktree: &Path) -> Option<crate::retention::Lease> {
+        crate::retention::Lease::acquire_key(
+            self.lease_root()?,
+            &hash16(worktree.to_string_lossy().as_bytes()),
+        )
+    }
+
     /// Locks [`Inner::state`], panicking only if a prior holder panicked while holding it.
     fn lock_state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state
@@ -813,28 +829,55 @@ impl Inner {
                 inner.finish_run(&worktree, language, false, policy_generation);
                 return;
             }
+            // Held from before the cache directory exists until the checker returns; a run
+            // cancelled meanwhile keeps it for the process lifetime (its child may still run).
+            // Without a lease a sweep could claim the cache, so the run does not start.
+            let Some(lease) = inner.lease(&worktree) else {
+                let generation = inner.current_generation(&worktree);
+                let snapshot =
+                    ProblemSnapshot::unavailable(language, UnavailableReason::Fatal, generation);
+                crate::errorlog::record(
+                    crate::errorlog::Method::Check,
+                    crate::errorlog::Outcome::Unavailable,
+                    crate::errorlog::Fields {
+                        worktree: Some(&worktree),
+                        detail: Some("retention lease unavailable"),
+                        ..Default::default()
+                    },
+                );
+                if inner.store_snapshot(&worktree, snapshot, policy_generation) {
+                    inner.mark_run_ineligible(&worktree, language, policy_generation);
+                    inner.finish_run(&worktree, language, false, policy_generation);
+                }
+                return;
+            };
+            let lease = crate::retention::SettledLease::new(Some(lease));
             let cache_dir = inner
                 .prepare_cache_dir(&worktree, language, &policy_digest, policy_generation)
                 .await;
             let permit = match Arc::clone(&inner.semaphore).acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_closed) => {
+                    lease.settled();
                     inner.finish_run(&worktree, language, false, policy_generation);
                     return;
                 }
             };
             if inner.is_shutting_down() {
                 drop(permit);
+                lease.settled();
                 inner.finish_run(&worktree, language, false, policy_generation);
                 return;
             }
             let Some(checker) = inner.checkers.get(&language).cloned() else {
                 drop(permit);
+                lease.settled();
                 inner.finish_run(&worktree, language, false, policy_generation);
                 return;
             };
             let Some((generation, read_denies)) = inner.check_inputs(&worktree, policy_generation)
             else {
+                lease.settled();
                 return;
             };
             let request = CheckRequest {
@@ -870,6 +913,7 @@ impl Inner {
             let started = Instant::now();
             let read_denies = request.read_denies.clone();
             let mut snapshot = checker.check(request).await;
+            lease.settled();
             filter_denied_problems(&mut snapshot, &worktree, &read_denies);
             let duration = started.elapsed();
             drop(permit);
@@ -1186,7 +1230,7 @@ impl Inner {
     /// even if two unrelated worktrees hash to the same worktree-level segment by coincidence of
     /// path reuse. The first time a worktree's cache directory is created, a
     /// [`WORKTREE_MARKER_FILE_NAME`] file recording its canonical path is written alongside it,
-    /// for [`sweep_stale_caches`] to later identify caches whose worktree no longer exists.
+    /// for a retention sweep to later identify caches whose worktree no longer exists.
     async fn prepare_cache_dir(
         &self,
         worktree: &Path,
@@ -1285,19 +1329,33 @@ impl Inner {
         let Some(source_dir) = source_dir else {
             return CacheClone::SkippedNoSource;
         };
+        // The source worktree's lease keeps a sweep from claiming it mid-copy; `cp` is not killed
+        // when this future is dropped, so an unsettled lease is kept for the process lifetime.
+        let source_lease = crate::retention::SettledLease::new(
+            source_dir
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .and_then(|key| self.lease_root().map(|root| (root, key)))
+                .and_then(|(root, key)| {
+                    crate::retention::Lease::acquire_key(root, &key.to_string_lossy())
+                }),
+        );
         let source_target = source_dir.join(subdirectory);
         if !source_target.exists() {
+            source_lease.settled();
             return CacheClone::SkippedNoSource;
         }
         let destination_target = dst_dir.join(subdirectory);
-        match tokio::process::Command::new("/bin/cp")
+        let copied = tokio::process::Command::new("/bin/cp")
             .arg("-c")
             .arg("-R")
             .arg(&source_target)
             .arg(&destination_target)
             .output()
-            .await
-        {
+            .await;
+        source_lease.settled();
+        match copied {
             Ok(output) if output.status.success() => CacheClone::Cloned,
             Ok(_) | Err(_) => {
                 crate::errorlog::record(
@@ -1392,7 +1450,7 @@ fn durable_unavailable_expired(
 
 /// Derives a 16 hex character cache key from `bytes`: the first 8 bytes of its blake3 digest,
 /// hex-encoded. Used for both the repository-key and canonical-worktree-path path segments.
-fn hash16(bytes: &[u8]) -> String {
+pub(crate) fn hash16(bytes: &[u8]) -> String {
     let digest = blake3::hash(bytes);
     digest.as_bytes()[..8]
         .iter()
@@ -1414,51 +1472,6 @@ fn policy_digest(denies: &[ReadDeny]) -> String {
         hasher.update(&rule);
     }
     hasher.finalize().to_hex().to_string()
-}
-
-/// Removes cache directories under `cache_root` whose worktree no longer exists on disk
-/// (EYES-r2 §5 follow-up), for a daemon to call periodically outside any live [`Scheduler`].
-///
-/// Walks `<cache_root>/<repository hash>/<worktree hash>/`, reading each worktree-level
-/// directory's `WORKTREE_MARKER_FILE_NAME` to recover the worktree path it was created for; a
-/// directory whose recorded worktree path no longer exists is removed entirely, and a
-/// repository-level directory left with no worktree subdirectories is removed too. A
-/// worktree-level directory with no marker file (never written by this scheduler, or from an
-/// older cache layout) is left untouched rather than guessed at. Best-effort: individual
-/// filesystem errors are swallowed so one unreadable entry does not abort the sweep.
-pub fn sweep_stale_caches(cache_root: &Path) {
-    let Ok(repository_entries) = std::fs::read_dir(cache_root) else {
-        return;
-    };
-    for repository_entry in repository_entries.flatten() {
-        let repository_dir = repository_entry.path();
-        if !repository_dir.is_dir() {
-            continue;
-        }
-        let Ok(worktree_entries) = std::fs::read_dir(&repository_dir) else {
-            continue;
-        };
-        let mut remaining = 0usize;
-        for worktree_entry in worktree_entries.flatten() {
-            let worktree_dir = worktree_entry.path();
-            if !worktree_dir.is_dir() {
-                continue;
-            }
-            let marker = worktree_dir.join(WORKTREE_MARKER_FILE_NAME);
-            let Ok(recorded_path) = std::fs::read_to_string(&marker) else {
-                remaining += 1;
-                continue;
-            };
-            if Path::new(&recorded_path).exists() {
-                remaining += 1;
-            } else {
-                let _ = std::fs::remove_dir_all(&worktree_dir);
-            }
-        }
-        if remaining == 0 {
-            let _ = std::fs::remove_dir_all(&repository_dir);
-        }
-    }
 }
 
 /// Creates `dir` (and its parents) if missing, then restricts `dir` itself to owner-only

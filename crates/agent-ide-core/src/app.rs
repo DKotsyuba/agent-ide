@@ -262,6 +262,11 @@ async fn run_daemon_inner(
             }
         }
     }
+    // Cache retention (`docs/cache-retention.md`) runs for the daemon's lifetime, first after a
+    // delay and then hourly; it is aborted with the serving loop.
+    let retention = dispatcher
+        .is_some()
+        .then(|| tokio::spawn(crate::retention::run_periodically()));
     let mut connections = tokio::task::JoinSet::new();
     let mut owned_socket = None;
     // Pending/running assistance jobs and project checks keep a lease-free daemon from idling
@@ -315,6 +320,9 @@ async fn run_daemon_inner(
         Ok(())
     }
     .await;
+    if let Some(retention) = retention {
+        retention.abort();
+    }
     let result = finish_daemon(serving, &mut connections, dispatcher.as_ref(), &lease).await;
     crate::errorlog::record(
         crate::errorlog::Method::Daemon,

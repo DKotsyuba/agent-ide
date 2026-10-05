@@ -3,11 +3,12 @@
 //! `FakeChecker` (in `agent_ide::checks`) does not record concurrency or reflect the dispatched
 //! `input_generation`, so these tests use `RecordingChecker` below instead.
 
-use agent_ide::checks::scheduler::{CacheClone, FingerprintFn, Scheduler, sweep_stale_caches};
+use agent_ide::checks::scheduler::{CacheClone, FingerprintFn, Scheduler};
 use agent_ide::checks::{
     BoxFuture, CheckRequest, CheckState, Checker, Language, ProblemSnapshot, UnavailableReason,
 };
 use agent_ide::execution::seatbelt::ReadDeny;
+use agent_ide::retention::{Fate, Reason, Report, sweep_with};
 use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -701,61 +702,88 @@ async fn scheduler_fatal_or_timeout_completion_never_replaces_a_ready_snapshot()
     );
 }
 
-/// `sweep_stale_caches` removes only cache directories whose recorded worktree path is gone.
-#[test]
-fn scheduler_sweep_stale_caches_removes_only_worktrees_that_no_longer_exist() {
+/// Returns the fate the retention sweep gave `dir`, or `None` when the policy did not select it.
+fn fate_of(report: &Report, dir: &Path) -> Option<(Reason, Fate)> {
+    report
+        .verdicts
+        .iter()
+        .find(|verdict| verdict.path == dir)
+        .map(|verdict| (verdict.reason, verdict.fate))
+}
+
+/// The cache directory of one worktree below a scheduler's `<home>/checks` cache root.
+fn worktree_cache_dir(request_cache_dir: &Path) -> PathBuf {
+    // `<home>/checks/<repo>/<worktree>/<policy digest>/<language>`
+    request_cache_dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+/// A running check holds its worktree's retention lease, so a sweep that finds the cache idle
+/// still keeps it; once the run completes the sweep reports it removed.
+#[tokio::test(start_paused = true)]
+async fn scheduler_check_lease_keeps_retention_off_a_running_check_until_it_completes() {
     agent_ide::languages::install();
-    let cache_root = scratch_dir("sweep-cache-root");
-    let live_worktree = scratch_dir("sweep-live-worktree");
-
-    // A worktree that still exists on disk: its cache directory must survive the sweep.
-    let live_dir = cache_root.join("repo-hash").join("live-worktree-hash");
-    std::fs::create_dir_all(live_dir.join("python")).unwrap();
-    std::fs::write(
-        live_dir.join("worktree.path"),
-        live_worktree.to_string_lossy().as_bytes(),
-    )
-    .unwrap();
-
-    // A worktree that has since been removed: its cache directory must be swept away.
-    let gone_worktree = scratch_dir("sweep-gone-worktree");
-    let gone_dir = cache_root.join("repo-hash").join("gone-worktree-hash");
-    std::fs::create_dir_all(gone_dir.join("python")).unwrap();
-    std::fs::write(
-        gone_dir.join("worktree.path"),
-        gone_worktree.to_string_lossy().as_bytes(),
-    )
-    .unwrap();
-    std::fs::remove_dir_all(&gone_worktree).unwrap();
-
-    // A different repository whose only worktree is also gone: the whole repository-level
-    // directory must be removed once it has no worktree subdirectories left.
-    let other_gone_worktree = scratch_dir("sweep-other-repo-gone-worktree");
-    let other_repo_dir = cache_root
-        .join("other-repo-hash")
-        .join("other-worktree-hash");
-    std::fs::create_dir_all(other_repo_dir.join("rust")).unwrap();
-    std::fs::write(
-        other_repo_dir.join("worktree.path"),
-        other_gone_worktree.to_string_lossy().as_bytes(),
-    )
-    .unwrap();
-    std::fs::remove_dir_all(&other_gone_worktree).unwrap();
-
-    sweep_stale_caches(&cache_root);
-
-    assert!(
-        live_dir.exists(),
-        "a cache for an existing worktree must survive the sweep"
+    let checker =
+        RecordingChecker::with_delay(agent_ide::languages::PYTHON, Duration::from_secs(5));
+    let home = std::fs::canonicalize(scratch_dir("retention-home")).unwrap();
+    let worktree = scratch_worktree("retention-worktree", agent_ide::languages::PYTHON);
+    let scheduler = Scheduler::new(
+        vec![Arc::new(checker.clone())],
+        Duration::from_millis(10),
+        2,
+        home.join("checks"),
     );
-    assert!(
-        !gone_dir.exists(),
-        "a cache for a removed worktree must be swept away"
+    let later = std::time::SystemTime::now() + Duration::from_secs(30 * 86_400);
+    let nobody = || Some(Vec::new());
+
+    scheduler.trigger("repo", &worktree);
+    advance(Duration::from_millis(20)).await;
+    assert_eq!(checker.live(), 1, "the check is running");
+    let language_dir = checker.calls()[0].cache_dir.clone();
+    let dir = worktree_cache_dir(&language_dir);
+    std::fs::write(language_dir.join("artifact"), vec![1u8; 4096]).unwrap();
+
+    let report = sweep_with(&home, true, later, &nobody);
+    assert_eq!(fate_of(&report, &dir), Some((Reason::Idle, Fate::InUse)));
+    assert!(dir.exists(), "a running check's cache is never claimed");
+
+    settle(Duration::from_secs(6), Duration::from_millis(100)).await;
+    assert_eq!(checker.live(), 0, "the check completed");
+    let report = sweep_with(&home, true, later, &nobody);
+    assert_eq!(fate_of(&report, &dir), Some((Reason::Idle, Fate::Removed)));
+    assert!(!dir.exists());
+    scheduler.shutdown().await;
+}
+
+/// A cancelled check may leave its confined child running, so its lease outlives the run.
+#[tokio::test(start_paused = true)]
+async fn scheduler_cancelled_check_keeps_its_lease_for_the_process_lifetime() {
+    agent_ide::languages::install();
+    let checker =
+        RecordingChecker::with_delay(agent_ide::languages::PYTHON, Duration::from_secs(3600));
+    let home = std::fs::canonicalize(scratch_dir("retention-cancel-home")).unwrap();
+    let worktree = scratch_worktree("retention-cancel-worktree", agent_ide::languages::PYTHON);
+    let scheduler = Scheduler::new(
+        vec![Arc::new(checker.clone())],
+        Duration::from_millis(10),
+        2,
+        home.join("checks"),
     );
-    assert!(
-        !cache_root.join("other-repo-hash").exists(),
-        "a repository directory left with no worktrees must be removed too"
-    );
+    scheduler.trigger("repo", &worktree);
+    advance(Duration::from_millis(20)).await;
+    assert_eq!(checker.live(), 1);
+    let dir = worktree_cache_dir(&checker.calls()[0].cache_dir);
+
+    scheduler.shutdown().await;
+    assert_eq!(checker.live(), 0, "the check future was dropped");
+    let later = std::time::SystemTime::now() + Duration::from_secs(30 * 86_400);
+    let report = sweep_with(&home, true, later, &|| Some(Vec::new()));
+    assert_eq!(fate_of(&report, &dir), Some((Reason::Idle, Fate::InUse)));
+    assert!(dir.exists());
 }
 
 /// The next run waits max(debounce, previous run duration) after the previous completion, not just the debounce.

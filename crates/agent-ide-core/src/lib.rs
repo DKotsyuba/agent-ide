@@ -45,6 +45,9 @@ pub mod errorlog;
 /// Resolves the real per-user home from the password database instead of `$HOME`.
 pub mod userhome;
 
+/// Removes unused per-user caches automatically under worktree leases (`docs/cache-retention.md`).
+pub mod retention;
+
 /// Implements the `init` command: per-user home tree and launcher template creation.
 pub mod init;
 

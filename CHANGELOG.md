@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Added
+
+- Automatic cache retention (`docs/cache-retention.md`): each daemon sweeps `~/.agent-ide` 60 s
+  after start and then hourly (one sweep per hour machine-wide). Check caches go when their
+  worktree is gone, idle 7 days, or least recently used over a 20 GiB budget; telemetry stores
+  when gone, idle 30 days or over 1 GiB; installed releases other than `current`, the newest
+  three, those installed in the last 14 days and those a live process executes. Every
+  activation, check and test run holds a shared lease on its worktree, a sweep claims a cache
+  only with an exclusive lock and renames it to trash before deleting, and nothing in checks or
+  telemetry is removed while an older (lease-unaware) `agent-ide` process is alive. Removals
+  are logged as `retention` events with the bytes freed.
+- `agent-ide cache status` (dry run) and `agent-ide cache prune` (apply now).
+
+### Changed
+
+- The lock-free start-up sweep of gone worktrees' check caches is replaced by the leased sweep;
+  `ide.start`, project checks and `ide.test` refuse to run when the worktree's retention lease
+  cannot be taken (`start:cache_lease`).
+
 ## 0.9.1 — 2026-10-05
 
 ### Fixed

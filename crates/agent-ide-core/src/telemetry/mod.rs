@@ -507,6 +507,13 @@ impl TelemetryOwnership {
         validate_private_file(&file.metadata().map_err(|_| TelemetryError::Store)?)?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result == 0 {
+            // A retention sweep may have moved this store to its trash between open and lock;
+            // owning that detached file would not exclude the next writer at the path.
+            let locked = file.metadata().map_err(|_| TelemetryError::Store)?;
+            let current = fs::symlink_metadata(&lock_path).map_err(|_| TelemetryError::Busy)?;
+            if (locked.dev(), locked.ino()) != (current.dev(), current.ino()) {
+                return Err(TelemetryError::Busy);
+            }
             Ok(Self { _file: file })
         } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
             Err(TelemetryError::Busy)

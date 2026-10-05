@@ -6,7 +6,7 @@
 //! builds the `agent-ide` binary. Every core module is re-exported unchanged.
 
 pub use agent_ide_core::{
-    app, assistance, changes, doctor_install, errorlog, execution, feed, init, project,
+    app, assistance, changes, doctor_install, errorlog, execution, feed, init, project, retention,
     selfinstall, telemetry, userhome, workspace,
 };
 

@@ -1329,6 +1329,7 @@ impl WorkerHandle {
                 observations,
                 edits,
                 grants: BTreeMap::new(),
+                leases: BTreeMap::new(),
                 pending_revocations: std::collections::BTreeSet::new(),
                 registered: BTreeMap::new(),
                 baselines: BTreeMap::new(),
@@ -2021,6 +2022,9 @@ struct Worker<'a> {
     edits: EditReceiptStore<'a>,
     /// Recoverable committed activation receipts, at most one for each live host binding.
     grants: BTreeMap<BindingRef, StartReceipt>,
+    /// Retention lease of each granted binding's worktree, taken before its activation commits
+    /// and released only with its binding state, so no sweep claims an activated worktree's caches.
+    leases: BTreeMap<BindingRef, crate::retention::Lease>,
     /// Bindings whose provider settlement succeeded but whose durable revoke failed, so their
     /// receipt, caches and registrations are deliberately retained for a bounded cleanup-only
     /// retry. It never carries a physical-process uncertainty, which stays in `uncertain`.
@@ -3075,6 +3079,16 @@ impl<'a> Worker<'a> {
             );
             FailureCode::WorkspaceActivation
         })?;
+        // The lease exists before the activation can: a sweep never sees an activated worktree
+        // without one, and an activation that cannot take it is refused.
+        let Some(lease) = crate::retention::Lease::for_worktree(requested_tree.worktree_path())
+        else {
+            job.failure_detail = Some(
+                "start:cache_lease: the worktree's cache retention lease could not be taken"
+                    .to_owned(),
+            );
+            return Err(FailureCode::WorkspaceActivation);
+        };
         // Do not cancel an in-flight durable commit: preserve its recoverable receipt before fencing output.
         let receipt = match self.workspace.activate(request).await {
             Ok(receipt) => receipt,
@@ -3118,6 +3132,7 @@ impl<'a> Worker<'a> {
         let next_role = receipt.role();
         let activation_operation = receipt.operation().to_owned();
         self.grants.insert(binding.clone(), receipt);
+        self.leases.insert(binding.clone(), lease);
         // The one shared fact a hook ingress can check before emitting a native hint: this
         // channel's binding now holds an activation.
         if let Ok(mut activated) = self.shared.activated.lock() {
@@ -4679,6 +4694,7 @@ impl<'a> Worker<'a> {
     /// baselines, so stopped bindings cannot retain roots or suppress a future binding's notices.
     fn release_binding_state(&mut self, binding: &BindingRef) {
         self.quiesce_worktree_caches(binding);
+        self.leases.remove(binding);
         self.registered.remove(binding);
         self.baselines.remove(binding);
         self.heads.remove(binding);
@@ -7074,6 +7090,7 @@ mod stop_retry_tests {
             observations: WorkspaceStore::new(store),
             edits: EditReceiptStore::new(store),
             grants: BTreeMap::new(),
+            leases: BTreeMap::new(),
             pending_revocations: std::collections::BTreeSet::new(),
             registered: BTreeMap::new(),
             baselines: BTreeMap::new(),

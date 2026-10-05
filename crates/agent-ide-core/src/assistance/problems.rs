@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use super::host_binding::HostKind;
 use super::launcher::{LauncherConfig, admit_worktree};
 use crate::checks::runner::{NestedSandboxFallbackRunner, SeatbeltRunner};
-use crate::checks::scheduler::{CompletionHook, Scheduler, sweep_stale_caches};
+use crate::checks::scheduler::{CompletionHook, Scheduler};
 use crate::checks::{
     CheckState, Checker, Language, MAX_PROBLEMS, Problem, ProblemSnapshot, Recheck, Severity,
     UnavailableReason,
@@ -227,7 +227,7 @@ impl ProjectProblemFeed {
     /// unchanged. Checkers run through the Seatbelt runner (with its one-time nested-sandbox
     /// fallback for a daemon the host itself confines) with the configured timeout, the
     /// scheduler uses the configured debounce and the cache root `$HOME/.agent-ide/checks`
-    /// (created `0700` best-effort), and stale caches of removed worktrees are swept first.
+    /// (created `0700` best-effort); the daemon's retention task removes unused caches.
     /// `on_complete` observes every completed check run. Returns `None` when `HOME` is unset.
     pub fn from_launcher(launcher: &LauncherConfig, on_complete: CompletionHook) -> Option<Self> {
         let checks = launcher.project_checks()?;
@@ -252,7 +252,6 @@ impl ProjectProblemFeed {
                 .mode(0o700)
                 .create(&cache_root);
         }
-        sweep_stale_caches(&cache_root);
         let languages = checkers.iter().map(|checker| checker.language()).collect();
         let scheduler = Scheduler::new(
             checkers,
