@@ -406,22 +406,29 @@ impl Outline {
     ///
     /// Same-named siblings are tried in source order and the walk backtracks: where a type `Foo`
     /// and its implementation blocks share the segment `Foo`, `Foo` finds the type while `Foo/new`
-    /// finds the method inside whichever block declares it.
+    /// finds the method inside whichever block declares it. A field and a method of the same name
+    /// (`Foo/source` declared by the type and by one of its blocks) resolve to the method: the field
+    /// is read and edited through its type.
     pub fn find(&self, path: &SymbolPath) -> Option<&Symbol> {
-        fn descend<'a>(level: &'a [Symbol], segments: &[String]) -> Option<&'a Symbol> {
-            let (first, rest) = segments.split_first()?;
-            level
-                .iter()
-                .filter(|symbol| symbol.name == *first)
-                .find_map(|symbol| {
-                    if rest.is_empty() {
-                        Some(symbol)
-                    } else {
-                        descend(&symbol.children, rest)
-                    }
-                })
+        fn descend<'a>(level: &'a [Symbol], segments: &[String], found: &mut Vec<&'a Symbol>) {
+            let Some((first, rest)) = segments.split_first() else {
+                return;
+            };
+            for symbol in level.iter().filter(|symbol| symbol.name == *first) {
+                if rest.is_empty() {
+                    found.push(symbol);
+                } else {
+                    descend(&symbol.children, rest, found);
+                }
+            }
         }
-        descend(&self.symbols, path.segments())
+        let mut found = Vec::new();
+        descend(&self.symbols, path.segments(), &mut found);
+        found
+            .iter()
+            .find(|symbol| symbol.kind != SymbolKind::Field)
+            .or(found.first())
+            .copied()
     }
 
     /// All symbols whose name equals `name`, at any depth, for ambiguity reports.
@@ -1365,5 +1372,50 @@ mod tests {
         assert_eq!(Language::for_path(Path::new("README.md")), None);
         assert_eq!(Language::by_id("beta"), Some(testing::BETA));
         assert!(testing::ALPHA < testing::BETA && testing::BETA < testing::GAMMA);
+    }
+
+    #[test]
+    fn a_method_wins_over_a_same_named_field_of_its_type() {
+        let symbol = |path: &[&str], kind, line, children| Symbol {
+            path: SymbolPath::new(None, path.iter().map(|s| (*s).to_owned()).collect()),
+            kind,
+            name: (*path.last().unwrap()).to_owned(),
+            range: LineRange::new(line, line),
+            body: LineRange::new(line, line),
+            signature: String::new(),
+            doc: None,
+            children,
+        };
+        let outline = Outline {
+            file: PathBuf::from("a.alpha"),
+            language: testing::ALPHA,
+            line_count: 9,
+            symbols: vec![
+                symbol(
+                    &["Foo"],
+                    SymbolKind::Struct,
+                    1,
+                    vec![
+                        symbol(&["Foo", "source"], SymbolKind::Field, 2, vec![]),
+                        symbol(&["Foo", "only_field"], SymbolKind::Field, 3, vec![]),
+                    ],
+                ),
+                symbol(
+                    &["Foo"],
+                    SymbolKind::Impl,
+                    5,
+                    vec![symbol(&["Foo", "source"], SymbolKind::Method, 6, vec![])],
+                ),
+            ],
+        };
+        let find = |text: &str| {
+            outline
+                .find(&SymbolPath::parse(text).unwrap())
+                .map(|s| (s.kind, s.range.start))
+        };
+        assert_eq!(find("Foo/source"), Some((SymbolKind::Method, 6)));
+        assert_eq!(find("Foo/only_field"), Some((SymbolKind::Field, 3)));
+        assert_eq!(find("Foo"), Some((SymbolKind::Struct, 1)));
+        assert_eq!(find("Foo/missing"), None);
     }
 }

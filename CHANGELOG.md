@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- A symbol address naming both a field of a type and a method of one of its blocks
+  (`PathSnapshot/source`) resolves to the method; it used to pick the field silently, so an
+  insert or replace aimed at the method landed inside the type declaration.
 - Two `old` text changes in one `ide.edit` batch overlap only when their matched bytes
   intersect: separate substrings of one line (parts of one string literal) apply together, right
   to left, with exact landing lines; they used to be refused as overlapping lines.
