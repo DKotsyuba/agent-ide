@@ -6688,7 +6688,7 @@ async fn diff_default_reply_is_compact_and_hash_free() {
     let text = diff["text"].as_str().unwrap();
     assert_eq!(
         text,
-        "diff (head): 1 files, +1 \u{2212}0\nfile: \"a.txt\"\n@@ -1 +1,2 @@\n line1\n+line2\n",
+        "diff (head): 1 files, +1 \u{2212}0\ninventory: 1 tracked, 0 untracked, 0 conflicted; hunks delivered: 1\npaths: \"a.txt\"\nfile: \"a.txt\"\n@@ -1 +1,2 @@\n line1\n+line2\n",
         "{text}"
     );
     for field in [
@@ -16031,7 +16031,7 @@ async fn diff_pagination_delivers_every_whole_hunk_once_with_truthful_freshness(
         assert_eq!(next["kind"], "diff", "{next}");
         let text = next["text"].as_str().unwrap().to_owned();
         assert!(
-            text.contains("current_tree: tracked file contents rechecked; commits, staging, and untracked names since the first page are not — if you committed, staged, or added an untracked file since, call ide.diff again"),
+            text.contains("current_tree: tracked file contents rechecked; untracked contents remain a captured snapshot; commits, staging, and untracked names since the first page are not — if you committed, staged, or added an untracked file since, call ide.diff again"),
             "{text}"
         );
         assert_ne!(
@@ -16125,52 +16125,628 @@ async fn diff_pagination_delivers_every_whole_hunk_once_with_truthful_freshness(
     daemon.wait().await.unwrap();
 }
 
-/// A single hunk can be small enough in raw bytes to be selected by `select_hunks` (well under the
-/// captured byte ceiling) yet still too large, once escaping and the duplicated MCP envelope are
-/// accounted for, to ever fit a page by itself. Proves this reports an explicit `capacity` failure
-/// — never a truncated hunk delivered as complete, and never state corrupted so a retry regresses
-/// to something other than the same explicit failure.
+/// A large hunk remains completely pageable after many test runs under the same activation.
+/// Completed test statuses and their bounded newest outputs do not obstruct an existing cursor.
 #[tokio::test]
-async fn diff_oversized_single_hunk_reports_capacity_without_false_continuation() {
+async fn diff_review_pages_survive_many_tests() {
+    let fixture = ProductFixture::new(json!([]));
+    for index in 0..40 {
+        std::fs::write(
+            fixture.root.join(format!("review-{index:02}.txt")),
+            "base\n",
+        )
+        .unwrap();
+    }
+    std::fs::write(fixture.root.join("review-zhuge.txt"), "base\n").unwrap();
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "review baseline"]);
+    for index in 0..40 {
+        std::fs::write(
+            fixture.root.join(format!("review-{index:02}.txt")),
+            "changed\n",
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        fixture.root.join("review-zhuge.txt"),
+        escape_heavy("huge", 800),
+    )
+    .unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "review-capacity").await;
+    let started = actor.call(&fixture, "ide.start", json!({})).await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let diff = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let diff = actor.settle(&fixture, diff).await;
+    assert_eq!(diff["continuation"], true, "{diff}");
+    let reference = diff["detail_ref"].as_str().unwrap().to_owned();
+    for _ in 0..12 {
+        let run = actor
+            .call(
+                &fixture,
+                "ide.test",
+                json!({"command":["/bin/echo","test result: ok. 1 passed; 0 failed;"]}),
+            )
+            .await;
+        let run = actor.settle(&fixture, run).await;
+        let id = run["text"]
+            .as_str()
+            .unwrap()
+            .split('#')
+            .nth(1)
+            .unwrap()
+            .split(':')
+            .next()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        for _ in 0..40 {
+            let status = actor.call(&fixture, "ide.test", json!({"status":id})).await;
+            let status = actor.settle(&fixture, status).await;
+            if status["text"].as_str().unwrap().contains("1 passed") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    let mut next = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+        .await;
+    let mut lines = 0;
+    loop {
+        assert_eq!(next["kind"], "diff", "{next}");
+        lines += next["text"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("+huge "))
+            .count();
+        if next["continuation"] == false {
+            break;
+        }
+        next = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+            .await;
+    }
+    assert_eq!(lines, 800);
+    let status = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":"tests #12"}))
+        .await;
+    assert!(
+        status["text"].as_str().unwrap().contains("1 passed"),
+        "{status}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A scoped review omits unrelated oversized tracked changes and delivers untracked text.
+#[tokio::test]
+async fn diff_review_paths_and_untracked_text_are_bounded() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::create_dir_all(fixture.root.join("review")).unwrap();
+    std::fs::write(fixture.root.join("review/old.txt"), "old\n").unwrap();
+    std::fs::write(fixture.root.join("generated.txt"), "base\n").unwrap();
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "review baseline"]);
+    std::fs::write(fixture.root.join("review/old.txt"), "new\n").unwrap();
+    std::fs::write(
+        fixture.root.join("generated.txt"),
+        vec![b'x'; 1024 * 1024 + 1],
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("review/new.rs"),
+        "/// New source.\npub fn fresh() {}\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("review/binary.bin"), [0, 255]).unwrap();
+    std::fs::write(
+        fixture.root.join("review/large.txt"),
+        vec![b'x'; 1024 * 1024 + 1],
+    )
+    .unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "review-paths").await;
+    let started = actor.call(&fixture, "ide.start", json!({})).await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    for mode in ["head", "unstaged", "task"] {
+        let diff = actor
+            .call(
+                &fixture,
+                "ide.diff",
+                json!({"mode":mode,"paths":["review"]}),
+            )
+            .await;
+        let diff = actor.settle(&fixture, diff).await;
+        assert_eq!(diff["kind"], "diff", "{diff}");
+        let text = diff["text"].as_str().unwrap();
+        assert!(text.contains("+pub fn fresh() {}"), "{text}");
+        assert!(
+            text.contains("inventory:") && text.contains("hunks delivered:"),
+            "{text}"
+        );
+        assert!(
+            text.contains("name only") && text.contains("binary") && text.contains("oversized"),
+            "{text}"
+        );
+        assert!(!text.contains("generated.txt"), "{text}");
+        let single = actor
+            .call(
+                &fixture,
+                "ide.diff",
+                json!({"mode":mode,"paths":["review/new.rs"]}),
+            )
+            .await;
+        let single = actor.settle(&fixture, single).await;
+        assert!(
+            single["text"]
+                .as_str()
+                .unwrap()
+                .contains("+pub fn fresh() {}"),
+            "{single}"
+        );
+        assert!(
+            !single["text"].as_str().unwrap().contains("old.txt"),
+            "{single}"
+        );
+    }
+    for path in ["../review", "/review", "review/../src"] {
+        actor.next += 1;
+        let refused = actor.mcp.exchange(json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{"name":"ide.diff","arguments":{"paths":[path]}}})).await;
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        assert!(
+            refused["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("paths"),
+            "{refused}"
+        );
+    }
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Untracked text is a frozen captured snapshot; rewrites cannot invalidate later pages.
+#[tokio::test]
+async fn diff_untracked_contents_are_frozen_across_pages() {
+    let fixture = ProductFixture::new(json!([]));
+    let body = escape_heavy("frozen-untracked", 1800);
+    std::fs::write(fixture.root.join("frozen.txt"), &body).unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "frozen-untracked").await;
+    let started = actor.call(&fixture, "ide.start", json!({})).await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    for mode in ["head", "task"] {
+        let first = actor
+            .call(
+                &fixture,
+                "ide.diff",
+                json!({"mode":mode,"paths":["frozen.txt"],"provenance":true}),
+            )
+            .await;
+        let mut page = actor.settle(&fixture, first).await;
+        let reference = page["detail_ref"].as_str().unwrap().to_owned();
+        assert!(
+            page["text"]
+                .as_str()
+                .unwrap()
+                .contains("tracked: 0; untracked: 1"),
+            "{page}"
+        );
+        let mut lines = Vec::new();
+        for _ in 0..20 {
+            assert_eq!(page["kind"], "diff", "{page}");
+            lines.extend(
+                page["text"]
+                    .as_str()
+                    .unwrap()
+                    .lines()
+                    .filter(|line| line.starts_with("+frozen-untracked "))
+                    .map(str::to_owned),
+            );
+            if page["continuation"] == false {
+                break;
+            }
+            std::fs::write(fixture.root.join("frozen.txt"), vec![b'y'; 2 * 1024 * 1024]).unwrap();
+            page = actor
+                .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+                .await;
+        }
+        assert_eq!(page["continuation"], false);
+        assert_eq!(
+            lines.join("\n") + "\n",
+            body.lines()
+                .map(|line| format!("+{line}\n"))
+                .collect::<String>()
+        );
+        std::fs::write(fixture.root.join("frozen.txt"), &body).unwrap();
+    }
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// The seventeenth retained capture reserves its real trailer and never cuts a line part.
+#[tokio::test]
+async fn diff_retention_full_split_page_fits_its_actual_trailer() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(fixture.root.join("packed.txt"), "base\n").unwrap();
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "packed baseline"]);
+    std::fs::write(
+        fixture.root.join("packed.txt"),
+        escape_heavy("packed", 3000),
+    )
+    .unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "retention-full").await;
+    let started = actor.call(&fixture, "ide.start", json!({})).await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    for _ in 0..16 {
+        let page = actor
+            .call(&fixture, "ide.diff", json!({"paths":["packed.txt"]}))
+            .await;
+        let page = actor.settle(&fixture, page).await;
+        assert_eq!(page["continuation"], true, "{page}");
+    }
+    for provenance in [false, true] {
+        let page = actor
+            .call(
+                &fixture,
+                "ide.diff",
+                json!({"paths":["packed.txt"],"provenance":provenance}),
+            )
+            .await;
+        let page = actor.settle(&fixture, page).await;
+        assert_eq!(page["kind"], "diff", "{page}");
+        assert_eq!(page["continuation"], false, "{page}");
+        let text = page["text"].as_str().unwrap();
+        assert!(
+            text.contains("diff continuation store full")
+                && text.contains("remaining lines require recapture"),
+            "{text}"
+        );
+        assert!(!text.contains("continues on the next page"), "{text}");
+        let patch = text.split("file: \"packed.txt\"\n").nth(1).unwrap();
+        for line in patch.lines().filter(|line| line.starts_with("+packed ")) {
+            assert_eq!(
+                line.len(),
+                format!("+packed {} 0000", "\\\"".repeat(12)).len(),
+                "{line}"
+            );
+        }
+        assert!(text.ends_with('\n'), "{text}");
+    }
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Staged output keeps untracked names but includes only index-vs-HEAD hunks and totals.
+#[tokio::test]
+async fn diff_staged_untracked_files_remain_name_only() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(fixture.root.join("staged.txt"), "base\n").unwrap();
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "staged baseline"]);
+    std::fs::write(fixture.root.join("staged.txt"), "changed\n").unwrap();
+    fixture.git(&["add", "--", "staged.txt"]);
+    std::fs::write(
+        fixture.root.join("not-staged.txt"),
+        "untracked line\n".repeat(100),
+    )
+    .unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "staged-only").await;
+    let started = actor.call(&fixture, "ide.start", json!({})).await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let page = actor
+        .call(&fixture, "ide.diff", json!({"mode":"staged"}))
+        .await;
+    let page = actor.settle(&fixture, page).await;
+    let text = page["text"].as_str().unwrap();
+    assert!(text.starts_with("diff (staged): 1 files, +1"), "{text}");
+    assert!(text.contains("untracked: not-staged.txt"), "{text}");
+    assert!(
+        !text.contains("file: \"not-staged.txt\"") && !text.contains("+untracked line"),
+        "{text}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Task capture charges tracked sources first, leaving extra untracked text name-only at the cap.
+#[tokio::test]
+async fn diff_plain_untracked_uses_remaining_source_budget() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::create_dir_all(fixture.root.join("budget")).unwrap();
+    let content = "0123456789012345678901234567890\n".repeat(32768);
+    assert_eq!(content.len(), 1024 * 1024);
+    for index in 0..8 {
+        std::fs::write(fixture.root.join(format!("budget/{index}.txt")), &content).unwrap();
+    }
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "budget baseline"]);
+    let mut changed = content.into_bytes();
+    changed[1024 * 1024 - 2] = b'x';
+    for index in 0..8 {
+        std::fs::write(fixture.root.join(format!("budget/{index}.txt")), &changed).unwrap();
+    }
+    std::fs::write(fixture.root.join("budget/new.txt"), "extra source\n").unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "plain-budget").await;
+    let started = actor.call(&fixture, "ide.start", json!({})).await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let page = actor
+        .call(
+            &fixture,
+            "ide.diff",
+            json!({"mode":"task","paths":["budget"]}),
+        )
+        .await;
+    let page = actor.settle(&fixture, page).await;
+    assert_eq!(page["kind"], "diff", "{page}");
+    let text = page["text"].as_str().unwrap();
+    assert!(
+        text.contains("total source limit") && !text.contains("+extra source"),
+        "{text}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// One oversized hunk pages into exact line-bounded parts and reconstructs its full bytes.
+/// No capacity error, missing line, duplicated byte or premature completion is accepted.
+#[tokio::test]
+async fn diff_oversized_single_hunk_pages_to_completion() {
     let fixture = ProductFixture::new(json!([]));
     std::fs::write(fixture.root.join("huge.txt"), "base\n").unwrap();
     fixture.git(&["add", "--", "."]);
     fixture.git(&["commit", "--quiet", "-m", "huge"]);
-    // Raw patch bytes stay well under the 48 KiB captured byte ceiling, so this hunk is selected
-    // rather than permanently skipped by `select_hunks`; its escape-heavy JSON form is what makes
-    // the actual duplicated MCP envelope impossible to fit.
-    std::fs::write(
-        fixture.root.join("huge.txt"),
-        escape_heavy("hunkmark-huge", 800),
-    )
-    .unwrap();
-
+    let body = escape_heavy("hunkmark-huge", 3000);
+    std::fs::write(fixture.root.join("huge.txt"), &body).unwrap();
+    let output = std::process::Command::new("/usr/bin/git")
+        .args(["diff", "--no-color", "--", "huge.txt"])
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let expected = String::from_utf8(output.stdout).unwrap();
+    let expected = expected[expected.find("@@ ").unwrap()..].to_owned();
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "product-root").await;
-    let started = actor
-        .call(&fixture, "ide.start", json!({"activation_id":"start"}))
-        .await;
-    let started = actor.settle(&fixture, started).await;
-    assert_eq!(started["kind"], "activation", "{started}");
-
+    let started = actor.call(&fixture, "ide.start", json!({})).await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     let first = actor
         .call(&fixture, "ide.diff", json!({"mode":"head"}))
         .await;
-    let first = actor.settle(&fixture, first).await;
-    assert_eq!(first["state"], "error", "{first}");
-    assert_eq!(first["code"], "capacity", "{first}");
+    let mut page = actor.settle(&fixture, first).await;
+    let reference = page["detail_ref"].as_str().unwrap().to_owned();
+    let mut reconstructed = String::new();
+    let mut pages = 0;
+    loop {
+        assert_eq!(page["kind"], "diff", "{page}");
+        let text = page["text"].as_str().unwrap();
+        let part = text.split("file: \"huge.txt\"\n").nth(1).unwrap();
+        let part = if part.starts_with("hunk ") {
+            part.split_once('\n').unwrap().1
+        } else {
+            part
+        };
+        reconstructed.push_str(part.split("\nhunks: ").next().unwrap());
+        if part.contains("\nhunks: ") {
+            reconstructed.push('\n');
+        }
+        pages += 1;
+        if page["continuation"] == false {
+            break;
+        }
+        assert!(pages < 32, "{page}");
+        page = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+            .await;
+    }
+    assert!(pages > 2);
+    assert_eq!(reconstructed, expected);
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
 
-    // No continuation was ever retained for this failed capture, so a retry must reach the exact
-    // same explicit failure rather than a stale or corrupted detail reference.
-    let retry = actor
+/// The unstable-capture fallback uses the same complete line pager and reviews untracked text.
+/// Name-only symlinks never veto continuation, and every page keeps its honest degraded label.
+#[tokio::test]
+async fn diff_fallback_pages_large_hunks_and_untracked_text() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(fixture.root.join("huge.txt"), "base\n").unwrap();
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "fallback baseline"]);
+    let body = escape_heavy("fallbackmark", 3000);
+    std::fs::write(fixture.root.join("huge.txt"), &body).unwrap();
+    std::fs::write(fixture.root.join("new.txt"), "new fallback source\n").unwrap();
+    std::os::unix::fs::symlink(
+        fixture.base.join("outside"),
+        fixture.root.join("node_modules"),
+    )
+    .unwrap();
+    let previous = std::process::Command::new("/usr/bin/git")
+        .args(["rev-parse", "HEAD~1"])
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    assert!(previous.status.success());
+    let previous = String::from_utf8(previous.stdout).unwrap();
+    let counter = fixture.base.join("head-counter");
+    let proxy = fixture.base.join("unstable-git.sh");
+    std::fs::write(&proxy, format!("#!/bin/sh\ncase \" $* \" in\n *\" rev-parse --verify --quiet HEAD \"*)\n n=$(cat \"{}\" 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > \"{}\"\n if [ $((n%2)) -eq 0 ]; then echo '{}'; exit 0; fi;;\nesac\nexec /usr/bin/git \"$@\"\n", counter.display(), counter.display(), previous.trim())).unwrap();
+    std::fs::set_permissions(&proxy, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    config["targets"][0]["git"] = accepted_program(proxy.to_str().unwrap(), "unstable-git");
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "fallback-pager").await;
+    let started = actor.call(&fixture, "ide.start", json!({})).await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let first = actor
         .call(&fixture, "ide.diff", json!({"mode":"head"}))
         .await;
-    let retry = actor.settle(&fixture, retry).await;
-    assert_eq!(retry["state"], "error", "{retry}");
-    assert_eq!(retry["code"], "capacity", "{retry}");
-
+    let mut page = actor.settle(&fixture, first).await;
+    let reference = page["detail_ref"].as_str().unwrap().to_owned();
+    let mut lines = Vec::new();
+    let mut new_source = false;
+    loop {
+        assert_eq!(page["kind"], "diff", "{page}");
+        let text = page["text"].as_str().unwrap();
+        assert!(
+            text.contains("plain git diff; exact capture unavailable"),
+            "{text}"
+        );
+        lines.extend(
+            text.lines()
+                .filter(|line| line.starts_with("+fallbackmark "))
+                .map(str::to_owned),
+        );
+        new_source |= text.contains("+new fallback source");
+        if page["continuation"] == false {
+            break;
+        }
+        assert!(lines.len() <= 3000);
+        page = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+            .await;
+    }
+    assert_eq!(
+        lines.join("\n") + "\n",
+        body.lines()
+            .map(|line| format!("+{line}\n"))
+            .collect::<String>()
+    );
+    assert!(new_source);
+    fixture.git(&["add", "--", "huge.txt"]);
+    let first = actor
+        .call(
+            &fixture,
+            "ide.diff",
+            json!({"mode":"staged","paths":["huge.txt"],"provenance":true}),
+        )
+        .await;
+    let mut staged = actor.settle(&fixture, first).await;
+    let reference = staged["detail_ref"].as_str().unwrap().to_owned();
+    assert_eq!(staged["continuation"], true, "{staged}");
+    std::fs::write(fixture.root.join("huge.txt"), vec![b'x'; 2 * 1024 * 1024]).unwrap();
+    let mut staged_lines = 0;
+    for _ in 0..20 {
+        assert_eq!(staged["kind"], "diff", "{staged}");
+        staged_lines += staged["text"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("+fallbackmark "))
+            .count();
+        if staged["continuation"] == false {
+            break;
+        }
+        staged = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+            .await;
+    }
+    assert_eq!(staged["continuation"], false);
+    assert_eq!(staged_lines, 3000);
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
-    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// An oversized line produces a read notice and advances past it to later lines and files.
+#[tokio::test]
+async fn diff_single_line_notice_keeps_later_changes_reachable() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(
+        fixture.root.join("src/long.rs"),
+        "// base\n// middle\n// tail\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("z-last.txt"), "base\n").unwrap();
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "long line"]);
+    std::fs::write(
+        fixture.root.join("src/long.rs"),
+        format!(
+            "// first changed\n// {}\n// tail changed\n",
+            "x".repeat(100_000)
+        ),
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("z-last.txt"), "second file changed\n").unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "single-line").await;
+    let started = actor.call(&fixture, "ide.start", json!({})).await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let first = actor
+        .call(
+            &fixture,
+            "ide.diff",
+            json!({"paths":["src/long.rs","z-last.txt"]}),
+        )
+        .await;
+    let mut page = actor.settle(&fixture, first).await;
+    let reference = page["detail_ref"].as_str().unwrap().to_owned();
+    let mut text = String::new();
+    for _ in 0..12 {
+        assert_eq!(page["kind"], "diff", "{page}");
+        text.push_str(page["text"].as_str().unwrap());
+        if page["continuation"] == false {
+            break;
+        }
+        page = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+            .await;
+    }
+    assert_eq!(page["continuation"], false);
+    assert!(
+        text.contains("one line of")
+            && text.contains("too long for one reply")
+            && text.contains("\"lines\":\"2-2\""),
+        "{text}"
+    );
+    assert!(
+        text.contains("+// tail changed") && text.contains("+second file changed"),
+        "{text}"
+    );
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"src/long.rs","lines":"2-2"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, read).await["kind"], "read");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();

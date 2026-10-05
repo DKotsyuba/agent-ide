@@ -22,15 +22,15 @@ use std::collections::BTreeSet;
 
 /// Renders the capture time on page one and the bounded rechecks and recovery on later pages.
 ///
-/// Later staged pages do not recheck file content; other later pages recheck tracked working-tree
-/// bytes. No later page rereads commits, staging state or untracked names.
+/// Later non-staged pages recheck tracked worktree bytes only. Untracked additions remain a
+/// captured snapshot; staged pages use immutable blobs and never recheck worktree contents.
 fn current_tree_line(mode: DiffMode, later_page: bool) -> String {
     let text = if !later_page {
         "current_tree: captured just now"
     } else if mode == DiffMode::Staged {
-        "current_tree: staged contents are not rechecked; commits, staging, and untracked names since the first page are not — if you committed, staged, or added an untracked file since, call ide.diff again"
+        "current_tree: staged contents are not rechecked; untracked paths are name-only; commits, staging, and untracked names since the first page are not — if you committed, staged, or added an untracked file since, call ide.diff again"
     } else {
-        "current_tree: tracked file contents rechecked; commits, staging, and untracked names since the first page are not — if you committed, staged, or added an untracked file since, call ide.diff again"
+        "current_tree: tracked file contents rechecked; untracked contents remain a captured snapshot; commits, staging, and untracked names since the first page are not — if you committed, staged, or added an untracked file since, call ide.diff again"
     };
     text.to_owned()
 }
@@ -51,6 +51,20 @@ struct ProductSnapshotRunner<'w, 'store> {
     detail: Option<String>,
 }
 impl SnapshotRunner for ProductSnapshotRunner<'_, '_> {
+    /// Selects validated literal paths before reads and budgets; omitted paths include the tree.
+    fn includes_path(&self, path: &Path) -> bool {
+        self.job
+            .parameters
+            .get("paths")
+            .and_then(Value::as_array)
+            .is_none_or(|paths| {
+                paths
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|selected| path.starts_with(selected))
+            })
+    }
+
     /// Executes only the peer-owned intent, settles direct-child proof, then returns immutable data.
     async fn run(&mut self, intent: SnapshotIntent) -> Result<CapturedProcessEvidence, GitError> {
         self.stage = Some(intent.label());
@@ -327,13 +341,19 @@ enum DiffPageEvidence {
         /// Complete per-path raw Git evidence retained for selection.
         snapshot: Box<crate::workspace::git::snapshot::GitSnapshot>,
     },
-    /// Task-mode patch plus live source fingerprints for every named path, detecting out-of-band edits.
+    /// Task or degraded plain patch, frozen untracked additions, and tracked-source fingerprints.
     Plain {
-        /// Bounded output of the controlled task diff command.
+        /// Bounded controlled plain/task patch plus best-effort captured untracked additions.
         stdout: Vec<u8>,
         /// Confined untracked names captured with Git's standard ignore rules.
         untracked: Vec<crate::workspace::git::PathStatus>,
-        /// Current worktree fingerprint when captured; `None` records a deleted path.
+        /// Bounded reasons untracked entries were not captured as text.
+        notes: Vec<(PathBuf, String)>,
+        /// Number of untracked paths represented in stdout, excluded from tracked inventory.
+        patch_paths: usize,
+        /// Fixed capture limitation carried through every degraded fallback page.
+        degraded: Option<&'static str>,
+        /// Non-staged tracked fingerprints only; absent for staged mode, None for deleted paths.
         worktree_sources: Vec<(PathBuf, Option<crate::workspace::observation::SourceBytes>)>,
         /// Owner operation reference retained with the patch.
         operation: String,
@@ -347,12 +367,9 @@ impl DiffPageState {
     /// this comparison was captured with, so a caller can shrink the page until it proves to fit
     /// the actual serialized reply envelope.
     ///
-    /// The captured `max_bytes` is deliberately never lowered: `Changes::select_hunks` treats a
-    /// hunk larger than the current `max_bytes` as one that can never fit any page and advances
-    /// permanently past it, so a shrinking byte budget would silently drop a hunk that fits the
-    /// original ceiling. Reducing only `max_hunks` can never do that — an unselected hunk always
-    /// parks the cursor on itself and is delivered by a later page. Never splits a hunk: a smaller
-    /// count only ever selects fewer whole hunks.
+    /// Selection resumes the cursor's hunk and line offset under the original byte target.
+    /// The fitter first reduces whole-hunk count, then cuts exact line parts or emits a read
+    /// notice for a lone oversized line. No unseen hunk or line remainder is silently skipped.
     pub(super) fn expand_with_max_hunks(
         &self,
         expected_scope: &GitScope,
@@ -373,6 +390,9 @@ impl DiffPageState {
             DiffPageEvidence::Plain {
                 stdout,
                 untracked,
+                notes,
+                patch_paths,
+                degraded,
                 operation,
                 generation,
                 ..
@@ -383,9 +403,27 @@ impl DiffPageState {
                 operation,
                 *generation,
                 budget,
-                |paths| confine_plain_diff_paths(expected_scope, paths).is_ok(),
+                |paths| {
+                    self.mode == DiffMode::Staged
+                        || confine_plain_diff_paths(
+                            expected_scope,
+                            &paths
+                                .iter()
+                                .filter(|path| {
+                                    !untracked.iter().any(|entry| entry.path() == path.as_path())
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                        )
+                        .is_ok()
+                },
             )
-            .map(|result| result.with_untracked(untracked.clone()))
+            .map(|result| {
+                result
+                    .with_untracked(untracked.clone())
+                    .with_untracked_notes(notes.clone(), *patch_paths)
+                    .with_degraded(*degraded)
+            })
             .unwrap_or_else(|| crate::changes::DiffResult::unavailable(expected_scope)),
         }
     }
@@ -413,10 +451,8 @@ impl DiffPageState {
         })
     }
     /// Re-verifies every retained tracked path's working-tree bytes against the current worktree
-    /// using the same no-follow reader Workspace itself captured them with. `Staged` never depends
-    /// on working-tree content, so it is not a meaningful freshness proof there and this always
-    /// reports unchanged; `Head`/`Unstaged`/`Task` genuinely compare against the working tree, so a
-    /// silent out-of-band edit (no native hook, so `native_epoch` never advanced) is caught here.
+    /// using Workspace's no-follow reader. Staged blobs and captured untracked additions are
+    /// immutable reply snapshots; neither depends on current worktree contents.
     pub(super) fn working_tree_bytes_unchanged(
         &self,
         worktree: &crate::workspace::authority::WorktreeRef,
@@ -429,11 +465,11 @@ impl DiffPageState {
             crate::workspace::git::snapshot::MAX_SNAPSHOT_BLOB_BYTES,
         )
         .expect("fixed source limits");
+        if self.mode == DiffMode::Staged {
+            return true;
+        }
         match &self.evidence {
             DiffPageEvidence::Snapshot { snapshot, .. } => {
-                if self.mode == DiffMode::Staged {
-                    return true;
-                }
                 for path in snapshot.paths() {
                     let Some(source) = path.source() else {
                         continue;
@@ -469,7 +505,8 @@ impl DiffPageState {
 }
 
 /// Runs one single-pass plain `git diff` directly in the worktree as a degraded fallback, used
-/// only when the exact two-pass capture proved unstable, and composes it under `budget`. `None` on
+/// only when the exact two-pass capture proved unstable. Validates composition under `budget`
+/// and returns bounded raw bytes for the shared pager. `None` on
 /// any failure — spawn, wait, a rejected exit, output `compose_plain_diff` cannot attribute
 /// exactly, or any named path failing the exact capture's per-path confinement
 /// (`confine_plain_diff_paths`) — so the caller reports the original capture failure instead of a
@@ -479,13 +516,21 @@ async fn plain_diff_fallback(
     program: &Path,
     scope: &GitScope,
     budget: crate::changes::DiffSelectionBudget,
-) -> Option<crate::changes::DiffResult> {
-    let intent = SnapshotIntent::plain_diff(scope.clone(), program).ok()?;
+) -> Option<Vec<u8>> {
+    let selected: Vec<PathBuf> = runner.job.parameters["paths"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(PathBuf::from)
+        .collect();
+    let intent = SnapshotIntent::plain_diff_paths(scope.clone(), program, &selected).ok()?;
     let evidence = runner.run_owned(intent.clone()).await.ok()?;
     let stdout = intent.accept(evidence).ok()?;
     crate::changes::compose_plain_diff(scope, &stdout, budget, |paths| {
         confine_plain_diff_paths(scope, paths).is_ok()
     })
+    .map(|_| stdout)
 }
 
 /// Hex-encodes raw comparison-side identity bytes for safe inclusion in rendered text.
@@ -498,13 +543,13 @@ fn hex_encode(bytes: &[u8]) -> String {
         })
 }
 
-/// Composes one whole-hunk Diff page that provably fits the actual serialized reply envelope.
+/// Composes a whole-hunk page or exact line part under the serialized reply envelope.
 ///
 /// This is the single fitting path shared by the initial composition in [`Worker::diff`] and by
 /// every later expansion in `serve_inspection`, so both obey the same rule: shrink the page by
-/// selecting *fewer whole hunks*, never by lowering the captured byte ceiling and never by cutting
-/// rendered text. `compose` is invoked with a candidate hunk count and must return the selection
-/// for exactly that count under the originally captured byte budget.
+/// selecting fewer whole hunks first, then splitting a lone oversized hunk into exact
+/// line-bounded parts without lowering the captured byte ceiling. `compose` receives a hunk
+/// count and must return that selection under the originally captured byte budget.
 ///
 /// Fitting is measured through [`content::fits`], the same compact projection and final serialized
 /// envelope predicate [`content::render_with_status`] uses for the complete MCP result the host receives. Using
@@ -529,9 +574,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 ///
 /// * [`FailureCode::SourceUnavailable`] when a candidate selection is structurally unavailable or
 ///   failed, which no smaller page can repair.
-/// * [`FailureCode::Capacity`] when even a single whole hunk cannot fit the serialized envelope.
-///   This is deliberately an explicit finite budget failure: the alternative would be delivering a
-///   silently cut hunk or claiming an undelivered hunk was delivered.
+/// * [`FailureCode::Capacity`] when inventory or the bounded recovery notice cannot fit the
+///   envelope. Oversized raw lines are delivered as notices whose cursor advances past the line.
 pub(crate) fn fit_diff_page(
     mode: DiffMode,
     authority_epoch: u64,
@@ -550,42 +594,195 @@ pub(crate) fn fit_diff_page(
         ) {
             return Err(FailureCode::SourceUnavailable);
         }
-        let more_available = candidate.detail_cursor().is_some();
-        let text = if provenance {
-            render_diff_provenance(
-                mode,
-                &candidate,
-                authority_epoch,
-                more_available,
-                later_page,
-            )
-        } else {
-            let continuation = if more_available {
-                DiffContinuationNote::Inspect(reference)
-            } else {
-                DiffContinuationNote::None
-            };
-            render_diff_compact(mode, &candidate, continuation, None)
-        };
-        let reply = PeerReply::Complete {
-            kind: ResultKind::Diff,
-            text,
-            detail_ref: Some(reference.to_owned()),
-            truncated: candidate.truncated_output()
-                || candidate.overflow_hunks() > 0
-                || candidate.overflow_bytes() > 0,
-            continuation: more_available,
-        };
+        let reply = diff_page_reply(
+            mode,
+            authority_epoch,
+            reference,
+            provenance,
+            later_page,
+            &candidate,
+            true,
+        );
         // The daemon composing this page has no host-kind signal of its own (T14B): only the MCP
         // facade, at final per-call render time, knows whether the caller is Claude or Codex. This
         // stays conservative for both hosts, sized to fit even alongside the structured JSON copy.
-        if content::fits(&reply, content::Envelope::WithStructured) {
+        if diff_page_fits(
+            mode,
+            authority_epoch,
+            reference,
+            provenance,
+            later_page,
+            &candidate,
+        ) {
             return Ok((candidate, reply));
         }
         if max_hunks == 1 {
+            let Some(hunk) = candidate.selected_hunks().first() else {
+                return Err(FailureCode::Capacity);
+            };
+            let mut boundaries: Vec<usize> = hunk
+                .patch()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, byte)| {
+                    (*byte == b'\n' && index + 1 < hunk.patch().len()).then_some(index + 1)
+                })
+                .collect();
+            // Binary search counts complete lines, while fits measures escaped text in both carriers.
+            let mut best = None;
+            while !boundaries.is_empty() {
+                let middle = boundaries.len() / 2;
+                let part = candidate.split_first_hunk(boundaries[middle]);
+                let reply = diff_page_reply(
+                    mode,
+                    authority_epoch,
+                    reference,
+                    provenance,
+                    later_page,
+                    &part,
+                    true,
+                );
+                if diff_page_fits(
+                    mode,
+                    authority_epoch,
+                    reference,
+                    provenance,
+                    later_page,
+                    &part,
+                ) {
+                    best = Some((part, reply));
+                    boundaries.drain(..=middle);
+                } else {
+                    boundaries.truncate(middle);
+                }
+            }
+            if let Some(best) = best {
+                return Ok(best);
+            }
+            if let Some(notice) = candidate.skip_first_line() {
+                let reply = diff_page_reply(
+                    mode,
+                    authority_epoch,
+                    reference,
+                    provenance,
+                    later_page,
+                    &notice,
+                    true,
+                );
+                if diff_page_fits(
+                    mode,
+                    authority_epoch,
+                    reference,
+                    provenance,
+                    later_page,
+                    &notice,
+                ) {
+                    return Ok((notice, reply));
+                }
+            }
             return Err(FailureCode::Capacity);
         }
         max_hunks = (max_hunks / 2).max(1);
+    }
+}
+
+/// Renders exactly one selection or line part with the same continuation and envelope fields.
+/// Metadata and hunk bytes are measured together by the fitter; this helper has no side effects.
+fn diff_page_reply(
+    mode: DiffMode,
+    authority_epoch: u64,
+    reference: &str,
+    provenance: bool,
+    later_page: bool,
+    candidate: &crate::changes::DiffResult,
+    retained: bool,
+) -> PeerReply {
+    let more_available = retained && candidate.detail_cursor().is_some();
+    let mut text = if provenance {
+        render_diff_provenance(mode, candidate, authority_epoch, more_available, later_page)
+    } else {
+        render_diff_compact(
+            mode,
+            candidate,
+            if more_available {
+                DiffContinuationNote::Inspect(reference)
+            } else if candidate.detail_cursor().is_some() {
+                DiffContinuationNote::Recapture
+            } else {
+                DiffContinuationNote::None
+            },
+            None,
+        )
+    };
+    if provenance && !retained && candidate.detail_cursor().is_some() {
+        text.push_str(&recapture_trailer(candidate));
+    }
+    PeerReply::Complete {
+        kind: ResultKind::Diff,
+        text,
+        detail_ref: Some(reference.to_owned()),
+        truncated: candidate.truncated_output()
+            || candidate.overflow_hunks() > 0
+            || candidate.overflow_bytes() > 0
+            || candidate
+                .selected_hunks()
+                .iter()
+                .any(|hunk| hunk.line_notice().is_some()),
+        continuation: more_available,
+    }
+}
+
+/// Measures both retained and retention-full replies before accepting any exact line part.
+/// This reserves the actual longer trailer and prevents final MCP rendering from shrinking bytes.
+fn diff_page_fits(
+    mode: DiffMode,
+    epoch: u64,
+    reference: &str,
+    provenance: bool,
+    later: bool,
+    candidate: &crate::changes::DiffResult,
+) -> bool {
+    [true, false].into_iter().all(|retained| {
+        content::fits(
+            &diff_page_reply(
+                mode, epoch, reference, provenance, later, candidate, retained,
+            ),
+            content::Envelope::WithStructured,
+        )
+    })
+}
+
+/// Names omitted bytes whose cursor could not be retained; used for compact and provenance pages.
+fn recapture_trailer(result: &crate::changes::DiffResult) -> String {
+    format!(
+        "hunks: {} more; diff continuation store full; finish other diff pages or recapture with ide.diff paths to retain less evidence\n",
+        result.overflow_hunks()
+    )
+}
+
+/// Names the reply resource that cannot fit: path inventory or a single exact diff line.
+/// The inventory is measured in the same host envelope, so its overflow never blames a source line.
+pub(super) fn diff_capacity_detail(
+    mode: DiffMode,
+    authority_epoch: u64,
+    reference: &str,
+    provenance: bool,
+    later_page: bool,
+    candidate: &crate::changes::DiffResult,
+) -> String {
+    let metadata = diff_page_reply(
+        mode,
+        authority_epoch,
+        reference,
+        provenance,
+        later_page,
+        &candidate.inventory_only(),
+        false,
+    );
+    if content::fits(&metadata, content::Envelope::WithStructured) {
+        candidate.line_capacity_detail()
+    } else {
+        "diff:reply_inventory".to_owned()
     }
 }
 
@@ -601,8 +798,8 @@ pub(crate) fn fit_diff_page(
 /// `ide.inspect` service deliberately performs no heavyweight Git recapture, so HEAD/index
 /// identities, untracked and conflict sets and durable current-observation tokens are never
 /// revalidated before a page is handed over. Later pages recheck tracked working-tree bytes except
-/// for staged mode (see [`DiffPageState::working_tree_bytes_unchanged`]), which cannot establish
-/// complete currentness.
+/// for staged mode (see [`DiffPageState::working_tree_bytes_unchanged`]). Untracked text is a
+/// frozen best-effort capture, never a claim about current bytes; staging/HEAD are not rechecked.
 fn render_diff_provenance(
     mode: DiffMode,
     result: &crate::changes::DiffResult,
@@ -648,6 +845,10 @@ fn render_diff_provenance(
     for path in result.conflicts() {
         text.push_str(&format!("conflicted_path: {:?}\n", path.path()));
     }
+    if let Some(note) = result.degraded() {
+        text.push_str(&format!("capture: degraded ({note})\n"));
+    }
+    text.push_str(&render_inventory(result));
     // Every file's first hunk is preceded by its `file:` line, so no hunk on any page depends on
     // the header's path list for attribution (T16B).
     let mut current: Option<&std::path::PathBuf> = None;
@@ -655,6 +856,10 @@ fn render_diff_provenance(
         if current != Some(hunk.path()) {
             text.push_str(&format!("file: {:?}\n", hunk.path()));
             current = Some(hunk.path());
+        }
+        text.push_str(&result.hunk_part_label(hunk, more_available));
+        if let Some(notice) = hunk.line_notice() {
+            text.push_str(notice);
         }
         match std::str::from_utf8(hunk.patch()) {
             Ok(patch) => text.push_str(patch),
@@ -707,6 +912,45 @@ fn bounded_names_line(label: &str, paths: &[crate::workspace::git::PathStatus]) 
     line
 }
 
+/// Separates capture inventory from delivered hunks and bounds names and omission notes.
+/// Quoted names preserve arbitrary Unix path labels without embedding control characters.
+fn render_inventory(result: &crate::changes::DiffResult) -> String {
+    let mut text = format!(
+        "inventory: {} tracked, {} untracked, {} conflicted; hunks delivered: {}\n",
+        result.counts().tracked(),
+        result.counts().untracked(),
+        result.counts().conflicted(),
+        result.selected_hunks().len()
+    );
+    let names: Vec<String> = result
+        .inventory()
+        .iter()
+        .take(MAX_INLINE_DIFF_NAMES)
+        .map(|path| format!("{path:?}"))
+        .collect();
+    if !names.is_empty() {
+        text.push_str(&format!("paths: {}", names.join(", ")));
+        let hidden = result.inventory().len().saturating_sub(names.len());
+        if hidden > 0 {
+            text.push_str(&format!(" (+{hidden} more)"));
+        }
+        text.push('\n');
+    }
+    for (path, reason) in result.name_only().iter().take(MAX_INLINE_DIFF_NAMES) {
+        text.push_str(&format!("name only: {path:?} ({reason})\n"));
+    }
+    let hidden = result
+        .name_only()
+        .len()
+        .saturating_sub(MAX_INLINE_DIFF_NAMES);
+    if hidden > 0 {
+        text.push_str(&format!(
+            "name only: +{hidden} more; use paths to inspect the remaining inventory\n"
+        ));
+    }
+    text
+}
+
 /// Renders the compact §2.7 default reply: one summary line, the untracked/conflicted names Git
 /// itself never diffs, per-file hunk text, and a bounded continuation marker — no hash-bearing or
 /// bookkeeping fields. `degraded`, when set, is appended in parentheses on the summary line, for
@@ -720,21 +964,29 @@ fn render_diff_compact(
     let mut text = format!(
         "diff ({}): {} files, +{} \u{2212}{}",
         mode_label(mode),
-        result.counts().tracked(),
+        result.files(),
         result.additions(),
         result.deletions(),
     );
-    if let Some(note) = degraded {
+    if let Some(note) = degraded.or(result.degraded()) {
         text.push_str(&format!(" ({note})"));
     }
     text.push('\n');
     text.push_str(&bounded_names_line("untracked", result.untracked()));
     text.push_str(&bounded_names_line("conflicted", result.conflicts()));
+    text.push_str(&render_inventory(result));
     let mut current: Option<&std::path::PathBuf> = None;
     for hunk in result.selected_hunks() {
         if current != Some(hunk.path()) {
             text.push_str(&format!("file: {:?}\n", hunk.path()));
             current = Some(hunk.path());
+        }
+        text.push_str(&result.hunk_part_label(
+            hunk,
+            matches!(continuation, DiffContinuationNote::Inspect(_)),
+        ));
+        if let Some(notice) = hunk.line_notice() {
+            text.push_str(notice);
         }
         match std::str::from_utf8(hunk.patch()) {
             Ok(patch) => text.push_str(patch),
@@ -751,10 +1003,7 @@ fn render_diff_compact(
         }
         DiffContinuationNote::Recapture => {
             if result.overflow_hunks() > 0 {
-                text.push_str(&format!(
-                    "hunks: {} more; recapture with ide.diff\n",
-                    result.overflow_hunks()
-                ));
+                text.push_str(&recapture_trailer(result));
             }
         }
     }
@@ -881,6 +1130,264 @@ impl Worker<'_> {
             .map_err(|_| FailureCode::SourceUnavailable)
     }
 
+    /// Pages a bounded plain Git capture for task mode or the degraded fallback.
+    /// Captures selected untracked text and source fingerprints, retains one immutable cursor,
+    /// reauthorizes delivery, and names source/patch/line limits. `degraded` is a fixed producer label.
+    async fn plain_diff_reply(
+        &mut self,
+        job: &mut Job,
+        authority: AuthorityStamp,
+        mode: DiffMode,
+        generation: u64,
+        mut stdout: Vec<u8>,
+        degraded: Option<&'static str>,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        let scope = GitScope::from_authority(&authority, mode);
+        let reference = job.reference.clone();
+        let program = job.target.git.path.clone();
+        let provenance = job.parameters["provenance"].as_bool().unwrap_or(false);
+        let mut runner = ProductSnapshotRunner {
+            worker: self,
+            job,
+            authority: authority.clone(),
+            failure: None,
+            stage: None,
+            detail: None,
+        };
+        let untracked_intent = SnapshotIntent::untracked_paths(&scope, &program)
+            .map_err(|_| FailureCode::SourceUnavailable)?;
+        let untracked_evidence = runner.run_owned(untracked_intent.clone()).await?;
+        let untracked_output = untracked_intent
+            .accept(untracked_evidence)
+            .map_err(|_| FailureCode::SourceUnavailable)?;
+        let untracked = crate::workspace::git::snapshot::parse_untracked_paths_selected(
+            &untracked_output,
+            |path| runner.includes_path(path),
+        )
+        .map_err(|_| FailureCode::SourceUnavailable)?;
+        let inventory: BTreeSet<PathBuf> = crate::changes::plain_diff_paths(&stdout)
+            .ok_or(FailureCode::SourceUnavailable)?
+            .into_iter()
+            .chain(untracked.iter().map(|path| path.path().to_path_buf()))
+            .collect();
+        if inventory.len() > crate::workspace::git::snapshot::MAX_SNAPSHOT_PATHS
+            || inventory
+                .iter()
+                .map(|path| path.as_os_str().as_encoded_bytes().len())
+                .sum::<usize>()
+                > crate::workspace::git::snapshot::MAX_SNAPSHOT_PATH_BYTES
+        {
+            runner.job.failure_detail = Some("diff:too_large".to_owned());
+            return Err(FailureCode::Capacity);
+        }
+        let tracked_paths =
+            crate::changes::plain_diff_paths(&stdout).ok_or(FailureCode::SourceUnavailable)?;
+        let limits = crate::workspace::observation::SourceReadLimits::new(
+            4096,
+            crate::workspace::git::snapshot::MAX_SNAPSHOT_BLOB_BYTES,
+        )
+        .map_err(|_| FailureCode::SourceUnavailable)?;
+        let mut worktree_sources = Vec::with_capacity(tracked_paths.len());
+        let mut source_bytes = 0usize;
+        let unique_paths: BTreeSet<PathBuf> = tracked_paths.iter().cloned().collect();
+        for path in unique_paths
+            .into_iter()
+            .filter(|_| mode != DiffMode::Staged)
+        {
+            runner
+                .authorize_read_path(&path)
+                .await
+                .map_err(|_| FailureCode::SourceUnavailable)?;
+            let source = match crate::workspace::observation::read_authorized_source(
+                authority.worktree(),
+                &path,
+                limits,
+            ) {
+                Ok(source) => {
+                    source_bytes = source_bytes.saturating_add(source.contents().len());
+                    if source_bytes > crate::workspace::git::snapshot::MAX_SNAPSHOT_TOTAL_BYTES {
+                        runner.job.failure_detail = Some("diff:too_large".to_owned());
+                        return Err(FailureCode::Capacity);
+                    }
+                    Some(crate::workspace::observation::SourceBytes::from_bytes(
+                        source.contents(),
+                    ))
+                }
+                Err(crate::workspace::observation::ObservationError::Missing) => None,
+                Err(_) => return Err(FailureCode::SourceUnavailable),
+            };
+            worktree_sources.push((path, source));
+        }
+        let mut notes = Vec::new();
+        let mut patch_paths = 0usize;
+
+        for path in untracked.iter().filter(|_| mode != DiffMode::Staged) {
+            runner
+                .authorize_read_path(path.path())
+                .await
+                .map_err(|_| FailureCode::SourceUnavailable)?;
+            let mut addition = crate::workspace::git::snapshot::PathSnapshot::untracked(
+                &scope,
+                generation,
+                path.clone(),
+                crate::workspace::git::snapshot::MAX_SNAPSHOT_TOTAL_BYTES
+                    .saturating_sub(source_bytes),
+                crate::workspace::git::snapshot::MAX_SNAPSHOT_PATCH_BYTES
+                    .saturating_sub(stdout.len()),
+            )
+            .map_err(|_| FailureCode::SourceUnavailable)?;
+            if addition.source().is_some() {
+                runner
+                    .authorize_read_path(path.path())
+                    .await
+                    .map_err(|_| FailureCode::SourceUnavailable)?;
+                addition
+                    .verify_untracked(authority.worktree())
+                    .map_err(|_| FailureCode::SourceUnavailable)?;
+            }
+            if let Some(reason) = addition.name_only() {
+                notes.push((path.path().to_path_buf(), reason.to_owned()));
+            }
+            let patch = addition.plain_patch();
+            if !patch.is_empty() {
+                if stdout.len().saturating_add(patch.len())
+                    > crate::workspace::git::snapshot::MAX_SNAPSHOT_PATCH_BYTES
+                {
+                    notes.push((path.path().to_path_buf(), "total patch limit".to_owned()));
+                    continue;
+                }
+                patch_paths += 1;
+                source_bytes += addition
+                    .source()
+                    .and_then(|source| source.bytes())
+                    .map_or(0, |bytes| bytes.length() as usize);
+                stdout.extend_from_slice(&patch);
+            }
+        }
+        let budget = crate::changes::DiffSelectionBudget::bounded(32, 48 * 1024);
+        let composed = crate::changes::compose_plain_diff_page(
+            &scope,
+            &stdout,
+            None,
+            &reference,
+            generation,
+            budget,
+            |paths| {
+                mode == DiffMode::Staged
+                    || confine_plain_diff_paths(
+                        &scope,
+                        &paths
+                            .iter()
+                            .filter(|path| {
+                                !untracked.iter().any(|entry| entry.path() == path.as_path())
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    )
+                    .is_ok()
+            },
+        )
+        .ok_or(FailureCode::SourceUnavailable)?
+        .with_untracked(untracked.clone())
+        .with_untracked_notes(notes.clone(), patch_paths)
+        .with_degraded(degraded);
+        drop(runner);
+        let (result, reply) = fit_diff_page(
+            mode,
+            authority.epoch(),
+            &reference,
+            budget.max_hunks,
+            provenance,
+            false,
+            |max_hunks| {
+                crate::changes::compose_plain_diff_page(
+                    &scope,
+                    &stdout,
+                    None,
+                    &reference,
+                    generation,
+                    crate::changes::DiffSelectionBudget::bounded(max_hunks, budget.max_bytes),
+                    |paths| {
+                        mode == DiffMode::Staged
+                            || confine_plain_diff_paths(
+                                &scope,
+                                &paths
+                                    .iter()
+                                    .filter(|path| {
+                                        !untracked
+                                            .iter()
+                                            .any(|entry| entry.path() == path.as_path())
+                                    })
+                                    .cloned()
+                                    .collect::<Vec<_>>(),
+                            )
+                            .is_ok()
+                    },
+                )
+                .map(|result| {
+                    result
+                        .with_untracked(untracked.clone())
+                        .with_untracked_notes(notes.clone(), patch_paths)
+                        .with_degraded(degraded)
+                })
+                .unwrap_or_else(|| crate::changes::DiffResult::unavailable(&scope))
+            },
+        )
+        .map_err(|code| {
+            if code == FailureCode::Capacity {
+                job.failure_detail = Some(diff_capacity_detail(
+                    mode,
+                    authority.epoch(),
+                    &reference,
+                    provenance,
+                    false,
+                    &composed,
+                ));
+            }
+            code
+        })?;
+        self.shared
+            .set_diff_provenance(&reference, tracked_paths.into_iter().collect());
+        let diff_page = result.detail_cursor().map(|cursor| DiffPageState {
+            scope: scope.clone(),
+            evidence: DiffPageEvidence::Plain {
+                stdout,
+                untracked,
+                notes,
+                patch_paths,
+                degraded,
+                worktree_sources,
+                operation: reference.clone(),
+                generation,
+            },
+            budget,
+            cursor: cursor.clone(),
+            mode,
+            provenance,
+        });
+        let continues = diff_page.is_some();
+        let retained = self.shared.set_diff_page(&reference, diff_page);
+        let authority = self.authority(&binding).await?;
+        self.shared.active(&binding)?;
+        if retained || !continues {
+            return Ok((reply, Some(authority), None));
+        }
+        Ok((
+            diff_page_reply(
+                mode,
+                authority.epoch(),
+                &reference,
+                provenance,
+                false,
+                &result,
+                false,
+            ),
+            Some(authority),
+            None,
+        ))
+    }
+
     /// Combines startup-verified executable selection with current durable authority and sandbox state before spawn.
     pub(super) async fn execution_request(
         &self,
@@ -949,6 +1456,13 @@ impl Worker<'_> {
             _ => return Err(FailureCode::Internal),
         };
         let provenance = job.parameters["provenance"].as_bool().unwrap_or(false);
+        let selected: Vec<PathBuf> = job.parameters["paths"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(PathBuf::from)
+            .collect();
         self.source_sequence = self
             .source_sequence
             .checked_add(1)
@@ -975,7 +1489,7 @@ impl Worker<'_> {
                 return Err(FailureCode::SourceUnavailable);
             };
             let scope = GitScope::from_authority(&authority, mode);
-            let intent = SnapshotIntent::task_diff(scope.clone(), &program, task_head)
+            let intent = SnapshotIntent::task_diff(scope.clone(), &program, task_head, &selected)
                 .map_err(|_| FailureCode::SourceUnavailable)?;
             let mut runner = ProductSnapshotRunner {
                 worker: self,
@@ -989,139 +1503,10 @@ impl Worker<'_> {
             let stdout = intent
                 .accept(evidence)
                 .map_err(|_| FailureCode::SourceUnavailable)?;
-            let untracked_intent = SnapshotIntent::untracked_paths(&scope, &program)
-                .map_err(|_| FailureCode::SourceUnavailable)?;
-            let untracked_evidence = runner.run_owned(untracked_intent.clone()).await?;
-            let untracked_output = untracked_intent
-                .accept(untracked_evidence)
-                .map_err(|_| FailureCode::SourceUnavailable)?;
-            let untracked =
-                crate::workspace::git::snapshot::parse_untracked_paths(&untracked_output)
-                    .map_err(|_| FailureCode::SourceUnavailable)?;
-            for path in &untracked {
-                runner
-                    .authorize_read_path(path.path())
-                    .await
-                    .map_err(|_| FailureCode::SourceUnavailable)?;
-                crate::workspace::git::snapshot::inspect_untracked(
-                    authority.worktree(),
-                    path.path(),
-                )
-                .map_err(|_| FailureCode::SourceUnavailable)?;
-            }
-            let budget = crate::changes::DiffSelectionBudget::bounded(32, 48 * 1024);
-            let composed = crate::changes::compose_plain_diff_page(
-                &scope,
-                &stdout,
-                None,
-                &reference,
-                generation,
-                budget,
-                |paths| confine_plain_diff_paths(&scope, paths).is_ok(),
-            )
-            .ok_or(FailureCode::SourceUnavailable)?
-            .with_untracked(untracked.clone());
-            let paths =
-                crate::changes::plain_diff_paths(&stdout).ok_or(FailureCode::SourceUnavailable)?;
-            let limits = crate::workspace::observation::SourceReadLimits::new(
-                4096,
-                crate::workspace::git::snapshot::MAX_SNAPSHOT_BLOB_BYTES,
-            )
-            .map_err(|_| FailureCode::SourceUnavailable)?;
-            let mut worktree_sources = Vec::with_capacity(paths.len());
-            let mut source_bytes = 0usize;
-            let unique_paths: BTreeSet<PathBuf> = paths.iter().cloned().collect();
-            for path in unique_paths {
-                runner
-                    .authorize_read_path(&path)
-                    .await
-                    .map_err(|_| FailureCode::SourceUnavailable)?;
-                let source = match crate::workspace::observation::read_authorized_source(
-                    authority.worktree(),
-                    &path,
-                    limits,
-                ) {
-                    Ok(source) => {
-                        source_bytes = source_bytes.saturating_add(source.contents().len());
-                        if source_bytes > crate::workspace::git::snapshot::MAX_SNAPSHOT_TOTAL_BYTES
-                        {
-                            return Err(FailureCode::Capacity);
-                        }
-                        Some(crate::workspace::observation::SourceBytes::from_bytes(
-                            source.contents(),
-                        ))
-                    }
-                    Err(crate::workspace::observation::ObservationError::Missing) => None,
-                    Err(_) => return Err(FailureCode::SourceUnavailable),
-                };
-                worktree_sources.push((path, source));
-            }
-            let (result, reply) = fit_diff_page(
-                mode,
-                authority.epoch(),
-                &reference,
-                budget.max_hunks,
-                provenance,
-                false,
-                |max_hunks| {
-                    crate::changes::compose_plain_diff_page(
-                        &scope,
-                        &stdout,
-                        None,
-                        &reference,
-                        generation,
-                        crate::changes::DiffSelectionBudget::bounded(max_hunks, budget.max_bytes),
-                        |paths| confine_plain_diff_paths(&scope, paths).is_ok(),
-                    )
-                    .map(|result| result.with_untracked(untracked.clone()))
-                    .unwrap_or_else(|| composed.clone())
-                },
-            )?;
             drop(runner);
-            self.shared.set_diff_provenance(
-                &reference,
-                paths
-                    .into_iter()
-                    .chain(untracked.iter().map(|path| path.path().to_path_buf()))
-                    .collect(),
-            );
-            let diff_page = result.detail_cursor().map(|cursor| DiffPageState {
-                scope: scope.clone(),
-                evidence: DiffPageEvidence::Plain {
-                    stdout,
-                    untracked,
-                    worktree_sources,
-                    operation: reference.clone(),
-                    generation,
-                },
-                budget,
-                cursor: cursor.clone(),
-                mode,
-                provenance,
-            });
-            let continues = diff_page.is_some();
-            let retained = self.shared.set_diff_page(&reference, diff_page);
-            let authority = self.authority(&binding).await?;
-            self.shared.active(&binding)?;
-            if retained || !continues {
-                return Ok((reply, Some(authority), None));
-            }
-            let text = if provenance {
-                render_diff_provenance(mode, &result, authority.epoch(), false, false)
-            } else {
-                render_diff_compact(mode, &result, DiffContinuationNote::Recapture, None)
-            };
-            return Ok((
-                PeerReply::Complete {
-                    kind: ResultKind::Diff,
-                    text,
-                    detail_ref: Some(reference),
-                    truncated: true,
-                    continuation: false,
-                },
-                Some(authority),
-                None,
-            ));
+            return self
+                .plain_diff_reply(job, authority, mode, generation, stdout, None)
+                .await;
         }
         let mut runner = ProductSnapshotRunner {
             worker: self,
@@ -1156,36 +1541,13 @@ impl Worker<'_> {
                 let stage = runner.stage;
                 let detail = runner.detail.clone();
                 drop(runner);
-                let Some(result) = plain else {
+                let Some(stdout) = plain else {
                     job.failure_detail = Some(detail.unwrap_or_else(|| {
                         git_failure_detail(&GitError::UnstableSnapshot, stage, failure.clone())
                     }));
                     return Err(failure.unwrap_or(FailureCode::SourceUnavailable));
                 };
-                let authority = self.authority(&binding).await?;
-                self.shared.active(&binding)?;
-                let continuation = if result.overflow_hunks() > 0 {
-                    DiffContinuationNote::Recapture
-                } else {
-                    DiffContinuationNote::None
-                };
-                let text = render_diff_compact(
-                    mode,
-                    &result,
-                    continuation,
-                    Some(
-                        "plain git diff; exact capture unavailable: snapshot unstable or a \
-                         file changed since it was observed",
-                    ),
-                );
-                let reply = PeerReply::Complete {
-                    kind: ResultKind::Diff,
-                    text,
-                    detail_ref: Some(reference.clone()),
-                    truncated: result.overflow_hunks() > 0,
-                    continuation: false,
-                };
-                return Ok((reply, Some(authority), None));
+                return self.plain_diff_reply(job, authority, mode, generation, stdout, Some("plain git diff; exact capture unavailable: snapshot unstable or a file changed since it was observed")).await;
             }
             Err(error) => {
                 // T27B: the terminal diff failure carries the closed failing stage, so a
@@ -1230,13 +1592,33 @@ impl Worker<'_> {
                     crate::changes::DiffSelectionBudget::bounded(max_hunks, budget.max_bytes),
                 )
             },
-        )?;
+        )
+        .map_err(|code| {
+            if code == FailureCode::Capacity {
+                let candidate = crate::changes::compose_diff(
+                    &scope,
+                    &comparison,
+                    evidence.clone(),
+                    crate::changes::DiffSelectionBudget::bounded(1, budget.max_bytes),
+                );
+                job.failure_detail = Some(diff_capacity_detail(
+                    mode,
+                    authority.epoch(),
+                    &reference,
+                    provenance,
+                    false,
+                    &candidate,
+                ));
+            }
+            code
+        })?;
         // T36B: retain the bounded provenance of every path this diff represents — each
         // delivered path plus its rename source — independently of the disposable pagination
         // state, so cached delivery must prove each under the live profile before it hands
         // back any composed page. The collector already bounded the path count and bytes.
-        // T36B-r: rendered pages also name untracked and conflict paths, so those names are
-        // provenance too — a name denied after capture refuses cached delivery.
+        // Name-only untracked entries carry no worktree bytes to disclose and must remain
+        // inspectable when they are symlinks. Their relative names were validated at capture.
+        // Captured untracked text keeps the same no-follow disclosure and freshness checks.
         let represented_paths: BTreeSet<PathBuf> = evidence
             .paths()
             .iter()
@@ -1245,13 +1627,6 @@ impl Worker<'_> {
                 represented.extend(path.status().original_path().map(Path::to_path_buf));
                 represented
             })
-            .chain(
-                evidence
-                    .status()
-                    .untracked()
-                    .iter()
-                    .map(|entry| entry.path().to_path_buf()),
-            )
             .chain(
                 evidence
                     .status()
@@ -1280,19 +1655,19 @@ impl Worker<'_> {
         if self.shared.set_diff_page(&job.reference, diff_page) || !continues {
             return Ok((reply, Some(authority), None));
         }
-        let text = if provenance {
-            render_diff_provenance(mode, &result, authority.epoch(), false, false)
-        } else {
-            render_diff_compact(mode, &result, DiffContinuationNote::Recapture, None)
-        };
-        let reply = PeerReply::Complete {
-            kind: ResultKind::Diff,
-            text,
-            detail_ref: Some(reference),
-            truncated: true,
-            continuation: false,
-        };
-        Ok((reply, Some(authority), None))
+        Ok((
+            diff_page_reply(
+                mode,
+                authority.epoch(),
+                &reference,
+                provenance,
+                false,
+                &result,
+                false,
+            ),
+            Some(authority),
+            None,
+        ))
     }
 }
 

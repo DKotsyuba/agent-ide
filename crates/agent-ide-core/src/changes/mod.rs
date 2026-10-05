@@ -12,7 +12,7 @@ pub mod edit;
 
 /// Maximum number of hunks selected by default for one bounded composition.
 pub const DEFAULT_MAX_HUNKS: usize = 32;
-/// Maximum number of raw hunk bytes selected by default for one bounded composition.
+/// Default target bytes across whole hunks; a lone oversized hunk is retained for line paging.
 pub const DEFAULT_MAX_HUNK_BYTES: usize = 32 * 1024;
 
 /// Outcome state for one bounded diff composition request.
@@ -61,7 +61,8 @@ pub enum DiffFreshness {
 pub struct DiffSelectionBudget {
     /// Maximum number of hunks that may be selected.
     pub max_hunks: usize,
-    /// Maximum number of bytes across selected hunks.
+    /// Target bytes across selected whole hunks; one oversized first hunk remains pageable
+    /// through Assistance's line-part fitter rather than being silently skipped.
     pub max_bytes: usize,
 }
 
@@ -122,6 +123,14 @@ pub struct DiffHunk {
     patch: Vec<u8>,
     /// Whether this entry represents binary rather than textual content.
     is_binary: bool,
+    /// One-based line of this part in the original hunk, including its header.
+    line_start: usize,
+    /// Number of lines in the complete original hunk.
+    total_lines: usize,
+    /// One-based current-source line at this part, for a single-line read recovery.
+    source_line: usize,
+    /// Bounded recovery notice replacing one line that cannot fit in the reply envelope.
+    line_notice: Option<String>,
 }
 
 impl DiffHunk {
@@ -144,6 +153,11 @@ impl DiffHunk {
     pub const fn is_binary(&self) -> bool {
         self.is_binary
     }
+
+    /// Returns recovery text for a delivered oversized line, or None for exact patch bytes.
+    pub fn line_notice(&self) -> Option<&str> {
+        self.line_notice.as_deref()
+    }
 }
 
 /// Tracks cursor and scope data used for bounded detail inspection.
@@ -159,6 +173,8 @@ pub struct DiffDetailCursor {
     comparison: Option<GitComparison>,
     /// Global index of the first omitted hunk within that exact snapshot.
     next_hunk: usize,
+    /// Already delivered bytes within next_hunk; always ends at a line boundary.
+    hunk_offset: usize,
 }
 
 impl DiffDetailCursor {
@@ -170,6 +186,7 @@ impl DiffDetailCursor {
             operation_reference: snapshot.operation_reference().to_owned(),
             comparison: Some(snapshot.comparison().clone()),
             next_hunk,
+            hunk_offset: 0,
         }
     }
 
@@ -181,6 +198,7 @@ impl DiffDetailCursor {
             operation_reference: operation.to_owned(),
             comparison: None,
             next_hunk,
+            hunk_offset: 0,
         }
     }
 
@@ -343,7 +361,7 @@ pub struct DiffResult {
     identities: DiffComparisonIdentities,
     /// Counts of the original separately classified raw status.
     status_counts: DiffStatusCounts,
-    /// Unsliced directly attributed hunks retained within request budgets.
+    /// Directly attributed whole hunks, exact line parts, or a bounded oversized-line notice.
     selected_hunks: Vec<DiffHunk>,
     /// Whether retained raw output was incomplete; minted snapshots require complete streams.
     /// Always `false` for a `GitSnapshot` that reached composition: Workspace's raw evidence
@@ -353,9 +371,9 @@ pub struct DiffResult {
     /// legitimately truncate does not have to change this struct's shape; hunk-level omission is
     /// reported separately and exactly via `overflow_hunks`/`overflow_bytes`.
     truncated_output: bool,
-    /// Number of complete hunks omitted by request budgets.
+    /// Number of remaining hunks or hunk remainders awaiting another page.
     overflow_hunks: usize,
-    /// Sum of bytes in omitted complete hunks.
+    /// Patch bytes in remaining hunks and line-part remainders.
     overflow_bytes: usize,
     /// Total added lines across every hunk in the whole diff, independent of pagination.
     additions: usize,
@@ -363,7 +381,7 @@ pub struct DiffResult {
     deletions: usize,
     /// Selected tracked paths, including additions/deletions and mode-only changes with no hunks.
     tracked: Vec<PathStatus>,
-    /// Separately listed raw untracked paths, never treated as baseline content.
+    /// Separately listed untracked paths, optionally reviewed as additions against empty.
     untracked: Vec<PathStatus>,
     /// Unmerged paths retained without guessed hunks.
     conflicts: Vec<PathStatus>,
@@ -373,17 +391,202 @@ pub struct DiffResult {
     detail_cursor: Option<DiffDetailCursor>,
     /// Bounded operation and baseline context for rendering and expansion.
     provenance: DiffProvenance,
+    /// Cursor for the first selected hunk, used only when the envelope requires line parts.
+    split_cursor: Option<DiffDetailCursor>,
+    /// Full hunk count before page selection, for stable part labels.
+    total_hunks: usize,
+    /// Untracked entries whose content cannot be reviewed under the capture limits.
+    name_only: Vec<(PathBuf, String)>,
+    /// Every captured changed path independent of which hunks are delivered on this page.
+    inventory: Vec<PathBuf>,
+    /// Fixed producer label for a plain fallback that cannot claim an exact capture window.
+    degraded: Option<&'static str>,
+    /// Captured untracked text files represented by additions, independent of the current page.
+    untracked_text_files: usize,
 }
 
 impl DiffResult {
     /// Attaches separately captured untracked names to a plain diff result and updates its count.
     ///
     /// The caller must already have authorized and confined these paths; this method only stores
-    /// the records for rendering and later-page reuse.
+    /// the records for rendering and later-page reuse, and merges their names into the sorted,
+    /// deduplicated inventory without changing the delivered hunks.
     pub fn with_untracked(mut self, untracked: Vec<PathStatus>) -> Self {
         self.status_counts.untracked = untracked.len();
+        self.inventory
+            .extend(untracked.iter().map(|path| path.path().to_path_buf()));
+        self.inventory.sort();
+        self.inventory.dedup();
         self.untracked = untracked;
         self
+    }
+
+    /// Attaches bounded name-only reasons and removes untracked patch paths from tracked counts.
+    /// The names remain the independent inventory even when an entry has no delivered hunk.
+    pub fn with_untracked_notes(
+        mut self,
+        notes: Vec<(PathBuf, String)>,
+        patch_paths: usize,
+    ) -> Self {
+        self.status_counts.tracked = self.status_counts.tracked.saturating_sub(patch_paths);
+        self.untracked_text_files = patch_paths;
+        if !notes.is_empty() {
+            self.coverage = DiffCoverage::Partial;
+            if self.state == DiffResultState::Ready {
+                self.state = DiffResultState::Incomplete;
+            }
+        }
+        self.name_only = notes;
+        self
+    }
+
+    /// Attaches a fixed capture limitation carried on every page; None keeps ordinary formatting.
+    /// Only producer-owned static text is accepted, with no host or process output in the label.
+    pub(crate) fn with_degraded(mut self, note: Option<&'static str>) -> Self {
+        self.degraded = note;
+        self
+    }
+
+    /// Returns the producer's fixed capture limitation, or None when no limitation was recorded.
+    pub(crate) fn degraded(&self) -> Option<&'static str> {
+        self.degraded
+    }
+
+    /// Returns the bounded captured path inventory, independently of this page's selected hunks.
+    pub fn inventory(&self) -> &[PathBuf] {
+        &self.inventory
+    }
+
+    /// Returns capture-limited untracked names and the reason their content was omitted.
+    pub fn name_only(&self) -> &[(PathBuf, String)] {
+        &self.name_only
+    }
+
+    /// Returns stable labels for a split hunk, empty for a complete whole hunk.
+    /// Line numbers count the original patch header and body; the bytes following the label are exact.
+    pub fn hunk_part_label(&self, hunk: &DiffHunk, continuation: bool) -> String {
+        if hunk.line_notice.is_some() {
+            return String::new();
+        }
+        let count = hunk.patch.split_inclusive(|byte| *byte == b'\n').count();
+        if hunk.line_start == 1 && count == hunk.total_lines {
+            return String::new();
+        }
+        let end = hunk.line_start + count.saturating_sub(1);
+        format!(
+            "hunk {} of {}, lines {}-{} of {}{}\n",
+            hunk.index + 1,
+            self.total_hunks,
+            hunk.line_start,
+            end,
+            hunk.total_lines,
+            if end < hunk.total_lines && continuation {
+                "; continues on the next page"
+            } else if end < hunk.total_lines {
+                "; remaining lines require recapture"
+            } else {
+                "; last part"
+            }
+        )
+    }
+
+    /// Cuts the first selected hunk at a complete line boundary and points its cursor at the remainder.
+    /// The envelope fitter uses a one-hunk result with a nonempty proper prefix.
+    ///
+    /// # Panics
+    /// Panics when there is no selected hunk or capture cursor, or end is zero, reaches/passes
+    /// the patch end, or does not follow a newline. Callers must provide a valid line boundary.
+    pub fn split_first_hunk(&self, end: usize) -> Self {
+        let mut result = self.clone();
+        let hunk = result
+            .selected_hunks
+            .first_mut()
+            .expect("one selected hunk");
+        assert!(end > 0 && end < hunk.patch.len() && hunk.patch[end - 1] == b'\n');
+        hunk.patch.truncate(end);
+        let mut cursor = result.split_cursor.clone().expect("captured hunk cursor");
+        cursor.hunk_offset += end;
+        result.detail_cursor = Some(cursor);
+        result.overflow_hunks += 1;
+        result.overflow_bytes += self.selected_hunks[0].patch.len() - end;
+        result.coverage = DiffCoverage::Partial;
+        result
+    }
+
+    /// Counts tracked changes and captured untracked text additions for the summary.
+    pub fn files(&self) -> usize {
+        self.status_counts.tracked + self.untracked_text_files
+    }
+
+    /// Replaces the first undeliverable line with a bounded read recovery and advances its cursor.
+    /// Returns None without mutation if there is no captured one-hunk selection or nonempty line.
+    /// The notice reports raw bytes including the line terminator; later hunks remain reachable.
+    pub(crate) fn skip_first_line(&self) -> Option<Self> {
+        if self.selected_hunks.len() != 1 {
+            return None;
+        }
+        let original = self.selected_hunks.first()?;
+        let mut cursor = self.split_cursor.clone()?;
+        let end = original
+            .patch
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(original.patch.len(), |index| index + 1);
+        if end == 0 {
+            return None;
+        }
+        let mut result = self.clone();
+        let hunk = result.selected_hunks.first_mut()?;
+        hunk.line_notice = Some(format!(
+            "hunk {} of {}, line {} of {}: one line of {} bytes is too long for one reply; read it with ide.read {{\"path\":{:?},\"lines\":\"{}-{}\"}}\n",
+            hunk.index + 1,
+            self.total_hunks,
+            hunk.line_start,
+            hunk.total_lines,
+            end,
+            hunk.path.to_string_lossy(),
+            hunk.source_line,
+            hunk.source_line
+        ));
+        hunk.patch.clear();
+        if end < original.patch.len() {
+            cursor.hunk_offset += end;
+            result.overflow_hunks += 1;
+            result.overflow_bytes += original.patch.len() - end;
+        } else {
+            cursor.next_hunk += 1;
+            cursor.hunk_offset = 0;
+        }
+        result.detail_cursor = (cursor.next_hunk < self.total_hunks).then_some(cursor);
+        result.coverage = DiffCoverage::Partial;
+        Some(result)
+    }
+
+    /// Removes hunk bytes from a clone to distinguish an oversized inventory from a long line.
+    /// Used only for reply-budget diagnosis; the retained result and cursor are not mutated.
+    pub(crate) fn inventory_only(&self) -> Self {
+        let mut result = self.clone();
+        result.selected_hunks.clear();
+        result.detail_cursor = None;
+        result
+    }
+
+    /// Names the line that cannot fit a reply and a bounded source-read recovery.
+    /// The hunk line is one-based within the exact patch, so native Git can also locate deleted lines.
+    pub fn line_capacity_detail(&self) -> String {
+        let Some(hunk) = self.selected_hunks.first() else {
+            return "diff:reply_inventory".to_owned();
+        };
+        format!(
+            "diff:single_line:{:?} source line {} (hunk {} line {}); read with ide.read {{\"path\":{:?},\"lines\":\"{}-{}\"}} or native git; paths can exclude this file",
+            hunk.path,
+            hunk.source_line,
+            hunk.index + 1,
+            hunk.line_start,
+            hunk.path.to_string_lossy(),
+            hunk.source_line,
+            hunk.source_line
+        )
     }
 
     /// Returns a payload-free refusal for retained plain-diff state that no longer validates.
@@ -403,6 +606,12 @@ impl DiffResult {
                 ignored: 0,
             },
             selected_hunks: Vec::new(),
+            split_cursor: None,
+            total_hunks: 0,
+            name_only: Vec::new(),
+            inventory: Vec::new(),
+            degraded: None,
+            untracked_text_files: 0,
             truncated_output: false,
             overflow_hunks: 0,
             overflow_bytes: 0,
@@ -542,9 +751,9 @@ pub fn expand_diff(
 
 /// Composes a degraded, single-pass `DiffResult` directly from plain `git diff` stdout, used only
 /// when the exact two-pass snapshot capture proved unstable. No comparison identities and no
-/// untracked or conflict data — a plain `git diff` reports neither — so `freshness` stays
-/// [`DiffFreshness::Unknown`] and `provenance` stays empty; the caller marks the rendered text as
-/// a plain-diff fallback and never offers `ide.inspect` continuation for it.
+/// built-in untracked or conflict inventory, so freshness remains Unknown. Callers attach
+/// separately captured untracked additions and use compose_plain_diff_page with an operation
+/// and generation to retain continuation, including line parts and oversized-line notices.
 ///
 /// `stdout` must come from `SnapshotIntent::plain_diff` (no renames, `a/`/`b/` prefixes). Returns
 /// `None` when any of it cannot be attributed exactly — a `diff --git` header of another shape, a
@@ -600,9 +809,13 @@ pub fn compose_plain_diff_page(
     {
         return None;
     }
+    let total_hunks = parsed.hunks.len();
     let start = cursor.map_or(0, DiffDetailCursor::next_hunk);
-    let (selected_hunks, overflow_hunks, overflow_bytes, next_hunk) =
-        select_hunks(parsed.hunks.into_iter().skip(start).collect(), budget);
+    let (selected_hunks, overflow_hunks, overflow_bytes, next_hunk) = select_hunks(
+        parsed.hunks.into_iter().skip(start).collect(),
+        budget,
+        cursor.map_or(0, |cursor| cursor.hunk_offset),
+    );
     let coverage = if overflow_hunks > 0 {
         DiffCoverage::Partial
     } else {
@@ -622,7 +835,7 @@ pub fn compose_plain_diff_page(
             untracked: 0,
             ignored: 0,
         },
-        selected_hunks,
+        selected_hunks: selected_hunks.clone(),
         truncated_output: false,
         overflow_hunks,
         overflow_bytes,
@@ -632,6 +845,17 @@ pub fn compose_plain_diff_page(
         untracked: Vec::new(),
         conflicts: Vec::new(),
         ignored: Vec::new(),
+        split_cursor: selected_hunks.first().map(|hunk| {
+            let mut split =
+                DiffDetailCursor::new_plain(expected_scope, operation, generation, hunk.index);
+            split.hunk_offset = cursor.map_or(0, |cursor| cursor.hunk_offset);
+            split
+        }),
+        total_hunks,
+        name_only: Vec::new(),
+        inventory: parsed.paths,
+        degraded: None,
+        untracked_text_files: 0,
         detail_cursor: next_hunk
             .filter(|_| !operation.is_empty() && generation > 0)
             .map(|next| DiffDetailCursor::new_plain(expected_scope, operation, generation, next)),
@@ -669,9 +893,13 @@ fn compose_diff_at(
         || evidence.scope() != expected_scope
         || comparison.scope() != expected_scope
         || evidence.comparison() != comparison
-        || evidence.paths().iter().any(|path| {
-            path.scope() != expected_scope || path.generation() != evidence.generation()
-        })
+        || evidence
+            .paths()
+            .iter()
+            .chain(evidence.untracked_paths())
+            .any(|path| {
+                path.scope() != expected_scope || path.generation() != evidence.generation()
+            })
         || !status_matches
         || !comparison.baseline().matches_scope(expected_scope)
     {
@@ -694,6 +922,12 @@ fn compose_diff_at(
                 ignored: 0,
             },
             selected_hunks: Vec::new(),
+            split_cursor: None,
+            total_hunks: 0,
+            name_only: Vec::new(),
+            inventory: Vec::new(),
+            degraded: None,
+            untracked_text_files: 0,
             truncated_output: false,
             overflow_hunks: 0,
             overflow_bytes: 0,
@@ -715,7 +949,12 @@ fn compose_diff_at(
     let truncated_output = false;
     let parsed = parse_snapshot_hunks(&evidence);
     let malformed = parsed.malformed;
-    let has_binary = parsed.has_binary;
+    let has_binary = parsed.has_binary
+        || evidence
+            .untracked_paths()
+            .iter()
+            .any(|path| path.name_only().is_some());
+    let total_hunks = parsed.hunks.len();
     let raw_hunks = parsed
         .hunks
         .into_iter()
@@ -738,8 +977,11 @@ fn compose_diff_at(
         };
     }
 
-    let (selected_hunks, overflow_hunks, overflow_bytes, cursor_offset) =
-        select_hunks(raw_hunks, budget);
+    let (selected_hunks, overflow_hunks, overflow_bytes, cursor_offset) = select_hunks(
+        raw_hunks,
+        budget,
+        cursor.map_or(0, |cursor| cursor.hunk_offset),
+    );
     if overflow_hunks > 0 {
         state = match state {
             DiffResultState::Ready => DiffResultState::Incomplete,
@@ -771,6 +1013,43 @@ fn compose_diff_at(
             tracked: evidence.paths().len(),
             ..DiffStatusCounts::from_status(status)
         },
+        split_cursor: selected_hunks.first().map(|hunk| {
+            let mut split = DiffDetailCursor::new(&evidence, hunk.index);
+            split.hunk_offset = cursor.map_or(0, |cursor| cursor.hunk_offset);
+            split
+        }),
+        total_hunks,
+        inventory: evidence
+            .paths()
+            .iter()
+            .map(|path| path.status().path().to_path_buf())
+            .chain(
+                status
+                    .untracked()
+                    .iter()
+                    .map(|path| path.path().to_path_buf()),
+            )
+            .chain(
+                status
+                    .conflicts()
+                    .iter()
+                    .map(|path| path.path().to_path_buf()),
+            )
+            .collect(),
+        degraded: None,
+        untracked_text_files: evidence
+            .untracked_paths()
+            .iter()
+            .filter(|path| !path.patch().is_empty())
+            .count(),
+        name_only: evidence
+            .untracked_paths()
+            .iter()
+            .filter_map(|path| {
+                path.name_only()
+                    .map(|note| (path.status().path().to_path_buf(), note.to_owned()))
+            })
+            .collect(),
         selected_hunks,
         truncated_output,
         overflow_hunks,
@@ -797,53 +1076,70 @@ fn compose_diff_at(
     }
 }
 
-/// Selects exact hunks without splitting payload under configured boundaries.
-///
-/// A hunk whose own byte length exceeds `budget.max_bytes` can never fit in any single page under
-/// this budget, so it is permanently skipped (counted as omitted, never selected) rather than
-/// parked behind a cursor that could never resolve it; this guarantees the returned cursor, if
-/// any, always strictly advances past every hunk already visited by this call. A hunk that could
-/// still fit a future page (only the count/byte budget of *this* call was exhausted) pauses
-/// selection instead, so the caller can resume exactly there with a fresh budget.
+/// Selects whole hunks under count/byte budgets, resuming the first at a proven line offset.
+/// A lone oversized hunk remains selected for Assistance's bounded line-part fitter; no hunk is
+/// permanently skipped. Returns the first undelivered hunk index, with exact omitted counts.
 fn select_hunks(
     hunks: Vec<RawHunk>,
     budget: DiffSelectionBudget,
+    offset: usize,
 ) -> (Vec<DiffHunk>, usize, usize, Option<usize>) {
     let mut selected = Vec::new();
     let mut selected_bytes = 0usize;
     let mut omitted = 0usize;
     let mut omitted_bytes = 0usize;
     let mut cursor = None;
-
     let mut hunks = hunks.into_iter();
-    while let Some(hunk) = hunks.next() {
+    let mut offset = offset;
+    while let Some(mut hunk) = hunks.next() {
+        let total_lines = hunk.patch.split_inclusive(|byte| *byte == b'\n').count();
+        let start_line = std::str::from_utf8(
+            hunk.patch
+                .split(|byte| *byte == b'\n')
+                .next()
+                .unwrap_or(&[]),
+        )
+        .ok()
+        .and_then(|header| header.split_whitespace().nth(2))
+        .and_then(|range| range.strip_prefix('+'))
+        .and_then(|range| range.split(',').next())
+        .and_then(|line| line.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+        let source_line = start_line
+            + hunk.patch[..offset.min(hunk.patch.len())]
+                .split_inclusive(|byte| *byte == b'\n')
+                .filter(|line| matches!(line.first(), Some(b'+' | b' ')))
+                .count();
+        let line_start = 1 + hunk.patch[..offset.min(hunk.patch.len())]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        hunk.patch.drain(..offset.min(hunk.patch.len()));
+        offset = 0;
         let fits_count = selected.len() < budget.max_hunks;
         let fits_bytes = selected_bytes + hunk.patch.len() <= budget.max_bytes;
-        if fits_count && fits_bytes {
+        if fits_count && (fits_bytes || selected.is_empty()) {
             selected_bytes += hunk.patch.len();
             selected.push(DiffHunk {
                 index: hunk.original_index,
                 path: hunk.path,
                 patch: hunk.patch,
                 is_binary: hunk.binary,
+                line_start,
+                total_lines,
+                source_line,
+                line_notice: None,
             });
             continue;
         }
-
         omitted += 1;
         omitted_bytes += hunk.patch.len();
-
-        if hunk.patch.len() > budget.max_bytes {
-            // Never fits under this budget regardless of page; advance past it for good.
-            continue;
-        }
-
         cursor = Some(hunk.original_index);
         omitted += hunks.len();
         omitted_bytes += hunks.map(|remaining| remaining.patch.len()).sum::<usize>();
         break;
     }
-
     (selected, omitted, omitted_bytes, cursor)
 }
 
@@ -899,7 +1195,7 @@ fn parse_snapshot_hunks(snapshot: &GitSnapshot) -> ParsedDiff {
         additions: 0,
         deletions: 0,
     };
-    for evidence in snapshot.paths() {
+    for evidence in snapshot.paths().iter().chain(snapshot.untracked_paths()) {
         let stdout = evidence.patch();
         let path = evidence.status().path().to_path_buf();
         let mut cursor = 0;

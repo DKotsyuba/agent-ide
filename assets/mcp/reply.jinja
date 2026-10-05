@@ -208,8 +208,18 @@ error: launcher_configuration{% if resolution_detail %} ({{ resolution_detail }}
 {%- elif code == "workspace_authority" -%}
 error: workspace_authority{% if resolution_detail %} ({{ resolution_detail }}){% else %} (inspect:authority_stale){% endif %}; this result belongs to an older IDE activation. Call ide.start, then repeat with fresh references
 {%- elif code == "capacity" -%}
-{%- if resolution_detail == "diff:too_large" -%}
-error: capacity (diff:too_large); the change is larger than one diff result allows; narrow it (head vs staged/unstaged) or review it with native git
+{%- if resolution_detail[:17] == "diff:single_line:" -%}
+error: capacity (diff:single_line); one diff line exceeds the reply envelope; {{ resolution_message }}
+{%- elif resolution_detail == "diff:reply_inventory" -%}
+error: capacity (diff:reply_inventory); the path inventory exceeds the reply envelope; narrow ide.diff with paths
+{%- elif resolution_detail == "worker:queue_full" or resolution_detail == "inspect:queue_full" -%}
+error: capacity ({{ resolution_detail }}); the request queue is full; wait for pending work, then retry
+{%- elif resolution_detail == "worker:result_store_full" -%}
+error: capacity (worker:result_store_full); the result store is full of pending or protected results; wait for pending work or stop an activation retaining results
+{%- elif resolution_detail == "worker:actor_share_full" -%}
+error: capacity (worker:actor_share_full); the result store is full of protected per-actor shares; stop an activation retaining results, or continue with native tools
+{%- elif resolution_detail == "diff:too_large" -%}
+error: capacity (diff:too_large); the source, patch or path capture budget is full; narrow ide.diff with paths or review it with native git
 {%- else -%}
 error: capacity{% if resolution_detail %} ({{ resolution_detail }}){% else %} (worker:capacity){% endif %}; the IDE's bounded queue or result store is full. Wait for pending work, or call ide.stop and ide.start
 {%- endif -%}

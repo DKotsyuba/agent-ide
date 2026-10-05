@@ -16,6 +16,14 @@
 - An edit that leaves its file clean while the project check reports errors in other files says
   so (`current_clean for this file; the project check reports N errors in other files`) and points
   at `ide.context` problems instead of `ide.diff`.
+- `ide.diff` no longer fails `capacity` on a hunk larger than one reply: the hunk arrives in
+  line-bounded parts on consecutive `ide.inspect` pages (`hunk N of T, lines A-B of L`), and a
+  single line too long for any reply becomes a notice with the `ide.read` that shows it, after
+  which paging continues. Capacity refusals name the resource that is full.
+- `ide.diff` accepts `paths` (literal worktree-relative files or directories) and shows bounded
+  untracked text as additions, without staging it. Untracked content is a best-effort snapshot:
+  a file that changes during capture stays name-only and never breaks the diff. `staged` mode
+  lists untracked names only, as before.
 - A test run's `rerun:` line reproduces the run: `cd <dir> && env NAME=VALUE … <argv>` when
   `ide.test` was given `cwd` or `env`.
 - A failed run lists up to 16 failing tests (was 8) and says how many more are in the full output

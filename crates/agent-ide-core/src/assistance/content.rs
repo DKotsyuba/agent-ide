@@ -68,8 +68,8 @@ pub(crate) fn render_with_call(
 
 /// Reports whether one unchanged reply fits after projection into the exact final MCP carrier.
 ///
-/// This predicate never shrinks text. Diff pagination uses it to accept only whole-hunk pages that
-/// the facade can later render byte-for-byte without advancing a cursor past omitted content.
+/// This predicate never shrinks text. Diff pagination measures whole hunks, exact line parts,
+/// oversized-line notices and the actual continuation trailer before advancing its cursor.
 pub(crate) fn fits(reply: &PeerReply, envelope: Envelope) -> bool {
     project(reply, None, envelope, None, None)
         .is_some_and(|rendered| call_tool_result_fits(&rendered))
@@ -1235,7 +1235,8 @@ mod tests {
         assert!(text_of(&none).ends_with("current writer: none"));
     }
 
-    /// Capacity failures preserve their stage and explain how to free bounded result storage.
+    /// Capacity failures identify the capture, queue, result-store or protected actor resource
+    /// and give the corresponding recovery, including a path-specific read for a lone long line.
     #[test]
     fn capacity_error_names_its_stage_and_recovery() {
         let large_diff = render(
@@ -1248,7 +1249,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&large_diff),
-            "error: capacity (diff:too_large); the change is larger than one diff result allows; narrow it (head vs staged/unstaged) or review it with native git"
+            "error: capacity (diff:too_large); the source, patch or path capture budget is full; narrow ide.diff with paths or review it with native git"
         );
         let staged = render(
             PeerReply::Error {
@@ -1262,6 +1263,26 @@ mod tests {
             text_of(&staged),
             "error: capacity (inspect:detail_unknown); the IDE's bounded queue or result store is full. Wait for pending work, or call ide.stop and ide.start"
         );
+        for (stage, recovery) in [
+            ("worker:queue_full", "request queue"),
+            ("inspect:queue_full", "request queue"),
+            ("worker:result_store_full", "result store"),
+            ("worker:actor_share_full", "per-actor shares"),
+            (
+                "diff:single_line:src/long.rs source line 1; ide.read",
+                "reply envelope",
+            ),
+        ] {
+            let reply = render(
+                PeerReply::Error {
+                    code: FailureCode::Capacity,
+                    detail: Some(stage.to_owned()),
+                },
+                Envelope::WithStructured,
+            )
+            .unwrap();
+            assert!(text_of(&reply).contains(recovery), "{}", text_of(&reply));
+        }
         let bare = render(
             PeerReply::Error {
                 code: FailureCode::Capacity,

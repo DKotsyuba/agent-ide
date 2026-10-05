@@ -1204,7 +1204,10 @@ impl WorkerHandle {
             attachment,
             Some(send),
         ) {
-            return PeerReply::Error { code, detail: None };
+            return PeerReply::Error {
+                detail: (code.code == FailureCode::Capacity).then_some(code.stage),
+                code: code.code,
+            };
         }
         match tokio::time::timeout(Duration::from_secs(4), wait).await {
             Ok(Ok(reply)) => reply,
@@ -1437,7 +1440,10 @@ impl WorkerHandle {
                         .await
                 }
             },
-            Err(code) => PeerReply::Error { code, detail: None },
+            Err(code) => PeerReply::Error {
+                detail: (code.code == FailureCode::Capacity).then_some(code.stage),
+                code: code.code,
+            },
         }
     }
 
@@ -1496,7 +1502,10 @@ impl WorkerHandle {
             attachment,
             Some(send),
         ) {
-            return PeerReply::Error { code, detail: None };
+            return PeerReply::Error {
+                detail: (code.code == FailureCode::Capacity).then_some(code.stage),
+                code: code.code,
+            };
         }
         match tokio::time::timeout(Duration::from_millis(800), wait).await {
             Ok(Ok(reply)) => reply,
@@ -1523,7 +1532,13 @@ impl WorkerHandle {
         }
         let permit = match reserve_inspection(&self.inspect) {
             Ok(permit) => permit,
-            Err(code) => return PeerReply::Error { code, detail: None },
+            Err(code) => {
+                return PeerReply::Error {
+                    detail: (code == FailureCode::Capacity)
+                        .then(|| "inspect:queue_full".to_owned()),
+                    code,
+                };
+            }
         };
         self.inspect_reserved(binding, reference, expected, permit)
             .await
@@ -1657,7 +1672,8 @@ impl WorkerHandle {
         Some(feedback.text)
     }
 
-    /// Atomically bounds and publishes one operation, without file, database or child-process I/O.
+    /// Atomically bounds and publishes one operation without I/O; failures name the queue,
+    /// result store or protected actor shares that prevented admission.
     #[allow(clippy::too_many_arguments)]
     fn enqueue(
         &self,
@@ -1666,13 +1682,13 @@ impl WorkerHandle {
         parameters: Value,
         attachment: &str,
         stop_reply: Option<oneshot::Sender<PeerReply>>,
-    ) -> Result<String, FailureCode> {
+    ) -> Result<String, InspectFailure> {
         if self
             .shared
             .shutting_down
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Err(FailureCode::Internal);
+            return Err(FailureCode::Internal.into());
         }
         if !self
             .task
@@ -1681,7 +1697,7 @@ impl WorkerHandle {
             .as_ref()
             .is_some_and(|task| !task.is_finished())
         {
-            return Err(FailureCode::Internal);
+            return Err(FailureCode::Internal.into());
         }
         let target = self
             .target(attachment)
@@ -1729,7 +1745,10 @@ impl WorkerHandle {
             .count()
             >= queue_cap
         {
-            return Err(FailureCode::Capacity);
+            return Err(InspectFailure::stage(
+                FailureCode::Capacity,
+                "worker:queue_full",
+            ));
         }
         if retain_detail && ledger.details.len() >= self.shared.launcher.limits.details {
             evict_settled_details(
@@ -1740,7 +1759,18 @@ impl WorkerHandle {
                 &self.shared.test_runs.detail_refs(),
             );
             if ledger.details.len() >= self.shared.launcher.limits.details {
-                return Err(FailureCode::Capacity);
+                return Err(InspectFailure::stage(
+                    FailureCode::Capacity,
+                    if ledger
+                        .details
+                        .values()
+                        .all(|detail| !matches!(detail.reply, PeerReply::Pending { .. }))
+                    {
+                        "worker:actor_share_full"
+                    } else {
+                        "worker:result_store_full"
+                    },
+                ));
             }
         }
         ledger.next = ledger.next.checked_add(1).ok_or(FailureCode::Capacity)?;
@@ -4814,11 +4844,26 @@ async fn inspection_loop(
     }
 }
 
-/// One failed inspection: the closed failure code plus the stage tag its path knows.
+/// One failed ingress or inspection check, with a closed code and resource-specific stage.
+#[derive(Debug)]
 struct InspectFailure {
+    /// Stable protocol failure category.
     code: FailureCode,
+    /// Privacy-safe stage or bounded path-specific recovery.
     stage: String,
 }
+
+impl From<FailureCode> for InspectFailure {
+    /// Keeps the closed code and derives its default stage when an ingress check has no finer cause.
+    fn from(code: FailureCode) -> Self {
+        if code == FailureCode::Capacity {
+            Self::stage(code, "inspect:queue_full")
+        } else {
+            Self::new(code)
+        }
+    }
+}
+
 impl InspectFailure {
     /// Derives the default `inspect:<reason>` stage for a path with nothing more specific.
     fn new(code: FailureCode) -> Self {
@@ -5037,9 +5082,9 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 crate::workspace::git::GitScope::from_authority(authority, page.mode());
             // Revalidate the retained evidence's working-tree material against the current
             // worktree before trusting it: an out-of-band edit with no native hook never bumps
-            // native_epoch, so that check alone cannot catch it. Staged-only comparisons never
-            // depend on working-tree bytes, so this is skipped rather than used as unrelated
-            // "proof" for them.
+            // native_epoch. Only non-staged tracked bytes are rechecked: staged blobs are
+            // independent of the worktree, and untracked additions are best-effort captured
+            // snapshots. Their later edits must not make tracked review unavailable.
             if !page.working_tree_bytes_unchanged(authority.worktree()) {
                 return Err(InspectFailure::stage(
                     invalidate(FailureCode::SourceUnavailable),
@@ -5066,8 +5111,17 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 FailureCode::SourceUnavailable => {
                     InspectFailure::stage(invalidate(code), "inspect:page_unavailable")
                 }
-                // A budget refusal delivered nothing, so the retained evidence stays: dropping the
-                // continuation here would lose hunks the caller can still reach later.
+                FailureCode::Capacity => InspectFailure {
+                    code: FailureCode::Capacity,
+                    stage: snapshots::diff_capacity_detail(
+                        page.mode(),
+                        authority.epoch(),
+                        &request.reference,
+                        page.provenance(),
+                        true,
+                        &page.expand_with_max_hunks(&expected_scope, 1),
+                    ),
+                },
                 code => InspectFailure::new(code),
             })?;
             let encoded = next
@@ -5153,10 +5207,10 @@ fn reserve_inspection(
 }
 
 /// Reserves the initial inspection slot before invoking the closure that publishes a job/detail.
-fn admit_initial_inspection(
+fn admit_initial_inspection<E: From<FailureCode>>(
     sender: &mpsc::Sender<Inspection>,
-    enqueue: impl FnOnce() -> Result<String, FailureCode>,
-) -> Result<(String, mpsc::OwnedPermit<Inspection>), FailureCode> {
+    enqueue: impl FnOnce() -> Result<String, E>,
+) -> Result<(String, mpsc::OwnedPermit<Inspection>), E> {
     let permit = reserve_inspection(sender)?;
     let reference = enqueue()?;
     Ok((reference, permit))
@@ -8229,13 +8283,15 @@ mod stop_retry_tests {
         handle: &WorkerHandle,
         invocation: ValidatedInvocation,
     ) -> Result<String, FailureCode> {
-        handle.enqueue(
-            invocation,
-            AssistanceTool::Context,
-            serde_json::json!({"path":"main.rs"}),
-            "stop-retry",
-            None,
-        )
+        handle
+            .enqueue(
+                invocation,
+                AssistanceTool::Context,
+                serde_json::json!({"path":"main.rs"}),
+                "stop-retry",
+                None,
+            )
+            .map_err(|failure| failure.code)
     }
 
     /// A full ledger evicts a dead binding's settled facts for a new binding instead of
