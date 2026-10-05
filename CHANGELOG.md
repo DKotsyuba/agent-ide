@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- `ide.edit` on a file the project check cannot analyse (a Python package with no environment,
+  a check that could not run) now answers the language server's diagnostics for the exact
+  post-edit source as `current_reported`, labelled as language-server diagnostics with the
+  check's reason, or `not_analysed (<reason>)` when the server has none — it used to drop them
+  and answer `unknown`. Language-server diagnostics in edit replies and `ide.context` carry
+  `path:line:col severity [code]`.
+
 ## 0.10.0 — 2026-10-05
 
 ### Added

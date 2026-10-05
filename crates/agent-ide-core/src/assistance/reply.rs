@@ -318,8 +318,10 @@ impl EditDiagnostics {
     ///
     /// Current semantic context, matching source/generation/version identities, and an explicit
     /// clean or reported readiness are all required. Unavailable, stale, lexical, unversioned, or
-    /// unready snapshots return [`Self::Unknown`].
+    /// unready snapshots return [`Self::Unknown`]. Messages name `path`, the worktree-relative
+    /// edited file (see [`diagnostic_line`]).
     pub(crate) fn from_snapshot(
+        path: &str,
         context: &crate::intelligence::context::ContextResult,
         diagnostics: &crate::intelligence::session::DiagnosticSnapshot,
     ) -> Self {
@@ -345,34 +347,11 @@ impl EditDiagnostics {
                     .diagnostics
                     .iter()
                     .take(8)
-                    .map(|diagnostic| {
-                        let code = diagnostic
-                            .code
-                            .as_ref()
-                            .map(|code| match code {
-                                async_lsp::lsp_types::NumberOrString::Number(code) => {
-                                    format!("[{code}] ")
-                                }
-                                async_lsp::lsp_types::NumberOrString::String(code) => {
-                                    format!("[{code}] ")
-                                }
-                            })
-                            .unwrap_or_default();
-                        bounded_utf8_prefix(
-                            &format!(
-                                "{}:{}:{} {code}{}",
-                                context.uri.path(),
-                                diagnostic.range.start.line + 1,
-                                diagnostic.range.start.character + 1,
-                                diagnostic.message
-                            ),
-                            256,
-                        )
-                    })
+                    .map(|diagnostic| diagnostic_line(path, diagnostic))
                     .collect::<Vec<String>>();
                 Self::CurrentReported {
                     delta: format!(
-                        "Provider reported {} diagnostics for the exact post-edit source generation.",
+                        "language server reported {} diagnostics for the exact post-edit source generation",
                         diagnostics.diagnostics.len()
                     ),
                     truncated: diagnostics.truncated
@@ -407,6 +386,34 @@ impl EditDiagnostics {
             }
         }
     }
+}
+
+/// Renders one language-server diagnostic as `path:line:col severity [code] message` (1-based
+/// position, severity omitted when the server sent none), bounded to 256 UTF-8 bytes.
+pub(crate) fn diagnostic_line(path: &str, diagnostic: &async_lsp::lsp_types::Diagnostic) -> String {
+    use async_lsp::lsp_types::{DiagnosticSeverity, NumberOrString};
+
+    let severity = match diagnostic.severity {
+        Some(DiagnosticSeverity::ERROR) => "error ",
+        Some(DiagnosticSeverity::WARNING) => "warning ",
+        Some(DiagnosticSeverity::INFORMATION) => "information ",
+        Some(DiagnosticSeverity::HINT) => "hint ",
+        _ => "",
+    };
+    let code = match &diagnostic.code {
+        Some(NumberOrString::Number(code)) => format!("[{code}] "),
+        Some(NumberOrString::String(code)) => format!("[{code}] "),
+        None => String::new(),
+    };
+    bounded_utf8_prefix(
+        &format!(
+            "{path}:{}:{} {severity}{code}{}",
+            diagnostic.range.start.line + 1,
+            diagnostic.range.start.character + 1,
+            diagnostic.message
+        ),
+        256,
+    )
 }
 
 /// Returns the largest UTF-8 prefix of `value` that fits `limit` bytes.
@@ -782,6 +789,30 @@ fn host_binding_causes_map_the_guard_refusals() {
             expected
         );
     }
+}
+
+/// A language-server diagnostic renders with its 1-based location, severity and code.
+#[test]
+fn diagnostic_line_names_location_severity_and_code() {
+    use async_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
+
+    let mut diagnostic = Diagnostic {
+        range: Range::new(Position::new(1, 11), Position::new(1, 23)),
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String("reportReturnType".into())),
+        message: "bad".into(),
+        ..Diagnostic::default()
+    };
+    assert_eq!(
+        diagnostic_line("pkg/mod.py", &diagnostic),
+        "pkg/mod.py:2:12 error [reportReturnType] bad"
+    );
+    diagnostic.severity = None;
+    diagnostic.code = None;
+    assert_eq!(
+        diagnostic_line("pkg/mod.py", &diagnostic),
+        "pkg/mod.py:2:12 bad"
+    );
 }
 
 /// A multibyte diagnostic message truncated by characters could exceed the closed byte bound,

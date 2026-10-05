@@ -3836,7 +3836,10 @@ impl<'a> Worker<'a> {
                     .iter()
                     .take(8)
                     .map(|diagnostic| {
-                        super::reply::bounded_utf8_prefix(&diagnostic.message, 256)
+                        super::reply::diagnostic_line(
+                            &observed.path().to_string_lossy(),
+                            diagnostic,
+                        )
                     })
                     .collect::<Vec<_>>();
                 let feedback = feedback
@@ -4272,6 +4275,7 @@ impl<'a> Worker<'a> {
                         job.deadline = original;
                         let diagnostics = match result {
                             Ok(Some(provider)) => EditDiagnostics::from_snapshot(
+                                request.path.trim_start_matches("./"),
                                 &provider.context,
                                 &provider.diagnostics,
                             ),
@@ -4453,8 +4457,13 @@ impl<'a> Worker<'a> {
         let snapshot = feed.latest(worktree).into_iter().find(|snapshot| {
             snapshot.language == *language && snapshot.input_generation >= *generation
         })?;
+        let not_analysed = || {
+            language
+                .checks()
+                .and_then(|checks| checks.not_analysed(worktree, std::path::Path::new(wanted)))
+        };
         if !matches!(snapshot.state, CheckState::Ready | CheckState::Partial) {
-            return Some(EditDiagnostics::Unknown {});
+            return Some(unchecked_file_diagnostics(fallback, not_analysed()));
         }
         let mut preexisting = preexisting.clone();
         let mut errors = 0u32;
@@ -4511,14 +4520,9 @@ impl<'a> Worker<'a> {
             // file's problems may be among the dropped ones, so it is neither clean nor reported.
             if truncated {
                 EditDiagnostics::Unknown {}
-            } else if let Some(reason) = language
-                .checks()
-                .and_then(|checks| checks.not_analysed(worktree, std::path::Path::new(wanted)))
-            {
+            } else if let Some(reason) = not_analysed() {
                 // Naming no problem in a file the check never compiled proves nothing about it.
-                EditDiagnostics::NotAnalysed {
-                    reason: reason.to_owned(),
-                }
+                unchecked_file_diagnostics(fallback, Some(reason))
             } else {
                 EditDiagnostics::CurrentClean {}
             }
@@ -5325,11 +5329,79 @@ fn take_preexisting_problem(identity: &str, counts: &mut BTreeMap<String, u32>) 
     }
 }
 
+/// Answers an edit whose project check did not analyse the file (the check could not run, or it
+/// skipped the file for the language's `reason`): the language server's exact post-edit report
+/// stands, labelled as such; otherwise `not_analysed` with the reason, or `unknown` without one.
+fn unchecked_file_diagnostics(fallback: &EditDiagnostics, reason: Option<&str>) -> EditDiagnostics {
+    match (fallback, reason) {
+        (
+            EditDiagnostics::CurrentReported {
+                messages,
+                delta,
+                truncated,
+            },
+            reason,
+        ) => EditDiagnostics::CurrentReported {
+            messages: messages.clone(),
+            delta: match reason {
+                Some(reason) => {
+                    format!("{delta}; project check did not analyse this file: {reason}")
+                }
+                None => format!("{delta}; project check unavailable"),
+            },
+            truncated: *truncated,
+        },
+        (_, Some(reason)) => EditDiagnostics::NotAnalysed {
+            reason: reason.to_owned(),
+        },
+        _ => EditDiagnostics::Unknown {},
+    }
+}
+
 /// Checks edit diagnostic attribution against the file's prior project-check snapshot.
 #[cfg(test)]
 mod edit_diagnostics_tests {
     use super::*;
     use crate::checks::{Problem, Severity};
+
+    /// An unanalysed file keeps the language server's report, never `unknown`.
+    #[test]
+    fn unchecked_file_keeps_the_language_server_report() {
+        let reported = EditDiagnostics::CurrentReported {
+            messages: vec!["pkg/mod.py:2:12 error bad".into()],
+            delta: "language server reported 1 diagnostics".into(),
+            truncated: false,
+        };
+        let EditDiagnostics::CurrentReported { delta, .. } =
+            unchecked_file_diagnostics(&reported, Some("no environment"))
+        else {
+            panic!("the report stands");
+        };
+        assert!(
+            delta.ends_with("did not analyse this file: no environment"),
+            "{delta}"
+        );
+        assert!(matches!(
+            unchecked_file_diagnostics(&reported, None),
+            EditDiagnostics::CurrentReported { delta, .. } if delta.ends_with("project check unavailable")
+        ));
+        assert_eq!(
+            unchecked_file_diagnostics(&EditDiagnostics::Unknown {}, Some("no environment")),
+            EditDiagnostics::NotAnalysed {
+                reason: "no environment".into()
+            }
+        );
+        assert_eq!(
+            unchecked_file_diagnostics(&EditDiagnostics::CurrentClean {}, Some("no environment")),
+            EditDiagnostics::NotAnalysed {
+                reason: "no environment".into()
+            }
+        );
+        assert_eq!(
+            unchecked_file_diagnostics(&EditDiagnostics::CurrentClean {}, None),
+            EditDiagnostics::Unknown {}
+        );
+    }
 
     /// Keeps shifted old errors pre-existing after inserted or deleted lines.
     #[test]
