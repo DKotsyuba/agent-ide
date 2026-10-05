@@ -13,7 +13,7 @@
 
 ### Changed
 
-- The check caches' budget is 10 GiB (was 20 GiB): least recently used worktrees past it are
+- The check caches' budget is 15 GiB (was 20 GiB): least recently used worktrees past it are
   removed and their next project check builds again from cold.
 
 ## 0.10.1 — 2026-10-05

@@ -26,7 +26,7 @@ of what the volume gets back.
 
 | | Removed when | Default |
 |---|---|---|
-| A checks | 1. **gone**: the marker's worktree path no longer exists. 2. **idle**: last use older than the idle age. 3. **budget**: total of all A entries above the budget — least recently used first until the total fits | idle 7 days, budget 10 GiB |
+| A checks | 1. **gone**: the marker's worktree path no longer exists. 2. **idle**: last use older than the idle age. 3. **budget**: total of all A entries above the budget — least recently used first until the total fits | idle 7 days, budget 15 GiB |
 | B telemetry | same three rules; a directory without a marker (written before this version) is only removed by idle or budget | idle 30 days, budget 1 GiB |
 | C releases | a completed release (`COMPLETE` present, directory named `X.Y.Z`) that is **not** the `current` target, **not** one of the 3 newest versions, **not** installed within the last 14 days, and **not** containing the executable of any live process | keep current + newest 3 + 14 days + live |
 

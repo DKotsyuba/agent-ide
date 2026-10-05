@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// Allocated bytes the check caches may keep before least-recently-used eviction.
-pub const CHECKS_BUDGET_BYTES: u64 = 10 << 30;
+pub const CHECKS_BUDGET_BYTES: u64 = 15 << 30;
 /// Last-use age after which a check cache is removed.
 pub const CHECKS_IDLE: Duration = Duration::from_secs(7 * 86_400);
 /// Allocated bytes the telemetry stores may keep before least-recently-used eviction.
