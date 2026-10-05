@@ -51,7 +51,7 @@ async fn composition_fences_scope_and_exact_comparison() {
     assert_eq!(result.state(), DiffResultState::Unavailable);
 }
 
-/// Byte and count budgets preserve raw paths and exact unsplit hunks plus owner-scoped cursors.
+/// Count/byte targets retain explicit raw paths, untracked additions and progressable cursors.
 #[tokio::test]
 async fn bounded_selection_keeps_explicit_raw_paths() {
     let fixture = GitFixture::new();
@@ -68,7 +68,19 @@ async fn bounded_selection_keeps_explicit_raw_paths() {
     );
     assert_eq!(full.state(), DiffResultState::Ready);
     assert_eq!(full.freshness(), DiffFreshness::Current);
-    assert_eq!(full.selected_hunks().len(), 3);
+    assert_eq!(full.counts().tracked(), 3);
+    assert_eq!(
+        full.untracked().len(),
+        1 + usize::from(fixture.non_utf8_supported)
+    );
+    assert_eq!(full.selected_hunks().len(), 3 + full.untracked().len());
+    assert_eq!(full.files(), full.selected_hunks().len());
+    assert!(
+        full.selected_hunks()
+            .iter()
+            .any(|hunk| hunk.path().as_os_str().as_encoded_bytes()
+                == b"untracked space\n-leading.txt")
+    );
     assert!(
         full.selected_hunks()
             .iter()
@@ -94,10 +106,8 @@ async fn bounded_selection_keeps_explicit_raw_paths() {
         assert_eq!(hunk, &full.selected_hunks()[hunk.index()]);
     }
 
-    // A byte budget too small for any real hunk (including the zero budget clamped to the
-    // minimum progressable request) can never be satisfied by a later page either, so every
-    // hunk is honestly omitted with no cursor rather than parked behind one that can never
-    // resolve.
+    // Byte targets never discard an oversized first hunk: the transport may split it into
+    // line parts. Even a clamped zero request selects that hunk and keeps later hunks reachable.
     for budget in [
         DiffSelectionBudget::bounded(32, 1),
         DiffSelectionBudget::bounded(0, 0),
@@ -105,16 +115,17 @@ async fn bounded_selection_keeps_explicit_raw_paths() {
         let starved = compose_diff(&scope, &comparison, snapshot.clone(), budget);
         assert_eq!(starved.state(), DiffResultState::Incomplete);
         assert_eq!(starved.coverage(), DiffCoverage::Partial);
-        assert_eq!(starved.overflow_hunks(), 3);
+        assert_eq!(starved.selected_hunks().len(), 1);
+        assert_eq!(starved.selected_hunks()[0], full.selected_hunks()[0]);
+        assert_eq!(starved.overflow_hunks(), full.selected_hunks().len() - 1);
         assert!(starved.overflow_bytes() > 0);
-        assert!(starved.selected_hunks().is_empty());
-        assert!(starved.detail_cursor().is_none());
+        assert_eq!(starved.detail_cursor().unwrap().next_hunk(), 1);
     }
 }
 
-/// Empty tracked comparisons remain distinct from untracked paths and descriptive baseline coverage.
+/// Empty tracked comparisons expose untracked addition bytes without inventing complete baseline coverage.
 #[tokio::test]
-async fn empty_snapshot_never_hides_untracked_or_invents_complete_baseline() {
+async fn empty_tracked_snapshot_reviews_untracked_without_inventing_complete_baseline() {
     let fixture = GitFixture::new();
     fixture.git(["add", "."]);
     fixture.git(["commit", "--quiet", "-m", "clean baseline"]);
@@ -131,7 +142,26 @@ async fn empty_snapshot_never_hides_untracked_or_invents_complete_baseline() {
         DiffSelectionBudget::default(),
     );
     assert_eq!(result.state(), DiffResultState::Ready);
-    assert!(result.selected_hunks().is_empty());
+    assert_eq!(result.counts().tracked(), 0);
+    assert!(result.tracked().is_empty());
+    assert_eq!(result.files(), 1);
+    assert_eq!(result.additions(), 1);
+    assert_eq!(result.deletions(), 0);
+    assert_eq!(result.selected_hunks().len(), 1);
+    assert_eq!(
+        result.selected_hunks()[0]
+            .path()
+            .as_os_str()
+            .as_encoded_bytes(),
+        b"only-untracked"
+    );
+    assert!(
+        result.selected_hunks()[0]
+            .patch()
+            .windows(b"+untracked".len())
+            .any(|bytes| bytes == b"+untracked")
+    );
+    assert!(result.detail_cursor().is_none());
     assert_eq!(result.untracked().len(), 1);
     assert_eq!(
         result.provenance().baseline_coverage(),
@@ -274,24 +304,49 @@ async fn cursor_expansion_rejects_reference_reuse_across_generations_and_modes()
         DiffSelectionBudget::bounded(1, 65536),
     );
     assert_eq!(expanded.selected_hunks()[0].index(), 1);
-    let final_page = expand_diff(
+    let third_page = expand_diff(
         &scope,
         &comparison,
         snapshot.clone(),
         expanded.detail_cursor().unwrap(),
         DiffSelectionBudget::bounded(1, 65536),
     );
-    assert_eq!(final_page.selected_hunks()[0].index(), 2);
-    assert!(final_page.detail_cursor().is_none());
+    assert_eq!(third_page.selected_hunks()[0].index(), 2);
     let mut indexes = first
         .selected_hunks()
         .iter()
         .chain(expanded.selected_hunks())
-        .chain(final_page.selected_hunks())
+        .chain(third_page.selected_hunks())
         .map(|hunk| hunk.index())
         .collect::<Vec<_>>();
-    indexes.sort_unstable();
-    assert_eq!(indexes, vec![0, 1, 2]);
+    let expected = compose_diff(
+        &scope,
+        &comparison,
+        snapshot.clone(),
+        DiffSelectionBudget::default(),
+    );
+    let mut page = third_page;
+    while let Some(next) = page.detail_cursor().cloned() {
+        assert!(
+            indexes.len() < expected.selected_hunks().len(),
+            "pagination must terminate"
+        );
+        page = expand_diff(
+            &scope,
+            &comparison,
+            snapshot.clone(),
+            &next,
+            DiffSelectionBudget::bounded(1, 65536),
+        );
+        assert_eq!(page.selected_hunks().len(), 1);
+        assert_eq!(page.selected_hunks()[0].index(), indexes.len());
+        indexes.push(page.selected_hunks()[0].index());
+    }
+    assert_eq!(
+        indexes,
+        (0..expected.selected_hunks().len()).collect::<Vec<_>>()
+    );
+    assert!(page.detail_cursor().is_none());
     fixture.write(b"unstaged.txt", b"replacement working change\n");
     let changed = collect_snapshot(
         &authority,
@@ -361,10 +416,10 @@ fn zero_budgets_are_clamped_to_a_minimum_progressable_request() {
     assert_eq!(budget.max_bytes, 1);
 }
 
-/// A hunk that can never fit the byte budget is honestly skipped rather than repeated forever,
-/// and repeated expansion of a real deferred page always strictly advances its cursor or ends.
+/// Oversized hunks remain available for line paging, and each expansion changes its cursor or ends.
+/// Joining every delivered line part reconstructs all raw bytes and paths exactly once.
 #[tokio::test]
-async fn oversized_hunk_is_skipped_and_cursor_advances_or_terminates() {
+async fn oversized_hunk_remains_pageable_and_cursor_terminates() {
     use agent_ide::changes::expand_diff;
     let fixture = GitFixture::new();
     let snapshot = collect(&fixture, DiffMode::Head, &mut Runner::default())
@@ -378,39 +433,46 @@ async fn oversized_hunk_is_skipped_and_cursor_advances_or_terminates() {
         snapshot.clone(),
         DiffSelectionBudget::default(),
     );
-    let largest = full
+    let budget = DiffSelectionBudget::bounded(1, 1);
+    let mut current = compose_diff(&scope, &comparison, snapshot.clone(), budget);
+    let mut delivered = vec![Vec::new(); full.selected_hunks().len()];
+    let mut previous = None;
+    let max_pages: usize = full
         .selected_hunks()
         .iter()
-        .map(|hunk| hunk.patch().len())
-        .max()
-        .expect("fixture has hunks");
-    assert!(largest > 1, "fixture hunk must exceed a one-byte budget");
-    // Budget deliberately too small for the largest hunk; it can never be selected under this
-    // budget on any page, so it must be permanently skipped instead of stalling pagination.
-    let budget = DiffSelectionBudget::bounded(32, largest - 1);
-
-    let mut current = compose_diff(&scope, &comparison, snapshot.clone(), budget);
-    assert!(
-        current
-            .selected_hunks()
+        .map(|hunk| hunk.patch().split_inclusive(|byte| *byte == b'\n').count())
+        .sum();
+    let mut pages = 0;
+    loop {
+        assert_eq!(current.selected_hunks().len(), 1);
+        let hunk = &current.selected_hunks()[0];
+        assert_eq!(hunk.path(), full.selected_hunks()[hunk.index()].path());
+        assert!(!hunk.patch().is_empty());
+        // Use the same public line-part operation as the transport fitter, one line at a time.
+        let end = hunk
+            .patch()
             .iter()
-            .all(|hunk| hunk.patch().len() < largest)
-    );
-    let mut previous_next_hunk = None;
-    let mut hops = 0;
-    while let Some(cursor) = current.detail_cursor().cloned() {
-        if let Some(previous) = previous_next_hunk {
-            assert!(
-                cursor.next_hunk() > previous,
-                "expand_diff must never return the same cursor twice"
-            );
+            .position(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or(hunk.patch().len());
+        if end < hunk.patch().len() {
+            current = current.split_first_hunk(end);
         }
-        previous_next_hunk = Some(cursor.next_hunk());
+        let part = &current.selected_hunks()[0];
+        delivered[part.index()].extend_from_slice(part.patch());
+        pages += 1;
+        assert!(pages <= max_pages, "every page must deliver a new line");
+        let Some(cursor) = current.detail_cursor().cloned() else {
+            break;
+        };
+        if let Some(previous) = &previous {
+            assert_ne!(&cursor, previous, "a line-part cursor must advance");
+        }
+        previous = Some(cursor.clone());
         current = expand_diff(&scope, &comparison, snapshot.clone(), &cursor, budget);
-        hops += 1;
-        assert!(
-            hops <= 8,
-            "pagination must terminate well within the fixture's hunk count"
-        );
+    }
+    assert!(current.detail_cursor().is_none());
+    for (bytes, hunk) in delivered.iter().zip(full.selected_hunks()) {
+        assert_eq!(bytes, hunk.patch());
     }
 }
