@@ -12904,6 +12904,109 @@ async fn configured_product_nested_python_packages_are_listed_checked_and_edited
     daemon.wait().await.unwrap();
 }
 
+/// A nested package with no environment: the project check cannot run for it, so a `.py` edit
+/// that introduces a type error answers the language server's diagnostics for the exact
+/// post-edit source (located, labelled), never `unknown`; `ide.context` locates them too.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
+async fn configured_product_edit_in_a_package_without_environment_reports_server_diagnostics() {
+    let fixture = ProductFixture::new(json!([accepted_pyright_provider("pyright-noenv-cache")]));
+    enable_real_pyright_checks(&fixture);
+    let package = fixture.root.join("libs/contracts");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        package.join("pyproject.toml"),
+        "[project]\nname = \"contracts\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("mod.py"),
+        "def value() -> int:\n    return 8\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "libs"]);
+    fixture.git(&["commit", "--quiet", "-m", "package without environment"]);
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "pyright-noenv").await;
+    let start = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"pyright-noenv-start"}),
+        )
+        .await;
+    let start = actor.settle(&fixture, start).await;
+    assert!(
+        start["text"]
+            .as_str()
+            .unwrap()
+            .contains("environment: python:libs/contracts missing"),
+        "{start}"
+    );
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"libs/contracts/mod.py","lines":"2-2"}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let edit = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":"pyright-noenv-edit",
+                "path":"libs/contracts/mod.py",
+                "source_ref":read["detail_ref"],
+                "lines":"2-2",
+                "content":"    return \"not an int\""
+            }),
+        )
+        .await;
+    let edit = actor.settle(&fixture, edit).await;
+    assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
+    assert_eq!(
+        edit["diagnostics"]["state"], "current_reported",
+        "the language server's result stands when the check cannot run: {edit}"
+    );
+    let messages = edit["diagnostics"]["messages"].as_array().unwrap();
+    assert!(
+        messages.iter().any(|message| {
+            let message = message.as_str().unwrap();
+            message.starts_with("libs/contracts/mod.py:2:12 error ")
+                && message.contains("not assignable")
+        }),
+        "the type error carries path:line:col severity: {edit}"
+    );
+    let delta = edit["diagnostics"]["delta"].as_str().unwrap();
+    assert!(
+        delta.contains("language server") && delta.contains("no environment"),
+        "labelled as language-server diagnostics with the check's reason: {edit}"
+    );
+    let context = actor
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"path":"libs/contracts/mod.py"}),
+        )
+        .await;
+    let context = actor.settle(&fixture, context).await;
+    assert!(
+        context["text"]
+            .as_str()
+            .unwrap()
+            .contains("libs/contracts/mod.py:2:12 error "),
+        "context diagnostics carry their location: {context}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A suffixed environment directory (`.venv-py314`) beside the manifest is discovered, named on
 /// the card, and used by the session: a stub package import resolves with no diagnostics.
 #[tokio::test]
