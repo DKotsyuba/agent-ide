@@ -1331,16 +1331,19 @@ impl Inner {
         };
         // The source worktree's lease keeps a sweep from claiming it mid-copy; `cp` is not killed
         // when this future is dropped, so an unsettled lease is kept for the process lifetime.
-        let source_lease = crate::retention::SettledLease::new(
-            source_dir
-                .parent()
-                .and_then(Path::parent)
-                .and_then(Path::file_name)
-                .and_then(|key| self.lease_root().map(|root| (root, key)))
-                .and_then(|(root, key)| {
-                    crate::retention::Lease::acquire_key(root, &key.to_string_lossy())
-                }),
-        );
+        // Without the source's lease the copy could read a cache being claimed: build cold.
+        let Some(source_lease) = source_dir
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .and_then(|key| self.lease_root().map(|root| (root, key)))
+            .and_then(|(root, key)| {
+                crate::retention::Lease::acquire_key(root, &key.to_string_lossy())
+            })
+        else {
+            return CacheClone::SkippedNoSource;
+        };
+        let source_lease = crate::retention::SettledLease::new(Some(source_lease));
         let source_target = source_dir.join(subdirectory);
         if !source_target.exists() {
             source_lease.settled();

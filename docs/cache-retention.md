@@ -30,8 +30,9 @@ of what the volume gets back.
 | B telemetry | same three rules; a directory without a marker (written before this version) is only removed by idle or budget | idle 30 days, budget 1 GiB |
 | C releases | a completed release (`COMPLETE` present, directory named `X.Y.Z`) that is **not** the `current` target, **not** one of the 3 newest versions, **not** installed within the last 14 days, and **not** containing the executable of any live process | keep current + newest 3 + 14 days + live |
 
-"Last use" of an A or B entry is the newest modification time among its lock file and every entry
-in its tree. mtime only orders entries for idle and LRU; it is never the in-use proof. The idle
+"Last use" of an A or B entry is the newest modification time among its *stamped* lease files
+(see safety rule 1) and every entry in its tree; an empty lease file, created by a sweeper's or
+`cache status`'s lock probe, is not a use. mtime only orders entries for idle and LRU; it is never the in-use proof. The idle
 and gone rules run first over every entry, then the budget rule over what is left, so a gone
 entry is never kept while a recent one is evicted. The budget bounds what can be reclaimed: bytes
 held by in-use caches are protected even when they alone exceed it (`cache status` reports them).
@@ -50,12 +51,16 @@ daemons run, and a failed or skipped sweep is retried an hour later. Errors neve
 
 1. **Worktree lease.** `~/.agent-ide/locks/<worktree16>.lock` (`worktree16` = the 16-hex
    BLAKE3 prefix of the canonical worktree path as text — the same key as the A directory
-   name) is a stable empty file that is never unlinked. A daemon holds a *shared* `flock` on it:
+   name) is a stable small file that is never unlinked; the first lease taken on it stamps it
+   with `leased`, so a file that is still empty was only created by a lock probe and its mtime
+   never counts as use, neither for last use nor for the claim's "used since the scan" check.
+   A daemon holds a *shared* `flock` on it:
    - for every activation, from before the durable activation is committed until the binding is
      released after a committed revoke (`ide.stop`) or the daemon exits — a paused activation
      keeps holding it;
    - for every project check, from before the cache directory is prepared until the checker
-     returns; during the copy-on-write clone it also holds the sibling source's lease;
+     returns; during the copy-on-write clone it also holds the sibling source's lease, and
+     skips the clone (the check builds cold) when that lease cannot be taken;
    - for every `ide.test` run, from before spawn until the child is settled, independent of
      `ide.stop`.
 

@@ -459,10 +459,16 @@ fn symlinked_cache_roots_and_entries_are_never_traversed() {
     let home = scratch("symlink");
     let outside = scratch("symlink-outside");
     let victim = check_cache(&outside, &outside.join("deleted"));
+    let trash_victim = outside.join("checks/.trash/leftover");
+    fs::create_dir_all(&trash_victim).unwrap();
     std::os::unix::fs::symlink(outside.join("checks"), home.join("checks")).unwrap();
     let report = sweep_with(&home, true, SystemTime::now(), &nobody);
     assert!(report.verdicts.is_empty());
     assert!(victim.exists());
+    assert!(
+        trash_victim.exists(),
+        "trash below a symlinked root is never emptied"
+    );
 
     let home = scratch("symlink-entry");
     fs::create_dir_all(home.join("checks").join(REPO)).unwrap();

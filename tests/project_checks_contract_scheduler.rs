@@ -601,6 +601,53 @@ async fn scheduler_clones_rust_target_from_sibling_worktree_of_the_same_reposito
     }
 }
 
+/// Without the sibling source's retention lease the clone is skipped and the check builds cold.
+#[tokio::test(start_paused = true)]
+async fn scheduler_skips_the_sibling_clone_when_the_source_lease_is_unavailable() {
+    agent_ide::languages::install();
+    let checker = RecordingChecker::new(agent_ide::languages::RUST);
+    let cache_root = scratch_dir("clone-no-lease-cache");
+    let worktree_a = scratch_worktree("clone-no-lease-a", agent_ide::languages::RUST);
+    let worktree_b = scratch_worktree("clone-no-lease-b", agent_ide::languages::RUST);
+    let scheduler = Scheduler::new(
+        vec![Arc::new(checker.clone())],
+        Duration::from_millis(10),
+        2,
+        cache_root.clone(),
+    );
+    scheduler.trigger("no-lease-repo", &worktree_a);
+    advance(Duration::from_millis(30)).await;
+    assert_eq!(checker.calls().len(), 1);
+    let target_a = checker.calls()[0].cache_dir.join("target");
+    std::fs::create_dir_all(&target_a).unwrap();
+    std::fs::write(target_a.join("marker.txt"), b"built").unwrap();
+
+    // A directory where the source's lease file belongs cannot be opened as a lock.
+    let key = agent_ide::retention::worktree_key(&std::fs::canonicalize(&worktree_a).unwrap());
+    let lease = cache_root
+        .parent()
+        .unwrap()
+        .join("locks")
+        .join(format!("{key}.lock"));
+    std::fs::remove_file(&lease).unwrap();
+    std::fs::create_dir(&lease).unwrap();
+
+    scheduler.trigger("no-lease-repo", &worktree_b);
+    advance(Duration::from_millis(30)).await;
+    assert_eq!(checker.calls().len(), 2, "the check still runs, cold");
+    assert_eq!(
+        scheduler.cache_clone_outcome(&worktree_b, agent_ide::languages::RUST),
+        CacheClone::SkippedNoSource
+    );
+    assert!(
+        !checker.calls()[1]
+            .cache_dir
+            .join("target/marker.txt")
+            .exists()
+    );
+    std::fs::remove_dir(&lease).unwrap();
+}
+
 /// Persistent caches and sibling Rust clones are isolated by the effective deny set.
 #[tokio::test(start_paused = true)]
 async fn scheduler_partitions_caches_and_clones_by_policy() {
