@@ -91,8 +91,12 @@ pub struct RunResult {
     pub budget: Duration,
     /// Detail reference retained under the binding that started the process.
     pub detail_ref: String,
-    /// Original argv shown for manual reruns.
+    /// Argv shown for manual reruns: the original argv, behind `env NAME=VALUE …` when the run set
+    /// environment overrides.
     pub command: Vec<String>,
+    /// Worktree-relative directory the run used when it was not the worktree root, shown before the
+    /// rerun command so the line reproduces the run.
+    pub rerun_dir: Option<String>,
     /// Environment chosen at launch, shown only when multiple candidates or a selection exist.
     pub environment_label: Option<String>,
 }
@@ -246,6 +250,20 @@ impl TestRuns {
                 };
             }
         };
+        // The rerun line reproduces the run: its directory and environment overrides included.
+        let rerun_dir = cwd
+            .strip_prefix(&root)
+            .ok()
+            .filter(|relative| !relative.as_os_str().is_empty())
+            .map(|relative| relative.display().to_string());
+        let rerun_command: Vec<String> = if env.is_empty() {
+            argv.clone()
+        } else {
+            std::iter::once("env".to_owned())
+                .chain(env.iter().map(|(name, value)| format!("{name}={value}")))
+                .chain(argv.iter().cloned())
+                .collect()
+        };
         state.next_id = state.next_id.saturating_add(1);
         let id = state.next_id;
         let started = tokio::time::Instant::now();
@@ -256,7 +274,7 @@ impl TestRuns {
                 owner: owner.fingerprint(),
                 channel: owner.channel_identity().fingerprint(),
                 detail_ref: detail_ref.clone(),
-                command: argv.clone(),
+                command: rerun_command.clone(),
                 explicit_command: false,
                 started,
                 result: None,
@@ -285,7 +303,8 @@ impl TestRuns {
             let mut result = run_child(language, budget, child).await;
             lease.settled();
             result.detail_ref = detail_ref;
-            result.command = argv;
+            result.command = rerun_command;
+            result.rerun_dir = rerun_dir;
             result.environment_label = environment_label;
             if let Ok(mut state) = registry.lock()
                 && let Some(job) = state.jobs.get_mut(&id)
@@ -856,6 +875,7 @@ async fn run_child(
         budget,
         detail_ref: String::new(),
         command: Vec::new(),
+        rerun_dir: None,
         environment_label: None,
     }
 }
@@ -876,6 +896,7 @@ fn failed_run(budget: Duration, output: String) -> RunResult {
         budget,
         detail_ref: String::new(),
         command: Vec::new(),
+        rerun_dir: None,
         environment_label: None,
     }
 }
@@ -1038,6 +1059,45 @@ mod runner_tests {
         let result = run_child(crate::lang::testing::ALPHA, Duration::from_secs(2), child).await;
         assert!(result.output.starts_with("from-env\n"), "{}", result.output);
         assert_eq!((result.report.passed, result.report.failed), (1, 0));
+    }
+
+    /// A run with a working directory and environment overrides keeps both for its rerun line.
+    #[tokio::test]
+    async fn rerun_names_the_working_directory_and_environment() {
+        let runs = TestRuns::default();
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("agent-ide-rerun-{}", std::process::id()));
+        let package = root.join("pkg");
+        std::fs::create_dir_all(&package).unwrap();
+        let owner = BindingRef::fixture("rerun-actor", "rerun-channel", 1);
+        let started = runs.start_with_options(
+            root.clone(),
+            vec!["/bin/echo".into(), "done".into()],
+            &owner,
+            TestCommandOptions {
+                cwd: package,
+                env: vec![("RUN_MARKER".into(), "x".into())],
+                language: crate::lang::testing::ALPHA,
+                command_language: None,
+                budget: Duration::from_secs(10),
+                detail_ref: "rerun-detail".into(),
+            },
+        );
+        assert!(matches!(started, StartResult::Started(1)));
+        let mut result = None;
+        for _ in 0..100 {
+            result = runs.get(&root, 1, &owner).and_then(|status| status.result);
+            if result.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let result = result.unwrap();
+        assert_eq!(result.rerun_dir.as_deref(), Some("pkg"));
+        assert_eq!(result.command, ["env", "RUN_MARKER=x", "/bin/echo", "done"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Kills and reaps a sleeping process group when the budget expires.

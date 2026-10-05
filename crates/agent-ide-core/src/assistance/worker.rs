@@ -5900,6 +5900,21 @@ fn missing_runner_text(program: &str, error: &str, not_found: bool, root: &Path)
     )
 }
 
+/// Failed tests listed in a run's reply; the rest are counted and live in the full output.
+const MAX_LISTED_FAILURES: usize = 16;
+
+/// The rerun line's command: `cd <dir> && ` first when the run used a working directory.
+fn rerun_text(result: &super::tests::RunResult) -> String {
+    let command = display_argv(&result.command);
+    match &result.rerun_dir {
+        Some(dir) => format!(
+            "cd {} && {command}",
+            display_argv(std::slice::from_ref(dir))
+        ),
+        None => command,
+    }
+}
+
 /// Renders the bounded parsed test result and actionable rerun/detail references.
 fn test_result_text(
     id: u64,
@@ -5913,7 +5928,7 @@ fn test_result_text(
     }
     let report = &result.report;
     let mut text = super::tests::result_line(id, result);
-    for failure in report.failures.iter().take(8) {
+    for failure in report.failures.iter().take(MAX_LISTED_FAILURES) {
         text.push_str(&format!("\n  FAIL {}", test_text_line(&failure.name, 160)));
         if let Some((path, line)) = &failure.location {
             text.push_str(&format!(
@@ -5929,7 +5944,13 @@ fn test_result_text(
             ));
         }
     }
-    text.push_str(&format!("\n  rerun: {}", display_argv(&result.command)));
+    if report.failures.len() > MAX_LISTED_FAILURES {
+        text.push_str(&format!(
+            "\n  (+{} more failed tests in the full output)",
+            report.failures.len() - MAX_LISTED_FAILURES
+        ));
+    }
+    text.push_str(&format!("\n  rerun: {}", rerun_text(result)));
     if owns_detail {
         text.push_str(&format!(
             "\n  full output: ide.inspect {}",
@@ -5956,7 +5977,7 @@ fn command_result_text(id: u64, result: &super::tests::RunResult, owns_detail: b
         text.push_str("\n  output (tail):\n");
         text.push_str(&tail);
     }
-    text.push_str(&format!("\n  rerun: {}", display_argv(&result.command)));
+    text.push_str(&format!("\n  rerun: {}", rerun_text(result)));
     if owns_detail && (tail.len() < result.output.len() || result.output_paged) {
         text.push_str(&format!(
             "\n  full output: ide.inspect {}",
@@ -5987,6 +6008,7 @@ mod tool_reply_fix_tests {
             budget: Duration::from_secs(30),
             detail_ref: "test-detail".into(),
             command: vec!["echo".into(), "hello".into()],
+            rerun_dir: None,
             environment_label: None,
         }
     }

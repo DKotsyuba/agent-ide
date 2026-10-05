@@ -28,6 +28,11 @@ because deferred MCP tools may be omitted there. If discovery is absent, returns
 no matching tools, or a discovered tool fails, continue with the fail-open rule
 below. Do not repeat discovery in a loop.
 
+Tool schemas loaded earlier in a long or resumed conversation can predate an Agent IDE
+upgrade. When a reply or this skill names a parameter your loaded schema lacks (for example
+`read_only` or `environment` on `ide.start`, `cwd` or `env` on `ide.test`), load the tool
+definitions again once; the server accepts every current parameter either way.
+
 Each accepted reply carries one compact decision-facing text block that states every fact needed
 for the next action — state, `detail_ref`, `continuation`, `retry`, Edit outcome and `source_ref`.
 Replies come back complete when the work finishes within a few seconds (the usual case on a

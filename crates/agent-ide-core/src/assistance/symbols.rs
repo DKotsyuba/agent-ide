@@ -3154,35 +3154,41 @@ fn delete_symbol_lines(source: &str, range: LineRange) -> String {
     lines.concat()
 }
 
-/// Inserts `content` before `site.line` with the site's indentation and blank lines.
+/// Inserts `content` before `site.line` with the site's indentation and blank lines. Blank lines
+/// already on either side of the insertion point count toward the site's spacing, so inserting
+/// next to a neighbour that is already separated does not double the separation.
 fn insert_lines(source: &str, site: &lang::InsertSite, content: &str) -> String {
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let at = (site.line.saturating_sub(1) as usize).min(lines.len());
+    let (before, after) = insert_gaps(source, site);
     let mut out = String::with_capacity(source.len() + content.len() + 64);
-    let mut inserted = false;
     let block = indent_block(content, &site.indent);
-    for (index, line) in source.split_inclusive('\n').enumerate() {
-        let number = index as u32 + 1;
-        if number == site.line && !inserted {
-            for _ in 0..site.blank_before {
-                out.push('\n');
-            }
-            push_block(&mut out, &block);
-            for _ in 0..site.blank_after {
-                out.push('\n');
-            }
-            inserted = true;
-        }
-        out.push_str(line);
+    if at == lines.len() && !source.is_empty() && !source.ends_with('\n') {
+        out.push_str(source);
+        out.push('\n');
+    } else {
+        lines[..at].iter().for_each(|line| out.push_str(line));
     }
-    if !inserted {
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
-        }
-        for _ in 0..site.blank_before {
-            out.push('\n');
-        }
-        push_block(&mut out, &block);
+    out.push_str(&"\n".repeat(before));
+    push_block(&mut out, &block);
+    if at < lines.len() {
+        out.push_str(&"\n".repeat(after));
+        lines[at..].iter().for_each(|line| out.push_str(line));
     }
     out
+}
+
+/// The blank lines an insert at `site` adds before and after its block: the site's spacing less
+/// the blank lines already on that side of the insertion point.
+fn insert_gaps(source: &str, site: &lang::InsertSite) -> (usize, usize) {
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let at = (site.line.saturating_sub(1) as usize).min(lines.len());
+    let blank = |line: &&&str| line.trim().is_empty();
+    (
+        usize::from(site.blank_before)
+            .saturating_sub(lines[..at].iter().rev().take_while(blank).count()),
+        usize::from(site.blank_after).saturating_sub(lines[at..].iter().take_while(blank).count()),
+    )
 }
 
 /// Re-indents a block so its least-indented non-blank line sits at `indent`.
@@ -3983,9 +3989,10 @@ fn apply_changes(
                 None
             }
             ChangeAction::Insert(site, content) => {
+                let (blank_before, _) = insert_gaps(&buffer, site);
                 buffer = insert_lines(&buffer, site, content);
                 let block = indent_block(content, &site.indent);
-                let start = change.base.start + u32::from(site.blank_before);
+                let start = change.base.start + u32::try_from(blank_before).unwrap_or(0);
                 Some(LineRange::new(start, start + lang::line_count(&block) - 1))
             }
             ChangeAction::Splice { start, end, new } => {
@@ -4793,7 +4800,8 @@ mod splice_tests {
                     blank_before: 1,
                     blank_after: 1,
                 },
-                LineRange::new(4, 4),
+                // The blank line already above `b` counts toward the spacing.
+                LineRange::new(3, 3),
             ),
             (
                 "a\n\nb\n",
@@ -4819,6 +4827,31 @@ mod splice_tests {
             let inserted = insert_lines(source, &site, "probe");
             assert_eq!(delete_symbol_lines(&inserted, range), source);
         }
+    }
+
+    /// Blank lines already beside the insertion point count toward the site's spacing: inserting
+    /// after a function that two blank lines separate from a comment keeps exactly two on each
+    /// side, and inserting before one keeps the existing two above it.
+    #[test]
+    fn existing_blank_lines_count_toward_insert_spacing() {
+        let source = "def a():\n    pass\n\n\n# section\ndef b():\n    pass\n";
+        let after = lang::InsertSite {
+            line: 3,
+            indent: String::new(),
+            blank_before: 2,
+            blank_after: 2,
+        };
+        assert_eq!(
+            insert_lines(source, &after, "def n():\n    pass"),
+            "def a():\n    pass\n\n\ndef n():\n    pass\n\n\n# section\ndef b():\n    pass\n"
+        );
+        assert_eq!(insert_gaps(source, &after), (2, 0));
+        let before = lang::InsertSite { line: 5, ..after };
+        assert_eq!(
+            insert_lines(source, &before, "def n():\n    pass"),
+            "def a():\n    pass\n\n\ndef n():\n    pass\n\n\n# section\ndef b():\n    pass\n"
+        );
+        assert_eq!(insert_gaps(source, &before), (0, 2));
     }
 
     #[test]

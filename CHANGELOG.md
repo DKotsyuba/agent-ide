@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed
+
+- A test run's `rerun:` line reproduces the run: `cd <dir> && env NAME=VALUE … <argv>` when
+  `ide.test` was given `cwd` or `env`.
+- A failed run lists up to 16 failing tests (was 8) and says how many more are in the full output
+  instead of dropping them silently.
+- `ide.edit` inserts count the blank lines already beside the insertion point toward the
+  spacing, so inserting next to a neighbour that is already separated (two blank lines before a
+  comment, say) no longer doubles the separation; the landing line numbers follow.
+
 ## 0.10.0 — 2026-10-05
 
 ### Added
