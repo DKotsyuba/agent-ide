@@ -13049,6 +13049,92 @@ async fn configured_product_pyright_usages_cross_nested_packages() {
     daemon.wait().await.unwrap();
 }
 
+/// Usages cross into a directory that imports a package by its import name only: `services/agent`
+/// has no `pyproject.toml`, just a `requirements.txt`, and reaches `libs/contracts`'
+/// `analytix_contracts` through `PYTHONPATH`. With no environment that installs the package, the
+/// session hands Pyright the discovered roots as `extraPaths`, so the module-level `REGISTRY`
+/// instance resolves in the other root and its method call counts as a usage.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
+async fn configured_product_pyright_usages_cross_roots_by_import_name() {
+    let fixture = ProductFixture::new(json!([accepted_pyright_provider(
+        "pyright-cross-root-cache"
+    )]));
+    let engine = fixture
+        .root
+        .join("libs/contracts/analytix_contracts/metrics/engine");
+    let tests = fixture.root.join("services/agent/tests");
+    std::fs::create_dir_all(&engine).unwrap();
+    std::fs::create_dir_all(&tests).unwrap();
+    std::fs::write(
+        fixture.root.join("libs/contracts/pyproject.toml"),
+        "[project]\nname = \"analytix-contracts\"\n",
+    )
+    .unwrap();
+    for package in [
+        "libs/contracts/analytix_contracts",
+        "libs/contracts/analytix_contracts/metrics",
+        "libs/contracts/analytix_contracts/metrics/engine",
+    ] {
+        std::fs::write(fixture.root.join(package).join("__init__.py"), "").unwrap();
+    }
+    std::fs::write(
+        engine.join("registry.py"),
+        "class Registry:\n    def formula(self, key: str, locale: str) -> str:\n        return key + locale\n\n\nREGISTRY = Registry()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("services/agent/requirements.txt"),
+        "pytest\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tests.join("test_formula.py"),
+        "from analytix_contracts.metrics.engine.registry import REGISTRY\n\n\ndef test_formula():\n    assert REGISTRY.formula(\"k\", \"en\") == \"ken\"\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "libs", "services"]);
+    fixture.git(&["commit", "--quiet", "-m", "cross-root fixture"]);
+
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "pyright-cross-root").await;
+    let start = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"pyright-cross-root-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, start).await["kind"], "activation");
+    // Background analysis of unopened files completes after the first answers; poll.
+    let mut text = String::new();
+    for _ in 0..60 {
+        let symbol = actor
+            .call(
+                &fixture,
+                "ide.symbol",
+                json!({"symbol":"libs/contracts/analytix_contracts/metrics/engine/registry.py#Registry/formula","callers":0}),
+            )
+            .await;
+        let symbol = actor.settle(&fixture, symbol).await;
+        assert_eq!(symbol["kind"], "symbol", "{symbol}");
+        text = symbol["text"].as_str().unwrap().to_owned();
+        if text.contains("services/agent/tests/test_formula.py") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(
+        text.contains("services/agent/tests/test_formula.py"),
+        "the call through the module-level instance in the other root is reported:\n{text}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A `.tsx` document whose tsconfig restricts `compilerOptions.types` (a policy the exact
 /// resolution rules refuse) still answers `ide.read` by symbol from its source outline, exactly
 /// as `.ts` documents do, with the refusal reason in the lexical footer.

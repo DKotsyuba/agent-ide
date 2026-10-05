@@ -153,6 +153,21 @@ pub(crate) fn python_roots(worktree: &Path) -> Vec<PathBuf> {
     roots
 }
 
+/// The import roots of the nested Python roots of `worktree` — each root, or its `src` directory
+/// under a src layout — for Pyright's `extraPaths`, so a directory that imports a sibling package
+/// by name through `PYTHONPATH` resolves it without an installed environment. The worktree root
+/// itself is left out: Pyright already searches it and its `src`.
+pub(crate) fn import_roots(worktree: &Path) -> Vec<PathBuf> {
+    python_roots(worktree)
+        .into_iter()
+        .filter(|root| root != worktree)
+        .map(|root| {
+            let src = root.join("src");
+            if src.is_dir() { src } else { root }
+        })
+        .collect()
+}
+
 /// Reports whether `root` is a Python project, per the shared marker rule.
 ///
 /// Root markers: any of [`ROOT_MARKER_FILES`], any root `requirements*.txt`, a `.venv`/`venv`
@@ -2227,6 +2242,39 @@ FAILED tests/test_service.py::TestWorker::test_label
         assert_eq!(
             project.manifests,
             [PathBuf::from("nested/deep/requirements.txt")]
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Pyright's import roots are the nested roots — `src` under a src layout, the root itself
+    /// otherwise, including a `requirements.txt`-only directory — never the worktree root, which
+    /// Pyright searches already.
+    #[test]
+    fn import_roots_are_nested_roots_or_their_src() {
+        let root = scratch("import-roots");
+        put(&root, "pyproject.toml", "[project]\nname = \"top\"\n");
+        put(&root, "main.py", "");
+        put(
+            &root,
+            "libs/contracts/pyproject.toml",
+            "[project]\nname = \"contracts\"\n",
+        );
+        put(&root, "libs/contracts/analytix_contracts/__init__.py", "");
+        put(
+            &root,
+            "libs/layout/pyproject.toml",
+            "[project]\nname = \"layout\"\n",
+        );
+        put(&root, "libs/layout/src/layout/__init__.py", "");
+        put(&root, "services/agent/requirements.txt", "pytest\n");
+        put(&root, "services/agent/tests/test_agent.py", "");
+        assert_eq!(
+            import_roots(&root),
+            [
+                root.join("libs/contracts"),
+                root.join("libs/layout/src"),
+                root.join("services/agent"),
+            ]
         );
         fs::remove_dir_all(&root).unwrap();
     }

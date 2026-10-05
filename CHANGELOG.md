@@ -15,6 +15,13 @@
   `ide.outline`, symbol reads, symbol cards and semantic context retain the reader's source
   authority instead of failing on the writer's different epoch, including nested Python packages
   without a virtual environment.
+- Python usages cross roots that import each other by name only: `ide.symbol` on a method of a
+  package in one nested root (`libs/contracts`) now counts its calls in another root that
+  reaches it through `PYTHONPATH` (`services/agent` with just a `requirements.txt`, no
+  environment installing the package). The Pyright session receives every nested Python root
+  (its `src` under a src layout) as `python.analysis.extraPaths`; before, the import was
+  unresolved there, the module-level instance had no type and its method calls were never
+  references. A project config file's own `extraPaths` still wins.
 
 ## 0.10.0 — 2026-10-05
 

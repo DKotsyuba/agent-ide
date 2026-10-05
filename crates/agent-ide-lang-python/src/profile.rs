@@ -66,6 +66,8 @@ pub struct PyrightProfile {
     interpreter: Option<PathBuf>,
     /// Shared-resolver identity of that environment, retained in the compatibility key.
     environment: String,
+    /// Import roots of the worktree's nested Python roots, sent as `python.analysis.extraPaths`.
+    extra_paths: Vec<PathBuf>,
 }
 
 impl PyrightProfile {
@@ -95,6 +97,7 @@ impl PyrightProfile {
             cache_namespace: identity.cache_namespace,
             interpreter: None,
             environment: String::new(),
+            extra_paths: Vec::new(),
         };
         profile
             .valid()
@@ -112,6 +115,13 @@ impl PyrightProfile {
     ) -> Self {
         self.interpreter = interpreter;
         self.environment = environment;
+        self
+    }
+
+    /// Adds the import roots Pyright searches beyond the worktree root (see
+    /// [`crate::support::import_roots`]); the consumed profile is returned with them applied.
+    pub(crate) fn with_extra_paths(mut self, extra_paths: Vec<PathBuf>) -> Self {
+        self.extra_paths = extra_paths;
         self
     }
 
@@ -236,23 +246,39 @@ impl PyrightProfile {
 
 impl agent_ide_core::intelligence::session::SessionProfile for PyrightProfile {
     /// Returns Pyright defaults, adding `python.pythonPath` only when the shared resolver found
-    /// one, and always `pyright.openFilesOnly: false`.
+    /// one, `python.analysis.extraPaths` only when nested roots exist, and always
+    /// `pyright.openFilesOnly: false`.
     ///
     /// Pyright's raw language server defaults to checking only opened files, so a references
     /// request would silently miss every call site in an unopened file — usages of a function
     /// in one package reported none of its callers in a sibling package's tests. Analyzing the
     /// whole workspace costs startup time on large repositories, but it is what makes `usages`
     /// an answer about the project rather than about the currently open document. The same
-    /// object serves both sections pyright requests: the `python` section reads `pythonPath`,
-    /// the `pyright` section reads `openFilesOnly`, and each ignores the other's keys.
+    /// object serves both sections pyright requests: the `python` section reads `pythonPath` and
+    /// the `analysis` object, the `pyright` section reads `openFilesOnly`, and each ignores the
+    /// other's keys.
+    ///
+    /// `analysis.extraPaths` lets a directory that imports a sibling package by name through
+    /// `PYTHONPATH` (no installed environment) resolve it; without it the imported names are
+    /// unknown and their uses never count as references. A present `analysis` object turns
+    /// pyright's `autoSearchPaths` off unless set, so it is set back to the default `true`.
+    /// Pyright itself prefers a project config file's own `extraPaths`, and
+    /// `executionEnvironments` keep theirs, so this only fills the gap.
     fn workspace_configuration(&self) -> serde_json::Value {
-        match &self.interpreter {
-            Some(interpreter) => serde_json::json!({
-                "pythonPath": interpreter.to_string_lossy(),
-                "openFilesOnly": false
-            }),
-            None => serde_json::json!({"openFilesOnly": false}),
+        let mut settings = serde_json::json!({"openFilesOnly": false});
+        if let Some(interpreter) = &self.interpreter {
+            settings["pythonPath"] = interpreter.to_string_lossy().into();
         }
+        if !self.extra_paths.is_empty() {
+            let extra_paths: Vec<_> = self
+                .extra_paths
+                .iter()
+                .map(|path| path.to_string_lossy())
+                .collect();
+            settings["analysis"] =
+                serde_json::json!({"autoSearchPaths": true, "extraPaths": extra_paths});
+        }
+        settings
     }
 
     /// Accepts an omitted identity or one named `pyright`.
@@ -632,7 +658,8 @@ mod tests {
     }
 
     /// Pyright disables open-files-only mode with or without an interpreter, adds
-    /// `python.pythonPath` when one is selected, and accepts an omitted or `pyright` identity.
+    /// `python.pythonPath` when one is selected and `extraPaths` when nested roots exist, and
+    /// accepts an omitted or `pyright` identity.
     #[test]
     fn pyright_session_profile_is_closed_and_allows_omitted_server_info() {
         use agent_ide_core::intelligence::session::SessionProfile;
@@ -664,6 +691,22 @@ mod tests {
                 .workspace_configuration(),
             serde_json::json!({
                 "pythonPath":"/repo/.venv/bin/python",
+                "openFilesOnly": false
+            })
+        );
+        assert_eq!(
+            profile
+                .clone()
+                .with_extra_paths(vec![
+                    PathBuf::from("/repo/libs/contracts"),
+                    PathBuf::from("/repo/services/agent/src"),
+                ])
+                .workspace_configuration(),
+            serde_json::json!({
+                "analysis": {
+                    "autoSearchPaths": true,
+                    "extraPaths": ["/repo/libs/contracts", "/repo/services/agent/src"]
+                },
                 "openFilesOnly": false
             })
         );
