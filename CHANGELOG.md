@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.10.2 — 2026-10-05
+
+### Fixed
+
+- Cache cleanup no longer stops after an upgrade while sessions of the previous release are
+  still open: every release after 0.9.1 takes leases, so a sweeper trusts older ones too. It
+  used to treat any release older than itself as lease-unaware and keep every check and
+  telemetry cache until those sessions ended (29 GiB kept against a 20 GiB budget).
+
 ## 0.10.1 — 2026-10-05
 
 ### Fixed
