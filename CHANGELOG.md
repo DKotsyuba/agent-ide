@@ -16,7 +16,6 @@
 - An edit that leaves its file clean while the project check reports errors in other files says
   so (`current_clean for this file; the project check reports N errors in other files`) and points
   at `ide.context` problems instead of `ide.diff`.
-
 - A test run's `rerun:` line reproduces the run: `cd <dir> && env NAME=VALUE … <argv>` when
   `ide.test` was given `cwd` or `env`.
 - A failed run lists up to 16 failing tests (was 8) and says how many more are in the full output

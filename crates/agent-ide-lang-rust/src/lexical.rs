@@ -53,8 +53,7 @@
 //! * comments rust-analyzer attaches to an item's node but a parser drops: comment text on the
 //!   nearest non-blank line above the item's first token with no empty line in between (a `//!`
 //!   inner doc line excepted, which is never attached, when no block comment sits in between),
-//!   or a blank line between the
-//!   item's first attribute or doc comment and its first token;
+//!   or a blank line between the item's first attribute or doc comment and its first token;
 //! * two same-named same-kind siblings where either carries a `cfg`/`cfg_attr` attribute.
 //!
 //! The corpus under `tests/fixtures/lexical` pins this against recorded rust-analyzer answers:
@@ -731,9 +730,9 @@ impl Walker<'_> {
     ///
     /// * comment text sits on the nearest non-blank line above `start`, between the last code
     ///   before the item and the item, with no empty line (`\n\n`) after it — rust-analyzer
-    ///   attaches such comments — unless that line
-    ///   is a `//!` inner doc line (never attached, nor anything above it) and no block comment
-    ///   opens or closes in between (a `//!` inside a block comment is no doc line);
+    ///   attaches such comments — unless that line is a `//!` inner doc line (never attached,
+    ///   nor anything above it) and no block comment opens or closes in between (a `//!` inside
+    ///   a block comment is no doc line);
     /// * a blank line separates `start` from the declaration (rust-analyzer attaches a doc
     ///   comment across one only when no plain comment sits between).
     fn check_start(&mut self, start: LineColumn, declaration: usize) {
