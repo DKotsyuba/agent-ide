@@ -1387,10 +1387,19 @@ impl Worker<'_> {
         let Some(server) = self.session_server(observed.path()) else {
             // No registered server owns the file: a language that outlines from its text still
             // answers; any other keeps the provider-unavailable refusal.
-            return support
-                .outline_from_source(observed.path(), &source)
-                .map(|outline| (outline, worktree_root, None))
-                .ok_or(FailureCode::ProviderUnavailable);
+            return match support.outline_from_source(observed.path(), &source) {
+                Some(outline) => Ok((outline, worktree_root, None)),
+                None => {
+                    job.set_stage_failure(
+                        &FailureCode::ProviderUnavailable,
+                        &format!(
+                            "no {} server serves this file and its source outline refused it; use ide.read with path and lines",
+                            language.name()
+                        ),
+                    );
+                    Err(FailureCode::ProviderUnavailable)
+                }
+            };
         };
         let live = match self.live_session_for(job, observed).await {
             Ok(live) => live,
@@ -1419,7 +1428,18 @@ impl Worker<'_> {
                         job.failure_detail = None;
                         Ok((outline, worktree_root, Some(Lexical::Unavailable)))
                     }
-                    None => Err(FailureCode::ProviderUnavailable),
+                    None => {
+                        if job.failure_detail.is_none() {
+                            job.set_stage_failure(
+                                &FailureCode::ProviderUnavailable,
+                                &format!(
+                                    "{} is unavailable and the source outline refused this file; use ide.read with path and lines",
+                                    server.name()
+                                ),
+                            );
+                        }
+                        Err(FailureCode::ProviderUnavailable)
+                    }
                 };
             }
             Err(FailureCode::ResolutionUnverified)
