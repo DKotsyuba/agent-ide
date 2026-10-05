@@ -5,7 +5,10 @@ use super::{
     freshness::{DiagnosticReadiness, Freshness, SourceBinding, ViewGeneration},
     wire::{WireLimits, WireSafety},
 };
-use crate::workspace::{authority::WorktreeRef, observation::SourceObservation};
+use crate::workspace::{
+    authority::{AuthorityStamp, WorktreeRef},
+    observation::SourceObservation,
+};
 use async_lsp::{
     MainLoop, ServerSocket,
     lsp_types::{self as lsp, request},
@@ -344,7 +347,7 @@ pub struct Session {
     server: ServerSocket,
     /// Immutable worktree incarnation supplied by the admitted provider view.
     worktree: WorktreeRef,
-    /// Workspace authority epoch supplied by the admitted provider view.
+    /// Authority epoch admitted for the current source; initially the provider view's epoch.
     epoch: u64,
     /// Immutable backend/configuration/toolchain/view fences for this connection.
     generation: ViewGeneration,
@@ -643,6 +646,27 @@ pub enum ReadinessError {
 }
 
 impl Session {
+    /// Admits `observation` under its invoking actor's freshly validated durable `authority`.
+    ///
+    /// The worker must validate the stamp before calling. Readers may borrow a writer's
+    /// transport while retaining their own epoch; the exact worktree and source epoch must match
+    /// the stamp or this returns an invalid-input error without changing the session. Source
+    /// bytes and sequence remain checked by each request, and provider ownership is unchanged.
+    pub(crate) fn authorize_source(
+        &mut self,
+        authority: &AuthorityStamp,
+        observation: &SourceObservation,
+    ) -> io::Result<()> {
+        if authority.worktree() != &self.worktree
+            || observation.worktree() != authority.worktree()
+            || observation.authority_epoch() != authority.epoch()
+        {
+            return Err(context::invalid("source does not match current authority"));
+        }
+        self.epoch = authority.epoch();
+        Ok(())
+    }
+
     /// Resets the outbound budget: every live request starts with a fresh allowance, while the
     /// one-shot `context` path keeps its single per-session budget.
     fn refill_budget(&mut self) {

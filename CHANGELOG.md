@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- Readers whose activation predates the current writer can borrow its live language session:
+  `ide.outline`, symbol reads, symbol cards and semantic context retain the reader's source
+  authority instead of failing on the writer's different epoch, including nested Python packages
+  without a virtual environment.
+
 ## 0.10.0 — 2026-10-05
 
 ### Added
