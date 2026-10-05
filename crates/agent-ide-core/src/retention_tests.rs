@@ -124,6 +124,26 @@ fn select_skips_in_use_entries_and_evicts_the_next_oldest_instead() {
     assert!(verdicts[1].path.ends_with("next"));
 }
 
+/// A paused sweep reports only the budget candidates it would remove, not every entry.
+#[test]
+fn a_paused_budget_selection_stops_once_the_would_remove_total_fits() {
+    let now = SystemTime::UNIX_EPOCH + DAY * 100;
+    let entries = vec![
+        synthetic("oldest", 50, 3),
+        synthetic("middle", 50, 2),
+        synthetic("newest", 50, 1),
+    ];
+    let verdicts = select(entries, DAY * 7, Some(100), now, &mut |entry| {
+        (Fate::Paused, entry.bytes)
+    });
+    assert_eq!(verdicts.len(), 1, "{verdicts:?}");
+    assert!(verdicts[0].path.ends_with("oldest"));
+    assert_eq!(
+        (verdicts[0].reason, verdicts[0].fate),
+        (Reason::Budget, Fate::Paused)
+    );
+}
+
 /// An entry whose tree could not be fully read is never claimed.
 #[test]
 fn select_never_claims_an_unreadable_entry() {

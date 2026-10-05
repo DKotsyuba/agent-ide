@@ -833,7 +833,9 @@ fn select(
         } else {
             (Fate::Unreadable, entry.bytes)
         };
-        if fate == Fate::Removed {
+        // A paused entry would be removed but for legacy processes; counting it keeps the
+        // report to what the budget actually selects.
+        if matches!(fate, Fate::Removed | Fate::Paused) {
             *total = total.saturating_sub(bytes);
         }
         verdicts.push(Verdict {
