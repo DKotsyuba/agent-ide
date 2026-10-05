@@ -154,13 +154,18 @@ impl Checker for RecordingChecker {
 /// use both as a scheduler cache root and as a fake worktree path (it only needs to exist so
 /// `std::fs::canonicalize` succeeds).
 fn scratch_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "agent-ide-scheduler-contract-{}-{name}-{}",
-        std::process::id(),
-        name.len()
+    // Below one private per-process directory: a cache root's parent holds the retention leases
+    // and must not be group or world writable, whatever the system temporary directory is.
+    let base = std::env::temp_dir().join(format!(
+        "agent-ide-scheduler-contract-{}",
+        std::process::id()
     ));
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = base.join(format!("{name}-{}", name.len()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     dir
 }
 

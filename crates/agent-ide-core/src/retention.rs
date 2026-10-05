@@ -1186,6 +1186,8 @@ pub fn sweep_with(
         totals.bytes = entries.iter().map(|entry| entry.bytes).sum();
         if !complete {
             totals.note = Some("listing incomplete, budget not applied");
+        } else if entries.iter().any(|entry| !entry.complete) {
+            totals.note = Some("some entries unreadable and kept, total is a lower bound");
         }
         let budget = complete.then_some(totals.budget);
         let mut claim = |entry: &Entry| {

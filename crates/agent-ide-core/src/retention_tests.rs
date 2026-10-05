@@ -14,6 +14,8 @@ fn scratch(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("agent-ide-retention-{}-{name}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
+    // A state root must not be group or world writable, whatever the umask.
+    fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
     fs::canonicalize(dir).unwrap()
 }
 
@@ -169,6 +171,22 @@ fn a_cache_without_a_marker_is_never_judged_gone() {
     let report = sweep_with(&home, true, SystemTime::now(), &nobody);
     assert!(report.verdicts.is_empty(), "{report:?}");
     assert!(dir.exists());
+}
+
+/// A fresh cache with an unreadable subtree is not selected, but the family total says it is a
+/// lower bound.
+#[test]
+fn an_unreadable_tree_marks_the_family_total_as_a_lower_bound() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = scratch("unreadable-tree");
+    let worktree = scratch("unreadable-tree-worktree");
+    let dir = check_cache(&home, &worktree);
+    let hidden = dir.join("digest/lang/target");
+    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+    let report = sweep_with(&home, false, SystemTime::now(), &nobody);
+    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(report.verdicts.is_empty(), "{report:?}");
+    assert!(report.render(false).contains("total is a lower bound"));
 }
 
 /// An unreadable marker keeps the cache even when it is long idle.
