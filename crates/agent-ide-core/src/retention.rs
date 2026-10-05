@@ -61,7 +61,7 @@ pub fn worktree_key(worktree: &Path) -> String {
     crate::checks::scheduler::hash16(worktree.to_string_lossy().as_bytes())
 }
 
-/// Shared advisory locks on one worktree's lease file and on the machine-wide [`ANY_LEASE`];
+/// Shared advisory locks on one worktree's lease file and on the machine-wide `ANY_LEASE`;
 /// dropping it releases both.
 ///
 /// While any lease of a worktree is held, no sweeper on the machine can claim that worktree's
@@ -71,7 +71,7 @@ pub fn worktree_key(worktree: &Path) -> String {
 pub struct Lease {
     /// The worktree's lease file, locked shared.
     worktree: File,
-    /// [`ANY_LEASE`], locked shared.
+    /// `ANY_LEASE`, locked shared.
     _any: File,
 }
 
@@ -1241,7 +1241,7 @@ impl SweepLock {
 }
 
 impl Drop for SweepLock {
-    /// Stamps the completed sweep (content and mtime) for [`SWEEP_SPACING`].
+    /// Stamps the completed sweep (content and mtime) for `SWEEP_SPACING`.
     fn drop(&mut self) {
         use std::io::Write;
         let _ = self.0.set_len(0);
@@ -1250,9 +1250,9 @@ impl Drop for SweepLock {
     }
 }
 
-/// Applies the policy in a long-lived daemon: first after [`FIRST_SWEEP_DELAY`], then every
-/// [`SWEEP_INTERVAL`], each on a blocking thread and only when no daemon swept within
-/// [`SWEEP_SPACING`]. Removals are recorded in this process's error log. Runs until dropped.
+/// Applies the policy in a long-lived daemon: first after `FIRST_SWEEP_DELAY`, then every
+/// `SWEEP_INTERVAL`, each on a blocking thread and only when no daemon swept within
+/// `SWEEP_SPACING`. Removals are recorded in this process's error log. Runs until dropped.
 pub async fn run_periodically() {
     let mut delay = FIRST_SWEEP_DELAY;
     loop {
