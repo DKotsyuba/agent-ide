@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- A Rust file with a plain comment separated from the next item by an empty line (a
+  `// xtask:…` marker, a section rule) gets its outline, symbol reads and edits while
+  waiting for rust-analyzer; the source outline used to refuse it and answer `provider_unavailable`.
 - A symbol address naming both a field of a type and a method of one of its blocks
   (`PathSnapshot/source`) resolves to the method; it used to pick the field silently, so an
   insert or replace aimed at the method landed inside the type declaration.

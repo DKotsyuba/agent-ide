@@ -51,8 +51,9 @@
 //! * whitespace rustc does not accept in code (a no-break space, …), which the parser skips;
 //! * a `// region:` comment, which the server reports as a symbol;
 //! * comments rust-analyzer attaches to an item's node but a parser drops: comment text on the
-//!   nearest non-blank line above the item's first token (a `//!` inner doc line excepted, which
-//!   is never attached, when no block comment sits in between), or a blank line between the
+//!   nearest non-blank line above the item's first token with no empty line in between (a `//!`
+//!   inner doc line excepted, which is never attached, when no block comment sits in between),
+//!   or a blank line between the
 //!   item's first attribute or doc comment and its first token;
 //! * two same-named same-kind siblings where either carries a `cfg`/`cfg_attr` attribute.
 //!
@@ -729,7 +730,8 @@ impl Walker<'_> {
     /// declaration starts):
     ///
     /// * comment text sits on the nearest non-blank line above `start`, between the last code
-    ///   before the item and the item — rust-analyzer attaches such comments — unless that line
+    ///   before the item and the item, with no empty line (`\n\n`) after it — rust-analyzer
+    ///   attaches such comments — unless that line
     ///   is a `//!` inner doc line (never attached, nor anything above it) and no block comment
     ///   opens or closes in between (a `//!` inside a block comment is no doc line);
     /// * a blank line separates `start` from the declaration (rust-analyzer attaches a doc
@@ -745,11 +747,17 @@ impl Walker<'_> {
         let above: String = self.chars[gap.min(line_start)..line_start].iter().collect();
         let inner_doc =
             |line: &str| line.starts_with("//!") && !above.contains("/*") && !above.contains("*/");
-        let commented = above
-            .lines()
-            .map(str::trim)
-            .rfind(|line| !line.is_empty())
-            .is_some_and(|nearest| !inner_doc(nearest));
+        // rust-analyzer stops attaching at whitespace holding an empty line (`\n\n`, so a line of
+        // spaces does not stop it); only an outer doc comment continues past one, and syn already
+        // counts those in `start`.
+        let code_above = above.trim_end_matches(rust_whitespace);
+        let separated = above[code_above.len()..].contains("\n\n");
+        let commented = !separated
+            && above
+                .lines()
+                .map(str::trim)
+                .rfind(|line| !line.is_empty())
+                .is_some_and(|nearest| !inner_doc(nearest));
         let blank = (start.line..declaration)
             .any(|line| line_at(&self.lines, line as u32).trim().is_empty());
         self.refused |= commented || blank;
@@ -1685,6 +1693,24 @@ let c = '{';\n    let _ = format!(\"{}\", c);\n    let _ = s.len() + r.len();\n}
         // Just within the bound, the same shape is labelled.
         let fits = format!("impl Tr for Foo<{}> {{}}\n", "u8, ".repeat(60));
         assert!(lexical_outline(Path::new("a.rs"), &fits).is_some());
+    }
+
+    /// A plain comment right above an item belongs to the server's node, so the outline refuses;
+    /// one an empty line separates does not (recorded from rust-analyzer: `// c`, empty line,
+    /// `/// Doc.`, `pub fn f() {}` ranges from the doc line), while a line of spaces still joins.
+    #[test]
+    fn a_comment_an_empty_line_separates_is_not_the_items() {
+        let start = |source: &str| {
+            lexical_outline(Path::new("a.rs"), source).map(|outline| outline.symbols[0].range.start)
+        };
+        assert_eq!(
+            start("use std::fmt;\n// tag\n\n/// Doc.\npub fn f() {}\n"),
+            Some(4)
+        );
+        assert_eq!(start("// tag\n\npub fn f() {}\n"), Some(3));
+        assert_eq!(start("// tag\n/// Doc.\npub fn f() {}\n"), None);
+        assert_eq!(start("// tag\n    \n/// Doc.\npub fn f() {}\n"), None);
+        assert_eq!(start("/* tag */\n\npub fn f() {}\n"), Some(3));
     }
 
     /// Unstable syntax syn parses in quadratic time is refused before the parse, at the full
