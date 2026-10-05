@@ -79,6 +79,17 @@
           ],
           "type": "string"
         },
+        "paths": {
+          "description": "Limit capture and hunk budgets to these worktree-relative files or directories; literal paths only, no absolute paths or .. segments.",
+          "items": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
         "provenance": {
           "default": false,
           "description": "Return the exact worktree/comparison identity header instead of the compact default; no hashes appear otherwise.",

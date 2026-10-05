@@ -4,6 +4,15 @@
 
 ### Fixed
 
+- `ide.diff` pages oversized hunks in exact line-bounded parts, including after repeated test
+  runs. A lone oversized line becomes a read notice that advances the cursor; capacity refusals distinguish
+  the reply envelope, queue, result store and protected actor shares.
+- `ide.diff` accepts literal relative `paths` to limit capture and page budgets, reviews bounded
+  untracked text without staging it, and reports path inventory separately from delivered hunks.
+- Untracked contents are best-effort snapshots: changing files become name-only and never invalidate
+  later pages. Staged mode retains untracked names only and ignores unstaged worktree edits.
+- Retention-full diff replies reserve their actual trailer, preserve exact line parts and report
+  continuation honestly. Plain capture charges tracked sources before untracked content.
 - A test run's `rerun:` line reproduces the run: `cd <dir> && env NAME=VALUE … <argv>` when
   `ide.test` was given `cwd` or `env`.
 - A failed run lists up to 16 failing tests (was 8) and says how many more are in the full output

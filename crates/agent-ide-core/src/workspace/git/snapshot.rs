@@ -520,6 +520,16 @@ impl SnapshotIntent {
     /// the only header shape `changes::compose_plain_diff` accepts; a rename appears as a deletion
     /// plus an addition.
     pub fn plain_diff(scope: GitScope, program: &Path) -> Result<Self, GitError> {
+        Self::plain_diff_paths(scope, program, &[])
+    }
+
+    /// Builds the same degraded comparison restricted to validated literal relative paths.
+    /// An empty selection includes the worktree; invalid paths fail before command construction.
+    pub fn plain_diff_paths(
+        scope: GitScope,
+        program: &Path,
+        paths: &[PathBuf],
+    ) -> Result<Self, GitError> {
         let mut arguments: Vec<OsString> = [
             "--no-pager",
             "--no-lazy-fetch",
@@ -544,6 +554,7 @@ impl SnapshotIntent {
             DiffMode::Unstaged => {}
             DiffMode::Task => return Err(GitError::InvalidIdentity),
         }
+        append_literal_paths(&mut arguments, paths)?;
         let command = ControlledCommand::from_validated_peer(
             CommandKind::Git,
             program.to_path_buf(),
@@ -561,11 +572,14 @@ impl SnapshotIntent {
         })
     }
 
-    /// Builds the bounded no-filter worktree diff against one validated activation commit.
+    /// Builds a bounded no-filter worktree diff against a validated activation commit.
+    /// The optional literal relative files/directories are validated before argv construction;
+    /// an empty list compares the worktree. Invalid identities or paths fail before execution.
     pub fn task_diff(
         scope: GitScope,
         program: &Path,
         identity: &super::GitIdentity,
+        paths: &[PathBuf],
     ) -> Result<Self, GitError> {
         let commit = identity
             .as_bytes()
@@ -592,6 +606,7 @@ impl SnapshotIntent {
         .map(Into::into)
         .collect();
         arguments.push(oid.as_str().into());
+        append_literal_paths(&mut arguments, paths)?;
         let command = ControlledCommand::from_validated_peer(
             CommandKind::Git,
             program.to_path_buf(),
@@ -645,6 +660,26 @@ impl SnapshotIntent {
         }
         Ok(result.stdout().bytes.clone())
     }
+}
+
+/// Appends bounded, valid relative paths after Git's option terminator as literal pathspecs.
+/// Empty selection means all paths; validation rejects traversal before argv is constructed.
+fn append_literal_paths(arguments: &mut Vec<OsString>, paths: &[PathBuf]) -> Result<(), GitError> {
+    if paths.len() > 16
+        || paths.iter().any(|path| {
+            !crate::workspace::observation::valid_relative_path(path)
+                || path.as_os_str().as_bytes().len() > 1024
+        })
+    {
+        return Err(GitError::InvalidPorcelain);
+    }
+    arguments.push("--".into());
+    for path in paths {
+        let mut literal = OsString::from(":(literal)");
+        literal.push(path);
+        arguments.push(literal);
+    }
+    Ok(())
 }
 
 /// Applies the exact capture's per-path confinement to every path a degraded plain `git diff`
@@ -816,6 +851,11 @@ async fn batch_worktree_hashes<R: SnapshotRunner>(
 /// Cancellation handoff retains child plus intent; unknown drops quarantine rather than deleting files.
 /// No implementation may run repository diff commands or transform SourceRead content with Git.
 pub trait SnapshotRunner: Send {
+    /// Selects literal files or directory descendants before content reads and capture budgets.
+    /// The default captures all paths; this is selection only and never grants read authority.
+    fn includes_path(&self, _path: &Path) -> bool {
+        true
+    }
     /// Runs this immutable operation with bounded streams and a Send future returning immutable actual-wait evidence after the Execution owner settles its one-time capability.
     fn run(
         &mut self,
@@ -918,7 +958,8 @@ impl SnapshotSource {
     }
 }
 
-/// Immutable per-path patch evidence; original paths never come from temporary diff headers.
+/// Immutable tracked or untracked patch evidence, including explicit name-only omission notes.
+/// Original paths remain separate from patch headers and captured source bytes support rechecks.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PathSnapshot {
     /// Scope matching the collection and comparison.
@@ -929,8 +970,10 @@ pub struct PathSnapshot {
     status: PathStatus,
     /// Complete bounded raw no-index output; Changes ignores temporary file headers.
     patch: Vec<u8>,
-    /// Raw worktree read provenance, absent for staged comparisons.
+    /// Raw worktree read provenance, absent for staged comparisons and name-only entries.
     source: Option<SnapshotSource>,
+    /// Why an untracked entry has no patch; absent for captured text and tracked paths.
+    name_only: Option<&'static str>,
 }
 
 impl PathSnapshot {
@@ -954,6 +997,127 @@ impl PathSnapshot {
     pub fn source(&self) -> Option<&SnapshotSource> {
         self.source.as_ref()
     }
+
+    /// Returns why an untracked entry has no patch, or None for captured text and tracked paths.
+    pub fn name_only(&self) -> Option<&'static str> {
+        self.name_only
+    }
+
+    /// Reads an untracked file without following links and composes additions against empty.
+    /// Binary, special and oversized files remain name-only under the existing per-file and
+    /// remaining source/patch caps. Missing or unreadable contents stay name-only; a changed
+    /// root still fails closed. The caller separately authorizes both reads and verifies bytes.
+    pub fn untracked(
+        scope: &GitScope,
+        generation: u64,
+        status: PathStatus,
+        remaining_source: usize,
+        remaining_patch: usize,
+    ) -> Result<Self, GitError> {
+        let mut result = Self {
+            scope: scope.clone(),
+            generation,
+            status,
+            patch: Vec::new(),
+            source: None,
+            name_only: None,
+        };
+        let limits = SourceReadLimits::new(4096, MAX_SNAPSHOT_BLOB_BYTES)
+            .map_err(|_| GitError::SnapshotIo)?;
+        let read = match read_authorized_source(scope.worktree(), result.status.path(), limits) {
+            Ok(read) => read,
+            Err(ObservationError::TooLarge { .. }) => {
+                result.name_only = Some("oversized file");
+                return Ok(result);
+            }
+            Err(ObservationError::SymlinkEscape) => {
+                result.name_only = Some("symlink");
+                return Ok(result);
+            }
+            Err(ObservationError::NotRegularFile) => {
+                result.name_only = Some("special entry");
+                return Ok(result);
+            }
+            Err(ObservationError::RootIdentityChanged) => return Err(GitError::UnstableSnapshot),
+            Err(ObservationError::Missing) => {
+                result.name_only = Some("changed during capture");
+                return Ok(result);
+            }
+            Err(_) => {
+                result.name_only = Some("unreadable file");
+                return Ok(result);
+            }
+        };
+        let bytes = read.contents();
+        if bytes.contains(&0) || std::str::from_utf8(bytes).is_err() {
+            result.name_only = Some("binary file");
+        } else if bytes.len() > remaining_source {
+            result.name_only = Some("total source limit");
+        } else {
+            let lines = bytes.split_inclusive(|byte| *byte == b'\n').count();
+            let mut patch = if bytes.is_empty() {
+                Vec::new()
+            } else {
+                format!("@@ -0,0 +1,{lines} @@\n").into_bytes()
+            };
+            for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+                patch.push(b'+');
+                patch.extend_from_slice(line);
+                if !line.ends_with(b"\n") {
+                    patch.extend_from_slice(b"\n\\ No newline at end of file\n");
+                }
+            }
+            if patch.len() > remaining_patch {
+                result.name_only = Some("total patch limit");
+            } else {
+                result.patch = patch;
+                result.source = Some(SnapshotSource {
+                    read: Some(read),
+                    observation: None,
+                });
+            }
+        }
+        Ok(result)
+    }
+
+    /// Checks the second untracked read without destabilizing tracked evidence.
+    /// Changed, missing, unreadable or oversized contents become name-only. Replaced worktree roots
+    /// still fail closed; a surviving patch is a captured snapshot and needs no later byte recheck.
+    pub fn verify_untracked(&mut self, worktree: &WorktreeRef) -> Result<(), GitError> {
+        let Some(original) = self.source.as_ref().and_then(SnapshotSource::bytes) else {
+            return Ok(());
+        };
+        let limits = SourceReadLimits::new(4096, MAX_SNAPSHOT_BLOB_BYTES)
+            .map_err(|_| GitError::SnapshotIo)?;
+        match read_authorized_source(worktree, self.status.path(), limits) {
+            Ok(read) if read.bytes() == original => return Ok(()),
+            Err(ObservationError::RootIdentityChanged) => return Err(GitError::UnstableSnapshot),
+            _ => {}
+        }
+        self.patch.clear();
+        self.source = None;
+        self.name_only = Some("changed during capture");
+        Ok(())
+    }
+
+    /// Adds literal C-quoted path headers so the task-mode plain parser attributes this patch.
+    /// Empty or name-only entries return no bytes; arbitrary Unix pathname bytes use octal.
+    pub fn plain_patch(&self) -> Vec<u8> {
+        if self.patch.is_empty() {
+            return Vec::new();
+        }
+        let quoted: String = self
+            .status
+            .path()
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{byte:03o}"))
+            .collect();
+        let mut patch = format!("diff --git \"a/{quoted}\" \"b/{quoted}\"\n").into_bytes();
+        patch.extend_from_slice(&self.patch);
+        patch
+    }
 }
 
 /// One bounded, twice-checked collection with exact comparison and separate conflict/untracked data.
@@ -969,8 +1133,10 @@ pub struct GitSnapshot {
     comparison: GitComparison,
     /// Original complete scoped porcelain metadata.
     status: GitStatus,
-    /// Exactly one evidence record for each supported selected tracked path.
+    /// One evidence record per supported selected tracked path.
     paths: Vec<PathSnapshot>,
+    /// Separate untracked additions and explicit name-only entries under the same capture caps.
+    untracked_paths: Vec<PathSnapshot>,
 }
 
 impl GitSnapshot {
@@ -986,6 +1152,13 @@ impl GitSnapshot {
     pub fn operation_reference(&self) -> &str {
         &self.operation
     }
+
+    /// Returns captured untracked additions and name-only entries, separate from tracked evidence.
+    /// Sources carry the same safe-reader fingerprints and generation as the tracked capture.
+    pub fn untracked_paths(&self) -> &[PathSnapshot] {
+        &self.untracked_paths
+    }
+
     /// Returns exact side identities, derived from complete metadata and exact raw worktree reads.
     pub fn comparison(&self) -> &GitComparison {
         &self.comparison
@@ -1628,6 +1801,9 @@ async fn capture_attempt<R: SnapshotRunner>(
     let mut symlink_bytes = 0usize;
     let mut attribute_untrusted = force_attributes;
     for path in &tracked {
+        if !runner.includes_path(path) {
+            continue;
+        }
         let head = head_entries.get(path).and_then(|stages| stages.get(&0));
         let index = index_entries.get(path).and_then(|stages| stages.get(&0));
         if head.is_some_and(|entry| entry.mode == 0o160000)
@@ -1741,6 +1917,7 @@ async fn capture_attempt<R: SnapshotRunner>(
     };
     let clean: Vec<_> = tracked
         .difference(&union)
+        .filter(|path| runner.includes_path(path))
         .filter(|path| !matches!(index_entries[*path][&0].mode, 0o120000 | 0o160000))
         .cloned()
         .collect();
@@ -1758,6 +1935,9 @@ async fn capture_attempt<R: SnapshotRunner>(
         let path = super::raw_path(bytes);
         if !crate::workspace::observation::valid_relative_path(&path) {
             return Err(GitError::InvalidPorcelain);
+        }
+        if !runner.includes_path(&path) {
+            continue;
         }
         status.untracked.push(PathStatus {
             kind: super::StatusKind::Untracked,
@@ -2069,7 +2249,37 @@ async fn capture_attempt<R: SnapshotRunner>(
             status: pending.entry,
             patch,
             source: (scope.mode() != DiffMode::Staged).then_some(pending.source),
+            name_only: None,
         });
+    }
+    let mut untracked_paths = Vec::new();
+    for entry in status
+        .untracked()
+        .iter()
+        .filter(|_| scope.mode() != DiffMode::Staged)
+    {
+        runner.authorize_read_path(entry.path()).await?;
+        let mut addition = PathSnapshot::untracked(
+            &scope,
+            generation,
+            entry.clone(),
+            MAX_SNAPSHOT_TOTAL_BYTES.saturating_sub(retained_bytes),
+            MAX_SNAPSHOT_PATCH_BYTES.saturating_sub(patch_bytes),
+        )?;
+        if addition.source.is_some() {
+            runner.authorize_read_path(entry.path()).await?;
+            addition.verify_untracked(scope.worktree())?;
+        }
+        if let Some(source) = &addition.source {
+            let name = entry.path().as_os_str().as_bytes();
+            working.update(&(name.len() as u64).to_le_bytes());
+            working.update(name);
+            working.update(&(source.contents().len() as u64).to_le_bytes());
+            working.update(source.contents());
+            retained_bytes += source.contents().len();
+        }
+        patch_bytes += addition.patch.len();
+        untracked_paths.push(addition);
     }
     // Every captured candidate is reread before the metadata bracket closes.
     for (path, source) in &sources {
@@ -2187,17 +2397,13 @@ async fn capture_attempt<R: SnapshotRunner>(
         comparison,
         status,
         paths,
+        untracked_paths,
     })
 }
 
-/// Keeps an untracked symlink or special entry listed by name only, without reading its bytes or
-/// (for a symlink) its target; a disappearing path or a changed worktree root still retries.
-///
-/// Untracked paths never become baseline content and their bytes are never captured, so a symlink
-/// (typically `node_modules ->` a sibling checkout) or other special entry has nothing to inspect
-/// for content: one such entry used to refuse the whole diff with `diff:unsupported_entry`. Only a
-/// disappearing path or a root-identity change still forces the unstable retry; every other
-/// classification outcome — including an ordinary regular file — keeps the entry.
+/// Checks one untracked entry's existence and root identity without reading content or links.
+/// Special entries stay name-only; regular text is captured separately by PathSnapshot::untracked.
+/// Missing entries or replaced roots retry the capture, while other I/O failures fail closed.
 pub(crate) fn inspect_untracked(worktree: &WorktreeRef, path: &Path) -> Result<(), GitError> {
     match crate::workspace::observation::inspect_authorized_source_kind(worktree, path) {
         Ok(()) | Err(ObservationError::SymlinkEscape | ObservationError::NotRegularFile) => Ok(()),
@@ -2214,6 +2420,15 @@ pub(crate) fn inspect_untracked(worktree: &WorktreeRef, path: &Path) -> Result<(
 /// invalid relative path returns `InvalidPorcelain`; exceeding the snapshot path-count or
 /// aggregate path-byte ceilings returns `EvidenceTooLarge`.
 pub fn parse_untracked_paths(output: &[u8]) -> Result<Vec<PathStatus>, GitError> {
+    parse_untracked_paths_selected(output, |_| true)
+}
+
+/// Parses valid NUL-delimited names and applies literal selection before pathname budgets.
+/// Invalid records fail closed even when unselected; only selected names consume retained capacity.
+pub fn parse_untracked_paths_selected(
+    output: &[u8],
+    includes: impl Fn(&Path) -> bool,
+) -> Result<Vec<PathStatus>, GitError> {
     if !output.is_empty() && !output.ends_with(&[0]) {
         return Err(GitError::InvalidPorcelain);
     }
@@ -2224,6 +2439,12 @@ pub fn parse_untracked_paths(output: &[u8]) -> Result<Vec<PathStatus>, GitError>
         .filter(|path| !path.is_empty())
     {
         let path = super::raw_path(raw);
+        if !crate::workspace::observation::valid_relative_path(&path) {
+            return Err(GitError::InvalidPorcelain);
+        }
+        if !includes(&path) {
+            continue;
+        }
         path_bytes = path_bytes.saturating_add(path.as_os_str().as_bytes().len());
         if paths.len() >= MAX_SNAPSHOT_PATHS || path_bytes > MAX_SNAPSHOT_PATH_BYTES {
             return Err(GitError::EvidenceTooLarge);

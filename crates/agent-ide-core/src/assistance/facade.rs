@@ -249,7 +249,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Diff,
             json!({
                 "type": "object", "additionalProperties": false,
-                "properties": {"mode": {"type":"string","enum":["head","staged","unstaged","task"],"default":"head","description":"`head`: everything not yet committed; `staged` / `unstaged`: only that part; `task`: everything changed since activation, including commits."}, "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."}, "provenance": {"type": "boolean", "default": false, "description": "Return the exact worktree/comparison identity header instead of the compact default; no hashes appear otherwise."}}
+                "properties": {"paths": {"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1,"maxLength":1024},"description":"Limit capture and hunk budgets to these worktree-relative files or directories; literal paths only, no absolute paths or .. segments."}, "mode": {"type":"string","enum":["head","staged","unstaged","task"],"default":"head","description":"`head`: everything not yet committed; `staged` / `unstaged`: only that part; `task`: everything changed since activation, including commits."}, "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."}, "provenance": {"type": "boolean", "default": false, "description": "Return the exact worktree/comparison identity header instead of the compact default; no hashes appear otherwise."}}
             }),
         ),
         schema(
@@ -658,7 +658,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "language",
             "offset",
         ],
-        AssistanceTool::Diff => &["mode", "detail_ref", "provenance"],
+        AssistanceTool::Diff => &["mode", "detail_ref", "provenance", "paths"],
         AssistanceTool::Inspect => &["detail_ref"],
         AssistanceTool::Stop => &["activation_id"],
         AssistanceTool::Edit => &[
@@ -1105,6 +1105,13 @@ pub fn validate_call(
             optional_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
         }
         AssistanceTool::Diff => {
+            if let Some(paths) = string_list(object, "paths", 16)? {
+                for path in paths {
+                    if let Some(rule) = path_shape_rule(&path) {
+                        return Err(invalid_field("paths", rule));
+                    }
+                }
+            }
             optional_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
             if object.get("mode").is_some_and(|value| {
                 !matches!(

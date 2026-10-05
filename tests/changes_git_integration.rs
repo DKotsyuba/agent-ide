@@ -903,6 +903,67 @@ async fn conflicts_retain_actual_stage_modes_and_objects() {
     );
 }
 
+/// Rewrites one untracked file at the existing authorization seam between its two content reads.
+struct RewritingUntrackedRunner {
+    /// Real process runner, unchanged except for native-read timing.
+    inner: Runner,
+    /// Authorized fixture root containing the volatile file.
+    root: PathBuf,
+    /// Number of proofs of volatile.log; proof three precedes its consistency read.
+    proofs: usize,
+}
+impl SnapshotRunner for RewritingUntrackedRunner {
+    /// Delegates exact Git execution and reap evidence to the existing runner.
+    async fn run(
+        &mut self,
+        intent: SnapshotIntent,
+    ) -> Result<agent_ide::execution::CapturedProcessEvidence, GitError> {
+        self.inner.run(intent).await
+    }
+    /// Mutates content once without changing the untracked inventory or denying authorization.
+    async fn authorize_read_path(&mut self, path: &Path) -> Result<(), GitError> {
+        if path == Path::new("volatile.log") {
+            self.proofs += 1;
+            if self.proofs == 3 {
+                fs::write(self.root.join(path), b"new concurrent output\n").unwrap();
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A volatile untracked source becomes name-only without destabilizing tracked capture.
+#[tokio::test]
+async fn untracked_rewrite_during_capture_is_best_effort() {
+    let fixture = GitFixture::new();
+    fixture.write(b"volatile.log", b"old log output\n");
+    let authority = authority_for(&fixture);
+    let mut runner = RewritingUntrackedRunner {
+        inner: Runner::default(),
+        root: fixture.root.clone(),
+        proofs: 0,
+    };
+    let snapshot = collect_snapshot(
+        &authority,
+        Path::new(GIT),
+        DiffMode::Head,
+        1,
+        "volatile-capture",
+        BaselineContext::new("volatile-baseline", BaselineCoverage::Partial).unwrap(),
+        &mut runner,
+    )
+    .await
+    .unwrap();
+    let volatile = snapshot
+        .untracked_paths()
+        .iter()
+        .find(|entry| entry.status().path() == Path::new("volatile.log"))
+        .unwrap();
+    assert_eq!(volatile.name_only(), Some("changed during capture"));
+    assert!(volatile.patch().is_empty());
+    assert!(!snapshot.paths().is_empty());
+}
+
 /// A Git-listed untracked symlink stays a listed name only — never refused — while Apple Git
 /// omits FIFOs from its own listing and direct source reads still reject a symlink without blocking.
 #[tokio::test]
