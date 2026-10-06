@@ -2,19 +2,19 @@
 
 ## Unreleased
 
+## 0.10.3
+
 ### Fixed
 
-- Claude parent and subagent actors sharing one MCP process keep their own worktree bindings
-  when another actor starts or stops, or a finished child's worktree is removed. Recent actor
-  activations recover independently after restart; idle actors never block a new start.
-- A lost edit, test or stop reply reports that the call may have applied instead of resending
-  it. Repeated Claude call identities answer replay, and the MCP accepts the daemon's full
-  reply frame size.
-- A stop whose reply expires or is lost stays stopped across daemon restarts; an unidentified
-  Claude stop no longer guesses another actor's activation. Restart recovery keeps reader roles
-  and the original hook endpoint for activations in another repository.
-- Claude stops continue to work while an older shared daemon is still serving. Losing an
-  identity-probe reply retries safely, and idle actors no longer add ongoing recovery traffic.
+- Several actors of one Claude Code session (the main agent and its subagents, each in its own
+  worktree of the same repository) now work side by side through one IDE: a subagent's
+  `ide.start` no longer moves everyone else's calls to its worktree (they failed with
+  `missing_pre` or `hooks_not_delivered` and `ide.stop` never succeeded), a removed subagent
+  worktree affects nobody else, and after a daemon restart each actor is re-activated with its
+  own root and role on its next call however much later it comes, while a stopped actor never
+  is. A call whose reply is lost after it reached the IDE is no longer sent again: it answers
+  `outcome_unknown` (an `ide.edit` may have applied) instead of a false `missing_pre`, and a
+  repeat of the same call is named a replay.
 
 ## 0.10.2 — 2026-10-06
 

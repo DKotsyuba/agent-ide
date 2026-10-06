@@ -408,18 +408,18 @@ pub enum MethodDispatchTransportResult {
         /// Assistance-owned opaque method result JSON.
         opaque_result_json: OpaqueJson,
     },
-    /// No dispatch result was available: connection failure or an explicit unavailable wire reply.
-    /// The transport driver separately classifies uncertainty after request writing began.
+    /// The daemon could not be reached before writing the request began, so the call was never
+    /// delivered and a reconnect may safely send it.
     Unavailable,
-    /// Connection establishment exceeded its deadline before request writing began.
+    /// Connecting exceeded its bounded deadline before writing the request began.
     TimedOut,
-
-    /// Request writing began, but no valid reply was received; the operation may have applied.
-    /// Mutating callers must verify its outcome instead of replaying the request.
+    /// Writing the request began but no usable reply arrived (write or read failure, malformed
+    /// or explicitly unavailable reply): the daemon may have executed the call, so it must never
+    /// be resent.
     OutcomeUnknown,
-
-    /// A deadline elapsed after request writing began. Mutations may have applied; read-only
-    /// callers retain their timeout behavior and must not reconnect a merely paused daemon.
+    /// Writing the request began and the write or reply exceeded its deadline: as for
+    /// [`Self::OutcomeUnknown`] the call may have executed, and a live daemon must not be
+    /// reconnected.
     WrittenTimedOut,
 }
 

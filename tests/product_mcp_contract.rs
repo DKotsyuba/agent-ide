@@ -3125,9 +3125,11 @@ async fn managed_claude_call(
     arguments: Value,
 ) -> Value {
     let call = format!("managed-claude-{id}");
-    let mut pre_event = managed_claude_event("PreToolUse", session, agent, &call);
-    pre_event["cwd"] = json!(project);
-    let pre = managed_claude_hook(Some(project), pre_event).await;
+    let pre = managed_claude_hook(
+        Some(project),
+        managed_claude_event("PreToolUse", session, agent, &call),
+    )
+    .await;
     assert!(
         pre.status.success() && pre.stdout.is_empty() && pre.stderr.is_empty(),
         "managed pre-hook failed: {}",
@@ -3140,9 +3142,11 @@ async fn managed_claude_call(
             }}),
         )
         .await;
-    let mut post_event = managed_claude_event("PostToolUse", session, agent, &call);
-    post_event["cwd"] = json!(project);
-    let post = managed_claude_hook(Some(project), post_event).await;
+    let post = managed_claude_hook(
+        Some(project),
+        managed_claude_event("PostToolUse", session, agent, &call),
+    )
+    .await;
     assert!(post.status.success() && post.stderr.is_empty());
     claude_fields(assert_claude_envelope(&reply))
 }
@@ -4555,741 +4559,6 @@ async fn managed_claude_root_child_rendezvous_shared_daemon_survives_eof() {
     );
 }
 
-/// Starts one review-fixture Claude actor, repeating only the initial uncached-root refusal.
-async fn review_claude_start(mcp: &mut Mcp, root: &Path, next: &mut usize, agent: Option<&str>) {
-    let activation = agent.unwrap_or("parent");
-    *next += 1;
-    let mut reply = managed_claude_call(
-        mcp,
-        root,
-        *next,
-        "review-session",
-        agent,
-        "ide.start",
-        json!({"root":root,"activation_id":activation}),
-    )
-    .await;
-    if reply["state"] == "unavailable" {
-        *next += 1;
-        reply = managed_claude_call(
-            mcp,
-            root,
-            *next,
-            "review-session",
-            agent,
-            "ide.start",
-            json!({"root":root,"activation_id":activation}),
-        )
-        .await;
-    }
-    let reply = settle_managed_claude_start(mcp, root, next, "review-session", agent, &reply).await;
-    assert_eq!(reply["kind"], "activation", "{activation}: {reply}");
-}
-
-/// Removing one stopped child and purging its target does not strand either surviving actor.
-#[tokio::test]
-async fn review_claude_removed_child_does_not_poison_survivors() {
-    let fixture = ProductFixture::new(json!([]));
-    let left = fixture.base.join("left");
-    let right = fixture.base.join("right");
-    for (branch, path) in [("left", &left), ("right", &right)] {
-        fixture.git(&[
-            "worktree",
-            "add",
-            "--quiet",
-            "-b",
-            branch,
-            path.to_str().unwrap(),
-        ]);
-    }
-    let runtime = managed_claude_runtime_path(&fixture.root);
-    let _guard = SharedClaudeDaemonGuard(runtime);
-    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
-    let mut next = 10;
-    for (root, agent) in [
-        (&fixture.root, None),
-        (&left, Some("b")),
-        (&right, Some("c")),
-    ] {
-        review_claude_start(&mut mcp, root, &mut next, agent).await;
-    }
-    next += 1;
-    let stopped = managed_claude_call(
-        &mut mcp,
-        &left,
-        next,
-        "review-session",
-        Some("b"),
-        "ide.stop",
-        json!({}),
-    )
-    .await;
-    assert_eq!(stopped["kind"], "stop", "{stopped}");
-    fixture.git(&["worktree", "remove", "--force", left.to_str().unwrap()]);
-    let extra = fixture.base.join("extra");
-    fixture.git(&[
-        "worktree",
-        "add",
-        "--quiet",
-        "-b",
-        "extra",
-        extra.to_str().unwrap(),
-    ]);
-    review_claude_start(&mut mcp, &extra, &mut next, Some("d")).await;
-    for (root, agent) in [(&fixture.root, None), (&right, Some("c"))] {
-        next += 1;
-        let reply = managed_claude_call(
-            &mut mcp,
-            root,
-            next,
-            "review-session",
-            agent,
-            "ide.read",
-            json!({"path":"src/lib.rs","lines":"1-2"}),
-        )
-        .await;
-        let reply =
-            settle_managed_claude_start(&mut mcp, root, &mut next, "review-session", agent, &reply)
-                .await;
-        assert!(claude_text(&reply).contains("pub fn value()"), "{reply}");
-    }
-    mcp.close().await;
-}
-
-/// A logical activation in another repository keeps hooks and refresh on the original daemon.
-#[tokio::test]
-async fn review_claude_cross_repository_refresh_keeps_hook_endpoint() {
-    let fixture = ProductFixture::new(json!([]));
-    let other = fixture.other_repository("foreign-review");
-    std::fs::write(other.join("tracked.txt"), "foreign-review-content\n").unwrap();
-    let runtime = managed_claude_runtime_path(&fixture.root);
-    let foreign_runtime = managed_claude_runtime_path(&other);
-    let _guard = SharedClaudeDaemonGuard(runtime.clone());
-    let _foreign_guard = SharedClaudeDaemonGuard(foreign_runtime.clone());
-    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
-    let mut next = 10;
-    let pending = managed_claude_call(
-        &mut mcp,
-        &fixture.root,
-        next,
-        "review-session",
-        None,
-        "ide.start",
-        json!({"activation_id":"foreign","root":other}),
-    )
-    .await;
-    assert_eq!(
-        settle_managed_claude_start(
-            &mut mcp,
-            &fixture.root,
-            &mut next,
-            "review-session",
-            None,
-            &pending
-        )
-        .await["kind"],
-        "activation"
-    );
-    let old = managed_claude_candidate_attachment(&fixture.root);
-    terminate_shared_claude_daemon(&runtime);
-    wait_for_healed_daemon(&fixture.root, &runtime, &old).await;
-    next += 1;
-    let context = managed_claude_call(
-        &mut mcp,
-        &fixture.root,
-        next,
-        "review-session",
-        None,
-        "ide.context",
-        json!({"path":"tracked.txt"}),
-    )
-    .await;
-    let context = settle_managed_claude_start(
-        &mut mcp,
-        &fixture.root,
-        &mut next,
-        "review-session",
-        None,
-        &context,
-    )
-    .await;
-    assert!(
-        claude_text(&context).contains("foreign-review-content"),
-        "{context}"
-    );
-    assert!(
-        !foreign_runtime.exists(),
-        "refresh must not move the default to another daemon"
-    );
-    mcp.close().await;
-}
-
-/// An idle remembered actor after restart cannot block a new actor's uncached worktree start.
-#[tokio::test]
-async fn review_claude_idle_recovery_does_not_block_new_start() {
-    let fixture = ProductFixture::new(json!([]));
-    let idle = fixture.base.join("idle");
-    let fresh = fixture.base.join("fresh");
-    for (branch, path) in [("idle", &idle), ("fresh", &fresh)] {
-        fixture.git(&[
-            "worktree",
-            "add",
-            "--quiet",
-            "-b",
-            branch,
-            path.to_str().unwrap(),
-        ]);
-    }
-    let runtime = managed_claude_runtime_path(&fixture.root);
-    let _guard = SharedClaudeDaemonGuard(runtime.clone());
-    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
-    let mut next = 10;
-    review_claude_start(&mut mcp, &fixture.root, &mut next, None).await;
-    review_claude_start(&mut mcp, &idle, &mut next, Some("idle")).await;
-    let old = managed_claude_candidate_attachment(&idle);
-    terminate_shared_claude_daemon(&runtime);
-    wait_for_healed_daemon(&idle, &runtime, &old).await;
-    review_claude_start(&mut mcp, &fresh, &mut next, Some("fresh")).await;
-    // Fresh explicit start of the parent also succeeds while the idle actor stays silent.
-    review_claude_start(&mut mcp, &fixture.root, &mut next, None).await;
-    mcp.close().await;
-}
-
-/// A stop with no actor pre after restart must preserve the parent's recovery intent.
-#[tokio::test]
-async fn review_claude_routeless_stop_preserves_parent() {
-    let fixture = ProductFixture::new(json!([]));
-    let runtime = managed_claude_runtime_path(&fixture.root);
-    let _guard = SharedClaudeDaemonGuard(runtime.clone());
-    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
-    let mut next = 10;
-    review_claude_start(&mut mcp, &fixture.root, &mut next, None).await;
-    let old = managed_claude_candidate_attachment(&fixture.root);
-    terminate_shared_claude_daemon(&runtime);
-    wait_for_healed_daemon(&fixture.root, &runtime, &old).await;
-    next += 1;
-    let unknown = mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.stop","arguments":{},"_meta":{"claudecode/toolUseId":"unknown-stop"}}})).await;
-    assert!(
-        assert_claude_envelope(&unknown).starts_with("unavailable: host_binding"),
-        "{unknown}"
-    );
-    next += 1;
-    let read = managed_claude_call(
-        &mut mcp,
-        &fixture.root,
-        next,
-        "review-session",
-        None,
-        "ide.read",
-        json!({"path":"src/lib.rs","lines":"1-2"}),
-    )
-    .await;
-    let read = settle_managed_claude_start(
-        &mut mcp,
-        &fixture.root,
-        &mut next,
-        "review-session",
-        None,
-        &read,
-    )
-    .await;
-    assert!(claude_text(&read).contains("pub fn value()"), "{read}");
-    mcp.close().await;
-}
-
-/// Recovery waits for a late pre and preserves a reader's original permission after restart.
-#[tokio::test]
-async fn review_claude_late_pre_after_restart_preserves_reader() {
-    let fixture = ProductFixture::new(json!([]));
-    let runtime = managed_claude_runtime_path(&fixture.root);
-    let _guard = SharedClaudeDaemonGuard(runtime.clone());
-    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
-    let mut next = 10;
-    let pending = managed_claude_call(
-        &mut mcp,
-        &fixture.root,
-        next,
-        "review-session",
-        None,
-        "ide.start",
-        json!({"activation_id":"reader","read_only":true}),
-    )
-    .await;
-    assert_eq!(
-        settle_managed_claude_start(
-            &mut mcp,
-            &fixture.root,
-            &mut next,
-            "review-session",
-            None,
-            &pending
-        )
-        .await["kind"],
-        "activation"
-    );
-    let old = managed_claude_candidate_attachment(&fixture.root);
-    terminate_shared_claude_daemon(&runtime);
-    wait_for_healed_daemon(&fixture.root, &runtime, &old).await;
-    next += 1;
-    mcp.send(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.read","arguments":{"path":"src/lib.rs","lines":"1-2"},"_meta":{"claudecode/toolUseId":"late-reader"}}})).await;
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    let pre = managed_claude_hook(
-        Some(&fixture.root),
-        managed_claude_event("PreToolUse", "review-session", None, "late-reader"),
-    )
-    .await;
-    assert!(pre.status.success());
-    let reply = tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let mut line = String::new();
-            assert_ne!(mcp.output.read_line(&mut line).await.unwrap(), 0);
-            let reply: Value = serde_json::from_str(&line).unwrap();
-            if reply["id"] == json!(next) {
-                break reply;
-            }
-        }
-    })
-    .await
-    .unwrap();
-    let read = claude_fields(assert_claude_envelope(&reply));
-    let read = settle_managed_claude_start(
-        &mut mcp,
-        &fixture.root,
-        &mut next,
-        "review-session",
-        None,
-        &read,
-    )
-    .await;
-    assert!(claude_text(&read).contains("pub fn value()"), "{read}");
-    next += 1;
-    let edit = managed_claude_call(&mut mcp, &fixture.root, next, "review-session", None, "ide.edit", json!({"operation_id":"reader-must-stay-reader","path":"src/new.rs","content":"pub fn blocked() {}\n"})).await;
-    assert!(
-        claude_text(&edit).starts_with("refused: read_only (ide.edit)"),
-        "{edit}"
-    );
-    assert!(!fixture.root.join("src/new.rs").exists());
-    mcp.close().await;
-}
-
-/// A stop reaching the guard stays stopped after a deadline reply and daemon replacement.
-#[tokio::test]
-async fn review_claude_deadline_stop_is_not_reactivated() {
-    let fixture = ProductFixture::new(json!([]));
-    let runtime = managed_claude_runtime_path(&fixture.root);
-    let _guard = SharedClaudeDaemonGuard(runtime.clone());
-    let mut mcp = Mcp::start_managed_claude_with_seam(
-        &fixture.config,
-        &fixture.root,
-        Some(("AGENT_IDE_TEST_STOP_DEADLINE", "1")),
-    )
-    .await;
-    let mut next = 10;
-    review_claude_start(&mut mcp, &fixture.root, &mut next, None).await;
-    next += 1;
-    let stopped = managed_claude_call(
-        &mut mcp,
-        &fixture.root,
-        next,
-        "review-session",
-        None,
-        "ide.stop",
-        json!({}),
-    )
-    .await;
-    assert_eq!(stopped["code"], "deadline", "{stopped}");
-    let old = managed_claude_candidate_attachment(&fixture.root);
-    terminate_shared_claude_daemon(&runtime);
-    wait_for_healed_daemon(&fixture.root, &runtime, &old).await;
-    next += 1;
-    let read = managed_claude_call(
-        &mut mcp,
-        &fixture.root,
-        next,
-        "review-session",
-        None,
-        "ide.read",
-        json!({"path":"src/lib.rs","lines":"1-2"}),
-    )
-    .await;
-    assert_eq!(
-        read["state"], "unavailable",
-        "stop must require a new explicit start: {read}"
-    );
-    mcp.close().await;
-}
-
-/// Codex retains its known activation when its daemon dies so a subsequent stop can acknowledge it.
-#[tokio::test]
-async fn review_codex_stop_after_restart_reports_already_stopped() {
-    let _lock = MANAGED_CODEX_TEST_LOCK.lock().await;
-    let fixture = ProductFixture::new(json!([]));
-    let before = managed_runtime_paths(&fixture);
-    let mut mcp = Mcp::start_managed(&fixture.config, &fixture.root).await;
-    let runtime = managed_runtime_paths(&fixture)
-        .difference(&before)
-        .next()
-        .unwrap()
-        .clone();
-    let state = fixture.state();
-    let mut next = 10;
-    let started = managed_call(
-        &mut mcp,
-        next,
-        "review-codex",
-        "ide.start",
-        json!({"activation_id":"review-codex"}),
-        &state,
-    )
-    .await;
-    assert_eq!(
-        settle_managed(&mut mcp, &mut next, "review-codex", &state, started).await["kind"],
-        "activation"
-    );
-    let pid = managed_daemon_pid(&runtime).await;
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    next += 1;
-    let reply = managed_call(
-        &mut mcp,
-        next,
-        "review-codex",
-        "ide.stop",
-        json!({}),
-        &state,
-    )
-    .await;
-    assert_eq!(reply["kind"], "stop", "{reply}");
-    assert!(
-        reply["text"]
-            .as_str()
-            .unwrap()
-            .contains("the IDE had already restarted"),
-        "{reply}"
-    );
-    mcp.close().await;
-}
-
-/// Losing an edit's IPC reply reports possible application and never resends the mutation.
-/// A deliberate retry of the consumed call identity answers replay while the file remains written.
-#[tokio::test]
-async fn managed_claude_lost_edit_reply_is_not_resent() {
-    let fixture = ProductFixture::new(json!([]));
-    let runtime = managed_claude_runtime_path(&fixture.root);
-    let _guard = SharedClaudeDaemonGuard(runtime.clone());
-    let mut mcp = Mcp::start_managed_claude_with_seam(
-        &fixture.config,
-        &fixture.root,
-        Some(("AGENT_IDE_TEST_DROP_EDIT_REPLY", "1")),
-    )
-    .await;
-    let mut next = 1;
-    let pending = managed_claude_call(
-        &mut mcp,
-        &fixture.root,
-        next,
-        "lost-edit-session",
-        None,
-        "ide.start",
-        json!({"activation_id":"lost-edit"}),
-    )
-    .await;
-    let started = settle_managed_claude_start(
-        &mut mcp,
-        &fixture.root,
-        &mut next,
-        "lost-edit-session",
-        None,
-        &pending,
-    )
-    .await;
-    assert_eq!(started["kind"], "activation", "{started}");
-    next += 1;
-    let call = format!("managed-claude-{next}");
-    let mut pre = managed_claude_event("PreToolUse", "lost-edit-session", None, &call);
-    pre["cwd"] = json!(&fixture.root);
-    assert!(
-        managed_claude_hook(Some(&fixture.root), pre)
-            .await
-            .status
-            .success()
-    );
-    let content = "/// Written once despite a lost reply.\npub fn once() {}\n";
-    let request = json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.edit","arguments":{"operation_id":"lost-edit-once","path":"src/once.rs","content":content},"_meta":{"claudecode/toolUseId":call}}});
-    let reply = mcp.exchange(request.clone()).await;
-    assert_eq!(reply["result"]["isError"], true, "{reply}");
-    let text = assert_claude_envelope(&reply);
-    assert!(
-        text.contains("outcome_unknown")
-            && text.contains("may have applied")
-            && text.contains("ide.diff"),
-        "{text}"
-    );
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while !fixture.root.join("src/once.rs").exists() && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(
-        std::fs::read_to_string(fixture.root.join("src/once.rs")).unwrap(),
-        content
-    );
-    // No second pre: this is the same lost-reply transport request, not a fresh edit.
-    next += 1;
-    let mut replay_request = request;
-    replay_request["id"] = json!(next);
-    let replay = mcp.exchange(replay_request).await;
-    let text = assert_claude_envelope(&replay);
-    assert!(
-        text.contains("host_binding (replay)") && !text.contains("missing_pre"),
-        "{text}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(fixture.root.join("src/once.rs")).unwrap(),
-        content
-    );
-    next += 1;
-    let diff = managed_claude_call(
-        &mut mcp,
-        &fixture.root,
-        next,
-        "lost-edit-session",
-        None,
-        "ide.diff",
-        json!({}),
-    )
-    .await;
-    let diff = settle_managed_claude_start(
-        &mut mcp,
-        &fixture.root,
-        &mut next,
-        "lost-edit-session",
-        None,
-        &diff,
-    )
-    .await;
-    assert_eq!(diff["kind"], "diff", "{diff}");
-    next += 1;
-    let stopped = managed_claude_call(
-        &mut mcp,
-        &fixture.root,
-        next,
-        "lost-edit-session",
-        None,
-        "ide.stop",
-        json!({}),
-    )
-    .await;
-    assert_eq!(stopped["kind"], "stop", "{stopped}");
-    mcp.close().await;
-}
-
-/// One Claude MCP retains parent and child channels while three worktrees interleave reads,
-/// writes and stops. Uncached child roots first receive the existing explicit registration hint.
-#[tokio::test]
-async fn managed_claude_three_worktree_actors_keep_their_channels() {
-    let fixture = ProductFixture::new(json!([]));
-    let left = fixture.base.join("child-b");
-    let right = fixture.base.join("child-c");
-    for (branch, path) in [("child-b", &left), ("child-c", &right)] {
-        fixture.git(&[
-            "worktree",
-            "add",
-            "--quiet",
-            "-b",
-            branch,
-            path.to_str().unwrap(),
-        ]);
-    }
-    let runtime = managed_claude_runtime_path(&fixture.root);
-    let _guard = SharedClaudeDaemonGuard(runtime.clone());
-    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
-    let actors = [
-        (&fixture.root, None, "parent"),
-        (&left, Some("agent-b"), "child-b"),
-        (&right, Some("agent-c"), "child-c"),
-    ];
-    let mut next = 10;
-    for (project, agent, activation) in actors {
-        next += 1;
-        let mut reply = managed_claude_call(
-            &mut mcp,
-            project,
-            next,
-            "shared-session",
-            agent,
-            "ide.start",
-            json!({"activation_id":activation,"root":project}),
-        )
-        .await;
-        if reply["state"] == "unavailable" {
-            assert!(reply["reason"] == "host_binding", "{reply}");
-            next += 1;
-            reply = managed_claude_call(
-                &mut mcp,
-                project,
-                next,
-                "shared-session",
-                agent,
-                "ide.start",
-                json!({"activation_id":activation,"root":project}),
-            )
-            .await;
-        }
-        let started = settle_managed_claude_start(
-            &mut mcp,
-            project,
-            &mut next,
-            "shared-session",
-            agent,
-            &reply,
-        )
-        .await;
-        assert_eq!(started["kind"], "activation", "{activation}: {started}");
-    }
-    for (project, agent, activation) in actors {
-        next += 1;
-        let read = managed_claude_call(
-            &mut mcp,
-            project,
-            next,
-            "shared-session",
-            agent,
-            "ide.read",
-            json!({"path":"src/lib.rs","lines":"1-2"}),
-        )
-        .await;
-        let read = settle_managed_claude_start(
-            &mut mcp,
-            project,
-            &mut next,
-            "shared-session",
-            agent,
-            &read,
-        )
-        .await;
-        assert!(
-            read["text"].as_str().is_some_and(
-                |text| text.contains("source_ref: ") && text.contains("pub fn value()")
-            ),
-            "{activation}: {read}"
-        );
-        next += 1;
-        let content = format!(
-            "/// Identifies this actor's worktree.\npub fn actor() -> &'static str {{\n    \"{activation}\"\n}}\n"
-        );
-        let edit = managed_claude_call(
-            &mut mcp,
-            project,
-            next,
-            "shared-session",
-            agent,
-            "ide.edit",
-            json!({"operation_id":activation,"path":"src/actor.rs","content":content}),
-        )
-        .await;
-        let edit = settle_managed_claude_start(
-            &mut mcp,
-            project,
-            &mut next,
-            "shared-session",
-            agent,
-            &edit,
-        )
-        .await;
-        assert_eq!(edit["state"], "edit", "{activation}: {edit}");
-        assert_eq!(
-            std::fs::read_to_string(project.join("src/actor.rs")).unwrap(),
-            content
-        );
-    }
-    let stale = actors.map(|(project, _, _)| managed_claude_candidate_attachment(project));
-    terminate_shared_claude_daemon(&runtime);
-    for ((project, _, _), attachment) in actors.iter().zip(&stale) {
-        wait_for_healed_daemon(project, &runtime, attachment).await;
-    }
-    // No explicit starts: all three remembered actor roots must recover independently.
-    for (project, agent, activation) in actors {
-        next += 1;
-        let read = managed_claude_call(
-            &mut mcp,
-            project,
-            next,
-            "shared-session",
-            agent,
-            "ide.read",
-            json!({"path":"src/actor.rs","lines":"1-4"}),
-        )
-        .await;
-        let read = settle_managed_claude_start(
-            &mut mcp,
-            project,
-            &mut next,
-            "shared-session",
-            agent,
-            &read,
-        )
-        .await;
-        assert!(
-            read["text"]
-                .as_str()
-                .is_some_and(|text| text.contains(&format!("\"{activation}\""))),
-            "this actor's remembered root must survive sibling starts: {read}"
-        );
-    }
-    for (index, (project, agent, activation)) in actors.into_iter().enumerate() {
-        next += 1;
-        let stopped = managed_claude_call(
-            &mut mcp,
-            project,
-            next,
-            "shared-session",
-            agent,
-            "ide.stop",
-            json!({}),
-        )
-        .await;
-        let stopped = settle_managed_claude_start(
-            &mut mcp,
-            project,
-            &mut next,
-            "shared-session",
-            agent,
-            &stopped,
-        )
-        .await;
-        assert_eq!(stopped["kind"], "stop", "{activation}: {stopped}");
-        if let Some((peer, peer_agent, _)) = actors.get(index + 1) {
-            next += 1;
-            let read = managed_claude_call(
-                &mut mcp,
-                peer,
-                next,
-                "shared-session",
-                *peer_agent,
-                "ide.read",
-                json!({"path":"src/actor.rs","lines":"1-4"}),
-            )
-            .await;
-            let read = settle_managed_claude_start(
-                &mut mcp,
-                peer,
-                &mut next,
-                "shared-session",
-                *peer_agent,
-                &read,
-            )
-            .await;
-            assert!(
-                read["text"]
-                    .as_str()
-                    .is_some_and(|text| text.contains("source_ref: ")),
-                "stopping a sibling must leave this actor live: {read}"
-            );
-        }
-    }
-    mcp.close().await;
-}
-
 /// A fresh daemon started by its first non-root worktree pairs the real hook before the first MCP call.
 /// A stale cached key must be replaced before either worktree's hook-paired start flow begins.
 #[tokio::test]
@@ -5921,30 +5190,25 @@ async fn ide_stop_after_a_daemon_restart_answers_success() {
     terminate_shared_claude_daemon(&runtime);
     wait_for_healed_daemon(&fixture.root, &runtime, &stale_attachment).await;
 
-    // A genuine pre identifies the stopped actor; no other actor's intent may be guessed.
-    let pre = managed_claude_hook(
-        Some(&fixture.root),
-        managed_claude_event(
-            "PreToolUse",
-            "stop-session",
-            None,
-            "stop-after-restart-call",
-        ),
+    // The stop's own genuine pre reaches the healed daemon, which has no binding for the actor: the
+    // facade, which identified that actor and knew its activation, answers the session-shaped
+    // success instead of a host-binding error. (A stop without any pre is not identifiable and is
+    // refused honestly rather than guessed.)
+    next += 1;
+    let stopped = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "stop-session",
+        None,
+        "ide.stop",
+        json!({}),
     )
     .await;
-    assert!(pre.status.success() && pre.stderr.is_empty());
-    let stopped = mcp
-        .exchange(
-            json!({"jsonrpc":"2.0","id":next + 1,"method":"tools/call","params":{
-                "name":"ide.stop","arguments":{},
-                "_meta":{"claudecode/toolUseId":"stop-after-restart-call"}
-            }}),
-        )
-        .await;
-    let text = assert_claude_envelope(&stopped);
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
     assert_eq!(
-        text,
-        "complete stop: stopped (the IDE had already restarted)\nWorkspace authority is released; native edits remain on disk",
+        claude_text(&stopped),
+        "stopped (the IDE had already restarted)",
         "{stopped}"
     );
     mcp.close().await;
@@ -20732,4 +19996,667 @@ async fn configured_product_environment_switch_plate_with_due_test_line_keeps_th
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
+}
+
+/// Runs one managed Claude call for `agent` in `project` and settles a `pending` reply.
+async fn claude_settled_call(
+    mcp: &mut Mcp,
+    project: &Path,
+    next: &mut usize,
+    session: &str,
+    agent: Option<&str>,
+    name: &str,
+    arguments: Value,
+) -> Value {
+    *next += 1;
+    let reply = managed_claude_call(mcp, project, *next, session, agent, name, arguments).await;
+    settle_managed_claude_start(mcp, project, next, session, agent, &reply).await
+}
+
+/// Starts one actor in `root`. A worktree the session never registered refuses its first start
+/// (its pre-hook could not reach the daemon yet) with the retry hint; the repeat pairs. A loaded
+/// host can also miss one hook's 250 ms deadline, so a refused start is repeated at most twice.
+async fn claude_start_actor(
+    mcp: &mut Mcp,
+    root: &Path,
+    next: &mut usize,
+    session: &str,
+    agent: Option<&str>,
+    arguments: Value,
+) {
+    let mut reply = Value::Null;
+    for _ in 0..3 {
+        reply = claude_settled_call(
+            mcp,
+            root,
+            next,
+            session,
+            agent,
+            "ide.start",
+            arguments.clone(),
+        )
+        .await;
+        if reply["state"] != "unavailable" {
+            break;
+        }
+        assert_eq!(reply["reason"], "host_binding", "{reply}");
+    }
+    assert_eq!(reply["kind"], "activation", "{agent:?}: {reply}");
+}
+
+/// Reads the fixture's first lines for `agent` and requires that the read succeeded.
+async fn claude_read_ok(
+    mcp: &mut Mcp,
+    project: &Path,
+    next: &mut usize,
+    session: &str,
+    agent: Option<&str>,
+) {
+    let read = claude_settled_call(
+        mcp,
+        project,
+        next,
+        session,
+        agent,
+        "ide.read",
+        json!({"path":"src/lib.rs","lines":"1-2"}),
+    )
+    .await;
+    assert!(
+        claude_text(&read).contains("pub fn value()"),
+        "{agent:?}: {read}"
+    );
+}
+
+/// Adds sibling worktrees (not nested in the main checkout) to one fixture repository.
+fn add_worktrees(fixture: &ProductFixture, names: &[&str]) -> Vec<PathBuf> {
+    names
+        .iter()
+        .map(|name| {
+            let path = fixture.base.join(name);
+            fixture.git(&[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                name,
+                path.to_str().unwrap(),
+            ]);
+            path
+        })
+        .collect()
+}
+
+/// Three actors of one Claude session (parent plus two subagents with `agent_id`), each in its own
+/// worktree of one repository, share one MCP and one daemon: starts, reads, edits and stops
+/// interleave without stranding each other, and removing one stopped subagent's worktree leaves
+/// the others — and a fourth subagent starting afterwards — working. On 0.10.2 every subagent
+/// start moved the whole session, so the parent's next call failed `missing_pre`.
+#[tokio::test]
+async fn managed_claude_actors_in_three_worktrees_work_side_by_side() {
+    let fixture = ProductFixture::new(json!([]));
+    let worktrees = add_worktrees(&fixture, &["side-b", "side-c", "side-d"]);
+    let (left, right, extra) = (&worktrees[0], &worktrees[1], &worktrees[2]);
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime);
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let session = "side-by-side";
+    let actors = [
+        (&fixture.root, None, "parent"),
+        (left, Some("agent-b"), "child-b"),
+        (right, Some("agent-c"), "child-c"),
+    ];
+    let mut next = 10;
+    for (root, agent, activation) in actors {
+        claude_start_actor(
+            &mut mcp,
+            root,
+            &mut next,
+            session,
+            agent,
+            json!({"activation_id":activation,"root":root}),
+        )
+        .await;
+        // Every actor started so far still works after each sibling start.
+        for (peer, peer_agent, _) in actors {
+            if peer_agent.is_none() || *peer == *root || peer_agent < agent {
+                claude_read_ok(&mut mcp, peer, &mut next, session, peer_agent).await;
+            }
+        }
+    }
+    for (root, agent, activation) in actors {
+        let content = format!("pub fn actor() -> &'static str {{\n    \"{activation}\"\n}}\n");
+        let edit = claude_settled_call(
+            &mut mcp,
+            root,
+            &mut next,
+            session,
+            agent,
+            "ide.edit",
+            json!({"operation_id":activation,"path":"src/actor.rs","content":content}),
+        )
+        .await;
+        assert_eq!(edit["state"], "edit", "{activation}: {edit}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/actor.rs")).unwrap(),
+            content
+        );
+    }
+    let stopped = claude_settled_call(
+        &mut mcp,
+        left,
+        &mut next,
+        session,
+        Some("agent-b"),
+        "ide.stop",
+        json!({}),
+    )
+    .await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    fixture.git(&["worktree", "remove", "--force", left.to_str().unwrap()]);
+    claude_start_actor(
+        &mut mcp,
+        extra,
+        &mut next,
+        session,
+        Some("agent-d"),
+        json!({"activation_id":"child-d","root":extra}),
+    )
+    .await;
+    for (root, agent) in [
+        (&fixture.root, None),
+        (right, Some("agent-c")),
+        (extra, Some("agent-d")),
+    ] {
+        claude_read_ok(&mut mcp, root, &mut next, session, agent).await;
+    }
+    for (root, agent) in [
+        (right, Some("agent-c")),
+        (extra, Some("agent-d")),
+        (&fixture.root, None),
+    ] {
+        let stopped = claude_settled_call(
+            &mut mcp,
+            root,
+            &mut next,
+            session,
+            agent,
+            "ide.stop",
+            json!({}),
+        )
+        .await;
+        assert_eq!(stopped["kind"], "stop", "{agent:?}: {stopped}");
+    }
+    mcp.close().await;
+}
+
+/// After a daemon restart each remembered actor recovers transparently with its own root, an
+/// idle remembered actor blocks nobody, and a new subagent can start in a fresh worktree.
+#[tokio::test]
+async fn managed_claude_restart_recovers_each_actor_and_admits_a_new_subagent() {
+    let fixture = ProductFixture::new(json!([]));
+    let worktrees = add_worktrees(&fixture, &["restart-idle", "restart-busy", "restart-new"]);
+    let (idle, busy, fresh) = (&worktrees[0], &worktrees[1], &worktrees[2]);
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let session = "restart-actors";
+    let mut next = 10;
+    for (root, agent, activation) in [
+        (&fixture.root, None, "parent"),
+        (idle, Some("agent-idle"), "idle"),
+    ] {
+        claude_start_actor(
+            &mut mcp,
+            root,
+            &mut next,
+            session,
+            agent,
+            json!({"activation_id":activation,"root":root}),
+        )
+        .await;
+    }
+    // The busy subagent registers its worktree with one start naming it, then activates with a
+    // root-less start: the default root is the worktree its own pre-hook came from.
+    let registering = claude_settled_call(
+        &mut mcp,
+        busy,
+        &mut next,
+        session,
+        Some("agent-busy"),
+        "ide.start",
+        json!({"activation_id":"busy","root":busy}),
+    )
+    .await;
+    assert_eq!(registering["state"], "unavailable", "{registering}");
+    claude_start_actor(
+        &mut mcp,
+        busy,
+        &mut next,
+        session,
+        Some("agent-busy"),
+        json!({"activation_id":"busy"}),
+    )
+    .await;
+    std::fs::write(busy.join("busy.txt"), "busy-worktree\n").unwrap();
+    let stale = managed_claude_candidate_attachment(busy);
+    terminate_shared_claude_daemon(&runtime);
+    wait_for_healed_daemon(busy, &runtime, &stale).await;
+    claude_start_actor(
+        &mut mcp,
+        fresh,
+        &mut next,
+        session,
+        Some("agent-new"),
+        json!({"activation_id":"new","root":fresh}),
+    )
+    .await;
+    claude_read_ok(&mut mcp, &fixture.root, &mut next, session, None).await;
+    // The busy subagent recovers its own root, not the parent's or the last remembered one.
+    let context = claude_settled_call(
+        &mut mcp,
+        busy,
+        &mut next,
+        session,
+        Some("agent-busy"),
+        "ide.context",
+        json!({"path":"busy.txt"}),
+    )
+    .await;
+    assert!(claude_text(&context).contains("busy-worktree"), "{context}");
+    claude_read_ok(&mut mcp, fresh, &mut next, session, Some("agent-new")).await;
+    mcp.close().await;
+}
+
+/// Restart recovery has no time window: the first call long after the restart still recovers.
+#[tokio::test]
+async fn managed_claude_recovers_when_the_next_call_comes_much_later() {
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let mut next = 10;
+    claude_start_actor(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        "late-call",
+        None,
+        json!({"activation_id":"late"}),
+    )
+    .await;
+    let stale = managed_claude_candidate_attachment(&fixture.root);
+    terminate_shared_claude_daemon(&runtime);
+    wait_for_healed_daemon(&fixture.root, &runtime, &stale).await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    claude_read_ok(&mut mcp, &fixture.root, &mut next, "late-call", None).await;
+    mcp.close().await;
+}
+
+/// A reply lost on a LIVE daemon reports an unknown outcome without reconnecting or resending,
+/// and neither the caller nor its sibling loses its binding.
+#[tokio::test]
+async fn managed_claude_lost_reply_on_a_live_daemon_keeps_every_actor() {
+    let fixture = ProductFixture::new(json!([]));
+    let worktrees = add_worktrees(&fixture, &["lost-sibling"]);
+    let sibling = &worktrees[0];
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let mut mcp = Mcp::start_managed_claude_with_seam(
+        &fixture.config,
+        &fixture.root,
+        Some(("AGENT_IDE_TEST_DROP_REPLY", "read")),
+    )
+    .await;
+    let session = "lost-read";
+    let mut next = 10;
+    for (root, agent) in [(&fixture.root, None), (sibling, Some("agent-s"))] {
+        claude_start_actor(
+            &mut mcp,
+            root,
+            &mut next,
+            session,
+            agent,
+            json!({"activation_id":"lost","root":root}),
+        )
+        .await;
+    }
+    let attachment = managed_claude_candidate_attachment(&fixture.root);
+    next += 1;
+    let lost = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        session,
+        None,
+        "ide.read",
+        json!({"path":"src/lib.rs","lines":"1-2"}),
+    )
+    .await;
+    assert_eq!(lost["code"], "outcome_unknown:", "{lost}");
+    assert_eq!(
+        managed_claude_candidate_attachment(&fixture.root),
+        attachment
+    );
+    claude_read_ok(&mut mcp, sibling, &mut next, session, Some("agent-s")).await;
+    claude_read_ok(&mut mcp, &fixture.root, &mut next, session, None).await;
+    mcp.close().await;
+}
+
+/// A lost edit reply is reported as an unknown outcome, the edit is applied exactly once, and a
+/// repeat of the same call identity is named a replay, never a missing pre-hook.
+#[tokio::test]
+async fn managed_claude_lost_edit_reply_is_reported_and_never_resent() {
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime);
+    let mut mcp = Mcp::start_managed_claude_with_seam(
+        &fixture.config,
+        &fixture.root,
+        Some(("AGENT_IDE_TEST_DROP_REPLY", "edit")),
+    )
+    .await;
+    let session = "lost-edit";
+    let mut next = 10;
+    claude_start_actor(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        session,
+        None,
+        json!({"activation_id":"lost-edit"}),
+    )
+    .await;
+    next += 1;
+    let call = format!("managed-claude-{next}");
+    let pre = managed_claude_hook(
+        Some(&fixture.root),
+        managed_claude_event("PreToolUse", session, None, &call),
+    )
+    .await;
+    assert!(pre.status.success());
+    let content = "/// Written once despite a lost reply.\npub fn once() {}\n";
+    let request = json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.edit","arguments":{"operation_id":"lost-edit-once","path":"src/once.rs","content":content},"_meta":{"claudecode/toolUseId":call}}});
+    let reply = mcp.exchange(request.clone()).await;
+    let text = assert_claude_envelope(&reply);
+    assert!(
+        text.starts_with("error: outcome_unknown: ide.edit may have reached the IDE and applied")
+            && text.contains("ide.diff"),
+        "{text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("src/once.rs")).unwrap(),
+        content
+    );
+    next += 1;
+    let mut repeat = request;
+    repeat["id"] = json!(next);
+    let text = assert_claude_envelope(&mcp.exchange(repeat).await).to_owned();
+    assert!(
+        text.contains("host_binding (replay)") && !text.contains("missing_pre"),
+        "{text}"
+    );
+    claude_read_ok(&mut mcp, &fixture.root, &mut next, session, None).await;
+    mcp.close().await;
+}
+
+/// A stopped actor is never re-bound by restart recovery — neither after a confirmed stop nor
+/// after a stop whose reply was lost — while its sibling still recovers.
+#[tokio::test]
+async fn managed_claude_stopped_actor_is_never_recovered() {
+    let fixture = ProductFixture::new(json!([]));
+    let worktrees = add_worktrees(&fixture, &["stopped-lost", "stopped-done"]);
+    let (lost, done) = (&worktrees[0], &worktrees[1]);
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let mut mcp = Mcp::start_managed_claude_with_seam(
+        &fixture.config,
+        &fixture.root,
+        Some(("AGENT_IDE_TEST_DROP_REPLY", "stop")),
+    )
+    .await;
+    let session = "stopped-actors";
+    let mut next = 10;
+    for (root, agent, activation) in [
+        (&fixture.root, None, "parent"),
+        (lost, Some("agent-lost"), "lost"),
+        (done, Some("agent-done"), "done"),
+    ] {
+        claude_start_actor(
+            &mut mcp,
+            root,
+            &mut next,
+            session,
+            agent,
+            json!({"activation_id":activation,"root":root}),
+        )
+        .await;
+    }
+    // The lost stop, then a host repeat of the same call without a second pre-hook while the
+    // sibling's memory still exists: the repeat is named a replay, never a missing pre-hook.
+    next += 1;
+    let call = format!("managed-claude-{next}");
+    let pre = managed_claude_hook(
+        Some(lost),
+        managed_claude_event("PreToolUse", session, Some("agent-lost"), &call),
+    )
+    .await;
+    assert!(pre.status.success());
+    let request = json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.stop","arguments":{},"_meta":{"claudecode/toolUseId":call}}});
+    let lost_stop = assert_claude_envelope(&mcp.exchange(request.clone()).await).to_owned();
+    assert!(
+        lost_stop.starts_with("error: outcome_unknown:"),
+        "{lost_stop}"
+    );
+    next += 1;
+    let mut repeat = request;
+    repeat["id"] = json!(next);
+    let repeated = assert_claude_envelope(&mcp.exchange(repeat).await).to_owned();
+    assert!(
+        repeated.contains("host_binding (replay)") && !repeated.contains("missing_pre"),
+        "{repeated}"
+    );
+    let done_stop = claude_settled_call(
+        &mut mcp,
+        done,
+        &mut next,
+        session,
+        Some("agent-done"),
+        "ide.stop",
+        json!({}),
+    )
+    .await;
+    assert_eq!(done_stop["kind"], "stop", "{done_stop}");
+    let stale = managed_claude_candidate_attachment(&fixture.root);
+    terminate_shared_claude_daemon(&runtime);
+    wait_for_healed_daemon(&fixture.root, &runtime, &stale).await;
+    for (root, agent) in [(lost, "agent-lost"), (done, "agent-done")] {
+        let read = claude_settled_call(
+            &mut mcp,
+            root,
+            &mut next,
+            session,
+            Some(agent),
+            "ide.read",
+            json!({"path":"src/lib.rs","lines":"1-2"}),
+        )
+        .await;
+        assert_eq!(
+            read["state"], "unavailable",
+            "{agent} must not be recovered: {read}"
+        );
+    }
+    claude_read_ok(&mut mcp, &fixture.root, &mut next, session, None).await;
+    mcp.close().await;
+}
+
+/// A daemon without this release's actor capabilities (the 0.10.2 contract) still serves a current
+/// managed Claude front: start, read and stop all work, and stop is never preceded by anything
+/// that could consume its pre-hook.
+#[tokio::test]
+async fn managed_claude_stop_works_against_a_daemon_without_actor_capabilities() {
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let mut mcp = Mcp::start_managed_claude_with_seam(
+        &fixture.config,
+        &fixture.root,
+        Some(("AGENT_IDE_TEST_LEGACY_CLAUDE_DAEMON", "1")),
+    )
+    .await;
+    let session = "legacy-daemon";
+    let mut next = 10;
+    claude_start_actor(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        session,
+        None,
+        json!({"activation_id":"legacy"}),
+    )
+    .await;
+    claude_read_ok(&mut mcp, &fixture.root, &mut next, session, None).await;
+    let stopped = claude_settled_call(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        session,
+        None,
+        "ide.stop",
+        json!({}),
+    )
+    .await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    // 0.10.2 restart recovery still works for the single remembered activation.
+    claude_start_actor(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        session,
+        None,
+        json!({"activation_id":"legacy-again"}),
+    )
+    .await;
+    let stale = managed_claude_candidate_attachment(&fixture.root);
+    terminate_shared_claude_daemon(&runtime);
+    wait_for_healed_daemon(&fixture.root, &runtime, &stale).await;
+    claude_read_ok(&mut mcp, &fixture.root, &mut next, session, None).await;
+    mcp.close().await;
+}
+
+/// A recovering actor's first call may reach the daemon before its pre-hook does: recovery waits
+/// for it and restores the actor's original permission (a reader stays a reader).
+#[tokio::test]
+async fn managed_claude_recovery_waits_for_a_late_pre_and_keeps_a_reader() {
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let session = "late-reader";
+    let mut next = 10;
+    claude_start_actor(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        session,
+        None,
+        json!({"activation_id":"reader","read_only":true}),
+    )
+    .await;
+    let stale = managed_claude_candidate_attachment(&fixture.root);
+    terminate_shared_claude_daemon(&runtime);
+    wait_for_healed_daemon(&fixture.root, &runtime, &stale).await;
+    next += 1;
+    mcp.send(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.read","arguments":{"path":"src/lib.rs","lines":"1-2"},"_meta":{"claudecode/toolUseId":"late-reader-call"}}})).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let pre = managed_claude_hook(
+        Some(&fixture.root),
+        managed_claude_event("PreToolUse", session, None, "late-reader-call"),
+    )
+    .await;
+    assert!(pre.status.success());
+    let reply = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let mut line = String::new();
+            assert_ne!(mcp.output.read_line(&mut line).await.unwrap(), 0);
+            let reply: Value = serde_json::from_str(&line).unwrap();
+            if reply["id"] == json!(next) {
+                break reply;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let read = claude_fields(assert_claude_envelope(&reply));
+    let read =
+        settle_managed_claude_start(&mut mcp, &fixture.root, &mut next, session, None, &read).await;
+    assert!(claude_text(&read).contains("pub fn value()"), "{read}");
+    let edit = claude_settled_call(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        session,
+        None,
+        "ide.edit",
+        json!({"operation_id":"reader-stays-reader","path":"src/new.rs","content":"pub fn blocked() {}\n"}),
+    )
+    .await;
+    assert!(
+        claude_text(&edit).starts_with("refused: read_only (ide.edit)"),
+        "{edit}"
+    );
+    assert!(!fixture.root.join("src/new.rs").exists());
+    mcp.close().await;
+}
+
+/// A managed Codex stop after its owned daemon died acknowledges the activation the restart
+/// already revoked, exactly as 0.10.2 did.
+#[tokio::test]
+async fn managed_codex_stop_after_daemon_restart_reports_already_stopped() {
+    let _lock = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let before = managed_runtime_paths(&fixture);
+    let mut mcp = Mcp::start_managed(&fixture.config, &fixture.root).await;
+    let runtime = managed_runtime_paths(&fixture)
+        .difference(&before)
+        .next()
+        .unwrap()
+        .clone();
+    let state = fixture.state();
+    let mut next = 10;
+    let started = managed_call(
+        &mut mcp,
+        next,
+        "codex-restart-stop",
+        "ide.start",
+        json!({"activation_id":"codex-restart-stop"}),
+        &state,
+    )
+    .await;
+    assert_eq!(
+        settle_managed(&mut mcp, &mut next, "codex-restart-stop", &state, started).await["kind"],
+        "activation"
+    );
+    let pid = managed_daemon_pid(&runtime).await;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    next += 1;
+    let reply = managed_call(
+        &mut mcp,
+        next,
+        "codex-restart-stop",
+        "ide.stop",
+        json!({}),
+        &state,
+    )
+    .await;
+    assert_eq!(reply["kind"], "stop", "{reply}");
+    assert!(
+        reply["text"]
+            .as_str()
+            .unwrap()
+            .contains("the IDE had already restarted"),
+        "{reply}"
+    );
+    mcp.close().await;
 }
