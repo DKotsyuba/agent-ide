@@ -46,6 +46,8 @@ unavailable: host_binding (inactive_binding); this session's IDE activation has 
 unavailable: host_binding (inactive_binding); this session's IDE activation has stopped. Call ide.start, then repeat this call, or continue with native tools
 {%- elif reason == "host_binding" and cause_tag == "never_activated" -%}
 unavailable: host_binding (never_activated); no IDE activation in this session yet. Call ide.start, then repeat this call, or continue with native tools
+{%- elif reason == "host_binding" and cause_tag == "recovery_needed" -%}
+unavailable: host_binding (recovery_needed); the IDE restarted and this session's activation is not restored yet. Call ide.start, then repeat this call, or continue with native tools
 {%- elif reason == "host_binding" and cause_tag == "capacity_exceeded" -%}
 unavailable: host_binding (capacity_exceeded); the daemon's session table is full. Call ide.stop, then ide.start, or continue with native tools
 {%- elif reason == "host_binding" and cause_tag == "host_unrecognized" -%}

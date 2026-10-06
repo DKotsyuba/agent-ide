@@ -62,6 +62,10 @@ pub enum HostBindingCause {
     InactiveBinding,
     /// This session never held an IDE activation in this daemon boot.
     NeverActivated,
+    /// The daemon restarted and this actor's remembered activation is not restored yet; the
+    /// call's pre-hook was kept, so the managed front re-activates the actor and repeats the call.
+    /// Only a front that announced its remembered actors ever receives it.
+    RecoveryNeeded,
     /// Bounded pending, binding, or replay storage is full for this scope.
     CapacityExceeded,
     /// The caller's `_meta` names no supported host contract, so no invocation can correlate.
@@ -120,6 +124,7 @@ impl HostBindingCause {
             Self::MissingInvocation => "missing_invocation".to_owned(),
             Self::InactiveBinding => "inactive_binding".to_owned(),
             Self::NeverActivated => "never_activated".to_owned(),
+            Self::RecoveryNeeded => "recovery_needed".to_owned(),
             Self::CapacityExceeded => "capacity_exceeded".to_owned(),
             Self::HostUnrecognized => "host_unrecognized".to_owned(),
             Self::ProjectMoved { bound, asked } => {

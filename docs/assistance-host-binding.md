@@ -43,6 +43,25 @@ pre-observation. `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, and `Permiss
 advance the native epoch and invalidate stale source references; inert tools do not. The managed
 Claude shared daemon remains one daemon per repository, with hooks rendezvousing to it.
 
+#### Several actors of one session (0.10.3)
+
+One Claude Code session can run several actors at once — the main agent and native subagents
+(hooks carry `agent_id`), each typically in its own worktree of the same repository — through one
+MCP process and one shared daemon. The managed shared Claude daemon therefore derives ONE channel
+from its nonce for every attachment it admitted (each attachment is still admitted first); other
+daemons keep one channel per attachment. Hooks from any registered worktree and calls through any
+attachment meet on that channel and pair exactly as before: the unique pre-hook with the call's
+`claudecode/toolUseId`, whose actor (`agent_id`, else `session_id`) owns the call, with ambiguity
+refused. Bindings stay keyed by actor, so actors remain isolated, and the attachment a call
+travels through only selects a worktree target. A root-less `ide.start` activates the worktree
+its own pre-hook came through (the dispatcher records, for each pending Claude pre, the
+attachment it arrived on, under the guard lock and pruned only to still-pending pres; a start
+whose recorded worktree vanished is refused before any binding changes). A subagent's start in an
+unregistered sibling worktree registers it (see the re-root rule below) instead of moving the
+session, so no actor's start, stop or removed worktree can strand another actor. Inherited limit:
+if the session's own home directory is removed and another registration purges it, its calls are
+refused until a restart or a `start{root}` moves the session to a live sibling.
+
 `agent-ide mcp --launcher-template ABSOLUTE_PATH` is the standard self-contained Codex entrypoint.
 It serves exactly the eleven `ide.*` tools — `ide.start`, `ide.context`, `ide.diff`,
 `ide.inspect`, `ide.stop`, `ide.edit`, `ide.outline`, `ide.read`, `ide.symbol`, `ide.graph`, and
@@ -83,29 +102,23 @@ cause proving this session's hooks no longer pair there — `hooks_not_delivered
 (this call's pre-hook never arrived). A start naming another admitted root then re-roots: the MCP
 canonicalizes and admits the root against the template's `allowed_roots` — the same single rule
 activation applies, with no additional permission layer — attaches through the exact fresh-session
-path of that directory (key cache, shared daemon, client lease, candidate attachment). The MCP
-retains its acquired attachment capabilities for that repository daemon: a child start never
-moves an already active parent's or sibling's channel. For each Claude call the daemon recovers
-the unique pre-hook attachment by `tool_use_id` within that MCP's retained capability set, then
-dispatches with that attachment's worktree target and exact actor binding. Ambiguous matches
-refuse with `mismatch`; another MCP's attachments are never searched. The routing actor key,
-attachment and default root travel only over private IPC and are removed before model replies
-or telemetry. A daemon acknowledgement removes retired capabilities from the MCP's retained set;
-an attachment purged after its worktree disappeared is ignored while matching surviving actors.
-Capabilities are bounded to 64 across repository endpoints, evicting the oldest unused entry
-while protecting the default endpoint and remembered activation routes. Recovery intents are
-bounded independently to the latest 32 actors. A previously uncached child worktree still needs its first start to register its
-hook cache; that refusal carries the repeat hint even when the daemon endpoint stays the same.
-Only a different daemon receives an immediate retry of the refused call. A start whose hooks
-still pair where it dispatched —
+path of that directory (key cache, shared daemon, client lease, candidate attachment), binds the
+session there, and retries the refused call. When the requested root is another worktree of
+the same repository and the daemon serving it is current, the session does not move at all: the
+MCP only registers that worktree (one short client-lease handshake that writes its key cache and
+candidate attachment, so its hooks reach the daemon), remembers it in a bounded sibling list that
+every later attach re-registers while the directory exists, and answers the refused call with the
+same retry hint. A target whose repository identity cannot be established (failed `git` probe and
+no readable `.git` evidence) is neither registered nor moved to. A start whose hooks still pair where it dispatched —
 including one naming another repository's admitted root — never re-roots: the daemon itself
 activates that root, so a cross-repository start can no longer strand a session between two
 daemons. The re-rooted call's own pre-hook necessarily ran before the new rendezvous existed, so
 its first reply is the cause-tagged refusal plus a stable `retry` hint rather than a hard failure,
 and the next call pairs once the host's hooks run in that directory; after a `missing_pre` re-root the hint also names the root-less
 `ide.start` that returns the session to the host's project directory, the same never-delivered
-evidence on which a root-less start re-roots back by itself. Another actor's pending recovery never
-blocks an explicit start or its own re-root decision. A root below no allowed root is never
+evidence on which a root-less start re-roots back by itself. No start re-roots while a daemon
+replacement awaits its re-activation: the replacement's fresh channel has seen no hook yet, which
+explains the refusal as well as a move would. A root below no allowed root is never
 re-rooted to; the daemon's own `outside_allowed_roots` error answers. A re-root that cannot attach
 answers `unavailable: host_binding (project_moved: bound to <path>, asked <path>); the IDE could not move to the requested root. Call ide.start under the session's current root, or continue with native tools`.
 
@@ -262,49 +275,61 @@ mechanisms keep the session usable without the agent being told to re-activate:
   MCP-before-pre ordering as permanent replay evidence, the dispatcher gives an absent Claude
   pre a bounded 600 ms arrival window; a call whose pre never arrives is still refused.
 - **Transparent re-activation.** The managed Claude MCP watches its held lease stream: EOF
-  means the generation ended, and it re-attaches at once so the host's next pre-hook already
-  finds a healthy rendezvous. The MCP remembers activation id and resolved root independently
-  for each daemon-proven actor, including admitted starts whose result is still pending. It
-  refreshes their hook caches only on the original repository endpoint, without moving the
-  default endpoint or lease. Hook cwd and logical activation root are kept separately, so a
-  cross-repository activation cannot redirect cache refresh. Transient refresh/lease failures
-  retain the intent; only definite missing or inadmissible worktrees retire it. During the first
-  five seconds after re-attachment, before the invoking actor's next
-  ordinary dispatch, it identifies that actor with a private read-only resolution request and
-  re-runs only that actor's pending start with the trusted
-  `claudecode/reactivation` host marker (never model arguments); the managed shared daemon
-  binds only a remembered actor whose genuine pending pre-hook reached one of the refreshed
-  attachments, without consuming it, under the same `allowed_roots` rule and the same replay
-  and capacity rules as any start. Resolution and actor-keyed reactivation retain the bounded
-  start pre-arrival window. After that recovery window, an unrecovered actor must explicitly
-  start again; idle siblings cause no continuing probe traffic. Definitive recovery
-  refusals retire only the failed actor's intent. A fresh explicit start clears only its actor's
-  pending recovery and preserves its reader role. Direct Codex ingress retains actor-addressed
-  activation memory and restart guidance without requiring Claude routing metadata.
+  means the generation ended, and it re-attaches at once (re-registering its sibling worktrees)
+  so the host's next pre-hook already finds a healthy rendezvous. A current daemon names the
+  actor of every start it resolved with a private actor tag (BLAKE3 of the actor id, carried only
+  over daemon IPC beside the reply, never rendered, granting nothing), and the MCP remembers each
+  admitted start's exact parameters — root, `read_only`, environment, activation id — under that
+  tag (at most 32 actors). After a replacement every managed Claude call announces the remembered
+  tags in `claudecode/recover`; when a call's own pre belongs to a listed actor that holds no
+  binding and never held one in this daemon generation, the daemon answers
+  `unavailable: host_binding (recovery_needed)` without consuming that pre. The MCP then re-runs
+  that actor's remembered start with the trusted `claudecode/reactivation` marker naming the real
+  call (the daemon binds exactly that call's pre actor, re-checked under the guard lock, refuses
+  an actor stopped in this generation, and consumes nothing) and sends the call once more without
+  that tag. There is no time window: an actor recovers on its first call however late, and an idle
+  actor costs nothing. A recovering call gets the start's 2.5 s pre arrival window. Starts and
+  stops of one MCP, actor recoveries and lease recovery are serialized, so remembered starts follow
+  the daemon's order.
+- **Stops are never recovered.** Before `ide.stop` the MCP sends a query with its own synthetic
+  call id and the real one in `claudecode/whois`; a current daemon answers the owning actor's tag
+  (or its exact refusal) without touching the pre, and the MCP forgets that actor before sending
+  the stop, which carries the expected tag (a pre now owned by anyone else is refused). An
+  unidentified stop is not sent. A daemon without the query sees an ordinary call with no pre and
+  refuses it unwrapped with `missing_pre` (any other unwrapped refusal is just a refusal): with
+  exactly one remembered actor the stop is that actor's, is forgotten and goes out as in 0.10.2;
+  with several, nothing is sent and every memory is kept (such a daemon never supported several
+  actors). A session that only ever met older daemons remembers no tags and stops directly, as in
+  0.10.2. On the daemon a stop also fences that actor for the rest of the generation and rejects
+  its other pending pres, so a delayed recovery can never bind it.
+- **Older daemons and Codex.** An activation answered without a tag (an older daemon, a Codex
+  host) uses the 0.10.2 single remembered activation and its eager re-activation before the next
+  ordinary call (never before a start or stop, and no longer from the lease watcher, which has no
+  call in hand); a current daemon then binds only an actor whose pre came through this MCP's own
+  attachment. The first tagged start discards that anonymous slot, an untagged start (an older
+  daemon serving again) discards tagged memory left by a replaced current daemon, and a stop whose
+  actor was identified never clears the slot; an anonymous activation remembered from an older daemon therefore
+  needs a fresh `ide.start` once a current daemon serves several actors (no migration). Every key above is inert on an older daemon, which reads only
+  `claudecode/toolUseId` and the presence of `claudecode/reactivation`. Documented limit for a
+  downgrade — a restart won by an older daemon after a current one remembered tagged actors: the
+  guarantee is safety, not transparent recovery. Such a daemon ignores the announcements, so an
+  actor's next call is refused honestly (`never_activated`, call `ide.start`), never bound to
+  another actor; its stop goes out only when exactly one actor is remembered, as described above.
   References issued by the dead generation are the one thing recovery cannot restore: an
   invalid `detail_ref` after a replacement appends "issued before the IDE restarted; re-read",
-  and `ide.stop` against a binding the replacement already revoked answers success-shaped
-  ("stopped (the IDE had already restarted)") when its actor is proven. A routeless Claude
-  stop cannot guess even a sole remembered actor. The private resolution probe is sent only
-  when the daemon advertises `-claude-resolve` in its opaque health generation. Older daemons
-  retain the original single-session activation/recovery path and receive stops directly.
-  A lost resolution reply reconnects and retries without claiming a stop was sent.
-  Stop intent disables only the proven actor's
-  recovery before dispatch, so a deadline or lost stop reply cannot resurrect it; a subsequent
-  fresh explicit start remains eligible for recovery. The guard also refuses implicit recovery
-  of an actor stopped in its current generation, fencing delayed recovery requests. Replay
-  refusals remain refusals.
+  and `ide.stop` of a known activation that a replacement already revoked answers success-shaped
+  ("stopped (the IDE had already restarted)").
 
-Claude recovery checks settling and settled-call evidence before looking for a pre-hook. A
-resent call whose pre was consumed answers `replay`, including after its terminal hook; it never
-claims that the original call lacked a pre. A genuine fresh pre for a different actor preserves
-that actor's independent call scope when IDs repeat; routing prefers the unique fresh pre over
-another actor's historical replay evidence. Both daemon and MCP accept complete IPC frames up to
-160 KiB. Once request writing begins, a missing, malformed or timed-out reply is
-`outcome_unknown`. The facade never automatically resends `ide.edit`, `ide.test` or `ide.stop`
-in that state: an edit directs the agent to verify with `ide.diff`, and a test directs it to
-inspect `ide.test` status before starting another run. Failure before writing can still
-re-establish the daemon and retry once. Read-only requests keep their bounded recovery path.
+### Lost replies (0.10.3)
+
+Once the request frame began to be written, a write or read failure, a malformed or explicitly
+unavailable reply, or a deadline means the daemon may have executed the call. The MCP never
+reconnects or resends it: a mutating tool (`ide.start`, `ide.stop`, `ide.edit`, `ide.test`)
+answers `error: outcome_unknown: … may have reached the IDE and applied` with the check to make
+first, and a read-only tool says to repeat the call (a read-only timeout keeps the 0.10.2 text).
+Only a call that was never delivered (connect failure) is retried after a reconnect. The MCP reads
+the daemon's full 160 KiB frame. A repeat of a call id this channel already validated or settled
+is answered `replay`, never `missing_pre`.
 
 Hook parsing rejects duplicate known JSON keys and retains only explicit host, phase, bounded
 identity, and optional call ID. Codex root events require `session_id`; native child events carry
@@ -354,7 +379,7 @@ Closed daemon outcomes are:
 
 | Outcome | Meaning |
 | --- | --- |
-| `{"state":"unavailable","reason":"host_binding"}` | No validated exact invocation. The compact text names one closed cause in parentheses (T15B): `(invalid_metadata)`, `(missing_field)`, `(invalid_field)`, `(invalid_attachment)`, `(unsupported_hook_phase)`, `(missing_invocation)`, `(outside_allowed_roots)`, `(hooks_not_delivered)`, `(missing_pre)`, `(replay)`, `(mismatch)`, `(inactive_binding)`, `(capacity_exceeded)`, `(host_unrecognized)`, or `(project_moved: bound to <path>, asked <path>)`; the refusal follows with the cause and next step. The same tag is the journal `detail`. The structured reply keeps its historical fields. |
+| `{"state":"unavailable","reason":"host_binding"}` | No validated exact invocation. The compact text names one closed cause in parentheses (T15B): `(invalid_metadata)`, `(missing_field)`, `(invalid_field)`, `(invalid_attachment)`, `(unsupported_hook_phase)`, `(missing_invocation)`, `(outside_allowed_roots)`, `(hooks_not_delivered)`, `(missing_pre)`, `(replay)`, `(mismatch)`, `(inactive_binding)`, `(never_activated)`, `(recovery_needed)`, `(capacity_exceeded)`, `(host_unrecognized)`, or `(project_moved: bound to <path>, asked <path>)`; the refusal follows with the cause and next step. The same tag is the journal `detail`. The structured reply keeps its historical fields. |
 | `{"state":"unavailable","reason":"workspace_activation"}` | Host invocation and current binding are proven; Workspace activation is not connected. |
 | `{"state":"hook_observed"}` | One pre-hook was retained; no authority or delivery claim. |
 | `{"state":"hook_settled"}` | One exact post-hook settled a validated invocation. |

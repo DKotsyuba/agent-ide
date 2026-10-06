@@ -1366,6 +1366,30 @@ async fn claude_rendezvous_key(candidate: &Path) -> PathBuf {
     }
 }
 
+/// The rendezvous key of a re-root target, or `None` while its repository identity is uncertain.
+///
+/// Unlike [`claude_rendezvous_key`], a failed probe never falls back to the directory itself: that
+/// fallback would classify a sibling worktree as another repository and move the whole session to a
+/// daemon keyed by the worktree. The `git` probe answers first, then the on-disk `.git` evidence;
+/// only a directory with provably no `.git` above it is its own key.
+async fn reroot_rendezvous_key(candidate: &Path) -> Option<PathBuf> {
+    if let Some(common_dir) = git_common_dir(candidate).await
+        && let Ok(key) = fs::canonicalize(common_dir)
+    {
+        return Some(key);
+    }
+    if let Some(key) = common_dir_from_git_files(candidate) {
+        return Some(key);
+    }
+    candidate
+        .ancestors()
+        .all(|dir| {
+            fs::symlink_metadata(dir.join(".git"))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        })
+        .then(|| candidate.to_owned())
+}
+
 /// Runs one bounded `git rev-parse --git-common-dir` probe and returns its absolute output path.
 ///
 /// Never removes, creates, or writes anything; a killed, failed, or malformed probe returns `None`.
@@ -2210,6 +2234,60 @@ struct ClaudeBinding {
     /// Canonical allowed roots copied once from the validated launcher template; a re-root admits
     /// only directories below one of these, exactly as activation itself does.
     allowed_roots: Vec<PathBuf>,
+    /// Other worktrees of the same repository registered for this session's actors (a subagent's
+    /// own worktree): every attach re-registers the ones that still exist, so their hooks reach a
+    /// restarted daemon too. Bounded by [`MAX_CLAUDE_SIBLINGS`], oldest dropped first.
+    siblings: Vec<PathBuf>,
+}
+
+/// Reports whether `path` definitely no longer is a directory (not found, or replaced by a
+/// non-directory); any other metadata failure is uncertain and keeps the path.
+fn definitely_gone(path: &Path) -> bool {
+    match fs::metadata(path) {
+        Ok(metadata) => !metadata.is_dir(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Most sibling worktrees one managed Claude session keeps registered.
+const MAX_CLAUDE_SIBLINGS: usize = 32;
+
+/// Registers `candidate` as a sibling of the session `binding` (see [`register_claude_sibling`])
+/// and remembers it for later re-registration, answering the facade's re-root outcome.
+async fn register_claude_sibling_into(
+    binding: &std::sync::Mutex<ClaudeBinding>,
+    key: &Path,
+    candidate: PathBuf,
+) -> RerootOutcome {
+    let Ok(runtime) = claude_runtime_path(key) else {
+        return RerootOutcome::Failed;
+    };
+    if !register_claude_sibling(&runtime, key, &candidate).await {
+        return RerootOutcome::Failed;
+    }
+    let mut shared = binding.lock().expect("claude binding mutex");
+    shared
+        .siblings
+        .retain(|sibling| sibling != &candidate && !definitely_gone(sibling));
+    if shared.siblings.len() >= MAX_CLAUDE_SIBLINGS {
+        shared.siblings.remove(0);
+    }
+    shared.siblings.push(candidate);
+    RerootOutcome::Registered
+}
+
+/// Registers one more worktree of the bound repository with its shared daemon and makes its hooks
+/// deliverable (key cache and candidate attachment), without moving the session: the daemon
+/// pairs every managed Claude attachment on one channel, so the session keeps dispatching through
+/// its own attachment while that worktree's actors are paired by their own pre-hooks.
+async fn register_claude_sibling(runtime: &Path, key: &Path, candidate: &Path) -> bool {
+    // The lease only performs the registration; dropping it leaves the target registered.
+    let Some((_lease, attachment)) = open_client_lease(runtime, candidate).await else {
+        return false;
+    };
+    write_claude_key_cache(candidate, key);
+    write_claude_candidate_attachment(candidate, &attachment);
+    true
 }
 
 /// Attaches one binding to its repository's shared daemon exactly as a fresh session there would.
@@ -2238,15 +2316,11 @@ async fn attach_claude_binding(
     )
     .await?;
     let (connection, attachment) = open_client_lease(&runtime_path, &binding.candidate).await?;
-    let supports_resolve = doctor_report(&runtime_path).await.is_ok_and(|report| {
-        matches!(report.status, DoctorStatus::Healthy { daemon_generation }
-            if agent_ide::app::daemon_supports_claude_resolve(&daemon_generation))
-    });
-    note.lock()
-        .expect("daemon currency note mutex")
-        .note_claude_resolve(supports_resolve);
     write_claude_candidate_attachment(&binding.candidate, &attachment);
     *lease.lock().await = Some(connection);
+    for sibling in binding.siblings.iter().filter(|sibling| sibling.is_dir()) {
+        register_claude_sibling(&runtime_path, &binding.key, sibling).await;
+    }
     Some((runtime_path, attachment))
 }
 
@@ -2278,6 +2352,7 @@ async fn run_managed_claude_mcp(
         candidate: candidate.clone(),
         key,
         allowed_roots,
+        siblings: Vec::new(),
     }));
     let lease: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
     // What every attach learns about the shared daemon's version currency (0.6.7): the initial
@@ -2316,7 +2391,6 @@ async fn run_managed_claude_mcp(
         note,
     ) {
         Some(facade) => {
-            let facade = facade.with_claude_refresh(claude_refresh_hook(Arc::clone(&binding)));
             // The held lease stream is a live death notice for the shared daemon: watching it
             // heals the session the moment a generation ends, instead of at the next failed tool
             // call, so the host's next pre-hook already finds a healthy rendezvous (T15B).
@@ -2362,7 +2436,8 @@ async fn watch_claude_lease(lease: Arc<Mutex<Option<UnixStream>>>, facade: Stdio
 /// daemon and stores it in `lease`, replacing (and thereby dropping) the dead one: otherwise the new
 /// daemon generation would see zero leases from this still-live MCP and idle out from under it.
 /// After a re-root (T15B) the shared binding already names the moved repository, so this same hook
-/// re-establishes that root's daemon.
+/// re-establishes that root's daemon. Sibling worktrees whose directory is definitely gone are
+/// dropped first, and a definitely removed home attaches through the first live sibling.
 fn claude_reestablish_hook(
     binding: Arc<std::sync::Mutex<ClaudeBinding>>,
     launcher_template: PathBuf,
@@ -2370,7 +2445,19 @@ fn claude_reestablish_hook(
     note: SharedDaemonNote,
 ) -> ReestablishFn {
     Arc::new(move || {
-        let binding = binding.lock().expect("claude binding mutex").clone();
+        let binding = {
+            let mut shared = binding.lock().expect("claude binding mutex");
+            // A removed sibling is retired for good; any other failure keeps it for the next try.
+            shared.siblings.retain(|sibling| !definitely_gone(sibling));
+            // A removed home cannot be attached again: the session survives through a live
+            // sibling of the same repository instead.
+            if definitely_gone(&shared.candidate)
+                && let Some(index) = shared.siblings.iter().position(|sibling| sibling.is_dir())
+            {
+                shared.candidate = shared.siblings.remove(index);
+            }
+            shared.clone()
+        };
         let launcher_template = launcher_template.clone();
         let lease = Arc::clone(&lease);
         let note = Arc::clone(&note);
@@ -2399,57 +2486,16 @@ fn claude_reestablish_hook(
     })
 }
 
-/// Refreshes a hook cache only on the supplied live repository daemon. The registered candidate
-/// gets a brief lease, while the default binding and its held lease are never moved or replaced.
-fn claude_refresh_hook(
-    binding: Arc<std::sync::Mutex<ClaudeBinding>>,
-) -> agent_ide::assistance::facade::RefreshFn {
-    Arc::new(move |runtime, requested| {
-        let allowed_roots = binding
-            .lock()
-            .expect("claude binding mutex")
-            .allowed_roots
-            .clone();
-        Box::pin(async move {
-            use agent_ide::assistance::facade::RefreshOutcome;
-            let candidate = match fs::canonicalize(requested) {
-                Ok(candidate) => candidate,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return RefreshOutcome::Retired;
-                }
-                Err(_) => return RefreshOutcome::Unavailable,
-            };
-            match agent_ide::assistance::launcher::admit_worktree(&allowed_roots, &candidate) {
-                Ok(_) => {}
-                Err(agent_ide::assistance::launcher::RootAdmissionError::Unresolvable) => {
-                    return RefreshOutcome::Unavailable;
-                }
-                Err(_) => return RefreshOutcome::Retired,
-            }
-            let key = claude_rendezvous_key(&candidate).await;
-            if claude_runtime_path(&key).ok().as_ref() != Some(&runtime) {
-                return RefreshOutcome::Retired;
-            }
-            let Some((connection, attachment)) = open_client_lease(&runtime, &candidate).await
-            else {
-                return RefreshOutcome::Unavailable;
-            };
-            write_claude_key_cache(&candidate, &key);
-            write_claude_candidate_attachment(&candidate, &attachment);
-            drop(connection);
-            RefreshOutcome::Attached(attachment)
-        })
-    })
-}
-
 /// Builds the closure a Claude [`StdioFacade`] calls to re-root a moved session (T15B).
 ///
 /// A host that moves a project never restarts this MCP process, so a session started in one
 /// directory stays bound there while its hooks already run with the new project directory and
 /// find no rendezvous. Only after the daemon refused a Start with a cause proving this session's
-/// hooks no longer pair there does the facade call this hook: `Some(root)` re-attaches through the
-/// exact fresh-session path of [`attach_claude_binding`] — key cache, shared daemon, lease,
-/// candidate attachment — and `None` returns to `startup`, the host's project directory this MCP
+/// hooks no longer pair there does the facade call this hook: `Some(root)` naming another worktree
+/// of the same repository on a current daemon only registers it ([`register_claude_sibling_into`];
+/// the daemon pairs every worktree on one channel, so nobody moves), any other admitted root
+/// re-attaches through the exact fresh-session path of [`attach_claude_binding`] — key cache,
+/// shared daemon, lease, candidate attachment — and `None` returns to `startup`, the host's project directory this MCP
 /// process began in, so a root-less start can never stay stranded on a root its session left. Only
 /// targets below the template's `allowed_roots` are accepted; that single rule is the whole
 /// security boundary and is unchanged.
@@ -2499,22 +2545,53 @@ fn claude_reroot_hook(
                             RerootOutcome::OutsideAllowedRoots
                         } else if candidate == current.candidate {
                             RerootOutcome::Unchanged
-                        } else {
-                            let key = claude_rendezvous_key(&candidate).await;
-                            let moved = ClaudeBinding {
-                                candidate: candidate.clone(),
-                                key,
-                                allowed_roots: current.allowed_roots.clone(),
-                            };
-                            match attach_claude_binding(&moved, &launcher_template, &lease, &note)
-                                .await
+                        } else if let Some(key) = reroot_rendezvous_key(&candidate).await {
+                            let same_repository = key == current.key;
+                            let current_daemon = note
+                                .lock()
+                                .expect("daemon currency note mutex")
+                                .line()
+                                .is_none();
+                            if same_repository
+                                && current_daemon
+                                && !definitely_gone(&current.candidate)
                             {
-                                Some((runtime, attachment)) => {
-                                    *binding.lock().expect("claude binding mutex") = moved;
-                                    RerootOutcome::Attached(runtime, attachment, candidate)
+                                // Same repository on a current daemon: register the worktree for
+                                // its actors' hooks and keep the session where it is. An outdated
+                                // daemon still pairs per attachment, so it keeps the 0.10.2 move
+                                // below, and a removed home moves the session to this worktree.
+                                register_claude_sibling_into(&binding, &current.key, candidate)
+                                    .await
+                            } else {
+                                let moved = ClaudeBinding {
+                                    candidate: candidate.clone(),
+                                    key,
+                                    allowed_roots: current.allowed_roots.clone(),
+                                    // Siblings belong to their own repository's daemon.
+                                    siblings: if same_repository {
+                                        current.siblings.clone()
+                                    } else {
+                                        Vec::new()
+                                    },
+                                };
+                                match attach_claude_binding(
+                                    &moved,
+                                    &launcher_template,
+                                    &lease,
+                                    &note,
+                                )
+                                .await
+                                {
+                                    Some((runtime, attachment)) => {
+                                        *binding.lock().expect("claude binding mutex") = moved;
+                                        RerootOutcome::Attached(runtime, attachment, candidate)
+                                    }
+                                    None => RerootOutcome::Failed,
                                 }
-                                None => RerootOutcome::Failed,
                             }
+                        } else {
+                            // Uncertain repository identity never moves or registers anything.
+                            RerootOutcome::Failed
                         }
                     }
                 }
@@ -2523,7 +2600,9 @@ fn claude_reroot_hook(
                 agent_ide::errorlog::Method::Client,
                 if matches!(
                     outcome,
-                    RerootOutcome::Attached(..) | RerootOutcome::Unchanged
+                    RerootOutcome::Attached(..)
+                        | RerootOutcome::Registered
+                        | RerootOutcome::Unchanged
                 ) {
                     agent_ide::errorlog::Outcome::Completed
                 } else {
@@ -2537,6 +2616,7 @@ fn claude_reroot_hook(
                     detail: Some(match &outcome {
                         RerootOutcome::Unchanged => "reroot:unchanged",
                         RerootOutcome::Attached(..) => "reroot:attached",
+                        RerootOutcome::Registered => "reroot:registered",
                         RerootOutcome::OutsideAllowedRoots => "reroot:outside_allowed_roots",
                         RerootOutcome::Failed => "reroot:failed",
                     }),

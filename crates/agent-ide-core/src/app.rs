@@ -38,9 +38,10 @@ const LOCK_NAME: &str = "agent-ide.lock";
 const WIRE_VERSION: u8 = 1;
 const MAX_REQUEST_ID_BYTES: usize = 128;
 const MAX_V1_FRAME_BYTES: usize = 64 * 1024;
-/// Shared daemon/facade cap for a complete Assistance IPC frame, including its envelope.
+/// Cap for one complete Assistance IPC frame, shared by the daemon and the MCP facade's reader.
 pub(crate) const MAX_V2_FRAME_BYTES: usize = 160 * 1024;
-const MAX_ASSISTANCE_JSON_BYTES: usize = 144 * 1024;
+/// Cap for one Assistance JSON payload inside a frame.
+pub(crate) const MAX_ASSISTANCE_JSON_BYTES: usize = 144 * 1024;
 /// Maximum time to wait for an Assistance method reply after its request is written.
 const METHOD_DISPATCH_BUDGET: Duration = Duration::from_secs(10);
 /// Total connect, request, and acknowledgement budget when a Codex MCP opens its client lease.
@@ -467,10 +468,10 @@ pub async fn submit_hook_if_running(
 
 /// Connects to an already-running daemon for one closed v2-v5 method dispatch without starting it.
 ///
-/// Connect faults return `Unavailable` and connect timeouts return `TimedOut`. Once writing
-/// begins, absent or invalid replies return `OutcomeUnknown` and deadlines return
-/// `WrittenTimedOut`: the operation may have applied, while read-only timeouts need no reconnect.
-/// Application never retries, renders, or reinterprets the opaque result.
+/// Connect faults return `Unavailable` and a connect deadline `TimedOut`: the request was never
+/// delivered. Once writing the request began, any missing, malformed or explicitly unavailable
+/// reply returns `OutcomeUnknown` and an elapsed deadline `WrittenTimedOut`, because the daemon may
+/// have executed the call. Application does not retry, render, or reinterpret the opaque result.
 /// Connect and request write share the hook transport deadline; after the write, reply waiting gets
 /// the longer method budget. A short no-reply interval checks daemon health before keeping the
 /// request open, so a paused daemon fails fast while a live worker retains the full method budget.
@@ -524,6 +525,7 @@ pub async fn dispatch_method_if_running(
     .await
     {
         Ok(Ok(())) => {}
+        // Writing began: a partial frame may already have reached the daemon.
         Ok(Err(_)) => return MethodDispatchTransportResult::OutcomeUnknown,
         Err(_) => return MethodDispatchTransportResult::WrittenTimedOut,
     }
@@ -538,12 +540,7 @@ pub async fn dispatch_method_if_running(
     };
     let result = async {
         let reply: Value = read_frame(&mut stream, limits.max_frame_bytes).await?;
-        parse_method_dispatch_reply(&reply, &request).map(|reply| match reply {
-            MethodDispatchTransportResult::Unavailable => {
-                MethodDispatchTransportResult::OutcomeUnknown
-            }
-            other => other,
-        })
+        parse_method_dispatch_reply(&reply, &request)
     };
     tokio::pin!(result);
     match tokio::time::timeout_at(first_reply_deadline, &mut result).await {
@@ -1057,13 +1054,7 @@ async fn serve_assistance_request(
                 dispatcher.dispatch(AssistanceDispatch::MethodDispatch(dispatch.clone())),
             )
             .await;
-            /// Product seam losing one edit reply after dispatch; production never sets the flag.
-            static EDIT_REPLY_DROPPED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if dispatch.method() == AssistanceMethod::Edit
-                && std::env::var("AGENT_IDE_TEST_DROP_EDIT_REPLY").as_deref() == Ok("1")
-                && !EDIT_REPLY_DROPPED.swap(true, std::sync::atomic::Ordering::AcqRel)
-            {
+            if drop_reply_for_test(dispatch.method()) {
                 return Ok(());
             }
             let value = match reply {
@@ -1131,8 +1122,10 @@ fn parse_method_dispatch_reply(
     {
         return Err(invalid_transport("method reply correlation mismatch"));
     }
+    // An explicit unavailable reply (for example a result over the payload bound) can follow an
+    // executed call: the request was delivered, so its outcome is unknown, never "not sent".
     let Some(payload) = object.get("opaque_result_json") else {
-        return Ok(MethodDispatchTransportResult::Unavailable);
+        return Ok(MethodDispatchTransportResult::OutcomeUnknown);
     };
     let payload = OpaqueJson::from_value(payload, MAX_ASSISTANCE_JSON_BYTES)
         .ok_or_else(|| invalid_transport("invalid method reply payload"))?;
@@ -1318,7 +1311,6 @@ impl Drop for OwnedSocket {
 /// daemon's version and whether it runs from the same installed executable. A pre-0.6.7 daemon's
 /// bare random hex names neither and is therefore older than every version-reporting front. The
 /// identifier is opaque to older consumers, which compared generations only for equality.
-/// The `-claude-resolve` suffix advertises non-consuming Claude identity probes.
 fn new_generation() -> Result<String, AppError> {
     let mut bytes = [0_u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
@@ -1327,16 +1319,37 @@ fn new_generation() -> Result<String, AppError> {
         Some(version) => {
             let executable = std::env::current_exe()?;
             let hash = blake3::hash(executable.as_os_str().as_bytes()).to_hex();
-            Ok(format!("{version}-{hash}-{random}-claude-resolve"))
+            Ok(format!("{version}-{hash}-{random}"))
         }
         None => Ok(random),
     }
 }
 
-/// Reports the non-consuming Claude identity-probe capability in a health generation.
-/// Its opaque suffix preserves older health decoders and version/executable comparisons.
-pub fn daemon_supports_claude_resolve(generation: &str) -> bool {
-    generation.ends_with("-claude-resolve")
+/// Reports whether this daemon drops the reply of one executed method call, once.
+///
+/// The `AGENT_IDE_TEST_DROP_REPLY` seam names one method (`edit`, `read`, `stop`, ...): the first
+/// such call executes normally and its connection then closes without a reply, exactly the lost
+/// reply a front must report as an unknown outcome. Production never sets it.
+fn drop_reply_for_test(method: AssistanceMethod) -> bool {
+    static DROPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Ok(seamed) = std::env::var("AGENT_IDE_TEST_DROP_REPLY") else {
+        return false;
+    };
+    let named = match method {
+        AssistanceMethod::Start => "start",
+        AssistanceMethod::Context => "context",
+        AssistanceMethod::Diff => "diff",
+        AssistanceMethod::Inspect => "inspect",
+        AssistanceMethod::Stop => "stop",
+        AssistanceMethod::Edit => "edit",
+        AssistanceMethod::Outline => "outline",
+        AssistanceMethod::Read => "read",
+        AssistanceMethod::Symbol => "symbol",
+        AssistanceMethod::Graph => "graph",
+        AssistanceMethod::Test => "test",
+        AssistanceMethod::HookSubmit => return false,
+    };
+    seamed == named && !DROPPED.swap(true, std::sync::atomic::Ordering::AcqRel)
 }
 
 /// The product version this daemon reports in its generation identifier.
@@ -1572,12 +1585,7 @@ mod tests {
     #[test]
     fn generation_identifiers_carry_the_daemon_version() {
         let generation = new_generation().expect("OS randomness is available");
-        assert!(daemon_supports_claude_resolve(&generation));
-        assert!(!daemon_supports_claude_resolve("0.10.2-hash-random"));
-        let mut parts = generation
-            .strip_suffix("-claude-resolve")
-            .unwrap()
-            .splitn(3, '-');
+        let mut parts = generation.splitn(3, '-');
         let version = parts.next().expect("version is first");
         let executable_hash = parts.next().expect("executable hash follows version");
         let random = parts.next().expect("random generation is last");

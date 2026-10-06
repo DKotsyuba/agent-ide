@@ -820,6 +820,7 @@ mod tests {
             HostBindingCause::MissingInvocation,
             HostBindingCause::InactiveBinding,
             HostBindingCause::NeverActivated,
+            HostBindingCause::RecoveryNeeded,
             HostBindingCause::CapacityExceeded,
             HostBindingCause::HostUnrecognized,
             HostBindingCause::project_moved(
@@ -868,6 +869,9 @@ mod tests {
                 }
                 "never_activated" => {
                     "no IDE activation in this session yet. Call ide.start, then repeat this call, or continue with native tools"
+                }
+                "recovery_needed" => {
+                    "the IDE restarted and this session's activation is not restored yet. Call ide.start, then repeat this call, or continue with native tools"
                 }
                 "capacity_exceeded" => {
                     "the daemon's session table is full. Call ide.stop, then ide.start, or continue with native tools"
