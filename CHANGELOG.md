@@ -12,6 +12,7 @@
   65 536 (was 1 024), which also unblocks stores that already reached the old cap.
 - Shared result-store capacity now reclaims a caller’s own settled results and results from idle
   actors, while bounding source-reference protection per actor.
+- Line-range edits based on an edit that moved lines are refused until the file is re-read, and successful edits report their net line shift. Unmatched exact-text edits now point to the closest matching line window.
 
 ## 0.10.2 — 2026-10-06
 
