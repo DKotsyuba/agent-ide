@@ -3125,11 +3125,9 @@ async fn managed_claude_call(
     arguments: Value,
 ) -> Value {
     let call = format!("managed-claude-{id}");
-    let pre = managed_claude_hook(
-        Some(project),
-        managed_claude_event("PreToolUse", session, agent, &call),
-    )
-    .await;
+    let mut pre_event = managed_claude_event("PreToolUse", session, agent, &call);
+    pre_event["cwd"] = json!(project);
+    let pre = managed_claude_hook(Some(project), pre_event).await;
     assert!(
         pre.status.success() && pre.stdout.is_empty() && pre.stderr.is_empty(),
         "managed pre-hook failed: {}",
@@ -3142,11 +3140,9 @@ async fn managed_claude_call(
             }}),
         )
         .await;
-    let post = managed_claude_hook(
-        Some(project),
-        managed_claude_event("PostToolUse", session, agent, &call),
-    )
-    .await;
+    let mut post_event = managed_claude_event("PostToolUse", session, agent, &call);
+    post_event["cwd"] = json!(project);
+    let post = managed_claude_hook(Some(project), post_event).await;
     assert!(post.status.success() && post.stderr.is_empty());
     claude_fields(assert_claude_envelope(&reply))
 }
@@ -4557,6 +4553,326 @@ async fn managed_claude_root_child_rendezvous_shared_daemon_survives_eof() {
         runtime.is_dir(),
         "the shared daemon must outlive its spawning MCP's own EOF"
     );
+}
+
+/// Losing an edit's IPC reply reports possible application and never resends the mutation.
+/// A deliberate retry of the consumed call identity answers replay while the file remains written.
+#[tokio::test]
+async fn managed_claude_lost_edit_reply_is_not_resent() {
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let mut mcp = Mcp::start_managed_claude_with_seam(
+        &fixture.config,
+        &fixture.root,
+        Some(("AGENT_IDE_TEST_DROP_EDIT_REPLY", "1")),
+    )
+    .await;
+    let mut next = 1;
+    let pending = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "lost-edit-session",
+        None,
+        "ide.start",
+        json!({"activation_id":"lost-edit"}),
+    )
+    .await;
+    let started = settle_managed_claude_start(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        "lost-edit-session",
+        None,
+        &pending,
+    )
+    .await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    next += 1;
+    let call = format!("managed-claude-{next}");
+    let mut pre = managed_claude_event("PreToolUse", "lost-edit-session", None, &call);
+    pre["cwd"] = json!(&fixture.root);
+    assert!(
+        managed_claude_hook(Some(&fixture.root), pre)
+            .await
+            .status
+            .success()
+    );
+    let content = "/// Written once despite a lost reply.\npub fn once() {}\n";
+    let request = json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.edit","arguments":{"operation_id":"lost-edit-once","path":"src/once.rs","content":content},"_meta":{"claudecode/toolUseId":call}}});
+    let reply = mcp.exchange(request.clone()).await;
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    let text = assert_claude_envelope(&reply);
+    assert!(
+        text.contains("outcome_unknown")
+            && text.contains("may have applied")
+            && text.contains("ide.diff"),
+        "{text}"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !fixture.root.join("src/once.rs").exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("src/once.rs")).unwrap(),
+        content
+    );
+    // No second pre: this is the same lost-reply transport request, not a fresh edit.
+    next += 1;
+    let mut replay_request = request;
+    replay_request["id"] = json!(next);
+    let replay = mcp.exchange(replay_request).await;
+    let text = assert_claude_envelope(&replay);
+    assert!(
+        text.contains("host_binding (replay)") && !text.contains("missing_pre"),
+        "{text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("src/once.rs")).unwrap(),
+        content
+    );
+    next += 1;
+    let diff = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "lost-edit-session",
+        None,
+        "ide.diff",
+        json!({}),
+    )
+    .await;
+    let diff = settle_managed_claude_start(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        "lost-edit-session",
+        None,
+        &diff,
+    )
+    .await;
+    assert_eq!(diff["kind"], "diff", "{diff}");
+    next += 1;
+    let stopped = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "lost-edit-session",
+        None,
+        "ide.stop",
+        json!({}),
+    )
+    .await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    mcp.close().await;
+}
+
+/// One Claude MCP retains parent and child channels while three worktrees interleave reads,
+/// writes and stops. Uncached child roots first receive the existing explicit registration hint.
+#[tokio::test]
+async fn managed_claude_three_worktree_actors_keep_their_channels() {
+    let fixture = ProductFixture::new(json!([]));
+    let left = fixture.base.join("child-b");
+    let right = fixture.base.join("child-c");
+    for (branch, path) in [("child-b", &left), ("child-c", &right)] {
+        fixture.git(&[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            branch,
+            path.to_str().unwrap(),
+        ]);
+    }
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let actors = [
+        (&fixture.root, None, "parent"),
+        (&left, Some("agent-b"), "child-b"),
+        (&right, Some("agent-c"), "child-c"),
+    ];
+    let mut next = 10;
+    for (project, agent, activation) in actors {
+        next += 1;
+        let mut reply = managed_claude_call(
+            &mut mcp,
+            project,
+            next,
+            "shared-session",
+            agent,
+            "ide.start",
+            json!({"activation_id":activation,"root":project}),
+        )
+        .await;
+        if reply["state"] == "unavailable" {
+            assert!(reply["reason"] == "host_binding", "{reply}");
+            next += 1;
+            reply = managed_claude_call(
+                &mut mcp,
+                project,
+                next,
+                "shared-session",
+                agent,
+                "ide.start",
+                json!({"activation_id":activation,"root":project}),
+            )
+            .await;
+        }
+        let started = settle_managed_claude_start(
+            &mut mcp,
+            project,
+            &mut next,
+            "shared-session",
+            agent,
+            &reply,
+        )
+        .await;
+        assert_eq!(started["kind"], "activation", "{activation}: {started}");
+    }
+    for (project, agent, activation) in actors {
+        next += 1;
+        let read = managed_claude_call(
+            &mut mcp,
+            project,
+            next,
+            "shared-session",
+            agent,
+            "ide.read",
+            json!({"path":"src/lib.rs","lines":"1-2"}),
+        )
+        .await;
+        let read = settle_managed_claude_start(
+            &mut mcp,
+            project,
+            &mut next,
+            "shared-session",
+            agent,
+            &read,
+        )
+        .await;
+        assert!(
+            read["text"].as_str().is_some_and(
+                |text| text.contains("source_ref: ") && text.contains("pub fn value()")
+            ),
+            "{activation}: {read}"
+        );
+        next += 1;
+        let content = format!(
+            "/// Identifies this actor's worktree.\npub fn actor() -> &'static str {{\n    \"{activation}\"\n}}\n"
+        );
+        let edit = managed_claude_call(
+            &mut mcp,
+            project,
+            next,
+            "shared-session",
+            agent,
+            "ide.edit",
+            json!({"operation_id":activation,"path":"src/actor.rs","content":content}),
+        )
+        .await;
+        let edit = settle_managed_claude_start(
+            &mut mcp,
+            project,
+            &mut next,
+            "shared-session",
+            agent,
+            &edit,
+        )
+        .await;
+        assert_eq!(edit["state"], "edit", "{activation}: {edit}");
+        assert_eq!(
+            std::fs::read_to_string(project.join("src/actor.rs")).unwrap(),
+            content
+        );
+    }
+    let stale = actors.map(|(project, _, _)| managed_claude_candidate_attachment(project));
+    terminate_shared_claude_daemon(&runtime);
+    for ((project, _, _), attachment) in actors.iter().zip(&stale) {
+        wait_for_healed_daemon(project, &runtime, attachment).await;
+    }
+    // No explicit starts: all three remembered actor roots must recover independently.
+    for (project, agent, activation) in actors {
+        next += 1;
+        let read = managed_claude_call(
+            &mut mcp,
+            project,
+            next,
+            "shared-session",
+            agent,
+            "ide.read",
+            json!({"path":"src/actor.rs","lines":"1-4"}),
+        )
+        .await;
+        let read = settle_managed_claude_start(
+            &mut mcp,
+            project,
+            &mut next,
+            "shared-session",
+            agent,
+            &read,
+        )
+        .await;
+        assert!(
+            read["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(&format!("\"{activation}\""))),
+            "this actor's remembered root must survive sibling starts: {read}"
+        );
+    }
+    for (index, (project, agent, activation)) in actors.into_iter().enumerate() {
+        next += 1;
+        let stopped = managed_claude_call(
+            &mut mcp,
+            project,
+            next,
+            "shared-session",
+            agent,
+            "ide.stop",
+            json!({}),
+        )
+        .await;
+        let stopped = settle_managed_claude_start(
+            &mut mcp,
+            project,
+            &mut next,
+            "shared-session",
+            agent,
+            &stopped,
+        )
+        .await;
+        assert_eq!(stopped["kind"], "stop", "{activation}: {stopped}");
+        if let Some((peer, peer_agent, _)) = actors.get(index + 1) {
+            next += 1;
+            let read = managed_claude_call(
+                &mut mcp,
+                peer,
+                next,
+                "shared-session",
+                *peer_agent,
+                "ide.read",
+                json!({"path":"src/actor.rs","lines":"1-4"}),
+            )
+            .await;
+            let read = settle_managed_claude_start(
+                &mut mcp,
+                peer,
+                &mut next,
+                "shared-session",
+                *peer_agent,
+                &read,
+            )
+            .await;
+            assert!(
+                read["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("source_ref: ")),
+                "stopping a sibling must leave this actor live: {read}"
+            );
+        }
+    }
+    mcp.close().await;
 }
 
 /// A fresh daemon started by its first non-root worktree pairs the real hook before the first MCP call.

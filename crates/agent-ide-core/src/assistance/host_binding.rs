@@ -136,6 +136,12 @@ impl BindingRef {
         }
     }
 
+    /// Returns a private stable actor key for re-activation across daemon generations.
+    /// It grants no authority and is carried only over daemon IPC, never model replies.
+    pub(crate) fn actor_key(&self) -> String {
+        blake3::hash(self.actor_id.as_bytes()).to_hex().to_string()
+    }
+
     /// Returns a stable opaque persistence key without exposing actor/channel fields or minting proof.
     /// The domain and length framing preserve distinct actor, channel, and generation identities.
     pub(crate) fn fingerprint(&self) -> [u8; 32] {
@@ -1093,17 +1099,135 @@ impl HostBindingGuard {
         }
     }
 
+    /// Reports consumed/settled Claude evidence before pre recovery. A genuine fresh pre for
+    /// another actor retains its own scope even when that actor reuses a historical call id.
+    /// Without a pre, any retained same-channel Claude evidence prevents a missing-pre answer.
+    pub(crate) fn claude_replay(&self, call_id: &str, channel: &ChannelSessionRef) -> bool {
+        let actors = self
+            .pre_observed
+            .iter()
+            .filter(|(candidate, observed)| {
+                candidate.host == HostKind::Claude
+                    && candidate.call_id == call_id
+                    && observed == channel
+            })
+            .map(|(candidate, _)| candidate.actor_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let matches_actor = |actor: &str| actors.is_empty() || actors.contains(actor);
+        self.settling.keys().any(|(candidate, observed)| {
+            candidate.host == HostKind::Claude
+                && candidate.call_id == call_id
+                && observed == channel
+                && matches_actor(&candidate.actor_id)
+        }) || self.replays.get(channel).is_some_and(|scopes| {
+            scopes.iter().any(|((host, actor), calls)| {
+                *host == HostKind::Claude && matches_actor(actor) && calls.contains_key(call_id)
+            })
+        })
+    }
+
+    /// Selects one genuine Claude pre channel within a caller's acquired capabilities, refusing
+    /// ambiguity. An actor key restricts re-activation to that actor's pending pre. Only when no
+    /// fresh pre exists does ordinary routing consult historical replay evidence, so distinct
+    /// actors may reuse call ids without another actor's settled invocation choosing their root.
+    pub(crate) fn claude_call_channel(
+        &self,
+        call_id: &str,
+        channels: &[ChannelSessionRef],
+        actor_key: Option<&str>,
+    ) -> Result<Option<ChannelSessionRef>, BindingUnavailable> {
+        let mut matches = channels.iter().filter(|channel| match actor_key {
+            Some(key) => self.pre_observed.iter().any(|(candidate, observed)| {
+                candidate.host == HostKind::Claude
+                    && observed == *channel
+                    && blake3::hash(candidate.actor_id.as_bytes())
+                        .to_hex()
+                        .as_str()
+                        == key
+            }),
+            None => self.has_pre(call_id, channel),
+        });
+        let channel = matches.next().cloned();
+        if matches.next().is_some() {
+            return Err(BindingUnavailable::Mismatch);
+        }
+        if channel.is_some() || actor_key.is_some() {
+            return Ok(channel);
+        }
+        let mut matches = channels
+            .iter()
+            .filter(|channel| self.claude_replay(call_id, channel));
+        let channel = matches.next().cloned();
+        if matches.next().is_some() {
+            return Err(BindingUnavailable::Mismatch);
+        }
+        Ok(channel)
+    }
+
+    /// Re-activates only the remembered actor whose genuine pending pre is present on this
+    /// channel. The actor key is private IPC data, not authority, and the pre remains unconsumed.
+    pub(crate) fn reactivate_claude_actor(
+        &mut self,
+        call_id: &str,
+        channel: ChannelSessionRef,
+        actor_key: &str,
+    ) -> BindingStatus {
+        let actor = self
+            .pre_observed
+            .iter()
+            .find(|(candidate, observed)| {
+                candidate.host == HostKind::Claude
+                    && observed == &channel
+                    && blake3::hash(candidate.actor_id.as_bytes())
+                        .to_hex()
+                        .as_str()
+                        == actor_key
+            })
+            .map(|(candidate, _)| candidate.actor_id.clone());
+        let Some(actor_id) = actor else {
+            return BindingStatus::Unavailable(BindingUnavailable::MissingPre);
+        };
+        self.bind_established(
+            CandidateInvocation {
+                host: HostKind::Claude,
+                actor_id,
+                call_id: call_id.to_owned(),
+            },
+            channel,
+        )
+    }
+
+    /// Returns the private actor key only for one unique genuine, unconsumed Claude pre.
+    /// Missing, ambiguous and replayed calls have no recoverable actor and grant no authority.
+    pub(crate) fn claude_pre_actor_key(
+        &self,
+        call_id: &str,
+        channel: &ChannelSessionRef,
+    ) -> Option<String> {
+        self.recover_claude_candidate(call_id, channel)
+            .ok()
+            .map(|candidate| {
+                blake3::hash(candidate.actor_id.as_bytes())
+                    .to_hex()
+                    .to_string()
+            })
+    }
+
     /// Recovers the exact actor a matching Claude pre-hook already registered for one MCP call.
     ///
     /// Claude's trusted MCP metadata carries only `claudecode/toolUseId`, never an actor, session,
     /// or sandbox field. The actor must come from the trusted native pre-hook already observed for
-    /// this exact channel and tool call. Zero or more than one matching pre-observation is rejected
+    /// this exact channel and tool call. Consumed/settled calls answer replay before pre recovery.
+    /// Zero or more than one matching pre-observation is rejected
     /// rather than guessed, so this can never accept a cross-actor or wrong-channel replay.
     fn recover_claude_candidate(
         &self,
         call_id: &str,
         channel: &ChannelSessionRef,
     ) -> Result<CandidateInvocation, BindingUnavailable> {
+        if self.claude_replay(call_id, channel) {
+            return Err(BindingUnavailable::Replay);
+        }
         let mut matches = self.pre_observed.iter().filter(|(candidate, observed)| {
             candidate.host == HostKind::Claude
                 && candidate.call_id == call_id
@@ -1760,6 +1884,85 @@ mod tests {
         ));
     }
 
+    /// Routing searches only owned capabilities, refuses ambiguous pre-hooks, and preserves a
+    /// fresh actor's pre when another actor/channel has historical evidence for the same call id.
+    #[test]
+    fn claude_routing_requires_one_owned_channel() {
+        let mut guard = HostBindingGuard::default();
+        let left = channel("owned-left");
+        let right = channel("unowned-right");
+        guard.observe_hook(claude_pre("session", Some("b"), "call"), right.clone());
+        assert_eq!(
+            guard.claude_call_channel("call", std::slice::from_ref(&left), None),
+            Ok(None)
+        );
+        assert_eq!(
+            guard.claude_call_channel("call", std::slice::from_ref(&right), None),
+            Ok(Some(right.clone()))
+        );
+        guard.observe_hook(claude_pre("session", None, "call"), left.clone());
+        assert_eq!(
+            guard.claude_call_channel("call", &[left.clone(), right.clone()], None),
+            Err(BindingUnavailable::Mismatch)
+        );
+        assert!(matches!(
+            guard.establish_start_claude("call", right.clone()),
+            BindingStatus::Validated(_)
+        ));
+        assert_eq!(
+            guard.claude_call_channel("call", &[left.clone(), right.clone()], None),
+            Ok(Some(left.clone()))
+        );
+        assert!(matches!(
+            guard.establish_start_claude("call", left.clone()),
+            BindingStatus::Validated(_)
+        ));
+        guard.observe_hook(claude_pre("session", Some("c"), "call"), right.clone());
+        assert_eq!(
+            guard.claude_call_channel("call", &[left, right.clone()], None),
+            Ok(Some(right.clone()))
+        );
+        assert!(matches!(
+            guard.establish_start_claude("call", right),
+            BindingStatus::Validated(_)
+        ));
+    }
+
+    /// A consumed Claude pre retains replay evidence both before and after its terminal hook.
+    #[test]
+    fn consumed_claude_pre_answers_replay() {
+        let mut guard = HostBindingGuard::default();
+        let channel = channel("replay-channel");
+        guard.observe_hook(claude_pre("session", None, "start"), channel.clone());
+        assert!(matches!(
+            guard.establish_start_claude("start", channel.clone()),
+            BindingStatus::Validated(_)
+        ));
+        assert!(matches!(
+            guard.establish_start_claude("start", channel.clone()),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
+        ));
+        guard.observe_hook(claude_post("session", None, "start"), channel.clone());
+        guard.observe_hook(claude_pre("session", None, "edit"), channel.clone());
+        assert!(matches!(
+            guard.validate_active_claude("edit", channel.clone()),
+            BindingStatus::Validated(_)
+        ));
+        assert!(matches!(
+            guard.validate_active_claude("edit", channel.clone()),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
+        ));
+        guard.observe_hook(claude_post("session", None, "edit"), channel.clone());
+        assert!(matches!(
+            guard.validate_active_claude("edit", channel.clone()),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
+        ));
+        assert!(matches!(
+            guard.validate_read_only_claude("edit", channel),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
+        ));
+    }
+
     /// A pre lookup answers per exact call identity and channel, without consuming anything, so a
     /// dispatcher can wait for a merely-late pre before recording the ordering as replay
     /// evidence (T15B parallel calls).
@@ -2351,7 +2554,8 @@ mod tests {
         ));
     }
 
-    /// Consumes one unique same-channel Claude pre-hook and rejects missing or ambiguous matches.
+    /// Consumes one unique same-channel Claude pre; rejects absent/ambiguous matches and
+    /// reports consumed or duplicate-pre identities as replay before trying pre recovery.
     #[test]
     fn claude_start_recovers_one_exact_parent_or_child_pre_observation() {
         let mut guard = HostBindingGuard::default();
@@ -2378,7 +2582,7 @@ mod tests {
         ));
         assert!(matches!(
             guard.establish_start_claude("parent-call", first_channel.clone()),
-            BindingStatus::Unavailable(BindingUnavailable::MissingPre)
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
         ));
 
         let child_channel = channel("child-channel");
@@ -2423,7 +2627,7 @@ mod tests {
         ));
         assert!(matches!(
             duplicate.establish_start_claude("duplicate-call", duplicate_channel),
-            BindingStatus::Unavailable(BindingUnavailable::MissingPre)
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
         ));
     }
 

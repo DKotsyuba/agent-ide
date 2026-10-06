@@ -1485,14 +1485,29 @@ fn optional_string(
 }
 
 /// Holds opaque trusted host correlations that never come from model tool arguments.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct TrustedTransport {
     request_id: String,
     correlation_id: String,
     opaque_attachment: String,
     /// Selected MCP host metadata, absent for generic transport-only callers.
     host_meta: Option<Value>,
+    /// Private daemon-selected actor/attachment facts, stripped before rendering to the host.
+    route: SharedCallRoute,
 }
+
+/// Compares immutable trusted ingress facts; private reply routing is transient bookkeeping.
+impl PartialEq for TrustedTransport {
+    /// Ignores the mutable reply route while preserving the original ingress equality contract.
+    fn eq(&self, other: &Self) -> bool {
+        self.request_id == other.request_id
+            && self.correlation_id == other.correlation_id
+            && self.opaque_attachment == other.opaque_attachment
+            && self.host_meta == other.host_meta
+    }
+}
+/// Immutable ingress equality is reflexive; routing state cannot change that identity.
+impl Eq for TrustedTransport {}
 
 impl std::fmt::Debug for TrustedTransport {
     /// Hides every private correlation, launcher attachment and populated host metadata field.
@@ -1525,6 +1540,7 @@ impl TrustedTransport {
                 correlation_id,
                 opaque_attachment,
                 host_meta: None,
+                route: Arc::new(std::sync::Mutex::new(None)),
             })
     }
 }
@@ -1538,8 +1554,10 @@ pub enum FacadeOutcome {
     MissingHostMetadata,
     /// The daemon, IPC, or typed peer result was unavailable; native host work remains unblocked.
     Unavailable,
-    /// The daemon did not answer an admitted call in time; managed routes must not reconnect.
+    /// A connection or read-only reply timed out; managed routes never reconnect on this cause.
     TimedOut,
+    /// The request may have applied, but no valid reply arrived; mutating calls are never resent.
+    OutcomeUnknown,
     /// Transport failed and this managed client could not re-establish a daemon.
     ReestablishFailed,
     /// IPC accepted the envelope but no typed peer result was available for safe rendering.
@@ -1562,8 +1580,12 @@ impl AssistanceFacade {
     pub fn new(runtime_dir: PathBuf) -> Self {
         Self {
             runtime_dir: Some(runtime_dir),
-            limits: HookTransportLimits::new(128 * 1024, MAX_HOOK_BYTES, Duration::from_secs(1))
-                .expect("fixed Assistance transport limits are valid"),
+            limits: HookTransportLimits::new(
+                crate::app::MAX_V2_FRAME_BYTES,
+                MAX_HOOK_BYTES,
+                Duration::from_secs(1),
+            )
+            .expect("fixed Assistance transport limits are valid"),
         }
     }
 
@@ -1575,8 +1597,12 @@ impl AssistanceFacade {
     pub fn unavailable() -> Self {
         Self {
             runtime_dir: None,
-            limits: HookTransportLimits::new(128 * 1024, MAX_HOOK_BYTES, Duration::from_secs(1))
-                .expect("fixed Assistance transport limits are valid"),
+            limits: HookTransportLimits::new(
+                crate::app::MAX_V2_FRAME_BYTES,
+                MAX_HOOK_BYTES,
+                Duration::from_secs(1),
+            )
+            .expect("fixed Assistance transport limits are valid"),
         }
     }
 
@@ -1642,8 +1668,44 @@ impl AssistanceFacade {
         match dispatch_method_if_running(runtime_dir, request, self.limits).await {
             MethodDispatchTransportResult::Unavailable => FacadeOutcome::Unavailable,
             MethodDispatchTransportResult::TimedOut => FacadeOutcome::TimedOut,
+            MethodDispatchTransportResult::OutcomeUnknown => FacadeOutcome::OutcomeUnknown,
+            MethodDispatchTransportResult::WrittenTimedOut => {
+                if matches!(
+                    tool,
+                    AssistanceTool::Edit | AssistanceTool::Test | AssistanceTool::Stop
+                ) {
+                    FacadeOutcome::OutcomeUnknown
+                } else {
+                    FacadeOutcome::TimedOut
+                }
+            }
             MethodDispatchTransportResult::Dispatched { opaque_result_json } => {
-                match PeerReply::decode_delivered(opaque_result_json.as_str()) {
+                let mut delivered = opaque_result_json.as_str().to_owned();
+                if host
+                    .host_meta
+                    .as_ref()
+                    .is_some_and(|meta| meta.get("claudecode/attachments").is_some())
+                    && let Ok(wrapper) = serde_json::from_str::<Value>(&delivered)
+                    && let (Some(reply), Some(actor), Some(attachment)) = (
+                        wrapper.get("reply"),
+                        wrapper["route"]["actor"].as_str(),
+                        wrapper["route"]["attachment"].as_str(),
+                    )
+                {
+                    if actor.len() != 64
+                        || !actor.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        || attachment.len() > 128
+                    {
+                        return FacadeOutcome::Incomplete;
+                    }
+                    let Some(root) = wrapper["route"]["root"].as_str() else {
+                        return FacadeOutcome::Incomplete;
+                    };
+                    *host.route.lock().expect("private call route mutex") =
+                        Some((actor.to_owned(), attachment.to_owned(), root.to_owned()));
+                    delivered = reply.to_string();
+                }
+                match PeerReply::decode_delivered(&delivered) {
                     Some((
                         reply @ (PeerReply::Unavailable { .. }
                         | PeerReply::HostStopped {}
@@ -2050,13 +2112,19 @@ pub(crate) fn stall_rendezvous_for_test() {
     std::thread::sleep(Duration::from_millis(milliseconds.min(60_000)));
 }
 
-/// One remembered successful activation, the facts a transparent re-activation replays.
+/// One call's private daemon-selected actor key and attachment; never rendered or logged.
+type SharedCallRoute = Arc<std::sync::Mutex<Option<(String, String, String)>>>;
+
+/// One actor's last admitted activation intent, including a start whose result is still pending.
+/// Transparent recovery replays it only with that actor's genuine pre-hook evidence.
 #[derive(Clone, Debug)]
 struct RememberedActivation {
-    /// The model-supplied activation id of the successful `ide.start`.
+    /// Explicit activation id, or empty to retain the daemon's default-id behavior.
     activation_id: String,
-    /// The `root` argument that start carried, when it carried one.
+    /// Explicit root, or the daemon-selected attachment's default root, for this actor.
     root: Option<String>,
+    /// This actor still needs its activation restored after a daemon generation ended.
+    recovery_pending: bool,
 }
 
 /// What a managed front knows about the currency of the daemon it serves (0.6.7), shared between
@@ -2115,21 +2183,18 @@ impl DaemonCurrencyNote {
 /// One shared [`DaemonCurrencyNote`], held by the managed attach path and the facade together.
 pub type SharedDaemonNote = Arc<std::sync::Mutex<DaemonCurrencyNote>>;
 
-/// Shares one live `(runtime_dir, attachment)` pair across every clone of a [`StdioFacade`].
-///
-/// A managed daemon can exit while its MCP process keeps running. Every call reads the current
-/// pair and, on transport loss, re-runs `reestablish` once and stores its result for later calls.
-/// A managed Claude session additionally tracks the canonical project it is bound to, may carry a
-/// `reroot` hook that moves the whole pair (and the host's hook rendezvous) to another root after
-/// the daemon proved this session's hooks no longer pair where it dispatched (T15B), and remembers
-/// its last successful activation so a daemon replacement can be recovered transparently (T15B
-/// restart recovery).
+/// Shares a default endpoint and acquired Claude attachment capabilities across facade clones.
+/// A re-root selects the default endpoint while preserving sibling channels on the same daemon.
+/// Transport recovery replaces dead capabilities and restores each remembered actor independently
+/// from genuine hook evidence; a written mutation with a lost reply is never resent.
 #[derive(Clone)]
 struct ManagedConnection {
     current: Arc<Mutex<(PathBuf, String)>>,
     candidate: Arc<Mutex<Option<PathBuf>>>,
-    /// The last successful activation of this session, when it ever activated.
-    last_activation: Arc<Mutex<Option<RememberedActivation>>>,
+    /// Last admitted activation per daemon-proven actor key, independent of sibling starts.
+    last_activation: Arc<Mutex<BTreeMap<String, RememberedActivation>>>,
+    /// Acquired capabilities for the selected repository daemon; other endpoints are retired.
+    attachments: Arc<Mutex<BTreeMap<PathBuf, BTreeSet<String>>>>,
     /// Set while a daemon replacement still needs its binding transparently re-activated.
     recovery_pending: Arc<std::sync::atomic::AtomicBool>,
     /// Set from a daemon replacement until the next successful activation; references issued
@@ -2143,11 +2208,16 @@ struct ManagedConnection {
 }
 
 impl ManagedConnection {
+    /// Creates a bounded managed route set holding the initial endpoint capability.
     fn new(runtime_dir: PathBuf, attachment: String, reestablish: ReestablishFn) -> Self {
         Self {
+            attachments: Arc::new(Mutex::new(BTreeMap::from([(
+                runtime_dir.clone(),
+                BTreeSet::from([attachment.clone()]),
+            )]))),
             current: Arc::new(Mutex::new((runtime_dir, attachment))),
             candidate: Arc::new(Mutex::new(None)),
-            last_activation: Arc::new(Mutex::new(None)),
+            last_activation: Arc::new(Mutex::new(BTreeMap::new())),
             recovery_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             replaced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             note: None,
@@ -2181,11 +2251,20 @@ impl ManagedConnection {
         self
     }
 
+    /// Returns the current endpoint and its default attachment without changing actor routes.
     async fn current(&self) -> (PathBuf, String) {
         self.current.lock().await.clone()
     }
 
+    /// Retains an acquired attachment so another actor's start cannot move existing channels.
     async fn store(&self, runtime_dir: PathBuf, attachment: String) {
+        let mut attachments = self.attachments.lock().await;
+        attachments.retain(|runtime, _| runtime == &runtime_dir);
+        attachments
+            .entry(runtime_dir.clone())
+            .or_default()
+            .insert(attachment.clone());
+        drop(attachments);
         *self.current.lock().await = (runtime_dir, attachment);
     }
 
@@ -2200,7 +2279,10 @@ impl ManagedConnection {
     }
 
     /// Marks this session's daemon as replaced, with its binding awaiting re-activation.
-    fn mark_replaced(&self) {
+    async fn mark_replaced(&self) {
+        for activation in self.last_activation.lock().await.values_mut() {
+            activation.recovery_pending = true;
+        }
         self.recovery_pending
             .store(true, std::sync::atomic::Ordering::Release);
         self.replaced
@@ -2429,6 +2511,25 @@ impl StdioFacade {
         Some(host)
     }
 
+    /// Adds only this managed Claude MCP's acquired capabilities for the selected daemon.
+    /// These trusted IPC fields are unavailable to model arguments and stripped from replies.
+    async fn add_claude_attachments(&self, host: &mut TrustedTransport, runtime: &Path) {
+        let Some(reconnect) = &self.reconnect else {
+            return;
+        };
+        if reconnect.reroot.is_none() {
+            return;
+        }
+        if let Some(meta) = host.host_meta.as_mut().and_then(Value::as_object_mut)
+            && meta.contains_key("claudecode/toolUseId")
+        {
+            let attachments = reconnect.attachments.lock().await;
+            if let Some(owned) = attachments.get(runtime) {
+                meta.insert("claudecode/attachments".into(), json!(owned));
+            }
+        }
+    }
+
     /// Returns the current `(runtime_dir, attachment)` this facade should dispatch against.
     async fn current_connection(&self) -> Option<(PathBuf, String)> {
         match &self.reconnect {
@@ -2443,13 +2544,17 @@ impl StdioFacade {
     /// once, matching prior behaviour. A facade with `reconnect` additionally treats a transport
     /// `Unavailable` outcome as "the daemon may be gone": it calls the host's restart or rendezvous
     /// hook, stores the refreshed pair for itself and every later call, and retries this call
-    /// exactly once. A failed hook reports re-establishment failure; a still-unavailable retry
+    /// exactly once. An unknown outcome after writing never resends Edit, Test or Stop; those
+    /// calls require verification. Read-only unknown outcomes keep their bounded recovery path.
+    /// A failed hook reports re-establishment failure; a still-unavailable retry
     /// reports transport unavailability. There is no retry loop.
     ///
     /// A managed Claude session re-roots only after the daemon it dispatched a `Start` to refused
     /// that call with a closed cause proving this session's hooks no longer pair there (T15B,
     /// [`reroot_target`]): the reroot hook attaches through the target root's fresh-session path,
-    /// stores the new pair for every later call, and retries this call there. A Start whose hooks
+    /// retains the new capability alongside existing actor channels and changes the default pair.
+    /// Only a different daemon receives an immediate retry; the same daemon returns a repeat hint
+    /// so the host can deliver a fresh pre to the newly registered worktree. A Start whose hooks
     /// still pair — including one naming another repository's admitted root — never re-roots: the
     /// daemon itself activates that root, so a cross-repository start can no longer strand the
     /// session between two daemons. The retried call's own pre-hook ran before the new rendezvous
@@ -2464,6 +2569,7 @@ impl StdioFacade {
         tool: AssistanceTool,
         parameters: Value,
         context: &RequestContext<RoleServer>,
+        route: &SharedCallRoute,
     ) -> (FacadeOutcome, Resume) {
         let Some((runtime_dir, attachment)) = self.current_connection().await else {
             return (FacadeOutcome::MissingHostMetadata, Resume::Fresh);
@@ -2476,14 +2582,16 @@ impl StdioFacade {
             && reconnect
                 .recovery_pending
                 .load(std::sync::atomic::Ordering::Acquire)
-            && reconnect.last_activation.lock().await.is_some()
+            && !reconnect.last_activation.lock().await.is_empty()
         {
             self.reactivate_remembered_binding(&runtime_dir, &attachment)
                 .await;
         }
-        let Some(host) = self.build_host(&attachment, context) else {
+        let Some(mut host) = self.build_host(&attachment, context) else {
             return (FacadeOutcome::MissingHostMetadata, resume);
         };
+        host.route = Arc::clone(route);
+        self.add_claude_attachments(&mut host, &runtime_dir).await;
         // Managed Codex only: publish this process's route before the first dispatch of every
         // valid call. Idempotent, so retried calls after publication failure still publish.
         self.publish_codex_route(&context.meta).await;
@@ -2505,13 +2613,15 @@ impl StdioFacade {
                     reconnect.store_candidate(candidate).await;
                     // Only a genuinely different daemon can answer the retry: the refused call
                     // identity is already replay evidence on the daemon that refused it.
+                    resume = rerooted;
                     if new_runtime == runtime_dir {
                         return (outcome, resume);
                     }
-                    resume = rerooted;
-                    let Some(host) = self.build_host(&new_attachment, context) else {
+                    let Some(mut host) = self.build_host(&new_attachment, context) else {
                         return (FacadeOutcome::MissingHostMetadata, resume);
                     };
+                    host.route = Arc::clone(route);
+                    self.add_claude_attachments(&mut host, &new_runtime).await;
                     self.publish_codex_route(&context.meta).await;
                     let retried = self
                         .facade
@@ -2548,7 +2658,18 @@ impl StdioFacade {
         let Some(reconnect) = &self.reconnect else {
             return (outcome, resume);
         };
-        if !matches!(outcome, FacadeOutcome::Unavailable) {
+        if matches!(outcome, FacadeOutcome::OutcomeUnknown)
+            && matches!(
+                tool,
+                AssistanceTool::Edit | AssistanceTool::Test | AssistanceTool::Stop
+            )
+        {
+            return (outcome, resume);
+        }
+        if !matches!(
+            outcome,
+            FacadeOutcome::Unavailable | FacadeOutcome::OutcomeUnknown
+        ) {
             return (outcome, resume);
         }
         let Some((new_runtime, new_attachment)) = (reconnect.reestablish)().await else {
@@ -2557,22 +2678,54 @@ impl StdioFacade {
         if new_runtime != runtime_dir || new_attachment != attachment {
             resume = Resume::Restarted;
         }
+        if resume == Resume::Restarted {
+            reconnect.attachments.lock().await.clear();
+        }
         reconnect
             .store(new_runtime.clone(), new_attachment.clone())
             .await;
         if resume == Resume::Restarted {
             // The replacement discarded this session's binding; the next call re-activates it.
-            reconnect.mark_replaced();
+            reconnect.mark_replaced().await;
+            self.refresh_claude_roots().await;
         }
-        let Some(host) = self.build_host(&new_attachment, context) else {
+        let Some(mut host) = self.build_host(&new_attachment, context) else {
             return (outcome, resume);
         };
+        host.route = Arc::clone(route);
+        self.add_claude_attachments(&mut host, &new_runtime).await;
         self.publish_codex_route(&context.meta).await;
         let retried = self
             .facade
             .dispatch_at(&new_runtime, &host, tool, parameters)
             .await;
         (retried, resume)
+    }
+
+    /// Refreshes each remembered worktree's hook cache and capability after a daemon replacement.
+    /// Roots are still admitted by the existing attach hook; a failed refresh remains unavailable.
+    async fn refresh_claude_roots(&self) {
+        let Some(reconnect) = &self.reconnect else {
+            return;
+        };
+        let Some(reroot) = &reconnect.reroot else {
+            return;
+        };
+        let roots = reconnect
+            .last_activation
+            .lock()
+            .await
+            .values()
+            .filter_map(|activation| activation.root.clone())
+            .collect::<BTreeSet<_>>();
+        for root in roots {
+            if let RerootOutcome::Attached(runtime, attachment, candidate) =
+                reroot(Some(root)).await
+            {
+                reconnect.store(runtime, attachment).await;
+                reconnect.store_candidate(candidate).await;
+            }
+        }
     }
 
     /// Re-attaches after the shared daemon generation ended and marks the session for transparent
@@ -2587,68 +2740,87 @@ impl StdioFacade {
         let Some(reconnect) = &self.reconnect else {
             return false;
         };
-        reconnect.mark_replaced();
+        reconnect.mark_replaced().await;
         let Some((runtime, attachment)) = (reconnect.reestablish)().await else {
             return false;
         };
+        reconnect.attachments.lock().await.clear();
         reconnect.store(runtime.clone(), attachment.clone()).await;
+        self.refresh_claude_roots().await;
         self.reactivate_remembered_binding(&runtime, &attachment)
             .await;
         true
     }
 
-    /// Re-runs the remembered activation through the ordinary `ide.start` path, with the trusted
-    /// `claudecode/reactivation` host marker (T15B restart recovery).
-    ///
-    /// The daemon admits the root by the same `allowed_roots` rule as any start and binds from
-    /// the actor of a genuine pre-hook the channel already delivered, so a session whose next
-    /// pre arrived on the healed daemon re-activates without the agent doing anything.
+    /// Restores each remembered actor only when its genuine pending pre reached the healed
+    /// daemon. Sibling activations remain pending independently; no pre is consumed or guessed.
     async fn reactivate_remembered_binding(&self, runtime_dir: &Path, attachment: &str) {
         let Some(reconnect) = &self.reconnect else {
             return;
         };
-        let Some(remembered) = reconnect.last_activation.lock().await.clone() else {
-            return;
-        };
-        let mut parameters = json!({"activation_id": remembered.activation_id});
-        if let Some(root) = &remembered.root {
-            parameters["root"] = json!(root);
-        }
-        // Each attempt carries a fresh call identity (a synthetic call never receives its own
-        // post-hook, so its settling entry could not be reused), and an activation retry reuses
-        // the committed facts of the one in flight, so a bounded second attempt settles a first
-        // `pending` quickly.
-        for attempt in 0..3 {
-            let call = format!("reactivate-{}-{}", remembered.activation_id, attempt);
-            let Some(mut host) =
-                TrustedTransport::from_host_ingress(&call, &call, attachment.to_owned())
-            else {
-                return;
-            };
-            host.host_meta = Some(json!({
-                "claudecode/toolUseId": call,
-                "claudecode/reactivation": true,
-            }));
-            if let FacadeOutcome::Reply(reply, _) = self
-                .facade
-                .dispatch_at(
-                    runtime_dir,
-                    &host,
-                    AssistanceTool::Start,
-                    parameters.clone(),
-                )
-                .await
-                && matches!(
-                    reply.as_ref(),
-                    PeerReply::Complete {
-                        kind: ResultKind::Activation,
-                        ..
-                    }
-                )
-            {
-                reconnect.mark_activated();
-                return;
+        let remembered = reconnect.last_activation.lock().await.clone();
+        for (actor, activation) in remembered
+            .into_iter()
+            .filter(|(_, activation)| activation.recovery_pending)
+        {
+            let mut parameters = json!({});
+            if !activation.activation_id.is_empty() {
+                parameters["activation_id"] = json!(activation.activation_id);
             }
+            if let Some(root) = &activation.root {
+                parameters["root"] = json!(root);
+            }
+            for attempt in 0..3 {
+                let call = format!("reactivate-{}-{attempt}", &actor[..16]);
+                let Some(mut host) =
+                    TrustedTransport::from_host_ingress(&call, &call, attachment.to_owned())
+                else {
+                    break;
+                };
+                host.host_meta = Some(
+                    json!({"claudecode/toolUseId": call, "claudecode/reactivation": true, "claudecode/reactivation_actor": actor}),
+                );
+                self.add_claude_attachments(&mut host, runtime_dir).await;
+                match self
+                    .facade
+                    .dispatch_at(
+                        runtime_dir,
+                        &host,
+                        AssistanceTool::Start,
+                        parameters.clone(),
+                    )
+                    .await
+                {
+                    FacadeOutcome::Reply(reply, _)
+                        if matches!(
+                            reply.as_ref(),
+                            PeerReply::Complete {
+                                kind: ResultKind::Activation,
+                                ..
+                            }
+                        ) =>
+                    {
+                        if let Some(activation) =
+                            reconnect.last_activation.lock().await.get_mut(&actor)
+                        {
+                            activation.recovery_pending = false;
+                        }
+                        break;
+                    }
+                    FacadeOutcome::Reply(reply, _)
+                        if matches!(reply.as_ref(), PeerReply::Pending { .. }) => {}
+                    _ => break,
+                }
+            }
+        }
+        if reconnect
+            .last_activation
+            .lock()
+            .await
+            .values()
+            .all(|activation| !activation.recovery_pending)
+        {
+            reconnect.mark_activated();
         }
     }
 
@@ -2660,7 +2832,7 @@ impl StdioFacade {
         reconnect
             .replaced
             .load(std::sync::atomic::Ordering::Acquire)
-            && reconnect.last_activation.lock().await.is_some()
+            && !reconnect.last_activation.lock().await.is_empty()
     }
 
     /// Reports whether one reply refuses a reference only a daemon replacement invalidated.
@@ -2679,12 +2851,57 @@ impl StdioFacade {
             )
     }
 
-    /// Forgets the remembered activation after the session explicitly ended.
-    async fn forget_remembered_activation(&self) {
+    /// Forgets only the daemon-proven stopped actor, preserving every sibling's recovery intent.
+    async fn forget_remembered_activation(&self, actor: &str) {
         if let Some(reconnect) = &self.reconnect {
-            *reconnect.last_activation.lock().await = None;
-            reconnect.mark_activated();
+            let mut activations = reconnect.last_activation.lock().await;
+            activations.remove(actor);
+            if activations
+                .values()
+                .all(|activation| !activation.recovery_pending)
+            {
+                reconnect.mark_activated();
+            }
         }
+    }
+
+    /// Identifies a stop's already-revoked actor after replacement. Genuine pre evidence wins;
+    /// the historical hookless fallback is permitted only for one pending remembered actor.
+    /// Ambiguous multi-actor stops and replay/order refusals never forget another actor's start.
+    async fn revoked_stop_actor(
+        &self,
+        route: &Option<(String, String, String)>,
+        reply: &PeerReply,
+    ) -> Option<String> {
+        if !matches!(
+            reply,
+            PeerReply::Unavailable {
+                reason: MissingPeer::HostBinding,
+                cause: Some(
+                    HostBindingCause::InactiveBinding
+                        | HostBindingCause::NeverActivated
+                        | HostBindingCause::MissingPre
+                        | HostBindingCause::HooksNotDelivered
+                )
+            }
+        ) {
+            return None;
+        }
+        let reconnect = self.reconnect.as_ref()?;
+        let activations = reconnect.last_activation.lock().await;
+        if let Some((actor, _, _)) = route {
+            return activations
+                .get(actor)
+                .filter(|activation| activation.recovery_pending)
+                .map(|_| actor.clone());
+        }
+        if activations.len() != 1 {
+            return None;
+        }
+        activations
+            .iter()
+            .find(|(_, activation)| activation.recovery_pending)
+            .map(|(actor, _)| actor.clone())
     }
 
     /// Reads this session's daemon-currency knowledge for one about-to-render reply (0.6.7).
@@ -2763,7 +2980,9 @@ impl StdioFacade {
             return None;
         }
         let reconnect = self.reconnect.as_ref()?;
-        reconnect.last_activation.lock().await.as_ref()?;
+        if reconnect.last_activation.lock().await.is_empty() {
+            return None;
+        }
         let root = std::env::current_dir().ok()?;
         Some(format!(
             "call ide.start again naming the current directory: ide.start {{root: {}}}",
@@ -2782,15 +3001,17 @@ impl StdioFacade {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let stage_parameters = parameters.clone();
+        let route = Arc::new(std::sync::Mutex::new(None));
         let (outcome, resume) = match validate_call(tool, parameters.clone()) {
             Ok(_) => {
-                self.dispatch_with_reconnect(tool, parameters, &context)
+                self.dispatch_with_reconnect(tool, parameters, &context, &route)
                     .await
             }
             Err(error) => {
                 return CallToolResult::error(vec![ContentBlock::text(error.message(tool))]);
             }
         };
+        let actor_route = route.lock().expect("private call route mutex").clone();
         // The Claude host hands `structuredContent` straight to its model in place of `content`,
         // defeating the compact renderer (T14B); its calls therefore never receive that duplicate
         // JSON copy. `parse_host_kind` reads the same trusted per-call `_meta` shape `build_host`
@@ -2799,6 +3020,14 @@ impl StdioFacade {
         // Every failed reply names its stage: the failing path's own tag when it set one, else
         // the derived `<tool>:<reason>` default — the same tag the daemon journal records.
         let outcome = match outcome {
+            FacadeOutcome::Incomplete
+                if matches!(
+                    tool,
+                    AssistanceTool::Edit | AssistanceTool::Test | AssistanceTool::Stop
+                ) =>
+            {
+                FacadeOutcome::OutcomeUnknown
+            }
             FacadeOutcome::Reply(mut reply, status) => {
                 if let PeerReply::Error { code, detail } = reply.as_mut()
                     && detail.is_none()
@@ -2809,7 +3038,7 @@ impl StdioFacade {
             }
             other => other,
         };
-        // Remember every successful activation: its id and root are what a transparent
+        // Remember each actor's admitted start intent: its id and root are what a transparent
         // re-activation replays after a daemon replacement (T15B restart recovery).
         if let FacadeOutcome::Reply(reply, _) = &outcome
             && matches!(
@@ -2817,38 +3046,62 @@ impl StdioFacade {
                 PeerReply::Complete {
                     kind: ResultKind::Activation,
                     ..
-                }
+                } | PeerReply::Pending { .. }
             )
+            && tool == AssistanceTool::Start
             && let Some(reconnect) = &self.reconnect
-            && let Some(activation_id) = stage_parameters
-                .get("activation_id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
+            && let Some((actor, _, root)) = actor_route.clone()
         {
-            *reconnect.last_activation.lock().await = Some(RememberedActivation {
-                activation_id: activation_id.to_owned(),
-                root: stage_parameters
-                    .get("root")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            });
-            reconnect.mark_activated();
+            reconnect.last_activation.lock().await.insert(
+                actor,
+                RememberedActivation {
+                    activation_id: stage_parameters
+                        .get("activation_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    root: stage_parameters
+                        .get("root")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or(Some(root)),
+                    recovery_pending: false,
+                },
+            );
+            if reconnect
+                .last_activation
+                .lock()
+                .await
+                .values()
+                .all(|activation| !activation.recovery_pending)
+            {
+                reconnect.mark_activated();
+            }
+        }
+        if tool == AssistanceTool::Stop
+            && let FacadeOutcome::Reply(reply, _) = &outcome
+            && matches!(
+                reply.as_ref(),
+                PeerReply::HostStopped {}
+                    | PeerReply::Complete {
+                        kind: ResultKind::Stop,
+                        ..
+                    }
+            )
+            && self.reconnect.is_some()
+            && let Some((actor, _, _)) = actor_route.clone()
+        {
+            self.forget_remembered_activation(&actor).await;
         }
         // A stop that finds no binding because the daemon was replaced already achieved its
         // goal: the replacement revoked everything the stop would have revoked.
         let outcome = match outcome {
             FacadeOutcome::Reply(reply, status)
                 if tool == AssistanceTool::Stop
-                    && matches!(
-                        reply.as_ref(),
-                        PeerReply::Unavailable {
-                            reason: MissingPeer::HostBinding,
-                            ..
-                        }
-                    )
-                    && self.binding_was_replaced().await =>
+                    && let Some(actor) =
+                        self.revoked_stop_actor(&actor_route, reply.as_ref()).await =>
             {
-                self.forget_remembered_activation().await;
+                self.forget_remembered_activation(&actor).await;
                 FacadeOutcome::Reply(
                     Box::new(PeerReply::Complete {
                         kind: ResultKind::Stop,
@@ -2923,6 +3176,22 @@ impl StdioFacade {
             }
             FacadeOutcome::TimedOut => {
                 "Assistance daemon transport timed out; continue with native tools"
+            }
+            FacadeOutcome::OutcomeUnknown => {
+                return CallToolResult::error(vec![ContentBlock::text(match tool {
+                    AssistanceTool::Edit => {
+                        "error: outcome_unknown: ide.edit may have applied; verify with ide.diff before another edit"
+                    }
+                    AssistanceTool::Test => {
+                        "error: outcome_unknown: ide.test may have started; inspect ide.test status before another run"
+                    }
+                    AssistanceTool::Stop => {
+                        "error: outcome_unknown: ide.stop may have applied; verify the binding before continuing"
+                    }
+                    _ => {
+                        "error: outcome_unknown: the call may have completed; verify before repeating it"
+                    }
+                })]);
             }
             FacadeOutcome::ReestablishFailed => {
                 "Assistance daemon exited; re-establish failed; continue with native tools"
@@ -3251,7 +3520,7 @@ async fn no_start_reroots_while_a_replacement_awaits_reactivation() {
     );
     let named = serde_json::json!({"activation_id": "x", "root": "/elsewhere"});
     let rootless = serde_json::json!({"activation_id": "x"});
-    connection.mark_replaced();
+    connection.mark_replaced().await;
     assert!(reroot_target(&named, &refused, &connection).await.is_none());
     assert!(
         reroot_target(&rootless, &refused, &connection)
@@ -3274,10 +3543,14 @@ async fn no_start_reroots_while_a_replacement_awaits_reactivation() {
 async fn rootless_missing_pre_start_names_current_directory_hint() {
     let reestablish: ReestablishFn = Arc::new(|| Box::pin(async { None }));
     let reconnect = ManagedConnection::new(PathBuf::from("/runtime"), "a".to_owned(), reestablish);
-    *reconnect.last_activation.lock().await = Some(RememberedActivation {
-        activation_id: "prior-start".to_owned(),
-        root: None,
-    });
+    reconnect.last_activation.lock().await.insert(
+        "actor".into(),
+        RememberedActivation {
+            activation_id: "prior-start".to_owned(),
+            root: None,
+            recovery_pending: false,
+        },
+    );
     let mut facade = StdioFacade::new(PathBuf::from("/runtime"));
     facade.reconnect = Some(reconnect);
     let reply = PeerReply::Unavailable {

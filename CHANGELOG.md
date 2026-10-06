@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- Claude parent and subagent actors sharing one MCP process keep their own worktree bindings
+  when another actor starts or stops. Restart recovery remembers each actor's activation.
+- A lost edit, test or stop reply reports that the call may have applied instead of resending
+  it. Repeated Claude call identities answer replay, and the MCP accepts the daemon's full
+  reply frame size.
+
 ## 0.10.2 — 2026-10-06
 
 ### Fixed

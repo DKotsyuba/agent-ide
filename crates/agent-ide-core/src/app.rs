@@ -38,7 +38,8 @@ const LOCK_NAME: &str = "agent-ide.lock";
 const WIRE_VERSION: u8 = 1;
 const MAX_REQUEST_ID_BYTES: usize = 128;
 const MAX_V1_FRAME_BYTES: usize = 64 * 1024;
-const MAX_V2_FRAME_BYTES: usize = 160 * 1024;
+/// Shared daemon/facade cap for a complete Assistance IPC frame, including its envelope.
+pub(crate) const MAX_V2_FRAME_BYTES: usize = 160 * 1024;
 const MAX_ASSISTANCE_JSON_BYTES: usize = 144 * 1024;
 /// Maximum time to wait for an Assistance method reply after its request is written.
 const METHOD_DISPATCH_BUDGET: Duration = Duration::from_secs(10);
@@ -466,8 +467,10 @@ pub async fn submit_hook_if_running(
 
 /// Connects to an already-running daemon for one closed v2-v5 method dispatch without starting it.
 ///
-/// Connect, framing, and daemon faults return `Unavailable`; elapsed bounded phases return
-/// `TimedOut`. Application does not retry, render, or reinterpret the opaque result.
+/// Connect faults return `Unavailable` and connect timeouts return `TimedOut`. Once writing
+/// begins, absent or invalid replies return `OutcomeUnknown` and deadlines return
+/// `WrittenTimedOut`: the operation may have applied, while read-only timeouts need no reconnect.
+/// Application never retries, renders, or reinterprets the opaque result.
 /// Connect and request write share the hook transport deadline; after the write, reply waiting gets
 /// the longer method budget. A short no-reply interval checks daemon health before keeping the
 /// request open, so a paused daemon fails fast while a live worker retains the full method budget.
@@ -521,35 +524,40 @@ pub async fn dispatch_method_if_running(
     .await
     {
         Ok(Ok(())) => {}
-        Ok(Err(_)) => return MethodDispatchTransportResult::Unavailable,
-        Err(_) => return MethodDispatchTransportResult::TimedOut,
+        Ok(Err(_)) => return MethodDispatchTransportResult::OutcomeUnknown,
+        Err(_) => return MethodDispatchTransportResult::WrittenTimedOut,
     }
     let Some(reply_deadline) = tokio::time::Instant::now().checked_add(METHOD_DISPATCH_BUDGET)
     else {
-        return MethodDispatchTransportResult::Unavailable;
+        return MethodDispatchTransportResult::OutcomeUnknown;
     };
     let Some(first_reply_deadline) =
         tokio::time::Instant::now().checked_add(limits.deadline.min(METHOD_DISPATCH_BUDGET))
     else {
-        return MethodDispatchTransportResult::Unavailable;
+        return MethodDispatchTransportResult::OutcomeUnknown;
     };
     let result = async {
         let reply: Value = read_frame(&mut stream, limits.max_frame_bytes).await?;
-        parse_method_dispatch_reply(&reply, &request)
+        parse_method_dispatch_reply(&reply, &request).map(|reply| match reply {
+            MethodDispatchTransportResult::Unavailable => {
+                MethodDispatchTransportResult::OutcomeUnknown
+            }
+            other => other,
+        })
     };
     tokio::pin!(result);
     match tokio::time::timeout_at(first_reply_deadline, &mut result).await {
         Ok(Ok(reply)) => reply,
-        Ok(Err(_)) => MethodDispatchTransportResult::Unavailable,
+        Ok(Err(_)) => MethodDispatchTransportResult::OutcomeUnknown,
         Err(_) => {
             let responsive = tokio::time::timeout(limits.deadline, doctor(runtime_dir)).await;
             if !matches!(responsive, Ok(Ok(DoctorStatus::Healthy { .. }))) {
-                return MethodDispatchTransportResult::TimedOut;
+                return MethodDispatchTransportResult::WrittenTimedOut;
             }
             match tokio::time::timeout_at(reply_deadline, &mut result).await {
                 Ok(Ok(reply)) => reply,
-                Ok(Err(_)) => MethodDispatchTransportResult::Unavailable,
-                Err(_) => MethodDispatchTransportResult::TimedOut,
+                Ok(Err(_)) => MethodDispatchTransportResult::OutcomeUnknown,
+                Err(_) => MethodDispatchTransportResult::WrittenTimedOut,
             }
         }
     }
@@ -1049,6 +1057,15 @@ async fn serve_assistance_request(
                 dispatcher.dispatch(AssistanceDispatch::MethodDispatch(dispatch.clone())),
             )
             .await;
+            /// Product seam losing one edit reply after dispatch; production never sets the flag.
+            static EDIT_REPLY_DROPPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if dispatch.method() == AssistanceMethod::Edit
+                && std::env::var("AGENT_IDE_TEST_DROP_EDIT_REPLY").as_deref() == Ok("1")
+                && !EDIT_REPLY_DROPPED.swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                return Ok(());
+            }
             let value = match reply {
                 Ok(Ok(AssistanceDispatchReply::MethodDispatch(payload)))
                     if payload.as_str().len() <= MAX_ASSISTANCE_JSON_BYTES =>

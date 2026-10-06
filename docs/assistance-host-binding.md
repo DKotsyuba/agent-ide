@@ -83,8 +83,17 @@ cause proving this session's hooks no longer pair there — `hooks_not_delivered
 (this call's pre-hook never arrived). A start naming another admitted root then re-roots: the MCP
 canonicalizes and admits the root against the template's `allowed_roots` — the same single rule
 activation applies, with no additional permission layer — attaches through the exact fresh-session
-path of that directory (key cache, shared daemon, client lease, candidate attachment), binds the
-session there, and retries the refused call. A start whose hooks still pair where it dispatched —
+path of that directory (key cache, shared daemon, client lease, candidate attachment). The MCP
+retains its acquired attachment capabilities for that repository daemon: a child start never
+moves an already active parent's or sibling's channel. For each Claude call the daemon recovers
+the unique pre-hook attachment by `tool_use_id` within that MCP's retained capability set, then
+dispatches with that attachment's worktree target and exact actor binding. Ambiguous matches
+refuse with `mismatch`; another MCP's attachments are never searched. The routing actor key,
+attachment and default root travel only over private IPC and are removed before model replies
+or telemetry. A previously uncached child worktree still needs its first start to register its
+hook cache; that refusal carries the repeat hint even when the daemon endpoint stays the same.
+Only a different daemon receives an immediate retry of the refused call. A start whose hooks
+still pair where it dispatched —
 including one naming another repository's admitted root — never re-roots: the daemon itself
 activates that root, so a cross-repository start can no longer strand a session between two
 daemons. The re-rooted call's own pre-hook necessarily ran before the new rendezvous existed, so
@@ -251,15 +260,32 @@ mechanisms keep the session usable without the agent being told to re-activate:
   pre a bounded 600 ms arrival window; a call whose pre never arrives is still refused.
 - **Transparent re-activation.** The managed Claude MCP watches its held lease stream: EOF
   means the generation ended, and it re-attaches at once so the host's next pre-hook already
-  finds a healthy rendezvous. The MCP remembers its last successful activation (activation id
-  and root) and, before its next dispatch, re-runs that start with the trusted
+  finds a healthy rendezvous. The MCP remembers activation id and resolved root independently
+  for each daemon-proven actor, including admitted starts whose result is still pending. It
+  refreshes those worktrees' hook caches after replacement and, before its next dispatch,
+  re-runs the relevant starts with the trusted
   `claudecode/reactivation` host marker (never model arguments); the managed shared daemon
-  binds from the actor of a genuine pre-hook the channel already delivered, without consuming
-  it, under the same `allowed_roots` rule and the same replay and capacity rules as any start.
+  binds only a remembered actor whose genuine pending pre-hook reached one of the refreshed
+  attachments, without consuming it, under the same `allowed_roots` rule and the same replay
+  and capacity rules as any start. Each sibling stays pending independently until its own hook
+  arrives, and stopping one actor forgets only its activation.
   References issued by the dead generation are the one thing recovery cannot restore: an
   invalid `detail_ref` after a replacement appends "issued before the IDE restarted; re-read",
   and `ide.stop` against a binding the replacement already revoked answers success-shaped
-  ("stopped (the IDE had already restarted)").
+  ("stopped (the IDE had already restarted)") when its actor is proven. The historical
+  hookless fallback remains only for one pending remembered actor; an ambiguous multi-actor
+  stop cannot clear another actor's activation, and replay refusals remain refusals.
+
+Claude recovery checks settling and settled-call evidence before looking for a pre-hook. A
+resent call whose pre was consumed answers `replay`, including after its terminal hook; it never
+claims that the original call lacked a pre. A genuine fresh pre for a different actor preserves
+that actor's independent call scope when IDs repeat; routing prefers the unique fresh pre over
+another actor's historical replay evidence. Both daemon and MCP accept complete IPC frames up to
+160 KiB. Once request writing begins, a missing, malformed or timed-out reply is
+`outcome_unknown`. The facade never automatically resends `ide.edit`, `ide.test` or `ide.stop`
+in that state: an edit directs the agent to verify with `ide.diff`, and a test directs it to
+inspect `ide.test` status before starting another run. Failure before writing can still
+re-establish the daemon and retry once. Read-only requests keep their bounded recovery path.
 
 Hook parsing rejects duplicate known JSON keys and retains only explicit host, phase, bounded
 identity, and optional call ID. Codex root events require `session_id`; native child events carry
