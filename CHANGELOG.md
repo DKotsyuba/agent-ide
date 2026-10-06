@@ -13,6 +13,8 @@
 - A stop whose reply expires or is lost stays stopped across daemon restarts; an unidentified
   Claude stop no longer guesses another actor's activation. Restart recovery keeps reader roles
   and the original hook endpoint for activations in another repository.
+- Claude stops continue to work while an older shared daemon is still serving. Losing an
+  identity-probe reply retries safely, and idle actors no longer add ongoing recovery traffic.
 
 ## 0.10.2 — 2026-10-06
 

@@ -2238,6 +2238,13 @@ async fn attach_claude_binding(
     )
     .await?;
     let (connection, attachment) = open_client_lease(&runtime_path, &binding.candidate).await?;
+    let supports_resolve = doctor_report(&runtime_path).await.is_ok_and(|report| {
+        matches!(report.status, DoctorStatus::Healthy { daemon_generation }
+            if agent_ide::app::daemon_supports_claude_resolve(&daemon_generation))
+    });
+    note.lock()
+        .expect("daemon currency note mutex")
+        .note_claude_resolve(supports_resolve);
     write_claude_candidate_attachment(&binding.candidate, &attachment);
     *lease.lock().await = Some(connection);
     Some((runtime_path, attachment))
@@ -2404,17 +2411,33 @@ fn claude_refresh_hook(
             .allowed_roots
             .clone();
         Box::pin(async move {
-            let candidate = fs::canonicalize(requested).ok()?;
-            agent_ide::assistance::launcher::admit_worktree(&allowed_roots, &candidate).ok()?;
-            let key = claude_rendezvous_key(&candidate).await;
-            if claude_runtime_path(&key).ok()? != runtime {
-                return None;
+            use agent_ide::assistance::facade::RefreshOutcome;
+            let candidate = match fs::canonicalize(requested) {
+                Ok(candidate) => candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return RefreshOutcome::Retired;
+                }
+                Err(_) => return RefreshOutcome::Unavailable,
+            };
+            match agent_ide::assistance::launcher::admit_worktree(&allowed_roots, &candidate) {
+                Ok(_) => {}
+                Err(agent_ide::assistance::launcher::RootAdmissionError::Unresolvable) => {
+                    return RefreshOutcome::Unavailable;
+                }
+                Err(_) => return RefreshOutcome::Retired,
             }
-            let (connection, attachment) = open_client_lease(&runtime, &candidate).await?;
+            let key = claude_rendezvous_key(&candidate).await;
+            if claude_runtime_path(&key).ok().as_ref() != Some(&runtime) {
+                return RefreshOutcome::Retired;
+            }
+            let Some((connection, attachment)) = open_client_lease(&runtime, &candidate).await
+            else {
+                return RefreshOutcome::Unavailable;
+            };
             write_claude_key_cache(&candidate, &key);
             write_claude_candidate_attachment(&candidate, &attachment);
             drop(connection);
-            Some(attachment)
+            RefreshOutcome::Attached(attachment)
         })
     })
 }

@@ -598,8 +598,8 @@ impl HostBindingGuard {
         BindingStatus::Validated(validated(candidate, binding, created_binding))
     }
 
-    /// Names the refusal for a scope whose generation is absent: `NeverActivated` while this
-    /// daemon boot never held a binding for it, else `InactiveBinding` for a stopped one.
+    /// Names a missing generation: NeverActivated before binding or a proven stop fence,
+    /// otherwise InactiveBinding. A stop before recovery must also forbid implicit activation.
     fn inactive_or_never(
         &self,
         host: HostKind,
@@ -662,6 +662,15 @@ impl HostBindingGuard {
         let Some(actor_id) = self.pending_pre_actor(&channel) else {
             return BindingStatus::Unavailable(BindingUnavailable::MissingPre);
         };
+        // Implicit recovery may restore a lost daemon, but never undo this daemon's stop.
+        if self.inactive_or_never(HostKind::Claude, &actor_id, &channel)
+            == BindingUnavailable::InactiveBinding
+            && !self
+                .bindings
+                .contains_key(&(HostKind::Claude, actor_id.clone(), channel.clone()))
+        {
+            return BindingStatus::Unavailable(BindingUnavailable::InactiveBinding);
+        }
         self.bind_established(
             CandidateInvocation {
                 host: HostKind::Claude,
@@ -1187,6 +1196,15 @@ impl HostBindingGuard {
         let Some(actor_id) = actor else {
             return BindingStatus::Unavailable(BindingUnavailable::MissingPre);
         };
+        // Implicit recovery may restore a lost daemon, but never undo this daemon's stop.
+        if self.inactive_or_never(HostKind::Claude, &actor_id, &channel)
+            == BindingUnavailable::InactiveBinding
+            && !self
+                .bindings
+                .contains_key(&(HostKind::Claude, actor_id.clone(), channel.clone()))
+        {
+            return BindingStatus::Unavailable(BindingUnavailable::InactiveBinding);
+        }
         self.bind_established(
             CandidateInvocation {
                 host: HostKind::Claude,
@@ -1195,6 +1213,14 @@ impl HostBindingGuard {
             },
             channel,
         )
+    }
+
+    /// Fences implicit recovery when an exact Claude stop pre proves the actor, including a stop
+    /// after restart before that actor has recovered. Explicit starts remain permitted.
+    pub(crate) fn fence_claude_reactivation(&mut self, call_id: &str, channel: &ChannelSessionRef) {
+        if let Ok(candidate) = self.recover_claude_candidate(call_id, channel) {
+            self.record_ever_bound((HostKind::Claude, candidate.actor_id, channel.clone()));
+        }
     }
 
     /// Returns the private actor key only for one unique genuine, unconsumed Claude pre.
@@ -1392,7 +1418,7 @@ impl HostBindingGuard {
             .any(|(candidate, observed)| candidate.call_id == call_id && observed == channel)
     }
 
-    /// Reports whether one channel ever established a start binding, including a stopped one.
+    /// Reports whether one channel established a start binding or a proven Claude stop fence.
     ///
     /// A channel with no binding belongs to a session that never activated the IDE, so its hook
     /// traffic is bookkeeping rather than a failure (T15B hook-noise follow-up). Pure lookup.
@@ -2551,6 +2577,50 @@ mod tests {
         assert!(matches!(
             kind(modern(json!({}))),
             Err(BindingUnavailable::InvalidMetadata)
+        ));
+    }
+
+    /// A delayed implicit reactivation cannot undo stop, even if a new pre arrives afterwards.
+    #[test]
+    fn claude_stop_fences_late_implicit_reactivation() {
+        let mut guard = HostBindingGuard::default();
+        let channel = channel("late-recovery");
+        guard.observe_hook(claude_pre("session", None, "start"), channel.clone());
+        let BindingStatus::Validated(start) =
+            guard.establish_start_claude("start", channel.clone())
+        else {
+            panic!("start must bind");
+        };
+        guard.stop_binding(start.binding_ref()).unwrap();
+        guard.observe_hook(claude_pre("session", None, "late-call"), channel.clone());
+        let actor = blake3::hash(b"session").to_hex().to_string();
+        assert!(matches!(
+            guard.reactivate_claude_actor("late-recovery", channel.clone(), &actor),
+            BindingStatus::Unavailable(BindingUnavailable::InactiveBinding)
+        ));
+        assert!(matches!(
+            guard.reactivate_start_claude("legacy-recovery", channel.clone()),
+            BindingStatus::Unavailable(BindingUnavailable::InactiveBinding)
+        ));
+        assert!(matches!(
+            guard.establish_start_claude("late-call", channel),
+            BindingStatus::Validated(_)
+        ));
+        // A stop can also arrive on the replacement before any implicit start has bound.
+        let channel = super::tests::channel("not-yet-recovered");
+        guard.observe_hook(claude_pre("session", None, "pending-read"), channel.clone());
+        guard.observe_hook(
+            claude_pre("session", None, "stop-before-recovery"),
+            channel.clone(),
+        );
+        guard.fence_claude_reactivation("stop-before-recovery", &channel);
+        assert!(matches!(
+            guard.reactivate_claude_actor("queued-recovery", channel.clone(), &actor),
+            BindingStatus::Unavailable(BindingUnavailable::InactiveBinding)
+        ));
+        assert!(matches!(
+            guard.establish_start_claude("pending-read", channel),
+            BindingStatus::Validated(_)
         ));
     }
 

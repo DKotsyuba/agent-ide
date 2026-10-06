@@ -267,14 +267,17 @@ mechanisms keep the session usable without the agent being told to re-activate:
   for each daemon-proven actor, including admitted starts whose result is still pending. It
   refreshes their hook caches only on the original repository endpoint, without moving the
   default endpoint or lease. Hook cwd and logical activation root are kept separately, so a
-  cross-repository activation cannot redirect cache refresh. Before the invoking actor's next
+  cross-repository activation cannot redirect cache refresh. Transient refresh/lease failures
+  retain the intent; only definite missing or inadmissible worktrees retire it. During the first
+  five seconds after re-attachment, before the invoking actor's next
   ordinary dispatch, it identifies that actor with a private read-only resolution request and
   re-runs only that actor's pending start with the trusted
   `claudecode/reactivation` host marker (never model arguments); the managed shared daemon
   binds only a remembered actor whose genuine pending pre-hook reached one of the refreshed
   attachments, without consuming it, under the same `allowed_roots` rule and the same replay
   and capacity rules as any start. Resolution and actor-keyed reactivation retain the bounded
-  start pre-arrival window. Idle siblings generate no reactivation requests; definitive recovery
+  start pre-arrival window. After that recovery window, an unrecovered actor must explicitly
+  start again; idle siblings cause no continuing probe traffic. Definitive recovery
   refusals retire only the failed actor's intent. A fresh explicit start clears only its actor's
   pending recovery and preserves its reader role. Direct Codex ingress retains actor-addressed
   activation memory and restart guidance without requiring Claude routing metadata.
@@ -282,9 +285,15 @@ mechanisms keep the session usable without the agent being told to re-activate:
   invalid `detail_ref` after a replacement appends "issued before the IDE restarted; re-read",
   and `ide.stop` against a binding the replacement already revoked answers success-shaped
   ("stopped (the IDE had already restarted)") when its actor is proven. A routeless Claude
-  stop cannot guess even a sole remembered actor. Stop intent disables only the proven actor's
+  stop cannot guess even a sole remembered actor. The private resolution probe is sent only
+  when the daemon advertises `-claude-resolve` in its opaque health generation. Older daemons
+  retain the original single-session activation/recovery path and receive stops directly.
+  A lost resolution reply reconnects and retries without claiming a stop was sent.
+  Stop intent disables only the proven actor's
   recovery before dispatch, so a deadline or lost stop reply cannot resurrect it; a subsequent
-  fresh explicit start remains eligible for recovery. Replay refusals remain refusals.
+  fresh explicit start remains eligible for recovery. The guard also refuses implicit recovery
+  of an actor stopped in its current generation, fencing delayed recovery requests. Replay
+  refusals remain refusals.
 
 Claude recovery checks settling and settled-call evidence before looking for a pre-hook. A
 resent call whose pre was consumed answers `replay`, including after its terminal hook; it never
