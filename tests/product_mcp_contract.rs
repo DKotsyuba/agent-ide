@@ -12413,7 +12413,8 @@ async fn configured_product_db_write_contention_fails_open_without_blocking_nati
     daemon.wait().await.unwrap();
 }
 
-/// Reclaims only the stopped actor's bounded result capacity while preserving its live peer's handles.
+/// A full result store admits an actor by evicting its own oldest result, never a live peer's;
+/// stopping one actor reclaims only its results while its peer keeps working.
 #[tokio::test]
 async fn configured_product_stop_reclaims_only_its_binding_details() {
     let fixture = ProductFixture::new(json!([]));
@@ -12453,25 +12454,45 @@ async fn configured_product_stop_reclaims_only_its_binding_details() {
             json!({"path":"src/lib.rs","byte_offset":0}),
         )
         .await;
-    assert_eq!(first.settle(&fixture, context).await["kind"], "context");
-    let full = second
+    let first_context = first.settle(&fixture, context).await;
+    assert_eq!(first_context["kind"], "context");
+    // The store holds 3 results (first: start + context, second: start). The second actor's
+    // next call is admitted by evicting its own oldest result, its start.
+    let admitted = second
         .call(
             &fixture,
             "ide.context",
             json!({"path":"src/lib.rs","byte_offset":0}),
         )
         .await;
-    assert_eq!(full["code"], "capacity", "{full}");
-    let stopped = first.call(&fixture, "ide.stop", json!({})).await;
-    assert_eq!(stopped["kind"], "stop", "{stopped}");
-    let retained = second
+    let admitted = second.settle(&fixture, admitted).await;
+    assert_eq!(admitted["kind"], "context", "{admitted}");
+    let evicted = second
         .call(
             &fixture,
             "ide.inspect",
             json!({"detail_ref":start["detail_ref"]}),
         )
         .await;
-    assert_eq!(retained["kind"], "activation", "{retained}");
+    assert_ne!(evicted["kind"], "activation", "{evicted}");
+    let peer_kept = first
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"detail_ref":first_context["detail_ref"]}),
+        )
+        .await;
+    assert_eq!(peer_kept["kind"], "context", "{peer_kept}");
+    let stopped = first.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    let retained = second
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"detail_ref":admitted["detail_ref"]}),
+        )
+        .await;
+    assert_eq!(retained["kind"], "context", "{retained}");
     let context = second
         .call(
             &fixture,
@@ -12481,8 +12502,6 @@ async fn configured_product_stop_reclaims_only_its_binding_details() {
         .await;
     let context = second.settle(&fixture, context).await;
     assert_eq!(context["kind"], "context", "{context}");
-    let stopped = second.call(&fixture, "ide.stop", json!({})).await;
-    assert_eq!(stopped["kind"], "stop", "{stopped}");
     first.mcp.close().await;
     second.mcp.close().await;
     daemon.kill().await.unwrap();
