@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- A repository's IDE no longer stops working after about a thousand reads: every read took a
+  permanent entry in the daemon's state store, and once its fixed cap was reached every durable
+  write failed, surfacing as `source_unavailable` on reads, `workspace_authority` on `ide.stop`
+  and `worktree_unresolved:identity_commit` on `ide.start` for every session of that
+  repository. Reads no longer take an entry, and the cap for the remaining operations is
+  65 536 (was 1 024), which also unblocks stores that already reached the old cap.
+
 ## 0.10.2 — 2026-10-06
 
 ### Fixed

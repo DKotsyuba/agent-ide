@@ -497,13 +497,21 @@ async fn receipt_exhaustion_preserves_exact_observation_recovery() {
         SourceCoverage::Complete,
     )
     .unwrap();
+    // A new observation needs no receipt, so it still records at an exhausted cap; tracked
+    // operations stay refused there.
+    assert!(matches!(
+        workspace.record(unrelated).await.unwrap(),
+        ObservationAdmission::Recorded(_)
+    ));
     assert_eq!(
-        workspace.record(unrelated).await,
-        Err(
-            agent_ide::workspace::store::WorkspaceStoreError::Application(
-                StoreError::ReceiptCapacityExhausted
+        store
+            .execute(
+                operation("tracked-at-cap"),
+                |_| Ok::<_, rusqlite::Error>(())
             )
-        )
+            .await
+            .unwrap_err(),
+        StoreError::ReceiptCapacityExhausted
     );
     drop(store);
     fs::remove_dir_all(root).unwrap();
@@ -788,4 +796,60 @@ async fn durable_root_replacement_cannot_reuse_source_authority() {
     }
     drop(store);
     fs::remove_dir_all(outer).unwrap();
+}
+
+/// Source observations take no Application receipt: many more reads than the hard receipt cap
+/// all record, a repeated operation still answers `AlreadyRecorded`, and tracked operations keep
+/// their whole budget (a field daemon refused every durable write once reads filled the cap).
+#[tokio::test]
+async fn source_observations_never_consume_the_receipt_cap() {
+    let root = temporary("receipt-free-root");
+    fs::create_dir(&root).unwrap();
+    let tree = worktree(&root);
+    let database = temporary("receipt-free-database").with_extension("sqlite");
+    let store = Store::open(
+        &database,
+        StoreConfig {
+            receipt_capacity: 8,
+            ..config()
+        },
+    )
+    .unwrap();
+    let workspace = WorkspaceStore::new(&store);
+    workspace.install_schema().await.unwrap();
+    let draft = |n: usize| {
+        ObservationDraft::present(
+            tree.clone(),
+            1,
+            operation(&format!("source-{n}")),
+            reference(&format!("source-{n}")),
+            PathBuf::from(format!("file-{}.txt", n % 3)),
+            SourceBytes::from_bytes(format!("bytes {n}").as_bytes()),
+            revision(&format!("rev-{n}")),
+            SourceCoverage::Complete,
+        )
+        .unwrap()
+    };
+    for n in 0..64 {
+        assert!(
+            matches!(
+                workspace.record(draft(n)).await.unwrap(),
+                ObservationAdmission::Recorded(_)
+            ),
+            "observation {n}"
+        );
+    }
+    assert_eq!(
+        workspace.record(draft(7)).await.unwrap(),
+        ObservationAdmission::AlreadyRecorded
+    );
+    store
+        .execute(operation("tracked-after-reads"), |_| {
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+    let _ = fs::remove_file(database);
 }

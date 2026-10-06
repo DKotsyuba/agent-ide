@@ -191,7 +191,10 @@ pub fn effective_config(
             queue_capacity: 32,
             busy_timeout: Duration::from_secs(1),
             request_deadline: Duration::from_secs(2),
-            receipt_capacity: 1_024,
+            // A hard cap with no eviction (docs/contracts/application.md): it has to outlast the
+            // runtime store, which lives as long as the repository's runtime directory, not one
+            // daemon. Observations no longer take receipts; activations, baselines and edits do.
+            receipt_capacity: 65_536,
         },
         provenance: ConfigProvenance {
             ipc_connection_deadline: ConfigOrigin::Defaults,

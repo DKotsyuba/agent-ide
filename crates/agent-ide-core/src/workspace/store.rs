@@ -10,7 +10,7 @@ use super::{
 };
 use crate::app::store::{
     DomainMigration, DomainName, MigrationAdmission, MigrationDigest, MigrationKey, OperationId,
-    Store as ApplicationStore, StoreError, StoreOutcome, TrustedUpSql,
+    Store as ApplicationStore, StoreError, TrustedUpSql, UntrackedOutcome,
 };
 use rusqlite::{OptionalExtension, params};
 use std::{os::unix::ffi::OsStrExt, path::PathBuf};
@@ -350,6 +350,12 @@ impl<'a> WorkspaceStore<'a> {
 
     /// Reads the exact latest same-path/epoch row and inserts its successor in one transaction.
     /// Returns previous facts only for a newly committed observation, never for replay or ambiguity.
+    ///
+    /// The write is receipt-free: an observation is local append-only bookkeeping with no external
+    /// effect, its operation id is unique per daemon and source sequence and is never replayed, and
+    /// its own row carries that id, so an ambiguous commit is reconciled from the row itself. A
+    /// tracked receipt per read would exhaust the Application store's hard receipt cap (one per
+    /// observed file version), after which every durable write of the daemon is refused.
     async fn record_with_previous(
         &self,
         draft: ObservationDraft,
@@ -368,15 +374,21 @@ impl<'a> WorkspaceStore<'a> {
             (Some(bytes.digest().to_vec()), Some(sqlite(bytes.length())))
         });
         let length = length.transpose()?;
-        let result = self.application.execute(operation.clone(), move |transaction| {
+        let result = self.application.execute_untracked(move |transaction| {
+            // A row already carrying this operation id is the replay evidence the receipt used to
+            // be: nothing is inserted and the caller classifies it from the row's facts.
+            let recorded = transaction.query_row("SELECT 1 FROM workspace_source_observations WHERE operation_id = ?1", params![operation.as_str()], |_| Ok(())).optional()?;
+            if recorded.is_some() {
+                return Ok(None);
+            }
             let previous = transaction.query_row("SELECT authority_epoch, source_sequence, observation_reference, byte_digest, byte_length, source_revision, coverage, observed_state FROM workspace_source_observations WHERE worktree_id = ?1 AND incarnation = ?2 AND relative_path = ?3 ORDER BY source_sequence DESC LIMIT 1", params![worktree_id, incarnation, path], |row| Ok(Row { epoch: row.get(0)?, sequence: row.get(1)?, reference: row.get(2)?, digest: row.get(3)?, length: row.get(4)?, revision: row.get(5)?, coverage: row.get(6)?, state: row.get(7)? })).optional()?;
             let latest: i64 = transaction.query_row("SELECT COALESCE(MAX(source_sequence), 0) FROM workspace_source_observations WHERE worktree_id = ?1 AND incarnation = ?2", params![worktree_id, incarnation], |row| row.get(0))?;
             let sequence = latest.checked_add(1).ok_or(rusqlite::Error::InvalidQuery)?;
             transaction.execute("INSERT INTO workspace_source_observations (worktree_id, incarnation, authority_epoch, source_sequence, operation_id, observation_reference, relative_path, byte_digest, byte_length, source_revision, coverage, observed_state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)", params![worktree_id, incarnation, epoch, sequence, operation.as_str(), reference, path, digest, length, revision, coverage, state])?;
-            Ok((sequence, previous))
+            Ok(Some((sequence, previous)))
         }).await;
         match result {
-            Ok((sequence, previous)) => {
+            Ok(UntrackedOutcome::Committed(Some((sequence, previous)))) => {
                 let previous = previous
                     .filter(|row| row.epoch == epoch)
                     .map(|row| row.observed(draft.worktree.clone(), draft.path.clone()))
@@ -391,24 +403,18 @@ impl<'a> WorkspaceStore<'a> {
                     previous,
                 ))
             }
-            Err(StoreError::DuplicateOperation {
-                existing: StoreOutcome::Committed,
-            }) => self
+            Ok(UntrackedOutcome::Committed(None)) => self
                 .duplicate_admission(&draft)
                 .await
                 .map(|admission| (admission, None)),
-            Err(StoreError::DuplicateOperation { .. }) => {
-                Ok((ObservationAdmission::OutcomeUnknown, None))
-            }
-            Err(StoreError::OutcomeUnknown { operation }) => {
-                match self.application.outcome(operation).await? {
-                    StoreOutcome::Committed => self
-                        .duplicate_admission(&draft)
-                        .await
-                        .map(|admission| (admission, None)),
-                    _ => Ok((ObservationAdmission::OutcomeUnknown, None)),
+            // The deadline passed after admission: the row may still commit. Its presence is the
+            // only evidence; an absent row stays unknown rather than a conflict.
+            Ok(UntrackedOutcome::OutcomeUnknown) => match self.duplicate_admission(&draft).await? {
+                ObservationAdmission::AlreadyRecorded => {
+                    Ok((ObservationAdmission::AlreadyRecorded, None))
                 }
-            }
+                _ => Ok((ObservationAdmission::OutcomeUnknown, None)),
+            },
             Err(error) => Err(error.into()),
         }
     }
