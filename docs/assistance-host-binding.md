@@ -90,7 +90,11 @@ the unique pre-hook attachment by `tool_use_id` within that MCP's retained capab
 dispatches with that attachment's worktree target and exact actor binding. Ambiguous matches
 refuse with `mismatch`; another MCP's attachments are never searched. The routing actor key,
 attachment and default root travel only over private IPC and are removed before model replies
-or telemetry. A previously uncached child worktree still needs its first start to register its
+or telemetry. A daemon acknowledgement removes retired capabilities from the MCP's retained set;
+an attachment purged after its worktree disappeared is ignored while matching surviving actors.
+Capabilities are bounded to 64 across repository endpoints, evicting the oldest unused entry
+while protecting the default endpoint and remembered activation routes. Recovery intents are
+bounded independently to the latest 32 actors. A previously uncached child worktree still needs its first start to register its
 hook cache; that refusal carries the repeat hint even when the daemon endpoint stays the same.
 Only a different daemon receives an immediate retry of the refused call. A start whose hooks
 still pair where it dispatched —
@@ -100,9 +104,8 @@ daemons. The re-rooted call's own pre-hook necessarily ran before the new rendez
 its first reply is the cause-tagged refusal plus a stable `retry` hint rather than a hard failure,
 and the next call pairs once the host's hooks run in that directory; after a `missing_pre` re-root the hint also names the root-less
 `ide.start` that returns the session to the host's project directory, the same never-delivered
-evidence on which a root-less start re-roots back by itself. No start re-roots while a daemon
-replacement awaits its re-activation: the replacement's fresh channel has seen no hook yet, which
-explains the refusal as well as a move would. A root below no allowed root is never
+evidence on which a root-less start re-roots back by itself. Another actor's pending recovery never
+blocks an explicit start or its own re-root decision. A root below no allowed root is never
 re-rooted to; the daemon's own `outside_allowed_roots` error answers. A re-root that cannot attach
 answers `unavailable: host_binding (project_moved: bound to <path>, asked <path>); the IDE could not move to the requested root. Call ide.start under the session's current root, or continue with native tools`.
 
@@ -262,19 +265,26 @@ mechanisms keep the session usable without the agent being told to re-activate:
   means the generation ended, and it re-attaches at once so the host's next pre-hook already
   finds a healthy rendezvous. The MCP remembers activation id and resolved root independently
   for each daemon-proven actor, including admitted starts whose result is still pending. It
-  refreshes those worktrees' hook caches after replacement and, before its next dispatch,
-  re-runs the relevant starts with the trusted
+  refreshes their hook caches only on the original repository endpoint, without moving the
+  default endpoint or lease. Hook cwd and logical activation root are kept separately, so a
+  cross-repository activation cannot redirect cache refresh. Before the invoking actor's next
+  ordinary dispatch, it identifies that actor with a private read-only resolution request and
+  re-runs only that actor's pending start with the trusted
   `claudecode/reactivation` host marker (never model arguments); the managed shared daemon
   binds only a remembered actor whose genuine pending pre-hook reached one of the refreshed
   attachments, without consuming it, under the same `allowed_roots` rule and the same replay
-  and capacity rules as any start. Each sibling stays pending independently until its own hook
-  arrives, and stopping one actor forgets only its activation.
+  and capacity rules as any start. Resolution and actor-keyed reactivation retain the bounded
+  start pre-arrival window. Idle siblings generate no reactivation requests; definitive recovery
+  refusals retire only the failed actor's intent. A fresh explicit start clears only its actor's
+  pending recovery and preserves its reader role. Direct Codex ingress retains actor-addressed
+  activation memory and restart guidance without requiring Claude routing metadata.
   References issued by the dead generation are the one thing recovery cannot restore: an
   invalid `detail_ref` after a replacement appends "issued before the IDE restarted; re-read",
   and `ide.stop` against a binding the replacement already revoked answers success-shaped
-  ("stopped (the IDE had already restarted)") when its actor is proven. The historical
-  hookless fallback remains only for one pending remembered actor; an ambiguous multi-actor
-  stop cannot clear another actor's activation, and replay refusals remain refusals.
+  ("stopped (the IDE had already restarted)") when its actor is proven. A routeless Claude
+  stop cannot guess even a sole remembered actor. Stop intent disables only the proven actor's
+  recovery before dispatch, so a deadline or lost stop reply cannot resurrect it; a subsequent
+  fresh explicit start remains eligible for recovery. Replay refusals remain refusals.
 
 Claude recovery checks settling and settled-call evidence before looking for a pre-hook. A
 resent call whose pre was consumed answers `replay`, including after its terminal hook; it never

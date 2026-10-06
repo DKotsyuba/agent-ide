@@ -433,7 +433,7 @@ impl ProductDispatcher {
         &self,
         request: &AssistanceDispatch,
         status: &mut Option<String>,
-        route: &mut Option<(String, String, String)>,
+        route: &mut super::facade::CallRouting,
     ) -> Option<PeerReply> {
         match request {
             AssistanceDispatch::HookSubmit(hook) => {
@@ -642,18 +642,6 @@ impl ProductDispatcher {
                 };
                 let call =
                     super::facade::validate_call(tool, object.get("parameters")?.clone()).ok()?;
-                if self
-                    .worker
-                    .as_ref()
-                    .is_some_and(|worker| !worker.accepts_attachment(method.opaque_attachment()))
-                {
-                    // This daemon never registered the calling attachment, so it has also never
-                    // received a hook on its channel (T15B).
-                    return Some(PeerReply::Unavailable {
-                        reason: MissingPeer::HostBinding,
-                        cause: Some(HostBindingCause::HooksNotDelivered),
-                    });
-                }
                 // Additional capabilities come only from managed ingress, never model arguments.
                 let mut attachments = vec![method.opaque_attachment().to_owned()];
                 if host == HostKind::Claude
@@ -666,7 +654,7 @@ impl ProductDispatcher {
                     }
                     for attachment in owned {
                         let attachment = attachment.as_str()?;
-                        if !self.worker.as_ref()?.accepts_attachment(attachment) {
+                        if attachment.is_empty() || attachment.len() > 128 {
                             return None;
                         }
                         if !attachments.iter().any(|owned| owned == attachment) {
@@ -674,11 +662,27 @@ impl ProductDispatcher {
                         }
                     }
                 }
+                // Registration can purge a removed worktree. Ignore its capability and acknowledge
+                // the remaining set even on refusals, so one retired child cannot strand its peers.
+                attachments.retain(|attachment| {
+                    self.worker
+                        .as_ref()
+                        .is_none_or(|worker| worker.accepts_attachment(attachment))
+                });
+                if meta.contains_key("claudecode/attachments") {
+                    route.accepted_attachments = Some(attachments.clone());
+                }
+                let Some(default_attachment) = attachments.first() else {
+                    return Some(PeerReply::Unavailable {
+                        reason: MissingPeer::HostBinding,
+                        cause: Some(HostBindingCause::HooksNotDelivered),
+                    });
+                };
                 let channels = attachments
                     .iter()
                     .map(|attachment| self.channel(attachment))
                     .collect::<Option<Vec<_>>>()?;
-                let mut channel = self.channel(method.opaque_attachment())?;
+                let mut channel = self.channel(default_attachment)?;
                 // Trusted re-activation ingress (T15B restart recovery): the managed Claude MCP
                 // marks the start that re-runs a remembered activation after the daemon it had
                 // activated on was replaced. The marker rides host metadata, never model
@@ -692,15 +696,15 @@ impl ProductDispatcher {
                 // sibling call can observe its submission hundreds of milliseconds late
                 // (~405 ms in the T15B evidence, against the hook's own 250 ms deadline).
                 // Give an absent Claude pre a bounded arrival window before the guard op; a
-                // re-activation start instead waits for any pre on its channel, whose actor it
-                // takes without consuming it.
+                // re-activation waits for its exact actor's pending pre (legacy ingress waits for
+                // any pre on its channel), without consuming that observation.
                 let actor_key = reactivation
                     .then(|| {
                         meta.get("claudecode/reactivation_actor")
                             .and_then(Value::as_str)
                     })
                     .flatten();
-                if host == HostKind::Claude && !(reactivation && actor_key.is_some()) {
+                if host == HostKind::Claude {
                     let evidence = |bindings: &std::sync::MutexGuard<'_, HostBindingGuard>| {
                         if reactivation && actor_key.is_none() {
                             bindings.pending_pre_actor(&channel).is_some()
@@ -720,8 +724,16 @@ impl ProductDispatcher {
                         .lock()
                         .is_ok_and(|bindings| evidence(&bindings))
                     {
-                        let deadline =
-                            tokio::time::Instant::now() + pre_arrival_wait(method.method());
+                        let deadline = tokio::time::Instant::now()
+                            + pre_arrival_wait(
+                                if reactivation
+                                    || meta.get("claudecode/resolve") == Some(&json!(true))
+                                {
+                                    AssistanceMethod::Start
+                                } else {
+                                    method.method()
+                                },
+                            );
                         while tokio::time::Instant::now() < deadline {
                             tokio::time::sleep(PRE_ARRIVAL_POLL).await;
                             if self
@@ -734,7 +746,7 @@ impl ProductDispatcher {
                         }
                     }
                 }
-                let mut attachment = method.opaque_attachment();
+                let mut attachment = default_attachment.as_str();
                 if host == HostKind::Claude && (!reactivation || actor_key.is_some()) {
                     match self.bindings.lock().ok()?.claude_call_channel(
                         method.correlation_id(),
@@ -755,6 +767,47 @@ impl ProductDispatcher {
                         }
                     }
                 }
+                // Resolve fallible target facts before any pre consumption, binding or stop mutation.
+                let route_root = match &self.worker {
+                    Some(worker) => match worker
+                        .target(attachment)
+                        .and_then(|target| target.candidate.to_str().map(str::to_owned))
+                    {
+                        Some(root) => Some(root),
+                        None => {
+                            return Some(PeerReply::Unavailable {
+                                reason: MissingPeer::HostBinding,
+                                cause: Some(HostBindingCause::InvalidAttachment),
+                            });
+                        }
+                    },
+                    None => None,
+                };
+                if self.managed_claude
+                    && meta.get("claudecode/resolve").and_then(Value::as_bool) == Some(true)
+                {
+                    let bindings = self.bindings.lock().ok()?;
+                    let actor = bindings.claude_pre_actor_key(method.correlation_id(), &channel);
+                    let cause = if actor.is_some() {
+                        None
+                    } else if bindings.has_pre(method.correlation_id(), &channel) {
+                        Some(HostBindingCause::Mismatch)
+                    } else if bindings.claude_replay(method.correlation_id(), &channel) {
+                        Some(HostBindingCause::Replay)
+                    } else {
+                        Some(HostBindingCause::MissingPre)
+                    };
+                    if let Some(actor) = actor
+                        && let Some(root) = &route_root
+                    {
+                        route.actor_route = Some((actor, attachment.to_owned(), root.clone()));
+                    }
+                    // Identity-only ingress grants no binding, consumes no pre and claims no activation.
+                    return Some(PeerReply::Unavailable {
+                        reason: MissingPeer::HostBinding,
+                        cause,
+                    });
+                }
                 // A test-run handle read by `ide.inspect` only answers that run's status, already
                 // owned by this actor and channel, so it stays readable after `ide.stop`; every
                 // other call still needs the active generation.
@@ -772,13 +825,9 @@ impl ProductDispatcher {
                     if meta.contains_key("claudecode/attachments")
                         && let Some(actor) =
                             bindings.claude_pre_actor_key(method.correlation_id(), &channel)
-                        && let Some(target) = self.worker.as_ref()?.target(attachment)
+                        && let Some(root) = &route_root
                     {
-                        *route = Some((
-                            actor,
-                            attachment.to_owned(),
-                            target.candidate.to_str()?.to_owned(),
-                        ));
+                        route.actor_route = Some((actor, attachment.to_owned(), root.clone()));
                     }
                     let status = match host {
                         HostKind::Codex => {
@@ -838,7 +887,7 @@ impl ProductDispatcher {
                                 cause: host_binding_cause(
                                     self.worker.as_ref(),
                                     hooks_delivered,
-                                    method.opaque_attachment(),
+                                    attachment,
                                     reason,
                                 ),
                             });
@@ -886,11 +935,13 @@ impl ProductDispatcher {
                             && call.parameters().get("detail_ref").is_none(),
                     );
                 }
-                if meta.contains_key("claudecode/attachments") {
-                    *route = Some((
+                if meta.contains_key("claudecode/attachments")
+                    && let Some(root) = &route_root
+                {
+                    route.actor_route = Some((
                         invocation.binding_ref().actor_key(),
                         attachment.to_owned(),
-                        worker.target(attachment)?.candidate.to_str()?.to_owned(),
+                        root.clone(),
                     ));
                 }
                 let fingerprint = invocation.binding_ref().fingerprint();
@@ -919,6 +970,15 @@ impl ProductDispatcher {
                             .await
                     }
                 };
+                // Product seam: expire presentation after stop has reached the guard and worker.
+                if method.method() == AssistanceMethod::Stop
+                    && std::env::var("AGENT_IDE_TEST_STOP_DEADLINE").as_deref() == Ok("1")
+                {
+                    reply = PeerReply::Error {
+                        code: super::reply::FailureCode::Deadline,
+                        detail: None,
+                    };
+                }
                 // T28B/T29B: reply-carrying hosts lead every terminal `ide.*` reply with the due
                 // plate. Every such call first reconciles the bound worktree's inputs (free while
                 // unchanged, T20B) — for managed Codex this stays even though hooks may now
@@ -1036,7 +1096,7 @@ impl AssistanceDispatcher for ProductDispatcher {
         Box::pin(async move {
             let started = std::time::Instant::now();
             let mut status = None;
-            let mut route = None;
+            let mut route = super::facade::CallRouting::default();
             let mut result = self
                 .handle(&request, &mut status, &mut route)
                 .await
@@ -1045,7 +1105,11 @@ impl AssistanceDispatcher for ProductDispatcher {
                     cause: None,
                 });
             // Hook payloads are intentionally never accepted by telemetry adapters or the log.
-            if let AssistanceDispatch::MethodDispatch(method) = &request {
+            if let AssistanceDispatch::MethodDispatch(method) = &request
+                && !serde_json::from_str::<Value>(method.params_json().as_str())
+                    .ok()
+                    .is_some_and(|envelope| envelope["host_meta"]["claudecode/resolve"] == true)
+            {
                 let tool = match method.method() {
                     AssistanceMethod::Start => Some(super::facade::AssistanceTool::Start),
                     AssistanceMethod::Context => Some(super::facade::AssistanceTool::Context),
@@ -1106,9 +1170,11 @@ impl AssistanceDispatcher for ProductDispatcher {
             }
             .ok_or(AssistanceDispatchUnavailable)?;
             // Private routing facts never enter the closed peer reply or any logging path.
-            let reply = match route {
-                Some((actor, attachment, root)) => OpaqueJson::from_value(&json!({"reply": serde_json::from_str::<Value>(reply.as_str()).ok(), "route": {"actor": actor, "attachment": attachment, "root": root}}), 144 * 1024).ok_or(AssistanceDispatchUnavailable)?,
-                None => reply,
+            let reply = if route.accepted_attachments.is_some() || route.actor_route.is_some() {
+                let actor_route = route.actor_route.map(|(actor, attachment, root)| json!({"actor":actor,"attachment":attachment,"root":root}));
+                OpaqueJson::from_value(&json!({"reply": serde_json::from_str::<Value>(reply.as_str()).ok(), "route": actor_route, "accepted_attachments":route.accepted_attachments}), 144 * 1024).ok_or(AssistanceDispatchUnavailable)?
+            } else {
+                reply
             };
             Ok(match request {
                 AssistanceDispatch::HookSubmit(_) => AssistanceDispatchReply::HookSubmit(reply),
@@ -1178,7 +1244,13 @@ async fn host_shaped_mixed_metadata_is_unavailable_at_daemon_ingress() {
         .expect("test dispatch is valid"),
     );
     assert_eq!(
-        dispatcher.handle(&request, &mut None, &mut None).await,
+        dispatcher
+            .handle(
+                &request,
+                &mut None,
+                &mut super::facade::CallRouting::default()
+            )
+            .await,
         None
     );
 }
@@ -1206,7 +1278,9 @@ async fn claude_start_without_worker_is_unavailable_after_correlation() {
             .expect("test hook dispatch is valid"),
     );
     assert_eq!(
-        dispatcher.handle(&hook, &mut None, &mut None).await,
+        dispatcher
+            .handle(&hook, &mut None, &mut super::facade::CallRouting::default())
+            .await,
         Some(PeerReply::HookObserved {})
     );
 
@@ -1229,7 +1303,13 @@ async fn claude_start_without_worker_is_unavailable_after_correlation() {
         .expect("test method dispatch is valid"),
     );
     assert_eq!(
-        dispatcher.handle(&method, &mut None, &mut None).await,
+        dispatcher
+            .handle(
+                &method,
+                &mut None,
+                &mut super::facade::CallRouting::default()
+            )
+            .await,
         Some(PeerReply::Unavailable {
             reason: MissingPeer::WorkspaceActivation,
             cause: None
@@ -1253,7 +1333,13 @@ async fn claude_start_without_worker_is_unavailable_after_correlation() {
             .expect("test hook dispatch is valid"),
     );
     assert_eq!(
-        dispatcher.handle(&next_hook, &mut None, &mut None).await,
+        dispatcher
+            .handle(
+                &next_hook,
+                &mut None,
+                &mut super::facade::CallRouting::default()
+            )
+            .await,
         Some(PeerReply::HookObserved {})
     );
     let next_parameters = OpaqueJson::from_value(
@@ -1276,7 +1362,13 @@ async fn claude_start_without_worker_is_unavailable_after_correlation() {
     );
     // A follow-up Claude operation on the same attachment also has no worker to handle it.
     assert_eq!(
-        dispatcher.handle(&next_method, &mut None, &mut None).await,
+        dispatcher
+            .handle(
+                &next_method,
+                &mut None,
+                &mut super::facade::CallRouting::default()
+            )
+            .await,
         Some(PeerReply::Unavailable {
             reason: MissingPeer::WorkspaceActivation,
             cause: None
@@ -1370,7 +1462,7 @@ async fn managed_codex_problems_context_short_circuits_before_read_boundary_reco
         .handle(
             &AssistanceDispatch::MethodDispatch(request),
             &mut None,
-            &mut None,
+            &mut super::facade::CallRouting::default(),
         )
         .await
         .expect("codex problems dispatch must produce a typed reply");

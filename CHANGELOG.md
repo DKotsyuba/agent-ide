@@ -5,10 +5,14 @@
 ### Fixed
 
 - Claude parent and subagent actors sharing one MCP process keep their own worktree bindings
-  when another actor starts or stops. Restart recovery remembers each actor's activation.
+  when another actor starts or stops, or a finished child's worktree is removed. Recent actor
+  activations recover independently after restart; idle actors never block a new start.
 - A lost edit, test or stop reply reports that the call may have applied instead of resending
   it. Repeated Claude call identities answer replay, and the MCP accepts the daemon's full
   reply frame size.
+- A stop whose reply expires or is lost stays stopped across daemon restarts; an unidentified
+  Claude stop no longer guesses another actor's activation. Restart recovery keeps reader roles
+  and the original hook endpoint for activations in another repository.
 
 ## 0.10.2 — 2026-10-06
 

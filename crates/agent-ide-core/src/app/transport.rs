@@ -408,7 +408,8 @@ pub enum MethodDispatchTransportResult {
         /// Assistance-owned opaque method result JSON.
         opaque_result_json: OpaqueJson,
     },
-    /// The daemon could not be contacted before request writing began.
+    /// No dispatch result was available: connection failure or an explicit unavailable wire reply.
+    /// The transport driver separately classifies uncertainty after request writing began.
     Unavailable,
     /// Connection establishment exceeded its deadline before request writing began.
     TimedOut,
