@@ -7104,7 +7104,8 @@ async fn configured_product_typescript_non_test_file_answers_no_tests() {
         "{refused}"
     );
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
-    assert_eq!(actor.settle(&fixture, stopped).await["kind"], "stop");
+    let stopped = actor.settle(&fixture, stopped).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
