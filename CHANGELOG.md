@@ -10,9 +10,22 @@
   and `worktree_unresolved:identity_commit` on `ide.start` for every session of that
   repository. Reads no longer take an entry, and the cap for the remaining operations is
   65 536 (was 1 024), which also unblocks stores that already reached the old cap.
-- Shared result-store capacity now reclaims a caller’s own settled results and results from idle
-  actors, while bounding source-reference protection per actor.
-- Line-range edits based on an edit that moved lines are refused until the file is re-read, and successful edits report their net line shift. Unmatched exact-text edits now point to the closest matching line window.
+- Several agents of one Claude Code session (an orchestrator and its subagents, each in its own
+  worktree) work side by side: one agent's `ide.start` no longer moves the others' connection,
+  which made their calls fail `missing_pre` or `hooks_not_delivered`. Each agent's activation
+  is remembered separately across a daemon restart.
+- A call whose reply was lost is never silently repeated: an edit, test or stop answers
+  `outcome_unknown` (check with `ide.diff` or the test status), and a resent call whose
+  pre-hook was already used answers as a replay instead of `missing_pre`. The client accepts
+  the daemon's full reply size.
+- The shared result store no longer fills up with parallel agents (`worker:actor_share_full`):
+  an agent can always free its own oldest results, the newest file versions an agent keeps
+  count inside its share, and an agent idle for 15 minutes gives up its results to others.
+- A line-range edit can no longer land on shifted lines: line numbers on the `source_ref` of
+  an edit that moved lines are refused `stale_source (edit:lines_moved)` until the file is
+  re-read, and every edit reply states its own shift (`lines after N moved +K`). An unmatched
+  `old` text names the closest lines, the first differing line and its text, or says
+  `no similar text`.
 
 ## 0.10.2 — 2026-10-06
 
