@@ -475,6 +475,8 @@ struct Ledger {
     starts: BTreeMap<(BindingRef, String, bool, [u8; 32]), String>,
     /// One cancellation sender per currently active binding.
     cancellation: BTreeMap<BindingRef, watch::Sender<bool>>,
+    /// Last accepted tool activity for each active binding, used to reclaim abandoned result shares.
+    last_activity: BTreeMap<BindingRef, tokio::time::Instant>,
     /// Nonzero monotonic detail identifiers within this daemon boot.
     next: u64,
     /// One bounded monotonic invalidation counter per active binding.
@@ -496,6 +498,7 @@ impl Default for Ledger {
             details: BTreeMap::new(),
             starts: BTreeMap::new(),
             cancellation: BTreeMap::new(),
+            last_activity: BTreeMap::new(),
             next: 0,
             native_epoch: BTreeMap::new(),
             feedback: BTreeMap::new(),
@@ -1487,6 +1490,7 @@ impl WorkerHandle {
                 .starts
                 .retain(|(owner, _, _, _), _| owner != &binding);
             ledger.native_epoch.remove(&binding);
+            ledger.last_activity.remove(&binding);
             ledger.feedback.remove(&binding);
             ledger.delivered.remove(&binding);
         }
@@ -1552,6 +1556,11 @@ impl WorkerHandle {
         expected: Option<(AssistanceTool, [u8; 32])>,
         permit: mpsc::OwnedPermit<Inspection>,
     ) -> PeerReply {
+        if let Ok(mut ledger) = self.shared.ledger.lock() {
+            ledger
+                .last_activity
+                .insert(binding.clone(), tokio::time::Instant::now());
+        }
         let (reply, wait) = oneshot::channel();
         permit.send(Inspection {
             binding,
@@ -1709,6 +1718,11 @@ impl WorkerHandle {
             .ledger
             .lock()
             .map_err(|_| FailureCode::Internal)?;
+        if tool != AssistanceTool::Stop {
+            ledger
+                .last_activity
+                .insert(binding.clone(), tokio::time::Instant::now());
+        }
         let start = if tool == AssistanceTool::Start {
             Some((
                 binding.clone(),
@@ -1757,6 +1771,7 @@ impl WorkerHandle {
                 &binding,
                 tool,
                 &self.shared.test_runs.detail_refs(),
+                now,
             );
             if ledger.details.len() >= self.shared.launcher.limits.details {
                 return Err(InspectFailure::stage(
@@ -1892,20 +1907,17 @@ fn edit_operation(parameters: &Value) -> Option<String> {
     }
 }
 
-/// Settled details every live binding keeps before its oldest facts may be evicted to admit
-/// another binding's work.
+/// Settled details another live binding keeps before its oldest facts may be evicted.
 const FAIR_DETAILS_PER_BINDING: usize = 8;
+/// An active binding with no tool activity this long may have its settled results reclaimed.
+const IDLE_BINDING_DETAILS_TTL: Duration = Duration::from_secs(15 * 60);
 
-/// `true` exactly when a detail may be evicted: its reply reached a terminal state, so only a
-/// future inspection — never its own still-running job — can consume it, and it is not a retained
-/// test run's output (`pinned`), which stays readable while the run's result does. Pending facts
-/// and pinned outputs are never eviction candidates.
+/// Returns whether a terminal detail is unpinned and therefore safe to evict.
 fn detail_evictable(reference: &str, reply: &PeerReply, pinned: &BTreeSet<String>) -> bool {
     !matches!(reply, PeerReply::Pending { .. }) && !pinned.contains(reference)
 }
 
-/// Extracts the monotonic per-boot counter from one detail reference (`<nonce>-<n>`), which is
-/// the detail's age order. A reference without a numeric suffix sorts as the oldest.
+/// Extracts the monotonic per-boot counter from a detail reference, which determines its age.
 fn detail_sequence(reference: &str) -> u64 {
     reference
         .rsplit_once('-')
@@ -1913,32 +1925,63 @@ fn detail_sequence(reference: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Evicts one binding's oldest settled details until the ledger holds fewer than `limit` facts,
-/// returning how many were removed. A live binding always keeps its newest
-/// [`FAIR_DETAILS_PER_BINDING`] settled facts: a reply the agent may still inspect is never
-/// taken from it, so a binding below that share frees nothing and the request is refused as
-/// before.
+/// Returns up to eight newest result handles that are the latest source observation for a file.
+/// This bounds a binding's source-protected share and counts it inside its fair floor.
+fn newest_source_details(ledger: &Ledger, owner: &BindingRef) -> BTreeSet<String> {
+    let mut newest: Vec<(u64, String)> = ledger
+        .details
+        .iter()
+        .filter(|(reference, detail)| {
+            detail.binding == *owner && is_newest_source_detail(ledger, reference, detail)
+        })
+        .map(|(reference, _)| (detail_sequence(reference), reference.clone()))
+        .collect();
+    newest.sort_unstable_by(|left, right| right.cmp(left));
+    newest
+        .into_iter()
+        .take(FAIR_DETAILS_PER_BINDING)
+        .map(|(_, reference)| reference)
+        .collect()
+}
+
+/// Evicts the owner's oldest settled, unpinned facts until the ledger has room below `limit` or
+/// only `floor` eligible facts remain. The floor counts protected source references too;
+/// `protect_sources` exempts up to eight latest source details, for other actors only. Returns the
+/// number removed. Pending details and references in `pinned` are never removed.
 fn evict_binding_oldest(
     ledger: &mut Ledger,
     limit: usize,
     owner: &BindingRef,
     pinned: &BTreeSet<String>,
+    floor: usize,
+    protect_sources: bool,
 ) -> usize {
+    let protected = if protect_sources {
+        newest_source_details(ledger, owner)
+    } else {
+        BTreeSet::new()
+    };
     let mut candidates: Vec<(u64, String)> = ledger
         .details
         .iter()
         .filter(|(reference, detail)| {
             detail.binding == *owner
                 && detail_evictable(reference, &detail.reply, pinned)
-                && !is_newest_source_detail(ledger, reference, detail)
+                && !protected.contains(*reference)
         })
         .map(|(reference, _)| (detail_sequence(reference), reference.clone()))
         .collect();
     candidates.sort_unstable();
-    let mut held = candidates.len();
-    let mut removed = 0usize;
+    let mut held = ledger
+        .details
+        .iter()
+        .filter(|(reference, detail)| {
+            detail.binding == *owner && detail_evictable(reference, &detail.reply, pinned)
+        })
+        .count();
+    let mut removed = 0;
     for (_, reference) in candidates {
-        if ledger.details.len() < limit || held <= FAIR_DETAILS_PER_BINDING {
+        if ledger.details.len() < limit || held <= floor {
             break;
         }
         ledger.details.remove(&reference);
@@ -1958,32 +2001,31 @@ fn is_newest_source_detail(ledger: &Ledger, reference: &str, detail: &Detail) ->
         .any(|path| newest_edit_source(ledger, &detail.binding, path).as_deref() == Some(reference))
 }
 
-/// Frees ledger room for one new operation by evicting only settled, uninspectable facts.
-///
-/// Called once the ledger already holds its `limits.details` ceiling. The batch order is fixed:
-/// first every settled detail whose binding is absent from `cancellation` (stopped, or never
-/// completed activation) and can therefore never be inspected again, then the requesting
-/// binding's own oldest settled details, then the oldest settled details of any other binding
-/// holding more than [`FAIR_DETAILS_PER_BINDING`]. Pending facts and the output details of
-/// retained test runs (`pinned`) are never evicted; a ledger
-/// that stays full after the batch refuses the request as before. One informational journal
-/// line records the whole batch so an operator can see the release happened.
+/// Frees room below `limit` in a full result ledger: stopped or idle bindings first, the
+/// requester next, then other bindings above their eight-result floor. `now` measures activity
+/// against the 15-minute idle threshold; `pinned` protects active test outputs. Pending details
+/// are always preserved, and each eviction batch is journaled.
 fn evict_settled_details(
     ledger: &mut Ledger,
     limit: usize,
     requesting: &BindingRef,
     tool: AssistanceTool,
     pinned: &BTreeSet<String>,
+    now: tokio::time::Instant,
 ) {
-    let mut freed = 0usize;
-    // (a) Settled facts of bindings no longer active: no future `ide.inspect` under any live
-    // binding can ever name them again.
+    let mut freed = 0;
     let inactive: Vec<String> = ledger
         .details
         .iter()
         .filter(|(reference, detail)| {
+            let idle = ledger
+                .last_activity
+                .get(&detail.binding)
+                .is_some_and(|last| {
+                    now.saturating_duration_since(*last) > IDLE_BINDING_DETAILS_TTL
+                });
             detail_evictable(reference, &detail.reply, pinned)
-                && !ledger.cancellation.contains_key(&detail.binding)
+                && (!ledger.cancellation.contains_key(&detail.binding) || idle)
         })
         .map(|(reference, _)| reference.clone())
         .collect();
@@ -1992,12 +2034,9 @@ fn evict_settled_details(
     }
     freed += inactive.len();
     if ledger.details.len() >= limit {
-        // (b) The requesting binding's own oldest settled facts yield before any other
-        // binding's.
-        freed += evict_binding_oldest(ledger, limit, requesting, pinned);
+        freed += evict_binding_oldest(ledger, limit, requesting, pinned, 0, false);
     }
     if ledger.details.len() >= limit {
-        // (c) Bindings beyond their fair share give up their oldest settled facts.
         let others: BTreeSet<BindingRef> = ledger
             .details
             .values()
@@ -2008,14 +2047,14 @@ fn evict_settled_details(
             if ledger.details.len() < limit {
                 break;
             }
-            let held = ledger
-                .details
-                .values()
-                .filter(|detail| detail.binding == binding)
-                .count();
-            if held > FAIR_DETAILS_PER_BINDING {
-                freed += evict_binding_oldest(ledger, limit, &binding, pinned);
-            }
+            freed += evict_binding_oldest(
+                ledger,
+                limit,
+                &binding,
+                pinned,
+                FAIR_DETAILS_PER_BINDING,
+                true,
+            );
         }
     }
     if freed > 0 {
@@ -8455,7 +8494,7 @@ mod stop_retry_tests {
         }
         let mut ledger = handle.shared.ledger.lock().unwrap();
         assert_eq!(
-            evict_binding_oldest(&mut ledger, 10, &binding, &BTreeSet::new()),
+            evict_binding_oldest(&mut ledger, 10, &binding, &BTreeSet::new(), 8, true),
             1
         );
         assert!(!ledger.details.contains_key("detail-1"));
@@ -8473,6 +8512,151 @@ mod stop_retry_tests {
             )
             .is_some()
         );
+    }
+
+    /// Admits a binding holding sixteen settled results, including eight distinct source bases.
+    #[tokio::test]
+    async fn active_binding_at_floor_can_evict_own_source_details() {
+        let fixture = Fixture::new();
+        let handle = detail_handle(&fixture.root, 16);
+        let actor_a = validated_call(&handle.shared.bindings, "actor-a", "a-start")
+            .binding_ref()
+            .clone();
+        let worktree = crate::workspace::authority::WorktreeRef::from_discovery(
+            fixture.root.clone(),
+            fixture.root.clone(),
+            ".git".into(),
+            1,
+        )
+        .unwrap();
+        for n in 1..=16 {
+            let reference = format!("detail-{n}");
+            plant_detail(&handle, &reference, &actor_a, settled_detail(&reference));
+            if n <= 8 {
+                handle
+                    .shared
+                    .ledger
+                    .lock()
+                    .unwrap()
+                    .details
+                    .get_mut(&reference)
+                    .unwrap()
+                    .source = Some(
+                    SourceObservation::new(
+                        worktree.clone(),
+                        1,
+                        n,
+                        crate::workspace::observation::ObservationRef::new(format!("source-{n}"))
+                            .unwrap(),
+                        format!("file-{n}.rs").into(),
+                        Some(crate::workspace::observation::SourceBytes::from_bytes(b"x")),
+                        crate::workspace::observation::SourceRevision::new(format!("rev-{n}"))
+                            .unwrap(),
+                        crate::workspace::observation::SourceCoverage::Complete,
+                        crate::workspace::observation::ObservedState::Present,
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        let now = tokio::time::Instant::now();
+        {
+            let mut ledger = handle.shared.ledger.lock().unwrap();
+            ledger
+                .cancellation
+                .insert(actor_a.clone(), watch::channel(false).0);
+            ledger.last_activity.insert(actor_a.clone(), now);
+        }
+        let invocation = validated_call(&handle.shared.bindings, "actor-a", "a-next");
+        let reference = enqueue_context(&handle, invocation).unwrap();
+        let ledger = handle.shared.ledger.lock().unwrap();
+        assert!(!ledger.details.contains_key("detail-1"));
+        assert!(ledger.details.contains_key("detail-2"));
+        assert!(ledger.details.contains_key("detail-9"));
+        assert!(ledger.details.contains_key(&reference));
+    }
+
+    /// Lets one active binding replace its oldest result when both bindings hold eight settled
+    /// results and the shared result store is full.
+    #[tokio::test]
+    async fn active_bindings_at_floor_evict_requesters_oldest() {
+        let fixture = Fixture::new();
+        let handle = detail_handle(&fixture.root, 16);
+        let a = validated_call(&handle.shared.bindings, "actor-a", "a-start")
+            .binding_ref()
+            .clone();
+        let b = validated_call(&handle.shared.bindings, "actor-b", "b-start")
+            .binding_ref()
+            .clone();
+        for n in 1..=16 {
+            let reference = format!("detail-{n}");
+            plant_detail(
+                &handle,
+                &reference,
+                if n <= 8 { &a } else { &b },
+                settled_detail(&reference),
+            );
+        }
+        let now = tokio::time::Instant::now();
+        {
+            let mut ledger = handle.shared.ledger.lock().unwrap();
+            for binding in [&a, &b] {
+                ledger
+                    .cancellation
+                    .insert(binding.clone(), watch::channel(false).0);
+                ledger.last_activity.insert(binding.clone(), now);
+            }
+        }
+        let invocation = validated_call(&handle.shared.bindings, "actor-a", "a-next");
+        let reference = enqueue_context(&handle, invocation).unwrap();
+        let ledger = handle.shared.ledger.lock().unwrap();
+        assert!(!ledger.details.contains_key("detail-1"));
+        assert!(ledger.details.contains_key("detail-2"));
+        assert!(ledger.details.contains_key("detail-9"));
+        assert!(ledger.details.contains_key(&reference));
+    }
+
+    /// Reclaims idle settled results for admission while retaining an idle binding's pending work.
+    #[tokio::test]
+    async fn idle_binding_settled_details_are_reclaimed_but_pending_survives() {
+        let fixture = Fixture::new();
+        let handle = detail_handle(&fixture.root, 4);
+        let idle = validated_call(&handle.shared.bindings, "idle-actor", "idle-start")
+            .binding_ref()
+            .clone();
+        let now = tokio::time::Instant::now();
+        for n in 1..=4 {
+            let reference = format!("detail-{n}");
+            let reply = if n == 4 {
+                PeerReply::Pending {
+                    detail_ref: reference.clone(),
+                }
+            } else {
+                settled_detail(&reference)
+            };
+            plant_detail(&handle, &reference, &idle, reply);
+        }
+        {
+            let mut ledger = handle.shared.ledger.lock().unwrap();
+            ledger
+                .cancellation
+                .insert(idle.clone(), watch::channel(false).0);
+            ledger.last_activity.insert(
+                idle.clone(),
+                now - IDLE_BINDING_DETAILS_TTL - Duration::from_secs(1),
+            );
+        }
+        let invocation = validated_call(&handle.shared.bindings, "active-actor", "active-start");
+        let new_reference = enqueue_context(&handle, invocation).unwrap();
+        let ledger = handle.shared.ledger.lock().unwrap();
+        assert!(!ledger.details.contains_key("detail-1"));
+        assert!(!ledger.details.contains_key("detail-2"));
+        assert!(!ledger.details.contains_key("detail-3"));
+        assert!(
+            ledger.details.contains_key("detail-4"),
+            "pending results remain protected"
+        );
+        assert!(ledger.details.contains_key(&new_reference));
     }
 
     /// A retained test run's output detail is never evicted, so its full output stays readable

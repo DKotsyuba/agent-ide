@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- Shared result-store capacity now reclaims a caller’s own settled results and results from idle
+  actors, while bounding source-reference protection per actor.
+
 ## 0.10.2 — 2026-10-06
 
 ### Fixed

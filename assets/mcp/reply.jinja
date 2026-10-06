@@ -217,7 +217,7 @@ error: capacity ({{ resolution_detail }}); the request queue is full; wait for p
 {%- elif resolution_detail == "worker:result_store_full" -%}
 error: capacity (worker:result_store_full); the result store is full of pending or protected results; wait for pending work or stop an activation retaining results
 {%- elif resolution_detail == "worker:actor_share_full" -%}
-error: capacity (worker:actor_share_full); the result store is full of protected per-actor shares; stop an activation retaining results, or continue with native tools
+error: capacity (worker:actor_share_full); you can free all your own settled, unpinned results; any remaining capacity is held by other active actors
 {%- elif resolution_detail == "diff:too_large" -%}
 error: capacity (diff:too_large); the source, patch or path capture budget is full; narrow ide.diff with paths or review it with native git
 {%- else -%}
