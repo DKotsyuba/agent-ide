@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent IDE"
-  short_description: "Bounded ide.* workflow for active-session source edits"
-  default_prompt: "Use $agent-ide to run the ide.start/context/diff/stop workflow while I edit this worktree."
+  short_description: "Language-server-backed ide.* tools for reading, editing and testing source"
+  default_prompt: "Use $agent-ide: ide.start, then ide.outline/ide.symbol/ide.read to understand the code, ide.edit to change it, ide.test for the affected tests, and ide.diff before ide.stop."

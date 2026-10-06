@@ -10,9 +10,18 @@
   still open: every release after 0.9.1 takes leases, so a sweeper trusts older ones too. It
   used to treat any release older than itself as lease-unaware and keep every check and
   telemetry cache until those sessions ended (29 GiB kept against a 20 GiB budget).
+- A Rust file whose workspace failed to load and that the source outline also refuses is
+  refused with `use native reads`; it used to say `ide.outline` and `ide.read` still answer
+  from source, which was false for that file.
 
 ### Changed
 
+- The bundled `agent-ide` skill matches the 0.10 tools: sixteen listed test failures and
+  the reproducing `rerun:` line, edit diagnostics split into `new:`/`pre-existing:` with the
+  `project errors in other files` and `not_analysed` next steps, rename and batch limits,
+  Python environments and its missing call hierarchy, `unsupported_file`, diff paging by
+  parts and `paths`, page markers instead of a `continuation` field, and the exact retry
+  facts. The bundled reviewer agent stops its activation before reporting.
 - The check caches' budget is 15 GiB (was 20 GiB): least recently used worktrees past it are
   removed and their next project check builds again from cold.
 
