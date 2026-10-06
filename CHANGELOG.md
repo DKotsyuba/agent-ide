@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.10.3 — 2026-10-06
+
 ### Fixed
 
 - A repository's IDE no longer stops working after about a thousand reads: every read took a
@@ -15,7 +17,8 @@
   which made their calls fail `missing_pre` or `hooks_not_delivered`, and removing a finished
   subagent's worktree no longer breaks the others. Each agent's activation recovers on its own
   after a daemon restart; a finished agent never blocks a new one, and a stopped agent stays
-  stopped even when its stop reply was lost.
+  stopped even when its stop reply was lost. An older daemon still serving right after an
+  upgrade keeps working with the new client.
 - A call whose reply was lost is never silently repeated: an edit, test or stop answers
   `outcome_unknown` (check with `ide.diff` or the test status), and a resent call whose
   pre-hook was already used answers as a replay instead of `missing_pre`. The client accepts
@@ -28,6 +31,7 @@
   re-read, and every edit reply states its own shift (`lines after N moved +K`). An unmatched
   `old` text names the closest lines, the first differing line and its text, or says
   `no similar text`.
+
 ## 0.10.2 — 2026-10-06
 
 ### Fixed

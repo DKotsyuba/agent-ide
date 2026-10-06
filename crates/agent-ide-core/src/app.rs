@@ -1318,6 +1318,7 @@ impl Drop for OwnedSocket {
 /// daemon's version and whether it runs from the same installed executable. A pre-0.6.7 daemon's
 /// bare random hex names neither and is therefore older than every version-reporting front. The
 /// identifier is opaque to older consumers, which compared generations only for equality.
+/// The `-claude-resolve` suffix advertises non-consuming Claude identity probes.
 fn new_generation() -> Result<String, AppError> {
     let mut bytes = [0_u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
@@ -1326,10 +1327,16 @@ fn new_generation() -> Result<String, AppError> {
         Some(version) => {
             let executable = std::env::current_exe()?;
             let hash = blake3::hash(executable.as_os_str().as_bytes()).to_hex();
-            Ok(format!("{version}-{hash}-{random}"))
+            Ok(format!("{version}-{hash}-{random}-claude-resolve"))
         }
         None => Ok(random),
     }
+}
+
+/// Reports the non-consuming Claude identity-probe capability in a health generation.
+/// Its opaque suffix preserves older health decoders and version/executable comparisons.
+pub fn daemon_supports_claude_resolve(generation: &str) -> bool {
+    generation.ends_with("-claude-resolve")
 }
 
 /// The product version this daemon reports in its generation identifier.
@@ -1565,7 +1572,12 @@ mod tests {
     #[test]
     fn generation_identifiers_carry_the_daemon_version() {
         let generation = new_generation().expect("OS randomness is available");
-        let mut parts = generation.splitn(3, '-');
+        assert!(daemon_supports_claude_resolve(&generation));
+        assert!(!daemon_supports_claude_resolve("0.10.2-hash-random"));
+        let mut parts = generation
+            .strip_suffix("-claude-resolve")
+            .unwrap()
+            .splitn(3, '-');
         let version = parts.next().expect("version is first");
         let executable_hash = parts.next().expect("executable hash follows version");
         let random = parts.next().expect("random generation is last");

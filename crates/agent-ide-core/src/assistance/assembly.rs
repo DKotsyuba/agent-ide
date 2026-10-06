@@ -769,11 +769,10 @@ impl ProductDispatcher {
                 }
                 // Resolve fallible target facts before any pre consumption, binding or stop mutation.
                 let route_root = match &self.worker {
-                    Some(worker) => match worker
-                        .target(attachment)
-                        .and_then(|target| target.candidate.to_str().map(str::to_owned))
-                    {
-                        Some(root) => Some(root),
+                    Some(worker) => match worker.target(attachment).and_then(|target| {
+                        hook_route_root(self.managed_claude, host, &target.candidate).ok()
+                    }) {
+                        Some(root) => root,
                         None => {
                             return Some(PeerReply::Unavailable {
                                 reason: MissingPeer::HostBinding,
@@ -781,7 +780,7 @@ impl ProductDispatcher {
                             });
                         }
                     },
-                    None => None,
+                    _ => None,
                 };
                 if self.managed_claude
                     && meta.get("claudecode/resolve").and_then(Value::as_bool) == Some(true)
@@ -854,6 +853,9 @@ impl ProductDispatcher {
                             let call_id = parse_claude_call_id(meta).ok()?;
                             if call_id != method.correlation_id() {
                                 return None;
+                            }
+                            if method.method() == AssistanceMethod::Stop {
+                                bindings.fence_claude_reactivation(&call_id, &channel);
                             }
                             if method.method() == AssistanceMethod::Start && reactivation {
                                 match actor_key {
@@ -1421,6 +1423,44 @@ fn codex_problems_fixture() -> (ProductDispatcher, super::host_binding::BindingR
     };
     let binding = invocation.binding_ref().clone();
     (dispatcher, binding, actor_id)
+}
+
+/// Builds the private hook-root string only for a routed Claude call. Other hosts retain native
+/// PathBuf candidates and require no UTF-8 conversion; an invalid Claude root refuses before binding.
+fn hook_route_root(
+    managed_claude: bool,
+    host: HostKind,
+    candidate: &std::path::Path,
+) -> Result<Option<String>, HostBindingCause> {
+    if managed_claude && host == HostKind::Claude {
+        candidate
+            .to_str()
+            .map(|root| Some(root.to_owned()))
+            .ok_or(HostBindingCause::InvalidAttachment)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Non-UTF-8 paths require no string representation for Codex or plain calls.
+#[test]
+fn codex_non_utf8_candidate_does_not_require_claude_route_root() {
+    use std::os::unix::ffi::OsStringExt;
+    let candidate = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+        b"/private/tmp/nonutf8-\xff".to_vec(),
+    ));
+    assert_eq!(
+        hook_route_root(false, HostKind::Codex, &candidate),
+        Ok(None)
+    );
+    assert_eq!(
+        hook_route_root(false, HostKind::Claude, &candidate),
+        Ok(None)
+    );
+    assert_eq!(
+        hook_route_root(true, HostKind::Claude, &candidate),
+        Err(HostBindingCause::InvalidAttachment)
+    );
 }
 
 /// EYES-r2: a `kind: "problems"` context call on the managed-Codex path never runs native
