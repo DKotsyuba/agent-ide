@@ -1393,8 +1393,9 @@ impl Worker<'_> {
                     job.set_stage_failure(
                         &FailureCode::ProviderUnavailable,
                         &format!(
-                            "no {} server serves this file and its source outline refused it; use ide.read with path and lines",
-                            language.name()
+                            "no {} server serves this file and its source outline refused it{}",
+                            language.name(),
+                            super::providers::session_fallback_clause(false)
                         ),
                     );
                     Err(FailureCode::ProviderUnavailable)
@@ -1429,14 +1430,27 @@ impl Worker<'_> {
                         Ok((outline, worktree_root, Some(Lexical::Unavailable)))
                     }
                     None => {
-                        if job.failure_detail.is_none() {
-                            job.set_stage_failure(
+                        // The stage `live_session_for` named promises a source outline this file
+                        // does not have: say native reads instead, keeping the server's cause.
+                        let promise =
+                            format!("{})", super::providers::session_fallback_clause(true));
+                        match job.failure_detail.as_mut() {
+                            Some(detail) if detail.ends_with(&promise) => {
+                                detail.truncate(detail.len() - promise.len());
+                                detail.push_str(&format!(
+                                    "; the source outline refused this file{})",
+                                    super::providers::session_fallback_clause(false)
+                                ));
+                            }
+                            Some(_) => {}
+                            None => job.set_stage_failure(
                                 &FailureCode::ProviderUnavailable,
                                 &format!(
-                                    "{} is unavailable and the source outline refused this file; use ide.read with path and lines",
-                                    server.name()
+                                    "{} is unavailable and the source outline refused this file{}",
+                                    server.name(),
+                                    super::providers::session_fallback_clause(false)
                                 ),
-                            );
+                            ),
                         }
                         Err(FailureCode::ProviderUnavailable)
                     }

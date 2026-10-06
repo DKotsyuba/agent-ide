@@ -11355,6 +11355,20 @@ async fn configured_product_unavailable_rust_symbol_tools_answer_from_the_lexica
     let refused = actor.settle(&fixture, refused).await;
     assert_eq!(refused["code"], "provider_unavailable", "{refused}");
     assert_ne!(refused["state"], "pending", "{refused}");
+    // The workspace failure promised source outlines; this file has none, so the refusal says
+    // native reads instead of claiming ide.outline and ide.read still answer.
+    let raw = actor
+        .call_raw(&fixture, "ide.outline", json!({"path":"src/refused.rs"}))
+        .await;
+    let raw = actor.settle_raw(&fixture, raw).await;
+    let refused_text = raw["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        refused_text.contains("the source outline refused this file; use native reads")
+            && !refused_text.contains("still answer from source"),
+        "{raw}"
+    );
 
     // `ide.symbol` answers the definition-only card: signature, doc and definition come from the
     // lexical outline, and every section a live session would answer names the failed workspace
