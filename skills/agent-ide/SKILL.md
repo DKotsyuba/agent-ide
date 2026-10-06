@@ -93,8 +93,7 @@ and cost a fraction of the context:
   result would not parse and the file parsed before (the reply shows the line and the change
   that caused it); a file that already had a syntax error is edited anyway, with a note
   saying so. The success reply lists where each change landed in the final
-  file (`3 changes applied: change 1: lines 12–20 replaced (now 12–24); …`), so continue
-  from it without re-reading. Prefer one read + one batch edit over a call per change.
+  file (`3 changes applied: change 1: lines 12–20 replaced (now 12–24); …`). After line movement, re-read before line-range edits; `old` and symbol edits can use the reply source. Prefer one read + one batch edit over a call per change.
 
 The single-call edit forms use the same symbol paths:
 
@@ -117,13 +116,12 @@ The single-call edit forms use the same symbol paths:
   `stale_source` (no write) when the file changed or the reference did not cover a complete read.
   Re-read with `ide.read` and inspect every page before retrying. The symbol forms take `source_ref` too
   (optional; validated when given).
-  After `ide.edit`, base the next edit of that file on the `source_ref` in the edit reply.
+  After `ide.edit`, base `old` and symbol edits on the reply `source_ref`; after an edit that moved lines, line-range edits need a fresh `ide.read` of the current file.
 - `ide.edit {"operation_id":"…","path":"src/new.rs","content":"…"}` — creates a file that does
   not exist yet (no `source_ref`: there is nothing to read) and answers `edit: created` with the
   same check — prefer it over native creation so the diagnostics arrive in-reply. The same call
   on an existing file is refused with no write: read it first and pass its `source_ref`.
-- When a reply carries a line `formatted: ±N lines after line X; use source_ref … for the next
-  edit`, the formatter moved lines: any further line-range edit must start from a fresh
+- When a reply carries `lines after X moved ±N`, any further line-range edit must start from a fresh
   `ide.read`, not from the line numbers you held before the edit.
 
 Every edit form formats the candidate with the project's formatter, then runs the project

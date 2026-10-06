@@ -8124,8 +8124,8 @@ async fn configured_product_batch_old_not_found_refuses_and_retries_the_same_ope
     assert_eq!(
         batch_without_status_plate(&refused_text),
         "error: edit_refused (edit:refused); 1 of 2 changes refused, nothing written — \
-         change 2: old text not found; closest line 1: \"pub fn first() -> i32 {\". \
-         Fix the named changes and retry with the same operation_id",
+         change 2: old text not found; closest lines 1-3; first difference at line 1: \
+         \"pub fn first() -> i32 {\". Fix the named changes and retry with the same operation_id",
         "{refused_text}"
     );
     assert_eq!(
@@ -8154,7 +8154,8 @@ async fn configured_product_batch_old_not_found_refuses_and_retries_the_same_ope
         batch_without_status_plate(&retried_text),
         format!(
             "edit: replaced; path src/batch.rs; source_ref {edit_ref}; {}\n2 changes applied: \
-             change 1: lines 1–3 replaced (now 1); change 2: old text at line 5 replaced (now 3–5)",
+             change 1: lines 1–3 replaced (now 1); change 2: old text at line 5 replaced (now 3–5)\n\
+             lines after 1 moved -2",
             batch_diagnostics_segment(&retried)
         ),
         "{retried_text}"
@@ -8339,7 +8340,8 @@ async fn configured_product_batch_terminator_old_empty_lines_and_same_line_inser
         batch_without_status_plate(&edit_text),
         format!(
             "edit: replaced; path src/batch.rs; source_ref {edit_ref}; {}\n2 changes applied: \
-             change 1: old text at line 2 replaced (now 2); change 2: lines 4 deleted",
+             change 1: old text at line 2 replaced (now 2); change 2: lines 4 deleted\n\
+             lines after 2 moved -1",
             batch_diagnostics_segment(&edit)
         ),
         "{edit_text}"
@@ -8348,6 +8350,33 @@ async fn configured_product_batch_terminator_old_empty_lines_and_same_line_inser
         std::fs::read(fixture.root.join("src/batch.rs")).unwrap(),
         b"pub fn alpha() -> i32 {\n    11\n}\npub fn beta() -> i32 {\n    2\n}\n"
     );
+
+    // The previous edit moved lines, so its source_ref cannot carry line numbers: a line entry
+    // on it is refused with nothing written, and the agent re-reads.
+    let moved = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({
+            "operation_id":"batch-bytes-moved",
+            "path":"src/batch.rs",
+            "source_ref":edit_ref,
+            "changes":[{"lines":"4-6","content":"pub fn beta() -> i32 {\n    22\n}"}]
+        }),
+    )
+    .await;
+    let (moved, moved_text) = batch_settle_with_text(&mut actor, &fixture, moved).await;
+    assert_eq!(moved["result"]["outcome"], "stale_source", "{moved}");
+    assert!(moved_text.contains("lines_moved"), "{moved_text}");
+    let reread = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"src/batch.rs","lines":"1-6"}),
+        )
+        .await;
+    let reread = actor.settle(&fixture, reread).await;
+    let reread_ref = reread["detail_ref"].as_str().unwrap().to_owned();
 
     // The insert is the earlier array entry and the replace still applies first at their shared
     // start line: the helper lands immediately before beta's replacement.
@@ -8358,7 +8387,7 @@ async fn configured_product_batch_terminator_old_empty_lines_and_same_line_inser
         json!({
             "operation_id":"batch-bytes-insert",
             "path":"src/batch.rs",
-            "source_ref":edit_ref,
+            "source_ref":reread_ref,
             "changes":[
                 {"symbol":"src/batch.rs#beta","op":"insert","where":"before",
                  "content":"fn helper() -> i32 {\n    0\n}"},
@@ -8375,7 +8404,7 @@ async fn configured_product_batch_terminator_old_empty_lines_and_same_line_inser
         format!(
             "edit: replaced; path src/batch.rs; source_ref {insert_ref}; {}\n2 changes applied: \
              change 1: src/batch.rs#beta inserted before #beta (now 5–7); change 2: lines 4–6 \
-             replaced (now 9–11)",
+             replaced (now 9–11)\nlines after 4 moved +5",
             batch_diagnostics_segment(&insert)
         ),
         "{insert_text}"
@@ -8620,7 +8649,8 @@ async fn configured_product_batch_several_refusals_in_one_bounded_reply() {
             "source_ref":source_ref,
             "changes":[
                 {"lines":"1-1","content":"// ok"},
-                {"old":"definitely absent two","new":"x"},
+                // Similar to the long comment but absent: the hint quotes that line, clipped.
+                {"old":format!("// {} absent", "x".repeat(40)),"new":"x"},
                 {"symbol":"src/batch.rs#nope","op":"delete"}
             ]
         }),
@@ -8632,9 +8662,9 @@ async fn configured_product_batch_several_refusals_in_one_bounded_reply() {
         batch_without_status_plate(&refused_text),
         format!(
             "error: edit_refused (edit:refused); 2 of 3 changes refused, nothing written — \
-             change 2: old text not found; closest line 1: \"// {clipped_comment}\"; change 3: \
-             no symbol src/batch.rs#nope; check ide.outline {{\"path\":\"src/batch.rs\"}}. \
-             Fix the named changes and retry with the same operation_id"
+             change 2: old text not found; closest lines 1-1; first difference at line 1: \
+             \"// {clipped_comment}\"; change 3: no symbol src/batch.rs#nope; check ide.outline \
+             {{\"path\":\"src/batch.rs\"}}. Fix the named changes and retry with the same operation_id"
         ),
         "{refused_text}"
     );
@@ -8646,7 +8676,7 @@ async fn configured_product_batch_several_refusals_in_one_bounded_reply() {
     // Five refusals with full-length excerpts overflow the bound: the reply is clipped at the
     // bound (never past it) and stays a single actionable line.
     let changes: Vec<Value> = (0..5)
-        .map(|number| json!({"old":format!("definitely absent {number}"),"new":"x"}))
+        .map(|number| json!({"old":format!("// {} absent {number}", "x".repeat(40)),"new":"x"}))
         .collect();
     let clipped = batch_call_with_text(
         &mut actor,
@@ -8667,7 +8697,7 @@ async fn configured_product_batch_several_refusals_in_one_bounded_reply() {
     assert!(
         clipped_text.starts_with(
             "error: edit_refused (edit:refused); 5 of 5 changes refused, nothing written — \
-             change 1: old text not found; closest line 1: \""
+             change 1: old text not found; closest lines 1-1; first difference at line 1: \""
         ),
         "{clipped_text}"
     );
@@ -9281,8 +9311,7 @@ async fn configured_product_batch_legacy_single_change_replies_stay_byte_identic
     assert_eq!(
         batch_without_status_plate(&insert_text),
         format!(
-            "edit: inserted; path src/batch.rs; source_ref {insert_ref}; {}\nformatted: +2 \
-             lines after line 4; use source_ref {insert_ref} for the next edit",
+            "edit: inserted; path src/batch.rs; source_ref {insert_ref}; {}\nlines after 4 moved +4",
             batch_diagnostics_segment(&insert)
         ),
         "{insert_text}"

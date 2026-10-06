@@ -2244,7 +2244,8 @@ mod no_such_file_tests {
 impl Worker<'_> {
     /// `ide.edit` with `symbol` (+ `op`) or `path` + `lines`: splices the file in memory, formats
     /// the candidate when the project has a formatter, then writes it through the ordinary
-    /// stale-safe edit path with the observation the splice was resolved on as the base.
+    /// stale-safe edit path with the observation the splice was resolved on as the base. A
+    /// line-range request using a moved edit result is refused until the current file is re-read.
     pub(super) async fn edit_by_symbol(
         &mut self,
         job: &mut Job,
@@ -2351,13 +2352,35 @@ impl Worker<'_> {
         let base = match job.parameters.get("source_ref").and_then(Value::as_str) {
             Some(reference) => {
                 let retained = self.shared.ledger.lock().ok().and_then(|ledger| {
-                    ledger
-                        .details
-                        .get(reference)
-                        .and_then(|detail| admitted_edit_source(detail, &binding, reference, &path))
+                    ledger.details.get(reference).and_then(|detail| {
+                        let source = admitted_edit_source(detail, &binding, reference, &path)?;
+                        let movement =
+                            admitted_edit_line_movement(detail, &binding, reference, &path);
+                        Some((source, movement))
+                    })
                 });
                 match retained {
-                    Some(retained) if retained.bytes() == observed.bytes() => retained,
+                    Some((_, Some((line, delta)))) if job.parameters.get("symbol").is_none() => {
+                        let authority = self.authority(&binding).await.ok();
+                        return Ok((
+                            PeerReply::Edit {
+                                result: EditResult {
+                                    operation_id,
+                                    path,
+                                    outcome: ChangesEditOutcome::StaleSource,
+                                    source_ref: None,
+                                },
+                                diagnostics: EditDiagnostics::Unknown {},
+                                note: Some(format!(
+                                    "stale_source (edit:lines_moved); the edit that produced {reference} moved lines after line {line} by {delta:+}; line numbers must come from a read of the current file — re-read with ide.read {{path, lines}}"
+                                )),
+                                operation: None,
+                            },
+                            authority,
+                            None,
+                        ));
+                    }
+                    Some((retained, _)) if retained.bytes() == observed.bytes() => retained,
                     _ => {
                         let authority = self.authority(&binding).await.ok();
                         return Ok((
@@ -2398,7 +2421,6 @@ impl Worker<'_> {
                     return Err(FailureCode::EditRefused);
                 }
             };
-        let spliced_lines = lang::line_count(&candidate);
         let formatted = self.format_candidate(&observed, &file, candidate).await;
         // Pre-write structural gate, shared with batches and file creation: a candidate that
         // does not parse is not written; a base that already failed is edited with a note.
@@ -2427,12 +2449,7 @@ impl Worker<'_> {
                 return Err(FailureCode::EditRefused);
             }
         };
-        job.format_note = formatted_note(
-            spliced_lines,
-            &formatted,
-            &job.reference,
-            splice_end(&splice),
-        );
+        job.format_note = line_shift_note(&source, &formatted, splice_start(&splice));
         if let Some(note_line) = pre_existing {
             job.format_note = Some(match job.format_note.take() {
                 Some(existing) => format!("{existing}\n{note_line}"),
@@ -2486,7 +2503,8 @@ impl Worker<'_> {
     /// batch, the fresh observation) before anything is applied; application is bottom-up so
     /// each change's final range is exact; the formatted candidate must parse; then one atomic
     /// stale-safe write carries the whole batch. A refused batch writes nothing and consumes
-    /// neither the `operation_id` nor a receipt, so the same id retries.
+    /// neither the `operation_id` nor a receipt, so the same id retries. Line-addressed entries
+    /// using an edit result that moved lines are refused until the current file is re-read.
     #[allow(clippy::too_many_lines)]
     pub(super) async fn edit_changes(
         &mut self,
@@ -2514,13 +2532,39 @@ impl Worker<'_> {
         let base = match job.parameters.get("source_ref").and_then(Value::as_str) {
             Some(reference) => {
                 let retained = self.shared.ledger.lock().ok().and_then(|ledger| {
-                    ledger
-                        .details
-                        .get(reference)
-                        .and_then(|detail| admitted_edit_source(detail, &binding, reference, &path))
+                    ledger.details.get(reference).and_then(|detail| {
+                        let source = admitted_edit_source(detail, &binding, reference, &path)?;
+                        let movement =
+                            admitted_edit_line_movement(detail, &binding, reference, &path);
+                        Some((source, movement))
+                    })
                 });
                 match retained {
-                    Some(retained) if retained.bytes() == observed.bytes() => retained,
+                    Some((_, Some((line, delta))))
+                        if job.parameters["changes"].as_array().is_some_and(|entries| {
+                            entries.iter().any(|entry| entry.get("lines").is_some())
+                        }) =>
+                    {
+                        let authority = self.authority(&binding).await.ok();
+                        return Ok((
+                            PeerReply::Edit {
+                                result: EditResult {
+                                    operation_id,
+                                    path,
+                                    outcome: ChangesEditOutcome::StaleSource,
+                                    source_ref: None,
+                                },
+                                diagnostics: EditDiagnostics::Unknown {},
+                                note: Some(format!(
+                                    "stale_source (edit:lines_moved); the edit that produced {reference} moved lines after line {line} by {delta:+}; line numbers must come from a read of the current file — re-read with ide.read {{path, lines}}"
+                                )),
+                                operation: None,
+                            },
+                            authority,
+                            None,
+                        ));
+                    }
+                    Some((retained, _)) if retained.bytes() == observed.bytes() => retained,
                     _ => {
                         let authority = self.authority(&binding).await.ok();
                         return Ok((
@@ -2591,7 +2635,6 @@ impl Worker<'_> {
                 return Err(refused(job, refusal));
             }
         };
-        let spliced_lines = lang::line_count(&spliced);
         let candidate = self
             .format_candidate(&observed, &file, spliced.clone())
             .await;
@@ -2637,9 +2680,17 @@ impl Worker<'_> {
             .map(|change| change.base.end)
             .max()
             .unwrap_or(0);
-        if let Some(formatted) = formatted_note(spliced_lines, &candidate, &job.reference, anchor) {
+        if let Some(shift) = line_shift_note(
+            &source,
+            &candidate,
+            changes
+                .iter()
+                .map(|change| change.base.start)
+                .min()
+                .unwrap_or(anchor),
+        ) {
             note.push('\n');
-            note.push_str(&formatted);
+            note.push_str(&shift);
         }
         if let Some(note_line) = pre_existing {
             note.push('\n');
@@ -3120,29 +3171,18 @@ fn single_change(op: &str, splice: &Splice, content: Option<&str>) -> Option<Res
     }
 }
 
-/// Last pre-format line the operation touched: everything after it shifts when the formatter
-/// moves lines.
-fn splice_end(splice: &Splice) -> u32 {
+/// First source line changed by a line replacement or insertion.
+fn splice_start(splice: &Splice) -> u32 {
     match splice {
-        Splice::Replace(range) => range.end,
+        Splice::Replace(range) => range.start,
         Splice::Insert(site) => site.line,
     }
 }
 
-/// States the formatter's line movement when it changed the file's line count, so a later
-/// line-addressed edit re-reads instead of reusing the pre-format line numbers.
-fn formatted_note(
-    spliced_lines: u32,
-    formatted: &str,
-    reference: &str,
-    anchor: u32,
-) -> Option<String> {
-    let shift = i64::from(lang::line_count(formatted)) - i64::from(spliced_lines);
-    (shift != 0).then(|| {
-        format!(
-            "formatted: {shift:+} lines after line {anchor}; use source_ref {reference} for the next edit"
-        )
-    })
+/// Reports an edit's net line-count change from its first changed line for later line-addressed edits.
+fn line_shift_note(source: &str, edited: &str, first_changed_line: u32) -> Option<String> {
+    let shift = i64::from(lang::line_count(edited)) - i64::from(lang::line_count(source));
+    (shift != 0).then(|| format!("lines after {first_changed_line} moved {shift:+}"))
 }
 
 /// Replaces the inclusive line range with `content` (a trailing newline is added when missing;
@@ -3514,8 +3554,8 @@ fn parse_change_requests(entries: &[Value]) -> Result<Vec<ChangeRequest>, Failur
 enum OldMatch {
     /// The unique match's byte span.
     One { start: usize, end: usize },
-    /// No match; the closest line (longest common prefix with `old`'s first line) and its text.
-    NotFound { line: u32, text: String },
+    /// No match; the closest n-line window and its first differing line, if anything is similar.
+    NotFound { closest: Option<(LineRange, u32)> },
     /// Several matches; the first line of each.
     Many(Vec<u32>),
 }
@@ -3544,7 +3584,7 @@ fn line_of_byte(spans: &[(usize, usize)], byte: usize) -> u32 {
 }
 
 /// Finds `old` in `source`, wholly inside `scope`'s lines when given: exactly one match, none
-/// (with the closest line), or several (with each match's first line).
+/// (with the closest similarly scored line window), or several (with each match's first line).
 fn find_old(source: &str, old: &str, scope: Option<LineRange>) -> OldMatch {
     let spans = line_byte_spans(source);
     let total = spans.len() as u32;
@@ -3574,29 +3614,61 @@ fn find_old(source: &str, old: &str, scope: Option<LineRange>) -> OldMatch {
     if let Some(&(start, end)) = matches.first() {
         return OldMatch::One { start, end };
     }
-    // No match: suggest the closest line — the one sharing the longest common prefix with the
-    // first line of `old` — clearly labelled a suggestion, never a match claim.
+    // Ignore edge blank lines in `old`; score windows by equal trimmed lines, then shared-prefix characters.
     let lines = source.lines().collect::<Vec<_>>();
     let scope = scope.unwrap_or(LineRange::new(1, total.max(1)));
-    let first = old.lines().next().unwrap_or_default();
-    let mut best = (scope.start, 0usize);
-    for number in scope.start..=scope.end.min(lines.len() as u32) {
-        let shared = lines[(number - 1) as usize]
-            .trim_start()
-            .chars()
-            .zip(first.trim_start().chars())
-            .take_while(|(a, b)| a == b)
+    let mut old_lines = old.lines().map(str::trim).collect::<Vec<_>>();
+    while old_lines.first() == Some(&"") {
+        old_lines.remove(0);
+    }
+    while old_lines.last() == Some(&"") {
+        old_lines.pop();
+    }
+    let count = old_lines.len().max(1);
+    let start = (scope.start.max(1) as usize - 1).min(lines.len());
+    let end = (scope.end as usize).min(lines.len());
+    let Some(last_start) = end.checked_sub(count).filter(|last| start <= *last) else {
+        return OldMatch::NotFound { closest: None };
+    };
+    let first = start..=last_start;
+    let mut best: Option<(usize, usize, usize)> = None;
+    for index in first {
+        let window = &lines[index..index + count];
+        let equal = window
+            .iter()
+            .zip(&old_lines)
+            .filter(|(a, b)| a.trim() == b.trim())
             .count();
-        if shared > best.1 {
-            best = (number, shared);
+        let prefix = window
+            .iter()
+            .zip(&old_lines)
+            .map(|(a, b)| {
+                a.trim()
+                    .chars()
+                    .zip(b.trim().chars())
+                    .take_while(|(x, y)| x == y)
+                    .count()
+            })
+            .sum();
+        if best
+            .is_none_or(|(_, best_equal, best_prefix)| (equal, prefix) > (best_equal, best_prefix))
+        {
+            best = Some((index, equal, prefix));
         }
     }
+    let Some((index, _equal, _prefix)) =
+        best.filter(|(_, equal, prefix)| *equal > 0 || *prefix > 0)
+    else {
+        return OldMatch::NotFound { closest: None };
+    };
+    let difference = (0..count)
+        .find(|offset| lines[index + offset].trim() != old_lines[*offset])
+        .unwrap_or(0);
     OldMatch::NotFound {
-        line: best.0,
-        text: lines
-            .get((best.0 - 1) as usize)
-            .map(|line| line.trim().to_owned())
-            .unwrap_or_default(),
+        closest: Some((
+            LineRange::new(index as u32 + 1, (index + count) as u32),
+            (index + difference + 1) as u32,
+        )),
     }
 }
 
@@ -3776,12 +3848,21 @@ fn resolve_changes(
                                 .join(", ")
                         ),
                     ),
-                    OldMatch::NotFound { line, text } => refusal.push(
+                    OldMatch::NotFound { closest } => refusal.push(
                         number,
-                        format!(
-                            "change {number}: old text not found; closest line {line}: \"{}\"",
-                            clip_bytes(&text, MAX_REFUSAL_EXCERPT_BYTES)
-                        ),
+                        match closest {
+                            Some((range, difference)) => format!(
+                                "change {number}: old text not found; closest lines {}-{}; first difference at line {difference}: \"{}\"",
+                                range.start,
+                                range.end,
+                                clip_bytes(
+                                    lang::slice_lines(source, LineRange::new(difference, difference))
+                                        .trim(),
+                                    MAX_REFUSAL_EXCERPT_BYTES
+                                )
+                            ),
+                            None => format!("change {number}: old text not found; no similar text"),
+                        },
                     ),
                 }
             }
@@ -4481,12 +4562,12 @@ mod batch_tests {
         let (candidate, landings) = apply_changes(source, "a.gamma", &changes).expect("applies");
         assert_eq!(candidate, "sym card\n1\nsym btn\nstain\nend\nmark\nend\n");
         assert_eq!(landings[0], Some(LineRange::new(4, 4)));
-        // Not found quotes the closest line by shared prefix.
+        // Not found points to the closest aligned line window.
         match resolve("martians", None) {
             Err(refusal) => assert!(
-                refusal
-                    .detail()
-                    .contains("change 1: old text not found; closest line 4: \"mark\""),
+                refusal.detail().contains(
+                    "change 1: old text not found; closest lines 4-4; first difference at line 4"
+                ),
                 "{}",
                 refusal.detail()
             ),
@@ -4506,7 +4587,7 @@ mod batch_tests {
         );
     }
 
-    /// Suggests the nearby indented line when old text is indented differently.
+    /// Suggests the closest line window when old text differs only in indentation and value.
     #[test]
     fn closest_old_line_ignores_leading_indentation() {
         let source = "unrelated\n    let value = 1;\n";
@@ -4519,8 +4600,26 @@ mod batch_tests {
         assert!(
             refusal
                 .detail()
-                .contains("closest line 2: \"let value = 1;\"")
+                .contains("closest lines 2-2; first difference at line 2")
         );
+    }
+
+    /// Scores unmatched old-text windows by equal trimmed lines, then shared prefixes.
+    #[test]
+    fn unmatched_old_text_reports_best_window_and_no_similarity() {
+        let source = "start\n    }\nmid\n    }\n    tail(1);\n";
+        assert!(matches!(
+            find_old(source, "    }\n    tail(2);", None),
+            OldMatch::NotFound { closest: Some((range, 5)) } if range == LineRange::new(4, 5)
+        ));
+        assert!(matches!(
+            find_old(source, "\n    tail(2);", None),
+            OldMatch::NotFound { closest: Some((range, 5)) } if range == LineRange::new(5, 5)
+        ));
+        assert!(matches!(
+            find_old(source, "unrelated", None),
+            OldMatch::NotFound { closest: None }
+        ));
     }
 
     /// A change addressing a symbol an earlier change inserts is refused: it is simply not in

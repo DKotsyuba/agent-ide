@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Line-range edits based on an edit that moved lines are refused until the file is re-read, and successful edits report their net line shift. Unmatched exact-text edits now point to the closest matching line window.
+
 ## 0.10.2 — 2026-10-06
 
 ### Fixed

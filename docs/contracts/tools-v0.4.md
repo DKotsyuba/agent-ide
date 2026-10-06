@@ -329,10 +329,10 @@ The whole-file form without `source_ref` only creates a file that does not exist
 
 For a symbol, `content` is the complete symbol including its header. The IDE derives indentation and blank lines from neighboring code. After writing, the project's formatter runs over the candidate (before the write), then the project check (cargo check / pyright / tsc) is scheduled at once and the reply carries the edited file's problems from it. `rename` is performed by the language server across the project.
 
-The line-range form **requires** `source_ref`, and it must name a retained read of the same file (an `ide.read` reply's `source_ref`, a completed paged read, or a prior edit's `source_ref`). The edit applies only while that observation's bytes are still the file's current bytes; a stale or incomplete reference is refused as `stale_source` with no write. The reply names the newest `source_ref` for that path known to this session, from its last successful edit or read, when available; retry with that reference. If none is given, re-read with `ide.read` and inspect every page before retrying. The symbol form resolves the symbol again, so its `source_ref` is optional — but when one is given it is validated the same way. When the formatter changes the file's line count, every successful edit reply states the movement as its last line:
+The line-range form **requires** `source_ref`, and it must name a retained read of the same file (an `ide.read` reply's `source_ref`, a completed paged read, or a prior edit's `source_ref`). The edit applies only while that observation's bytes are still the file's current bytes; a stale or incomplete reference is refused as `stale_source` with no write. The reply names the newest `source_ref` for that path known to this session, from its last successful edit or read, when available; retry with that reference. If none is given, re-read with `ide.read` and inspect every page before retrying. The symbol form resolves the symbol again, so its `source_ref` is optional — but when one is given it is validated the same way. When an edit changes the file's line count, its successful reply states the net movement and first changed line (for example `lines after 12 moved +3`). A later line-addressed edit using that edit result is refused as `stale_source (edit:lines_moved)`; re-read current lines with `ide.read {path, lines}`. `old` and symbol edits can continue from the edit reply. A line-count-preserving edit and reads from `ide.read` or `ide.context` remain valid bases for line ranges.
 
 ```text
-formatted: +3 lines after line 24; use source_ref sym-14 for the next edit
+lines after 12 moved +3
 ```
 
 Output (implemented wire form):
@@ -341,7 +341,7 @@ Output (implemented wire form):
 edit: replaced; path src/lang/path.rs; source_ref …-3; diagnostics: current_reported (project check 1.8s: 1 errors, 0 warnings in this file)
 src/lang/path.rs:132:9 error [E0308] mismatched types
 Next: use ide.edit with source_ref …-3
-formatted: +3 lines after line 24; use source_ref …-3 for the next edit
+lines after 12 moved +3
 ```
 
 ```text
@@ -359,7 +359,7 @@ renamed method → run; 7 sites in 4 files: src/index.ts (3), src/api.ts (2), te
 
 The first line's operation word names what happened: `edit: inserted`, `edit: deleted`, `edit: renamed` (`replace` and every plain edit keep `edit: replaced`, `edit: created`, `edit: unchanged`). The rename's second line lists every touched file with its site count, bounded like every other list (five files inline, then `+N more`); its diagnostics are the last written file's, and a rename never waits for the project check — a still-running check reports `diagnostics: unknown` and reaches the next `<agent-ide>` block or `ide.context` like any other edit.
 
-Errors: `stale_source`, `unknown_symbol`, `edit_refused` (address resolution, overlap, or a candidate that does not parse — nothing written, retry with the same `operation_id`).
+Errors: `stale_source` (including `edit:lines_moved`, which requires re-reading current lines), `unknown_symbol`, `edit_refused` (address resolution, overlap, or a candidate that does not parse — nothing written, retry with the same `operation_id`).
 
 A batch edit changes many places in ONE file in one call:
 
@@ -381,7 +381,7 @@ The success reply lists where every change landed in the final file, so no re-re
 ```text
 edit: replaced; path src/x.rs; source_ref …-7; diagnostics: current_clean. Next: use ide.diff
 3 changes applied: change 1: lines 12–20 replaced (now 12–24); change 2: src/x.rs#Foo/bar inserted after #Foo (now 26–33); change 3: old text at line 88 replaced (now 90–91)
-formatted: +3 lines after line 33; use source_ref …-7 for the next edit
+lines after 12 moved +3
 ```
 
 ### 2.6 `ide.test` — run tests on request, in the background (implemented)

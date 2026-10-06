@@ -145,7 +145,7 @@ enum JobStage {
 }
 
 /// A retained outcome requiring exact binding ownership and fresh durable authorization on access.
-struct Detail {
+pub(super) struct Detail {
     /// Immutable owner binding, checked separately from the opaque reference.
     binding: BindingRef,
     /// Current pending, error or owner-generated result.
@@ -160,6 +160,8 @@ struct Detail {
     /// first file's observation stays `source`; every other delivered file rides here so the
     /// same reference authorizes an edit of any file the read included. Path disambiguates.
     extra_sources: Vec<crate::workspace::observation::SourceObservation>,
+    /// Net line-count change and first line changed by a successful edit, if it moved lines.
+    line_movement: Option<(u32, i64)>,
     /// Native lifecycle revision associated with this result.
     native_epoch: u64,
     /// Retained bounded Changes state for the next Diff page; absent once fully delivered.
@@ -629,6 +631,7 @@ impl Shared {
             detail.authority = authority;
             detail.source = source;
             detail.native_epoch = native_epoch;
+            detail.line_movement = reply_line_movement(&detail.reply);
         }
     }
     /// Answers one settled run's terminal text and, for the owning binding, hands the run's
@@ -1801,6 +1804,7 @@ impl WorkerHandle {
                     authority: None,
                     source: None,
                     native_epoch: 0,
+                    line_movement: None,
                     diff_page: None,
                     diff_page_fresh: false,
                     context_page: None,
@@ -2742,9 +2746,9 @@ impl<'a> Worker<'a> {
                 result,
                 diagnostics,
                 operation,
-                ..
+                note,
             } if result.outcome == ChangesEditOutcome::StaleSource => PeerReply::Edit {
-                note: None,
+                note,
                 result,
                 diagnostics,
                 operation,
@@ -5278,6 +5282,21 @@ fn never_issued(reference: &str, nonce: &[u8; 32], next: u64) -> bool {
         || number.parse::<u64>().map_or(true, |minted| minted > next)
 }
 
+/// Reads the line movement recorded in a successful edit reply for its retained source detail.
+fn reply_line_movement(reply: &PeerReply) -> Option<(u32, i64)> {
+    let PeerReply::Edit {
+        note: Some(note), ..
+    } = reply
+    else {
+        return None;
+    };
+    note.lines().find_map(|line| {
+        let rest = line.strip_prefix("lines after ")?;
+        let (anchor, delta) = rest.split_once(" moved ")?;
+        Some((anchor.parse().ok()?, delta.parse().ok()?))
+    })
+}
+
 /// Returns the exact same-binding source eligible to authorize a replacement edit.
 ///
 /// Context, a completed Read and a successful prior Edit are the only source-producing details. A
@@ -5325,6 +5344,17 @@ fn admitted_edit_source(
                 .cloned()
         })
         .flatten()
+}
+
+/// Returns a prior edit's line shift only when it is admitted as this binding's source for `path`.
+pub(super) fn admitted_edit_line_movement(
+    detail: &Detail,
+    binding: &BindingRef,
+    reference: &str,
+    path: &str,
+) -> Option<(u32, i64)> {
+    admitted_edit_source(detail, binding, reference, path)?;
+    detail.line_movement.filter(|(_, delta)| *delta != 0)
 }
 
 /// Returns the newest retained detail reference that authorizes a full-file edit of `path` for
@@ -7302,6 +7332,7 @@ mod stop_retry_tests {
                 authority,
                 source,
                 native_epoch: 0,
+                line_movement: None,
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
@@ -7368,6 +7399,7 @@ mod stop_retry_tests {
                 authority,
                 source,
                 native_epoch: 0,
+                line_movement: None,
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
@@ -7520,6 +7552,7 @@ mod stop_retry_tests {
                 authority,
                 source,
                 native_epoch: 0,
+                line_movement: None,
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
@@ -7538,6 +7571,7 @@ mod stop_retry_tests {
         parameters: Value,
     ) -> PeerReply {
         let invocation = production_call(worker, "line-actor", reference);
+        let binding = invocation.binding_ref().clone();
         let (mut job, _cancel) = tool_job(
             root,
             invocation,
@@ -7547,7 +7581,27 @@ mod stop_retry_tests {
         );
         loop {
             match worker.edit(&mut job).await {
-                Ok((reply, _, _)) => return reply,
+                Ok((reply, authority, source)) => {
+                    worker.shared.ledger.lock().unwrap().details.insert(
+                        reference.to_owned(),
+                        Detail {
+                            binding,
+                            selection: (AssistanceTool::Edit, selection(&job.parameters)),
+                            line_movement: reply_line_movement(&reply),
+                            reply: reply.clone(),
+                            authority,
+                            source,
+                            native_epoch: 0,
+                            diff_page: None,
+                            diff_page_fresh: false,
+                            context_page: None,
+                            context_page_fresh: false,
+                            diff_provenance: None,
+                            extra_sources: Vec::new(),
+                        },
+                    );
+                    return reply;
+                }
                 Err(FailureCode::ProviderLoading) => {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
@@ -7557,7 +7611,7 @@ mod stop_retry_tests {
     }
 
     /// A line-range edit applies only on a retained same-path observation whose bytes are still
-    /// current, reports the formatter's line movement, and never writes on a refused base; the
+    /// current, reports its net line movement, and never writes on a refused base; the
     /// symbol form validates an explicit `source_ref` the same way and stays optional.
     #[tokio::test]
     async fn line_and_symbol_edits_gate_on_a_fresh_retained_source() {
@@ -7611,7 +7665,7 @@ mod stop_retry_tests {
                     note: Some(note),
                     ..
                 } if reference == "line-edit"
-                    && note == "formatted: +1 lines after line 3; use source_ref line-edit for the next edit"
+                    && note == "lines after 2 moved +1"
             ),
             "{reply:?}"
         );
@@ -7619,6 +7673,103 @@ mod stop_retry_tests {
             std::fs::read_to_string(fixture.root.join("a.gamma")).unwrap(),
             "sym card\nsym btn\nmark\nx\nend\nend\n"
         );
+
+        let shifted = std::fs::read_to_string(fixture.root.join("a.gamma")).unwrap();
+        let reply = run_edit(
+            &mut worker, &fixture.root, "shifted-single",
+            serde_json::json!({"operation_id":"shifted-single-op","path":"a.gamma","lines":"5-5","source_ref":"line-edit","content":"end"}),
+        ).await;
+        assert!(
+            matches!(&reply, PeerReply::Edit { result: EditResult { outcome: ChangesEditOutcome::StaleSource, .. }, note: Some(note), .. } if note.contains("edit:lines_moved") && note.contains("after line 2 by +1") && note.contains("ide.read {path, lines}")),
+            "{reply:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("a.gamma")).unwrap(),
+            shifted
+        );
+        let reply = run_edit(
+            &mut worker, &fixture.root, "shifted-batch",
+            serde_json::json!({"operation_id":"shifted-batch-op","path":"a.gamma","source_ref":"line-edit","changes":[{"lines":"2-2","content":"changed"}]}),
+        ).await;
+        assert!(
+            matches!(&reply, PeerReply::Edit { result: EditResult { outcome: ChangesEditOutcome::StaleSource, .. }, note: Some(note), .. } if note.contains("edit:lines_moved")),
+            "{reply:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("a.gamma")).unwrap(),
+            shifted
+        );
+        let reply = run_edit(
+            &mut worker, &fixture.root, "old-read-after-edit",
+            serde_json::json!({"operation_id":"old-read-op","path":"a.gamma","lines":"2-3","source_ref":"line-read","content":"wrong"}),
+        ).await;
+        assert!(matches!(
+            reply,
+            PeerReply::Edit {
+                result: EditResult {
+                    outcome: ChangesEditOutcome::StaleSource,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("a.gamma")).unwrap(),
+            shifted
+        );
+
+        // Batch replies carry the same net shift as single line edits.
+        std::fs::remove_file(fixture.root.join("fmt.toml")).unwrap();
+        std::fs::write(fixture.root.join("a.gamma"), source).unwrap();
+        read_and_retain(
+            &mut worker,
+            &fixture.root,
+            "line-actor",
+            &binding,
+            "batch-shift-read",
+            serde_json::json!({"path":"a.gamma","lines":"2-3"}),
+        )
+        .await;
+        let reply = run_edit(&mut worker, &fixture.root, "batch-shift-edit", serde_json::json!({"operation_id":"batch-shift-op","path":"a.gamma","source_ref":"batch-shift-read","changes":[{"lines":"2-3","content":"sym btn\nmark\nx"}]})).await;
+        assert!(
+            matches!(&reply, PeerReply::Edit { note: Some(note), .. } if note.contains("lines after 2 moved +1")),
+            "{reply:?}"
+        );
+
+        // Equal-line-count edits remain valid line-range bases.
+        std::fs::remove_file(fixture.root.join("fmt.toml")).ok();
+        std::fs::write(fixture.root.join("a.gamma"), source).unwrap();
+        read_and_retain(
+            &mut worker,
+            &fixture.root,
+            "line-actor",
+            &binding,
+            "same-count-read",
+            serde_json::json!({"path":"a.gamma","lines":"2-3"}),
+        )
+        .await;
+        let reply = run_edit(&mut worker, &fixture.root, "same-count-edit", serde_json::json!({"operation_id":"same-count-op","path":"a.gamma","lines":"2-3","source_ref":"same-count-read","content":"sym btn\nmark,y"})).await;
+        assert!(matches!(
+            reply,
+            PeerReply::Edit {
+                result: EditResult {
+                    outcome: ChangesEditOutcome::Replaced,
+                    ..
+                },
+                ..
+            }
+        ));
+        let reply = run_edit(&mut worker, &fixture.root, "same-count-next", serde_json::json!({"operation_id":"same-count-next-op","path":"a.gamma","lines":"3-3","source_ref":"same-count-edit","content":"mark,z"})).await;
+        assert!(matches!(
+            reply,
+            PeerReply::Edit {
+                result: EditResult {
+                    outcome: ChangesEditOutcome::Replaced,
+                    ..
+                },
+                ..
+            }
+        ));
 
         // The file changed after the read: the edit is refused with no write at all.
         std::fs::write(fixture.root.join("a.gamma"), source).unwrap();
@@ -8227,6 +8378,7 @@ mod stop_retry_tests {
                 authority: None,
                 source: None,
                 native_epoch: 0,
+                line_movement: None,
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
@@ -8594,6 +8746,7 @@ mod stop_retry_tests {
                 authority: None,
                 source: None,
                 native_epoch: 0,
+                line_movement: None,
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
@@ -8717,6 +8870,7 @@ mod stop_retry_tests {
                 authority: None,
                 source: None,
                 native_epoch: 0,
+                line_movement: None,
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
@@ -8810,6 +8964,7 @@ mod stop_retry_tests {
                 authority: None,
                 source: None,
                 native_epoch: 0,
+                line_movement: None,
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
@@ -8886,6 +9041,7 @@ mod stop_retry_tests {
                 authority: None,
                 source: None,
                 native_epoch: 0,
+                line_movement: None,
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
@@ -9369,6 +9525,7 @@ mod stop_retry_tests {
                 authority: Some(authority),
                 source: None,
                 native_epoch: 0,
+                line_movement: None,
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
@@ -9423,6 +9580,7 @@ mod stop_retry_tests {
                 authority: None,
                 source: None,
                 native_epoch: 0,
+                line_movement: None,
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
@@ -9509,6 +9667,7 @@ mod stop_retry_tests {
                 authority: Some(authority.clone()),
                 source: None,
                 native_epoch: 0,
+                line_movement: None,
                 diff_page: None,
                 diff_page_fresh: false,
                 context_page: None,
