@@ -1267,7 +1267,7 @@ mod tests {
             ("worker:queue_full", "request queue"),
             ("inspect:queue_full", "request queue"),
             ("worker:result_store_full", "result store"),
-            ("worker:actor_share_full", "per-actor shares"),
+            ("worker:actor_share_full", "other active actors"),
             (
                 "diff:single_line:src/long.rs source line 1; ide.read",
                 "reply envelope",

@@ -10,6 +10,8 @@
   and `worktree_unresolved:identity_commit` on `ide.start` for every session of that
   repository. Reads no longer take an entry, and the cap for the remaining operations is
   65 536 (was 1 024), which also unblocks stores that already reached the old cap.
+- Shared result-store capacity now reclaims a caller’s own settled results and results from idle
+  actors, while bounding source-reference protection per actor.
 
 ## 0.10.2 — 2026-10-06
 
