@@ -12,8 +12,10 @@
   65 536 (was 1 024), which also unblocks stores that already reached the old cap.
 - Several agents of one Claude Code session (an orchestrator and its subagents, each in its own
   worktree) work side by side: one agent's `ide.start` no longer moves the others' connection,
-  which made their calls fail `missing_pre` or `hooks_not_delivered`. Each agent's activation
-  is remembered separately across a daemon restart.
+  which made their calls fail `missing_pre` or `hooks_not_delivered`, and removing a finished
+  subagent's worktree no longer breaks the others. Each agent's activation recovers on its own
+  after a daemon restart; a finished agent never blocks a new one, and a stopped agent stays
+  stopped even when its stop reply was lost.
 - A call whose reply was lost is never silently repeated: an edit, test or stop answers
   `outcome_unknown` (check with `ide.diff` or the test status), and a resent call whose
   pre-hook was already used answers as a replay instead of `missing_pre`. The client accepts
@@ -26,7 +28,6 @@
   re-read, and every edit reply states its own shift (`lines after N moved +K`). An unmatched
   `old` text names the closest lines, the first differing line and its text, or says
   `no similar text`.
-
 ## 0.10.2 — 2026-10-06
 
 ### Fixed

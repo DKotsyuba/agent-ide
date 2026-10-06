@@ -2309,6 +2309,7 @@ async fn run_managed_claude_mcp(
         note,
     ) {
         Some(facade) => {
+            let facade = facade.with_claude_refresh(claude_refresh_hook(Arc::clone(&binding)));
             // The held lease stream is a live death notice for the shared daemon: watching it
             // heals the session the moment a generation ends, instead of at the next failed tool
             // call, so the host's next pre-hook already finds a healthy rendezvous (T15B).
@@ -2387,6 +2388,33 @@ fn claude_reestablish_hook(
                 },
             );
             result
+        })
+    })
+}
+
+/// Refreshes a hook cache only on the supplied live repository daemon. The registered candidate
+/// gets a brief lease, while the default binding and its held lease are never moved or replaced.
+fn claude_refresh_hook(
+    binding: Arc<std::sync::Mutex<ClaudeBinding>>,
+) -> agent_ide::assistance::facade::RefreshFn {
+    Arc::new(move |runtime, requested| {
+        let allowed_roots = binding
+            .lock()
+            .expect("claude binding mutex")
+            .allowed_roots
+            .clone();
+        Box::pin(async move {
+            let candidate = fs::canonicalize(requested).ok()?;
+            agent_ide::assistance::launcher::admit_worktree(&allowed_roots, &candidate).ok()?;
+            let key = claude_rendezvous_key(&candidate).await;
+            if claude_runtime_path(&key).ok()? != runtime {
+                return None;
+            }
+            let (connection, attachment) = open_client_lease(&runtime, &candidate).await?;
+            write_claude_key_cache(&candidate, &key);
+            write_claude_candidate_attachment(&candidate, &attachment);
+            drop(connection);
+            Some(attachment)
         })
     })
 }
