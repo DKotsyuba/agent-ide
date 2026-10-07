@@ -265,23 +265,14 @@ fn check(root: &Path) -> Result<()> {
         skips.push(name.to_string());
     }
     let skip_refs: Vec<&str> = skips.iter().map(String::as_str).collect();
+    // The seam-driven product tests need the `test-seams` feature; the next run proves a release
+    // build ignores every seam.
+    #[rustfmt::skip]
+    let workspace_tests = vec!["test", "--locked", "--workspace", "--no-fail-fast", "--features", "test-seams", "--"];
     run(
         root,
         "cargo",
-        &[
-            vec![
-                "test",
-                "--locked",
-                "--workspace",
-                "--features",
-                "test-seams",
-                "--no-fail-fast",
-                "--",
-            ],
-            vec!["--test-threads=1"],
-            skip_refs,
-        ]
-        .concat(),
+        &[workspace_tests, vec!["--test-threads=1"], skip_refs].concat(),
     )?;
     // A release build (no `test-seams` feature) must ignore every environment seam.
     run(

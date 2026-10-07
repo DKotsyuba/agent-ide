@@ -194,6 +194,8 @@ fn ci_workflow_runs_the_xtask_gate_and_supply_chain_job() {
         "\"fmt\", \"--all\", \"--check\"",
         "\"test\", \"--locked\", \"--workspace\", \"--no-fail-fast\"",
         "--test-threads=1",
+        "\"--features\", \"test-seams\"",
+        "release_build_ignores_the_version_seams",
         "real_gopls_production_context_tracks_exact_observed_bytes",
         "shared_gopls_isolates_divergent_worktrees_and_detaches_one_view",
         "dropping_live_gopls_owner_closes_its_owned_listener",
