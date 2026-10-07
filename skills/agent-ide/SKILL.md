@@ -348,6 +348,8 @@ recovery the reply names once (`unknown` → `ide.context {"kind":"problems"}`;
 this call` → do that); otherwise, and whenever `ide.*` is inactive, unsupported
 or its reply is not usable, fall back immediately to native host tools and
 CodeGraph or native search — never block source work waiting for `ide.*`.
+`error: busy: … did not run this one, so nothing was applied` means the daemon's connection
+lane was full and refused the call before running it: repeat the same call in a moment.
 A `retry` fact names the exact recovery: `daemon restarted; repeat this call
 once` (on `ide.start`) or `session re-rooted to the requested root; repeat this
 call once` → repeat that exact call once before falling back; `daemon restarted;
