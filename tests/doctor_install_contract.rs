@@ -442,12 +442,14 @@ fn live_daemons_are_listed_with_versions_and_outdated_ones_flagged() {
     // Shared repository daemons live in /private/tmp under the `ai-r-` prefix; a short path also
     // keeps the socket under macOS's 104-byte limit on runners with a long temp root.
     let unique = TEST_ID.fetch_add(2, Ordering::Relaxed);
+    // Doctor recognises only exact product runtime names: `ai-r-` plus sixteen lowercase hex
+    // digits (here 12 for the process id, 3 for the test id and one for the daemon).
     let current_runtime = PathBuf::from(format!(
-        "/private/tmp/ai-r-doctor-{}-{unique}-c",
+        "/private/tmp/ai-r-{:012x}{unique:03x}a",
         std::process::id()
     ));
     let outdated_runtime = PathBuf::from(format!(
-        "/private/tmp/ai-r-doctor-{}-{unique}-o",
+        "/private/tmp/ai-r-{:012x}{unique:03x}b",
         std::process::id()
     ));
     let current = spawn_health_daemon(&current_runtime, None);
