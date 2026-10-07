@@ -4422,6 +4422,9 @@ impl<'a> Worker<'a> {
                 Err(_) => crate::workspace::edit::EditOutcome::CancelledNoEffect,
             }
         };
+        if fault_seam("edit_after_write") {
+            panic!("agent-ide test seam: deliberate panic after an edit wrote");
+        }
         let known = matches!(
             outcome,
             crate::workspace::edit::EditOutcome::Created(_)
@@ -6348,7 +6351,7 @@ fn panic_seam(_job: &Job) {}
 
 /// Test seam: reports `true` exactly once per flag file when `AGENT_IDE_TEST_FAULT` names `point`,
 /// so a product test can inject one fault into a named place of the daemon (`inspection`, `ensure`,
-/// `loop`, `worker_exit`) that survives a daemon replacement.
+/// `loop`, `worker_exit`, `edit_after_write`) that survives a daemon replacement.
 ///
 /// The variable reads `<point>:<absolute flag file>`; the fault fires when the flag file exists
 /// and this call is the one that removes it, so only the first daemon to reach the point fails and
