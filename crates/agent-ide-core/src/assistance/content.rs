@@ -278,7 +278,8 @@ fn display_safe(label: &str) -> String {
 }
 
 /// Splits an environment-selector refusal detail, `environment "<root key>" <selector>`, into the
-/// root key (`python` or `python:<relative root>`) and the selector exactly as the agent sent it.
+/// root key (a language id, or `<language id>:<relative root>`) and the selector exactly as the
+/// agent sent it.
 ///
 /// The worker JSON-quotes the key, so a root containing spaces, quotes or colons is read back
 /// unchanged; the selector is everything after the single space that follows the quoted key and
@@ -1247,9 +1248,9 @@ mod tests {
     fn environment_selector_refusal_names_the_selector_and_the_venv_form() {
         // The worker JSON-quotes the root key, so roots and selectors with spaces stay exact.
         for (key, selector) in [
-            ("python", "/usr/local/bin/python3.14"),
-            ("python:packages/my project", "/opt/my envs/python 3.14"),
-            ("python:odd\"root", "/usr/bin/python3"),
+            ("alpha", "/usr/local/bin/interpreter-1"),
+            ("alpha:packages/my project", "/opt/my envs/interpreter 1"),
+            ("alpha:odd\"root", "/usr/bin/interpreter"),
         ] {
             let refused = render(
                 PeerReply::Error {
@@ -1270,7 +1271,6 @@ mod tests {
             for fact in [
                 &format!("environment selector {selector} for {key} is outside"),
                 "inside the worktree",
-                "bin/python",
                 "not a base interpreter",
                 &format!("ide.start with environment {example}"),
                 "allowed_roots",
