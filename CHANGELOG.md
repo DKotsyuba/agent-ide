@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- `doctor` no longer counts every old file or directory in the temporary directory as a "stale agent-ide runtime entry" (it reported tens of thousands, mostly other programs' files). It looks only at the product's own runtime directories (`ai-` and `ai-r-` plus sixteen hex digits, owned by you and private), removes those older than a day with no daemon listening, and reports how many it removed; every other entry, the `ai-k-` key caches included, is left alone.
 - A Python environment selector refused as outside the allowed roots (for example a base
   interpreter passed instead of the project venv) now answers with a text that names the
   selector and the expected project venv form, instead of telling the agent to move the project

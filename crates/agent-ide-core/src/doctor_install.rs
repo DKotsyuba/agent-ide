@@ -3,8 +3,10 @@
 //! Reports the launcher configuration, the toolchains it declares, the standalone install and
 //! launcher shim, the host plugin pinning, Codex/Claude host wiring, stale runtime entries under
 //! the temporary root, and the last day's error-journal volume as bounded JSON findings. It never
-//! creates or mutates state, never starts a daemon, and only ever names paths below the effective
-//! user's own home (see [`crate::userhome`]).
+//! creates state, never starts a daemon, and only ever names paths below the effective user's own
+//! home (see [`crate::userhome`]). Its one mutation is retiring the product's own abandoned
+//! runtime directories (see [`is_product_runtime_name`]); no other temporary entry is counted,
+//! probed or removed.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -29,6 +31,11 @@ const STALE_RUNTIME_AGE: Duration = Duration::from_secs(24 * 3600);
 /// Name prefix of the shared repository daemons managed Claude sessions rendezvous with in
 /// `/private/tmp` (the same prefix the launcher and the error log use).
 const SHARED_RUNTIME_PREFIX: &str = "ai-r-";
+/// Name prefix of the private per-process runtime directories the front creates below the temp
+/// root for an owned daemon.
+const OWNED_RUNTIME_PREFIX: &str = "ai-";
+/// Hexadecimal characters after either runtime prefix (eight random or digest bytes).
+const RUNTIME_SUFFIX_LEN: usize = 16;
 /// Wall-clock ceiling for one socket-liveness connect in the stale-runtime check.
 const SOCKET_LIVENESS_TIMEOUT: Duration = Duration::from_millis(250);
 /// Error-level journal lines in the last day above which the volume finding warns.
@@ -474,13 +481,36 @@ fn check_hosts(findings: &mut Vec<Finding>, effective: &Path) {
     );
 }
 
+/// Reports whether `name` is exactly the name of one of the product's own runtime directories:
+/// `ai-` or `ai-r-` followed by sixteen lowercase hexadecimal characters.
+///
+/// Every other temporary entry belongs to some other program or to a cache a live session still
+/// reads (the `ai-k-` key caches carry hook state of running sessions), so doctor neither
+/// counts, probes nor removes it.
+fn is_product_runtime_name(name: &str) -> bool {
+    [SHARED_RUNTIME_PREFIX, OWNED_RUNTIME_PREFIX]
+        .iter()
+        .filter_map(|prefix| name.strip_prefix(prefix))
+        .any(|suffix| {
+            suffix.len() == RUNTIME_SUFFIX_LEN
+                && suffix
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
+
 /// Lists this user's live daemons below the temp root with their versions, flags outdated ones
-/// (0.6.7), and counts stale abandoned runtime entries; never names their paths.
+/// (0.6.7), and retires the product's own abandoned runtime directories; never names their paths.
 ///
 /// A live daemon is one of this user's runtime directories whose daemon socket answers the
 /// side-effect-free health exchange, so its reported version is read from the reply the product
-/// itself uses for the same decision. Only versions are reported, never paths. Entries older than
-/// a day that answer on no socket count as stale exactly as before.
+/// itself uses for the same decision. Only versions are reported, never paths.
+///
+/// Only a directory named exactly like a product runtime ([`is_product_runtime_name`]), owned by
+/// this user and private (no group or other access) is a candidate. A candidate older than a day
+/// whose sockets answer nobody (no daemon, so no lease either) is abandoned: it is removed and
+/// counted as pruned, or counted as stale when removal fails. A younger or answering candidate is
+/// never touched.
 ///
 /// The shared repository daemons a managed Claude session rendezvouses with live in
 /// `/private/tmp` under the `ai-r-` prefix rather than below the temp root, so those entries
@@ -491,44 +521,52 @@ async fn check_running_daemons(findings: &mut Vec<Finding>) {
     };
     let mut candidates = Vec::new();
     let shared = Path::new("/private/tmp");
-    let mut roots = vec![(root.as_path(), "")];
+    let mut roots = vec![root.as_path()];
     if root.as_path() != shared {
-        roots.push((shared, SHARED_RUNTIME_PREFIX));
+        roots.push(shared);
     }
-    for (dir, prefix) in roots {
+    for dir in roots {
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
         for entry in entries.flatten() {
-            if !entry.file_name().to_string_lossy().starts_with(prefix) {
+            if !is_product_runtime_name(&entry.file_name().to_string_lossy()) {
                 continue;
             }
+            // `DirEntry::metadata` does not follow a symlink, so a link named like a runtime is
+            // neither a directory nor a candidate.
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
             let owned = metadata.uid() == unsafe { libc::geteuid() }
-                && (metadata.is_dir() || metadata.file_type().is_socket());
+                && metadata.is_dir()
+                && metadata.mode() & 0o077 == 0;
             if owned {
-                candidates.push((entry.path(), metadata.is_dir()));
+                candidates.push(entry.path());
             }
         }
     }
     let mut versions: BTreeMap<String, usize> = BTreeMap::new();
     let mut outdated = 0usize;
     let mut stale = 0usize;
-    for (path, is_dir) in candidates {
+    let mut pruned = 0usize;
+    for path in candidates {
         let stale_age = fs::symlink_metadata(&path)
             .ok()
             .and_then(|metadata| metadata.modified().ok())
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|age| age > STALE_RUNTIME_AGE);
-        if !has_live_listener(&path, is_dir).await {
+        if !has_live_listener(&path).await {
             if stale_age {
-                stale += 1;
+                if fs::remove_dir_all(&path).is_ok() {
+                    pruned += 1;
+                } else {
+                    stale += 1;
+                }
             }
             continue;
         }
-        let Some((version, outdated_version)) = live_daemon_version(&path, is_dir).await else {
+        let Some((version, outdated_version)) = live_daemon_version(&path).await else {
             continue;
         };
         if outdated_version {
@@ -576,6 +614,18 @@ async fn check_running_daemons(findings: &mut Vec<Finding>) {
             ),
         );
     }
+    if pruned > 0 {
+        push(
+            findings,
+            "stale_runtime_pruned",
+            "info",
+            "daemons",
+            format!(
+                "{pruned} abandoned agent-ide runtime director{} removed (older than a day, no daemon listening)",
+                if pruned == 1 { "y" } else { "ies" },
+            ),
+        );
+    }
     if stale > 0 {
         push(
             findings,
@@ -583,7 +633,7 @@ async fn check_running_daemons(findings: &mut Vec<Finding>) {
             "warn",
             "daemons",
             format!(
-                "{stale} stale agent-ide runtime entries owned by this user under the temporary directory"
+                "{stale} stale agent-ide runtime entries owned by this user under the temporary directory could not be removed"
             ),
         );
     }
@@ -594,10 +644,7 @@ async fn check_running_daemons(findings: &mut Vec<Finding>) {
 ///
 /// `None` inside `Some` marks a daemon that reports no version: one older than 0.6.7, the exact
 /// case the outdated finding names.
-async fn live_daemon_version(path: &Path, is_dir: bool) -> Option<(Option<String>, bool)> {
-    if !is_dir {
-        return None;
-    }
+async fn live_daemon_version(path: &Path) -> Option<(Option<String>, bool)> {
     let report = crate::app::doctor_report(path).await.ok()?;
     let DoctorStatus::Healthy { daemon_generation } = report.status else {
         return None;
@@ -608,25 +655,19 @@ async fn live_daemon_version(path: &Path, is_dir: bool) -> Option<(Option<String
     ))
 }
 
-/// Reports whether any socket at `path` — or directly inside it, for a runtime directory —
-/// still has a listening owner. A successful connect proves a live daemon; refusal, a missing
-/// path, or any other connect failure means nobody is listening. This is the same liveness
-/// question `retire_stale_socket` asks before removing a socket file.
-async fn has_live_listener(path: &Path, is_dir: bool) -> bool {
-    let mut sockets = Vec::new();
-    if is_dir {
-        let Ok(entries) = fs::read_dir(path) else {
-            return false;
-        };
-        sockets.extend(
-            entries
-                .flatten()
-                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_socket()))
-                .map(|entry| entry.path()),
-        );
-    } else {
-        sockets.push(path.to_path_buf());
-    }
+/// Reports whether any socket directly inside the runtime directory `path` still has a listening
+/// owner. A successful connect proves a live daemon; refusal, a missing path, or any other connect
+/// failure means nobody is listening. This is the same liveness question `retire_stale_socket`
+/// asks before removing a socket file.
+async fn has_live_listener(path: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    let sockets: Vec<_> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_socket()))
+        .map(|entry| entry.path())
+        .collect();
     for socket in sockets {
         if let Ok(Ok(_)) = tokio::time::timeout(
             SOCKET_LIVENESS_TIMEOUT,

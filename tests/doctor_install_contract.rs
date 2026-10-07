@@ -492,3 +492,87 @@ fn live_daemons_are_listed_with_versions_and_outdated_ones_flagged() {
     assert!(!current_runtime.exists() && !outdated_runtime.exists());
     let _ = fs::remove_dir_all(&layout.root);
 }
+
+/// F-16: doctor retires only the product's own abandoned runtime directories.
+///
+/// Exact names (`ai-` or `ai-r-` plus sixteen lowercase hex digits), owned by this user, private,
+/// older than a day, with no listening daemon are removed and counted; every other temporary entry
+/// — another program's directory, a near-miss name, a key cache, a young runtime, a runtime with
+/// open permissions — is neither counted nor touched.
+#[test]
+fn doctor_prunes_only_the_products_own_abandoned_runtimes() {
+    use std::os::unix::fs::DirBuilderExt;
+    let layout = Layout::new("prune");
+    let tmp = layout.root.join("tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    let two_days = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 3600);
+    let make = |name: &str, mode: u32, old: bool| -> PathBuf {
+        let path = tmp.join(name);
+        fs::DirBuilder::new().mode(mode).create(&path).unwrap();
+        fs::write(path.join("agent-ide.lock"), b"").unwrap();
+        if old {
+            fs::File::open(&path)
+                .unwrap()
+                .set_modified(two_days)
+                .unwrap();
+        }
+        path
+    };
+    let abandoned = [
+        make("ai-0123456789abcdef", 0o700, true),
+        make("ai-r-0123456789abcdef", 0o700, true),
+    ];
+    let kept = [
+        make("ai-fedcba9876543210", 0o700, false),
+        make("some-old-project", 0o700, true),
+        make("ai-0123456789abcdeg", 0o700, true),
+        make("ai-0123456789abcdef0", 0o700, true),
+        make("ai-k-0123456789abcdef", 0o700, true),
+        make("ai-aaaaaaaaaaaaaaaa", 0o755, true),
+    ];
+    let output = agent_ide()
+        .arg("doctor")
+        .env(HOME_OVERRIDE_ENV, &layout.root)
+        .env("TMPDIR", &tmp)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for path in &abandoned {
+        assert!(!path.exists(), "abandoned runtime kept: {}", path.display());
+    }
+    for path in &kept {
+        assert!(path.exists(), "foreign entry removed: {}", path.display());
+    }
+    let report = report_of(&output);
+    let pruned = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["code"] == "stale_runtime_pruned")
+        .expect("the removal is reported");
+    let count: usize = pruned["detail"]
+        .as_str()
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        count >= abandoned.len(),
+        "the removed directories are counted: {pruned}"
+    );
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| finding["code"] != "stale_runtime"),
+        "nothing foreign is counted as a stale runtime: {report}"
+    );
+    let _ = fs::remove_dir_all(&layout.root);
+}
