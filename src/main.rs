@@ -2450,8 +2450,10 @@ where
         };
         tokio::select! {
             () = ended => {
-                // This generation ended; heal until a fresh one is attached, then watch it.
-                while !heal().await {
+                // This generation ended. Heal until a fresh one is attached, then watch it — but
+                // only while no newer lease is stored: a replaced daemon closing its old stream
+                // must not make the current, healthy daemon look replaced.
+                while lease.lock().await.is_none() && !heal().await {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
@@ -3826,6 +3828,43 @@ mod tests {
         })
         .await
         .expect("the death of the new daemon must be noticed");
+        watcher.abort();
+    }
+
+    /// F-03: the death of a daemon whose lease was already replaced is not a lost daemon: the
+    /// current lease is healthy, so the watcher heals only when the current daemon dies.
+    #[tokio::test]
+    async fn lease_watcher_ignores_the_death_of_a_replaced_daemon() {
+        use std::sync::atomic::AtomicUsize;
+        let (old_lease, old_daemon) = UnixStream::pair().unwrap();
+        let (new_lease, new_daemon) = UnixStream::pair().unwrap();
+        let lease = Arc::new(Mutex::new(Some(old_lease)));
+        let healed = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&healed);
+        let watcher = tokio::spawn(follow_lease(Arc::clone(&lease), move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(true)
+        }));
+        while lease.lock().await.is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The replacement is stored and the old daemon dies at once, before the swap poll runs.
+        *lease.lock().await = Some(new_lease);
+        drop(old_daemon);
+        tokio::time::sleep(LEASE_SWAP_POLL * 3).await;
+        assert_eq!(
+            healed.load(Ordering::SeqCst),
+            0,
+            "the current daemon is alive"
+        );
+        drop(new_daemon);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while healed.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the death of the current daemon must be noticed");
         watcher.abort();
     }
 
