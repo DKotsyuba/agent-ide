@@ -21111,10 +21111,14 @@ async fn owned_daemon_kill_reaps_a_provider_forked_during_the_kill() {
         let wrapper = fixture.base.join("wrapper");
         std::fs::write(
             &wrapper,
+            // Unlike the first regression's wrapper, this one leaves when the fixture directory
+            // goes, so a failing (mutated) run cannot leak the loops it exists to detect; the
+            // survivors are checked before the fixture drops, so the sensitivity is unchanged.
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nwhile [ ! -f '{}' ]; do [ -d '{}' ] || exit 1; sleep 0.01; done\n",
                 log.display(),
-                gate.display()
+                gate.display(),
+                fixture.base.display()
             ),
         )
         .unwrap();
