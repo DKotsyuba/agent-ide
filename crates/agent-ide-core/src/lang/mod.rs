@@ -1373,6 +1373,24 @@ pub(crate) mod testing {
             .push(fixture_tag(binding));
     }
 
+    /// Armed one-shot `ensure_live` faults of the fixture server: the binding tag and whether the
+    /// fault is a namespace lookup as a binding that owns none (`true`) or a bare refusal (`false`).
+    static FIXTURE_ENSURE_FAULTS: std::sync::Mutex<Vec<(String, bool)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// Makes the next fixture-server `ensure_live` of `binding` fail with a bare
+    /// `ProviderUnavailable` the way a real backend does, once: directly when `unowned` is false,
+    /// or by resolving the cache namespace of a binding that owns none when it is true.
+    pub(crate) fn fixture_fail_next_ensure(
+        binding: &crate::assistance::host_binding::BindingRef,
+        unowned: bool,
+    ) {
+        FIXTURE_ENSURE_FAULTS
+            .lock()
+            .expect("fixture ensure faults")
+            .push((fixture_tag(binding), unowned));
+    }
+
     /// Appends one line to [`FIXTURE_LOG`].
     fn fixture_record(line: String) {
         FIXTURE_LOG.lock().expect("fixture log").push(line);
@@ -1459,7 +1477,8 @@ pub(crate) mod testing {
         /// Resolves the job binding's retained namespace like a real backend, records it, marks
         /// the binding live, and answers `ProviderLoading` (the namespace was obtained; a real
         /// server would now be starting). A binding without a retained namespace gets the real
-        /// backends' bare `ProviderUnavailable`.
+        /// backends' bare `ProviderUnavailable`, as does a binding armed by
+        /// [`fixture_fail_next_ensure`].
         fn ensure_live<'a>(
             &'a mut self,
             host: &'a mut dyn crate::intelligence::server::ProviderHost,
@@ -1471,8 +1490,27 @@ pub(crate) mod testing {
             Box::pin(async move {
                 let binding = job.binding().clone();
                 let authority = host.authority(&binding).await?;
+                let fault = {
+                    let mut armed = FIXTURE_ENSURE_FAULTS.lock().expect("fixture ensure faults");
+                    let tag = fixture_tag(&binding);
+                    armed
+                        .iter()
+                        .position(|(armed, _)| *armed == tag)
+                        .map(|position| armed.remove(position).1)
+                };
+                let lookup = match fault {
+                    Some(false) => {
+                        return Err(crate::assistance::reply::FailureCode::ProviderUnavailable);
+                    }
+                    Some(true) => crate::assistance::host_binding::BindingRef::fixture(
+                        "fixture-unowned",
+                        "fixture-unowned-channel",
+                        1,
+                    ),
+                    None => binding.clone(),
+                };
                 let namespace = host.cache_namespace(
-                    &binding,
+                    &lookup,
                     &authority,
                     launch,
                     &crate::intelligence::server::effective_trust(launch),

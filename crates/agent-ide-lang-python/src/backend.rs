@@ -252,7 +252,13 @@ impl PyrightBackend {
                     host.registry().cancel_pending(&mut admission, ticket);
                     return Err(FailureCode::Capacity);
                 }
-                _ => return Err(FailureCode::ProviderUnavailable),
+                _ => {
+                    job.set_stage_failure(
+                        &FailureCode::ProviderUnavailable,
+                        "python: view refused",
+                    );
+                    return Err(FailureCode::ProviderUnavailable);
+                }
             }
         };
         let output_bytes = host.output_bytes();
@@ -277,6 +283,10 @@ impl PyrightBackend {
                     if let PyrightProfileError::Process(error) = error {
                         host.spawn_failure(error, &binding);
                     }
+                    job.set_stage_failure(
+                        &FailureCode::ProviderUnavailable,
+                        "python: spawn failed",
+                    );
                     return Err(FailureCode::ProviderUnavailable);
                 }
             }
@@ -321,6 +331,10 @@ impl PyrightBackend {
                 if job.cancelled() {
                     Err(FailureCode::Cancelled)
                 } else {
+                    job.set_stage_failure(
+                        &FailureCode::ProviderUnavailable,
+                        "python: initialize failed",
+                    );
                     Err(FailureCode::ProviderUnavailable)
                 }
             }
@@ -359,6 +373,10 @@ impl PyrightBackend {
                 return if job.cancelled() {
                     Err(FailureCode::Cancelled)
                 } else {
+                    job.set_stage_failure(
+                        &FailureCode::ProviderUnavailable,
+                        "python: request failed",
+                    );
                     Err(FailureCode::ProviderUnavailable)
                 };
             }

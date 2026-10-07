@@ -466,6 +466,20 @@ fn admission_reserves_a_server_slot_per_registered_language_and_one_free_slot() 
     assert_eq!(limits.per_owner_running_limit, server_slots + 1);
 }
 
+/// The stage of a terminal job failure that no path named: the derived `<tool>:<reason>` default.
+///
+/// A `ProviderUnavailable` nobody named still gets a parenthesised stage —
+/// `<tool>:provider_unavailable (provider: cause not reported)` — and never the bare default that
+/// a reply would render as "no language server is configured". The real no-server refusal names
+/// itself (`set_no_server_stage` in `providers.rs`).
+fn terminal_stage(tool: AssistanceTool, code: &FailureCode) -> String {
+    if *code == FailureCode::ProviderUnavailable {
+        crate::telemetry::adapters::stage_with_failure(tool, code, "provider: cause not reported")
+    } else {
+        crate::telemetry::adapters::default_stage(tool, code)
+    }
+}
+
 /// Shared bounded transport-side bookkeeping; no lock survives an I/O await.
 struct Ledger {
     /// Jobs popped for execution and not yet settled; maintained in the same locked section that
@@ -2844,8 +2858,7 @@ impl<'a> Worker<'a> {
                 // Every terminal failure names its stage: the failing path's own tag when it set
                 // one, else the derived `<tool>:<reason>` default — never a bare reason.
                 if job.failure_detail.is_none() {
-                    job.failure_detail =
-                        Some(crate::telemetry::adapters::default_stage(job.tool, &code));
+                    job.failure_detail = Some(terminal_stage(job.tool, &code));
                 }
                 (
                     PeerReply::Error {
@@ -7028,25 +7041,26 @@ mod stop_retry_tests {
         Ok(binding)
     }
 
-    /// Resolves `file` (an `.epsilon` source in `worktree`) through the production
-    /// `Worker::live_session_for` as `actor`'s symbol call, returning how it answered. The
-    /// recording fixture provider answers `ProviderLoading` once it holds the retained namespace.
-    async fn provider_symbol_call(
+    /// Resolves `file` (a worktree-relative source) through the production
+    /// `Worker::live_session_for` as `actor`'s symbol call, returning how it answered and the
+    /// failure detail the job carried. The recording fixture provider answers `ProviderLoading`
+    /// once it holds the retained namespace.
+    async fn provider_symbol_call_detailed(
         worker: &mut Worker<'_>,
         actor: &str,
         call: &str,
         file: &std::path::Path,
-    ) -> Result<(), FailureCode> {
+    ) -> (Result<(), FailureCode>, Option<String>) {
         let invocation = production_call(worker, actor, call);
         let binding = invocation.binding_ref().clone();
-        let (observed, _) = worker.observe(&binding, file.to_path_buf()).await?;
+        let (observed, _) = worker.observe(&binding, file.to_path_buf()).await.unwrap();
         let (cancel_sender, cancel) = watch::channel(false);
         let _keep = cancel_sender;
         let mut job = Job {
             reference: format!("provider-{call}"),
             invocation,
             tool: AssistanceTool::Symbol,
-            parameters: serde_json::json!({}),
+            parameters: serde_json::json!({"symbol":format!("{}#a", file.display())}),
             target: provider_target(&worker.runtime),
             deadline: tokio::time::Instant::now() + Duration::from_secs(5),
             cancel,
@@ -7067,7 +7081,19 @@ mod stop_retry_tests {
             job.session_binding.is_none(),
             "the borrowed owner is cleared after the provider call"
         );
-        outcome
+        (outcome, job.failure_detail)
+    }
+
+    /// [`provider_symbol_call_detailed`] without the failure detail.
+    async fn provider_symbol_call(
+        worker: &mut Worker<'_>,
+        actor: &str,
+        call: &str,
+        file: &std::path::Path,
+    ) -> Result<(), FailureCode> {
+        provider_symbol_call_detailed(worker, actor, call, file)
+            .await
+            .0
     }
 
     /// Returns the target selected by the fixture's trusted launcher attachment.
@@ -7819,6 +7845,72 @@ mod stop_retry_tests {
         );
         assert_eq!(events.first(), Some(&format!("ensure:{reader_tag}")));
         assert_eq!(namespaces.len(), 1, "{namespaces:?}");
+    }
+
+    /// Every `provider_unavailable` a provider call raises carries a parenthesised stage: a
+    /// backend's bare refusal is named after its server and step, a namespace the session does
+    /// not own names that cause, a file type no server serves keeps the `ext=` no-server form, and
+    /// an unnamed terminal failure gets the generic provider stage.
+    #[tokio::test]
+    async fn every_provider_unavailable_names_its_stage() {
+        use crate::lang::testing::fixture_fail_next_ensure;
+        let fixture = Fixture::new();
+        let file = epsilon_source(&fixture);
+        std::fs::write(fixture.root.join("b.delta"), "two\n").unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let reader = provider_start(&mut worker, "st-reader", "st-reader-start", true, None)
+            .await
+            .unwrap();
+
+        fixture_fail_next_ensure(&reader, false);
+        let (outcome, detail) =
+            provider_symbol_call_detailed(&mut worker, "st-reader", "st-1", &file).await;
+        assert_eq!(outcome, Err(FailureCode::ProviderUnavailable));
+        assert_eq!(
+            detail.as_deref(),
+            Some(
+                "symbol:provider_unavailable (fixtureserver: session could not start; use native reads)"
+            ),
+            "a backend's bare refusal is named after its server"
+        );
+
+        fixture_fail_next_ensure(&reader, true);
+        let (outcome, detail) =
+            provider_symbol_call_detailed(&mut worker, "st-reader", "st-2", &file).await;
+        assert_eq!(outcome, Err(FailureCode::ProviderUnavailable));
+        assert_eq!(
+            detail.as_deref(),
+            Some(
+                "symbol:provider_unavailable (fixtureserver: cache namespace not owned by this session; use native reads)"
+            ),
+            "the namespace refusal names its own cause"
+        );
+
+        let (outcome, detail) = provider_symbol_call_detailed(
+            &mut worker,
+            "st-reader",
+            "st-3",
+            std::path::Path::new("b.delta"),
+        )
+        .await;
+        assert_eq!(outcome, Err(FailureCode::ProviderUnavailable));
+        assert_eq!(
+            detail.as_deref(),
+            Some("symbol:provider_unavailable ext=delta"),
+            "a file type no server serves keeps the no-server form"
+        );
+
+        assert_eq!(
+            terminal_stage(AssistanceTool::Symbol, &FailureCode::ProviderUnavailable),
+            "symbol:provider_unavailable (provider: cause not reported)"
+        );
+        assert_eq!(
+            terminal_stage(AssistanceTool::Read, &FailureCode::Capacity),
+            "read:capacity"
+        );
     }
 
     /// Readers of sibling worktrees own independent namespaces: a writer arriving on one worktree
@@ -11445,7 +11537,10 @@ mod stop_retry_tests {
             };
             let error = worker.symbol(&mut job).await.unwrap_err();
             assert_eq!(error, FailureCode::ProviderUnavailable);
-            assert_eq!(job.failure_detail.as_deref(), Some("symbol:anchor_missing"));
+            assert_eq!(
+                job.failure_detail.as_deref(),
+                Some("symbol:provider_unavailable (symbols: no language file found to search)")
+            );
         }
 
         // A context on a source over the read ceiling derives the default `<tool>:<reason>` stage.

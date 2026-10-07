@@ -1664,7 +1664,10 @@ impl Worker<'_> {
         let root = authority.worktree().worktree_path().to_path_buf();
         let files = collect_language_files(&root);
         if files.is_empty() {
-            job.failure_detail = Some("symbol:anchor_missing".to_owned());
+            job.set_stage_failure(
+                &FailureCode::ProviderUnavailable,
+                "symbols: no language file found to search",
+            );
             return Err(FailureCode::ProviderUnavailable);
         }
         // (relative file, rendered candidate, is impl) in language and provider order.
@@ -1771,7 +1774,10 @@ impl Worker<'_> {
         // Every language was searched: a name several languages share is ambiguous.
         deduplicate_symbol_candidates(&mut matches);
         if !answered {
-            job.failure_detail = Some("symbol:workspace_symbols".to_owned());
+            job.set_stage_failure(
+                &FailureCode::ProviderUnavailable,
+                "symbols: no language server answered the workspace search",
+            );
             return Err(FailureCode::ProviderUnavailable);
         }
         match matches.len() {

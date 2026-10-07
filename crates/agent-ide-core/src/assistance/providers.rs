@@ -78,6 +78,10 @@ pub(super) struct Providers {
     /// worktrees legitimately use at once. This count is the source of truth for when the shared
     /// entry may actually transition to quiescent.
     shared_cache_refs: BTreeMap<String, usize>,
+    /// Why the last [`ProviderHost`] namespace lookup refused, so the caller that sees only a bare
+    /// `ProviderUnavailable` from a backend can still name the stage. Set by
+    /// [`Worker::retained_cache_namespace`], taken by [`Providers::name_bare_failure`].
+    refusal: std::sync::Mutex<Option<&'static str>>,
 }
 impl Providers {
     /// Creates fixed finite provider bookkeeping and one idle backend per server without launching
@@ -100,8 +104,51 @@ impl Providers {
             caches: BTreeMap::new(),
             binding_caches: BTreeMap::new(),
             shared_cache_refs: BTreeMap::new(),
+            refusal: std::sync::Mutex::new(None),
         }
     }
+
+    /// Forgets the recorded namespace refusal; called before a backend step so a stale cause of an
+    /// earlier call never names a later failure.
+    fn clear_refusal(&self) {
+        *self
+            .refusal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// Gives a backend's bare `ProviderUnavailable` its stage: the namespace refusal recorded
+    /// during the step, else `step`, prefixed by the server name and followed by what still
+    /// answers without the server. A failure that already set its own detail, and every other
+    /// code, is left alone.
+    ///
+    /// `step` is a closed phrase naming the failing step, never a path or payload.
+    fn name_bare_failure(
+        &self,
+        job: &mut Job,
+        server: &'static dyn LanguageServer,
+        step: &str,
+        code: &FailureCode,
+    ) {
+        let refusal = self
+            .refusal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if *code != FailureCode::ProviderUnavailable || job.failure_detail.is_some() {
+            return;
+        }
+        job.set_stage_failure(
+            code,
+            &format!(
+                "{}: {}{}",
+                server.name(),
+                refusal.unwrap_or(step),
+                session_fallback_clause(server.language().support().outline_while_loading())
+            ),
+        );
+    }
+
     /// Mints one checked protocol generation without using timing/PID as actor identity.
     fn next(&mut self) -> Result<u64, FailureCode> {
         self.generation = self
@@ -368,6 +415,7 @@ impl Worker<'_> {
         // call; a writer-less reader becomes that owner first.
         self.resolve_session_owner(job, &source_authority).await?;
         let mut backend = self.providers.take_backend(index)?;
+        self.providers.clear_refusal();
         let result = async {
             if server.session_extensions().contains(&extension) {
                 backend.ensure_live(self, job, &launch, source).await?;
@@ -385,6 +433,10 @@ impl Worker<'_> {
         .await;
         job.session_binding = None;
         self.providers.put_backend(index, backend);
+        if let Err(code) = &result {
+            self.providers
+                .name_bare_failure(job, server, "session request failed", code);
+        }
         result.map(Some)
     }
 
@@ -420,6 +472,7 @@ impl Worker<'_> {
             .session_server(source.path())
             .ok_or_else(|| {
                 job.session_binding = None;
+                set_no_server_stage(job);
                 FailureCode::ProviderUnavailable
             })?;
         let index = match self.providers.slot_of(server) {
@@ -437,12 +490,18 @@ impl Worker<'_> {
             .cloned()
             .ok_or_else(|| {
                 job.session_binding = None;
+                set_no_server_stage(job);
                 FailureCode::ProviderUnavailable
             })?;
         let mut backend = self.providers.take_backend(index)?;
+        self.providers.clear_refusal();
         let ensured = backend.ensure_live(self, job, &launch, source).await;
         self.providers.put_backend(index, backend);
         job.session_binding = None;
+        if let Err(code) = &ensured {
+            self.providers
+                .name_bare_failure(job, server, "session could not start", code);
+        }
         ensured?;
         let budget = Duration::from_millis(100).min(
             job.deadline
@@ -662,6 +721,15 @@ impl Worker<'_> {
         failure.map_or(Ok(()), Err)
     }
 
+    /// Remembers why a namespace lookup refused, for [`Providers::name_bare_failure`].
+    fn record_refusal(&self, cause: &'static str) {
+        *self
+            .providers
+            .refusal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cause);
+    }
+
     /// Resolves the already-retained namespace for this exact durable worktree and provider.
     ///
     /// The path is read from the retained `CacheLifecycle` itself rather than recomputed from the
@@ -729,6 +797,7 @@ impl Worker<'_> {
             .get(binding)
             .is_some_and(|keys| keys.iter().any(|existing| existing == key))
         {
+            self.record_refusal("cache namespace not owned by this session");
             return Err(FailureCode::ProviderUnavailable);
         }
         self.providers
@@ -737,7 +806,10 @@ impl Worker<'_> {
             .and_then(CacheLifecycle::namespace_path)
             .and_then(|path| path.to_str())
             .map(str::to_owned)
-            .ok_or(FailureCode::ProviderUnavailable)
+            .ok_or_else(|| {
+                self.record_refusal("cache namespace unavailable");
+                FailureCode::ProviderUnavailable
+            })
     }
 }
 
@@ -756,6 +828,18 @@ pub(super) struct CacheRequest {
     /// Whether this namespace is the one shared native namespace several concurrently active
     /// worktrees legitimately hold at once rather than a single-owner worktree namespace.
     pub(super) shared: bool,
+}
+
+/// Names the stage of a provider refusal that is a real "no language server for this file type"
+/// answer: the `<tool>:provider_unavailable ext=<extension>` shape the reply template renders as
+/// `no language server is configured for .<extension> files`. Only a path with no accepted server
+/// may use it; every other `ProviderUnavailable` carries its own parenthesised stage.
+fn set_no_server_stage(job: &mut Job) {
+    job.failure_detail = Some(crate::assistance::facade::staged_detail(
+        job.tool,
+        &FailureCode::ProviderUnavailable,
+        &job.parameters,
+    ));
 }
 
 /// Parks `job` for a retry in 300 ms because its language server is still loading; the caller

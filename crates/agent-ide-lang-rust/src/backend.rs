@@ -267,7 +267,10 @@ impl RustBackend {
                     host.registry().cancel_pending(&mut admission, ticket);
                     return Err(FailureCode::Capacity);
                 }
-                _ => return Err(FailureCode::ProviderUnavailable),
+                _ => {
+                    job.set_stage_failure(&FailureCode::ProviderUnavailable, "rust: view refused");
+                    return Err(FailureCode::ProviderUnavailable);
+                }
             }
         };
         let output_bytes = host.output_bytes();
@@ -416,6 +419,10 @@ impl RustBackend {
                 if job.cancelled() {
                     Err(FailureCode::Cancelled)
                 } else {
+                    job.set_stage_failure(
+                        &FailureCode::ProviderUnavailable,
+                        "rust: request failed",
+                    );
                     Err(FailureCode::ProviderUnavailable)
                 }
             }

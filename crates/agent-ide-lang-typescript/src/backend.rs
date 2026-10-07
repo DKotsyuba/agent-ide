@@ -664,9 +664,19 @@ impl TypeScriptBackend {
                     return Err(FailureCode::Capacity);
                 }
                 TypeScriptViewAdmission::Unavailable(TypeScriptProfileError::Quarantined) => {
+                    job.set_stage_failure(
+                        &FailureCode::ProviderUnavailable,
+                        "typescript: project quarantined",
+                    );
                     return Err(FailureCode::ProviderUnavailable);
                 }
-                _ => return Err(FailureCode::ProviderUnavailable),
+                _ => {
+                    job.set_stage_failure(
+                        &FailureCode::ProviderUnavailable,
+                        "typescript: view refused",
+                    );
+                    return Err(FailureCode::ProviderUnavailable);
+                }
             }
         };
         let output_bytes = host.output_bytes();
@@ -695,6 +705,9 @@ impl TypeScriptBackend {
                     } else {
                         FailureCode::ProviderUnavailable
                     };
+                    if failure == FailureCode::ProviderUnavailable {
+                        job.set_stage_failure(&failure, "typescript: spawn failed");
+                    }
                     if let TypeScriptProfileError::Process(error) = error {
                         host.spawn_failure(error, &binding);
                     }
@@ -743,6 +756,10 @@ impl TypeScriptBackend {
                 if job.cancelled() {
                     Err(FailureCode::Cancelled)
                 } else {
+                    job.set_stage_failure(
+                        &FailureCode::ProviderUnavailable,
+                        "typescript: initialize failed",
+                    );
                     Err(FailureCode::ProviderUnavailable)
                 }
             }
@@ -777,6 +794,10 @@ impl TypeScriptBackend {
                 return if job.cancelled() {
                     Err(FailureCode::Cancelled)
                 } else {
+                    job.set_stage_failure(
+                        &FailureCode::ProviderUnavailable,
+                        "typescript: request failed",
+                    );
                     Err(FailureCode::ProviderUnavailable)
                 };
             }
