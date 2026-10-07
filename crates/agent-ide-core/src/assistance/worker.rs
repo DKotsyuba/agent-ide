@@ -2663,8 +2663,9 @@ impl<'a> Worker<'a> {
             match job {
                 Some(job) => {
                     let mut job = job;
-                    // One job's panic answers that call `internal` and journals the message; the
-                    // worker is the daemon's only job task, so it must outlive every job.
+                    // One job's panic answers that call `internal` and journals where it happened
+                    // (never the payload); the worker is the daemon's only job task, so it must
+                    // outlive every job.
                     if catch_panic(self.perform(&mut job)).await.is_err() {
                         self.settle_panicked(&mut job);
                     }

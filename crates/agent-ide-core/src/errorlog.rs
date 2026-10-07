@@ -727,6 +727,8 @@ std::thread_local! {
 /// catcher with the failed call's method instead. The previous hook still runs, so the default
 /// stderr report and a test harness's output capture are unchanged. Later calls do nothing.
 pub fn install_panic_hook() {
+    /// Guards the one-time installation, so a second daemon start in the same process (a test
+    /// harness) never chains the hook onto itself.
     static INSTALLED: std::sync::Once = std::sync::Once::new();
     INSTALLED.call_once(|| {
         let previous = std::panic::take_hook();
@@ -749,9 +751,12 @@ pub fn install_panic_hook() {
     });
 }
 
-/// Runs `poll` — one poll of a job's future — so that a panic inside it is left to the caller
-/// instead of being journaled by the panic hook, which only records the location (see
-/// [`take_panic_place`]).
+/// Runs `poll` — one poll of a job's future — and returns its result unchanged, marking the
+/// thread so that a panic inside it is left to the caller instead of being journaled by the
+/// panic hook (the caller reads the location with [`take_panic_place`]).
+///
+/// `poll` must contain its own `catch_unwind`: an unwind that escaped it would skip the
+/// un-marking, which is why the sole caller wraps the poll that way.
 pub fn catch_job_panic<R>(poll: impl FnOnce() -> R) -> R {
     CATCHING.set(CATCHING.get() + 1);
     let result = poll();

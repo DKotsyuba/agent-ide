@@ -6235,6 +6235,75 @@ async fn binary_and_unreadable_files_refuse_softly_naming_a_native_tool() {
     daemon.wait().await.unwrap();
 }
 
+/// A line edit of a file no IDE language reads keeps working from the `source_ref` of every text
+/// read form (`{path}`, `{path, ranges}`, a bare-path `{symbols}` item): the read's retained
+/// observation is a valid edit base and the edit writes exactly the requested bytes.
+#[tokio::test]
+async fn non_code_file_line_edits_work_from_every_text_read_ref() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(fixture.root.join("run.log"), "one\ntwo\nthree\n").unwrap();
+    fixture.git(&["add", "--", "run.log"]);
+    fixture.git(&["commit", "--quiet", "-m", "log fixture"]);
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "log-edit").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"log-edit"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let mut expected = String::from("one\ntwo\nthree\n");
+    for (round, read) in [
+        json!({"path":"run.log"}),
+        json!({"path":"run.log","ranges":["1-3"]}),
+        json!({"symbols":["run.log"]}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (reply, text) = settled_read(&mut actor, &fixture, read.clone()).await;
+        let source_ref = reply["detail_ref"].as_str().unwrap_or_default().to_owned();
+        assert!(
+            reply["kind"] == "read" && !source_ref.is_empty(),
+            "{read}: {reply} {text}"
+        );
+        let edited = format!("edited {round}");
+        let edit = batch_call_with_text(
+            &mut actor,
+            &fixture,
+            "ide.edit",
+            json!({
+                "operation_id":format!("log-edit-{round}"),
+                "path":"run.log",
+                "lines":"2-2",
+                "source_ref":source_ref,
+                "content":edited,
+            }),
+        )
+        .await;
+        let (edit, edit_text) = batch_settle_with_text(&mut actor, &fixture, edit).await;
+        expected = expected
+            .lines()
+            .enumerate()
+            .map(|(index, line)| if index == 1 { edited.as_str() } else { line })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert!(
+            edit["state"] == "edit" && edit["result"]["outcome"] == "replaced",
+            "{read}: the edit must apply: {edit} {edit_text}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("run.log")).unwrap(),
+            expected,
+            "{read}: {edit_text}"
+        );
+    }
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A job that panics answers that one call `internal`, the error journal records the panic's
 /// source location and the call's method but never the payload text, and the daemon's single
 /// worker stays alive: the next read still answers. Driven by the `test-seams` panic seam, which panics an `ide.read` of
