@@ -123,11 +123,12 @@ fn nested_sandbox_refusal(output: &RunOutput) -> bool {
 ///
 /// Every run first tries the profiled wrapper. When the host refuses to apply a nested Seatbelt
 /// profile (`sandbox-exec: sandbox_apply: Operation not permitted`), the same check runs once
-/// without our profile — the host's own confinement of this daemon already applies to the child,
-/// and the product's only path policy is the launcher `allowed_roots` list, so this drops no
-/// security layer. The refusal is remembered for the daemon's lifetime,
-/// so later checks skip the doomed wrapper and run directly; a run that fails for any other
-/// reason is returned untouched for the checker to report its cause.
+/// without our profile, so a host-confined session still gets its checks instead of none. Those
+/// checks then run under the host's confinement only: the product's read-only, no-network,
+/// private-cache profile does not apply, and whatever the host allows (project writes, network)
+/// the check and its `build.rs` may do. The refusal is remembered for the daemon's lifetime, so
+/// later checks skip the doomed wrapper and run directly; a run that fails for any other reason
+/// is returned untouched for the checker to report its cause.
 pub struct NestedSandboxFallbackRunner {
     /// The profile-applying runner tried first on every check.
     inner: Arc<dyn ConfinedRunner>,

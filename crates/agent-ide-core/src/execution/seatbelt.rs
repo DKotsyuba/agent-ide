@@ -462,10 +462,9 @@ pub async fn run_confined(
 /// output under the same byte budget, whole-group kill on timeout or cancellation — minus only
 /// the `sandbox-exec` wrapper. This is the nested-sandbox fallback path: when the daemon itself
 /// is already confined by the host, applying our profile on top is refused
-/// (`sandbox-exec: sandbox_apply: Operation not permitted`), and the host's own confinement of
-/// this daemon already applies to every child it spawns, so the check runs unprofiled rather than
-/// not at all. The product's only path policy stays the launcher `allowed_roots` list; this
-/// profile was never a permission model.
+/// (`sandbox-exec: sandbox_apply: Operation not permitted`), so the check runs unprofiled rather
+/// than not at all. It then runs under the host's confinement only — not under this product's
+/// read-only, no-network profile.
 pub async fn run_unconfined(
     program: &Path,
     args: &[OsString],

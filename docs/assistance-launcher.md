@@ -188,10 +188,11 @@ resolution.
 One environment limit is handled, not hidden: when the daemon itself is already confined by the
 host (an agent's own sandboxed session), macOS refuses to apply a nested profile —
 `sandbox-exec: sandbox_apply: Operation not permitted`, a non-zero exit with no checker output.
-The runner detects that refusal, runs the same check once without our profile (the host's own
-confinement of the daemon already applies to the child; the product's only path policy is the
-`allowed_roots` list, so this adds no security layer), and remembers the refusal for the daemon's
-lifetime so later checks never retry the doomed wrapper. A check that fails for any other reason
+The runner detects that refusal, runs the same check once without our profile — so such a
+session still gets its checks — and remembers the refusal for the daemon's lifetime so later
+checks never retry the doomed wrapper. Those checks run under the host's confinement only: the
+product's read-only, no-network, private-cache profile does not apply to them, and whatever the
+host allows (project writes, network) the check and its `build.rs` may do. A check that fails for any other reason
 keeps its own cause: the snapshot detail carries the first `error:` line of stderr, else its
 first non-empty line, else `exit <status>`, so a failed check always says why.
 Each check owns one process group, killed whole on cancel, timeout (`check_timeout_s`), or daemon
