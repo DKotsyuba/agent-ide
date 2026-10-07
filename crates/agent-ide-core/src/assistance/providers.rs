@@ -82,6 +82,11 @@ pub(super) struct Providers {
     /// `ProviderUnavailable` from a backend can still name the stage. Set by
     /// [`Worker::retained_cache_namespace`], taken by [`Providers::name_bare_failure`].
     refusal: std::sync::Mutex<Option<&'static str>>,
+    /// Bindings whose reader-to-writer upgrade failed while releasing their own reader-owned
+    /// state. The grant already reads `Writer`, so the retry cannot tell from its role that the
+    /// release is still owed; this marker keeps the debt until the release succeeds or the
+    /// binding's namespace is quiesced ([`Worker::release_reader_owners`]).
+    pending_handover: std::collections::BTreeSet<BindingRef>,
 }
 impl Providers {
     /// Creates fixed finite provider bookkeeping and one idle backend per server without launching
@@ -105,6 +110,7 @@ impl Providers {
             binding_caches: BTreeMap::new(),
             shared_cache_refs: BTreeMap::new(),
             refusal: std::sync::Mutex::new(None),
+            pending_handover: std::collections::BTreeSet::new(),
         }
     }
 
@@ -322,6 +328,7 @@ impl Worker<'_> {
     /// every divergent worktree currently sharing that one heavy listener has stopped, so a still
     /// live shared entry is never falsely retired or handed off to an unrelated actor.
     pub(super) fn quiesce_worktree_caches(&mut self, binding: &BindingRef) {
+        self.providers.pending_handover.remove(binding);
         for key in self
             .providers
             .binding_caches
@@ -644,8 +651,10 @@ impl Worker<'_> {
     /// closed and its namespace quiesced, in that order, before this returns; the readers keep
     /// working and borrow the writer's sessions from their next call on. `writer_was_reader` is
     /// true when the incoming writer upgrades its own reader activation, which then releases its
-    /// own reader-owned state too. Fails with the first cleanup failure; the namespace of a reader
-    /// whose cleanup failed stays non-quiescent, so the writer's start refuses instead of sharing it.
+    /// own reader-owned state too; a retry after a failed upgrade is recognised by the recorded
+    /// debt, not by the role (the grant already says `Writer`), so the failed cleanup is attempted
+    /// again. Fails with the first cleanup failure; the namespace of a reader whose cleanup failed
+    /// stays non-quiescent, so the writer's start refuses instead of sharing it.
     pub(super) async fn release_reader_owners(
         &mut self,
         writer: &BindingRef,
@@ -653,13 +662,14 @@ impl Worker<'_> {
         authority: &AuthorityStamp,
     ) -> Result<(), FailureCode> {
         use crate::workspace::authority::StartRole;
+        let upgrading = writer_was_reader || self.providers.pending_handover.contains(writer);
         let owners: Vec<BindingRef> = self
             .providers
             .binding_caches
             .keys()
             .filter(|owner| {
                 if *owner == writer {
-                    return writer_was_reader;
+                    return upgrading;
                 }
                 self.grants.get(*owner).is_some_and(|grant| {
                     grant.role() == StartRole::Reader
@@ -670,9 +680,15 @@ impl Worker<'_> {
             .collect();
         for owner in owners {
             self.release_live(&owner).await;
-            self.close_provider(&owner).await?;
+            if let Err(code) = self.close_provider(&owner).await {
+                if owner == *writer {
+                    self.providers.pending_handover.insert(writer.clone());
+                }
+                return Err(code);
+            }
             self.quiesce_worktree_caches(&owner);
         }
+        self.providers.pending_handover.remove(writer);
         Ok(())
     }
 

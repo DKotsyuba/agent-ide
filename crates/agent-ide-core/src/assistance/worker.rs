@@ -7913,6 +7913,60 @@ mod stop_retry_tests {
         );
     }
 
+    /// A reader that upgrades in place and fails its own cleanup keeps the debt: the retry (the
+    /// grant already reads `Writer`) attempts the failed cleanup again instead of retaining the
+    /// still-owned namespace around it, and succeeds once the cleanup does.
+    #[tokio::test]
+    async fn failed_reader_upgrade_cleanup_is_attempted_again_on_retry() {
+        use crate::lang::testing::{fixture_fail_next_close, fixture_tag};
+        let fixture = Fixture::new();
+        let file = epsilon_source(&fixture);
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        let actor = provider_start(&mut worker, "fu-actor", "fu-start-reader", true, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider_symbol_call(&mut worker, "fu-actor", "fu-1", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+
+        // First upgrade attempt: the reader-owned cleanup fails.
+        fixture_fail_next_close(&actor);
+        let first = provider_start(&mut worker, "fu-actor", "fu-start-writer-1", false, None)
+            .await
+            .err();
+        assert_eq!(first, Some(FailureCode::Internal));
+        // The retry must try the cleanup again: arm it to fail once more.
+        fixture_fail_next_close(&actor);
+        let second = provider_start(&mut worker, "fu-actor", "fu-start-writer-2", false, None)
+            .await
+            .err();
+        assert_eq!(
+            second,
+            Some(FailureCode::Internal),
+            "the retry attempted the failed cleanup again instead of skipping it"
+        );
+        // With the fault gone the upgrade completes and the actor owns the namespace as a writer.
+        provider_start(&mut worker, "fu-actor", "fu-start-writer-3", false, None)
+            .await
+            .unwrap();
+        assert!(worker.test_binding_owns_caches(&actor));
+        let (events, _) = provider_events(&[&actor]);
+        let tag = fixture_tag(&actor);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| **event == format!("close-failed:{tag}"))
+                .count(),
+            2,
+            "{events:?}"
+        );
+    }
+
     /// Readers of sibling worktrees own independent namespaces: a writer arriving on one worktree
     /// releases only that worktree's reader owner.
     #[tokio::test]
