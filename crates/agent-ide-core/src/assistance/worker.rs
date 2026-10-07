@@ -8302,16 +8302,17 @@ mod stop_retry_tests {
         }
         assert_eq!(paths.len(), MAX_REGISTERED_PATHS);
 
-        // The hook-driven refresh re-reads the stale path; its age is unchanged.
-        worker
-            .observe_as(&binding, std::path::PathBuf::from("stale.txt"), false)
-            .await
-            .expect("the maintenance read succeeds");
-        // An agent's own read of another path refreshes that path's age.
+        // An agent's own read of another path refreshes that path's age...
         worker
             .observe(&binding, std::path::PathBuf::from("asked.txt"))
             .await
             .expect("the requested read succeeds");
+        // ...and only then the hook-driven refresh re-reads the stale path; if it wrongly counted
+        // as a use, the stale path would now be newer than the asked one.
+        worker
+            .observe_as(&binding, std::path::PathBuf::from("stale.txt"), false)
+            .await
+            .expect("the maintenance read succeeds");
 
         // At the full budget the stale path is the oldest and makes room; the asked one stays.
         worker.admit_registered_path(&binding, std::path::Path::new("new.txt"));
