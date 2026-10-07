@@ -913,8 +913,9 @@ impl Worker<'_> {
                         .await
                     {
                         Ok(found) => references = Some(found),
+                        // This branch runs only after the outline's documentSymbols exchange
+                        // failed, which already marked the session failed.
                         Err(_) if exchange => {
-                            self.providers.note_session_fault();
                             degraded = Some("references request failed".to_owned());
                         }
                         Err(_) => {

@@ -7877,7 +7877,7 @@ mod stop_retry_tests {
         assert_eq!(
             detail.as_deref(),
             Some(
-                "symbol:provider_unavailable (fixtureserver: session could not start; use native reads)"
+                "symbol:provider_unavailable (fixtureserver: session could not start; outline and read answer from source)"
             ),
             "a backend's bare refusal is named after its server"
         );
@@ -7889,7 +7889,7 @@ mod stop_retry_tests {
         assert_eq!(
             detail.as_deref(),
             Some(
-                "symbol:provider_unavailable (fixtureserver: cache namespace not owned by this session; use native reads)"
+                "symbol:provider_unavailable (fixtureserver: cache namespace not owned by this session; outline and read answer from source)"
             ),
             "the namespace refusal names its own cause"
         );
@@ -8175,7 +8175,7 @@ mod stop_retry_tests {
         use crate::lang::testing::fixture_serve_session;
         let fixture = Fixture::new();
         epsilon_source(&fixture);
-        std::fs::write(fixture.root.join("a.epsilon"), "fn a\n").unwrap();
+        std::fs::write(fixture.root.join("a.epsilon"), "sym a\nend\n").unwrap();
         git_commit(&fixture.root, "scripted source");
         let store = fixture.store();
         let workspace = DurableWorkspace::open(&store).await.unwrap();
@@ -8212,15 +8212,30 @@ mod stop_retry_tests {
                 1,
             ),
             (
-                "bare-name workspace symbols",
+                "healthy bare name",
                 AssistanceTool::Symbol,
                 serde_json::json!({"symbol":"a","usages":false,"callers":0}),
-                1,
+                0,
             ),
         ];
         run_scripted_cases(&mut worker, &reader, "sx-reader", "sx", cases).await;
 
-        // Failing outline and reference exchanges mark the session as well.
+        // Failing workspace-symbol, outline and reference exchanges mark the session as well,
+        // each isolated from the others (the rest of the scripted server answers).
+        fixture_serve_session(&reader, &["workspaceSymbol"]);
+        run_scripted_cases(
+            &mut worker,
+            &reader,
+            "sx-reader",
+            "sw",
+            [(
+                "bare-name workspace symbols",
+                AssistanceTool::Symbol,
+                serde_json::json!({"symbol":"a","usages":false,"callers":0}),
+                1,
+            )],
+        )
+        .await;
         fixture_serve_session(&reader, &["references"]);
         run_scripted_cases(
             &mut worker,
@@ -8229,6 +8244,22 @@ mod stop_retry_tests {
             "sy",
             [(
                 "card references",
+                AssistanceTool::Symbol,
+                serde_json::json!({"symbol":"a.epsilon#a","callers":0}),
+                1,
+            )],
+        )
+        .await;
+        // The outline exchange fails too, so the card answers from the source outline and the
+        // failing references exchange takes the degraded path.
+        fixture_serve_session(&reader, &["documentSymbol", "references"]);
+        run_scripted_cases(
+            &mut worker,
+            &reader,
+            "sx-reader",
+            "sv",
+            [(
+                "card references after an outline fallback",
                 AssistanceTool::Symbol,
                 serde_json::json!({"symbol":"a.epsilon#a","callers":0}),
                 1,

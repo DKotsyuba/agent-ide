@@ -1107,10 +1107,14 @@ pub(crate) mod testing {
                 .strip_prefix("#!doc ")
                 .map(str::to_owned)
         }
-        /// Gamma alone outlines from its text: `sym <name>` opens a symbol, `end` closes the
+        /// Epsilon, whose server can fail, falls back to its source outline like a real language.
+        fn outline_while_loading(&self) -> bool {
+            self.0 == "epsilon"
+        }
+        /// Gamma and epsilon outline from their text: `sym <name>` opens a symbol, `end` closes the
         /// innermost open one.
         fn outline_from_source(&self, file: &Path, source: &str) -> Option<Outline> {
-            if self.0 != "gamma" {
+            if self.0 != "gamma" && self.0 != "epsilon" {
                 return None;
             }
             let mut open: Vec<Symbol> = Vec::new();
@@ -1423,10 +1427,10 @@ pub(crate) mod testing {
         std::sync::Mutex::new(Vec::new());
 
     /// Makes the fixture server open a scripted session for `binding` from now on: it answers
-    /// document symbols (one function, `a`) and an empty reference list, and fails every other
-    /// request (call hierarchy, workspace symbols) with an error reply, so tests can drive the
+    /// document symbols (one function, `a`), an empty reference list and an empty workspace-symbol
+    /// list, and fails every call-hierarchy request with an error reply, so tests can drive the
     /// worker's real exchange-failure paths. `failing` additionally names requests
-    /// (`"documentSymbol"`, `"references"`) that fail with an error reply too.
+    /// (`"documentSymbol"`, `"references"`, `"workspaceSymbol"`) that fail with an error reply.
     pub(crate) fn fixture_serve_session(
         binding: &crate::assistance::host_binding::BindingRef,
         failing: &'static [&'static str],
@@ -1502,10 +1506,10 @@ pub(crate) mod testing {
                         kind: lsp::SymbolKind::FUNCTION,
                         tags: None,
                         deprecated: None,
-                        range: lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 4)),
+                        range: lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 5)),
                         selection_range: lsp::Range::new(
-                            lsp::Position::new(0, 3),
                             lsp::Position::new(0, 4),
+                            lsp::Position::new(0, 5),
                         ),
                         children: None,
                     },
@@ -1519,6 +1523,15 @@ pub(crate) mod testing {
                     ));
                 }
                 Ok(Some(Vec::new()))
+            });
+            router.request::<request::WorkspaceSymbolRequest, _>(move |_, _| async move {
+                if failing.contains(&"workspaceSymbol") {
+                    return Err(async_lsp::ResponseError::new(
+                        async_lsp::ErrorCode::INTERNAL_ERROR,
+                        "scripted workspaceSymbol failure",
+                    ));
+                }
+                Ok(Some(lsp::WorkspaceSymbolResponse::Flat(Vec::new())))
             });
             router.request::<request::Shutdown, _>(|_, _| async { Ok(()) });
             router.notification::<lsp::notification::Exit>(|_, _| {
