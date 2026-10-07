@@ -86,6 +86,16 @@ impl SymbolPath {
         Ok(Self { file, segments })
     }
 
+    /// Parses one batch-read item: `file#A/b` exactly as [`Self::parse`], or a bare `file` (text
+    /// without `#`), which names the whole file and has no segments.
+    pub fn parse_item(text: &str) -> Result<Self, PathError> {
+        if text.contains('#') {
+            Self::parse(text)
+        } else {
+            Self::parse(&format!("{}#", text.trim()))
+        }
+    }
+
     /// Builds a path from parts already known to be valid.
     pub fn new(file: Option<PathBuf>, segments: Vec<String>) -> Self {
         Self { file, segments }

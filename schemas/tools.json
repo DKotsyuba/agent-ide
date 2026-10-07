@@ -345,7 +345,7 @@
           "type": "string"
         },
         "path": {
-          "description": "File relative to the project root, with `lines` or `ranges`.",
+          "description": "File relative to the project root; alone it reads the whole file, with `lines` or `ranges` those lines.",
           "maxLength": 1024,
           "minLength": 1,
           "type": "string"
@@ -367,7 +367,7 @@
           "type": "string"
         },
         "symbols": {
-          "description": "Several bodies in one reply, request order, one `source_ref` valid for every file included: `[\"src/a.rs#Foo/bar\",\"src/b.rs#qux\"]`. Unknown symbols are reported per item without failing the rest.",
+          "description": "Several bodies in one reply, request order, one `source_ref` valid for every file included: `[\"src/a.rs#Foo/bar\",\"src/b.rs#qux\"]`. Unknown symbols are reported per item without failing the rest; a bare file path reads the text of a file no IDE language reads.",
           "items": {
             "maxLength": 1024,
             "minLength": 1,

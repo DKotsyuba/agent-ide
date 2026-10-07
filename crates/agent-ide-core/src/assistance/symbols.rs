@@ -208,8 +208,10 @@ impl Worker<'_> {
         let (path, range, title) = match (requested.as_deref(), sigil) {
             // A sigil address reads the name's first indexed definition.
             (_, Some((namespace, name))) => {
-                self.sigil_definition(job, &binding, namespace, name)
-                    .await?
+                let (path, range, title) = self
+                    .sigil_definition(job, &binding, namespace, name)
+                    .await?;
+                (path, Some(range), title)
             }
             (Some(symbol), None) => {
                 let symbol = SymbolPath::parse(symbol).map_err(|_| FailureCode::UnknownSymbol)?;
@@ -233,19 +235,23 @@ impl Worker<'_> {
                 lexical = from_text
                     .as_ref()
                     .and_then(|why| self.lexical_note(observed.path(), why));
-                (file, found.range, symbol.to_string())
+                (file, Some(found.range), symbol.to_string())
             }
             (None, None) => {
                 let path = job.parameters["path"]
                     .as_str()
                     .ok_or(FailureCode::SourceUnavailable)?
                     .to_owned();
-                let range = job
-                    .parameters
-                    .get("lines")
-                    .and_then(Value::as_str)
-                    .and_then(crate::assistance::facade::parse_line_range)
-                    .ok_or(FailureCode::SourceUnavailable)?;
+                // `path` alone (no `lines`) reads the whole file.
+                let range = match job.parameters.get("lines") {
+                    Some(lines) => Some(
+                        lines
+                            .as_str()
+                            .and_then(crate::assistance::facade::parse_line_range)
+                            .ok_or(FailureCode::SourceUnavailable)?,
+                    ),
+                    None => None,
+                };
                 (std::path::PathBuf::from(&path), range, path)
             }
         };
@@ -261,21 +267,33 @@ impl Worker<'_> {
         if let Some(code) = no_such_file(observed.state(), &path.to_string_lossy()) {
             return Err(code);
         }
-        let source = observed_text(&observed, &bytes)?;
+        let source = readable_text(job, &observed, &bytes, &path)?;
         let total = lang::line_count(source);
-        if range.start > total || range.end > total {
+        if let Some(range) = range
+            && (range.start > total || range.end > total)
+        {
             job.failure_detail = Some(format!(
                 "read:line_range:file has {total} lines; requested {}-{}",
                 range.start, range.end
             ));
             return Err(FailureCode::SourceUnavailable);
         }
-        let range = LineRange::new(range.start, range.end.min(total));
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
-        let mut text = render::read_text(&path, Some(&title), range, source);
+        let mut text = match range {
+            Some(range) => render::read_text(
+                &path,
+                Some(&title),
+                LineRange::new(range.start, range.end.min(total)),
+                source,
+            ),
+            None => whole_file_text(&path, &title, source),
+        };
         if let Some(note) = lexical {
             text.push_str(&note);
             text.push('\n');
+        }
+        if Lang::for_path(&path).is_none() {
+            text.push_str(NO_ANALYSIS_NOTE);
         }
         text.push_str(&format!("source_ref: {}\n", job.reference));
         let (reply, page) =
@@ -319,22 +337,33 @@ impl Worker<'_> {
             seen.push(address.to_owned());
             match form {
                 ReadBatch::Symbols => {
-                    let Ok(symbol) = SymbolPath::parse(address) else {
+                    let Ok(symbol) = SymbolPath::parse_item(address) else {
                         return Err(FailureCode::UnknownSymbol);
                     };
                     let Some(file) = symbol.file().map(Path::to_path_buf) else {
                         return Err(FailureCode::UnknownSymbol);
                     };
+                    // A bare path of a file no IDE language reads has no outline to resolve: it
+                    // reads as text, like `ide.read {path}`.
+                    let text_file = symbol.segments().is_empty() && Lang::for_path(&file).is_none();
                     let index = match self
-                        .read_batch_file(job, &binding, &mut files, file.clone(), true)
+                        .read_batch_file(job, &binding, &mut files, file.clone(), !text_file)
                         .await
                     {
-                        Ok(index) => index,
+                        Ok(Some(index)) => index,
+                        Ok(None) => {
+                            items.push((
+                                format!("{NOT_TEXT_REFUSAL}: {}\n", file.display()),
+                                None,
+                                address.to_owned(),
+                            ));
+                            continue;
+                        }
                         Err(
                             code @ (FailureCode::NoSuchFile(_) | FailureCode::UnsupportedFile(_)),
                         ) => {
                             items.push((
-                                format!("{}: {}\n", batch_file_refusal(&code), file.display()),
+                                batch_file_refusal(&code, &file.display().to_string()),
                                 None,
                                 address.to_owned(),
                             ));
@@ -343,6 +372,14 @@ impl Worker<'_> {
                         Err(code) => return Err(code),
                     };
                     let (_, _, source, outline) = &files[index];
+                    if text_file {
+                        items.push((
+                            whole_file_text(&file, address, source),
+                            Some(index),
+                            address.to_owned(),
+                        ));
+                        continue;
+                    }
                     match outline.as_ref().and_then(|outline| outline.find(&symbol)) {
                         Some(found) => {
                             let text = render::read_text(&file, Some(address), found.range, source);
@@ -371,12 +408,20 @@ impl Worker<'_> {
                         .read_batch_file(job, &binding, &mut files, file.clone(), false)
                         .await
                     {
-                        Ok(index) => index,
+                        Ok(Some(index)) => index,
+                        Ok(None) => {
+                            items.push((
+                                format!("{NOT_TEXT_REFUSAL}: {path}\n"),
+                                None,
+                                address.to_owned(),
+                            ));
+                            continue;
+                        }
                         Err(
                             code @ (FailureCode::NoSuchFile(_) | FailureCode::UnsupportedFile(_)),
                         ) => {
                             items.push((
-                                format!("{}: {path}\n", batch_file_refusal(&code)),
+                                batch_file_refusal(&code, &path),
                                 None,
                                 address.to_owned(),
                             ));
@@ -423,14 +468,23 @@ impl Worker<'_> {
                 .iter()
                 .map(|&index| files[index].0.display().to_string())
                 .collect();
+            // Text read of a file no IDE language analyzes: say so once, ahead of the reference.
+            let note = if delivered
+                .iter()
+                .any(|&index| Lang::for_path(&files[index].0).is_none())
+            {
+                NO_ANALYSIS_NOTE
+            } else {
+                ""
+            };
             if names.len() > 1 {
                 format!(
-                    "source_ref: {} (valid for {})\n",
+                    "{note}source_ref: {} (valid for {})\n",
                     job.reference,
                     names.join(", ")
                 )
             } else {
-                format!("source_ref: {}\n", job.reference)
+                format!("{note}source_ref: {}\n", job.reference)
             }
         };
         // The continuation footer names exactly the cut items' own requested addresses and the
@@ -591,23 +645,33 @@ impl Worker<'_> {
         files: &mut Vec<(PathBuf, SourceObservation, String, Option<Outline>)>,
         path: PathBuf,
         outline: bool,
-    ) -> Result<usize, FailureCode> {
+    ) -> Result<Option<usize>, FailureCode> {
         if let Some(index) = files.iter().position(|(file, ..)| *file == path) {
-            return Ok(index);
+            return Ok(Some(index));
         }
-        let (observed, bytes) = self.observe(binding, path.clone()).await?;
+        let (observed, bytes) = self
+            .observe(binding, path.clone())
+            .await
+            .inspect_err(|code| {
+                if matches!(code, FailureCode::SourceUnavailable) {
+                    job.failure_detail =
+                        Some(format!("read:source_unavailable:{}", path.display()));
+                }
+            })?;
         let display = path.display().to_string();
         if let Some(code) = no_such_file(observed.state(), &display) {
             return Err(code);
         }
-        let source = observed_text(&observed, &bytes)?.to_owned();
+        let Ok(source) = readable_text(job, &observed, &bytes, &path).map(str::to_owned) else {
+            return Ok(None);
+        };
         let outline = match outline {
             true => Some(self.outline_of(job, &observed, &bytes).await?.0),
             false => None,
         };
         self.finish_symbol_job(job, binding, &observed).await?;
         files.push((path, observed, source, outline));
-        Ok(files.len() - 1)
+        Ok(Some(files.len() - 1))
     }
 
     /// `ide.symbol {symbol, usages?, callers?, callees?, history?}`: the symbol card.
@@ -2178,6 +2242,48 @@ fn find_word(line: &str, word: &str) -> Option<usize> {
     None
 }
 
+/// The text of a whole file for `ide.read {path}` and a bare-path batch item: every line
+/// numbered, or `(empty file)` for a file with no lines. `title` heads the block.
+fn whole_file_text(file: &Path, title: &str, source: &str) -> String {
+    match lang::line_count(source) {
+        0 => format!("{title}  (empty file)\n"),
+        total => render::read_text(file, Some(title), LineRange::new(1, total), source),
+    }
+}
+
+/// Reply line a text read of a file no IDE language analyzes ends with, ahead of `source_ref`.
+const NO_ANALYSIS_NOTE: &str = "note: no code analysis for this format; showing its text only (ide.outline and ide.symbol do not read it)\n";
+
+/// Item line of a batch read whose file is binary or could not be read as text.
+const NOT_TEXT_REFUSAL: &str = "not a readable text file (binary, not UTF-8 or unreadable; inspect it \
+with a native tool such as `file` or `xxd`)";
+
+/// The observed bytes of a read as text, for any readable text file whatever its type.
+///
+/// A file that is binary (not UTF-8, or holding a NUL byte) or whose bytes were not observed is
+/// refused as
+/// `source_unavailable` with a `read:` detail naming the path, which the reply renders as a soft
+/// refusal pointing at native tools — never as `internal`. Unlike [`observed_text`], which the
+/// edit paths share, it records that detail on `job`.
+fn readable_text<'a>(
+    job: &mut Job,
+    observed: &SourceObservation,
+    bytes: &'a [u8],
+    path: &Path,
+) -> Result<&'a str, FailureCode> {
+    observed_text(observed, bytes)
+        .and_then(|text| {
+            if bytes.contains(&0) {
+                Err(FailureCode::SourceUnavailable)
+            } else {
+                Ok(text)
+            }
+        })
+        .inspect_err(|_| {
+            job.failure_detail = Some(format!("read:not_text:{}", path.display()));
+        })
+}
+
 /// The observed bytes as text; symbol tools need UTF-8 sources.
 fn observed_text<'a>(
     observed: &SourceObservation,
@@ -2189,13 +2295,14 @@ fn observed_text<'a>(
     std::str::from_utf8(bytes).map_err(|_| FailureCode::SourceUnavailable)
 }
 
-/// Names one file a batch read could not use, in the item's own line.
-fn batch_file_refusal(code: &FailureCode) -> &'static str {
+/// The item line for one file a batch read could not use: a symbol address into a file no IDE
+/// language reads gets the soft hint to read its text, a missing file `no such file`.
+fn batch_file_refusal(code: &FailureCode, file: &str) -> String {
     match code {
         FailureCode::UnsupportedFile(_) => {
-            "no symbols in this file type (read it with path and lines)"
+            format!("{file} has no code symbols; read it with ide.read {{path, lines|ranges}}\n")
         }
-        _ => "no such file",
+        _ => format!("no such file: {file}\n"),
     }
 }
 

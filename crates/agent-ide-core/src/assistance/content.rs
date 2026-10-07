@@ -320,8 +320,10 @@ fn environment() -> &'static Environment<'static> {
 }
 
 /// VM-instruction budget for one reply render; a render that exceeds it fails into the
-/// presentation-degraded fallback instead of looping.
-const RENDER_FUEL: u64 = 5_000;
+/// presentation-degraded fallback instead of looping. Keeps tenfold headroom over the costliest
+/// real render (the final error fallbacks walk every `elif` of `reply.jinja`, so each added error
+/// branch raises it).
+const RENDER_FUEL: u64 = 6_000;
 /// Deepest template nesting one render may reach; `reply.jinja` has no recursion at all.
 const RENDER_RECURSION_LIMIT: usize = 16;
 
@@ -993,6 +995,10 @@ mod tests {
                 "error: source_unavailable (read:line_range); file has 249 lines; requested 286-334",
             ),
             (
+                "read:not_text:assets/logo.png",
+                "error: source_unavailable (read:not_text); assets/logo.png is not a readable text file (binary, not UTF-8 or unreadable), so ide.read cannot show it. Inspect it with a native tool such as `file` or `xxd`",
+            ),
+            (
                 "read:source_unavailable:src/main.rs",
                 "error: source_unavailable (read:source_unavailable); src/main.rs could not be read at that path. Retry ide.read, or continue with native tools",
             ),
@@ -1068,7 +1074,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&rendered),
-            "error: unsupported_file: Cargo.toml (outline:unsupported_file); no IDE language reads this file type, so it has no outline or symbols. Read it with ide.read `path` and `lines`, or with native tools"
+            "error: unsupported_file: Cargo.toml (outline:unsupported_file); no IDE language reads this file type, so it has no outline or symbols. Read its text with ide.read `path` and `lines` or `ranges`, or with native tools"
         );
         assert_eq!(
             rendered.structured_content.unwrap()["code"]["unsupported_file"],

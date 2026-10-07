@@ -453,8 +453,16 @@ fn assert_compact_envelope(reply: &Value) {
         // `<title>  (lines A–B)` read header.
         ("complete", Some("read")) => {
             let header = body.lines().next().unwrap_or_default();
-            let (title, details) = header.split_once("  (lines ").expect("read symbol header");
-            assert!(!title.is_empty() && details.ends_with(')'), "{reply}");
+            // A batch may open with a per-item refusal line instead of a block, and an empty
+            // file's block says so instead of naming lines.
+            if !(header.starts_with("no such ")
+                || header.starts_with("not a readable text file")
+                || header.contains(" has no code symbols; ")
+                || header.ends_with("  (empty file)"))
+            {
+                let (title, details) = header.split_once("  (lines ").expect("read symbol header");
+                assert!(!title.is_empty() && details.ends_with(')'), "{reply}");
+            }
         }
         ("invalid_parameters", _) => {
             assert!(text.starts_with("invalid bounded parameters:"), "{reply}")
@@ -6022,10 +6030,168 @@ async fn ranges_read_of_a_non_language_file_answers_and_keeps_the_worker_alive()
     let after = actor.settle(&fixture, after).await;
     let text = ranges["text"].as_str().unwrap_or_default();
     assert!(
-        ranges["kind"] == "read" && text.contains("1\tone") && text.contains("3\tthree"),
+        ranges["kind"] == "read"
+            && text.contains("1\tone")
+            && text.contains("3\tthree")
+            && text.contains("no code analysis for this format"),
         "ranges: {ranges}; later read: {after}"
     );
     assert_eq!(after["kind"], "read", "the worker must survive: {after}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// One settled `ide.read` with its compact text, for the non-language read tests.
+async fn settled_read(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    arguments: Value,
+) -> (Value, String) {
+    let reply = batch_call_with_text(actor, fixture, "ide.read", arguments).await;
+    batch_settle_with_text(actor, fixture, reply).await
+}
+
+/// Every read form of a readable non-language text file returns its numbered text and the
+/// no-code-analysis note: `{path}` alone, `{path, lines}`, `{path, ranges}` and a bare-path batch
+/// item. A symbol address into such a file is a soft per-item hint that never fails the batch, an
+/// empty file reads as such, and the daemon keeps answering.
+#[tokio::test]
+async fn text_reads_of_non_language_files_return_numbered_text_with_a_note_in_every_form() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(fixture.root.join("notes.md"), "# title\nbody\n").unwrap();
+    std::fs::write(fixture.root.join("empty.txt"), "").unwrap();
+    fixture.git(&["add", "--", "notes.md", "empty.txt"]);
+    fixture.git(&["commit", "--quiet", "-m", "text fixtures"]);
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "text-reads").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"text-reads"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    for arguments in [
+        json!({"path":"notes.md"}),
+        json!({"path":"notes.md","lines":"1-2"}),
+        json!({"path":"notes.md","ranges":["1-1","2-2"]}),
+        json!({"symbols":["notes.md"]}),
+    ] {
+        let (reply, text) = settled_read(&mut actor, &fixture, arguments.clone()).await;
+        assert!(
+            reply["kind"] == "read"
+                && text.contains("1\t# title")
+                && text.contains("2\tbody")
+                && text.contains("note: no code analysis for this format"),
+            "{arguments}: {reply} {text}"
+        );
+    }
+    let (empty, text) = settled_read(&mut actor, &fixture, json!({"path":"empty.txt"})).await;
+    assert!(
+        empty["kind"] == "read" && text.contains("(empty file)"),
+        "{empty} {text}"
+    );
+    // A symbol address into a text file has no symbol to resolve and no file to deliver: it is
+    // one soft item, and a bare-path item beside it still delivers its text.
+    let (mixed, text) = settled_read(
+        &mut actor,
+        &fixture,
+        json!({"symbols":["notes.md#title","notes.md"]}),
+    )
+    .await;
+    assert!(
+        mixed["kind"] == "read"
+            && text.contains(
+                "notes.md has no code symbols; read it with ide.read {path, lines|ranges}"
+            )
+            && text.contains("2\tbody"),
+        "{mixed} {text}"
+    );
+    let (hint, text) =
+        settled_read(&mut actor, &fixture, json!({"symbols":["notes.md#title"]})).await;
+    assert!(
+        hint["kind"] == "read" && text.contains("has no code symbols"),
+        "an all-refused batch still answers: {hint} {text}"
+    );
+    let (after, text) = settled_read(
+        &mut actor,
+        &fixture,
+        json!({"path":"notes.md","lines":"2-2"}),
+    )
+    .await;
+    assert_eq!(
+        after["kind"], "read",
+        "the daemon must keep answering: {text}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A binary file (invalid UTF-8, or valid UTF-8 holding a NUL byte), a directory and an unreadable
+/// file are refused softly in every read form: never `internal`, the single forms answer
+/// `source_unavailable` and the batch forms report the item, each naming a native tool.
+#[tokio::test]
+async fn binary_and_unreadable_files_refuse_softly_naming_a_native_tool() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(fixture.root.join("blob.bin"), [0xffu8, 0xfe, 0x00, 0x01]).unwrap();
+    std::fs::write(fixture.root.join("nul.dat"), "a\0b\n").unwrap();
+    std::fs::write(fixture.root.join("secret.txt"), "hidden\n").unwrap();
+    std::fs::write(fixture.root.join("fine.txt"), "fine\n").unwrap();
+    std::fs::create_dir(fixture.root.join("adir")).unwrap();
+    fixture.git(&["add", "--", "blob.bin", "nul.dat", "secret.txt", "fine.txt"]);
+    fixture.git(&["commit", "--quiet", "-m", "binary fixtures"]);
+    std::fs::set_permissions(
+        fixture.root.join("secret.txt"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "binary-reads").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"binary-reads"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let mut refusals = Vec::new();
+    for path in ["blob.bin", "nul.dat", "secret.txt", "adir"] {
+        for arguments in [
+            json!({"path":path}),
+            json!({"path":path,"lines":"1-1"}),
+            json!({"path":path,"ranges":["1-1"]}),
+            json!({"symbols":[path]}),
+        ] {
+            let (reply, text) = settled_read(&mut actor, &fixture, arguments.clone()).await;
+            let soft = reply["code"] == "source_unavailable" && text.contains("native tool")
+                || reply["kind"] == "read"
+                    && text.contains("not a readable text file")
+                    && text.contains("native tool");
+            if !soft {
+                refusals.push(format!("{arguments}: {reply} {text}"));
+            }
+        }
+    }
+    let (after, text) = settled_read(&mut actor, &fixture, json!({"path":"fine.txt"})).await;
+    std::fs::set_permissions(
+        fixture.root.join("secret.txt"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert!(
+        refusals.is_empty(),
+        "every refusal must be soft and name a native tool:\n{}",
+        refusals.join("\n")
+    );
+    assert_eq!(
+        after["kind"], "read",
+        "the daemon must keep answering: {text}"
+    );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();

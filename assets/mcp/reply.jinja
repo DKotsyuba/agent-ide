@@ -84,7 +84,7 @@ error: resolution_unverified (context:resolution); {{ resolution_detail if resol
 {%- elif code.no_such_file is defined -%}
 error: no_such_file: {{ code.no_such_file }}{% if resolution_detail %} ({{ resolution_detail }}){% else %} (read:no_such_file){% endif %}; this path does not exist in the worktree. Fix the path, or use ide.symbol with a bare name to find it
 {%- elif code.unsupported_file is defined -%}
-error: unsupported_file: {{ code.unsupported_file }}{% if resolution_detail %} ({{ resolution_detail }}){% else %} (read:unsupported_file){% endif %}; no IDE language reads this file type, so it has no outline or symbols. Read it with ide.read `path` and `lines`, or with native tools
+error: unsupported_file: {{ code.unsupported_file }}{% if resolution_detail %} ({{ resolution_detail }}){% else %} (read:unsupported_file){% endif %}; no IDE language reads this file type, so it has no outline or symbols. Read its text with ide.read `path` and `lines` or `ranges`, or with native tools
 {%- elif code is mapping -%}
 error: source_too_large (read:source_too_large); source is {{ code.source_too_large.size }} bytes, over the {{ code.source_too_large.ceiling }} byte read limit. Read it in pieces with native tools
 {%- elif code == "unknown_symbol" and resolution_detail is startingwith("edit:range_past_end:") -%}
@@ -119,6 +119,8 @@ error: source_unavailable ({{ resolution_detail }}); the source changed since it
 error: source_unavailable (context:observation_failed); {{ resolution_message }} could not be read through the confined reader. Retry ide.context, or continue with native tools
 {%- elif code == "source_unavailable" and resolution_detail is startingwith("read:line_range:") -%}
 error: source_unavailable (read:line_range); {{ resolution_message }}
+{%- elif code == "source_unavailable" and resolution_detail is startingwith("read:not_text:") -%}
+error: source_unavailable (read:not_text); {{ resolution_message }} is not a readable text file (binary, not UTF-8 or unreadable), so ide.read cannot show it. Inspect it with a native tool such as `file` or `xxd`
 {%- elif code == "source_unavailable" and resolution_detail is startingwith("read:source_unavailable:") -%}
 error: source_unavailable (read:source_unavailable); {{ resolution_message }} could not be read at that path. Retry ide.read, or continue with native tools
 {%- elif code == "source_unavailable" and resolution_detail is startingwith("read:observation_store:") -%}

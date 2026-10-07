@@ -311,9 +311,9 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "type": "object", "additionalProperties": false,
                 "properties": {
                     "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`; returns its body with the doc header."},
-                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root, with `lines` or `ranges`."},
+                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root; alone it reads the whole file, with `lines` or `ranges` those lines."},
                     "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "Inclusive 1-based line range such as `120-180`."},
-                    "symbols": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "description": "Several bodies in one reply, request order, one `source_ref` valid for every file included: `[\"src/a.rs#Foo/bar\",\"src/b.rs#qux\"]`. Unknown symbols are reported per item without failing the rest."},
+                    "symbols": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "description": "Several bodies in one reply, request order, one `source_ref` valid for every file included: `[\"src/a.rs#Foo/bar\",\"src/b.rs#qux\"]`. Unknown symbols are reported per item without failing the rest; a bare file path reads the text of a file no IDE language reads."},
                     "ranges": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "description": "Several line ranges of `path` in one reply, request order, with the same numbered gutter and one `source_ref`."}
                 }
             }),
@@ -414,14 +414,16 @@ fn symbol_list(
     let list = string_list(object, field, max)?;
     if let Some(list) = &list
         && list.iter().any(|entry| {
-            crate::lang::SymbolPath::parse(entry).map_or(true, |symbol| {
-                symbol.file().is_none() || symbol.segments().is_empty()
+            crate::lang::SymbolPath::parse_item(entry).map_or(true, |symbol| {
+                symbol.file().is_none() || (symbol.segments().is_empty() && entry.contains('#'))
             })
         })
     {
         return Err(invalid_field(
             field,
-            FieldRule::OneOf("strict symbol paths like src/x.rs#Owner/name"),
+            FieldRule::OneOf(
+                "symbol paths like src/x.rs#Owner/name, or a bare file path (its text, for a file no IDE language reads)",
+            ),
         ));
     }
     Ok(list)
@@ -483,8 +485,8 @@ pub enum ParameterError {
     ContextTarget,
     /// `ide.outline` requires a relative file or directory path.
     OutlineTarget,
-    /// `ide.read` needs exactly one of: `symbol`, `path` with `lines`, `path` with `ranges`, or
-    /// `symbols`.
+    /// `ide.read` needs exactly one of: `symbol`, `path` alone (the whole file), `path` with
+    /// `lines`, `path` with `ranges`, or `symbols`.
     ReadTarget,
     /// `ide.edit` needs `symbol` (with `op`), or `path` with `lines` and `source_ref` for a range
     /// replace, or the full-file form `path` + `content` (with `source_ref` to replace an existing
@@ -625,8 +627,8 @@ impl ParameterError {
             Self::ContextTarget => CONTEXT_TARGET_MESSAGE.to_string(),
             Self::OutlineTarget => OUTLINE_TARGET_MESSAGE.to_string(),
             Self::ReadTarget => {
-                "ide.read needs one form: `symbol`, or `path` with `lines`, or `path` with \
-                 `ranges`, or `symbols` — exactly one"
+                "ide.read needs one form: `symbol`, or `path` alone (the whole file), or `path` \
+                 with `lines`, or `path` with `ranges`, or `symbols` — exactly one"
                     .to_string()
             }
             Self::EditTarget => {
@@ -822,7 +824,11 @@ pub fn validate_call(
                 }
                 // A batch of symbol addresses needs nothing else.
                 (false, false, false, true, false) => {}
-                (false, true, false, false, true) => {
+                // `path` with `ranges` reads those ranges; `path` alone (no empty list beside it)
+                // reads the whole file.
+                (false, true, false, false, with_ranges)
+                    if with_ranges || (symbols.is_none() && ranges.is_none()) =>
+                {
                     let path = object["path"].as_str().unwrap_or_default();
                     if let Some(rule) = path_shape_rule(path) {
                         return Err(invalid_field("path", rule));
@@ -4611,8 +4617,8 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Read,
-            "ide.read needs one form: `symbol`, or `path` with `lines`, or `path` with \
-             `ranges`, or `symbols` — exactly one"
+            "ide.read needs one form: `symbol`, or `path` alone (the whole file), or `path` \
+             with `lines`, or `path` with `ranges`, or `symbols` — exactly one"
                 .to_string(),
         ),
         (
@@ -4818,6 +4824,11 @@ fn read_symbols_and_ranges_validate() {
         )
         .is_ok()
     );
+    // `path` alone reads the whole file, but not beside an empty batch list.
+    assert!(validate_call(AssistanceTool::Read, json!({"path":"notes.md"})).is_ok());
+    assert!(validate_call(AssistanceTool::Read, json!({"path":"/abs.md"})).is_err());
+    assert!(validate_call(AssistanceTool::Read, json!({"path":"a.md","ranges":[]})).is_err());
+    assert!(validate_call(AssistanceTool::Read, json!({"path":"a.md","symbols":[]})).is_err());
     // A sigil address is not a strict symbol path; ranges need `path`.
     assert!(
         validate_call(AssistanceTool::Read, json!({"symbols":["#main"]})).is_err(),
