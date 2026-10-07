@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.10.4 — 2026-10-07
+
 ### Fixed
 
 - An orchestrator and its subagents no longer lose their connection when one agent starts work in a different repository. `ide.start {root}` naming another repository, while the session has other actors, is refused with `host_binding (other_repository: bound to <path>, asked <path>)` and moves nothing; before, the whole session followed the start to the other repository's daemon, the other agents' hooks stayed behind and their next calls failed `missing_pre`. A session with a single actor still moves as before.
