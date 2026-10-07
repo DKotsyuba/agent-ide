@@ -354,6 +354,10 @@ call ide.start first, then repeat this call with fresh references` → call
 reads; `session re-rooted to the requested root; repeat this call once, or call
 ide.start without root` → repeat once, and if it stays unavailable call
 `ide.start` with no `root` to return to the host's project directory. A start
+naming another repository while the session has other actors is refused
+`host_binding (other_repository: bound to <path>, asked <path>)` and moves
+nothing: start under the bound repository, or work in the other one from a
+session started there. A start
 reply may end with `daemon: <version> still serving (another session is
 active); restart that session or wait for it to stop for <current>`: another
 session keeps the older daemon alive, so this session uses its behaviour until

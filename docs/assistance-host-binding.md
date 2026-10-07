@@ -108,7 +108,7 @@ the same repository and the daemon serving it is current, the session does not m
 MCP only registers that worktree (one short client-lease handshake that writes its key cache and
 candidate attachment, so its hooks reach the daemon), remembers it in a bounded sibling list that
 every later attach re-registers while the directory exists, and answers the refused call with the
-same retry hint. A target whose repository identity cannot be established (failed `git` probe and
+same retry hint. A start naming another *repository* is never followed while the session has other actors (any remembered actor that is not provably the caller): their hooks stay in the bound repository, so a move would strand them. The refusal moves nothing and answers `unavailable: host_binding (other_repository: bound to <path>, asked <path>)` with the advice to start under the bound repository or to work in the other one from a session started there. A session with no other actor (its only actor, or none yet) still re-roots as described. A target whose repository identity cannot be established (failed `git` probe and
 no readable `.git` evidence) is neither registered nor moved to. A start whose hooks still pair where it dispatched —
 including one naming another repository's admitted root — never re-roots: the daemon itself
 activates that root, so a cross-repository start can no longer strand a session between two

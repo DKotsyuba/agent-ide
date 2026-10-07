@@ -2542,7 +2542,7 @@ fn claude_reroot_hook(
     note: SharedDaemonNote,
     startup: PathBuf,
 ) -> RerootFn {
-    Arc::new(move |requested| {
+    Arc::new(move |requested, other_actors| {
         let binding = Arc::clone(&binding);
         let launcher_template = launcher_template.clone();
         let lease = Arc::clone(&lease);
@@ -2588,7 +2588,12 @@ fn claude_reroot_hook(
                                 .expect("daemon currency note mutex")
                                 .line()
                                 .is_none();
-                            if same_repository
+                            if !same_repository && other_actors {
+                                // F-02: other actors of this session still work in the bound
+                                // repository, and their hooks stay there; moving the session
+                                // would strand them. Refuse before any route changes.
+                                RerootOutcome::OtherRepository
+                            } else if same_repository
                                 && current_daemon
                                 && !definitely_gone(&current.candidate)
                             {
@@ -2654,6 +2659,7 @@ fn claude_reroot_hook(
                         RerootOutcome::Attached(..) => "reroot:attached",
                         RerootOutcome::Registered => "reroot:registered",
                         RerootOutcome::OutsideAllowedRoots => "reroot:outside_allowed_roots",
+                        RerootOutcome::OtherRepository => "reroot:other_repository",
                         RerootOutcome::Failed => "reroot:failed",
                     }),
                     duration_ms: started.elapsed().as_millis().try_into().ok(),

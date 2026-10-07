@@ -117,7 +117,7 @@ evidence before it may leave the Codex contract: a `ZCODE_*` startup variable se
 Claude-compatible contract (the ZCode desktop host's hooks are `claude-hook`), with the current
 directory as the captured candidate — hooks resolve through the Claude rendezvous, a call carrying
 no supported host metadata answers `unavailable: host_binding (host_unrecognized)`, and the first
-`ide.start {root}` inside `allowed_roots` re-roots the session like a moved Claude session.
+`ide.start {root}` inside `allowed_roots` re-roots the session like a moved Claude session (a start for another repository is refused while the session has other actors).
 Everything else — Codex startup markers, and no evidence at all — keeps the previous Codex
 default, so agent-run's Codex children and existing Codex hosts are unchanged; the explicit host
 flags below remain supported.

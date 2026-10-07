@@ -77,6 +77,14 @@ pub enum HostBindingCause {
         /// Bounded requested root exactly as the model named it.
         asked: String,
     },
+    /// `ide.start {root}` named another repository while the session has other actors: moving the
+    /// session there would strand them, so nothing moved and the start was refused.
+    OtherRepository {
+        /// Home-shortened bounded path the session is currently bound to.
+        bound: String,
+        /// Bounded requested root exactly as the model named it.
+        asked: String,
+    },
 }
 
 impl HostBindingCause {
@@ -108,6 +116,14 @@ impl HostBindingCause {
         }
     }
 
+    /// Builds the cross-repository refusal cause from both directories, bounded and home-shortened.
+    pub fn other_repository(bound: &Path, asked: &str) -> Self {
+        Self::OtherRepository {
+            bound: shortened_cause_path(bound),
+            asked: bounded_utf8_prefix(asked, MAX_CAUSE_PATH_BYTES).to_owned(),
+        }
+    }
+
     /// Renders the exact bounded text inside the reply's parentheses and the journal `detail`.
     pub fn cause_tag(&self) -> String {
         match self {
@@ -129,6 +145,9 @@ impl HostBindingCause {
             Self::HostUnrecognized => "host_unrecognized".to_owned(),
             Self::ProjectMoved { bound, asked } => {
                 format!("project_moved: bound to {bound}, asked {asked}")
+            }
+            Self::OtherRepository { bound, asked } => {
+                format!("other_repository: bound to {bound}, asked {asked}")
             }
         }
     }
@@ -742,6 +761,10 @@ fn host_binding_causes_round_trip_and_bare_replies_stay_bare() {
         HostBindingCause::project_moved(
             Path::new("/Users/pluto/projects/agent-worktree"),
             "/private/tmp/agent-ide-stability/fixture",
+        ),
+        HostBindingCause::other_repository(
+            Path::new("/Users/pluto/projects/agent-worktree"),
+            "/private/tmp/agent-ide-stability/other",
         ),
     ] {
         let reply = PeerReply::Unavailable {

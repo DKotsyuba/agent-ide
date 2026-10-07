@@ -2110,7 +2110,9 @@ pub type ReestablishFn =
 /// the target itself and attaches through the same path a fresh session in that directory would
 /// take.
 pub type RerootFn = Arc<
-    dyn Fn(Option<String>) -> Pin<Box<dyn Future<Output = RerootOutcome> + Send>> + Send + Sync,
+    dyn Fn(Option<String>, bool) -> Pin<Box<dyn Future<Output = RerootOutcome> + Send>>
+        + Send
+        + Sync,
 >;
 
 /// Closed outcome of one managed Claude re-root attempt (T15B).
@@ -2123,6 +2125,9 @@ pub enum RerootOutcome {
     /// The target is another worktree of the same repository on a current shared daemon: it was
     /// registered so its own actors' hooks pair there, and the session's pair stays unchanged.
     Registered,
+    /// The target is another repository while the session has other actors: moving the session
+    /// would strand them, so nothing moved and the start is refused with an explicit cause.
+    OtherRepository,
     /// The target root resolves below no allowed root; the refused reply stands and the daemon's
     /// own admission answers.
     OutsideAllowedRoots,
@@ -2677,7 +2682,11 @@ impl StdioFacade {
             && tool == AssistanceTool::Start
             && let Some((target, rerooted)) = reroot_target(&parameters, &outcome, reconnect).await
         {
-            match reroot(target.clone()).await {
+            // Other actors of this session (every remembered actor except this call's own, when
+            // the refusal identified it) work in the bound repository: a move to another
+            // repository would strand them.
+            let others = !reconnect.remembered_tags(tag.as_deref()).is_empty();
+            match reroot(target.clone(), others).await {
                 RerootOutcome::Attached(new_runtime, new_attachment, candidate) => {
                     reconnect
                         .store(new_runtime.clone(), new_attachment.clone())
@@ -2705,6 +2714,25 @@ impl StdioFacade {
                 RerootOutcome::Registered => return (outcome, rerooted, tag),
                 RerootOutcome::Unchanged | RerootOutcome::OutsideAllowedRoots => {
                     return (outcome, resume, tag);
+                }
+                // Nothing moved: name both directories and the reason, never re-root the session.
+                RerootOutcome::OtherRepository => {
+                    let asked = target.filter(|asked| !asked.is_empty());
+                    let bound = reconnect.bound_candidate().await;
+                    let cause = bound
+                        .zip(asked)
+                        .map(|(bound, asked)| HostBindingCause::other_repository(&bound, &asked));
+                    return (
+                        FacadeOutcome::Reply(
+                            Box::new(PeerReply::Unavailable {
+                                reason: MissingPeer::HostBinding,
+                                cause,
+                            }),
+                            None,
+                        ),
+                        resume,
+                        tag,
+                    );
                 }
                 RerootOutcome::Failed if target.is_some() => {
                     // Name both directories honestly; only an admitted root can be re-rooted.
@@ -5022,7 +5050,7 @@ mod managed_claude_front_tests {
                 "old".into(),
                 PathBuf::from("/repo"),
                 reestablish,
-                Arc::new(|_| Box::pin(async { RerootOutcome::Unchanged })),
+                Arc::new(|_, _| Box::pin(async { RerootOutcome::Unchanged })),
                 Arc::new(std::sync::Mutex::new(DaemonCurrencyNote::default())),
             )
             .unwrap()

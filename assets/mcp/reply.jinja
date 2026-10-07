@@ -52,6 +52,8 @@ unavailable: host_binding (recovery_needed); the IDE restarted and this session'
 unavailable: host_binding (capacity_exceeded); the daemon's session table is full. Call ide.stop, then ide.start, or continue with native tools
 {%- elif reason == "host_binding" and cause_tag == "host_unrecognized" -%}
 unavailable: host_binding (host_unrecognized); this host did not identify the call in a supported format. Continue with native tools
+{%- elif reason == "host_binding" and cause_tag is startingwith("other_repository:") -%}
+unavailable: host_binding ({{ cause_tag }}); other agents of this session work in the bound repository, so this start was refused and nothing moved. Start under the bound repository, work in the other repository from a session started there, or continue with native tools
 {%- elif reason == "host_binding" and cause_tag is startingwith("project_moved:") -%}
 unavailable: host_binding ({{ cause_tag }}); the IDE could not move to the requested root. Call ide.start under the session's current root, or continue with native tools
 {%- else -%}

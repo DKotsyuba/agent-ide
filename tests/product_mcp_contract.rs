@@ -5097,11 +5097,15 @@ async fn managed_claude_cross_repository_start_activates_without_stranding() {
     mcp.close().await;
 }
 
-/// 0.6.4: the one residual way a session can move while its hooks stay behind — a re-root on a
-/// missing pre-hook alone — answers with the two-step recovery hint, and the root-less start then
-/// re-roots home and activates the host's project directory, so the session is never stranded.
+/// F-02: an `ide.start {root}` naming another repository while the session already has an active
+/// actor is refused with the explicit `other_repository` cause and moves nothing.
+///
+/// On 0.10.3 the whole session followed the start to the other repository's daemon, so the actor
+/// that was already working failed `missing_pre`. Now the other repository gets no daemon, the
+/// refusal names both directories, and the working actor's next calls — and its own root-less
+/// start — still work where it lives.
 #[tokio::test]
-async fn managed_claude_rootless_start_returns_a_stranded_session_home() {
+async fn managed_claude_cross_repository_start_is_refused_without_moving_the_session() {
     let fixture = ProductFixture::new(json!([]));
     let other = fixture.other_repository("other-repository");
     let home_runtime = managed_claude_runtime_path(&fixture.root);
@@ -5111,7 +5115,7 @@ async fn managed_claude_rootless_start_returns_a_stranded_session_home() {
     assert!(!home_runtime.exists() && !other_runtime.exists());
     let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
 
-    // The session first activates normally, so its channel has delivered hooks at home.
+    // The session's first actor activates at home.
     let mut next = 1;
     let pending = managed_claude_call(
         &mut mcp,
@@ -5134,41 +5138,41 @@ async fn managed_claude_rootless_start_returns_a_stranded_session_home() {
     .await;
     assert_eq!(started["kind"], "activation", "{started}");
 
-    // A start naming the other repository whose own pre-hook never ran anywhere: the paired
-    // daemon answers missing_pre, the re-root moves the session anyway (the session may truly
-    // have moved), and the reply keeps the daemon's closed cause plus the two-step recovery hint
-    // instead of promising a pairing repeat that a lost pre-hook cannot guarantee.
+    // Another agent's start naming the other repository, whose own pre-hook never reached this
+    // daemon: it is refused by name, nothing re-roots, and no second daemon appears.
     next += 1;
-    let stranded = mcp
+    let refused = mcp
         .exchange(
             json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{
                 "name":"ide.start",
-                "arguments":{"activation_id":"strand","root":other.to_str().unwrap()},
-                "_meta":{"claudecode/toolUseId":"strand-lost"}
+                "arguments":{"activation_id":"stranger","root":other.to_str().unwrap()},
+                "_meta":{"claudecode/toolUseId":"stranger-lost"}
             }}),
         )
         .await;
-    let stranded_text = assert_claude_envelope(&stranded);
+    let refused_text = assert_claude_envelope(&refused);
     assert!(
-        stranded_text.starts_with(
-            "unavailable: host_binding (hooks_not_delivered); the daemon has received no host event for this session. Call ide.start with the same root, or continue with native tools"
-        ),
-        "{stranded_text}"
+        refused_text.starts_with("unavailable: host_binding (other_repository: bound to "),
+        "{refused_text}"
     );
     assert!(
-        stranded_text.ends_with(
-            "; retry: session re-rooted to the requested root; repeat this call once, or call ide.start without root"
-        ),
-        "{stranded_text}"
+        refused_text.contains(&format!(", asked {}", other.display())),
+        "{refused_text}"
     );
     assert!(
-        other_runtime.is_dir(),
-        "the missing-pre re-root must have attached the other repository's daemon"
+        refused_text.contains("this start was refused and nothing moved"),
+        "{refused_text}"
+    );
+    assert!(
+        !refused_text.contains("retry: session re-rooted"),
+        "{refused_text}"
+    );
+    assert!(
+        !other_runtime.exists(),
+        "a refused cross-repository start must not attach the other repository's daemon"
     );
 
-    // The session's next hooks run where it lives and reach the home daemon, and the root-less
-    // start re-roots home before activating the host's project directory — the same activation
-    // the session began with, retried where it belongs.
+    // The working actor is untouched: its next call (a repeat start) still reaches its daemon.
     next += 1;
     let pending = managed_claude_call(
         &mut mcp,
@@ -5180,7 +5184,7 @@ async fn managed_claude_rootless_start_returns_a_stranded_session_home() {
         json!({"activation_id":"strand"}),
     )
     .await;
-    let recovered = settle_managed_claude_start(
+    let again = settle_managed_claude_start(
         &mut mcp,
         &fixture.root,
         &mut next,
@@ -5189,7 +5193,8 @@ async fn managed_claude_rootless_start_returns_a_stranded_session_home() {
         &pending,
     )
     .await;
-    assert_eq!(recovered["kind"], "activation", "{recovered}");
+    assert_eq!(again["kind"], "activation", "{again}");
+    assert!(!other_runtime.exists());
     mcp.close().await;
 }
 
