@@ -1029,8 +1029,9 @@ pub(crate) mod testing {
         }
 
         /// An outline with no symbols, except for epsilon: it keeps each top-level server symbol
-        /// as a function covering the lines of its range, so the scripted fixture session can
-        /// resolve a symbol.
+        /// the way epsilon's source outline reads a `sym <name>` … `end` block (kind `Other`,
+        /// signature `sym <name>`, the lines of its range), as the opt-in contract of
+        /// [`LanguageSupport::outline_while_loading`] requires.
         fn normalize(
             &self,
             file: &Path,
@@ -1048,8 +1049,8 @@ pub(crate) mod testing {
                                 Some(file.to_path_buf()),
                                 vec![symbol.name.clone()],
                             ),
-                            kind: SymbolKind::Function,
-                            signature: symbol.name.clone(),
+                            kind: SymbolKind::Other,
+                            signature: format!("sym {}", symbol.name),
                             name: symbol.name,
                             range,
                             body: range,
@@ -1463,6 +1464,23 @@ pub(crate) mod testing {
         }
     }
 
+    /// The document symbols the scripted session answers for the fixture source `sym a\nend\n`:
+    /// one symbol `a` over both lines, exactly what epsilon's source outline reads from that text.
+    #[allow(deprecated)]
+    pub(crate) fn fixture_document_symbols() -> Vec<async_lsp::lsp_types::DocumentSymbol> {
+        use async_lsp::lsp_types as lsp;
+        vec![lsp::DocumentSymbol {
+            name: "a".into(),
+            detail: None,
+            kind: lsp::SymbolKind::FUNCTION,
+            tags: None,
+            deprecated: None,
+            range: lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(1, 3)),
+            selection_range: lsp::Range::new(lsp::Position::new(0, 4), lsp::Position::new(0, 5)),
+            children: None,
+        }]
+    }
+
     /// Opens a live session against a scripted in-process language server (see
     /// [`fixture_serve_session`]).
     ///
@@ -1506,22 +1524,9 @@ pub(crate) mod testing {
                         "scripted documentSymbol failure",
                     ));
                 }
-                #[allow(deprecated)]
-                Ok(Some(lsp::DocumentSymbolResponse::Nested(vec![
-                    lsp::DocumentSymbol {
-                        name: "a".into(),
-                        detail: None,
-                        kind: lsp::SymbolKind::FUNCTION,
-                        tags: None,
-                        deprecated: None,
-                        range: lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 5)),
-                        selection_range: lsp::Range::new(
-                            lsp::Position::new(0, 4),
-                            lsp::Position::new(0, 5),
-                        ),
-                        children: None,
-                    },
-                ])))
+                Ok(Some(lsp::DocumentSymbolResponse::Nested(
+                    fixture_document_symbols(),
+                )))
             });
             router.request::<request::References, _>(move |_, _| async move {
                 if failing.contains(&"references") {

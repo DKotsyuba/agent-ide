@@ -8372,6 +8372,25 @@ mod stop_retry_tests {
         );
     }
 
+    /// Epsilon opts into the source-outline fallback, so its source outline and its normalized
+    /// server outline must agree for the text the scripted session answers for.
+    #[test]
+    fn epsilon_source_and_server_outlines_agree() {
+        crate::lang::testing::install();
+        let file = std::path::Path::new("a.epsilon");
+        let source = "sym a\nend\n";
+        let support = crate::lang::testing::EPSILON.support();
+        let from_source = support
+            .outline_from_source(file, source)
+            .expect("source outline");
+        let from_server = support.normalize(
+            file,
+            source,
+            crate::lang::testing::fixture_document_symbols(),
+        );
+        assert_eq!(from_source, from_server);
+    }
+
     /// Readers of sibling worktrees own independent namespaces: a writer arriving on one worktree
     /// releases only that worktree's reader owner.
     #[tokio::test]
