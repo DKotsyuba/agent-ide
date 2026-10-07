@@ -327,7 +327,8 @@ editing from them. A change of a Python root's environment (selected, recreated 
 also announced once, and its check runs again.
 `check failed (<reason>)`, `check timed out`, `tool not found`, `environment not found` (or the
 environment's own missing-cause line), `no files analyzed`, `outside allowed roots`,
-`unavailable: read_restricted` or `checks disabled` mean the feed has no counts for that
+`unavailable: read_restricted`, `checks unavailable (nested sandbox)` (the host's own sandbox
+refuses the product's check sandbox, so the check does not run) or `checks disabled` mean the feed has no counts for that
 language — never treat them as a clean result.
 
 ## Pending replies

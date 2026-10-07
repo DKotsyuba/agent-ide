@@ -363,6 +363,11 @@ impl ProblemSnapshot {
 /// Maximum bytes of a checker-run failure cause retained in a [`ProblemSnapshot::detail`].
 pub const MAX_CAUSE_BYTES: usize = 160;
 
+/// The [`ProblemSnapshot::detail`] of a check the host's own sandbox would not let the product
+/// confine (F-08): the plate and the problems text render it as `checks unavailable (nested
+/// sandbox)` instead of `check failed (…)`.
+pub const NESTED_SANDBOX_CAUSE: &str = "nested sandbox";
+
 /// Truncates `value` to at most `max_bytes` UTF-8 bytes, cutting only on a whole character.
 pub fn truncate_bytes(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {

@@ -94,12 +94,6 @@ impl ConfinedRunner for SeatbeltRunner {
     }
 }
 
-/// Whether this daemon has already seen the host refuse to apply our Seatbelt profile because
-/// the daemon itself is confined; remembered for the daemon's lifetime so no later check wastes
-/// a spawn on the doomed wrapper again.
-static NESTED_SANDBOX_REFUSED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// Reports whether one completed profiled run proves the host refused the nested profile.
 ///
 /// The refusal signature is the wrapper's own: a non-zero status, no checker output on stdout (a
@@ -118,60 +112,36 @@ fn nested_sandbox_refusal(output: &RunOutput) -> bool {
             .is_some_and(|first| first.starts_with("sandbox-exec: sandbox_apply:"))
 }
 
-/// Production check runner: the Seatbelt profile of [`SeatbeltRunner`], with a one-time fallback
-/// for a daemon the host itself already confines.
+/// Production check runner: the Seatbelt profile of [`SeatbeltRunner`], and never anything less.
 ///
-/// Every run first tries the profiled wrapper. When the host refuses to apply a nested Seatbelt
-/// profile (`sandbox-exec: sandbox_apply: Operation not permitted`), the same check runs once
-/// without our profile — the host's own confinement of this daemon already applies to the child,
-/// and the product's only path policy is the launcher `allowed_roots` list, so this drops no
-/// security layer. The refusal is remembered for the daemon's lifetime,
-/// so later checks skip the doomed wrapper and run directly; a run that fails for any other
-/// reason is returned untouched for the checker to report its cause.
-pub struct NestedSandboxFallbackRunner {
-    /// The profile-applying runner tried first on every check.
+/// Checks promise a read-only, no-network run confined to their declared roots. When the host
+/// refuses to apply a nested Seatbelt profile (`sandbox-exec: sandbox_apply: Operation not
+/// permitted`, the daemon itself being confined), the host's confinement is not an equivalent
+/// policy — it may allow project writes and network — so the check does not run at all: the
+/// runner answers an error whose text is [`super::NESTED_SANDBOX_CAUSE`], which the checkers
+/// report as `unavailable (nested sandbox)`. Nothing is remembered and no run ever happens
+/// unconfined; each check tries the wrapper afresh. A run that fails for any other reason is
+/// returned untouched for the checker to report its cause.
+pub struct NestedSandboxRunner {
+    /// The profile-applying runner every check goes through.
     inner: Arc<dyn ConfinedRunner>,
 }
 
-impl NestedSandboxFallbackRunner {
+impl NestedSandboxRunner {
     /// Builds the production check runner around `inner` (normally [`SeatbeltRunner`]).
     pub fn new(inner: Arc<dyn ConfinedRunner>) -> Self {
         Self { inner }
     }
 }
 
-impl ConfinedRunner for NestedSandboxFallbackRunner {
+impl ConfinedRunner for NestedSandboxRunner {
     fn run(&self, spec: RunSpec) -> BoxFuture<'_, io::Result<RunOutput>> {
         Box::pin(async move {
-            if !NESTED_SANDBOX_REFUSED.load(std::sync::atomic::Ordering::Acquire) {
-                match self.inner.run(spec.clone()).await {
-                    Ok(output) => {
-                        if !nested_sandbox_refusal(&output) {
-                            return Ok(output);
-                        }
-                        NESTED_SANDBOX_REFUSED.store(true, std::sync::atomic::Ordering::Release);
-                    }
-                    // A spawn or profile failure is the checker's cause to report, not evidence
-                    // of a nested-sandbox refusal.
-                    Err(error) => return Err(error),
-                }
+            let output = self.inner.run(spec).await?;
+            if nested_sandbox_refusal(&output) {
+                return Err(io::Error::other(super::NESTED_SANDBOX_CAUSE));
             }
-            let output = crate::execution::seatbelt::run_unconfined(
-                &spec.program,
-                &spec.args,
-                &spec.cwd,
-                &spec.env,
-                spec.timeout,
-                spec.max_output_bytes,
-            )
-            .await?;
-            Ok(RunOutput {
-                status: output.status,
-                stdout: output.stdout,
-                stderr: output.stderr,
-                timed_out: output.timed_out,
-                truncated: output.truncated,
-            })
+            Ok(output)
         })
     }
 }
@@ -238,31 +208,11 @@ impl ConfinedRunner for FakeRunner {
 mod tests {
     use super::*;
 
-    /// Serializes the tests that flip the daemon-lifetime nested-sandbox memory and resets it,
-    /// so each starts from an unrefused daemon regardless of parallel test order.
-    async fn isolated_fallback_state() -> tokio::sync::MutexGuard<'static, ()> {
-        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let guard = LOCK.lock().await;
-        NESTED_SANDBOX_REFUSED.store(false, std::sync::atomic::Ordering::Release);
-        guard
-    }
-
-    /// Proves the nested-sandbox fallback: a profiled run that returns the host's
-    /// `sandbox_apply` refusal (`exit 71`, no output) is retried once without our profile, and
-    /// the remembered decision keeps every later check off the doomed wrapper. The fake runner
-    /// holds exactly one scripted output, so a second profiled consult would fail loudly.
-    #[tokio::test]
-    async fn nested_sandbox_refusal_falls_back_once_and_is_remembered() {
-        let _state = isolated_fallback_state().await;
-        let fake = FakeRunner::new(vec![Ok(RunOutput {
-            status: Some(71),
-            stderr: b"sandbox-exec: sandbox_apply: Operation not permitted\n".to_vec(),
-            ..RunOutput::default()
-        })]);
-        let runner = NestedSandboxFallbackRunner::new(Arc::new(fake.clone()));
-        let spec = RunSpec {
-            program: PathBuf::from("/bin/echo"),
-            args: vec![OsString::from("fallback-ran")],
+    /// A runnable specification for the fallback-runner tests.
+    fn spec(program: &str, args: Vec<OsString>) -> RunSpec {
+        RunSpec {
+            program: PathBuf::from(program),
+            args,
             cwd: std::env::temp_dir(),
             env: Vec::new(),
             read_roots: Vec::new(),
@@ -270,51 +220,83 @@ mod tests {
             read_denies: Vec::new(),
             timeout: Duration::from_secs(10),
             max_output_bytes: 4096,
-        };
-        let first = runner
-            .run(spec.clone())
+        }
+    }
+
+    /// The host's exact refusal output: `exit 71`, no stdout, the wrapper's own first stderr line.
+    fn nested_refusal() -> RunOutput {
+        RunOutput {
+            status: Some(71),
+            stderr: b"sandbox-exec: sandbox_apply: Operation not permitted\n".to_vec(),
+            ..RunOutput::default()
+        }
+    }
+
+    /// F-08: the host's nested-sandbox refusal makes the check unavailable and never runs it
+    /// unconfined, and nothing is remembered: the next check tries the wrapper afresh.
+    ///
+    /// The scripted refusal is followed by one ordinary success. The program of the specification
+    /// would create a marker file if anything ran it without the profile; the marker must not
+    /// exist, the first run must carry the `nested sandbox` cause, and the second run must reach
+    /// the profiled runner again (the old behaviour switched the whole daemon to unconfined runs
+    /// after the first refusal).
+    #[tokio::test]
+    async fn nested_sandbox_refusal_is_unavailable_never_unconfined_and_not_remembered() {
+        let marker = std::env::temp_dir().join(format!(
+            "agent-ide-nested-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fake = FakeRunner::new(vec![
+            Ok(nested_refusal()),
+            Ok(RunOutput {
+                status: Some(0),
+                stdout: b"profiled\n".to_vec(),
+                ..RunOutput::default()
+            }),
+        ]);
+        let runner = NestedSandboxRunner::new(Arc::new(fake.clone()));
+        let touch = spec("/usr/bin/touch", vec![marker.clone().into_os_string()]);
+
+        let refused = runner
+            .run(touch.clone())
             .await
-            .expect("unprofiled retry runs");
-        assert_eq!(first.status, Some(0));
-        assert_eq!(first.stdout, b"fallback-ran\n");
+            .expect_err("check is unavailable");
+        assert_eq!(refused.to_string(), crate::checks::NESTED_SANDBOX_CAUSE);
+        assert!(!marker.exists(), "the check must never run unconfined");
         assert_eq!(fake.specs().len(), 1, "the profiled wrapper ran once");
-        let second = runner
-            .run(spec)
+
+        let next = runner
+            .run(touch)
             .await
-            .expect("later checks skip the wrapper");
-        assert_eq!(second.status, Some(0));
-        assert_eq!(second.stdout, b"fallback-ran\n");
+            .expect("later checks try the wrapper again");
+        assert_eq!(next.stdout, b"profiled\n");
         assert_eq!(
             fake.specs().len(),
-            1,
-            "the remembered refusal keeps later checks off the doomed wrapper"
+            2,
+            "no daemon-wide switch skips the wrapper"
         );
+        assert!(!marker.exists());
     }
 
     /// Proves a profiled failure that is not the nested-sandbox refusal is returned untouched:
     /// the checker, not the runner, owns reporting that run's cause.
     #[tokio::test]
-    async fn ordinary_profiled_failure_is_not_redirected_to_an_unprofiled_run() {
-        let _state = isolated_fallback_state().await;
+    async fn ordinary_profiled_failure_is_returned_untouched() {
         let fake = FakeRunner::new(vec![Ok(RunOutput {
             status: Some(101),
             stdout: b"{}\n".to_vec(),
             stderr: b"error: no test target named 'x'\n".to_vec(),
             ..RunOutput::default()
         })]);
-        let runner = NestedSandboxFallbackRunner::new(Arc::new(fake.clone()));
-        let spec = RunSpec {
-            program: PathBuf::from("/bin/cat"),
-            args: Vec::new(),
-            cwd: std::env::temp_dir(),
-            env: Vec::new(),
-            read_roots: Vec::new(),
-            write_roots: Vec::new(),
-            read_denies: Vec::new(),
-            timeout: Duration::from_secs(10),
-            max_output_bytes: 4096,
-        };
-        let output = runner.run(spec).await.expect("profiled result returned");
+        let runner = NestedSandboxRunner::new(Arc::new(fake.clone()));
+        let output = runner
+            .run(spec("/bin/cat", Vec::new()))
+            .await
+            .expect("profiled result returned");
         assert_eq!(output.status, Some(101));
         assert_eq!(output.stderr, b"error: no test target named 'x'\n");
         assert_eq!(fake.specs().len(), 1);
@@ -323,11 +305,10 @@ mod tests {
     /// Proves the refusal signature is the wrapper's own stderr, not the substring anywhere in
     /// it: a checker failure whose stderr merely contains `sandbox_apply` — cargo quoting a
     /// workspace path such as `/repos/sandbox_apply_lab`, or a `build.rs` that itself invokes
-    /// `sandbox-exec` and dies, mentioning it on a later line — is returned untouched, never
-    /// retried unprofiled, and leaves the daemon-lifetime fallback memory unset.
+    /// `sandbox-exec` and dies, mentioning it on a later line — is returned untouched and is not
+    /// reported as a nested-sandbox refusal.
     #[tokio::test]
     async fn sandbox_apply_in_a_checker_failure_is_not_the_wrappers_refusal() {
-        let _state = isolated_fallback_state().await;
         let stderrs = [
             // A workspace search failure quoting a path that contains the substring.
             &b"error: failed searching for potential workspace\nerror: current package \
@@ -343,30 +324,14 @@ mod tests {
                 stderr: stderr.to_vec(),
                 ..RunOutput::default()
             })]);
-            let runner = NestedSandboxFallbackRunner::new(Arc::new(fake.clone()));
-            let spec = RunSpec {
-                program: PathBuf::from("/bin/cat"),
-                args: Vec::new(),
-                cwd: std::env::temp_dir(),
-                env: Vec::new(),
-                read_roots: Vec::new(),
-                write_roots: Vec::new(),
-                read_denies: Vec::new(),
-                timeout: Duration::from_secs(10),
-                max_output_bytes: 4096,
-            };
-            let output = runner.run(spec).await.expect("profiled result returned");
+            let runner = NestedSandboxRunner::new(Arc::new(fake.clone()));
+            let output = runner
+                .run(spec("/bin/cat", Vec::new()))
+                .await
+                .expect("profiled result returned");
             assert_eq!(output.status, Some(101), "{output:?}");
             assert_eq!(output.stderr, stderr);
-            assert_eq!(
-                fake.specs().len(),
-                1,
-                "a checker failure must not be retried without the profile"
-            );
-            assert!(
-                !NESTED_SANDBOX_REFUSED.load(std::sync::atomic::Ordering::Acquire),
-                "a checker failure must not arm the daemon-wide fallback"
-            );
+            assert_eq!(fake.specs().len(), 1);
         }
     }
 
@@ -438,9 +403,9 @@ mod tests {
             .unwrap();
         // A caller already confined by Seatbelt (for example an agent's own sandboxed shell)
         // cannot apply a nested profile: macOS refuses `sandbox_apply` for a process that is
-        // itself confined. Production handles that refusal by running the check once without
-        // our profile (see [`NestedSandboxFallbackRunner`]); this test asserts confinement
-        // itself, so a nested environment still cannot exercise it and skips.
+        // itself confined. Production reports that refusal as an unavailable check (see
+        // [`NestedSandboxRunner`]); this test asserts confinement itself, so a nested
+        // environment still cannot exercise it and skips.
         if allowed.stderr.windows(13).any(|w| w == b"sandbox_apply") {
             eprintln!("skipping: nested sandbox-exec is not permitted in this environment");
             let _ = std::fs::remove_dir_all(&root);
