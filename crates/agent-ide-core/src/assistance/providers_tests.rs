@@ -5,7 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{CacheRequest, MAX_CACHE_NAMESPACES, retain_cache_plan};
+use super::{CacheRequest, MAX_CACHE_NAMESPACES, project_inputs_stamp, retain_cache_plan};
 use crate::app::cache::{CacheNamespaceId, CacheRoot};
 use crate::assistance::reply::FailureCode;
 use crate::intelligence::freshness::{CacheIdentity, CacheLifecycle};
@@ -298,4 +298,76 @@ fn a_failed_later_provider_leaves_no_unaccounted_namespace_or_directory_growth()
         "rollback must never remove pre-existing retained contents"
     );
     fs::remove_dir_all(root_path).unwrap();
+}
+
+/// The project input stamp follows exactly the named files inside its search ceiling: an edit of a
+/// named file changes it, an unrelated file or a skipped tree does not, a manifest deeper than the
+/// ceiling is not seen, and a directory far larger than the entry budget is still stamped.
+#[test]
+fn project_inputs_stamp_follows_named_files_within_its_ceiling() {
+    let root = temporary();
+    fs::create_dir_all(root.join("member/src")).unwrap();
+    fs::create_dir_all(root.join("target/debug")).unwrap();
+    fs::create_dir_all(root.join("a/b/c/d/e")).unwrap();
+    fs::write(root.join("Cargo.toml"), "one").unwrap();
+    fs::write(root.join("member/Cargo.toml"), "one").unwrap();
+    fs::write(root.join("target/debug/Cargo.toml"), "one").unwrap();
+    fs::write(root.join("a/b/c/d/e/Cargo.toml"), "one").unwrap();
+    let stamp = || project_inputs_stamp(&root, &["Cargo.toml"]);
+    let before = stamp();
+    assert_eq!(before, stamp(), "the stamp is deterministic");
+    fs::write(root.join("member/src/lib.rs"), "unrelated").unwrap();
+    assert_eq!(before, stamp(), "an unnamed file is not an input");
+    fs::write(
+        root.join("target/debug/Cargo.toml"),
+        "changed in a skipped tree",
+    )
+    .unwrap();
+    assert_eq!(before, stamp(), "a skipped tree is not searched");
+    fs::write(
+        root.join("a/b/c/d/e/Cargo.toml"),
+        "changed past the depth ceiling",
+    )
+    .unwrap();
+    assert_eq!(
+        before,
+        stamp(),
+        "a manifest past the depth ceiling is not seen"
+    );
+    fs::write(root.join("member/Cargo.toml"), "changed member manifest").unwrap();
+    assert_ne!(
+        before,
+        stamp(),
+        "a named file inside the ceiling is an input"
+    );
+    // A same-length edit that restores the modification time still changes the stamp.
+    let manifest = root.join("Cargo.toml");
+    let modified = fs::metadata(&manifest).unwrap().modified().unwrap();
+    let before_fix = stamp();
+    fs::write(&manifest, "two").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&manifest)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    assert_eq!(fs::read(&manifest).unwrap().len(), 3);
+    assert_ne!(
+        before_fix,
+        stamp(),
+        "the stamp follows content, not the timestamp"
+    );
+    assert_eq!(
+        project_inputs_stamp(&root, &[]),
+        [0; 32],
+        "no named inputs stamp to a constant"
+    );
+    // A directory far larger than the entry budget is read only up to the budget.
+    let many = root.join("many");
+    fs::create_dir_all(&many).unwrap();
+    for index in 0..(super::INPUT_SCAN_ENTRIES + 500) {
+        fs::write(many.join(format!("f{index}")), "").unwrap();
+    }
+    let _ = stamp();
+    fs::remove_dir_all(root).unwrap();
 }

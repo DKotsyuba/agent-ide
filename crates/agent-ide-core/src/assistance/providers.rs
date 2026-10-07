@@ -95,6 +95,22 @@ pub(super) struct Providers {
     /// The owner and server slot of the session the running job used, so the worker can settle
     /// that session's health when the job ends ([`Worker::settle_session_health`]).
     pub(super) current: Option<(BindingRef, usize)>,
+    /// What the running job's provider calls showed about [`Providers::current`] so far. Recorded
+    /// where the provider answers or fails, not from the tool's final result: a tool that falls
+    /// back to a source outline after the session failed still succeeds, and the session is still
+    /// failed.
+    health: SessionHealth,
+}
+
+/// What a job's provider calls showed about the session it used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SessionHealth {
+    /// No provider call has answered or failed yet.
+    Unsettled,
+    /// A provider call completed against the session and nothing failed.
+    Healthy,
+    /// A provider call failed against the session; sticky for the rest of the job.
+    Failed,
 }
 
 /// What a failed provider session was running against: Git's `HEAD` and the content stamp of the
@@ -132,6 +148,26 @@ impl Providers {
             pending_handover: std::collections::BTreeSet::new(),
             failed: BTreeMap::new(),
             current: None,
+            health: SessionHealth::Unsettled,
+        }
+    }
+
+    /// Starts a job's session-health tracking: no session used, nothing observed.
+    pub(super) fn begin_job(&mut self) {
+        self.current = None;
+        self.health = SessionHealth::Unsettled;
+    }
+
+    /// Records that a provider call failed against the session the job uses; later successes of
+    /// the same job never undo it.
+    pub(super) fn note_session_fault(&mut self) {
+        self.health = SessionHealth::Failed;
+    }
+
+    /// Records that a provider call completed against the session, unless one already failed.
+    fn note_session_healthy(&mut self) {
+        if self.health == SessionHealth::Unsettled {
+            self.health = SessionHealth::Healthy;
         }
     }
 
@@ -350,6 +386,9 @@ impl Worker<'_> {
     /// live shared entry is never falsely retired or handed off to an unrelated actor.
     pub(super) fn quiesce_worktree_caches(&mut self, binding: &BindingRef) {
         self.providers.pending_handover.remove(binding);
+        self.providers
+            .failed
+            .retain(|(owner, _), _| owner != binding);
         for key in self
             .providers
             .binding_caches
@@ -392,6 +431,19 @@ impl Worker<'_> {
             .caches
             .get(key)
             .map(CacheLifecycle::quiescent)
+    }
+
+    /// Test-only count of sessions currently marked failed.
+    #[cfg(test)]
+    pub(super) fn test_failed_sessions(&self) -> usize {
+        self.providers.failed.len()
+    }
+
+    /// Test-only: records a failed provider call against the session the running job used, the
+    /// way a lexical fallback that swallowed a provider failure would have.
+    #[cfg(test)]
+    pub(super) fn test_note_session_fault(&mut self) {
+        self.providers.note_session_fault();
     }
 
     /// Test-only read of whether `binding` still owns any cache keys.
@@ -469,9 +521,15 @@ impl Worker<'_> {
         .await;
         job.session_binding = None;
         self.providers.put_backend(index, backend);
-        if let Err(code) = &result {
-            self.providers
-                .name_bare_failure(job, server, "session request failed", code);
+        match &result {
+            Err(code) => {
+                self.providers
+                    .name_bare_failure(job, server, "session request failed", code);
+                if *code == FailureCode::ProviderUnavailable {
+                    self.providers.note_session_fault();
+                }
+            }
+            Ok(_) => self.providers.note_session_healthy(),
         }
         result.map(Some)
     }
@@ -546,6 +604,9 @@ impl Worker<'_> {
         if let Err(code) = &ensured {
             self.providers
                 .name_bare_failure(job, server, "session could not start", code);
+            if *code == FailureCode::ProviderUnavailable {
+                self.providers.note_session_fault();
+            }
         }
         ensured?;
         let budget = Duration::from_millis(100).min(
@@ -570,6 +631,7 @@ impl Worker<'_> {
                 return Err(FailureCode::ProviderLoading);
             }
             Err(ReadinessError::WorkspaceError) => {
+                self.providers.note_session_fault();
                 job.set_stage_failure(
                     &FailureCode::ProviderUnavailable,
                     &format!(
@@ -590,6 +652,7 @@ impl Worker<'_> {
                 if cancelled {
                     return Err(FailureCode::Cancelled);
                 }
+                self.providers.note_session_fault();
                 job.set_stage_failure(
                     &FailureCode::ProviderUnavailable,
                     &format!(
@@ -611,6 +674,12 @@ impl Worker<'_> {
         live.session
             .authorize_source(&source_authority, source)
             .map_err(|_| FailureCode::WorkspaceAuthority)?;
+        self.providers.note_session_healthy();
+        let live = self.providers.slots[index]
+            .backend
+            .as_mut()
+            .and_then(|backend| backend.live_session(&binding))
+            .ok_or(FailureCode::Internal)?;
         Ok(live)
     }
 
@@ -723,30 +792,26 @@ impl Worker<'_> {
         }
     }
 
-    /// Settles the health of the session the finished job used, if any: a job that succeeded
-    /// clears its session's failed mark; one that ended `ProviderUnavailable` (other than a rename
-    /// or other edit refusal, which are answers rather than session faults) marks it failed
-    /// against the basis it failed on. `failure` is the job's terminal failure, `None` on success.
-    pub(super) async fn settle_session_health(&mut self, job: &Job, failure: Option<&FailureCode>) {
+    /// Settles the health of the session the finished job used, if any, from what its provider
+    /// calls observed ([`SessionHealth`]), not from the tool's final result: a failed provider
+    /// call marks the session failed against the basis it failed on even when the tool then
+    /// answered from a source outline, and a job whose provider calls all completed clears the mark.
+    pub(super) async fn settle_session_health(&mut self, job: &Job) {
+        let health = self.providers.health;
         let Some(key) = self.providers.current.take() else {
             return;
         };
-        match failure {
-            None => {
+        match health {
+            SessionHealth::Unsettled => {}
+            SessionHealth::Healthy => {
                 self.providers.failed.remove(&key);
             }
-            Some(FailureCode::ProviderUnavailable)
-                if !job
-                    .failure_detail
-                    .as_deref()
-                    .is_some_and(|detail| detail.starts_with("edit:")) =>
-            {
+            SessionHealth::Failed => {
                 if let Ok(authority) = self.authority(job.invocation.binding_ref()).await {
                     let basis = self.session_basis(key.1, &authority);
                     self.providers.failed.insert(key, basis);
                 }
             }
-            Some(_) => {}
         }
     }
 
@@ -800,6 +865,10 @@ impl Worker<'_> {
 
     /// Shuts down and reaps every live language session owned by one binding, in server order.
     pub(super) async fn release_live(&mut self, binding: &BindingRef) {
+        // A released session has nothing left to retire; its failed mark would only outlive it.
+        self.providers
+            .failed
+            .retain(|(owner, _), _| owner != binding);
         for index in 0..self.providers.slots.len() {
             let Ok(mut backend) = self.providers.take_backend(index) else {
                 continue;
@@ -970,8 +1039,8 @@ fn set_no_server_stage(job: &mut Job) {
 
 /// Deepest directory level below the worktree root that [`project_inputs_stamp`] searches.
 const INPUT_SCAN_DEPTH: usize = 4;
-/// Most directory entries [`project_inputs_stamp`] visits; a larger tree is stamped from the
-/// entries seen so far.
+/// Most directory entries [`project_inputs_stamp`] reads in total; a larger tree is stamped from
+/// the entries read so far.
 const INPUT_SCAN_ENTRIES: usize = 5_000;
 /// Directories [`project_inputs_stamp`] never enters: VCS metadata and generated or vendored trees
 /// that hold copies of manifests the project does not own.
@@ -987,24 +1056,33 @@ const INPUT_SCAN_SKIP: &[&str] = &[
     "vendor",
 ];
 
-/// Digests the relative path, length and modification time of every file named in `names` below
-/// `root`, searching at most [`INPUT_SCAN_DEPTH`] levels and [`INPUT_SCAN_ENTRIES`] entries
-/// (ponytail: a bounded walk per call while a session is marked failed; a watcher would replace
-/// it if that ever shows up in profiles). Entries are visited in sorted order so the digest is
-/// deterministic; an unreadable directory contributes nothing. Empty `names` digest to a constant.
+/// Most bytes of one input file that [`project_inputs_stamp`] digests; a longer file is stamped
+/// by its length and this prefix.
+const INPUT_SCAN_FILE_BYTES: u64 = 256 * 1024;
+
+/// Digests the relative path, length and content of every file named in `names` below `root`.
+///
+/// Content, not the modification time, is what is digested: an edit that keeps a file's length and
+/// timestamp (a restored mtime, a same-length fix) still changes the stamp. A file longer than
+/// [`INPUT_SCAN_FILE_BYTES`] is digested by its length and that prefix.
+///
+/// Coverage is bounded and honest: at most [`INPUT_SCAN_DEPTH`] levels below `root` and
+/// [`INPUT_SCAN_ENTRIES`] directory entries read in total (entries are streamed, never collected,
+/// so a huge directory costs at most the remaining budget); a manifest deeper than that or past the
+/// budget is not seen, and only a moved `HEAD` then revives a failed session. The per-file digests
+/// are summed, so the result does not depend on the order the filesystem lists entries. An
+/// unreadable directory or file contributes nothing; empty `names` digest to a constant.
 fn project_inputs_stamp(root: &Path, names: &[&str]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
+    let mut sum = [0_u8; 32];
     let mut budget = INPUT_SCAN_ENTRIES;
     let mut pending = vec![(root.to_path_buf(), 0_usize)];
     while let Some((directory, depth)) = pending.pop() {
         let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;
         };
-        let mut entries: Vec<_> = entries.flatten().collect();
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
+        for entry in entries.flatten() {
             if budget == 0 {
-                return *hasher.finalize().as_bytes();
+                return sum;
             }
             budget -= 1;
             let name = entry.file_name();
@@ -1017,22 +1095,35 @@ fn project_inputs_stamp(root: &Path, names: &[&str]) -> [u8; 32] {
                     pending.push((entry.path(), depth + 1));
                 }
             } else if names.contains(&name)
-                && let Ok(metadata) = entry.metadata()
+                && let Ok(file) = std::fs::File::open(entry.path())
             {
+                use std::io::Read;
                 let relative = entry.path();
                 let relative = relative.strip_prefix(root).unwrap_or(&relative);
-                let modified = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(0, |elapsed| elapsed.as_nanos());
+                let mut content = Vec::new();
+                if file
+                    .take(INPUT_SCAN_FILE_BYTES)
+                    .read_to_end(&mut content)
+                    .is_err()
+                {
+                    continue;
+                }
+                let mut hasher = blake3::Hasher::new();
                 hasher.update(relative.as_os_str().as_encoded_bytes());
-                hasher.update(&metadata.len().to_le_bytes());
-                hasher.update(&modified.to_le_bytes());
+                hasher.update(
+                    &entry
+                        .metadata()
+                        .map_or(0, |metadata| metadata.len())
+                        .to_le_bytes(),
+                );
+                hasher.update(&content);
+                for (total, byte) in sum.iter_mut().zip(hasher.finalize().as_bytes()) {
+                    *total = total.wrapping_add(*byte);
+                }
             }
         }
     }
-    *hasher.finalize().as_bytes()
+    sum
 }
 
 /// Parks `job` for a retry in 300 ms because its language server is still loading; the caller

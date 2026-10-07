@@ -198,9 +198,10 @@ impl RustBackend {
     ///
     /// `job` supplies binding ownership, cancellation, and spawn authority; `launch` is the
     /// accepted analyzer profile; `source` fixes the worktree and authority epoch. Admission,
-    /// profile, spawn, initialization, and cancellation failures return a bounded code. Every
-    /// `ProviderUnavailable` it returns first names its stage on `job` (`rust: view refused`,
-    /// `spawn failed`, `initialize failed` or `initialize timeout`), so no refusal is stage-less.
+    /// profile, spawn, initialization, and cancellation failures return a bounded code. The
+    /// view, spawn and initialize refusals name their stage on `job` (`rust: view refused`,
+    /// `spawn failed`, `initialize failed` or `initialize timeout`); a bare `ProviderUnavailable`
+    /// from the cache-namespace lookup is named by the caller after this returns.
     async fn ensure(
         &mut self,
         host: &mut dyn ProviderHost,

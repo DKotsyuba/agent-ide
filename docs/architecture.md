@@ -136,11 +136,16 @@ refusal is `<tool>:provider_unavailable ext=<ext> (provider: no server for this 
 the reply template renders as the no-server sentence; and a refusal no path named gets
 `(provider: cause not reported)` from the worker.
 
-A session whose workspace failed, or that a call failed on, is marked failed with its basis: Git's
-`HEAD` and a stamp of the server's project input files (`LanguageServer::project_inputs`, searched
-four levels deep without generated or vendored trees). Before the next provider call the worker
-retires a marked session whose basis changed; an unchanged basis keeps the staged refusal and is
-never restarted, on a timer or per call. A successful call clears the mark.
+A session whose workspace failed, or that a provider call failed on, is marked failed with its
+basis: Git's `HEAD` and a content digest of the server's project input files
+(`LanguageServer::project_inputs`). The mark follows the provider calls of a job, not the tool's
+final answer, so a tool that falls back to a source outline after the session failed still marks
+it. The digest searches four directory levels and 5,000 directory entries without generated or
+vendored trees; a manifest outside that ceiling is not seen, and only a moved `HEAD` then revives
+the session. Before the next provider call the worker retires a marked session whose basis
+changed; an unchanged basis keeps the staged refusal and is never restarted, on a timer or per
+call. A job whose provider calls all completed clears the mark, and releasing the session (stop,
+downgrade, handover) drops it.
 
 ### Adding a language (recipe)
 

@@ -914,9 +914,11 @@ impl Worker<'_> {
                     {
                         Ok(found) => references = Some(found),
                         Err(_) if exchange => {
+                            self.providers.note_session_fault();
                             degraded = Some("references request failed".to_owned());
                         }
                         Err(_) => {
+                            self.providers.note_session_fault();
                             // The ready session failed this exchange; the stage names the request
                             // so the refusal's reply can say what still answers and how to
                             // recover.
@@ -1595,6 +1597,7 @@ impl Worker<'_> {
         let symbols = match live.session.document_symbols(observed, bytes).await {
             Ok(symbols) => symbols,
             Err(error) => {
+                self.providers.note_session_fault();
                 // The session passed readiness but this exchange failed (a server error reply
                 // while it reloads its workspace, or a dying transport): a language that
                 // outlines from its text answers at once, marked lexical with the cause in its

@@ -193,8 +193,9 @@ impl PyrightBackend {
     /// every use: a session whose interpreter identity no longer matches is released and
     /// restarted with the new one. A replaced child is shut down before another is admitted.
     /// Profile, authority, capacity, spawn, handshake, and cancellation failures return their
-    /// bounded `FailureCode`; every `ProviderUnavailable` first names its stage on `job`
-    /// (`python: view refused`, `spawn failed` or `initialize failed`).
+    /// bounded `FailureCode`; the view, spawn and handshake refusals name their stage on `job`
+    /// (`python: view refused`, `spawn failed` or `initialize failed`) and a bare
+    /// `ProviderUnavailable` from the cache-namespace lookup is named by the caller.
     async fn ensure(
         &mut self,
         host: &mut dyn ProviderHost,

@@ -581,8 +581,9 @@ impl TypeScriptBackend {
     /// `source` selects and verifies project inputs. A different worktree, bundle, or captured
     /// project file set shuts down the old session before a new one is admitted. Unverified inputs,
     /// authority, capacity, spawn, handshake, and cancellation failures return a bounded code;
-    /// every `ProviderUnavailable` first names its stage on `job` (`typescript: project
-    /// quarantined`, `view refused`, `spawn failed` or `initialize failed`).
+    /// the view, spawn and handshake refusals name their stage on `job` (`typescript: project
+    /// quarantined`, `view refused`, `spawn failed` or `initialize failed`) and a bare
+    /// `ProviderUnavailable` from the cache-namespace lookup is named by the caller.
     async fn ensure(
         &mut self,
         host: &mut dyn ProviderHost,
@@ -783,8 +784,8 @@ impl TypeScriptBackend {
     /// Answers TypeScript context requests through the binding's persistent server session.
     ///
     /// The exchange always waits (bounded) for the diagnostics push. A failed or cancelled
-    /// exchange retires the session and answers `ProviderUnavailable` with the stage
-    /// `typescript: request failed`. The result is then checked against the session's project
+    /// exchange retires the session; a cancelled one answers `Cancelled`, any other failure
+    /// `ProviderUnavailable` with the stage `typescript: request failed`. The result is then checked against the session's project
     /// snapshot and answers `ResolutionUnverified` (with the failure detail set) when the project
     /// changed.
     async fn answer(

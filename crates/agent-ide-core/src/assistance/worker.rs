@@ -2750,7 +2750,7 @@ impl<'a> Worker<'a> {
     /// Rechecks queued liveness, executes only the selected owner operation, and fences every result.
     async fn perform(&mut self, job: &mut Job) {
         let binding = job.invocation.binding_ref().clone();
-        self.providers.current = None;
+        self.providers.begin_job();
         let was_parked = job.park_until.take().is_some();
         // Read/query jobs can restart from the top after readiness probes: observe records a fresh
         // source snapshot, and ensure_live_* reuses the same alive per-binding session.
@@ -2853,7 +2853,7 @@ impl<'a> Worker<'a> {
         if job.park_until.is_some() {
             return;
         }
-        self.settle_session_health(job, result.as_ref().err()).await;
+        self.settle_session_health(job).await;
         let (reply, authority, source) = match result {
             Ok(result) => result,
             Err(code) => {
@@ -7075,7 +7075,7 @@ mod stop_retry_tests {
             stage: None,
             session_binding: None,
         };
-        worker.providers.current = None;
+        worker.providers.begin_job();
         let outcome = worker
             .live_session_for(&mut job, &observed)
             .await
@@ -7085,9 +7085,7 @@ mod stop_retry_tests {
             "the borrowed owner is cleared after the provider call"
         );
         // What `perform` does when a job ends: settle the health of the session it used.
-        worker
-            .settle_session_health(&job, outcome.as_ref().err())
-            .await;
+        worker.settle_session_health(&job).await;
         (outcome, job.failure_detail)
     }
 
@@ -8044,6 +8042,87 @@ mod stop_retry_tests {
             events.iter().filter(|event| **event == release).count(),
             2,
             "{events:?}"
+        );
+    }
+
+    /// A job's provider calls decide its session's health, not the tool's final result: a failure
+    /// noted by a provider call stays marked although the tool then answered (as the lexical
+    /// fallbacks do), and a stop or handover that releases the session drops the mark with it.
+    #[tokio::test]
+    async fn session_health_follows_provider_calls_and_dies_with_the_session() {
+        use crate::lang::testing::fixture_fail_next_ensure;
+        let fixture = Fixture::new();
+        let file = epsilon_source(&fixture);
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let reader = provider_start(&mut worker, "sh-reader", "sh-start", true, None)
+            .await
+            .unwrap();
+
+        // The provider call is fine (Loading), but a later exchange of the same job fails and the
+        // tool swallows it into a lexical answer: the job still ends with the session failed.
+        worker.providers.begin_job();
+        let invocation = production_call(&worker, "sh-reader", "sh-1");
+        let binding = invocation.binding_ref().clone();
+        let (observed, _) = worker.observe(&binding, file.clone()).await.unwrap();
+        let (_cancel_sender, cancel) = watch::channel(false);
+        let mut job = Job {
+            reference: "provider-sh-1".into(),
+            invocation,
+            tool: AssistanceTool::Symbol,
+            parameters: serde_json::json!({}),
+            target: provider_target(&worker.runtime),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            cancel,
+            stop_reply: None,
+            native_epoch: 0,
+            failure_detail: None,
+            format_note: None,
+            check_scheduled: false,
+            park_until: None,
+            stage: None,
+            session_binding: None,
+        };
+        let outcome = worker
+            .live_session_for(&mut job, &observed)
+            .await
+            .map(|_| ());
+        assert_eq!(outcome, Err(FailureCode::ProviderLoading));
+        worker.test_note_session_fault();
+        worker.settle_session_health(&job).await;
+        assert_eq!(
+            worker.test_failed_sessions(),
+            1,
+            "the swallowed failure is kept"
+        );
+
+        // A stop drops the mark with the session; nothing outlives the binding.
+        assert!(worker.settle_revocation(&reader).await.unwrap());
+        assert_eq!(
+            worker.test_failed_sessions(),
+            0,
+            "stop prunes the failed mark"
+        );
+
+        // A handover releases the reader owner's session and its mark too.
+        let reader = provider_start(&mut worker, "sh-reader-2", "sh-start-2", true, None)
+            .await
+            .unwrap();
+        fixture_fail_next_ensure(&reader, false);
+        assert_eq!(
+            provider_symbol_call(&mut worker, "sh-reader-2", "sh-2", &file).await,
+            Err(FailureCode::ProviderUnavailable)
+        );
+        assert_eq!(worker.test_failed_sessions(), 1);
+        provider_start(&mut worker, "sh-writer", "sh-start-3", false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            worker.test_failed_sessions(),
+            0,
+            "the writer's handover prunes the reader owner's mark"
         );
     }
 
