@@ -176,7 +176,16 @@ impl Worker<'_> {
         Ok((reply, Some(authority), Some(observed)))
     }
 
-    /// `ide.read {symbol}` or `ide.read {path, lines}`: numbered source with the header.
+    /// `ide.read {symbol}`, `ide.read {path, lines}` or `ide.read {path}`: numbered source with
+    /// the header.
+    ///
+    /// `path` alone reads the whole file (`(empty file)` when it has no lines), paged by bytes
+    /// like any read. Any readable text file answers the `path` forms, whatever its type; a file
+    /// no IDE language analyzes ends with [`NO_ANALYSIS_NOTE`]. A binary or unreadable file
+    /// is refused as `source_unavailable` with a `read:not_text:` or `read:source_unavailable:`
+    /// detail (a soft refusal naming native tools, never `internal`); a `lines` range past the
+    /// end is refused `read:line_range`. The `symbol` form still needs an outline, so a file no
+    /// IDE language reads answers `unsupported_file`.
     pub(super) async fn read(
         &mut self,
         job: &mut Job,
@@ -308,6 +317,14 @@ impl Worker<'_> {
     /// failing the rest; an exactly duplicated address renders once; a block is never cut
     /// mid-body — what the reply budget could not hold is listed with the exact follow-up call,
     /// and only files whose blocks were all delivered get an edit base retained.
+    ///
+    /// A `symbols` item may also be a bare file path: for a file no IDE language reads it renders
+    /// the whole text (as `ide.read {path}`), while a symbol address into such a file is one soft
+    /// item (`<file> has no code symbols; read it with ide.read {path, lines|ranges}`), in
+    /// whichever order the two come. A binary or unreadable file is one `not a readable text
+    /// file` item, a missing file one `no such file` item. When any delivered file is one no IDE
+    /// language analyzes the reply carries [`NO_ANALYSIS_NOTE`] once, ahead of `source_ref`.
+    /// Failures that are not about one file (a malformed address, a deadline) still fail the call.
     async fn read_batch(
         &mut self,
         job: &mut Job,
@@ -380,7 +397,20 @@ impl Worker<'_> {
                         ));
                         continue;
                     }
-                    match outline.as_ref().and_then(|outline| outline.find(&symbol)) {
+                    // A file read earlier in the batch without an outline (a bare path or a range
+                    // item) has no symbols to resolve, whatever order the items came in.
+                    let Some(outline) = outline else {
+                        items.push((
+                            batch_file_refusal(
+                                &FailureCode::UnsupportedFile(String::new()),
+                                &file.display().to_string(),
+                            ),
+                            None,
+                            address.to_owned(),
+                        ));
+                        continue;
+                    };
+                    match outline.find(&symbol) {
                         Some(found) => {
                             let text = render::read_text(&file, Some(address), found.range, source);
                             items.push((text, Some(index), address.to_owned()));
@@ -636,8 +666,14 @@ impl Worker<'_> {
     }
 
     /// Observes, outlines and finishes one file of a batch read once: every item of that file
-    /// shares the observation, the outline and the deadline/authority/source checks. `outline`
-    /// is false for line ranges, which never need one, so any readable file answers them.
+    /// shares the observation, the outline and the deadline/authority/source checks.
+    ///
+    /// `outline` is false for line ranges and whole-file text, which never need one, so any
+    /// readable file answers them; the file is then retained with `None` for its outline, and a
+    /// later symbol item of the same file must not look it up. Returns `Ok(None)` for a file that
+    /// is binary or has no observed bytes (the caller reports it as one soft item), `Ok(Some(index))`
+    /// into `files` otherwise, and `NoSuchFile`/`UnsupportedFile` errors the caller also turns into
+    /// items; every other error fails the whole call.
     async fn read_batch_file(
         &mut self,
         job: &mut Job,
@@ -3998,7 +4034,8 @@ fn clip_bytes(text: &str, limit: usize) -> String {
 /// Which form one batch read takes: several symbol addresses, or several ranges of one file.
 #[derive(Clone, Copy, PartialEq)]
 enum ReadBatch {
-    /// `ide.read {symbols: […]}` — cross-file symbol bodies.
+    /// `ide.read {symbols: […]}` — cross-file symbol bodies, and bare-path whole-file text of
+    /// files no IDE language reads.
     Symbols,
     /// `ide.read {path, ranges: […]}` — several ranges of the one file.
     Ranges,

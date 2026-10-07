@@ -6107,6 +6107,23 @@ async fn text_reads_of_non_language_files_return_numbered_text_with_a_note_in_ev
             && text.contains("2\tbody"),
         "{mixed} {text}"
     );
+    // The bare path first caches the file without an outline; the address after it must still
+    // get the same soft hint, not `no such symbol`.
+    let (reversed, text) = settled_read(
+        &mut actor,
+        &fixture,
+        json!({"symbols":["notes.md","notes.md#title"]}),
+    )
+    .await;
+    assert!(
+        reversed["kind"] == "read"
+            && text.contains(
+                "notes.md has no code symbols; read it with ide.read {path, lines|ranges}"
+            )
+            && !text.contains("no such symbol")
+            && text.contains("2\tbody"),
+        "{reversed} {text}"
+    );
     let (hint, text) =
         settled_read(&mut actor, &fixture, json!({"symbols":["notes.md#title"]})).await;
     assert!(

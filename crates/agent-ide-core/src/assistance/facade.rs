@@ -404,8 +404,9 @@ fn string_list(
 /// Closed rule text for a bounded list argument of strings.
 const LIST_OF_STRINGS: &str = "an array of 1 to 16 non-empty strings";
 
-/// The `symbols` list: each entry a strict `path#Owner/name` (a nonempty file part before the
-/// `#`), never a sigil address — those stay on the single `symbol` form.
+/// The `symbols` list: each entry a `path#Owner/name` (a nonempty file part before the `#`) or a
+/// bare relative file path with no `#` (the whole file's text, for a file no IDE language reads),
+/// never a sigil address — those stay on the single `symbol` form.
 fn symbol_list(
     object: &Map<String, Value>,
     field: &'static str,
