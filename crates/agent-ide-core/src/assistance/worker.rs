@@ -2614,6 +2614,10 @@ impl<'a> Worker<'a> {
     /// (see `inspection_loop`) so a non-yielding poll of the current operation cannot starve
     /// `ide.inspect`. Shutdown first cancels the current operation, allowing its provider or forwarder
     /// child to reap, then this loop closes retained providers before returning.
+    ///
+    /// A job that panics does not end the loop: its call settles `internal` (see
+    /// `settle_panicked`), the error journal gets the panic's source location and the call's
+    /// method but never the payload text, and the next queued job runs normally.
     async fn run(mut self, inspections: mpsc::Receiver<Inspection>)
     where
         'a: 'static,
