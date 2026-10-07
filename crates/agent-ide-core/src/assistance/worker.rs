@@ -5828,7 +5828,11 @@ fn validate_environment(
             super::launcher::admit_path(&roots, &project_root.join(selector)).map_err(|_| {
                 (
                     FailureCode::OutsideAllowedRoots,
-                    format!("environment {key} {selector}"),
+                    // The key is JSON-quoted so a root containing spaces stays unambiguous.
+                    format!(
+                        "environment {} {selector}",
+                        serde_json::Value::String(key.clone())
+                    ),
                 )
             })?;
             language
@@ -6716,7 +6720,7 @@ mod stop_retry_tests {
                 error,
                 (
                     FailureCode::OutsideAllowedRoots,
-                    format!("environment alpha {selector}")
+                    format!("environment \"alpha\" {selector}")
                 )
             );
         }
@@ -6902,7 +6906,7 @@ mod stop_retry_tests {
             (
                 serde_json::json!({"alpha":"/outside/environment"}),
                 FailureCode::OutsideAllowedRoots,
-                "environment alpha /outside/environment",
+                "environment \"alpha\" /outside/environment",
             ),
         ]
         .into_iter()

@@ -118,6 +118,7 @@ fn project(
     context["resolution_message"] = serde_json::Value::String(String::new());
     context["environment_key"] = serde_json::Value::String(String::new());
     context["environment_selector"] = serde_json::Value::String(String::new());
+    context["environment_example"] = serde_json::Value::String(String::new());
     context["tool_name"] = serde_json::Value::String(tool_name.unwrap_or_default().to_owned());
     context["test_status_id"] =
         test_status_id.map_or(serde_json::Value::Null, serde_json::Value::from);
@@ -127,8 +128,12 @@ fn project(
         context["resolution_message"] =
             serde_json::Value::String(resolution_message(detail).to_owned());
         if let Some((key, selector)) = environment_refusal(detail) {
-            context["environment_key"] = serde_json::Value::String(key.to_owned());
+            context["environment_key"] = serde_json::Value::String(key.clone());
             context["environment_selector"] = serde_json::Value::String(selector.to_owned());
+            context["environment_example"] = serde_json::Value::String(format!(
+                "{{{}: \".venv\"}}",
+                serde_json::Value::String(key.clone())
+            ));
         }
         if let Some(fields) = structured.as_object_mut() {
             fields.remove("detail");
@@ -224,6 +229,7 @@ fn escape_untrusted_labels(context: &mut serde_json::Value) {
         "cause_tag",
         "environment_key",
         "environment_selector",
+        "environment_example",
     ] {
         field(context, key);
     }
@@ -271,14 +277,17 @@ fn display_safe(label: &str) -> String {
     escaped
 }
 
-/// Splits an environment-selector refusal detail, `environment <root key> <selector>`, into the
+/// Splits an environment-selector refusal detail, `environment "<root key>" <selector>`, into the
 /// root key (`python` or `python:<relative root>`) and the selector exactly as the agent sent it.
 ///
-/// Returns `None` for every other detail. The selector may contain spaces: only the first two
-/// separators split.
-fn environment_refusal(detail: &str) -> Option<(&str, &str)> {
+/// The worker JSON-quotes the key, so a root containing spaces, quotes or colons is read back
+/// unchanged; the selector is everything after the single space that follows the quoted key and
+/// may itself contain spaces. Returns `None` for every other detail, including an unquoted key.
+fn environment_refusal(detail: &str) -> Option<(String, &str)> {
     let rest = detail.strip_prefix("environment ")?;
-    let (key, selector) = rest.split_once(' ')?;
+    let mut keys = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+    let key = keys.next()?.ok()?;
+    let selector = rest[keys.byte_offset()..].strip_prefix(' ')?;
     (!key.is_empty() && !selector.is_empty()).then_some((key, selector))
 }
 
@@ -1229,26 +1238,40 @@ mod tests {
     /// root refusal keeps its own text.
     #[test]
     fn environment_selector_refusal_names_the_selector_and_the_venv_form() {
-        let refused = render(
-            PeerReply::Error {
-                code: FailureCode::OutsideAllowedRoots,
-                detail: Some("environment python:service /usr/local/bin/python3.14".to_owned()),
-            },
-            Envelope::TextOnly,
-        )
-        .unwrap();
-        let line = text_of(&refused);
-        for fact in [
-            "environment selector /usr/local/bin/python3.14 for python:service",
-            "inside the worktree",
-            "bin/python",
-            "not a base interpreter",
-            "{\"python\": \".venv\"}",
-            "allowed_roots",
+        // The worker JSON-quotes the root key, so roots and selectors with spaces stay exact.
+        for (key, selector) in [
+            ("python", "/usr/local/bin/python3.14"),
+            ("python:packages/my project", "/opt/my envs/python 3.14"),
+            ("python:odd\"root", "/usr/bin/python3"),
         ] {
-            assert!(line.contains(fact), "missing {fact:?}: {line}");
+            let refused = render(
+                PeerReply::Error {
+                    code: FailureCode::OutsideAllowedRoots,
+                    detail: Some(format!(
+                        "environment {} {selector}",
+                        serde_json::Value::String(key.to_owned())
+                    )),
+                },
+                Envelope::TextOnly,
+            )
+            .unwrap();
+            let line = text_of(&refused);
+            let example = format!(
+                "{{{}: \".venv\"}}",
+                serde_json::Value::String(key.to_owned())
+            );
+            for fact in [
+                &format!("environment selector {selector} for {key} is outside"),
+                "inside the worktree",
+                "bin/python",
+                "not a base interpreter",
+                &format!("ide.start with environment {example}"),
+                "allowed_roots",
+            ] {
+                assert!(line.contains(fact), "missing {fact:?}: {line}");
+            }
+            assert!(!line.contains("requested project root"), "{line}");
         }
-        assert!(!line.contains("requested project root"), "{line}");
 
         let ordinary = render(
             PeerReply::Error {
