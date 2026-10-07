@@ -6304,6 +6304,84 @@ async fn non_code_file_line_edits_work_from_every_text_read_ref() {
     daemon.wait().await.unwrap();
 }
 
+/// Combination smoke (stability plan QW-9): every read form of every kind of text file no IDE
+/// language reads (`.log`, `.md`, `.toml`) answers a read, and a second, known-good call after each
+/// one still answers.
+///
+/// The forms are the bare path, `lines`, `ranges`, a bare-path `{symbols}` batch, a batch mixing two
+/// of the files, and a batch holding only a symbol address (an all-refused batch that delivers no
+/// file). The 2026-10-07 field incident (`sources.drain(..1)` on the empty source list of a
+/// `.log` ranges read) failed exactly this shape: the first call of a combination broke the daemon
+/// and the second one with it. Every combination runs before any assertion so one failure lists
+/// all of them.
+#[tokio::test]
+async fn text_file_read_forms_each_answer_and_a_second_call_still_answers() {
+    let fixture = ProductFixture::new(json!([]));
+    let files = [
+        ("run.log", "one\ntwo\nthree\n"),
+        ("notes.md", "# title\nbody\nend\n"),
+        ("config.toml", "[package]\nname = \"x\"\nversion = \"1\"\n"),
+    ];
+    for (name, text) in files {
+        std::fs::write(fixture.root.join(name), text).unwrap();
+    }
+    fixture.git(&["add", "--", "run.log", "notes.md", "config.toml"]);
+    fixture.git(&["commit", "--quiet", "-m", "smoke fixtures"]);
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "read-smoke").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"read-smoke"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let mut failures = Vec::new();
+    for (path, text) in files {
+        let first = text.lines().next().unwrap();
+        let second = text.lines().nth(1).unwrap();
+        let other = if path == "run.log" {
+            "notes.md"
+        } else {
+            "run.log"
+        };
+        let forms = [
+            ("path", json!({"path":path}), first),
+            ("lines", json!({"path":path,"lines":"1-2"}), first),
+            ("ranges", json!({"path":path,"ranges":["1-1","2-2"]}), first),
+            ("batch", json!({"symbols":[path]}), first),
+            ("mixed batch", json!({"symbols":[path, other]}), first),
+            (
+                "symbol-only batch",
+                json!({"symbols":[format!("{path}#missing")]}),
+                "has no code symbols",
+            ),
+        ];
+        for (form, arguments, expected) in forms {
+            let (reply, text) = settled_read(&mut actor, &fixture, arguments.clone()).await;
+            if reply["kind"] != "read" || !text.contains(expected) {
+                failures.push(format!("{path} {form} {arguments}: {reply} {text}"));
+            }
+            let (after, text) = settled_read(
+                &mut actor,
+                &fixture,
+                json!({"path":path,"lines":"2-2"}),
+            )
+            .await;
+            if after["kind"] != "read" || !text.contains(second) {
+                failures.push(format!("{path} {form}: the second call broke: {after} {text}"));
+            }
+        }
+    }
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+    assert!(
+        failures.is_empty(),
+        "every read form must answer and leave the daemon answering:\n{}",
+        failures.join("\n")
+    );
+}
+
 /// A job that panics answers that one call `internal`, the error journal records the panic's
 /// source location and the call's method but never the payload text, and the daemon's single
 /// worker stays alive: the next read still answers. Driven by the `test-seams` panic seam, which panics an `ide.read` of
@@ -10994,9 +11072,12 @@ async fn product_second_worktree_inherits_the_name_index() {
         text.contains("links: class, id, style-variable facts from css, html (indexed 3 files, "),
         "{text}"
     );
+    // The card must carry the inherited index's rows. Whether it answers inline or first as
+    // `pending` depends on the machine's load, so it is settled, not timed (stability QW-9).
     let card = next
         .call(&fixture, "ide.symbol", json!({"symbol":"styles.css#.btn"}))
         .await;
+    let card = next.settle(&fixture, card).await;
     assert_eq!(card["state"], "complete", "{card}");
     assert!(
         card["text"]
@@ -11333,9 +11414,28 @@ async fn configured_product_cold_symbol_test_accepts_inline_or_pending() {
 }
 
 /// Proves warm Rust outline and symbol calls finish inline without pending inspection round trips.
+///
+/// Correctness only: the replies are `complete` (the daemon's own inline wait bounds them) and no
+/// call takes a pending round trip. The wall-clock bound lives in
+/// [`configured_product_warm_rust_calls_stay_within_three_seconds`], so a loaded host fails the
+/// timing job and never this one.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment"]
-async fn configured_product_warm_rust_calls_complete_inline_within_three_seconds() {
+async fn configured_product_warm_rust_calls_complete_inline() {
+    warm_rust_inline_replies(false).await;
+}
+
+/// The timing half of the warm Rust inline contract: the same warm calls finish within three
+/// seconds each. Load-sensitive by nature, so it is a separate ignored test (the performance job),
+/// never part of the correctness gate.
+#[tokio::test]
+#[ignore = "timing: requires accepted AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment and an unloaded host"]
+async fn configured_product_warm_rust_calls_stay_within_three_seconds() {
+    warm_rust_inline_replies(true).await;
+}
+
+/// Shared body of the two warm Rust inline tests; `timed` adds the three-second bound per call.
+async fn warm_rust_inline_replies(timed: bool) {
     let fixture = symbol_test_fixture();
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "warm-rust-inline").await;
@@ -11375,7 +11475,10 @@ async fn configured_product_warm_rust_calls_complete_inline_within_three_seconds
         let reply = actor.call(&fixture, tool, params).await;
         let elapsed = began.elapsed();
         assert_eq!(reply["state"], "complete", "{tool}: {reply}");
-        assert!(elapsed < Duration::from_secs(3), "{tool} took {elapsed:?}");
+        assert!(
+            !timed || elapsed < Duration::from_secs(3),
+            "{tool} took {elapsed:?}"
+        );
     }
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;

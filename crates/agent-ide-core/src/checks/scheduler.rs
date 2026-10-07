@@ -1808,7 +1808,7 @@ mod deny_tests {
                 Arc::new(move |_| Some(fingerprint.load(std::sync::atomic::Ordering::SeqCst)))
             });
             scheduler.trigger("repo", &root);
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
                     if checker.requests().len() == 1
                         && scheduler
@@ -1827,7 +1827,27 @@ mod deny_tests {
             // Unchanged inputs: a second trigger must not re-probe a durable condition, and the
             // stored snapshot must still answer the newer generation.
             scheduler.trigger("repo", &root);
-            tokio::time::sleep(Duration::from_millis(120)).await;
+            // Wait for the observable outcome of the second trigger, never for a fixed time: a
+            // skipped re-probe is settled once the stored snapshot tracks the newer generation, a
+            // re-check once the checker saw its second request. A loaded machine only delays it.
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let settled = if durable {
+                        scheduler
+                            .latest(&root)
+                            .first()
+                            .is_some_and(|snapshot| snapshot.input_generation >= 2)
+                    } else {
+                        checker.requests().len() >= 2
+                    };
+                    if settled {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{reason:?} second trigger must settle"));
             let after_unchanged = checker.requests().len();
             if durable {
                 assert_eq!(
@@ -1851,7 +1871,7 @@ mod deny_tests {
             // Changed inputs (the environment directory or manifest moved): the check re-runs.
             fingerprint.store(8, std::sync::atomic::Ordering::SeqCst);
             scheduler.trigger("repo", &root);
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
                     if checker.requests().len() > after_unchanged {
                         break;
