@@ -2629,6 +2629,12 @@ impl<'a> Worker<'a> {
         ));
         let _inspector = AbortOnDrop(inspector);
         loop {
+            if fault_seam("loop") {
+                panic!("agent-ide test seam: deliberate worker loop panic");
+            }
+            if fault_seam("worker_exit") {
+                return;
+            }
             if self
                 .shared
                 .shutting_down
@@ -5108,6 +5114,9 @@ impl InspectFailure {
 /// whole-tree proof requirement. A semantic Context also proves each retained definition and
 /// reference path, so a newly denied secondary file invalidates its cached page.
 async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, request: Inspection) {
+    if fault_seam("inspection") {
+        panic!("agent-ide test seam: deliberate inspection panic");
+    }
     let result: Result<PeerReply, InspectFailure> = async {
         // A known test-run handle (`tests #N`, `tests-N`, `#N`, `N`) names a background
         // run rather than a retained detail. Its status belongs to the actor and channel, so it
@@ -6336,6 +6345,32 @@ fn panic_seam(job: &Job) {
 /// Without the `test-seams` feature there is no panic seam.
 #[cfg(not(feature = "test-seams"))]
 fn panic_seam(_job: &Job) {}
+
+/// Test seam: reports `true` exactly once per flag file when `AGENT_IDE_TEST_FAULT` names `point`,
+/// so a product test can inject one fault into a named place of the daemon (`inspection`, `ensure`,
+/// `loop`, `worker_exit`) that survives a daemon replacement.
+///
+/// The variable reads `<point>:<absolute flag file>`; the fault fires when the flag file exists
+/// and this call is the one that removes it, so only the first daemon to reach the point fails and
+/// the replacement daemon, which inherits the same environment, runs clean. A build without the
+/// `test-seams` feature never reads the environment and always answers `false`.
+#[cfg(feature = "test-seams")]
+pub(super) fn fault_seam(point: &str) -> bool {
+    crate::test_seams::var("AGENT_IDE_TEST_FAULT")
+        .and_then(|value| {
+            value
+                .split_once(':')
+                .filter(|(name, _)| *name == point)
+                .map(|(_, flag)| std::fs::remove_file(flag).is_ok())
+        })
+        .unwrap_or(false)
+}
+
+/// Without the `test-seams` feature no fault is ever injected.
+#[cfg(not(feature = "test-seams"))]
+pub(super) fn fault_seam(_point: &str) -> bool {
+    false
+}
 
 /// Projects detected at the worktree root in registration order, those with a root manifest
 /// first: a language present only by its files never shadows one the root declares.

@@ -433,6 +433,9 @@ impl Worker<'_> {
                 FailureCode::ProviderUnavailable
             })?;
         let mut backend = self.providers.take_backend(index)?;
+        if super::fault_seam("ensure") {
+            panic!("agent-ide test seam: deliberate provider ensure panic");
+        }
         let ensured = backend.ensure_live(self, job, &launch, source).await;
         self.providers.put_backend(index, backend);
         job.session_binding = None;
