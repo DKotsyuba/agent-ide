@@ -2109,6 +2109,12 @@ pub type ReestablishFn =
 /// when a root-less start returns to the host's own project directory; it canonicalizes and admits
 /// the target itself and attaches through the same path a fresh session in that directory would
 /// take.
+///
+/// The second argument says whether the session has other actors than this call's own — every
+/// remembered actor the refusal did not identify as the caller, or, for a caller no tag
+/// identified, the single remembered activation of an older daemon. A target in another
+/// repository is then refused with [`RerootOutcome::OtherRepository`] instead of moving the whole
+/// session away from those actors.
 pub type RerootFn = Arc<
     dyn Fn(Option<String>, bool) -> Pin<Box<dyn Future<Output = RerootOutcome> + Send>>
         + Send
@@ -2685,7 +2691,8 @@ impl StdioFacade {
             // Other actors of this session (every remembered actor except this call's own, when
             // the refusal identified it) work in the bound repository: a move to another
             // repository would strand them.
-            let others = !reconnect.remembered_tags(tag.as_deref()).is_empty();
+            let others = !reconnect.remembered_tags(tag.as_deref()).is_empty()
+                || (tag.is_none() && reconnect.last_activation.lock().await.is_some());
             match reroot(target.clone(), others).await {
                 RerootOutcome::Attached(new_runtime, new_attachment, candidate) => {
                     reconnect
@@ -5430,6 +5437,67 @@ mod managed_claude_front_tests {
             peer
         );
         assert!(text.contains("host_binding"), "{text}");
+    }
+
+    /// F-02: against an older daemon that identifies no actor, the single remembered activation
+    /// counts as another actor for an unidentified cross-repository start, which is refused by
+    /// name; a front with no remembered activation still lets the start re-root.
+    #[tokio::test]
+    async fn legacy_remembered_activation_blocks_an_unidentified_cross_repository_start() {
+        for remembered in [true, false] {
+            let daemon = ScriptedDaemon::new("agent-ide.sock");
+            let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = Arc::clone(&asked);
+            let front = StdioFacade::with_reestablishing_claude_attachment(
+                daemon.runtime.clone(),
+                "old".into(),
+                PathBuf::from("/repo"),
+                Arc::new(|| Box::pin(async { None })),
+                Arc::new(move |_, others| {
+                    seen.lock().unwrap().push(others);
+                    Box::pin(async move {
+                        if others {
+                            RerootOutcome::OtherRepository
+                        } else {
+                            RerootOutcome::Unchanged
+                        }
+                    })
+                }),
+                Arc::new(std::sync::Mutex::new(DaemonCurrencyNote::default())),
+            )
+            .unwrap();
+            if remembered {
+                let reconnect = front.reconnect.clone().unwrap();
+                *reconnect.last_activation.lock().await = Some(RememberedActivation {
+                    activation_id: "legacy".to_owned(),
+                    root: None,
+                });
+            }
+            let peer = async {
+                let (stream, start) = daemon.request().await.unwrap();
+                assert_eq!(start["dispatch_method"], "start");
+                let refusal = serde_json::to_value(PeerReply::Unavailable {
+                    reason: MissingPeer::HostBinding,
+                    cause: Some(HostBindingCause::HooksNotDelivered),
+                })
+                .unwrap();
+                answer(stream, &start, refusal).await;
+            };
+            let (text, ()) = tokio::join!(
+                claude_call(
+                    front,
+                    "ide.start",
+                    json!({"activation_id":"stranger","root":"/other"})
+                ),
+                peer
+            );
+            assert_eq!(*asked.lock().unwrap(), [remembered], "{text}");
+            assert_eq!(
+                text.contains("other_repository: bound to /repo, asked /other"),
+                remembered,
+                "{text}"
+            );
+        }
     }
 
     /// A tagged start discards the anonymous 0.10.2 slot and its pending eager recovery.
