@@ -226,9 +226,7 @@ error: {{ code }} (stop:authority); this stop conflicts with the recorded activa
 {%- elif code == "workspace_authority" -%}
 error: workspace_authority{% if resolution_detail %} ({{ resolution_detail }}){% else %} (inspect:authority_stale){% endif %}; this result belongs to an older IDE activation. Call ide.start, then repeat with fresh references
 {%- elif code == "capacity" -%}
-{%- if resolution_detail == "registered_path_limit" -%}
-error: capacity (registered_path_limit); this session already keeps 256 source files registered for refresh and none was idle long enough to retire, so this read was not recorded. Wait a few minutes and repeat it, or call ide.stop and ide.start to release them
-{%- elif resolution_detail[:17] == "diff:single_line:" -%}
+{%- if resolution_detail[:17] == "diff:single_line:" -%}
 error: capacity (diff:single_line); one diff line exceeds the reply envelope; {{ resolution_message }}
 {%- elif resolution_detail == "diff:reply_inventory" -%}
 error: capacity (diff:reply_inventory); the path inventory exceeds the reply envelope; narrow ide.diff with paths

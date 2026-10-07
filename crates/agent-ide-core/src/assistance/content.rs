@@ -1472,11 +1472,6 @@ mod tests {
             ),
             (
                 FailureCode::Capacity,
-                "registered_path_limit",
-                "error: capacity (registered_path_limit); this session already keeps 256 source files registered for refresh and none was idle long enough to retire, so this read was not recorded. Wait a few minutes and repeat it, or call ide.stop and ide.start to release them",
-            ),
-            (
-                FailureCode::Capacity,
                 "stop:busy",
                 "error: capacity (stop:busy); the IDE's state store stayed busy, so this stop is not recorded yet and its grant is still held. The IDE keeps retrying it itself; nothing more is needed",
             ),

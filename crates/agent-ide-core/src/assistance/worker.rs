@@ -1345,7 +1345,6 @@ impl WorkerHandle {
                 revoke_retry_rounds: 0,
                 next_revoke_retry: None,
                 registered: BTreeMap::new(),
-                refusal_detail: None,
                 baselines: BTreeMap::new(),
                 heads: BTreeMap::new(),
                 source_sequence: 0,
@@ -2119,9 +2118,6 @@ struct Worker<'a> {
     next_revoke_retry: Option<tokio::time::Instant>,
     /// Only explicitly requested paths are polled; no directory scanning is performed.
     registered: BTreeMap<BindingRef, RegisteredPaths>,
-    /// Closed `detail` of the last refusal a job path decided without a job at hand (the
-    /// registered-path budget); taken by the failing job to name its cause.
-    refusal_detail: Option<&'static str>,
     /// Durable partial activation baselines retained for same-binding diff provenance.
     baselines: BTreeMap<BindingRef, crate::workspace::git::BaselineContext>,
     /// Per binding: when `HEAD` was last probed, successfully or not, and the checked-out branch or
@@ -2800,9 +2796,6 @@ impl<'a> Worker<'a> {
             Err(code) => {
                 // Every terminal failure names its stage: the failing path's own tag when it set
                 // one, else the derived `<tool>:<reason>` default — never a bare reason.
-                if job.failure_detail.is_none() {
-                    job.failure_detail = self.refusal_detail.take().map(str::to_owned);
-                }
                 if job.failure_detail.is_none() {
                     job.failure_detail =
                         Some(crate::telemetry::adapters::default_stage(job.tool, &code));
@@ -3707,9 +3700,9 @@ impl<'a> Worker<'a> {
             store::{ObservationAdmission, ObservationDraft},
         };
         let authority = self.authority(binding).await?;
-        // The registered-path budget is checked before anything is read or recorded, so a refused
-        // read leaves no observation behind.
-        self.admit_registered_path(binding, &path)?;
+        // A new path takes a registered-path slot first, evicting the least recently used path
+        // when the budget is full; a read is never refused for it.
+        self.admit_registered_path(binding, &path);
         // The source read ceiling is the v0.1 reader's own bound, not the launcher's discovery and
         // check-process output budget: `limits.output_bytes` sizes bounded command captures and is
         // far smaller than a source file may legitimately be.
@@ -3793,28 +3786,19 @@ impl<'a> Worker<'a> {
         Ok((observed, bytes))
     }
 
-    /// Admits `path` into the binding's registered-path working set, retiring paths unused for
-    /// [`REGISTERED_PATH_IDLE`] when the set is at its [`MAX_REGISTERED_PATHS`] budget.
+    /// Admits `path` into the binding's registered-path working set, evicting the least recently
+    /// used path when the set is at its [`MAX_REGISTERED_PATHS`] budget (F-25).
     ///
     /// The budget is the registered paths' own: it neither shares nor shrinks with the retained
     /// results limit, and evicting results does not touch it. A path already registered is always
-    /// admitted. When every registered path was used recently the read is refused as `capacity`
-    /// with the distinct `registered_path_limit` detail, before any observation is recorded.
-    fn admit_registered_path(
-        &mut self,
-        binding: &BindingRef,
-        path: &std::path::Path,
-    ) -> Result<(), FailureCode> {
+    /// admitted, and a new path always is: the evicted path only stops being refreshed on native
+    /// hints, so a later edit relying on it meets the ordinary stale-source answer and the agent
+    /// re-reads it. Nothing here refuses or blocks a read.
+    fn admit_registered_path(&mut self, binding: &BindingRef, path: &std::path::Path) {
         let paths = self.registered.entry(binding.clone()).or_default();
-        if paths.contains(path) || paths.len() < MAX_REGISTERED_PATHS {
-            return Ok(());
+        if !paths.contains(path) && paths.len() >= MAX_REGISTERED_PATHS {
+            paths.evict_least_recently_used();
         }
-        paths.retire_idle(tokio::time::Instant::now());
-        if paths.len() < MAX_REGISTERED_PATHS {
-            return Ok(());
-        }
-        self.refusal_detail = Some("registered_path_limit");
-        Err(FailureCode::Capacity)
     }
 
     /// Reconciles native-hinted registered paths only when a new MCP call supplies current sandbox state.
@@ -6004,15 +5988,13 @@ fn validate_environment(
 /// Most distinct source paths one binding keeps registered for refresh at once (F-25): the
 /// registered-path working set's own budget, apart from the retained results limit.
 const MAX_REGISTERED_PATHS: usize = 256;
-/// A registered path unused for this long is retired when the working set is full.
-const REGISTERED_PATH_IDLE: Duration = Duration::from_secs(15 * 60);
 
 /// One binding's registered source paths with the moment each was last read.
 ///
 /// Registration makes a path part of the native-hint refresh set; reading a path again counts as
-/// a use. When the set is full, [`Self::retire_idle`] drops the paths nobody used for
-/// [`REGISTERED_PATH_IDLE`], so a long session's working set follows what it reads instead of
-/// growing for its whole life.
+/// a use. When the set is full, [`Self::evict_least_recently_used`] drops the path nobody read for
+/// longest, so a long session's working set follows what it reads instead of growing for its
+/// whole life.
 #[derive(Clone, Debug, Default)]
 struct RegisteredPaths(BTreeMap<std::path::PathBuf, tokio::time::Instant>);
 
@@ -6048,10 +6030,16 @@ impl RegisteredPaths {
         self.0.keys().cloned().collect()
     }
 
-    /// Retires every path last used at least [`REGISTERED_PATH_IDLE`] before `now`.
-    fn retire_idle(&mut self, now: tokio::time::Instant) {
-        self.0
-            .retain(|_, used| now.saturating_duration_since(*used) < REGISTERED_PATH_IDLE);
+    /// Drops the registered path whose last use is oldest.
+    fn evict_least_recently_used(&mut self) {
+        if let Some(oldest) = self
+            .0
+            .iter()
+            .min_by_key(|(_, used)| **used)
+            .map(|(path, _)| path.clone())
+        {
+            self.0.remove(&oldest);
+        }
     }
 }
 
@@ -7604,7 +7592,6 @@ mod stop_retry_tests {
             revoke_retry_rounds: 0,
             next_revoke_retry: None,
             registered: BTreeMap::new(),
-            refusal_detail: None,
             baselines: BTreeMap::new(),
             heads: BTreeMap::new(),
             source_sequence: 0,
@@ -8250,72 +8237,48 @@ mod stop_retry_tests {
         );
     }
 
-    /// F-25: the registered-path budget is its own: filling it refuses a new path with the
-    /// distinct `registered_path_limit` detail before anything is recorded, a path already
-    /// registered is still admitted, and paths idle for fifteen minutes are retired to make room.
+    /// F-25: the registered-path budget is its own and never refuses: filling it evicts the least
+    /// recently used path to admit a new one, a path already registered is admitted without
+    /// evicting anything, and nothing the retained-results limit does touches it.
     #[tokio::test]
-    async fn registered_paths_have_their_own_budget_and_retire_idle_paths() {
+    async fn registered_paths_have_their_own_budget_and_evict_the_least_recently_used() {
         let fixture = Fixture::new();
         let store = fixture.store();
         let workspace = DurableWorkspace::open(&store).await.unwrap();
         let mut worker = worker(&store, workspace, fixture.root.clone());
-        worker.observations.install_schema().await.unwrap();
         let (binding, _) = production_start(&mut worker, "actor-1", "call-1").await;
-        std::fs::write(fixture.root.join("fresh.txt"), "fresh\n").unwrap();
-        std::fs::write(fixture.root.join("known.txt"), "known\n").unwrap();
-        let now = tokio::time::Instant::now();
+        let base = tokio::time::Instant::now();
         let paths = worker.registered.entry(binding.clone()).or_default();
-        for index in 0..MAX_REGISTERED_PATHS - 1 {
-            paths.insert_used_at(std::path::PathBuf::from(format!("used-{index}.txt")), now);
+        for index in 0..MAX_REGISTERED_PATHS {
+            paths.insert_used_at(
+                std::path::PathBuf::from(format!("used-{index}.txt")),
+                base + Duration::from_millis(index as u64),
+            );
         }
-        paths.insert_used_at(std::path::PathBuf::from("known.txt"), now);
-        let sequence = worker.source_sequence;
+        assert_eq!(paths.len(), MAX_REGISTERED_PATHS);
 
-        // At the budget with every path recently used: a new path is refused with its own
-        // detail, and nothing was recorded for it.
-        let refused = worker
-            .observe(&binding, std::path::PathBuf::from("fresh.txt"))
-            .await;
-        assert!(matches!(refused, Err(FailureCode::Capacity)));
-        assert_eq!(worker.refusal_detail.take(), Some("registered_path_limit"));
-        assert_eq!(
-            worker.source_sequence, sequence,
-            "a refused read records nothing"
-        );
+        // A path that is already registered is admitted without evicting anything.
+        worker.admit_registered_path(&binding, std::path::Path::new("used-7.txt"));
         assert_eq!(worker.registered[&binding].len(), MAX_REGISTERED_PATHS);
+        assert!(worker.registered[&binding].contains(std::path::Path::new("used-0.txt")));
 
-        // A path that is already registered is never refused.
+        // A new path is admitted at the full budget: the oldest path makes room, no refusal.
+        worker.admit_registered_path(&binding, std::path::Path::new("new.txt"));
+        let kept = worker.registered[&binding].paths();
         assert!(
-            worker
-                .admit_registered_path(&binding, std::path::Path::new("known.txt"))
-                .is_ok()
+            !kept.contains(&std::path::PathBuf::from("used-0.txt")),
+            "{kept:?}"
         );
-
-        // Fifteen idle minutes later the unused paths retire and the new path is admitted.
-        let idle = now
-            .checked_sub(REGISTERED_PATH_IDLE + Duration::from_secs(1))
-            .unwrap();
-        for index in 0..MAX_REGISTERED_PATHS - 1 {
-            worker
-                .registered
-                .get_mut(&binding)
-                .unwrap()
-                .insert_used_at(std::path::PathBuf::from(format!("used-{index}.txt")), idle);
-        }
-        assert!(
-            worker
-                .admit_registered_path(&binding, std::path::Path::new("fresh.txt"))
-                .is_ok()
-        );
+        assert!(kept.contains(&std::path::PathBuf::from("used-1.txt")));
         assert_eq!(
-            worker.registered[&binding].paths(),
-            [std::path::PathBuf::from("known.txt")],
-            "only the idle paths were retired; the one used recently stays"
+            kept.len(),
+            MAX_REGISTERED_PATHS - 1,
+            "the freed slot awaits the new path"
         );
     }
 
     /// F-25: a native-hint refresh re-reads every registered path but keeps each path's real age,
-    /// so a path nobody asks for still retires at a full budget however often hooks fire.
+    /// so a path nobody asks for is still the first to make room however often hooks fire.
     #[tokio::test]
     async fn maintenance_refresh_does_not_keep_unused_registered_paths_alive() {
         let fixture = Fixture::new();
@@ -8326,19 +8289,19 @@ mod stop_retry_tests {
         let (binding, _) = production_start(&mut worker, "actor-1", "call-1").await;
         std::fs::write(fixture.root.join("stale.txt"), "stale\n").unwrap();
         std::fs::write(fixture.root.join("asked.txt"), "asked\n").unwrap();
-        let now = tokio::time::Instant::now();
-        let idle = now
-            .checked_sub(REGISTERED_PATH_IDLE + Duration::from_secs(1))
-            .unwrap();
+        let base = tokio::time::Instant::now();
         let paths = worker.registered.entry(binding.clone()).or_default();
-        paths.insert_used_at(std::path::PathBuf::from("stale.txt"), idle);
-        paths.insert_used_at(std::path::PathBuf::from("asked.txt"), idle);
+        paths.insert_used_at(std::path::PathBuf::from("stale.txt"), base);
+        paths.insert_used_at(std::path::PathBuf::from("asked.txt"), base);
         for index in 0..MAX_REGISTERED_PATHS - 2 {
-            paths.insert_used_at(std::path::PathBuf::from(format!("used-{index}.txt")), now);
+            paths.insert_used_at(
+                std::path::PathBuf::from(format!("used-{index}.txt")),
+                base + Duration::from_secs(1),
+            );
         }
         assert_eq!(paths.len(), MAX_REGISTERED_PATHS);
 
-        // The hook-driven refresh re-reads the stale path; it stays idle.
+        // The hook-driven refresh re-reads the stale path; its age is unchanged.
         worker
             .observe_as(&binding, std::path::PathBuf::from("stale.txt"), false)
             .await
@@ -8349,19 +8312,112 @@ mod stop_retry_tests {
             .await
             .expect("the requested read succeeds");
 
-        // At the full budget the idle stale path retires to admit a new one; the asked one stays.
-        assert!(
-            worker
-                .admit_registered_path(&binding, std::path::Path::new("new.txt"))
-                .is_ok()
-        );
+        // At the full budget the stale path is the oldest and makes room; the asked one stays.
+        worker.admit_registered_path(&binding, std::path::Path::new("new.txt"));
         let kept = worker.registered[&binding].paths();
         assert!(
             !kept.contains(&std::path::PathBuf::from("stale.txt")),
             "{kept:?}"
         );
         assert!(kept.contains(&std::path::PathBuf::from("asked.txt")));
-        assert_eq!(kept.len(), MAX_REGISTERED_PATHS - 1);
+        assert_eq!(
+            kept.len(),
+            MAX_REGISTERED_PATHS - 1,
+            "the freed slot awaits the new path"
+        );
+    }
+
+    /// F-25: with the budget full, a read of a new path is admitted (no refusal) and an edit that
+    /// relies on the evicted oldest path gets the ordinary stale-source answer, asking for a
+    /// re-read — never a hard refusal of work.
+    #[tokio::test]
+    async fn eviction_never_refuses_work_and_an_edit_on_the_evicted_path_asks_for_a_reread() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("fmt.toml"), "gamma formatter marker\n").unwrap();
+        let source = "sym card\nsym btn\nmark\nend\nend\n";
+        std::fs::write(fixture.root.join("a.gamma"), source).unwrap();
+        std::fs::write(fixture.root.join("b.gamma"), source).unwrap();
+        git_commit(&fixture.root, "eviction fixture");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        worker.edits.install_schema().await.unwrap();
+        let (binding, _authority) =
+            activate_worktree(&mut worker, "line-actor", "line-start").await;
+
+        // The agent reads a.gamma first: it is the oldest registered path.
+        read_and_retain(
+            &mut worker,
+            &fixture.root,
+            "line-actor",
+            &binding,
+            "line-read",
+            serde_json::json!({"path":"a.gamma","lines":"2-3"}),
+        )
+        .await;
+        let base = tokio::time::Instant::now() + Duration::from_secs(60);
+        let paths = worker.registered.get_mut(&binding).unwrap();
+        for index in 0..MAX_REGISTERED_PATHS - 1 {
+            paths.insert_used_at(
+                std::path::PathBuf::from(format!("filler-{index}.txt")),
+                base,
+            );
+        }
+        assert_eq!(paths.len(), MAX_REGISTERED_PATHS);
+
+        // The 257th path is admitted: the read succeeds and a.gamma, the oldest, is evicted.
+        read_and_retain(
+            &mut worker,
+            &fixture.root,
+            "line-actor",
+            &binding,
+            "other-read",
+            serde_json::json!({"path":"b.gamma","lines":"1-2"}),
+        )
+        .await;
+        let kept = worker.registered[&binding].paths();
+        assert!(kept.contains(&std::path::PathBuf::from("b.gamma")));
+        assert!(
+            !kept.contains(&std::path::PathBuf::from("a.gamma")),
+            "{kept:?}"
+        );
+        assert_eq!(kept.len(), MAX_REGISTERED_PATHS);
+
+        // a.gamma is no longer refreshed; it changes on disk, and an edit built on the old read
+        // is answered `stale_source`, asking the agent to read again.
+        std::fs::write(
+            fixture.root.join("a.gamma"),
+            "sym card\nsym btn\nmark\nx\nend\nend\n",
+        )
+        .unwrap();
+        let reply = run_edit(
+            &mut worker,
+            &fixture.root,
+            "after-eviction",
+            serde_json::json!({
+                "operation_id":"after-eviction-op",
+                "path":"a.gamma",
+                "lines":"2-3",
+                "source_ref":"line-read",
+                "content":"sym btn\nmark,x\n"
+            }),
+        )
+        .await;
+        assert!(
+            matches!(
+                &reply,
+                PeerReply::Edit {
+                    result: EditResult {
+                        outcome: ChangesEditOutcome::StaleSource,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
     }
 
     /// F-12: the daemon retries a transiently busy stop itself, by its operation id, so the agent
