@@ -34,7 +34,8 @@ use self::transport::{
 };
 
 const SOCKET_NAME: &str = "agent-ide.sock";
-const LOCK_NAME: &str = "agent-ide.lock";
+/// File name of the exclusive lock a daemon holds in its runtime directory for its whole life.
+pub(crate) const LOCK_NAME: &str = "agent-ide.lock";
 const WIRE_VERSION: u8 = 1;
 const MAX_REQUEST_ID_BYTES: usize = 128;
 const MAX_V1_FRAME_BYTES: usize = 64 * 1024;

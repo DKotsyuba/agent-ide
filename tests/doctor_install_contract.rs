@@ -501,7 +501,7 @@ fn live_daemons_are_listed_with_versions_and_outdated_ones_flagged() {
 /// open permissions — is neither counted nor touched.
 #[test]
 fn doctor_prunes_only_the_products_own_abandoned_runtimes() {
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let layout = Layout::new("prune");
     let tmp = layout.root.join("tmp");
     fs::create_dir_all(&tmp).unwrap();
@@ -509,7 +509,13 @@ fn doctor_prunes_only_the_products_own_abandoned_runtimes() {
     let make = |name: &str, mode: u32, old: bool| -> PathBuf {
         let path = tmp.join(name);
         fs::DirBuilder::new().mode(mode).create(&path).unwrap();
-        fs::write(path.join("agent-ide.lock"), b"").unwrap();
+        // A daemon's lock file is a private regular file.
+        fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path.join("agent-ide.lock"))
+            .unwrap();
         if old {
             fs::File::open(&path)
                 .unwrap()
@@ -574,5 +580,80 @@ fn doctor_prunes_only_the_products_own_abandoned_runtimes() {
             .all(|finding| finding["code"] != "stale_runtime"),
         "nothing foreign is counted as a stale runtime: {report}"
     );
+    let _ = fs::remove_dir_all(&layout.root);
+}
+
+/// F-16: a runtime whose lock is held (a daemon still starting, before its socket exists) or whose
+/// lock file is unsafe is never removed, however old; an unlocked one still is.
+#[test]
+fn doctor_keeps_runtimes_with_a_held_or_unsafe_lock() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, symlink};
+    let layout = Layout::new("lock");
+    let tmp = layout.root.join("tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    let two_days = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 3600);
+    let make = |name: &str| -> PathBuf {
+        let path = tmp.join(name);
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        path
+    };
+    let age = |path: &PathBuf| {
+        fs::File::open(path)
+            .unwrap()
+            .set_modified(two_days)
+            .unwrap()
+    };
+    let lock_file = |dir: &PathBuf| {
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(dir.join("agent-ide.lock"))
+            .unwrap()
+    };
+    // Held: a lock the test keeps exclusive for the whole doctor run, with no socket at all.
+    let held = make("ai-1111111111111111");
+    let held_lock = lock_file(&held);
+    // SAFETY: `flock` only locks the descriptor this test owns.
+    assert_eq!(
+        unsafe { libc::flock(held_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    age(&held);
+    // Unsafe: the lock path is a symlink, not a private regular file.
+    let unsafe_lock = make("ai-2222222222222222");
+    symlink(
+        layout.root.join("elsewhere"),
+        unsafe_lock.join("agent-ide.lock"),
+    )
+    .unwrap();
+    age(&unsafe_lock);
+    // Free: an old runtime whose lock nobody holds is abandoned.
+    let free = make("ai-3333333333333333");
+    drop(lock_file(&free));
+    age(&free);
+    let output = agent_ide()
+        .arg("doctor")
+        .env(HOME_OVERRIDE_ENV, &layout.root)
+        .env("TMPDIR", &tmp)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(held.exists(), "a runtime with a held lock was removed");
+    assert!(
+        unsafe_lock.exists(),
+        "a runtime with an unsafe lock was removed"
+    );
+    assert!(
+        !free.exists(),
+        "an abandoned runtime with a free lock stays"
+    );
+    drop(held_lock);
     let _ = fs::remove_dir_all(&layout.root);
 }

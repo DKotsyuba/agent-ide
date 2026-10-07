@@ -10,7 +10,8 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -499,6 +500,78 @@ fn is_product_runtime_name(name: &str) -> bool {
         })
 }
 
+/// What retiring one runtime directory judged abandoned did.
+enum Retired {
+    /// The directory was removed.
+    Removed,
+    /// The directory was left alone: its runtime lock is held or unsafe, or it changed since it
+    /// was judged abandoned.
+    Kept,
+    /// Removal was attempted and failed.
+    Failed,
+}
+
+/// Removes the runtime directory `path`, judged abandoned as `judged`, only while holding its
+/// exclusive runtime lock and only if it is still that same old directory.
+///
+/// A daemon holds `agent-ide.lock` for its whole life, including startup before its socket
+/// exists, so "no listener" alone does not prove abandonment: a held lock, or a lock file that is
+/// not a private regular file of this user, keeps the directory. With the lock held no daemon can
+/// start in the directory, and its device, inode, owner, mode and age are checked again before
+/// the removal, so a directory another front replaced meanwhile is never removed.
+fn retire_abandoned_runtime(path: &Path, judged: &fs::Metadata) -> Retired {
+    let lock_path = path.join(crate::app::LOCK_NAME);
+    let lock = match fs::symlink_metadata(&lock_path) {
+        Ok(lock) => {
+            if !lock.is_file()
+                || lock.uid() != unsafe { libc::geteuid() }
+                || lock.mode() & 0o077 != 0
+            {
+                return Retired::Kept;
+            }
+            match fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&lock_path)
+            {
+                Ok(file) => Some(file),
+                Err(_) => return Retired::Kept,
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Retired::Kept,
+    };
+    if let Some(file) = &lock {
+        // SAFETY: `flock` only locks the descriptor this function owns.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Retired::Kept;
+        }
+    }
+    let Ok(now) = fs::symlink_metadata(path) else {
+        return Retired::Kept;
+    };
+    let unchanged = now.is_dir()
+        && now.dev() == judged.dev()
+        && now.ino() == judged.ino()
+        && now.uid() == judged.uid()
+        && now.mode() == judged.mode()
+        && now
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > STALE_RUNTIME_AGE);
+    if !unchanged {
+        return Retired::Kept;
+    }
+    // The lock stays held (the descriptor lives to the end of this function) while the tree goes.
+    if fs::remove_dir_all(path).is_ok() {
+        Retired::Removed
+    } else {
+        Retired::Failed
+    }
+}
+
 /// Lists this user's live daemons below the temp root with their versions, flags outdated ones
 /// (0.6.7), and retires the product's own abandoned runtime directories; never names their paths.
 ///
@@ -508,9 +581,10 @@ fn is_product_runtime_name(name: &str) -> bool {
 ///
 /// Only a directory named exactly like a product runtime ([`is_product_runtime_name`]), owned by
 /// this user and private (no group or other access) is a candidate. A candidate older than a day
-/// whose sockets answer nobody (no daemon, so no lease either) is abandoned: it is removed and
-/// counted as pruned, or counted as stale when removal fails. A younger or answering candidate is
-/// never touched.
+/// whose sockets answer nobody and whose runtime lock nobody holds ([`retire_abandoned_runtime`]) is
+/// abandoned: it is removed and counted as pruned, or counted as stale when removal fails. A
+/// younger or answering candidate, or one whose lock is held (a daemon still starting), is never
+/// touched.
 ///
 /// The shared repository daemons a managed Claude session rendezvouses with live in
 /// `/private/tmp` under the `ai-r-` prefix rather than below the temp root, so those entries
@@ -542,7 +616,7 @@ async fn check_running_daemons(findings: &mut Vec<Finding>) {
                 && metadata.is_dir()
                 && metadata.mode() & 0o077 == 0;
             if owned {
-                candidates.push(entry.path());
+                candidates.push((entry.path(), metadata));
             }
         }
     }
@@ -550,18 +624,18 @@ async fn check_running_daemons(findings: &mut Vec<Finding>) {
     let mut outdated = 0usize;
     let mut stale = 0usize;
     let mut pruned = 0usize;
-    for path in candidates {
-        let stale_age = fs::symlink_metadata(&path)
+    for (path, judged) in candidates {
+        let stale_age = judged
+            .modified()
             .ok()
-            .and_then(|metadata| metadata.modified().ok())
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|age| age > STALE_RUNTIME_AGE);
         if !has_live_listener(&path).await {
             if stale_age {
-                if fs::remove_dir_all(&path).is_ok() {
-                    pruned += 1;
-                } else {
-                    stale += 1;
+                match retire_abandoned_runtime(&path, &judged) {
+                    Retired::Removed => pruned += 1,
+                    Retired::Failed => stale += 1,
+                    Retired::Kept => {}
                 }
             }
             continue;
