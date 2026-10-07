@@ -2368,6 +2368,211 @@ async fn configured_daemon_opens_workspace_once_after_exclusive_lock() {
     std::fs::remove_file(config).unwrap();
 }
 
+/// A live process identified by PID and kernel start time (F-11).
+///
+/// PIDs are reused after a process exits; a PID together with its start time is not. Every
+/// signal this file sends to a process it does not hold a `Child` handle for goes through an
+/// identity captured while the process was provably a child of a daemon this test spawned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessIdentity {
+    /// Process id at capture time.
+    pid: libc::pid_t,
+    /// Kernel start time of that process: seconds and microseconds.
+    started: (u64, u64),
+}
+
+impl ProcessIdentity {
+    /// Returns the identity of `pid` and its parent PID, or `None` when it is gone or a zombie.
+    fn of(pid: libc::pid_t) -> Option<(Self, libc::pid_t)> {
+        // SAFETY: an all-zero `proc_bsdinfo` is a valid plain-data value for the kernel to fill.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: `info` is writable for `size` bytes; the call only reads kernel process data.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        (written == size && info.pbi_status != libc::SZOMB).then_some((
+            Self {
+                pid,
+                started: (info.pbi_start_tvsec, info.pbi_start_tvusec),
+            },
+            info.pbi_ppid as libc::pid_t,
+        ))
+    }
+
+    /// Reports whether this exact process (not a later holder of its PID) is still running.
+    fn alive(self) -> bool {
+        Self::of(self.pid).is_some_and(|(now, _)| now == self)
+    }
+
+    /// Lists the live direct children of `parent`; only call it while `parent` is a process this
+    /// test holds an unreaped `Child` handle for, so its PID cannot belong to anyone else.
+    fn children_of(parent: libc::pid_t) -> Vec<Self> {
+        let mut pids = vec![0 as libc::pid_t; 1024];
+        let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+        // SAFETY: `pids` is writable for `bytes` bytes and the call only lists kernel PIDs.
+        let listed = unsafe { libc::proc_listchildpids(parent, pids.as_mut_ptr().cast(), bytes) };
+        pids.into_iter()
+            .take(usize::try_from(listed).unwrap_or(0))
+            .filter(|pid| *pid > 0)
+            .filter_map(Self::of)
+            .filter(|(_, ppid)| *ppid == parent)
+            .map(|(identity, _)| identity)
+            .collect()
+    }
+
+    /// Terminates the still-running `owned` processes: `SIGTERM`, then `SIGKILL` after five
+    /// seconds, and returns once none of them is running.
+    ///
+    /// A process that leads its own group (a daemon-spawned provider) is signalled as a group so
+    /// its helpers die with it; any other process is signalled alone, never through a group it
+    /// merely belongs to.
+    fn terminate(owned: &[Self]) {
+        for signal in [libc::SIGTERM, libc::SIGKILL] {
+            let live: Vec<_> = owned.iter().copied().filter(|id| id.alive()).collect();
+            if live.is_empty() {
+                return;
+            }
+            for id in live {
+                // SAFETY: `id` was verified a moment ago to be the exact process that was
+                // captured as a child of this test's daemon; a group is addressed only when
+                // that process leads it.
+                unsafe {
+                    let leads = libc::getpgid(id.pid) == id.pid;
+                    libc::kill(if leads { -id.pid } else { id.pid }, signal);
+                }
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline && owned.iter().any(|id| id.alive()) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+/// A configured product daemon whose provider process groups die with its owner (F-11).
+///
+/// The daemon places each provider in its own process group, so killing the daemon handle
+/// (`SIGKILL`, what `kill_on_drop` and `Child::kill` do) orphans them. This wrapper snapshots the
+/// daemon's direct children while it is provably theirs, stops the daemon through its orderly
+/// `SIGTERM` path (which reaps its own groups), falls back to `SIGKILL` only after ten seconds,
+/// and then terminates any snapshotted child that survived. It does so on success, on panic
+/// unwinding and when a timeout drops the test future, before the fixture deletes its tree.
+/// It dereferences to the tokio [`Child`], so tests use it exactly like the plain handle.
+struct OwnedDaemon {
+    /// The daemon process; its unreaped handle is what proves its PID is ours.
+    child: Child,
+    /// Children of the daemon captured while it was alive, with their start times.
+    owned: Vec<ProcessIdentity>,
+}
+
+impl OwnedDaemon {
+    /// Takes ownership of a freshly spawned daemon.
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            owned: Vec::new(),
+        }
+    }
+
+    /// Adds the daemon's current direct children to the owned set while it is still unreaped.
+    fn adopt_children(&mut self) {
+        if let Some(pid) = self.child.id() {
+            for child in ProcessIdentity::children_of(pid as libc::pid_t) {
+                if !self.owned.contains(&child) {
+                    self.owned.push(child);
+                }
+            }
+        }
+    }
+
+    /// Kills the daemon like [`Child::kill`] after snapshotting the children it would orphan.
+    async fn kill(&mut self) -> std::io::Result<()> {
+        self.adopt_children();
+        self.child.kill().await
+    }
+
+    /// Waits for the daemon like [`Child::wait_with_output`], then terminates any child it orphaned.
+    async fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
+        self.adopt_children();
+        self.child.stdin.take();
+        let mut stdout = self.child.stdout.take();
+        let mut stderr = self.child.stderr.take();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let read_out = async {
+            match stdout.as_mut() {
+                Some(stream) => stream.read_to_end(&mut out).await,
+                None => Ok(0),
+            }
+        };
+        let read_err = async {
+            match stderr.as_mut() {
+                Some(stream) => stream.read_to_end(&mut err).await,
+                None => Ok(0),
+            }
+        };
+        let (read_out, read_err, status) = tokio::join!(read_out, read_err, self.child.wait());
+        read_out?;
+        read_err?;
+        Ok(std::process::Output {
+            status: status?,
+            stdout: out,
+            stderr: err,
+        })
+    }
+
+    /// Waits up to `limit` for the daemon to exit, reaping it; returns whether it did.
+    fn wait_for_exit(&mut self, limit: Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl std::ops::Deref for OwnedDaemon {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for OwnedDaemon {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+
+impl Drop for OwnedDaemon {
+    /// Stops the daemon orderly, then terminates and reaps every provider group it owned.
+    fn drop(&mut self) {
+        self.adopt_children();
+        if let Some(pid) = self.child.id() {
+            // SAFETY: the unreaped `Child` handle proves `pid` is this test's own daemon.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+            if !self.wait_for_exit(Duration::from_secs(10)) {
+                self.adopt_children();
+                ProcessIdentity::terminate(&self.owned);
+                let _ = self.child.start_kill();
+                self.wait_for_exit(Duration::from_secs(5));
+            }
+        }
+        ProcessIdentity::terminate(&self.owned);
+    }
+}
+
 /// Owns a configured product daemon's private Git worktree and admitted temporary root.
 struct ProductFixture {
     /// Unique private parent removed only after this fixture's daemon has exited.
@@ -2384,8 +2589,17 @@ struct ProductFixture {
     /// survive a restart is selected through the absolute `AGENT_IDE_TELEMETRY_DATABASE` override,
     /// exactly as the managed launcher does.
     telemetry: PathBuf,
+    /// Gate files that hold provider wrappers; teardown writes each so no waiter outlives the tree.
+    gates: std::sync::Mutex<Vec<PathBuf>>,
 }
 impl ProductFixture {
+    /// Registers a gate file that holds a provider wrapper; teardown writes it to release waiters.
+    fn guard_gate(&self, gate: &Path) {
+        self.gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(gate.to_path_buf());
+    }
     /// Creates the private admitted layout every fixture kind shares, before any project files.
     fn skeleton() -> Self {
         let base = std::fs::canonicalize(std::env::temp_dir())
@@ -2407,6 +2621,7 @@ impl ProductFixture {
             runtime: base.join("ipc"),
             config: base.join("launcher.json"),
             telemetry: telemetry_dir.join("telemetry.sqlite"),
+            gates: std::sync::Mutex::new(Vec::new()),
             base,
             root,
         }
@@ -2522,12 +2737,12 @@ impl ProductFixture {
         json!({"permissionProfile":{"type":"disabled"},"codexLinuxSandboxExe":null,"sandboxCwd":self.root,"useLegacyLandlock":false})
     }
     /// Starts one configured shipping daemon and waits only for its real private endpoint.
-    async fn daemon(&self) -> Child {
+    async fn daemon(&self) -> OwnedDaemon {
         self.daemon_with_startup_timeout(Duration::from_secs(30))
             .await
     }
     /// Starts a configured daemon with a caller-selected bound for cold multi-profile startup.
-    async fn daemon_with_startup_timeout(&self, startup_timeout: Duration) -> Child {
+    async fn daemon_with_startup_timeout(&self, startup_timeout: Duration) -> OwnedDaemon {
         self.spawn_configured_daemon(None, false, startup_timeout, None)
             .await
     }
@@ -2536,7 +2751,7 @@ impl ProductFixture {
     /// An orderly daemon shutdown removes its whole runtime directory, so only the absolute
     /// `AGENT_IDE_TELEMETRY_DATABASE` override — exactly what the managed launcher selects — makes
     /// sanitized telemetry queryable and exportable after a restart.
-    async fn daemon_with_durable_telemetry(&self) -> Child {
+    async fn daemon_with_durable_telemetry(&self) -> OwnedDaemon {
         self.spawn_configured_daemon(None, true, Duration::from_secs(30), None)
             .await
     }
@@ -2544,14 +2759,14 @@ impl ProductFixture {
     /// Starts the configured daemon with a hostile substituted `HOME` (an empty `.cargo`, the
     /// shape `agent-run` runtime homes ship): the resolved user home and cargo home must stay
     /// the operator's.
-    async fn daemon_with_substituted_home(&self, home: &Path) -> Child {
+    async fn daemon_with_substituted_home(&self, home: &Path) -> OwnedDaemon {
         self.spawn_configured_daemon(None, false, Duration::from_secs(30), Some(home))
             .await
     }
     /// Starts the configured daemon, optionally with its home (`AGENT_IDE_HOME`, which the product
     /// resolves instead of `$HOME`) redirected into the fixture so its project check caches never
     /// touch the real home directory. Without one it inherits the test-wide `AGENT_IDE_HOME`.
-    async fn daemon_with_home(&self, home: Option<&Path>) -> Child {
+    async fn daemon_with_home(&self, home: Option<&Path>) -> OwnedDaemon {
         self.spawn_configured_daemon(home, false, Duration::from_secs(30), None)
             .await
     }
@@ -2567,7 +2782,7 @@ impl ProductFixture {
         durable_telemetry: bool,
         startup_timeout: Duration,
         substitute_home: Option<&Path>,
-    ) -> Child {
+    ) -> OwnedDaemon {
         let mut command = Command::new(product_binary());
         if let Some(home) = home {
             command.env(agent_ide::userhome::HOME_OVERRIDE_ENV, home);
@@ -2584,16 +2799,18 @@ impl ProductFixture {
         if durable_telemetry {
             command.env("AGENT_IDE_TELEMETRY_DATABASE", &self.telemetry);
         }
-        let mut daemon = command
-            .args(["daemon", "--runtime-dir"])
-            .arg(&self.runtime)
-            .env("AGENT_IDE_LAUNCHER_CONFIG", &self.config)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
+        let mut daemon = OwnedDaemon::new(
+            command
+                .args(["daemon", "--runtime-dir"])
+                .arg(&self.runtime)
+                .env("AGENT_IDE_LAUNCHER_CONFIG", &self.config)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap(),
+        );
         tokio::time::timeout(startup_timeout, async {
             loop {
                 if UnixStream::connect(self.runtime.join("agent-ide.sock"))
@@ -2622,8 +2839,19 @@ impl ProductFixture {
     }
 }
 impl Drop for ProductFixture {
-    /// Removes only the test-owned private tree; callers must stop/reap their daemon first.
+    /// Releases every registered gate, then removes only the test-owned private tree.
+    ///
+    /// Runs on success, on panic unwinding and when a timeout drops the test future. The daemon
+    /// handle ([`OwnedDaemon`]), declared after the fixture, has already stopped its providers.
     fn drop(&mut self) {
+        for gate in self
+            .gates
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+        {
+            let _ = std::fs::write(gate, "release\n");
+        }
         let _ = std::fs::remove_dir_all(&self.base);
     }
 }
@@ -15511,12 +15739,14 @@ async fn configured_product_cold_go_burst_preserves_admission_and_peer_view() {
     let gate = fixture.base.join("release-gopls-listener");
     let invocation_log = fixture.base.join("gopls-cold-invocations");
     let wrapper = fixture.base.join("gopls-cold-provider");
+    fixture.guard_gate(&gate);
     std::fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\nprintf '%s\\t%s\\t%s\\n' \"$$\" \"$PWD\" \"$*\" >> '{}'\ncase \"$*\" in *'-listen=unix;'*) while [ ! -f '{}' ]; do sleep 0.01; done;; esac\nexec '{}' \"$@\"\n",
+            "#!/bin/sh\nprintf '%s\\t%s\\t%s\\n' \"$$\" \"$PWD\" \"$*\" >> '{}'\ncase \"$*\" in *'-listen=unix;'*) while [ ! -f '{}' ]; do [ -d '{}' ] || exit 1; sleep 0.01; done;; esac\nexec '{}' \"$@\"\n",
             invocation_log.display(),
             gate.display(),
+            fixture.base.display(),
             gopls.replace('\'', "'\\''")
         ),
     )
@@ -15825,11 +16055,13 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
     // observe the job still queued (`Pending`) rather than racing a fast real provider.
     let gate = fixture.base.join("release-gopls-listener");
     let wrapper = fixture.base.join("gopls-gated-provider");
+    fixture.guard_gate(&gate);
     std::fs::write(
         &wrapper,
         format!(
-            "#!/bin/sh\nwhile [ ! -f '{}' ]; do sleep 0.02; done\nexec '{}' \"$@\"\n",
+            "#!/bin/sh\nwhile [ ! -f '{}' ]; do [ -d '{}' ] || exit 1; sleep 0.02; done\nexec '{}' \"$@\"\n",
             gate.display(),
+            fixture.base.display(),
             gopls.replace('\'', "'\\''")
         ),
     )
@@ -17944,9 +18176,12 @@ const CHECKS_GATE: &str = "checks-gate";
 /// window: the test releases [`release_checks_gate`] only after the activation replies have
 /// settled, so the first result provably cannot be consumed by an earlier reply carrier.
 fn hold_checks_at_gate(fixture: &ProductFixture) -> String {
+    let gate = fixture.base.join(CHECKS_GATE);
+    fixture.guard_gate(&gate);
     format!(
-        "while [ ! -f '{}' ]; do sleep 0.05; done",
-        fixture.base.join(CHECKS_GATE).display()
+        "while [ ! -f '{}' ]; do [ -d '{}' ] || exit 1; sleep 0.05; done",
+        gate.display(),
+        fixture.base.display()
     )
 }
 
@@ -20717,4 +20952,96 @@ async fn managed_codex_stop_after_daemon_restart_reports_already_stopped() {
         "{reply}"
     );
     mcp.close().await;
+}
+
+/// Starts a fake daemon holding one gate-held provider wrapper in its own process group.
+///
+/// The fake daemon is a perl process that forks a child, moves it to its own group (as the real
+/// daemon does for providers) and executes the wrapper there. The wrapper has no bound of its own
+/// — the F-11 defect: an unbounded loop on a gate file that a panicking test never writes — so
+/// only the owner can end it. Returns the owned daemon and the wrapper's identity.
+async fn spawn_daemon_with_gated_wrapper(
+    fixture: &ProductFixture,
+) -> (OwnedDaemon, ProcessIdentity) {
+    let gate = fixture.base.join("gate");
+    let log = fixture.base.join("wrapper-log");
+    let wrapper = fixture.base.join("wrapper");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\n",
+            log.display(),
+            gate.display()
+        ),
+    )
+    .unwrap();
+    fixture.guard_gate(&gate);
+    let daemon = OwnedDaemon::new(
+        Command::new("/usr/bin/perl")
+            .args([
+                "-e",
+                "my $p = fork(); if (!$p) { setpgrp(0, 0); exec '/bin/sh', $ARGV[0]; } sleep 3600;",
+            ])
+            .arg(&wrapper)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap(),
+    );
+    for _ in 0..500 {
+        if let Some(pid) = std::fs::read_to_string(&log)
+            .ok()
+            .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
+        {
+            let (identity, parent) = ProcessIdentity::of(pid).unwrap();
+            assert_eq!(parent as u32, daemon.id().unwrap());
+            return (daemon, identity);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the wrapper never recorded its PID");
+}
+
+/// Asserts that a failed fixture ended its wrapper and removed its tree; the test's own
+/// identity-checked terminate ends a survivor first, so a failing assertion never leaks the loop.
+fn assert_wrapper_reaped(wrapper: ProcessIdentity, base: &Path) {
+    let survived = wrapper.alive();
+    ProcessIdentity::terminate(&[wrapper]);
+    assert!(!survived, "the gated wrapper outlived its fixture");
+    assert!(!base.exists(), "the fixture tree must be deleted");
+}
+
+/// F-11: a fixture dropped by a panic or a timeout stops its daemon, terminates the provider
+/// groups the daemon owned and releases its gates before the tree is deleted; the deliberate
+/// failures here are the regression.
+#[tokio::test]
+async fn fixture_guard_reaps_a_gated_provider_after_a_panic_and_a_timeout() {
+    let survivor = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let seen = survivor.clone();
+    let panicked = tokio::spawn(async move {
+        let fixture = ProductFixture::skeleton();
+        let (daemon, wrapper) = spawn_daemon_with_gated_wrapper(&fixture).await;
+        *seen.lock().unwrap() = Some((wrapper, fixture.base.clone()));
+        let _owned = daemon;
+        panic!("deliberate fixture failure");
+    })
+    .await;
+    assert!(panicked.is_err_and(|error| error.is_panic()));
+    let (wrapper, base) = survivor.lock().unwrap().take().unwrap();
+    assert_wrapper_reaped(wrapper, &base);
+
+    let survivor = std::sync::Mutex::new(None);
+    let timed_out = tokio::time::timeout(Duration::from_millis(1500), async {
+        let fixture = ProductFixture::skeleton();
+        let (daemon, wrapper) = spawn_daemon_with_gated_wrapper(&fixture).await;
+        *survivor.lock().unwrap() = Some((wrapper, fixture.base.clone()));
+        let _owned = daemon;
+        std::future::pending::<()>().await;
+    })
+    .await;
+    assert!(timed_out.is_err());
+    let (wrapper, base) = survivor.lock().unwrap().take().unwrap();
+    assert_wrapper_reaped(wrapper, &base);
 }
