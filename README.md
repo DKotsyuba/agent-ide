@@ -189,7 +189,8 @@ pair, as in the shipped fragment
 [docs/examples/launcher-eyes.json](docs/examples/launcher-eyes.json). Missing fields, empty
 roots, or an undeclared language keep the feed disabled and v0.2 behaviour unchanged. Each check
 runs under `sandbox-exec` with no network, a read-only worktree, reads limited to the declared
-toolchains, and one private cache under
+toolchains (when the host already confines the daemon and refuses a nested profile, the check
+still runs, under the host's confinement only), and one private cache under
 `$HOME/.agent-ide/checks/<repository>/<worktree>/<policy digest>/<language>`; the environment is rebuilt from an
 allowlist (`CARGO_NET_OFFLINE=true`, private `CARGO_TARGET_DIR` and temp). Runs are debounced,
 bounded by `check_timeout_s`, and their process groups are killed on cancel or timeout. Unused

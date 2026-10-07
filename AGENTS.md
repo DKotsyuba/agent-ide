@@ -84,7 +84,9 @@ unit tests enforce both rules.
   keys live in `/private/tmp/ai-k-<hash>`. Ownership and staleness are checked
   before adoption and an MCP exit never stops a healthy daemon.
 - Project checks run confined (`sandbox-exec`, no network, read-only worktree,
-  allowlisted environment) and are fail-open.
+  allowlisted environment) and are fail-open. When the host already confines the
+  daemon and refuses a nested profile, the check still runs, under the host's
+  confinement only (`docs/assistance-launcher.md`).
 
 ## Invariants and delivery
 

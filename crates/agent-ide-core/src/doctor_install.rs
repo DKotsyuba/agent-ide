@@ -69,7 +69,11 @@ pub struct Report {
     pub findings: Vec<Finding>,
 }
 
-/// Runs every installation check read-only and returns the bounded report.
+/// Runs every installation check and returns the bounded report.
+///
+/// The checks only read, with one narrow mutation: a runtime directory of this product that is
+/// older than a day and has no daemon listening is removed under its own exclusive lock (the
+/// lock file of a runtime that never had one is created first); see the daemons check.
 pub async fn report() -> Report {
     let mut findings = Vec::new();
     let Some(effective) = userhome::user_home() else {
