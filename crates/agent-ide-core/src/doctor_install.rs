@@ -5,7 +5,7 @@
 //! the temporary root, and the last day's error-journal volume as bounded JSON findings. It never
 //! creates state, never starts a daemon, and only ever names paths below the effective user's own
 //! home (see [`crate::userhome`]). Its one mutation is retiring the product's own abandoned
-//! runtime directories (see [`is_product_runtime_name`]); no other temporary entry is counted,
+//! runtime directories (see `is_product_runtime_name`); no other temporary entry is counted,
 //! probed or removed.
 
 use std::collections::{BTreeMap, HashSet};
