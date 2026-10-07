@@ -2841,7 +2841,27 @@ impl ProductFixture {
         startup_timeout: Duration,
         substitute_home: Option<&Path>,
     ) -> OwnedDaemon {
+        self.spawn_configured_daemon_with_env(
+            home,
+            durable_telemetry,
+            startup_timeout,
+            substitute_home,
+            &[],
+        )
+        .await
+    }
+    /// [`Self::spawn_configured_daemon`] with extra environment variables (test seams) for the
+    /// daemon process.
+    async fn spawn_configured_daemon_with_env(
+        &self,
+        home: Option<&Path>,
+        durable_telemetry: bool,
+        startup_timeout: Duration,
+        substitute_home: Option<&Path>,
+        env: &[(&str, &str)],
+    ) -> OwnedDaemon {
         let mut command = Command::new(product_binary());
+        command.envs(env.iter().copied());
         if let Some(home) = home {
             command.env(agent_ide::userhome::HOME_OVERRIDE_ENV, home);
         }
@@ -6209,6 +6229,144 @@ async fn binary_and_unreadable_files_refuse_softly_naming_a_native_tool() {
         after["kind"], "read",
         "the daemon must keep answering: {text}"
     );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A job that panics answers that one call `internal`, the error journal records the panic's
+/// source location and the call's method but never the payload text, and the daemon's single
+/// worker stays alive: the next read still answers. Driven by the `test-seams` panic seam, which panics an `ide.read` of
+/// the one path it names.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn a_panicking_job_answers_internal_journals_the_panic_and_keeps_the_worker_alive() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(fixture.root.join("boom.log"), "one\n").unwrap();
+    std::fs::write(fixture.root.join("fine.log"), "two\n").unwrap();
+    fixture.git(&["add", "--", "boom.log", "fine.log"]);
+    fixture.git(&["commit", "--quiet", "-m", "panic fixtures"]);
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture
+        .spawn_configured_daemon_with_env(
+            Some(&home),
+            false,
+            Duration::from_secs(30),
+            None,
+            &[("AGENT_IDE_TEST_PANIC_READ_PATH", "boom.log")],
+        )
+        .await;
+    let mut actor = ProductActor::new(&fixture, "panicking-job").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"panicking-job"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let (panicked, text) = settled_read(
+        &mut actor,
+        &fixture,
+        json!({"path":"boom.log","lines":"1-1"}),
+    )
+    .await;
+    assert_eq!(panicked["code"], "internal", "{panicked} {text}");
+    assert!(
+        !text.contains("deliberate") && !text.contains("example-secret"),
+        "the panic text never reaches the caller: {text}"
+    );
+    // Both later calls run before any assertion, so a failure shows whether the worker survived.
+    let (after, after_text) = settled_read(
+        &mut actor,
+        &fixture,
+        json!({"path":"fine.log","lines":"1-1"}),
+    )
+    .await;
+    let (again, _) = settled_read(
+        &mut actor,
+        &fixture,
+        json!({"path":"boom.log","lines":"1-1"}),
+    )
+    .await;
+    assert!(
+        after["kind"] == "read" && after_text.contains("1\ttwo"),
+        "the worker must survive the panic: {after} {after_text}"
+    );
+    assert_eq!(
+        again["code"], "internal",
+        "the seam panics every time: {again}"
+    );
+    let journal = home
+        .join(".agent-ide/logs")
+        .join(agent_ide::errorlog::repository_key(&fixture.runtime))
+        .join("events.jsonl");
+    let events = std::fs::read_to_string(journal).unwrap_or_default();
+    assert!(
+        events.contains("panic at crates/agent-ide-core/src/assistance/worker.rs:")
+            && events.contains(" during read\"")
+            && events.contains("\"method\":\"read\"")
+            && events.contains("\"reason\":\"internal\""),
+        "the failed call is journaled with the panic location and its method: {events}"
+    );
+    assert!(
+        !events.contains("example-secret")
+            && !events.contains("deliberate")
+            && !events.contains("boom.log"),
+        "the panic payload text never reaches the journal: {events}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A release build (no `test-seams` feature) ignores `AGENT_IDE_TEST_PANIC_READ_PATH`: the read it
+/// names answers its text and nothing is journaled as a panic. `xtask check` runs it in its
+/// default-build pass beside the version-seam check.
+#[cfg(not(feature = "test-seams"))]
+#[tokio::test]
+async fn release_build_ignores_the_panic_seam() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(fixture.root.join("boom.log"), "one\n").unwrap();
+    fixture.git(&["add", "--", "boom.log"]);
+    fixture.git(&["commit", "--quiet", "-m", "panic fixture"]);
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture
+        .spawn_configured_daemon_with_env(
+            Some(&home),
+            false,
+            Duration::from_secs(30),
+            None,
+            &[("AGENT_IDE_TEST_PANIC_READ_PATH", "boom.log")],
+        )
+        .await;
+    let mut actor = ProductActor::new(&fixture, "release-panic-seam").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"release-panic-seam"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let (read, text) = settled_read(
+        &mut actor,
+        &fixture,
+        json!({"path":"boom.log","lines":"1-1"}),
+    )
+    .await;
+    assert!(
+        read["kind"] == "read" && text.contains("1\tone"),
+        "a release build must ignore the panic seam: {read} {text}"
+    );
+    let journal = home
+        .join(".agent-ide/logs")
+        .join(agent_ide::errorlog::repository_key(&fixture.runtime))
+        .join("events.jsonl");
+    let events = std::fs::read_to_string(journal).unwrap_or_default();
+    assert!(!events.contains("panic at"), "no panic: {events}");
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();

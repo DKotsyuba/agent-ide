@@ -333,6 +333,7 @@ async fn run_daemon_inner(
     idle_timeout: Duration,
 ) -> Result<(), AppError> {
     crate::errorlog::init(runtime_dir.path());
+    crate::errorlog::install_panic_hook();
     let _lock = DaemonLock::acquire(runtime_dir.lock_path())?;
     let runtime_identity = fs::symlink_metadata(runtime_dir.path())
         .ok()

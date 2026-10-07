@@ -2663,7 +2663,11 @@ impl<'a> Worker<'a> {
             match job {
                 Some(job) => {
                     let mut job = job;
-                    self.perform(&mut job).await;
+                    // One job's panic answers that call `internal` and journals the message; the
+                    // worker is the daemon's only job task, so it must outlive every job.
+                    if catch_panic(self.perform(&mut job)).await.is_err() {
+                        self.settle_panicked(&mut job);
+                    }
                     if let Ok(mut ledger) = shared.ledger.lock() {
                         ledger.in_flight = ledger.in_flight.saturating_sub(1);
                         if job.park_until.is_some() {
@@ -2687,6 +2691,37 @@ impl<'a> Worker<'a> {
                     }
                 }
             }
+        }
+    }
+    /// Settles a job whose execution panicked: the caller's call answers `internal` under the
+    /// tool's default stage (never the panic text), the error journal gets one line under the job's
+    /// correlation id naming the panic's source location and the call's method, and no
+    /// later run of the job is queued. The shared worker state it leaves behind is whatever the
+    /// unwind stopped at; every later job re-derives its own inputs, so the worker keeps serving.
+    fn settle_panicked(&mut self, job: &mut Job) {
+        job.park_until = None;
+        let detail = crate::telemetry::adapters::default_stage(job.tool, &FailureCode::Internal);
+        let reply = PeerReply::Error {
+            code: FailureCode::Internal,
+            detail: Some(detail),
+        };
+        let method = errorlog_method(job.tool);
+        let place = crate::errorlog::take_panic_place()
+            .unwrap_or_else(|| "panic at an unknown location".to_owned());
+        crate::errorlog::record(
+            method,
+            job_failure_outcome(FailureCode::Internal),
+            crate::errorlog::Fields {
+                reason: Some(FailureCode::Internal.into()),
+                correlation: Some(job.reference.as_str()),
+                detail: Some(&format!("{place} during {}", method.as_str())),
+                ..Default::default()
+            },
+        );
+        self.shared
+            .complete(&job.reference, reply.clone(), None, None, job.native_epoch);
+        if let Some(sender) = job.stop_reply.take() {
+            let _ = sender.send(reply);
         }
     }
     /// Rechecks queued liveness, executes only the selected owner operation, and fences every result.
@@ -2780,7 +2815,10 @@ impl<'a> Worker<'a> {
                     AssistanceTool::Context => self.context(job).await,
                     AssistanceTool::Diff => self.diff(job).await,
                     AssistanceTool::Outline => self.outline(job).await,
-                    AssistanceTool::Read => self.read(job).await,
+                    AssistanceTool::Read => {
+                        panic_seam(job);
+                        self.read(job).await
+                    }
                     AssistanceTool::Symbol => self.symbol(job).await,
                     AssistanceTool::Graph => self.graph(job).await,
                     AssistanceTool::Test => self.test(job).await,
@@ -6258,6 +6296,41 @@ fn errorlog_method(tool: AssistanceTool) -> crate::errorlog::Method {
         AssistanceTool::Test => crate::errorlog::Method::Test,
     }
 }
+
+/// Drives `future` to completion, returning the payload of a panic raised while polling it
+/// instead of unwinding through the caller. The future is dropped once it has panicked.
+async fn catch_panic<F: std::future::Future>(
+    future: F,
+) -> Result<F::Output, Box<dyn std::any::Any + Send>> {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        let polled = crate::errorlog::catch_job_panic(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx)))
+        });
+        match polled {
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Ok(std::task::Poll::Ready(output)) => std::task::Poll::Ready(Ok(output)),
+            Err(payload) => std::task::Poll::Ready(Err(payload)),
+        }
+    })
+    .await
+}
+
+/// Test seam: panics a `test-seams` build's `ide.read` of the path named by
+/// `AGENT_IDE_TEST_PANIC_READ_PATH`, so the product tests can prove the worker survives a job
+/// panic. The panic does not exist in a build without the feature.
+#[cfg(feature = "test-seams")]
+fn panic_seam(job: &Job) {
+    if let Some(path) = crate::test_seams::var("AGENT_IDE_TEST_PANIC_READ_PATH")
+        && job.parameters.get("path").and_then(Value::as_str) == Some(path.as_str())
+    {
+        panic!("agent-ide test seam: deliberate job panic for {path} token=example-secret");
+    }
+}
+
+/// Without the `test-seams` feature there is no panic seam.
+#[cfg(not(feature = "test-seams"))]
+fn panic_seam(_job: &Job) {}
 
 /// Projects detected at the worktree root in registration order, those with a root manifest
 /// first: a language present only by its files never shadows one the root declares.

@@ -709,6 +709,86 @@ pub fn record(method: Method, outcome: Outcome, fields: Fields<'_>) {
     writer.append(&build_line(method, outcome, fields, timestamp));
 }
 
+std::thread_local! {
+    /// How many [`catch_job_panic`] polls are active on this thread; the hook leaves their
+    /// panics to the catcher's own journal line.
+    static CATCHING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Where this thread's latest panic happened, for [`take_panic_place`].
+    static LAST_PLACE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Installs, once per process, a panic hook that writes the location of every panic to the error
+/// log (method `daemon`, outcome `failed`, reason `internal`, detail `panic at <file>:<line>:<column>`)
+/// before running the hook it replaced.
+///
+/// A daemon's stderr is `/dev/null`, so without this a panic on any thread leaves no trace at
+/// all. Only the location in the product's own source is recorded — never the payload text, which
+/// can carry paths, source or secrets. A panic caught by [`catch_job_panic`] is journaled by its
+/// catcher with the failed call's method instead. The previous hook still runs, so the default
+/// stderr report and a test harness's output capture are unchanged. Later calls do nothing.
+pub fn install_panic_hook() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let place = panic_place(info.location());
+            if CATCHING.get() == 0 {
+                record(
+                    Method::Daemon,
+                    Outcome::Failed,
+                    Fields {
+                        reason: Some(ReasonCode::Internal),
+                        detail: Some(&place),
+                        ..Default::default()
+                    },
+                );
+            }
+            LAST_PLACE.replace(Some(place));
+            previous(info);
+        }));
+    });
+}
+
+/// Runs `poll` — one poll of a job's future — so that a panic inside it is left to the caller
+/// instead of being journaled by the panic hook, which only records the location (see
+/// [`take_panic_place`]).
+pub fn catch_job_panic<R>(poll: impl FnOnce() -> R) -> R {
+    CATCHING.set(CATCHING.get() + 1);
+    let result = poll();
+    CATCHING.set(CATCHING.get() - 1);
+    result
+}
+
+/// The location line (`panic at <file>:<line>:<column>`) of the panic this thread's hook saw
+/// last, taken out of the hook; `None` when no hook is installed or none ran.
+pub fn take_panic_place() -> Option<String> {
+    LAST_PLACE.take()
+}
+
+/// The journal detail naming where a panic happened: `panic at <file>:<line>:<column>`, with the
+/// path the compiler recorded when it is crate-relative and only the file name when it is
+/// absolute (a dependency's source on this host). Never any payload text.
+fn panic_place(location: Option<&std::panic::Location<'_>>) -> String {
+    let Some(at) = location else {
+        return "panic at an unknown location".to_owned();
+    };
+    let file = Path::new(at.file());
+    let shown = if file.is_absolute() {
+        file.file_name().map(std::ffi::OsStr::to_string_lossy)
+    } else {
+        Some(file.to_string_lossy())
+    };
+    let mut detail = format!(
+        "panic at {}:{}:{}",
+        shown.as_deref().unwrap_or("?"),
+        at.line(),
+        at.column()
+    );
+    detail.retain(|c| c.is_ascii());
+    detail.truncate(MAX_DETAIL_BYTES);
+    detail
+}
+
 /// Renders one canonical JSON Lines record (without its trailing newline); pure and side-effect
 /// free so [`record`]'s exact wire shape is unit-testable without touching the global writer.
 pub(crate) fn build_line(
@@ -1033,6 +1113,19 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A panic is journaled by its source location alone: crate-relative file, line and column,
+    /// with no payload text.
+    #[test]
+    fn panic_place_names_only_the_source_location() {
+        let place = panic_place(Some(std::panic::Location::caller()));
+        assert!(
+            place.starts_with("panic at crates/agent-ide-core/src/errorlog.rs:")
+                && place.matches(':').count() == 2,
+            "{place}"
+        );
+        assert_eq!(panic_place(None), "panic at an unknown location");
     }
 
     /// Independent writers stand in for the daemon and client processes sharing one file: no

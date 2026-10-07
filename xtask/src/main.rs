@@ -274,7 +274,8 @@ fn check(root: &Path) -> Result<()> {
         "cargo",
         &[workspace_tests, vec!["--test-threads=1"], skip_refs].concat(),
     )?;
-    // A release build (no `test-seams` feature) must ignore every environment seam.
+    // A release build (no `test-seams` feature) must ignore every environment seam: the version
+    // seams and the job-panic seam.
     run(
         root,
         "cargo",
@@ -284,6 +285,17 @@ fn check(root: &Path) -> Result<()> {
             "--test",
             "service_lifecycle_contract",
             "release_build_ignores_the_version_seams",
+        ],
+    )?;
+    run(
+        root,
+        "cargo",
+        &[
+            "test",
+            "--locked",
+            "--test",
+            "product_mcp_contract",
+            "release_build_ignores_the_panic_seam",
         ],
     )?;
     // The provider tests read their toolchains from the AGENT_IDE_* environment exactly as CI
