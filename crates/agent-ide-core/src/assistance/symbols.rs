@@ -435,7 +435,16 @@ impl Worker<'_> {
                         .ok_or(FailureCode::Internal)?;
                     let file = std::path::PathBuf::from(&path);
                     let index = match self
-                        .read_batch_file(job, &binding, &mut files, file.clone(), false)
+                        .read_batch_file(
+                            job,
+                            &binding,
+                            &mut files,
+                            file.clone(),
+                            // A language file keeps the outline its ranges read always took,
+                            // which registers it with the language session before any edit; a
+                            // file no language reads has none to take.
+                            Lang::for_path(&file).is_some(),
+                        )
                         .await
                     {
                         Ok(Some(index)) => index,
@@ -668,9 +677,10 @@ impl Worker<'_> {
     /// Observes, outlines and finishes one file of a batch read once: every item of that file
     /// shares the observation, the outline and the deadline/authority/source checks.
     ///
-    /// `outline` is false for line ranges and whole-file text, which never need one, so any
-    /// readable file answers them; the file is then retained with `None` for its outline, and a
-    /// later symbol item of the same file must not look it up. Returns `Ok(None)` for a file that
+    /// `outline` is false for a bare-path whole-file text item and for the ranges of a file no
+    /// IDE language reads: neither needs one, so any readable file answers them. The file is
+    /// then retained with `None` for its outline, and a later symbol item of the same file must
+    /// not look it up. The ranges of a language file still take the outline, as ever. Returns `Ok(None)` for a file that
     /// is binary or has no observed bytes (the caller reports it as one soft item), `Ok(Some(index))`
     /// into `files` otherwise, and `NoSuchFile`/`UnsupportedFile` errors the caller also turns into
     /// items; every other error fails the whole call.
