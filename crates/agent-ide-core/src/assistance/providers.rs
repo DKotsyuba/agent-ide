@@ -95,18 +95,16 @@ pub(super) struct Providers {
     /// The owner and server slot of the session the running job used, so the worker can settle
     /// that session's health when the job ends ([`Worker::settle_session_health`]).
     pub(super) current: Option<(BindingRef, usize)>,
-    /// What the running job's provider calls showed about [`Providers::current`] so far. Recorded
-    /// where the provider answers or fails, not from the tool's final result: a tool that falls
-    /// back to a source outline after the session failed still succeeds, and the session is still
-    /// failed.
-    health: SessionHealth,
+    /// What the running job's provider calls showed about each session it used, by owner and
+    /// server slot. Recorded where the provider answers or fails, not from the tool's final
+    /// result: a tool that falls back to a source outline after the session failed still succeeds,
+    /// and the session is still failed. One session's outcome never marks or clears another's.
+    health: BTreeMap<(BindingRef, usize), SessionHealth>,
 }
 
 /// What a job's provider calls showed about the session it used.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SessionHealth {
-    /// No provider call has answered or failed yet.
-    Unsettled,
     /// A provider call completed against the session and nothing failed.
     Healthy,
     /// A provider call failed against the session; sticky for the rest of the job.
@@ -148,26 +146,30 @@ impl Providers {
             pending_handover: std::collections::BTreeSet::new(),
             failed: BTreeMap::new(),
             current: None,
-            health: SessionHealth::Unsettled,
+            health: BTreeMap::new(),
         }
     }
 
     /// Starts a job's session-health tracking: no session used, nothing observed.
     pub(super) fn begin_job(&mut self) {
         self.current = None;
-        self.health = SessionHealth::Unsettled;
+        self.health.clear();
     }
 
-    /// Records that a provider call failed against the session the job uses; later successes of
-    /// the same job never undo it.
+    /// Records that a provider call failed against the session the job used last (the one
+    /// [`Worker::live_session_for`] or [`Worker::semantic_context`] handed out immediately
+    /// before the call); later successes of the same job never undo it.
     pub(super) fn note_session_fault(&mut self) {
-        self.health = SessionHealth::Failed;
+        if let Some(key) = self.current.clone() {
+            self.health.insert(key, SessionHealth::Failed);
+        }
     }
 
-    /// Records that a provider call completed against the session, unless one already failed.
+    /// Records that a provider call completed against the session the job used last, unless one
+    /// already failed against it.
     fn note_session_healthy(&mut self) {
-        if self.health == SessionHealth::Unsettled {
-            self.health = SessionHealth::Healthy;
+        if let Some(key) = self.current.clone() {
+            self.health.entry(key).or_insert(SessionHealth::Healthy);
         }
     }
 
@@ -797,19 +799,22 @@ impl Worker<'_> {
     /// call marks the session failed against the basis it failed on even when the tool then
     /// answered from a source outline, and a job whose provider calls all completed clears the mark.
     pub(super) async fn settle_session_health(&mut self, job: &Job) {
-        let health = self.providers.health;
-        let Some(key) = self.providers.current.take() else {
+        self.providers.current = None;
+        let health = std::mem::take(&mut self.providers.health);
+        if health.is_empty() {
             return;
-        };
-        match health {
-            SessionHealth::Unsettled => {}
-            SessionHealth::Healthy => {
-                self.providers.failed.remove(&key);
-            }
-            SessionHealth::Failed => {
-                if let Ok(authority) = self.authority(job.invocation.binding_ref()).await {
-                    let basis = self.session_basis(key.1, &authority);
-                    self.providers.failed.insert(key, basis);
+        }
+        let authority = self.authority(job.invocation.binding_ref()).await.ok();
+        for (key, health) in health {
+            match health {
+                SessionHealth::Healthy => {
+                    self.providers.failed.remove(&key);
+                }
+                SessionHealth::Failed => {
+                    if let Some(authority) = &authority {
+                        let basis = self.session_basis(key.1, authority);
+                        self.providers.failed.insert(key, basis);
+                    }
                 }
             }
         }
@@ -1060,18 +1065,22 @@ const INPUT_SCAN_SKIP: &[&str] = &[
 /// by its length and this prefix.
 const INPUT_SCAN_FILE_BYTES: u64 = 256 * 1024;
 
-/// Digests the relative path, length and content of every file named in `names` below `root`.
+/// Digests the relative path, length, modification time and first [`INPUT_SCAN_FILE_BYTES`] bytes
+/// of every file named in `names` below `root`.
 ///
-/// Content, not the modification time, is what is digested: an edit that keeps a file's length and
-/// timestamp (a restored mtime, a same-length fix) still changes the stamp. A file longer than
-/// [`INPUT_SCAN_FILE_BYTES`] is digested by its length and that prefix.
+/// A file of up to that size is digested whole, so any edit of it changes the stamp. A longer file
+/// is covered by its length, its modification time and its prefix: an ordinary edit moves the
+/// modification time, but a same-length edit past the prefix that also restores the timestamp is
+/// not seen (a stated ceiling; the next `HEAD` move or session restart recovers it).
 ///
 /// Coverage is bounded and honest: at most [`INPUT_SCAN_DEPTH`] levels below `root` and
 /// [`INPUT_SCAN_ENTRIES`] directory entries read in total (entries are streamed, never collected,
 /// so a huge directory costs at most the remaining budget); a manifest deeper than that or past the
 /// budget is not seen, and only a moved `HEAD` then revives a failed session. The per-file digests
 /// are summed, so the result does not depend on the order the filesystem lists entries. An
-/// unreadable directory or file contributes nothing; empty `names` digest to a constant.
+/// unreadable directory or file contributes nothing; empty `names` digest to a constant. Only
+/// regular files are opened: a named pipe, socket, device or symlink named like an input is skipped
+/// (opening a pipe would block the worker), so a symlinked manifest is not stamped.
 fn project_inputs_stamp(root: &Path, names: &[&str]) -> [u8; 32] {
     let mut sum = [0_u8; 32];
     let mut budget = INPUT_SCAN_ENTRIES;
@@ -1094,7 +1103,8 @@ fn project_inputs_stamp(root: &Path, names: &[&str]) -> [u8; 32] {
                 if depth < INPUT_SCAN_DEPTH && !INPUT_SCAN_SKIP.contains(&name) {
                     pending.push((entry.path(), depth + 1));
                 }
-            } else if names.contains(&name)
+            } else if kind.is_file()
+                && names.contains(&name)
                 && let Ok(file) = std::fs::File::open(entry.path())
             {
                 use std::io::Read;
@@ -1110,12 +1120,14 @@ fn project_inputs_stamp(root: &Path, names: &[&str]) -> [u8; 32] {
                 }
                 let mut hasher = blake3::Hasher::new();
                 hasher.update(relative.as_os_str().as_encoded_bytes());
-                hasher.update(
-                    &entry
-                        .metadata()
-                        .map_or(0, |metadata| metadata.len())
-                        .to_le_bytes(),
-                );
+                let metadata = entry.metadata().ok();
+                let modified = metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |elapsed| elapsed.as_nanos());
+                hasher.update(&metadata.map_or(0, |metadata| metadata.len()).to_le_bytes());
+                hasher.update(&modified.to_le_bytes());
                 hasher.update(&content);
                 for (total, byte) in sum.iter_mut().zip(hasher.finalize().as_bytes()) {
                     *total = total.wrapping_add(*byte);

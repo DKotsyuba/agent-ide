@@ -1028,18 +1028,44 @@ pub(crate) mod testing {
             })
         }
 
-        /// An outline with no symbols.
+        /// An outline with no symbols, except for epsilon: it keeps each top-level server symbol
+        /// as a function covering the lines of its range, so the scripted fixture session can
+        /// resolve a symbol.
         fn normalize(
             &self,
             file: &Path,
             source: &str,
-            _symbols: Vec<lsp::DocumentSymbol>,
+            symbols: Vec<lsp::DocumentSymbol>,
         ) -> Outline {
+            let symbols = if self.0 == "epsilon" {
+                symbols
+                    .into_iter()
+                    .map(|symbol| {
+                        let range =
+                            LineRange::new(symbol.range.start.line + 1, symbol.range.end.line + 1);
+                        Symbol {
+                            path: SymbolPath::new(
+                                Some(file.to_path_buf()),
+                                vec![symbol.name.clone()],
+                            ),
+                            kind: SymbolKind::Function,
+                            signature: symbol.name.clone(),
+                            name: symbol.name,
+                            range,
+                            body: range,
+                            doc: None,
+                            children: Vec::new(),
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             Outline {
                 file: file.to_path_buf(),
                 language: self.language(),
                 line_count: line_count(source),
-                symbols: Vec::new(),
+                symbols,
             }
         }
         /// No insertion points.
@@ -1391,6 +1417,129 @@ pub(crate) mod testing {
             .push((fixture_tag(binding), unowned));
     }
 
+    /// Tags of the bindings whose fixture `ensure_live` opens a scripted language-server session
+    /// (and so answers `Ok` instead of `ProviderLoading`).
+    static FIXTURE_SESSIONS: std::sync::Mutex<Vec<(String, &'static [&'static str])>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// Makes the fixture server open a scripted session for `binding` from now on: it answers
+    /// document symbols (one function, `a`) and an empty reference list, and fails every other
+    /// request (call hierarchy, workspace symbols) with an error reply, so tests can drive the
+    /// worker's real exchange-failure paths. `failing` additionally names requests
+    /// (`"documentSymbol"`, `"references"`) that fail with an error reply too.
+    pub(crate) fn fixture_serve_session(
+        binding: &crate::assistance::host_binding::BindingRef,
+        failing: &'static [&'static str],
+    ) {
+        FIXTURE_SESSIONS
+            .lock()
+            .expect("fixture sessions")
+            .push((fixture_tag(binding), failing));
+    }
+
+    /// Profile of the scripted fixture session: accepts any server, opens `.epsilon` as `epsilon`.
+    #[derive(Debug)]
+    struct FixtureProfile;
+
+    impl crate::intelligence::session::SessionProfile for FixtureProfile {
+        /// An empty configuration object.
+        fn workspace_configuration(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        /// Any server identity is accepted.
+        fn accepts_server(&self, _info: Option<&async_lsp::lsp_types::ServerInfo>) -> bool {
+            true
+        }
+        /// Every file opens as `epsilon`.
+        fn language_id(&self, _path: &std::path::Path) -> &'static str {
+            "epsilon"
+        }
+    }
+
+    /// Opens a live session against a scripted in-process language server (see
+    /// [`fixture_serve_session`]).
+    async fn fixture_open_session(
+        source: &crate::workspace::observation::SourceObservation,
+        failing: &'static [&'static str],
+    ) -> std::io::Result<crate::intelligence::session::LiveSession> {
+        use async_lsp::{MainLoop, lsp_types as lsp, lsp_types::request, router::Router};
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+        let (client, peer) = tokio::io::duplex(65536);
+        let (input, output) = tokio::io::split(client);
+        let (peer_input, peer_output) = tokio::io::split(peer);
+        let (server, _) = MainLoop::new_server(|client| {
+            let mut router = Router::new(client);
+            router.request::<request::Initialize, _>(|_, _| async {
+                Ok(lsp::InitializeResult {
+                    capabilities: lsp::ServerCapabilities {
+                        text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
+                            lsp::TextDocumentSyncKind::FULL,
+                        )),
+                        document_symbol_provider: Some(lsp::OneOf::Left(true)),
+                        references_provider: Some(lsp::OneOf::Left(true)),
+                        hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
+                        call_hierarchy_provider: Some(lsp::CallHierarchyServerCapability::Simple(
+                            true,
+                        )),
+                        workspace_symbol_provider: Some(lsp::OneOf::Left(true)),
+                        ..Default::default()
+                    },
+                    server_info: None,
+                })
+            });
+            router.request::<request::DocumentSymbolRequest, _>(move |_, _| async move {
+                if failing.contains(&"documentSymbol") {
+                    return Err(async_lsp::ResponseError::new(
+                        async_lsp::ErrorCode::INTERNAL_ERROR,
+                        "scripted documentSymbol failure",
+                    ));
+                }
+                #[allow(deprecated)]
+                Ok(Some(lsp::DocumentSymbolResponse::Nested(vec![
+                    lsp::DocumentSymbol {
+                        name: "a".into(),
+                        detail: None,
+                        kind: lsp::SymbolKind::FUNCTION,
+                        tags: None,
+                        deprecated: None,
+                        range: lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 4)),
+                        selection_range: lsp::Range::new(
+                            lsp::Position::new(0, 3),
+                            lsp::Position::new(0, 4),
+                        ),
+                        children: None,
+                    },
+                ])))
+            });
+            router.request::<request::References, _>(move |_, _| async move {
+                if failing.contains(&"references") {
+                    return Err(async_lsp::ResponseError::new(
+                        async_lsp::ErrorCode::INTERNAL_ERROR,
+                        "scripted references failure",
+                    ));
+                }
+                Ok(Some(Vec::new()))
+            });
+            router.request::<request::Shutdown, _>(|_, _| async { Ok(()) });
+            router.notification::<lsp::notification::Exit>(|_, _| {
+                std::ops::ControlFlow::Break(Ok(()))
+            });
+            router.unhandled_notification(|_, _| std::ops::ControlFlow::Continue(()));
+            router
+        });
+        tokio::spawn(server.run_buffered(peer_input.compat(), peer_output.compat_write()));
+        crate::intelligence::session::LiveSession::open(
+            input,
+            output,
+            source.worktree().clone(),
+            source.authority_epoch(),
+            crate::intelligence::freshness::ViewGeneration::default(),
+            crate::intelligence::session::ProviderSettings::new(FixtureProfile),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+    }
+
     /// Appends one line to [`FIXTURE_LOG`].
     fn fixture_record(line: String) {
         FIXTURE_LOG.lock().expect("fixture log").push(line);
@@ -1455,6 +1604,11 @@ pub(crate) mod testing {
     struct FixtureBackend {
         /// Bindings whose session `ensure_live` established and `release_live` has not yet ended.
         live: std::collections::BTreeSet<crate::assistance::host_binding::BindingRef>,
+        /// Scripted sessions opened for bindings armed by [`fixture_serve_session`].
+        sessions: std::collections::BTreeMap<
+            crate::assistance::host_binding::BindingRef,
+            crate::intelligence::session::LiveSession,
+        >,
     }
 
     impl crate::intelligence::server::ServerBackend for FixtureBackend {
@@ -1488,7 +1642,7 @@ pub(crate) mod testing {
             host: &'a mut dyn crate::intelligence::server::ProviderHost,
             job: &'a mut dyn crate::intelligence::server::ProviderJob,
             launch: &'a crate::assistance::launcher::ProviderLaunch,
-            _source: &'a crate::workspace::observation::SourceObservation,
+            source: &'a crate::workspace::observation::SourceObservation,
         ) -> crate::checks::BoxFuture<'a, Result<(), crate::assistance::reply::FailureCode>>
         {
             Box::pin(async move {
@@ -1520,8 +1674,24 @@ pub(crate) mod testing {
                     &crate::intelligence::server::effective_trust(launch),
                 )?;
                 fixture_record(format!("ensure:{}:{namespace}", fixture_tag(&binding)));
-                self.live.insert(binding);
-                Err(crate::assistance::reply::FailureCode::ProviderLoading)
+                let serving = FIXTURE_SESSIONS
+                    .lock()
+                    .expect("fixture sessions")
+                    .iter()
+                    .rev()
+                    .find(|(tag, _)| *tag == fixture_tag(&binding))
+                    .map(|(_, failing)| *failing);
+                self.live.insert(binding.clone());
+                let Some(failing) = serving else {
+                    return Err(crate::assistance::reply::FailureCode::ProviderLoading);
+                };
+                if !self.sessions.contains_key(&binding) {
+                    let session = fixture_open_session(source, failing)
+                        .await
+                        .map_err(|_| crate::assistance::reply::FailureCode::ProviderUnavailable)?;
+                    self.sessions.insert(binding, session);
+                }
+                Ok(())
             })
         }
 
@@ -1531,6 +1701,7 @@ pub(crate) mod testing {
             _host: &'a mut dyn crate::intelligence::server::ProviderHost,
             binding: &'a crate::assistance::host_binding::BindingRef,
         ) -> crate::checks::BoxFuture<'a, ()> {
+            self.sessions.remove(binding);
             if self.live.remove(binding) {
                 fixture_record(format!("release:{}", fixture_tag(binding)));
             }
@@ -1561,6 +1732,14 @@ pub(crate) mod testing {
                     Ok(())
                 }
             })
+        }
+
+        /// The scripted session of `binding`, when one was opened.
+        fn live_session(
+            &mut self,
+            binding: &crate::assistance::host_binding::BindingRef,
+        ) -> Option<&mut crate::intelligence::session::LiveSession> {
+            self.sessions.get_mut(binding)
         }
 
         /// The bindings holding a pretend session.

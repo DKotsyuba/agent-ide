@@ -8126,6 +8126,164 @@ mod stop_retry_tests {
         );
     }
 
+    /// Runs one `tool` job of `actor` against the scripted fixture session through the production
+    /// tool path, then settles the session's health as `perform` does. Returns the tool's outcome
+    /// and how many sessions are marked failed afterwards.
+    async fn scripted_tool(
+        worker: &mut Worker<'_>,
+        actor: &str,
+        call: &str,
+        tool: AssistanceTool,
+        parameters: Value,
+    ) -> (Result<(), FailureCode>, usize) {
+        let invocation = production_call(worker, actor, call);
+        let (cancel_sender, cancel) = watch::channel(false);
+        let _keep = cancel_sender;
+        let mut job = Job {
+            reference: format!("scripted-{call}"),
+            invocation,
+            tool,
+            parameters,
+            target: provider_target(&worker.runtime),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            cancel,
+            stop_reply: None,
+            native_epoch: 0,
+            failure_detail: None,
+            format_note: None,
+            check_scheduled: false,
+            park_until: None,
+            stage: None,
+            session_binding: None,
+        };
+        worker.providers.begin_job();
+        let outcome = match tool {
+            AssistanceTool::Graph => worker.graph(&mut job).await,
+            _ => worker.symbol(&mut job).await,
+        }
+        .map(|_| ());
+        assert!(job.park_until.is_none(), "{call} parked: {outcome:?}");
+        worker.settle_session_health(&job).await;
+        (outcome, worker.test_failed_sessions())
+    }
+
+    /// Every real exchange failure marks its session failed, whatever the tool then answers:
+    /// call-hierarchy requests of a symbol card and of a graph, and workspace symbols of a
+    /// bare-name search. A card whose exchanges all succeed marks nothing.
+    #[tokio::test]
+    async fn failed_exchanges_of_every_tool_mark_the_session() {
+        use crate::lang::testing::fixture_serve_session;
+        let fixture = Fixture::new();
+        epsilon_source(&fixture);
+        std::fs::write(fixture.root.join("a.epsilon"), "fn a\n").unwrap();
+        git_commit(&fixture.root, "scripted source");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let reader = provider_start(&mut worker, "sx-reader", "sx-start", true, None)
+            .await
+            .unwrap();
+        fixture_serve_session(&reader, &[]);
+
+        let cases = [
+            (
+                "healthy card",
+                AssistanceTool::Symbol,
+                serde_json::json!({"symbol":"a.epsilon#a","callers":0}),
+                0,
+            ),
+            (
+                "card callers",
+                AssistanceTool::Symbol,
+                serde_json::json!({"symbol":"a.epsilon#a","callers":1}),
+                1,
+            ),
+            (
+                "card callees",
+                AssistanceTool::Symbol,
+                serde_json::json!({"symbol":"a.epsilon#a","usages":false,"callers":0,"callees":1}),
+                1,
+            ),
+            (
+                "graph callers",
+                AssistanceTool::Graph,
+                serde_json::json!({"symbol":"a.epsilon#a","direction":"callers","depth":2}),
+                1,
+            ),
+            (
+                "bare-name workspace symbols",
+                AssistanceTool::Symbol,
+                serde_json::json!({"symbol":"a","usages":false,"callers":0}),
+                1,
+            ),
+        ];
+        run_scripted_cases(&mut worker, &reader, "sx-reader", "sx", cases).await;
+
+        // Failing outline and reference exchanges mark the session as well.
+        fixture_serve_session(&reader, &["references"]);
+        run_scripted_cases(
+            &mut worker,
+            &reader,
+            "sx-reader",
+            "sy",
+            [(
+                "card references",
+                AssistanceTool::Symbol,
+                serde_json::json!({"symbol":"a.epsilon#a","callers":0}),
+                1,
+            )],
+        )
+        .await;
+        fixture_serve_session(&reader, &["documentSymbol"]);
+        run_scripted_cases(
+            &mut worker,
+            &reader,
+            "sx-reader",
+            "sz",
+            [
+                (
+                    "card documentSymbols",
+                    AssistanceTool::Symbol,
+                    serde_json::json!({"symbol":"a.epsilon#a","callers":0}),
+                    1,
+                ),
+                (
+                    "bare-name documentSymbols",
+                    AssistanceTool::Symbol,
+                    serde_json::json!({"symbol":"a","usages":false,"callers":0}),
+                    1,
+                ),
+            ],
+        )
+        .await;
+    }
+
+    /// Runs each `(label, tool, parameters, expected failed marks)` case on a freshly released
+    /// session of `reader` and asserts the failed-session count the settled job leaves.
+    async fn run_scripted_cases<const N: usize>(
+        worker: &mut Worker<'_>,
+        reader: &BindingRef,
+        actor: &str,
+        prefix: &str,
+        cases: [(&str, AssistanceTool, Value, usize); N],
+    ) {
+        for (index, (label, tool, parameters, marks)) in cases.into_iter().enumerate() {
+            // A released session starts clean, with its failed mark dropped.
+            worker.release_live(reader).await;
+            assert_eq!(worker.test_failed_sessions(), 0, "{label}: clean start");
+            let (outcome, failed) = scripted_tool(
+                worker,
+                actor,
+                &format!("{prefix}-{index}"),
+                tool,
+                parameters,
+            )
+            .await;
+            assert_eq!(failed, marks, "{label}: {outcome:?}");
+        }
+    }
+
     /// Readers of sibling worktrees own independent namespaces: a writer arriving on one worktree
     /// releases only that worktree's reader owner.
     #[tokio::test]

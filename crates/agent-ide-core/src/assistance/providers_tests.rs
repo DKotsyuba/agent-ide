@@ -355,7 +355,41 @@ fn project_inputs_stamp_follows_named_files_within_its_ceiling() {
     assert_ne!(
         before_fix,
         stamp(),
-        "the stamp follows content, not the timestamp"
+        "a small file is digested whole, whatever its timestamp"
+    );
+    // A file past the prefix: an ordinary tail edit moves the modification time and is seen; a
+    // same-length tail edit that also restores it is the stated ceiling and is not.
+    let lock = root.join("member/Cargo.lock");
+    fs::write(
+        &lock,
+        vec![b'a'; super::INPUT_SCAN_FILE_BYTES as usize + 64],
+    )
+    .unwrap();
+    let stamp = || project_inputs_stamp(&root, &["Cargo.toml", "Cargo.lock"]);
+    let before_tail = stamp();
+    let mut edited = vec![b'a'; super::INPUT_SCAN_FILE_BYTES as usize + 64];
+    *edited.last_mut().unwrap() = b'b';
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::write(&lock, &edited).unwrap();
+    assert_ne!(
+        before_tail,
+        stamp(),
+        "an ordinary tail edit moves the mtime"
+    );
+    let after_tail = stamp();
+    let modified = fs::metadata(&lock).unwrap().modified().unwrap();
+    *edited.last_mut().unwrap() = b'c';
+    fs::write(&lock, &edited).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&lock)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    assert_eq!(
+        after_tail,
+        stamp(),
+        "a same-length tail edit past the prefix with a restored mtime is the stated ceiling"
     );
     assert_eq!(
         project_inputs_stamp(&root, &[]),
@@ -369,5 +403,56 @@ fn project_inputs_stamp_follows_named_files_within_its_ceiling() {
         fs::write(many.join(format!("f{index}")), "").unwrap();
     }
     let _ = stamp();
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Session health is tracked per owner and server slot: a failure of one session never marks or
+/// clears another's, whatever order a job visits them in, and a failure is sticky for its session.
+#[test]
+fn session_health_is_kept_per_owner_and_slot() {
+    use super::{Providers, SessionHealth};
+    use crate::assistance::host_binding::BindingRef;
+    let (a, b) = (
+        (BindingRef::fixture("health-a", "health-channel", 1), 0),
+        (BindingRef::fixture("health-b", "health-channel", 1), 1),
+    );
+    let mut providers = Providers::new();
+    providers.begin_job();
+    providers.current = Some(a.clone());
+    providers.note_session_fault();
+    providers.current = Some(b.clone());
+    providers.note_session_healthy();
+    providers.current = Some(a.clone());
+    providers.note_session_healthy();
+    assert_eq!(providers.health.get(&a), Some(&SessionHealth::Failed));
+    assert_eq!(providers.health.get(&b), Some(&SessionHealth::Healthy));
+    providers.begin_job();
+    assert!(providers.health.is_empty());
+}
+
+/// A named pipe, or a symlink to one, carrying an input's name never blocks the stamp: only
+/// regular files are opened, so the scan returns at once (a blocking open would hang the worker).
+#[test]
+fn project_inputs_stamp_never_opens_special_files() {
+    let root = temporary();
+    fs::create_dir_all(&root).unwrap();
+    let pipe = root.join("Cargo.toml");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&pipe)
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo");
+    std::os::unix::fs::symlink(&pipe, root.join("pyproject.toml")).unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let scanned = root.clone();
+    std::thread::spawn(move || {
+        let _ = sender.send(project_inputs_stamp(
+            &scanned,
+            &["Cargo.toml", "pyproject.toml"],
+        ));
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the stamp must not block on a named pipe");
     fs::remove_dir_all(root).unwrap();
 }

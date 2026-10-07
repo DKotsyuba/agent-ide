@@ -137,12 +137,14 @@ the reply template renders as the no-server sentence; and a refusal no path name
 `(provider: cause not reported)` from the worker.
 
 A session whose workspace failed, or that a provider call failed on, is marked failed with its
-basis: Git's `HEAD` and a content digest of the server's project input files
-(`LanguageServer::project_inputs`). The mark follows the provider calls of a job, not the tool's
-final answer, so a tool that falls back to a source outline after the session failed still marks
-it. The digest searches four directory levels and 5,000 directory entries without generated or
-vendored trees; a manifest outside that ceiling is not seen, and only a moved `HEAD` then revives
-the session. Before the next provider call the worker retires a marked session whose basis
+basis: Git's `HEAD` and a stamp of the server's project input files
+(`LanguageServer::project_inputs`). The mark follows the provider calls of a job per session (owner
+and server slot), not the tool's final answer, so a tool that falls back to a source outline after
+the session failed still marks it. The stamp covers each regular input file by length, modification
+time and a hash of its first 256 KiB, searching four directory levels and 5,000 directory entries
+without generated or vendored trees (pipes and symlinks are never opened); a same-length edit
+past the prefix that keeps the modification time, a manifest outside that ceiling or a symlinked
+manifest is not seen, and the next `HEAD` move or session restart recovers it. Before the next provider call the worker retires a marked session whose basis
 changed; an unchanged basis keeps the staged refusal and is never restarted, on a timer or per
 call. A job whose provider calls all completed clears the mark, and releasing the session (stop,
 downgrade, handover) drops it.
