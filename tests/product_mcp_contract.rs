@@ -3458,6 +3458,63 @@ async fn managed_claude_call(
     claude_fields(assert_claude_envelope(&reply))
 }
 
+/// Runs one managed Claude hook whose shell `cwd` is `cwd` while `CLAUDE_PROJECT_DIR` stays
+/// `project`, the shape of a session whose shell left its project (`cd` into a log directory).
+async fn managed_claude_hook_from(
+    project: &Path,
+    cwd: &Path,
+    mut payload: Value,
+) -> std::process::Output {
+    let mut child = managed_claude_hook_process(Some(project));
+    payload["cwd"] = json!(cwd);
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(payload.to_string().as_bytes())
+        .await
+        .unwrap();
+    input.shutdown().await.unwrap();
+    drop(input);
+    tokio::time::timeout(Duration::from_secs(2), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// [`managed_claude_call`] with both lifecycle hooks fired from `cwd` instead of the project.
+async fn managed_claude_call_from(
+    mcp: &mut Mcp,
+    project: &Path,
+    cwd: &Path,
+    id: usize,
+    session: &str,
+    name: &str,
+    arguments: Value,
+) -> Value {
+    let call = format!("managed-claude-{id}");
+    let pre = managed_claude_hook_from(
+        project,
+        cwd,
+        managed_claude_event("PreToolUse", session, None, &call),
+    )
+    .await;
+    assert!(pre.status.success() && pre.stdout.is_empty() && pre.stderr.is_empty());
+    let reply = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+                "name":name,"arguments":arguments,"_meta":{"claudecode/toolUseId":call}
+            }}),
+        )
+        .await;
+    let post = managed_claude_hook_from(
+        project,
+        cwd,
+        managed_claude_event("PostToolUse", session, None, &call),
+    )
+    .await;
+    assert!(post.status.success() && post.stderr.is_empty());
+    claude_fields(assert_claude_envelope(&reply))
+}
+
 /// Polls one pending managed Claude start through hook-paired `ide.inspect` calls until it settles.
 ///
 /// The shared daemon executes the start itself; every poll is one ordinary [`managed_claude_call`]
@@ -6769,6 +6826,184 @@ async fn managed_claude_hook_relies_on_its_cached_key_not_a_live_git_probe() {
     assert_eq!(stopped["kind"], "stop", "{stopped}");
 
     mcp.close().await;
+}
+
+/// A Claude session whose shell `cwd` left the project still pairs its pre-hooks: the payload cwd
+/// finds no rendezvous, so the hook falls back to the session's own `CLAUDE_PROJECT_DIR`
+/// registration (QW-8; the reproduced field refusal was `host_binding (missing_pre)` on every call
+/// while the cwd was outside). The miss leaves a per-call `warn` hook line with a closed reason,
+/// and a `CLAUDE_PROJECT_DIR` that names no registration still routes nowhere.
+#[tokio::test]
+async fn managed_claude_hook_pairs_through_project_dir_when_the_shell_cwd_left_the_project() {
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let journal = hook_journal_dir(&fixture.root);
+    let _ = std::fs::remove_dir_all(&journal);
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let outside = fixture.base.join("shell-left-the-project");
+    std::fs::create_dir(&outside).unwrap();
+
+    let mut next = 1;
+    let mut reply = managed_claude_call_from(
+        &mut mcp,
+        &fixture.root,
+        &outside,
+        next,
+        "cwd-session",
+        "ide.start",
+        json!({"activation_id":"cwd-start"}),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while reply["state"] == "pending" {
+        assert!(tokio::time::Instant::now() < deadline, "{reply}");
+        let detail_ref = reply["detail_ref"].clone();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        next += 1;
+        reply = managed_claude_call_from(
+            &mut mcp,
+            &fixture.root,
+            &outside,
+            next,
+            "cwd-session",
+            "ide.inspect",
+            json!({"detail_ref":detail_ref}),
+        )
+        .await;
+    }
+    assert_eq!(
+        reply["kind"], "activation",
+        "pre-hooks fired from outside the project must still pair: {reply}"
+    );
+    // The reproduced field session lost 11 of 11 calls while its cwd was outside the project.
+    for index in 0..11 {
+        next += 1;
+        let paired = managed_claude_call_from(
+            &mut mcp,
+            &fixture.root,
+            &outside,
+            next,
+            "cwd-session",
+            "ide.context",
+            json!({"kind":"problems"}),
+        )
+        .await;
+        assert_ne!(paired["state"], "unavailable", "call {index}: {paired}");
+    }
+
+    let events = std::fs::read_to_string(journal.join("events.jsonl")).unwrap_or_default();
+    assert!(
+        events
+            .lines()
+            .any(|line| line.contains("\"level\":\"warn\"")
+                && line.contains("\"method\":\"hook\"")
+                && line.contains("hook_cwd_rerouted:hook_no_key_cache")),
+        "the cwd miss is journaled as warn: {events}"
+    );
+    assert!(
+        !events.contains(outside.to_str().unwrap()),
+        "the journal never carries the shell cwd: {events}"
+    );
+
+    // A project directory that names no registration cannot route anywhere: the pre is dropped
+    // and the call is refused as before, never delivered to this or another repository's daemon.
+    let stranger = fixture.base.join("unregistered-project");
+    std::fs::create_dir(&stranger).unwrap();
+    let pre = managed_claude_hook_from(
+        &stranger,
+        &outside,
+        managed_claude_event("PreToolUse", "cwd-session", None, "stranger-call"),
+    )
+    .await;
+    assert!(pre.status.success() && pre.stdout.is_empty() && pre.stderr.is_empty());
+    let refused = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":90,"method":"tools/call","params":{
+                "name":"ide.context","arguments":{"kind":"problems"},
+                "_meta":{"claudecode/toolUseId":"stranger-call"}
+            }}),
+        )
+        .await;
+    assert!(
+        refused["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("unavailable: host_binding")),
+        "a pre routed nowhere cannot pair: {refused}"
+    );
+    mcp.close().await;
+}
+
+/// A shell that wandered into another registered repository never delivers its session's pre
+/// there: the cwd route is accepted only inside the session's own repository, so the pre pairs on
+/// the session's daemon, and a call of the other repository that carries the same session and
+/// tool-use id (nothing fired for it) stays refused instead of consuming the stray pre.
+#[tokio::test]
+async fn managed_claude_hook_never_routes_a_wandering_cwd_to_another_registered_repository() {
+    let session_repo = ProductFixture::new(json!([]));
+    let other_repo = ProductFixture::new(json!([]));
+    let _session_guard = SharedClaudeDaemonGuard(managed_claude_runtime_path(&session_repo.root));
+    let _other_guard = SharedClaudeDaemonGuard(managed_claude_runtime_path(&other_repo.root));
+    let session_journal = hook_journal_dir(&session_repo.root);
+    let _ = std::fs::remove_dir_all(&session_journal);
+    let mut mcp = Mcp::start_managed_claude(&session_repo.config, &session_repo.root).await;
+    let mut other = Mcp::start_managed_claude(&other_repo.config, &other_repo.root).await;
+
+    let mut next = 1;
+    let mut reply = managed_claude_call_from(
+        &mut mcp,
+        &session_repo.root,
+        &other_repo.root,
+        next,
+        "shared-session",
+        "ide.start",
+        json!({"activation_id":"wander-start"}),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while reply["state"] == "pending" {
+        assert!(tokio::time::Instant::now() < deadline, "{reply}");
+        let detail_ref = reply["detail_ref"].clone();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        next += 1;
+        reply = managed_claude_call_from(
+            &mut mcp,
+            &session_repo.root,
+            &other_repo.root,
+            next,
+            "shared-session",
+            "ide.inspect",
+            json!({"detail_ref":detail_ref}),
+        )
+        .await;
+    }
+    assert_eq!(
+        reply["kind"], "activation",
+        "the session's pre pairs on its own repository: {reply}"
+    );
+    let events = std::fs::read_to_string(session_journal.join("events.jsonl")).unwrap_or_default();
+    assert!(
+        events.contains("hook_cwd_rerouted:hook_cwd_other_repository"),
+        "{events}"
+    );
+
+    // The other repository's call with the same session and tool-use id had no pre fired for it.
+    let refused = other
+        .exchange(
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                "name":"ide.context","arguments":{"kind":"problems"},
+                "_meta":{"claudecode/toolUseId":"managed-claude-1"}
+            }}),
+        )
+        .await;
+    assert!(
+        refused["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("unavailable: host_binding")),
+        "the stray pre never reached the other repository: {refused}"
+    );
+    mcp.close().await;
+    other.close().await;
 }
 
 /// Bounded host binding generations one daemon retains, mirroring `host_binding::MAX_BINDINGS`.

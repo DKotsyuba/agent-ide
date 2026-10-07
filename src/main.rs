@@ -1802,17 +1802,60 @@ fn read_claude_attachment(key: &Path) -> std::io::Result<(PathBuf, String)> {
     Ok((runtime, attachment.to_owned()))
 }
 
-/// Submits one argument-free managed Claude hook on the payload cwd's lease channel.
+/// The repository identity a hook compares routes by: the canonical git common directory read from
+/// `.git` files (never `git` itself), else the key the owning MCP cached for `dir`, else `dir`.
+fn hook_repository_key(dir: &Path) -> PathBuf {
+    common_dir_from_git_files(dir)
+        .or_else(|| read_claude_key_cache(dir))
+        .unwrap_or_else(|| dir.to_owned())
+}
+
+/// Resolves where a managed Claude hook submits: its runtime directory and candidate attachment.
 ///
-/// The hook's inherited project environment can name another worktree of the same repository.
-/// Missing or malformed cwd, cached key, runtime, candidate attachment, or daemon returns silently
-/// to Claude while recording a closed, path-free reason in the repository error log.
-/// Per EYES-r2 §3, this never spawns `git` itself and so never risks the existing bounded 250 ms
-/// total deadline on that account: the rendezvous key is only ever read from
-/// [`read_claude_key_cache`], a hint the owning MCP server left behind at its own startup. Once
-/// validated, the existing bounded Claude parser, sanitized transport, exact lifecycle correlation,
-/// feedback rendering, and foreground-helper recognition remain unchanged. Closed input failure
-/// details distinguish thread startup, timeout, read, size, and cwd failures without logging input.
+/// The payload `cwd` route comes first: the nearest ancestor holding a cached rendezvous key (a
+/// registered worktree) names the project. It is accepted only when that project belongs to the
+/// same repository as `project_dir` — the canonical `CLAUDE_PROJECT_DIR` this session's own MCP
+/// registered under — so a shell that wandered into another registered repository never delivers
+/// this session's pre there (`hook_cwd_other_repository`); a sibling worktree of the session's
+/// repository still routes by its own cwd. When the cwd route misses (no cached key, runtime or
+/// candidate attachment, or another repository), `project_dir` gets the same lookup. That fallback
+/// names the session's own registration and nothing else, so it can never reach a different
+/// registered repository, and it only ever replaces a path that would drop the pre; the daemon's
+/// attachment, session and exact call-id checks still decide the pairing. Without a `project_dir`
+/// the cwd route is the only route, unchanged.
+///
+/// Returns the route plus, when the fallback carried it, the closed reason the cwd route missed
+/// (for the caller's journal warn); on failure the closed reason of the cwd route.
+fn claude_hook_route(
+    cwd: &Path,
+    project_dir: Option<&Path>,
+) -> Result<((PathBuf, String), Option<&'static str>), &'static str> {
+    let resolve = |project: &Path| -> Result<(PathBuf, String), &'static str> {
+        let key = read_claude_key_cache(project).ok_or("hook_no_key_cache")?;
+        let (runtime, _) = read_claude_attachment(&key).map_err(|_| "hook_no_rendezvous")?;
+        let attachment =
+            read_claude_candidate_attachment(project).ok_or("hook_no_candidate_attachment")?;
+        Ok((runtime, attachment))
+    };
+    let by_cwd = cwd
+        .ancestors()
+        .find(|path| read_claude_key_cache(path).is_some())
+        .ok_or("hook_no_key_cache")
+        .and_then(|project| match project_dir {
+            Some(session) if hook_repository_key(project) != hook_repository_key(session) => {
+                Err("hook_cwd_other_repository")
+            }
+            _ => resolve(project),
+        });
+    match (by_cwd, project_dir) {
+        (Ok(route), _) => Ok((route, None)),
+        (Err(miss), Some(project)) => resolve(project)
+            .map(|route| (route, Some(miss)))
+            .map_err(|_| miss),
+        (Err(miss), None) => Err(miss),
+    }
+}
+
 /// Window for one client-side hook skip: at most one journal line per detail per ten minutes.
 const HOOK_SKIP_WINDOW: Duration = Duration::from_secs(600);
 
@@ -1854,6 +1897,19 @@ fn hook_skip_window(dir: &Path, detail: &str) -> Option<u64> {
     due
 }
 
+/// Submits one argument-free managed Claude hook on the lease channel of the session's project.
+///
+/// The project is found from the payload cwd first, then from the session's own
+/// `CLAUDE_PROJECT_DIR` when the cwd finds no rendezvous (see [`claude_hook_route`]). Missing or
+/// malformed cwd, cached key, runtime, candidate attachment, or daemon returns silently to Claude
+/// while recording a closed, path-free reason in the repository error log; a pre that paired only
+/// through the fallback also leaves a per-call `warn` naming why the cwd route missed.
+/// Per EYES-r2 §3, this never spawns `git` itself and so never risks the existing bounded 250 ms
+/// total deadline on that account: the rendezvous key is only ever read from
+/// [`read_claude_key_cache`], a hint the owning MCP server left behind at its own startup. Once
+/// validated, the existing bounded Claude parser, sanitized transport, exact lifecycle correlation,
+/// feedback rendering, and foreground-helper recognition remain unchanged. Closed input failure
+/// details distinguish thread startup, timeout, read, size, and cwd failures without logging input.
 async fn run_managed_claude_hook() {
     let started = tokio::time::Instant::now();
     let deadline = started + Duration::from_millis(250);
@@ -1949,24 +2005,35 @@ async fn run_managed_claude_hook() {
         log("hook_no_cwd");
         return;
     };
-    let Some(project) = cwd
-        .ancestors()
-        .find(|path| read_claude_key_cache(path).is_some())
-    else {
-        log("hook_no_key_cache");
-        return;
-    };
-    let Some(key) = read_claude_key_cache(project) else {
-        log("hook_no_key_cache");
-        return;
-    };
-    let Ok((runtime, _)) = read_claude_attachment(&key) else {
-        log("hook_no_rendezvous");
-        return;
-    };
-    let Some(attachment) = read_claude_candidate_attachment(project) else {
-        log("hook_no_candidate_attachment");
-        return;
+    // The payload cwd follows the session's shell, which can leave the project; the project the
+    // session's own MCP registered under (`CLAUDE_PROJECT_DIR`) is the fallback for that miss.
+    let project_dir = std::env::var_os("CLAUDE_PROJECT_DIR")
+        .map(PathBuf::from)
+        .and_then(|path| fs::canonicalize(path).ok());
+    let (runtime, attachment) = match claude_hook_route(&cwd, project_dir.as_deref()) {
+        Ok((route, rerouted)) => {
+            if let Some(miss) = rerouted {
+                // A per-call warn (not rate limited): this session's pre only paired because of
+                // the fallback, and the cwd route's own closed miss reason names why.
+                agent_ide::errorlog::record(
+                    agent_ide::errorlog::Method::Hook,
+                    agent_ide::errorlog::Outcome::Unavailable,
+                    agent_ide::errorlog::Fields {
+                        host: Some(HostKind::Claude),
+                        detail: Some(&format!("hook_cwd_rerouted:{miss}")),
+                        duration_ms: Some(
+                            u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+                        ),
+                        ..Default::default()
+                    },
+                );
+            }
+            route
+        }
+        Err(miss) => {
+            log(miss);
+            return;
+        }
     };
     if !agent_ide::assistance::codex_hook::run_with_payload(
         &runtime,
