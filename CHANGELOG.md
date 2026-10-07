@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.10.5 — 2026-10-07
+
 ### Fixed
 
 - A ranged `ide.read {path, ranges}` of a file no IDE language reads (a `.log`, Markdown, YAML) no longer kills the daemon's worker. Every range item used to become an `unsupported_file` refusal with no delivered file, the batch then drained the first edit source from an empty list and panicked, and the worker — the daemon's only job task — died: every later call of every session of that repository answered `internal` or hung until the transport deadline, until the daemon was replaced.
