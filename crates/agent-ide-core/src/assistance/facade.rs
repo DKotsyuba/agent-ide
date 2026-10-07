@@ -2255,6 +2255,9 @@ struct ManagedConnection {
     /// Each actor's last admitted start parameters on a current managed Claude daemon, keyed by
     /// the daemon's private actor tag, oldest first, at most [`MAX_REMEMBERED_ACTORS`].
     remembered: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+    /// Set once the bounded memory above evicted an actor that may still be active: from then on
+    /// the session may hold actors it no longer remembers, so no actor is assumed gone.
+    memory_overflowed: Arc<std::sync::atomic::AtomicBool>,
     /// Orders every start and stop (identity query, dispatch, memory update), each actor
     /// recovery and lease-driven recovery, so remembered starts follow the daemon's own order.
     lifecycle: Arc<Mutex<()>>,
@@ -2277,6 +2280,7 @@ impl ManagedConnection {
             candidate: Arc::new(Mutex::new(None)),
             last_activation: Arc::new(Mutex::new(None)),
             remembered: Arc::new(std::sync::Mutex::new(Vec::new())),
+            memory_overflowed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lifecycle: Arc::new(Mutex::new(())),
             recovery_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             replaced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2335,6 +2339,8 @@ impl ManagedConnection {
         remembered.retain(|(known, _)| known != &tag);
         if remembered.len() >= MAX_REMEMBERED_ACTORS {
             remembered.remove(0);
+            self.memory_overflowed
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         remembered.push((tag, parameters));
     }
@@ -2355,6 +2361,21 @@ impl ManagedConnection {
             .iter()
             .find(|(known, _)| known == tag)
             .map(|(_, parameters)| parameters.clone())
+    }
+
+    /// Reports whether the session has actors other than this call's own, so a start naming
+    /// another repository must not move the session away from them (F-02).
+    ///
+    /// `caller` is the actor tag the refusal identified, when it did. Every remembered actor
+    /// except the caller counts; for an unidentified caller the older daemon's single remembered
+    /// activation counts too; and once the bounded memory evicted an actor that may still be
+    /// active, the answer stays `true` — an evicted actor is never assumed gone.
+    async fn has_other_actors(&self, caller: Option<&str>) -> bool {
+        !self.remembered_tags(caller).is_empty()
+            || (caller.is_none() && self.last_activation.lock().await.is_some())
+            || self
+                .memory_overflowed
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Returns every remembered actor tag except `exclude`.
@@ -2691,8 +2712,7 @@ impl StdioFacade {
             // Other actors of this session (every remembered actor except this call's own, when
             // the refusal identified it) work in the bound repository: a move to another
             // repository would strand them.
-            let others = !reconnect.remembered_tags(tag.as_deref()).is_empty()
-                || (tag.is_none() && reconnect.last_activation.lock().await.is_some());
+            let others = reconnect.has_other_actors(tag.as_deref()).await;
             match reroot(target.clone(), others).await {
                 RerootOutcome::Attached(new_runtime, new_attachment, candidate) => {
                     reconnect
@@ -5498,6 +5518,34 @@ mod managed_claude_front_tests {
                 "{text}"
             );
         }
+    }
+
+    /// F-02: an actor the bounded recovery memory evicted may still be active, so the reroot
+    /// guard keeps counting other actors after the overflow even when every remembered one has
+    /// stopped.
+    #[tokio::test]
+    async fn evicted_actor_still_counts_as_another_actor_for_the_reroot_guard() {
+        let daemon = ScriptedDaemon::new("agent-ide.sock");
+        let front = daemon.front(Arc::new(|| Box::pin(async { None })));
+        let reconnect = front.reconnect.clone().unwrap();
+        assert!(!reconnect.has_other_actors(None).await);
+        for index in 0..=MAX_REMEMBERED_ACTORS {
+            reconnect.remember(format!("actor-{index}"), json!({}));
+        }
+        // Actor 0 was evicted from the memory; every remembered actor then stops.
+        assert!(
+            !reconnect
+                .remembered_tags(None)
+                .contains(&"actor-0".to_owned())
+        );
+        for index in 1..=MAX_REMEMBERED_ACTORS {
+            reconnect.forget(&format!("actor-{index}"));
+        }
+        assert!(reconnect.remembered_tags(None).is_empty());
+        assert!(
+            reconnect.has_other_actors(Some("a-new-actor")).await,
+            "the evicted actor may still be active"
+        );
     }
 
     /// A tagged start discards the anonymous 0.10.2 slot and its pending eager recovery.
