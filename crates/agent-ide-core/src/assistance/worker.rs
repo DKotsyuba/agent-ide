@@ -3680,11 +3680,24 @@ impl<'a> Worker<'a> {
             .map_err(|_| FailureCode::WorkspaceAuthority)
     }
 
-    /// Reads and persists one registered file under fresh durable authority, preserving missing state.
+    /// Reads and persists one registered file under fresh durable authority, preserving missing
+    /// state. The read counts as a use of the path in the registered-path working set.
     async fn observe(
         &mut self,
         binding: &BindingRef,
         path: std::path::PathBuf,
+    ) -> Result<(SourceObservation, Vec<u8>), FailureCode> {
+        self.observe_as(binding, path, true).await
+    }
+
+    /// [`Self::observe`], with `used` saying whether the read answers a request (and so refreshes
+    /// the path's last-use time) or is maintenance — a native-hint refresh of every registered
+    /// path — that must keep the path's real age, so paths nobody asks for still retire.
+    async fn observe_as(
+        &mut self,
+        binding: &BindingRef,
+        path: std::path::PathBuf,
+        used: bool,
     ) -> Result<(SourceObservation, Vec<u8>), FailureCode> {
         use crate::workspace::{
             observation::{
@@ -3771,10 +3784,12 @@ impl<'a> Worker<'a> {
             return Err(FailureCode::SourceUnavailable);
         };
         self.shared.active(binding)?;
-        self.registered
-            .entry(binding.clone())
-            .or_default()
-            .insert(path);
+        let paths = self.registered.entry(binding.clone()).or_default();
+        if used {
+            paths.insert(path);
+        } else {
+            paths.keep(path);
+        }
         Ok((observed, bytes))
     }
 
@@ -3823,7 +3838,8 @@ impl<'a> Worker<'a> {
                 if *job.cancel.borrow() || tokio::time::Instant::now() >= job.deadline {
                     break;
                 }
-                if self.observe(binding, path).await.is_err() {
+                // Maintenance, not a request: the refresh keeps each path's real last-use time.
+                if self.observe_as(binding, path, false).await.is_err() {
                     break;
                 }
             }
@@ -5995,6 +6011,12 @@ impl RegisteredPaths {
     /// Registers `path` as last used at `used`.
     fn insert_used_at(&mut self, path: std::path::PathBuf, used: tokio::time::Instant) {
         self.0.insert(path, used);
+    }
+
+    /// Keeps `path` registered without touching its last-use time (registering it as used now
+    /// only when it was not registered).
+    fn keep(&mut self, path: std::path::PathBuf) {
+        self.0.entry(path).or_insert_with(tokio::time::Instant::now);
     }
 
     /// Reports whether `path` is registered.
@@ -8223,6 +8245,7 @@ mod stop_retry_tests {
         let store = fixture.store();
         let workspace = DurableWorkspace::open(&store).await.unwrap();
         let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
         let (binding, _) = production_start(&mut worker, "actor-1", "call-1").await;
         std::fs::write(fixture.root.join("fresh.txt"), "fresh\n").unwrap();
         std::fs::write(fixture.root.join("known.txt"), "known\n").unwrap();
@@ -8275,6 +8298,56 @@ mod stop_retry_tests {
             [std::path::PathBuf::from("known.txt")],
             "only the idle paths were retired; the one used recently stays"
         );
+    }
+
+    /// F-25: a native-hint refresh re-reads every registered path but keeps each path's real age,
+    /// so a path nobody asks for still retires at a full budget however often hooks fire.
+    #[tokio::test]
+    async fn maintenance_refresh_does_not_keep_unused_registered_paths_alive() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, _) = production_start(&mut worker, "actor-1", "call-1").await;
+        std::fs::write(fixture.root.join("stale.txt"), "stale\n").unwrap();
+        std::fs::write(fixture.root.join("asked.txt"), "asked\n").unwrap();
+        let now = tokio::time::Instant::now();
+        let idle = now
+            .checked_sub(REGISTERED_PATH_IDLE + Duration::from_secs(1))
+            .unwrap();
+        let paths = worker.registered.entry(binding.clone()).or_default();
+        paths.insert_used_at(std::path::PathBuf::from("stale.txt"), idle);
+        paths.insert_used_at(std::path::PathBuf::from("asked.txt"), idle);
+        for index in 0..MAX_REGISTERED_PATHS - 2 {
+            paths.insert_used_at(std::path::PathBuf::from(format!("used-{index}.txt")), now);
+        }
+        assert_eq!(paths.len(), MAX_REGISTERED_PATHS);
+
+        // The hook-driven refresh re-reads the stale path; it stays idle.
+        worker
+            .observe_as(&binding, std::path::PathBuf::from("stale.txt"), false)
+            .await
+            .expect("the maintenance read succeeds");
+        // An agent's own read of another path refreshes that path's age.
+        worker
+            .observe(&binding, std::path::PathBuf::from("asked.txt"))
+            .await
+            .expect("the requested read succeeds");
+
+        // At the full budget the idle stale path retires to admit a new one; the asked one stays.
+        assert!(
+            worker
+                .admit_registered_path(&binding, std::path::Path::new("new.txt"))
+                .is_ok()
+        );
+        let kept = worker.registered[&binding].paths();
+        assert!(
+            !kept.contains(&std::path::PathBuf::from("stale.txt")),
+            "{kept:?}"
+        );
+        assert!(kept.contains(&std::path::PathBuf::from("asked.txt")));
+        assert_eq!(kept.len(), MAX_REGISTERED_PATHS - 1);
     }
 
     /// F-12: the daemon retries a transiently busy stop itself, by its operation id, so the agent
