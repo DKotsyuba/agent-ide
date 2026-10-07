@@ -7899,7 +7899,7 @@ mod stop_retry_tests {
         assert_eq!(outcome, Err(FailureCode::ProviderUnavailable));
         assert_eq!(
             detail.as_deref(),
-            Some("symbol:provider_unavailable ext=delta"),
+            Some("symbol:provider_unavailable ext=delta (provider: no server for this file type)"),
             "a file type no server serves keeps the no-server form"
         );
 

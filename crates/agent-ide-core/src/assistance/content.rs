@@ -298,7 +298,8 @@ fn resolution_message(detail: &str) -> &str {
         return detail;
     };
     if let Some(extension) = stage_detail.strip_prefix("provider_unavailable ext=") {
-        return extension;
+        // The extension ends at the space before the trailing parenthesised stage, when present.
+        return extension.split(' ').next().unwrap_or(extension);
     }
     stage_detail
         .split_once(':')
@@ -1410,6 +1411,11 @@ mod tests {
                 FailureCode::ProviderUnavailable,
                 "outline:provider_unavailable ext=md",
                 "error: provider_unavailable (outline:no_server); no language server is configured for .md files in this project. Continue with native tools",
+            ),
+            (
+                FailureCode::ProviderUnavailable,
+                "symbol:provider_unavailable ext=md (provider: no server for this file type)",
+                "error: provider_unavailable (symbol:no_server); no language server is configured for .md files in this project. Continue with native tools",
             ),
             (
                 FailureCode::ProviderUnavailable,

@@ -847,15 +847,19 @@ pub(super) struct CacheRequest {
 }
 
 /// Names the stage of a provider refusal that is a real "no language server for this file type"
-/// answer: the `<tool>:provider_unavailable ext=<extension>` shape the reply template renders as
-/// `no language server is configured for .<extension> files`. Only a path with no accepted server
-/// may use it; every other `ProviderUnavailable` carries its own parenthesised stage.
+/// answer: `<tool>:provider_unavailable ext=<extension> (provider: no server for this file type)`.
+///
+/// The leading `ext=` shape is what the reply template renders as `no language server is
+/// configured for .<extension> files`; the trailing parenthesised stage keeps the journal line and
+/// the structured detail uniform with every other provider refusal. Only a path with no accepted
+/// server may use it; every other `ProviderUnavailable` carries its own parenthesised stage.
 fn set_no_server_stage(job: &mut Job) {
-    job.failure_detail = Some(crate::assistance::facade::staged_detail(
+    let shape = crate::assistance::facade::staged_detail(
         job.tool,
         &FailureCode::ProviderUnavailable,
         &job.parameters,
-    ));
+    );
+    job.failure_detail = Some(format!("{shape} (provider: no server for this file type)"));
 }
 
 /// Parks `job` for a retry in 300 ms because its language server is still loading; the caller
