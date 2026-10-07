@@ -634,6 +634,10 @@ fn doctor_keeps_runtimes_with_a_held_or_unsafe_lock() {
     let free = make("ai-3333333333333333");
     drop(lock_file(&free));
     age(&free);
+    // Missing: an old runtime whose front died before any daemon created its lock; doctor
+    // creates and holds the lock itself before it removes the tree.
+    let missing = make("ai-4444444444444444");
+    age(&missing);
     let output = agent_ide()
         .arg("doctor")
         .env(HOME_OVERRIDE_ENV, &layout.root)
@@ -644,6 +648,10 @@ fn doctor_keeps_runtimes_with_a_held_or_unsafe_lock() {
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !missing.exists(),
+        "an abandoned runtime without a lock stays"
     );
     assert!(held.exists(), "a runtime with a held lock was removed");
     assert!(

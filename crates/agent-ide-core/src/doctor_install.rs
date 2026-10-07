@@ -520,8 +520,32 @@ enum Retired {
 /// start in the directory, and its device, inode, owner, mode and age are checked again before
 /// the removal, so a directory another front replaced meanwhile is never removed.
 fn retire_abandoned_runtime(path: &Path, judged: &fs::Metadata) -> Retired {
+    // The same directory (device, inode, owner, mode) as the one judged.
+    let same_directory = |now: &fs::Metadata| {
+        now.is_dir()
+            && now.dev() == judged.dev()
+            && now.ino() == judged.ino()
+            && now.uid() == judged.uid()
+            && now.mode() == judged.mode()
+    };
+    // Untouched since it was judged and old enough: nothing was written into it meanwhile.
+    let untouched = fs::symlink_metadata(path).is_ok_and(|now| {
+        same_directory(&now)
+            && now.modified().ok() == judged.modified().ok()
+            && judged
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > STALE_RUNTIME_AGE)
+    });
+    if !untouched {
+        return Retired::Kept;
+    }
     let lock_path = path.join(crate::app::LOCK_NAME);
-    let lock = match fs::symlink_metadata(&lock_path) {
+    // A runtime that never got its lock (its front died before the daemon started) gets one
+    // created exclusively now, so removal is always under a lock a starting daemon would contend
+    // for; losing the creation race means a daemon is already there.
+    match fs::symlink_metadata(&lock_path) {
         Ok(lock) => {
             if !lock.is_file()
                 || lock.uid() != unsafe { libc::geteuid() }
@@ -529,39 +553,36 @@ fn retire_abandoned_runtime(path: &Path, judged: &fs::Metadata) -> Retired {
             {
                 return Retired::Kept;
             }
-            match fs::OpenOptions::new()
-                .read(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if fs::OpenOptions::new()
                 .write(true)
+                .create_new(true)
+                .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(&lock_path)
+                .is_err()
             {
-                Ok(file) => Some(file),
-                Err(_) => return Retired::Kept,
+                return Retired::Kept;
             }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => return Retired::Kept,
-    };
-    if let Some(file) = &lock {
-        // SAFETY: `flock` only locks the descriptor this function owns.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Retired::Kept;
-        }
     }
-    let Ok(now) = fs::symlink_metadata(path) else {
+    let Ok(lock) = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path)
+    else {
         return Retired::Kept;
     };
-    let unchanged = now.is_dir()
-        && now.dev() == judged.dev()
-        && now.ino() == judged.ino()
-        && now.uid() == judged.uid()
-        && now.mode() == judged.mode()
-        && now
-            .modified()
-            .ok()
-            .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age > STALE_RUNTIME_AGE);
-    if !unchanged {
+    // SAFETY: `flock` only locks the descriptor this function owns.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Retired::Kept;
+    }
+    // The lock may have just been created here, which touches the directory: only the identity
+    // is checked again now, the age was established before.
+    if !fs::symlink_metadata(path).is_ok_and(|now| same_directory(&now)) {
         return Retired::Kept;
     }
     // The lock stays held (the descriptor lives to the end of this function) while the tree goes.
