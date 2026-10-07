@@ -2411,19 +2411,53 @@ async fn run_managed_claude_mcp(
 /// next tool call re-runs the remembered activation itself. A failed heal retries at a bounded
 /// cadence; nothing here can block or fail the MCP's serving loop.
 async fn watch_claude_lease(lease: Arc<Mutex<Option<UnixStream>>>, facade: StdioFacade) {
+    follow_lease(lease, || facade.recover_lost_daemon()).await;
+}
+
+/// How often the lease watcher checks whether a newer lease replaced the one it is reading.
+const LEASE_SWAP_POLL: Duration = Duration::from_millis(250);
+
+/// Follows whichever lease `lease` currently holds, forever (F-03).
+///
+/// The watcher takes the stored stream and reads it until the daemon ends it, then calls `heal`
+/// until it reports a fresh daemon attached (which stores a new lease). A re-root or reconnect
+/// that stores a newer lease while the watcher is still reading the old one makes the watcher drop
+/// the old stream — so the old daemon can idle out — and follow the new one, whose daemon's death
+/// it must notice. Never returns.
+async fn follow_lease<Heal, Healed>(lease: Arc<Mutex<Option<UnixStream>>>, mut heal: Heal)
+where
+    Heal: FnMut() -> Healed,
+    Healed: std::future::Future<Output = bool>,
+{
+    use tokio::io::AsyncReadExt as _;
     loop {
         let stream = lease.lock().await.take();
         let Some(mut stream) = stream else {
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
         };
-        let mut discard = [0_u8; 256];
-        use tokio::io::AsyncReadExt as _;
-        while matches!(stream.read(&mut discard).await, Ok(read) if read > 0) {}
-        // This generation ended; heal until a fresh one is attached, then watch its stream.
-        while !facade.recover_lost_daemon().await {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+        let ended = async {
+            let mut discard = [0_u8; 256];
+            while matches!(stream.read(&mut discard).await, Ok(read) if read > 0) {}
+        };
+        let replaced = async {
+            loop {
+                tokio::time::sleep(LEASE_SWAP_POLL).await;
+                if lease.lock().await.is_some() {
+                    break;
+                }
+            }
+        };
+        tokio::select! {
+            () = ended => {
+                // This generation ended; heal until a fresh one is attached, then watch it.
+                while !heal().await {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+            () = replaced => {}
         }
+        // `stream` is dropped here: on a replacement that closes the old daemon's lease.
     }
 }
 
@@ -3750,6 +3784,49 @@ mod tests {
                 }
             })
         );
+    }
+
+    /// F-03: when a newer lease replaces the one the watcher is reading, the watcher closes the old
+    /// stream (so the old daemon can idle out) and then notices the new daemon's death.
+    #[tokio::test]
+    async fn lease_watcher_follows_a_replaced_lease() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::AsyncReadExt as _;
+        let (old_lease, mut old_daemon) = UnixStream::pair().unwrap();
+        let (new_lease, new_daemon) = UnixStream::pair().unwrap();
+        let lease = Arc::new(Mutex::new(Some(old_lease)));
+        let healed = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&healed);
+        let watcher = tokio::spawn(follow_lease(Arc::clone(&lease), move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(true)
+        }));
+        // Wait until the watcher has taken the old stream, then swap in a newer lease exactly as
+        // a re-root's attach does.
+        while lease.lock().await.is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        *lease.lock().await = Some(new_lease);
+        let mut byte = [0_u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(3), old_daemon.read(&mut byte))
+            .await
+            .expect("the watcher must drop the replaced lease stream");
+        assert_eq!(closed.unwrap(), 0, "the old daemon sees its lease closed");
+        assert_eq!(
+            healed.load(Ordering::SeqCst),
+            0,
+            "a swap is not a lost daemon"
+        );
+        // The new daemon dies: the watcher must notice and heal exactly once.
+        drop(new_daemon);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while healed.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the death of the new daemon must be noticed");
+        watcher.abort();
     }
 
     /// Retires the managed Codex publication exactly when the owned daemon child exit is observed.
