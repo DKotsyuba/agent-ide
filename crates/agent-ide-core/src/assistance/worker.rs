@@ -1342,6 +1342,8 @@ impl WorkerHandle {
                 pending_revocations: std::collections::BTreeSet::new(),
                 stop_cause: None,
                 stop_attempts: Arc::default(),
+                revoke_retry_rounds: 0,
+                next_revoke_retry: None,
                 registered: BTreeMap::new(),
                 refusal_detail: None,
                 baselines: BTreeMap::new(),
@@ -2111,6 +2113,10 @@ struct Worker<'a> {
     /// Durable revoke attempts this worker has started, across all stops; read by tests that
     /// release a held store lock only once the daemon's own retry began.
     stop_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    /// Consecutive background retry rounds that left a revoke pending; drives the retry backoff.
+    revoke_retry_rounds: u32,
+    /// When the next background retry of the pending revokes is due; `None` while none is pending.
+    next_revoke_retry: Option<tokio::time::Instant>,
     /// Only explicitly requested paths are polled; no directory scanning is performed.
     registered: BTreeMap<BindingRef, RegisteredPaths>,
     /// Closed `detail` of the last refusal a job path decided without a job at hand (the
@@ -2636,6 +2642,12 @@ impl<'a> Worker<'a> {
                 }
                 return;
             }
+            // Failed stops stay pending and the daemon retries them itself (F-12), between jobs
+            // as well as when idle, on a doubling schedule.
+            let retry = self.schedule_revoke_retry();
+            if retry.is_some_and(|due| tokio::time::Instant::now() >= due) {
+                self.retry_pending_revocations().await;
+            }
             let shared = self.shared.clone();
             let wake = shared.notify.notified();
             // The in-flight count moves in the same locked section as the pop, so "queue empty
@@ -2663,13 +2675,21 @@ impl<'a> Worker<'a> {
                         }
                     }
                 }
-                None => match earliest {
-                    Some(until) => tokio::select! {
-                        _ = wake => {},
-                        _ = tokio::time::sleep_until(until) => {},
-                    },
-                    None => wake.await,
-                },
+                None => {
+                    // The idle worker also wakes when the next background retry is due.
+                    let retry = self.schedule_revoke_retry();
+                    let until = match (earliest, retry) {
+                        (Some(job), Some(retry)) => Some(job.min(retry)),
+                        (job, retry) => job.or(retry),
+                    };
+                    match until {
+                        Some(until) => tokio::select! {
+                            _ = wake => {},
+                            _ = tokio::time::sleep_until(until) => {},
+                        },
+                        None => wake.await,
+                    }
+                }
             }
         }
     }
@@ -4885,6 +4905,38 @@ impl<'a> Worker<'a> {
         }
     }
 
+    /// Returns when the next background retry of the pending revokes is due, scheduling it one
+    /// backoff step ahead when none is scheduled yet, or `None` while no revoke is pending.
+    fn schedule_revoke_retry(&mut self) -> Option<tokio::time::Instant> {
+        if self.pending_revocations.is_empty() {
+            self.revoke_retry_rounds = 0;
+            self.next_revoke_retry = None;
+            return None;
+        }
+        let rounds = self.revoke_retry_rounds;
+        Some(
+            *self
+                .next_revoke_retry
+                .get_or_insert_with(|| tokio::time::Instant::now() + revoke_retry_delay(rounds)),
+        )
+    }
+
+    /// Retries every pending revoke with its original operation id, as the daemon's own
+    /// background cleanup: each success releases the grant, caches, paths and lease; each failure
+    /// stays pending for the next, later round.
+    async fn retry_pending_revocations(&mut self) {
+        let pending = self.pending_revocations.iter().cloned().collect::<Vec<_>>();
+        for binding in pending {
+            let _ = self.settle_revocation(&binding).await;
+        }
+        self.next_revoke_retry = None;
+        self.revoke_retry_rounds = if self.pending_revocations.is_empty() {
+            0
+        } else {
+            self.revoke_retry_rounds.saturating_add(1)
+        };
+    }
+
     /// Revokes a recoverable receipt after host stop; absent grants are explicitly harmless.
     ///
     /// The reply also names the test runs this binding started but never collected — passed in by
@@ -4895,6 +4947,7 @@ impl<'a> Worker<'a> {
         binding: &BindingRef,
         uncollected: &[String],
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        self.stop_cause = None;
         let revoked = self.settle_revocation(binding).await?;
         if self.uncertain.contains(binding) {
             return Err(FailureCode::Internal);
@@ -5964,6 +6017,19 @@ impl RegisteredPaths {
         self.0
             .retain(|_, used| now.saturating_duration_since(*used) < REGISTERED_PATH_IDLE);
     }
+}
+
+/// First pause before the daemon's own background retry of a pending revoke; each further round
+/// doubles it, up to [`PENDING_REVOKE_RETRY_MAX`].
+const PENDING_REVOKE_RETRY_FIRST: Duration = Duration::from_secs(1);
+/// Longest pause between two background retry rounds of a pending revoke.
+const PENDING_REVOKE_RETRY_MAX: Duration = Duration::from_secs(16);
+
+/// Returns the pause before background retry round `rounds` (0 first): 1 s doubling to 16 s.
+fn revoke_retry_delay(rounds: u32) -> Duration {
+    PENDING_REVOKE_RETRY_FIRST
+        .saturating_mul(1_u32.checked_shl(rounds).unwrap_or(u32::MAX))
+        .min(PENDING_REVOKE_RETRY_MAX)
 }
 
 /// Attempts of one durable revoke before a transient store failure is reported (F-12).
@@ -7499,6 +7565,8 @@ mod stop_retry_tests {
             pending_revocations: std::collections::BTreeSet::new(),
             stop_cause: None,
             stop_attempts: Arc::default(),
+            revoke_retry_rounds: 0,
+            next_revoke_retry: None,
             registered: BTreeMap::new(),
             refusal_detail: None,
             baselines: BTreeMap::new(),
@@ -8245,6 +8313,67 @@ mod stop_retry_tests {
         assert!(worker.grants.is_empty());
         assert!(worker.pending_revocations.is_empty());
         assert_eq!(worker.stop_cause, None);
+    }
+
+    /// F-12: a stop whose store stays locked past the inline attempts stays pending, is scheduled
+    /// for the daemon's own background retry, and is committed by that retry once the store
+    /// answers — with no further tool call from the agent.
+    #[tokio::test]
+    async fn pending_stop_is_retried_by_the_daemon_until_the_store_answers() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        let (binding, _) = production_start(&mut worker, "actor-1", "call-1").await;
+        worker
+            .shared
+            .bindings
+            .lock()
+            .unwrap()
+            .stop_binding(&binding)
+            .unwrap();
+        assert!(
+            worker.schedule_revoke_retry().is_none(),
+            "nothing pending yet"
+        );
+
+        let lock = rusqlite::Connection::open(fixture.base.join("state.sqlite")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let failed = worker.revoke(&binding, &[]).await;
+        assert!(matches!(failed, Err(FailureCode::Capacity)), "{failed:?}");
+        assert!(worker.pending_revocations.contains(&binding));
+        assert!(
+            worker.schedule_revoke_retry().is_some(),
+            "a pending revoke is scheduled for a background retry"
+        );
+
+        // A background round while the store is still locked changes nothing and backs off.
+        worker.retry_pending_revocations().await;
+        assert!(worker.pending_revocations.contains(&binding));
+        assert_eq!(worker.revoke_retry_rounds, 1);
+
+        // The store answers again: the next background round commits the same revoke.
+        lock.execute_batch("ROLLBACK;").unwrap();
+        drop(lock);
+        worker.retry_pending_revocations().await;
+        assert!(worker.pending_revocations.is_empty());
+        assert!(worker.grants.is_empty());
+        assert_eq!(worker.revoke_retry_rounds, 0);
+        assert!(worker.schedule_revoke_retry().is_none());
+    }
+
+    /// F-12: the background retry pause doubles from one second to a ceiling of sixteen.
+    #[test]
+    fn background_revoke_retry_backs_off_to_a_ceiling() {
+        let seconds = |rounds| revoke_retry_delay(rounds).as_secs();
+        assert_eq!(
+            [seconds(0), seconds(1), seconds(2), seconds(3), seconds(4)],
+            [1, 2, 4, 8, 16]
+        );
+        assert_eq!(
+            [seconds(5), seconds(31), seconds(32), seconds(u32::MAX)],
+            [16; 4]
+        );
     }
 
     /// F-12: every durable stop failure names its closed typed cause.

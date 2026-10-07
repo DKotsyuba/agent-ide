@@ -1478,22 +1478,22 @@ mod tests {
             (
                 FailureCode::Capacity,
                 "stop:busy",
-                "error: capacity (stop:busy); the IDE's state store stayed busy, so this stop was not recorded and its grant is still held. The IDE retried it already; repeat ide.stop in a moment",
+                "error: capacity (stop:busy); the IDE's state store stayed busy, so this stop is not recorded yet and its grant is still held. The IDE keeps retrying it itself; nothing more is needed",
             ),
             (
                 FailureCode::Capacity,
                 "stop:store_full",
-                "error: capacity (stop:store_full); the IDE's state store for this repository is full, so this stop was not recorded and its grant is still held. Repeating will not help: end this repository's IDE sessions so it restarts, or continue with native tools",
+                "error: capacity (stop:store_full); the IDE's state store for this repository is full, so this stop cannot be recorded and its grant stays held. The IDE keeps retrying, but a full store only clears when every IDE session of this repository ends and it restarts; continue with native tools",
             ),
             (
                 FailureCode::Deadline,
                 "stop:store_deadline",
-                "error: deadline (stop:store_deadline); recording this stop took too long and may still complete. Repeat ide.stop, or call ide.start to check the session",
+                "error: deadline (stop:store_deadline); recording this stop took too long and may still complete. The IDE keeps retrying it with the same operation id, so nothing more is needed",
             ),
             (
                 FailureCode::WorkspaceAuthority,
                 "stop:store_unavailable",
-                "error: workspace_authority (stop:store_unavailable); the IDE's state store could not record this stop, so its grant is still held. Repeat ide.stop later, or continue with native tools",
+                "error: workspace_authority (stop:store_unavailable); the IDE's state store could not record this stop, so its grant is still held. The IDE keeps retrying it itself; continue with native tools",
             ),
             (
                 FailureCode::WorkspaceAuthority,

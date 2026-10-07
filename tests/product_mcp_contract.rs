@@ -21177,3 +21177,54 @@ async fn owned_daemon_kill_reaps_a_provider_forked_during_the_kill() {
         );
     }
 }
+
+/// F-12: a stop the store could not record is retried by the daemon itself, with no further call
+/// from the agent: the durable grant is revoked once the store answers again.
+///
+/// The test holds the state store's write lock across the stop and its inline attempts, then
+/// releases it and only watches the database — it never calls the daemon again.
+#[tokio::test]
+async fn failed_stop_is_retried_by_the_daemon_without_another_call() {
+    let fixture = ProductFixture::new(json!([]));
+    let _daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "stop-retry").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"retry"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let database = fixture.runtime.join("state.sqlite");
+    let active = |database: &Path| -> i64 {
+        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .and_then(|connection| {
+                connection.query_row(
+                    "SELECT COUNT(*) FROM workspace_starts WHERE active=1",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap_or(-1)
+    };
+    assert_eq!(active(&database), 1, "the start holds one durable grant");
+
+    let lock = rusqlite::Connection::open(&database).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let stop = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_ne!(
+        stop["kind"], "stop",
+        "the stop cannot commit under the lock: {stop}"
+    );
+    // Longer than both inline attempts of the revoke, so only a background retry can finish it.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(active(&database), 1, "still held while the store is locked");
+    lock.execute_batch("ROLLBACK;").unwrap();
+    drop(lock);
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while active(&database) != 0 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("the daemon's own retry must revoke the grant without another call");
+    actor.mcp.close().await;
+}

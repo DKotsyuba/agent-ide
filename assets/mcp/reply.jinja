@@ -213,13 +213,13 @@ error: unsupported_git{% if resolution_detail %} ({{ resolution_detail }}){% els
 error: launcher_configuration{% if resolution_detail %} ({{ resolution_detail }}){% else %} (start:launcher_configuration){% endif %}; the IDE could not match this session to its launch configuration. Call ide.start again, or continue with native tools
 {%- elif resolution_detail in ["stop:busy", "stop:store_full", "stop:store_deadline", "stop:store_unavailable", "stop:authority"] -%}
 {%- if resolution_detail == "stop:busy" -%}
-error: {{ code }} (stop:busy); the IDE's state store stayed busy, so this stop was not recorded and its grant is still held. The IDE retried it already; repeat ide.stop in a moment
+error: {{ code }} (stop:busy); the IDE's state store stayed busy, so this stop is not recorded yet and its grant is still held. The IDE keeps retrying it itself; nothing more is needed
 {%- elif resolution_detail == "stop:store_full" -%}
-error: {{ code }} (stop:store_full); the IDE's state store for this repository is full, so this stop was not recorded and its grant is still held. Repeating will not help: end this repository's IDE sessions so it restarts, or continue with native tools
+error: {{ code }} (stop:store_full); the IDE's state store for this repository is full, so this stop cannot be recorded and its grant stays held. The IDE keeps retrying, but a full store only clears when every IDE session of this repository ends and it restarts; continue with native tools
 {%- elif resolution_detail == "stop:store_deadline" -%}
-error: {{ code }} (stop:store_deadline); recording this stop took too long and may still complete. Repeat ide.stop, or call ide.start to check the session
+error: {{ code }} (stop:store_deadline); recording this stop took too long and may still complete. The IDE keeps retrying it with the same operation id, so nothing more is needed
 {%- elif resolution_detail == "stop:store_unavailable" -%}
-error: {{ code }} (stop:store_unavailable); the IDE's state store could not record this stop, so its grant is still held. Repeat ide.stop later, or continue with native tools
+error: {{ code }} (stop:store_unavailable); the IDE's state store could not record this stop, so its grant is still held. The IDE keeps retrying it itself; continue with native tools
 {%- else -%}
 error: {{ code }} (stop:authority); this stop conflicts with the recorded activation. Call ide.start to see the current binding, then repeat ide.stop
 {%- endif -%}

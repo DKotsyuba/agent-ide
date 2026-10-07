@@ -295,10 +295,11 @@ loading — `ide.context {"kind":"problems"}` shows the project check.
 8. `ide.stop` at handoff to another actor, or when the task ends, to release this binding's
    activation (`activation_id` is optional). Its reply lists test runs you have not collected;
    read them with `ide.inspect {"detail_ref":"tests #N"}` before reporting results.
-   A stop that could not be recorded names its cause: `capacity (stop:busy)` (the daemon already
-   retried once; repeat `ide.stop` in a moment), `capacity (stop:store_full)` (the repository's
-   state store is full: end its sessions so it restarts), `deadline (stop:store_deadline)` or
-   `workspace_authority (stop:store_unavailable)`; the grant stays held until a later retry.
+   A stop that could not be recorded names its cause: `capacity (stop:busy)`, `capacity
+   (stop:store_full)` (the repository's state store is full: it clears only when every session
+   of the repository ends), `deadline (stop:store_deadline)` or `workspace_authority
+   (stop:store_unavailable)`. The daemon keeps retrying the stop itself with the same operation
+   id, so there is nothing to repeat.
 
 ## Project problem feed
 
