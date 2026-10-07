@@ -5983,6 +5983,55 @@ async fn a_full_file_edit_without_source_ref_creates_only_a_missing_file() {
     daemon.wait().await.unwrap();
 }
 
+/// `ide.read {path, ranges}` on a file no IDE language reads (a test log) answers its ranges like
+/// `{path, lines}` does, and the daemon's sole worker survives it: a later read still answers.
+///
+/// Regression for the 2026-10-07 field incident, where every range item of such a file became a
+/// per-item `unsupported_file` refusal with no delivered file, `read_batch` drained the first edit
+/// source from an empty list, the worker task panicked, and every later call of that daemon
+/// answered `internal` (or hung into a transport timeout) until the daemon was replaced.
+#[tokio::test]
+async fn ranges_read_of_a_non_language_file_answers_and_keeps_the_worker_alive() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(fixture.root.join("test.log"), "one\ntwo\nthree\n").unwrap();
+    fixture.git(&["add", "--", "test.log"]);
+    fixture.git(&["commit", "--quiet", "-m", "log fixture"]);
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "ranges-log").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"ranges-log"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let ranges = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"test.log","ranges":["1-1","3-3"]}),
+        )
+        .await;
+    let ranges = actor.settle(&fixture, ranges).await;
+    // Both calls run before any assertion, so a failure shows whether the worker survived.
+    let after = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"test.log","lines":"2-2"}),
+        )
+        .await;
+    let after = actor.settle(&fixture, after).await;
+    let text = ranges["text"].as_str().unwrap_or_default();
+    assert!(
+        ranges["kind"] == "read" && text.contains("1\tone") && text.contains("3\tthree"),
+        "ranges: {ranges}; later read: {after}"
+    );
+    assert_eq!(after["kind"], "read", "the worker must survive: {after}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A session that never calls `ide.start` produces hook bookkeeping, not failures: one `info`
 /// skip line per detail per window on each side, and no `warn` hook line at all.
 #[tokio::test]

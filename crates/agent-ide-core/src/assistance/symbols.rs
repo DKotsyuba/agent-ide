@@ -299,7 +299,7 @@ impl Worker<'_> {
         let binding = job.invocation.binding_ref().clone();
         // One observation, one outline and one finish per distinct file; items reference files
         // by index so request order survives.
-        let mut files: Vec<(PathBuf, SourceObservation, String, Outline)> = Vec::new();
+        let mut files: Vec<(PathBuf, SourceObservation, String, Option<Outline>)> = Vec::new();
         // (rendered block, the file whose observation it retains, the address exactly as
         // requested) — duplicates never become items, so an item's own address is what the
         // continuation footer must name, never an index back into `requested`.
@@ -326,7 +326,7 @@ impl Worker<'_> {
                         return Err(FailureCode::UnknownSymbol);
                     };
                     let index = match self
-                        .read_batch_file(job, &binding, &mut files, file.clone())
+                        .read_batch_file(job, &binding, &mut files, file.clone(), true)
                         .await
                     {
                         Ok(index) => index,
@@ -343,7 +343,7 @@ impl Worker<'_> {
                         Err(code) => return Err(code),
                     };
                     let (_, _, source, outline) = &files[index];
-                    match outline.find(&symbol) {
+                    match outline.as_ref().and_then(|outline| outline.find(&symbol)) {
                         Some(found) => {
                             let text = render::read_text(&file, Some(address), found.range, source);
                             items.push((text, Some(index), address.to_owned()));
@@ -368,7 +368,7 @@ impl Worker<'_> {
                         .ok_or(FailureCode::Internal)?;
                     let file = std::path::PathBuf::from(&path);
                     let index = match self
-                        .read_batch_file(job, &binding, &mut files, file.clone())
+                        .read_batch_file(job, &binding, &mut files, file.clone(), false)
                         .await
                     {
                         Ok(index) => index,
@@ -384,8 +384,7 @@ impl Worker<'_> {
                         }
                         Err(code) => return Err(code),
                     };
-                    let (_, _, source, outline) = &files[index];
-                    let _ = &outline;
+                    let (_, _, source, _) = &files[index];
                     let total = lang::line_count(source);
                     if range.start > total {
                         items.push((
@@ -558,7 +557,7 @@ impl Worker<'_> {
             self.shared.set_context_page(&job.reference, page);
             return Ok((reply, authority, Some(files[file].1.clone())));
         }
-        let job_source = sources.drain(..1).next();
+        let job_source = (!sources.is_empty()).then(|| sources.remove(0));
         self.shared.add_edit_sources(&job.reference, sources);
         let truncated = !cut.is_empty();
         let (reply, page) =
@@ -583,13 +582,15 @@ impl Worker<'_> {
     }
 
     /// Observes, outlines and finishes one file of a batch read once: every item of that file
-    /// shares the observation, the outline and the deadline/authority/source checks.
+    /// shares the observation, the outline and the deadline/authority/source checks. `outline`
+    /// is false for line ranges, which never need one, so any readable file answers them.
     async fn read_batch_file(
         &mut self,
         job: &mut Job,
         binding: &BindingRef,
-        files: &mut Vec<(PathBuf, SourceObservation, String, Outline)>,
+        files: &mut Vec<(PathBuf, SourceObservation, String, Option<Outline>)>,
         path: PathBuf,
+        outline: bool,
     ) -> Result<usize, FailureCode> {
         if let Some(index) = files.iter().position(|(file, ..)| *file == path) {
             return Ok(index);
@@ -600,7 +601,10 @@ impl Worker<'_> {
             return Err(code);
         }
         let source = observed_text(&observed, &bytes)?.to_owned();
-        let (outline, _, _) = self.outline_of(job, &observed, &bytes).await?;
+        let outline = match outline {
+            true => Some(self.outline_of(job, &observed, &bytes).await?.0),
+            false => None,
+        };
         self.finish_symbol_job(job, binding, &observed).await?;
         files.push((path, observed, source, outline));
         Ok(files.len() - 1)
