@@ -174,7 +174,7 @@ src/assistance/host_binding.rs  (2292 lines, rust)
 
 The docstring is the first displayed line. Collapse test modules to a count. For Python, show decorators; for TypeScript, show `export` and overloads on one line.
 
-Errors: `no_such_file` (the requested path does not exist in the worktree; fix the path or use `ide.symbol` with a bare name), `unsupported_file` (the file exists but no IDE language reads its type, such as `Cargo.toml` or a shell script; read it with `ide.read` `path` and `lines` or native tools — the same refusal answers `ide.read`, `ide.symbol` and `ide.graph` addressed into such a file), `outside_allowed_roots`.
+Errors: `no_such_file` (the requested path does not exist in the worktree; fix the path or use `ide.symbol` with a bare name), `unsupported_file` (the file exists but no IDE language reads its type, such as `Cargo.toml` or a shell script; read its text with `ide.read` `path` and `lines` or `ranges`, or native tools — the same refusal answers `ide.read`, `ide.symbol` and `ide.graph` addressed into such a file), `outside_allowed_roots`.
 
 ### 2.3 `ide.symbol` — symbol card and relationships (implemented)
 
@@ -283,7 +283,7 @@ graph: callees of src/Button.tsx#Button (depth 2, 2 nodes, 1 edges)
 
 ### 2.4 `ide.read` — symbol body or line range (implemented)
 
-Input: `{symbol}` or `{path, lines: "120-180"}`.
+Input: `{symbol}`, `{path, lines: "120-180"}` or `{path}` (the whole file).
 
 Output is code with line numbers and the header included:
 
@@ -308,7 +308,9 @@ ide.read {"path": "src/x.rs", "ranges": ["10-20", "44-60"]}  // up to 16 ranges
 
 The reply has one block per item in request order, headed by its address and line range, with the same numbered gutter as every read. Unknown symbols are reported per item (`no such symbol: … — check ide.outline {"path":"…"}`) without failing the rest. One `source_ref` is minted per call and is valid for every file it included: a batch `ide.edit` on any of them needs no re-read, and its line numbers are that version's. Blocks are never cut mid-body: what the reply budget could not hold is listed explicitly (`not included (over the reply budget): src/c.rs#C — call ide.read {"symbols":["src/c.rs#C"]}`); a single block larger than the whole budget pages by bytes like any read. An exactly duplicated address renders once; a nested symbol (a method inside a requested type) renders inside its parent and as its own block.
 
-Errors: `no_such_file` (the requested path does not exist in the worktree; fix the path or use `ide.symbol` with a bare name), `unknown_symbol`.
+A file no IDE language analyzes (a log, `README.md`, YAML, a script, `Cargo.toml`) reads as text in every form that needs no outline — `{path}` alone (the whole file, `(empty file)` when it has no lines, paged by bytes like any read), `{path, lines}`, `{path, ranges}` and a bare file path as an item of `{symbols}` — and the reply carries one line before `source_ref`: `note: no code analysis for this format; showing its text only (ide.outline and ide.symbol do not read it)`. A symbol address into such a file (`ide.read {symbol}`, an item of `{symbols}`) has no outline to resolve: the single form answers `unsupported_file`, a batch item says `<file> has no code symbols; read it with ide.read {path, lines|ranges}` — in either order with a bare-path item of the same file, and without failing the rest. A binary file (not UTF-8, or holding a NUL byte), a directory or a file whose bytes could not be read is refused softly, never as `internal`: the single forms answer `source_unavailable` (`read:not_text` or `read:source_unavailable`) naming the path and a native tool, a batch reports a binary item as `not a readable text file (binary, not UTF-8 or unreadable; inspect it with a native tool such as `file` or `xxd`): <path>` and still answers the rest.
+
+Errors: `no_such_file` (the requested path does not exist in the worktree; fix the path or use `ide.symbol` with a bare name), `unknown_symbol`, `unsupported_file` (symbol address into a file no IDE language reads), `source_unavailable` (binary or unreadable file, or a line range past the end).
 
 ### 2.5 `ide.edit` — edit a symbol or range (implemented)
 

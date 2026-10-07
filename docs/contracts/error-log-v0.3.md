@@ -64,6 +64,15 @@ model, existing already-sanitized checker text (`checks::ProblemSnapshot::detail
 summary. `worktree`, when present, is an absolute path; every other path-shaped fact stays relative
 to the worktree, matching what a reply already exposes to the model.
 
+A panic is the one fact whose natural text is unsafe, so it is journaled by *location only*: the
+daemon installs a panic hook (`errorlog::install_panic_hook`) that writes `method` `daemon`,
+`outcome` `failed`, `reason` `internal` with `detail` `panic at <file>:<line>:<column>` (the
+crate-relative source path the compiler recorded, or only the file name when it is absolute) and
+never the payload text, which can carry paths, source or secrets. A panic inside one job is caught
+by the worker (the call answers `internal`, the worker keeps serving) and journaled once under the
+call's own `method` and `correlation` with `detail` `panic at <file>:<line>:<column> during
+<method>`; the hook leaves those to the catcher so one panic is one line.
+
 Every typed tool reply leaving the dispatcher is logged once from the dispatcher itself
 (`adapters::log_tool_reply`), independently of whether the durable telemetry sink is available:
 that sink is absent whenever its lock is contended or its initialization failed, for example while a

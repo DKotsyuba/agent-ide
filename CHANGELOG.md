@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed
+
+- A ranged `ide.read {path, ranges}` of a file no IDE language reads (a `.log`, Markdown, YAML) no longer kills the daemon's worker. Every range item used to become an `unsupported_file` refusal with no delivered file, the batch then drained the first edit source from an empty list and panicked, and the worker — the daemon's only job task — died: every later call of every session of that repository answered `internal` or hung until the transport deadline, until the daemon was replaced.
+- A panic inside one job no longer kills the worker. That call answers `internal`, the error journal gets one line with the panic's source location and the call's method (`panic at crates/…/symbols.rs:561:44 during read`, under the call's correlation id) and later calls keep working. The panic text itself is never journaled, since it can carry paths or source. A daemon panic hook now writes the location of panics outside a job (`panic at <file>:<line>:<column>`) to the journal too; a daemon's stderr is `/dev/null`, so they left no trace before.
+
+### Changed
+
+- `ide.read` returns the text of any readable text file whatever its type: `{path}` alone (the whole file, paged like any read), `{path, lines}`, `{path, ranges}` and a bare file path as an item of `{symbols}`. It is numbered as ever and, when no IDE language analyzes the file, carries one `note: no code analysis for this format` line before `source_ref`. A symbol address into such a file (`notes.md#title`) is one soft item, `notes.md has no code symbols; read it with ide.read {path, lines|ranges}`, and never fails a batch. A binary file (invalid UTF-8 or a NUL byte), a directory or an unreadable file is refused softly, never `internal`: `source_unavailable (read:not_text)` for the single forms, one `not a readable text file` item for a batch, both naming a native tool (`file`, `xxd`). `ide.outline`, `ide.symbol`, `ide.graph` and `ide.read {symbol}` of such a file still answer `unsupported_file`, now pointing at `ide.read` with `lines` or `ranges`.
+- The test-only environment variable `AGENT_IDE_TEST_PANIC_READ_PATH` (panics an `ide.read` of one path) is read only by builds with the `test-seams` cargo feature; `xtask check` runs a default-build test proving a release build ignores it.
+
 ## 0.10.4 — 2026-10-07
 
 ### Fixed

@@ -66,9 +66,14 @@ and cost a fraction of the context:
   with one exact path. CSS and HTML names are addressed by sigil (`.btn`, `##main`,
   `--brand`): `ide.symbol` answers a name card with every defining file, `ide.read` reads the
   first definition; the `symbols` batch form takes file paths only.
-- A file no IDE language reads (`Cargo.toml`, a shell script, a template) answers
-  `unsupported_file: <path>` from `ide.outline`, `ide.read {symbol}`, `ide.symbol` and
-  `ide.graph`; read it with `ide.read {"path":…,"lines":…}` or native tools.
+- A file no IDE language reads (`Cargo.toml`, a shell script, a template, a log, Markdown, YAML)
+  answers `unsupported_file: <path>` from `ide.outline`, `ide.read {symbol}`, `ide.symbol` and
+  `ide.graph`, but `ide.read` still returns its text in every form without an outline:
+  `{"path":…}` (whole file), `{"path":…,"lines":…}`, `{"path":…,"ranges":[…]}` or a bare path
+  in `symbols` — numbered, with a `note: no code analysis for this format` line. A symbol
+  address into such a file (`notes.md#title`) is one soft item that points at `lines`/`ranges`.
+  A binary or unreadable file is refused softly (`source_unavailable (read:not_text)`, or one
+  `not a readable text file` item in a batch) naming a native tool such as `file` or `xxd`.
 - `ide.read {"symbol":"src/x.rs#Type/method"}` or `{"path":"src/x.rs","lines":"120-180"}`
   — the body with line numbers; its `source_ref` is what `ide.edit` needs. Each line reads
   `NNN<TAB>code`: one tab separates the number from the code, so stripping the gutter leaves
