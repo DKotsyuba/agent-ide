@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- A daemon whose connection permits are exhausted (parallel agents of one repository) now answers a call with a typed `busy` reply ("nothing was applied; repeat this call") instead of dropping the connection, which the client had to report as an unknown outcome — and, for a lost pre-hook, as a binding error. Hooks have their own small lane of four, so a burst of slow tool calls no longer starves the hooks that authenticate them, and every refusal is counted in the error journal (one line per lane per minute with the suppressed count).
 - A Claude session that re-rooted to another repository no longer pins the old repository's daemon: the session's lease watcher now follows the current lease, drops the old one so the old daemon can idle out, and notices when the new daemon dies instead of only at the next failed call.
 - `doctor` no longer counts every old file or directory in the temporary directory as a "stale agent-ide runtime entry" (it reported tens of thousands, mostly other programs' files). It looks only at the product's own runtime directories (`ai-` and `ai-r-` plus sixteen hex digits, owned by you and private), removes those older than a day with no daemon listening, and reports how many it removed; every other entry, the `ai-k-` key caches included, is left alone.
 - A Python environment selector refused as outside the allowed roots (for example a base

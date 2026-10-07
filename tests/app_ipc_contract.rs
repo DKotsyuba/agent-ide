@@ -603,3 +603,238 @@ async fn hook_and_method_keep_connect_write_within_the_configured_deadline() {
     }
     clock_guard.abort();
 }
+
+/// Parks selected calls inside the dispatcher until the test releases them.
+struct ParkingDispatcher {
+    /// Method dispatches that reached the dispatcher.
+    methods_entered: Arc<AtomicUsize>,
+    /// Hook submissions that reached the dispatcher.
+    hooks_entered: Arc<AtomicUsize>,
+    /// Parked calls wait for a permit here; the test adds permits to release them.
+    release: Arc<tokio::sync::Semaphore>,
+    /// Whether hook submissions park as well; method dispatches always park.
+    park_hooks: bool,
+}
+
+impl AssistanceDispatcher for ParkingDispatcher {
+    /// Counts the arrival, parks a method (and a hook when asked), then answers like [`TestDispatcher`].
+    fn dispatch(
+        &self,
+        request: AssistanceDispatch,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = Result<AssistanceDispatchReply, AssistanceDispatchUnavailable>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            match request {
+                AssistanceDispatch::HookSubmit(_) => {
+                    self.hooks_entered.fetch_add(1, Ordering::SeqCst);
+                    if self.park_hooks {
+                        let _ = self.release.acquire().await;
+                    }
+                    Ok(AssistanceDispatchReply::HookSubmit(
+                        OpaqueJson::new("{\"hook\":true}", 64 * 1024).unwrap(),
+                    ))
+                }
+                AssistanceDispatch::MethodDispatch(_) => {
+                    self.methods_entered.fetch_add(1, Ordering::SeqCst);
+                    let _ = self.release.acquire().await;
+                    Ok(AssistanceDispatchReply::MethodDispatch(
+                        OpaqueJson::new("{\"method\":true}", 64 * 1024).unwrap(),
+                    ))
+                }
+            }
+        })
+    }
+}
+
+/// Starts an in-process daemon with `max_connections` call permits around `dispatcher`.
+async fn start_limited_daemon(
+    runtime_dir: &Path,
+    dispatcher: Arc<ParkingDispatcher>,
+    max_connections: usize,
+) -> tokio::task::JoinHandle<()> {
+    use agent_ide::app::config::{AppConfigPatch, ConfigLayer, ConfigOrigin, effective_config};
+    let config = effective_config(
+        std::num::NonZeroU64::new(1).unwrap(),
+        &[ConfigLayer {
+            origin: ConfigOrigin::Host,
+            values: AppConfigPatch {
+                ipc_max_connections: Some(max_connections),
+                ..Default::default()
+            },
+        }],
+    )
+    .unwrap();
+    let daemon_runtime = RuntimeDir::prepare_for_daemon(runtime_dir).unwrap();
+    let task = tokio::spawn(async move {
+        run_daemon_with_assistance(
+            daemon_runtime,
+            dispatcher,
+            config,
+            agent_ide::app::lease::DEFAULT_IDLE_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    });
+    let socket = runtime_dir.join("agent-ide.sock");
+    for _ in 0..200 {
+        if UnixStream::connect(&socket).await.is_ok() {
+            return task;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("limited daemon did not bind its private socket");
+}
+
+/// One context dispatch with a caller-chosen request id.
+fn context_dispatch(request_id: &str) -> MethodDispatch {
+    MethodDispatch::new(
+        request_id,
+        format!("{request_id}-correlation"),
+        "attachment",
+        agent_ide::app::transport::AssistanceMethod::Context,
+        OpaqueJson::new("{\"path\":\"main.rs\"}", 64 * 1024).unwrap(),
+    )
+    .unwrap()
+}
+
+/// One hook submission with a caller-chosen request id.
+fn hook_submission(request_id: &str) -> HookSubmit {
+    HookSubmit::new(
+        request_id,
+        format!("{request_id}-correlation"),
+        "attachment",
+        OpaqueJson::new("{\"phase\":\"post\"}", 64 * 1024).unwrap(),
+    )
+    .unwrap()
+}
+
+/// F-04: a call that finds every call permit taken is answered `busy` (never dropped, so the
+/// front can say nothing ran), hooks keep their own lane while calls are saturated, and the
+/// refusal is counted in the journal.
+#[tokio::test]
+async fn saturated_call_lane_answers_busy_and_leaves_the_hook_lane_free() {
+    let home = runtime_dir();
+    // SAFETY: set before any thread of this test reads the variable; the journal writer is
+    // initialised once per process and only this test names it.
+    unsafe { std::env::set_var(agent_ide::userhome::HOME_OVERRIDE_ENV, &home) };
+    agent_ide::errorlog::init_repository("0123456789abcdef");
+
+    let runtime_dir = runtime_dir();
+    let methods = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let dispatcher = Arc::new(ParkingDispatcher {
+        methods_entered: Arc::clone(&methods),
+        hooks_entered: Arc::new(AtomicUsize::new(0)),
+        release: Arc::clone(&release),
+        park_hooks: false,
+    });
+    let task = start_limited_daemon(&runtime_dir, dispatcher, 1).await;
+
+    let parked_runtime = runtime_dir.clone();
+    let parked = tokio::spawn(async move {
+        dispatch_method_if_running(
+            &parked_runtime,
+            context_dispatch("parked"),
+            transport_limits(),
+        )
+        .await
+    });
+    while methods.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let refused = dispatch_method_if_running(
+        &runtime_dir,
+        context_dispatch("refused"),
+        transport_limits(),
+    )
+    .await;
+    assert_eq!(refused, MethodDispatchTransportResult::Busy);
+    let hook =
+        submit_hook_if_running(&runtime_dir, hook_submission("hook"), transport_limits()).await;
+    assert!(
+        matches!(hook, HookSubmitTransportResult::Dispatched { .. }),
+        "hooks keep their own lane while calls are saturated: {hook:?}"
+    );
+    release.add_permits(8);
+    assert!(matches!(
+        parked.await.unwrap(),
+        MethodDispatchTransportResult::Dispatched { .. }
+    ));
+
+    let journal = fs::read_dir(home.join(".agent-ide/logs/0123456789abcdef"))
+        .unwrap()
+        .flatten()
+        .map(|entry| fs::read_to_string(entry.path()).unwrap_or_default())
+        .collect::<String>();
+    assert!(
+        journal.contains("\"outcome\":\"refused\"") && journal.contains("connection_busy:call"),
+        "the refused connection is journaled: {journal}"
+    );
+    stop_assistance_daemon(task, runtime_dir).await;
+    fs::remove_dir_all(home).unwrap();
+}
+
+/// F-04: the hook lane is small and bounded too: a fifth concurrent hook is answered `busy`
+/// while method calls, on their own lane, still dispatch.
+#[tokio::test]
+async fn saturated_hook_lane_answers_busy_and_leaves_the_call_lane_free() {
+    let runtime_dir = runtime_dir();
+    let hooks = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let dispatcher = Arc::new(ParkingDispatcher {
+        methods_entered: Arc::new(AtomicUsize::new(0)),
+        hooks_entered: Arc::clone(&hooks),
+        release: Arc::clone(&release),
+        park_hooks: true,
+    });
+    let task = start_limited_daemon(&runtime_dir, dispatcher, 16).await;
+    let mut parked = Vec::new();
+    for index in 0..4 {
+        let runtime = runtime_dir.clone();
+        parked.push(tokio::spawn(async move {
+            submit_hook_if_running(
+                &runtime,
+                hook_submission(&format!("parked-{index}")),
+                transport_limits(),
+            )
+            .await
+        }));
+    }
+    while hooks.load(Ordering::SeqCst) < 4 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let reply = exchange(
+        &runtime_dir,
+        json!({
+            "version": 2,
+            "request_id": "fifth",
+            "correlation_id": "fifth-correlation",
+            "opaque_attachment": "attachment",
+            "method": "assistance.hook_submit",
+            "sanitized_observation_json": {"phase": "post"},
+        }),
+    )
+    .await;
+    assert_eq!(reply["status"], "busy", "{reply}");
+    assert_eq!(reply["request_id"], "fifth");
+    release.add_permits(8);
+    let method = tokio::time::timeout(
+        Duration::from_secs(2),
+        dispatch_method_if_running(&runtime_dir, context_dispatch("call"), transport_limits()),
+    )
+    .await
+    .expect("a call dispatches while the hook lane is saturated");
+    assert!(matches!(
+        method,
+        MethodDispatchTransportResult::Dispatched { .. }
+    ));
+    for task in parked {
+        let _ = task.await;
+    }
+    stop_assistance_daemon(task, runtime_dir).await;
+}

@@ -46,6 +46,65 @@ pub(crate) const MAX_ASSISTANCE_JSON_BYTES: usize = 144 * 1024;
 const METHOD_DISPATCH_BUDGET: Duration = Duration::from_secs(10);
 /// Total connect, request, and acknowledgement budget when a Codex MCP opens its client lease.
 const CLIENT_LEASE_OPEN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Concurrent hook submissions one daemon serves, a lane of its own apart from the tool-call
+/// permits (`max_connections`): every native tool call of every session sends two hooks, and a
+/// burst of slow tool calls must neither starve the hooks that authenticate them nor be starved
+/// by them.
+const HOOK_CONNECTIONS: usize = 4;
+/// Window of the journal line that counts refused connections: one line per lane per minute.
+const BUSY_JOURNAL_WINDOW_MS: u64 = 60_000;
+
+/// One bounded connection lane: its permits, and the rate window of its refusal journal line.
+#[derive(Clone)]
+struct Lane {
+    /// Concurrent connections the lane serves.
+    permits: Arc<Semaphore>,
+    /// Rate window of the journal line that counts refusals.
+    refused: Arc<std::sync::Mutex<crate::errorlog::RateWindow>>,
+    /// Closed journal detail naming the lane.
+    detail: &'static str,
+}
+
+impl Lane {
+    /// Creates a lane that serves at most `capacity` connections at once.
+    fn new(capacity: usize, detail: &'static str) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(capacity)),
+            refused: Arc::default(),
+            detail,
+        }
+    }
+
+    /// Counts one refused connection in the journal: the first refusal of a window is written at
+    /// once, the rest only counted and flushed with the next window's line, so overload cannot
+    /// flood the journal.
+    fn note_refused(&self) {
+        let due = self.refused.lock().ok().and_then(|mut window| {
+            window.record(crate::errorlog::now_ms(), BUSY_JOURNAL_WINDOW_MS)
+        });
+        if let Some(suppressed) = due {
+            crate::errorlog::record(
+                crate::errorlog::Method::Daemon,
+                crate::errorlog::Outcome::Refused,
+                crate::errorlog::Fields {
+                    reason: Some(crate::errorlog::ReasonCode::Capacity),
+                    detail: Some(self.detail),
+                    count: (suppressed > 0).then_some(suppressed),
+                    ..crate::errorlog::Fields::default()
+                },
+            );
+        }
+    }
+}
+
+/// The two connection lanes of one daemon: tool calls (`max_connections`) and hooks.
+#[derive(Clone)]
+struct Lanes {
+    /// Tool-call connections.
+    calls: Lane,
+    /// Hook-submission connections.
+    hooks: Lane,
+}
 
 /// Reports whether a daemon answered the side-effect-free health request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,7 +346,10 @@ async fn run_daemon_inner(
         owned_socket = Some(OwnedSocket::new(socket_path.clone())?);
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
         let generation = new_generation()?;
-        let permits = Arc::new(Semaphore::new(ipc.max_connections));
+        let lanes = Lanes {
+            calls: Lane::new(ipc.max_connections, "connection_busy:call"),
+            hooks: Lane::new(HOOK_CONNECTIONS, "connection_busy:hook"),
+        };
         crate::errorlog::record(
             crate::errorlog::Method::Daemon,
             crate::errorlog::Outcome::Started,
@@ -304,7 +366,7 @@ async fn run_daemon_inner(
             let (stream, _) = accepted?;
             let generation = generation.clone();
             let dispatcher = dispatcher.clone();
-            let permits = Arc::clone(&permits);
+            let lanes = lanes.clone();
             let lease = lease.clone();
             connections.spawn(async move {
                 serve_accepted_connection(
@@ -313,7 +375,7 @@ async fn run_daemon_inner(
                     dispatcher,
                     transport_limits,
                     ipc.connection_deadline,
-                    permits,
+                    lanes,
                     lease,
                 )
                 .await;
@@ -690,14 +752,17 @@ fn inspect_lock(path: &Path) -> DoctorLockState {
 /// Only an admitted lease's ensuing hold-open phase is unbounded until peer EOF, run by
 /// [`hold_lease_until_eof`] after this function returns (EYES-r2 §2). A lease request is admitted
 /// from its own bounded pool ([`lease::LeaseController::try_admit`]) and never acquires `permits`,
-/// the separate hook/assistance `max_connections` semaphore.
+/// the separate hook/assistance connection lanes.
+///
+/// A call or hook that finds its lane full is answered with a typed `busy` reply instead of being
+/// dropped, and the refusal is counted in the journal (F-04).
 async fn serve_accepted_connection(
     mut stream: UnixStream,
     generation: String,
     dispatcher: Option<Arc<dyn AssistanceDispatcher>>,
     transport_limits: Option<HookTransportLimits>,
     connection_deadline: Duration,
-    permits: Arc<Semaphore>,
+    lanes: Lanes,
     lease: lease::LeaseController,
 ) {
     let connection_deadline = tokio::time::Instant::now() + connection_deadline;
@@ -740,22 +805,32 @@ async fn serve_accepted_connection(
         Some(2..=5) => {
             // Served Assistance calls prove a live client session and restart the idle countdown.
             lease.mark_activity();
-            if let (Some(dispatcher), Some(limits)) = (dispatcher, transport_limits)
-                && let Ok(_permit) = permits.try_acquire_owned()
-            {
-                let method = request.get("method").and_then(Value::as_str)
-                    == Some("assistance.method_dispatch");
-                let budget = if method {
-                    METHOD_DISPATCH_BUDGET
+            if let (Some(dispatcher), Some(limits)) = (dispatcher, transport_limits) {
+                let hook =
+                    request.get("method").and_then(Value::as_str) == Some("assistance.hook_submit");
+                let lane = if hook { &lanes.hooks } else { &lanes.calls };
+                if let Ok(_permit) = Arc::clone(&lane.permits).try_acquire_owned() {
+                    let method = request.get("method").and_then(Value::as_str)
+                        == Some("assistance.method_dispatch");
+                    let budget = if method {
+                        METHOD_DISPATCH_BUDGET
+                    } else {
+                        connection_deadline.duration_since(tokio::time::Instant::now())
+                    };
+                    let deadline = tokio::time::Instant::now() + budget;
+                    let _ = tokio::time::timeout_at(
+                        deadline,
+                        serve_assistance_request(&mut stream, request, dispatcher, limits),
+                    )
+                    .await;
                 } else {
-                    connection_deadline.duration_since(tokio::time::Instant::now())
-                };
-                let deadline = tokio::time::Instant::now() + budget;
-                let _ = tokio::time::timeout_at(
-                    deadline,
-                    serve_assistance_request(&mut stream, request, dispatcher, limits),
-                )
-                .await;
+                    lane.note_refused();
+                    let _ = tokio::time::timeout_at(
+                        connection_deadline,
+                        write_busy_reply(&mut stream, &request, version),
+                    )
+                    .await;
+                }
             }
             None
         }
@@ -765,6 +840,34 @@ async fn serve_accepted_connection(
         hold_lease_until_eof(stream).await;
         drop(guard);
     }
+}
+
+/// Answers a call or hook that found its lane full with the typed `busy` reply.
+///
+/// The reply carries the request's own version, `request_id` (and `correlation_id` for a hook)
+/// and `"status": "busy"`, and no result: the daemon refused the request before dispatching it, so
+/// nothing ran and the front may report that and let the caller repeat it. A request without a
+/// usable `request_id` is dropped as before. The write is best-effort; the peer may be gone.
+async fn write_busy_reply(
+    stream: &mut UnixStream,
+    request: &Value,
+    version: Option<u64>,
+) -> io::Result<()> {
+    let Some(request_id) = request.get("request_id").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if request_id.is_empty() || request_id.len() > MAX_REQUEST_ID_BYTES {
+        return Ok(());
+    }
+    let mut reply = json!({
+        "version": version.unwrap_or_default(),
+        "request_id": request_id,
+        "status": "busy",
+    });
+    if let Some(correlation) = request.get("correlation_id").and_then(Value::as_str) {
+        reply["correlation_id"] = Value::String(correlation.to_owned());
+    }
+    write_frame(stream, &reply, MAX_V1_FRAME_BYTES).await
 }
 
 /// Reads and discards bytes until EOF or error on one admitted lease connection.
@@ -1121,6 +1224,10 @@ fn parse_method_dispatch_reply(
         || object.get("request_id").and_then(Value::as_str) != Some(request.request_id())
     {
         return Err(invalid_transport("method reply correlation mismatch"));
+    }
+    // The daemon refused the request before dispatching it: it never ran and may be repeated.
+    if object.get("status").and_then(Value::as_str) == Some("busy") {
+        return Ok(MethodDispatchTransportResult::Busy);
     }
     // An explicit unavailable reply (for example a result over the payload bound) can follow an
     // executed call: the request was delivered, so its outcome is unknown, never "not sent".

@@ -421,6 +421,9 @@ pub enum MethodDispatchTransportResult {
     /// [`Self::OutcomeUnknown`] the call may have executed, and a live daemon must not be
     /// reconnected.
     WrittenTimedOut,
+    /// The daemon read the request and refused it before dispatching because every connection of
+    /// its lane was taken: the call never ran, so repeating it is safe, and the daemon is alive.
+    Busy,
 }
 
 /// Checks the common bounded opaque identifier invariant without making an identity claim.

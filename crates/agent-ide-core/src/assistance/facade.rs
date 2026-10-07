@@ -1546,6 +1546,9 @@ pub enum FacadeOutcome {
     Unavailable,
     /// The daemon did not answer an admitted call in time; managed routes must not reconnect.
     TimedOut,
+    /// The daemon answered a typed `busy` reply: every connection of its lane was taken, the call
+    /// never ran (nothing was applied), and repeating it is safe.
+    Busy,
     /// Writing the request began but no usable reply arrived, or a mutating call's reply timed
     /// out: the call may have executed, so it is never resent and no reconnect is attempted.
     OutcomeUnknown,
@@ -1678,6 +1681,7 @@ impl AssistanceFacade {
         let outcome = match dispatch_method_if_running(runtime_dir, request, self.limits).await {
             MethodDispatchTransportResult::Unavailable => FacadeOutcome::Unavailable,
             MethodDispatchTransportResult::TimedOut => FacadeOutcome::TimedOut,
+            MethodDispatchTransportResult::Busy => FacadeOutcome::Busy,
             MethodDispatchTransportResult::OutcomeUnknown => FacadeOutcome::OutcomeUnknown,
             // A read-only call that timed out after delivery changed nothing worth checking.
             MethodDispatchTransportResult::WrittenTimedOut if tool.mutates() => {
@@ -3414,6 +3418,10 @@ impl StdioFacade {
             }
             FacadeOutcome::TimedOut => {
                 "Assistance daemon transport timed out; continue with native tools"
+            }
+            // The daemon refused the call before running it, so even a mutation applied nothing.
+            FacadeOutcome::Busy => {
+                "error: busy: the IDE is serving too many calls at once and did not run this one, so nothing was applied; repeat this call in a moment"
             }
             // Never resent: the daemon may have executed the call, and a resend could only repeat
             // a change or be refused for its already consumed pre-hook.
