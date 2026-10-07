@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use super::host_binding::HostKind;
 use super::launcher::{LauncherConfig, admit_worktree};
-use crate::checks::runner::{NestedSandboxRunner, SeatbeltRunner};
+use crate::checks::runner::{NestedSandboxFallbackRunner, SeatbeltRunner};
 use crate::checks::scheduler::{CompletionHook, Scheduler};
 use crate::checks::{
     CheckState, Checker, Language, MAX_PROBLEMS, Problem, ProblemSnapshot, Recheck, Severity,
@@ -224,8 +224,8 @@ impl ProjectProblemFeed {
     ///
     /// Project checks are enabled only with nonempty `allowed_roots`, a `project_checks` section
     /// and at least one configured language (EYES-r1 §1); otherwise `None` leaves v0.2 behaviour
-    /// unchanged. Checkers run through the Seatbelt runner (a daemon the host itself confines
-    /// reports its checks unavailable, `nested sandbox`, instead of running them unconfined) with the configured timeout, the
+    /// unchanged. Checkers run through the Seatbelt runner (with its one-time nested-sandbox
+    /// fallback for a daemon the host itself confines) with the configured timeout, the
     /// scheduler uses the configured debounce and the cache root `$HOME/.agent-ide/checks`
     /// (created `0700` best-effort); the daemon's retention task removes unused caches.
     /// `on_complete` observes every completed check run. Returns `None` when `HOME` is unset.
@@ -234,7 +234,7 @@ impl ProjectProblemFeed {
         if launcher.allowed_roots().is_empty() {
             return None;
         }
-        let runner = Arc::new(NestedSandboxRunner::new(Arc::new(SeatbeltRunner)));
+        let runner = Arc::new(NestedSandboxFallbackRunner::new(Arc::new(SeatbeltRunner)));
         let checkers: Vec<Arc<dyn Checker>> = checks
             .sections()
             .map(|(_, config)| config.checker(runner.clone(), checks.check_timeout()))
@@ -830,11 +830,6 @@ fn state_line(snapshot: &ProblemSnapshot, recheck: Option<Recheck>) -> String {
                 untrusted_line(snapshot.detail.as_deref().unwrap_or_default())
             )
         }
-        CheckState::Unavailable(UnavailableReason::Fatal)
-            if snapshot.detail.as_deref() == Some(crate::checks::NESTED_SANDBOX_CAUSE) =>
-        {
-            format!("{language}: checks unavailable (nested sandbox)")
-        }
         CheckState::Unavailable(UnavailableReason::Fatal) => match &snapshot.detail {
             Some(detail) => format!("{language}: check failed ({})", untrusted_line(detail)),
             None => {
@@ -1281,22 +1276,6 @@ mod tests {
         assert_eq!(
             problems_text(&without_detail, None, 0),
             "alpha: check failed (checker supplied no reason)"
-        );
-    }
-
-    /// F-08: a check the host's nested sandbox refused reads as unavailable, not as a failed check.
-    #[test]
-    fn nested_sandbox_cause_renders_as_unavailable() {
-        let snapshots = [ProblemSnapshot::unavailable_with_detail(
-            crate::lang::testing::ALPHA,
-            UnavailableReason::Fatal,
-            1,
-            0,
-            Some(crate::checks::NESTED_SANDBOX_CAUSE.to_owned()),
-        )];
-        assert_eq!(
-            problems_text(&snapshots, None, 0),
-            "alpha: checks unavailable (nested sandbox)"
         );
     }
 

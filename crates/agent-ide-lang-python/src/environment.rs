@@ -1147,7 +1147,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires accepted AGENT_IDE_PYRIGHT, AGENT_IDE_NODE and AGENT_IDE_PYTHON environments"]
     async fn real_pyright_check_follows_the_selected_environment() {
-        use agent_ide_core::checks::runner::{NestedSandboxRunner, SeatbeltRunner};
+        use agent_ide_core::checks::runner::{NestedSandboxFallbackRunner, SeatbeltRunner};
 
         let python = PathBuf::from(std::env::var_os("AGENT_IDE_PYTHON").unwrap());
         let node = PathBuf::from(std::env::var_os("AGENT_IDE_NODE").unwrap());
@@ -1193,7 +1193,7 @@ mod tests {
             "VALUE: int = 42\n",
         );
         let runner: Arc<dyn ConfinedRunner> =
-            Arc::new(NestedSandboxRunner::new(Arc::new(SeatbeltRunner)));
+            Arc::new(NestedSandboxFallbackRunner::new(Arc::new(SeatbeltRunner)));
         let checker = PythonChecker::new(runner, node, cli, Duration::from_secs(120));
         let unresolved = |snapshot: &agent_ide_core::checks::ProblemSnapshot| {
             assert!(

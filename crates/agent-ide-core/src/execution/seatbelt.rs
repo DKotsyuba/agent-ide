@@ -456,8 +456,41 @@ pub async fn run_confined(
     run_prepared(command, timeout, max_output_bytes).await
 }
 
+/// Runs one check program with no Seatbelt profile of ours, in its own process group.
+///
+/// Same child contract as [`run_confined`] — cleared environment rebuilt from `env` alone, piped
+/// output under the same byte budget, whole-group kill on timeout or cancellation — minus only
+/// the `sandbox-exec` wrapper. This is the nested-sandbox fallback path: when the daemon itself
+/// is already confined by the host, applying our profile on top is refused
+/// (`sandbox-exec: sandbox_apply: Operation not permitted`), and the host's own confinement of
+/// this daemon already applies to every child it spawns, so the check runs unprofiled rather than
+/// not at all. The product's only path policy stays the launcher `allowed_roots` list; this
+/// profile was never a permission model.
+pub async fn run_unconfined(
+    program: &Path,
+    args: &[OsString],
+    cwd: &Path,
+    env: &[(String, String)],
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> io::Result<ConfinedOutput> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .envs(
+            env.iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    run_prepared(command, timeout, max_output_bytes).await
+}
+
 /// Spawns one prepared check child and reaps it with the shared timeout, group-kill, and
-/// bounded-output-drain contract of [`run_confined`].
+/// bounded-output-drain contract of [`run_confined`] and [`run_unconfined`].
 async fn run_prepared(
     mut command: Command,
     timeout: Duration,

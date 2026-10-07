@@ -382,13 +382,6 @@ fn render_item(item: &FeedItem, last_counts: Option<(u32, u32)>, compact: bool) 
         ItemState::Unavailable(UnavailableReason::EnvMissing, Some(detail)) => {
             format!("{language}: {detail}")
         }
-        // F-08: the host's own sandbox would not let the product confine the check, so it did
-        // not run; that is not a failed check.
-        ItemState::Unavailable(UnavailableReason::Fatal, Some(detail))
-            if detail == crate::checks::NESTED_SANDBOX_CAUSE =>
-        {
-            format!("{language}: checks unavailable (nested sandbox)")
-        }
         ItemState::Unavailable(UnavailableReason::Fatal, None) => {
             format!("{language}: check failed (checker supplied no reason)")
         }
@@ -617,27 +610,6 @@ mod tests {
                 .expect("unavailable state emits");
             assert_eq!(block, format!("<agent-ide>\nbeta: {phrase}\n</agent-ide>"));
         }
-    }
-
-    /// F-08: the plate says `checks unavailable (nested sandbox)` for a check the host's own
-    /// sandbox would not let the product confine, not `check failed (…)`.
-    #[test]
-    fn nested_sandbox_cause_renders_as_unavailable_on_the_plate() {
-        let mut state = FeedState::default();
-        let snapshot = ProblemSnapshot::unavailable_with_detail(
-            crate::lang::testing::BETA,
-            UnavailableReason::Fatal,
-            1,
-            0,
-            Some(crate::checks::NESTED_SANDBOX_CAUSE.to_owned()),
-        );
-        let block = state
-            .next_block(&key("hook"), &[snapshot], &[])
-            .expect("unavailable state emits");
-        assert_eq!(
-            block,
-            "<agent-ide>\nbeta: checks unavailable (nested sandbox)\n</agent-ide>"
-        );
     }
 
     /// A language still on its first check renders `checking (first check)` instead of being

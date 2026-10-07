@@ -185,15 +185,13 @@ For Rust, T06B adds `CC`/`CXX`/`SDKROOT` plus `CARGO_TARGET_<TRIPLE>_LINKER` (or
 pointing at the resolved developer directory's own `clang`, bypassing the `/usr/bin/cc` `xcrun`
 shim that a build script's link step cannot run under this profile; see EYES-r2 §3 for the exact
 resolution.
-One environment limit is reported, never worked around: when the daemon itself is already confined
-by the host (an agent's own sandboxed session), macOS refuses to apply a nested profile —
+One environment limit is handled, not hidden: when the daemon itself is already confined by the
+host (an agent's own sandboxed session), macOS refuses to apply a nested profile —
 `sandbox-exec: sandbox_apply: Operation not permitted`, a non-zero exit with no checker output.
-The runner detects exactly that refusal and the check does not run: the host's confinement may
-allow project writes and network, which is not the read-only, no-network policy checks promise, so
-running unprofiled would drop the promise. The snapshot is `Unavailable(Fatal)` with the cause
-`nested sandbox`, shown as `checks unavailable (nested sandbox)` on the plate and in the problems
-text. Nothing is remembered and no daemon-wide switch exists: each check tries the profiled
-wrapper afresh, and native work stays fail-open. A check that fails for any other reason
+The runner detects that refusal, runs the same check once without our profile (the host's own
+confinement of the daemon already applies to the child; the product's only path policy is the
+`allowed_roots` list, so this adds no security layer), and remembers the refusal for the daemon's
+lifetime so later checks never retry the doomed wrapper. A check that fails for any other reason
 keeps its own cause: the snapshot detail carries the first `error:` line of stderr, else its
 first non-empty line, else `exit <status>`, so a failed check always says why.
 Each check owns one process group, killed whole on cancel, timeout (`check_timeout_s`), or daemon

@@ -684,40 +684,6 @@ async fn rust_check_runner_error_is_fatal() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// F-08: the host's nested-sandbox refusal through the production runner makes the Rust check
-/// `Unavailable(Fatal)` with the `nested sandbox` cause, and the check never runs unconfined: the
-/// scripted profiled runner is consulted once and nothing else executes.
-#[tokio::test]
-async fn rust_check_in_a_nested_sandbox_is_unavailable_not_unconfined() {
-    use agent_ide::checks::runner::NestedSandboxRunner;
-    agent_ide::languages::install();
-    let root = rust_scratch("nested-sandbox");
-    let request = rust_request(&root, true);
-    let fake = FakeRunner::new(vec![Ok(RunOutput {
-        status: Some(71),
-        stderr: b"sandbox-exec: sandbox_apply: Operation not permitted\n".to_vec(),
-        ..RunOutput::default()
-    })]);
-    let checker = RustChecker::new(
-        Arc::new(NestedSandboxRunner::new(Arc::new(fake.clone()))),
-        rust_toolchain(&root, true),
-        None,
-        Duration::from_secs(300),
-        Some(rust_developer_dir(&root)),
-    );
-    let snapshot = checker.check(request).await;
-    assert_eq!(
-        snapshot.state,
-        CheckState::Unavailable(UnavailableReason::Fatal)
-    );
-    assert_eq!(
-        snapshot.detail.as_deref(),
-        Some(agent_ide::checks::NESTED_SANDBOX_CAUSE)
-    );
-    assert_eq!(fake.specs().len(), 1, "only the profiled run was attempted");
-    let _ = fs::remove_dir_all(&root);
-}
-
 /// Proves a timed-out run maps to `Unavailable(Timeout)`.
 #[tokio::test]
 async fn rust_check_timed_out_run_is_timeout() {
