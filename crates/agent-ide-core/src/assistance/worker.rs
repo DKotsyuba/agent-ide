@@ -8284,6 +8284,63 @@ mod stop_retry_tests {
         }
     }
 
+    /// A failed session's mark dies with its owner: a call that failed on the provider marks the
+    /// session, and a stop, a writer's handover and a downgrade each leave no mark behind.
+    #[tokio::test]
+    async fn failed_marks_are_pruned_by_stop_handover_and_downgrade() {
+        use crate::lang::testing::fixture_fail_next_ensure;
+        let fixture = Fixture::new();
+        let file = epsilon_source(&fixture);
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        // Stop.
+        let stopped = provider_start(&mut worker, "fp-stopped", "fp-start-1", true, None)
+            .await
+            .unwrap();
+        fixture_fail_next_ensure(&stopped, false);
+        assert_eq!(
+            provider_symbol_call(&mut worker, "fp-stopped", "fp-1", &file).await,
+            Err(FailureCode::ProviderUnavailable)
+        );
+        assert_eq!(worker.test_failed_sessions(), 1);
+        assert!(worker.settle_revocation(&stopped).await.unwrap());
+        assert_eq!(worker.test_failed_sessions(), 0, "stop prunes the mark");
+
+        // Writer handover from a reader owner.
+        let reader = provider_start(&mut worker, "fp-reader", "fp-start-2", true, None)
+            .await
+            .unwrap();
+        fixture_fail_next_ensure(&reader, false);
+        assert_eq!(
+            provider_symbol_call(&mut worker, "fp-reader", "fp-2", &file).await,
+            Err(FailureCode::ProviderUnavailable)
+        );
+        assert_eq!(worker.test_failed_sessions(), 1);
+        let writer = provider_start(&mut worker, "fp-writer", "fp-start-3", false, None)
+            .await
+            .unwrap();
+        assert_eq!(worker.test_failed_sessions(), 0, "handover prunes the mark");
+
+        // Downgrade of the writer.
+        fixture_fail_next_ensure(&writer, false);
+        assert_eq!(
+            provider_symbol_call(&mut worker, "fp-writer", "fp-3", &file).await,
+            Err(FailureCode::ProviderUnavailable)
+        );
+        assert_eq!(worker.test_failed_sessions(), 1);
+        provider_start(&mut worker, "fp-writer", "fp-start-4", true, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            worker.test_failed_sessions(),
+            0,
+            "downgrade prunes the mark"
+        );
+    }
+
     /// Readers of sibling worktrees own independent namespaces: a writer arriving on one worktree
     /// releases only that worktree's reader owner.
     #[tokio::test]
