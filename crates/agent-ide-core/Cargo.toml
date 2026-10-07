@@ -23,6 +23,10 @@ tokio.workspace = true
 tokio-util.workspace = true
 tower-service.workspace = true
 
+[features]
+# Honours the `AGENT_IDE_*` test seams (see `test_seams`); never enabled in a release build.
+test-seams = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 

@@ -7,7 +7,7 @@
 
 pub use agent_ide_core::{
     app, assistance, changes, doctor_install, errorlog, execution, feed, init, project, retention,
-    selfinstall, telemetry, userhome, workspace,
+    selfinstall, telemetry, test_seams, userhome, workspace,
 };
 
 /// Confined project checks: the core scheduling and snapshot types plus each bundled language's

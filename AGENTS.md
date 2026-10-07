@@ -11,7 +11,9 @@ contract is `docs/contracts/tools-v0.4.md` with the exported snapshot in
 
 `cargo xtask check` is the full non-mutating gate; run it before claiming
 done. It runs fmt `--check`, the locked workspace tests with
-`--test-threads=1` and the three named gopls skips, the four ignored
+`--test-threads=1` and the three named gopls skips (built with the `test-seams`
+cargo feature that the seam-driven product tests need, plus one default-build
+run proving a release build ignores every `AGENT_IDE_TEST_*` seam), the four ignored
 real-provider product tests, clippy and rustdoc with `-D warnings`, the
 release build, the family standard checks and the contract snapshot check —
 with `--no-fail-fast` on the workspace tests so one failing test binary does

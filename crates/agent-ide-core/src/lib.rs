@@ -56,6 +56,9 @@ pub mod doctor_install;
 /// Installs one sealed release bundle into the immutable standalone layout (`self-install`).
 pub mod selfinstall;
 
+/// Reads the environment seams of the product tests, only under the `test-seams` cargo feature.
+pub mod test_seams;
+
 /// Enforces the crate boundary: the core names no language and depends on no language crate.
 #[cfg(test)]
 mod language_free {

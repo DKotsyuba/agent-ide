@@ -1898,6 +1898,7 @@ async fn binary_managed_codex_hook_stalled_daemon_returns_within_deadline() {
 /// Discovery runs on a detached thread whose result is abandoned — never joined — at the
 /// deadline, so the process itself must exit 0 with no output; a discovery left on the blocking
 /// pool would hold runtime shutdown past the ceiling and fail this test.
+#[cfg(feature = "test-seams")]
 #[tokio::test]
 async fn binary_managed_codex_hook_stalled_discovery_exits_within_the_deadline() {
     let base = rendezvous_area("hook-stall-discovery");
@@ -3807,6 +3808,7 @@ async fn managed_codex_transient_transport_timeout_keeps_daemon_and_binding() {
 }
 
 /// SIGTERM while a replacement cannot acknowledge its lease still reaps the child and runtime.
+#[cfg(feature = "test-seams")]
 #[tokio::test]
 async fn managed_codex_sigterm_during_restart_removes_pending_runtime() {
     let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
@@ -4024,6 +4026,7 @@ async fn managed_codex_publication_failure_leaves_replies_working() {
 /// the publication wait must be bounded: the MCP reply still arrives within the normal deadline,
 /// the detached publish task finishes in the background afterwards, and teardown's retirement
 /// then leaves nothing discoverable.
+#[cfg(feature = "test-seams")]
 #[tokio::test]
 async fn managed_codex_stalled_publication_keeps_replies_bounded() {
     let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
@@ -5030,6 +5033,7 @@ async fn claude_call_with_a_late_pre_hook_is_served_not_refused() {
 /// seven-second health window that killed slow-but-successful starts on GitHub's cold macOS
 /// runners: the daemon's startup-stall seam outlives that old window (and the SIGTERM it issued)
 /// by half a second, so recovery must instead complete inside the raised readiness budget.
+#[cfg(feature = "test-seams")]
 async fn start_managed_claude_with_slow_daemon(template: &Path, project: &Path) -> Mcp {
     Mcp::start_managed_claude_with_seam(
         template,
@@ -5043,6 +5047,7 @@ async fn start_managed_claude_with_slow_daemon(template: &Path, project: &Path) 
 /// rendezvous at once, the next call transparently re-runs the remembered activation from its own
 /// pre-hook, a reference issued by the dead generation names the restart explicitly, and the
 /// session still stops cleanly.
+#[cfg(feature = "test-seams")]
 #[tokio::test]
 async fn claude_session_survives_a_daemon_restart_between_calls() {
     let fixture = ProductFixture::new(json!([]));
@@ -5158,6 +5163,7 @@ async fn claude_session_survives_a_daemon_restart_between_calls() {
 
 /// A stop whose binding already died with a replaced daemon answers success-shaped instead of an
 /// error: the replacement already revoked everything the stop would have revoked.
+#[cfg(feature = "test-seams")]
 #[tokio::test]
 async fn ide_stop_after_a_daemon_restart_answers_success() {
     let fixture = ProductFixture::new(json!([]));
@@ -20343,6 +20349,7 @@ async fn managed_claude_recovers_when_the_next_call_comes_much_later() {
 
 /// A reply lost on a LIVE daemon reports an unknown outcome without reconnecting or resending,
 /// and neither the caller nor its sibling loses its binding.
+#[cfg(feature = "test-seams")]
 #[tokio::test]
 async fn managed_claude_lost_reply_on_a_live_daemon_keeps_every_actor() {
     let fixture = ProductFixture::new(json!([]));
@@ -20393,6 +20400,7 @@ async fn managed_claude_lost_reply_on_a_live_daemon_keeps_every_actor() {
 
 /// A lost edit reply is reported as an unknown outcome, the edit is applied exactly once, and a
 /// repeat of the same call identity is named a replay, never a missing pre-hook.
+#[cfg(feature = "test-seams")]
 #[tokio::test]
 async fn managed_claude_lost_edit_reply_is_reported_and_never_resent() {
     let fixture = ProductFixture::new(json!([]));
@@ -20450,6 +20458,7 @@ async fn managed_claude_lost_edit_reply_is_reported_and_never_resent() {
 
 /// A stopped actor is never re-bound by restart recovery — neither after a confirmed stop nor
 /// after a stop whose reply was lost — while its sibling still recovers.
+#[cfg(feature = "test-seams")]
 #[tokio::test]
 async fn managed_claude_stopped_actor_is_never_recovered() {
     let fixture = ProductFixture::new(json!([]));
@@ -20541,6 +20550,7 @@ async fn managed_claude_stopped_actor_is_never_recovered() {
 /// A daemon without this release's actor capabilities (the 0.10.2 contract) still serves a current
 /// managed Claude front: start, read and stop all work, and stop is never preceded by anything
 /// that could consume its pre-hook.
+#[cfg(feature = "test-seams")]
 #[tokio::test]
 async fn managed_claude_stop_works_against_a_daemon_without_actor_capabilities() {
     let fixture = ProductFixture::new(json!([]));

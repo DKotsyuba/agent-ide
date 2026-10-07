@@ -2142,11 +2142,10 @@ const PUBLICATION_WAIT: Duration = Duration::from_millis(25);
 /// Both blocking rendezvous sites — the managed hook's route discovery and the MCP process's route
 /// publication — sleep for this long before touching the filesystem, so deadline regressions can
 /// inject a slow publisher or a stalled discovery without an artificially hostile filesystem.
-/// Only product tests set the variable; production never does, and the hook's own 250 ms total
+/// Only a `test-seams` build reads the variable; the hook's own 250 ms total
 /// deadline and this module's [`PUBLICATION_WAIT`] bound the delay's observable effect either way.
 pub(crate) fn stall_rendezvous_for_test() {
-    let Some(milliseconds) = std::env::var_os("AGENT_IDE_CODEX_RENDEZVOUS_STALL_MS")
-        .and_then(|value| value.into_string().ok())
+    let Some(milliseconds) = crate::test_seams::var("AGENT_IDE_CODEX_RENDEZVOUS_STALL_MS")
         .and_then(|value| value.parse::<u64>().ok())
     else {
         return;

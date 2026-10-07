@@ -445,12 +445,12 @@ impl ProductDispatcher {
     /// The `AGENT_IDE_TEST_LEGACY_CLAUDE_DAEMON=1` seam serves the 0.10.2 contract instead —
     /// one channel per attachment, no actor tags, recovery announcements, identity queries or
     /// pre-attachment targets — so product tests can exercise a current front against a daemon
-    /// without those capabilities. Production never sets it.
+    /// without those capabilities. Only a `test-seams` build reads it.
     pub fn with_managed_claude_launcher(launcher: LauncherConfig) -> Self {
         let mut dispatcher = Self::with_launcher(launcher);
         dispatcher.managed_claude = true;
         dispatcher.shared_claude_channel =
-            std::env::var("AGENT_IDE_TEST_LEGACY_CLAUDE_DAEMON").as_deref() != Ok("1");
+            crate::test_seams::var("AGENT_IDE_TEST_LEGACY_CLAUDE_DAEMON").as_deref() != Some("1");
         dispatcher
     }
     /// Derives the same opaque channel for hook/MCP input under this exact daemon nonce.

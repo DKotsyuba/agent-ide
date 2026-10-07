@@ -2161,9 +2161,9 @@ fn codex_reestablish_hook(
             };
             // Product test seam: hold a live replacement before its lease is acquired so SIGTERM
             // can prove that cancellation still reaps the child and removes this registered runtime.
-            if let Some(milliseconds) = std::env::var("AGENT_IDE_MANAGED_CODEX_RESTART_STALL_MS")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
+            if let Some(milliseconds) =
+                agent_ide::test_seams::var("AGENT_IDE_MANAGED_CODEX_RESTART_STALL_MS")
+                    .and_then(|value| value.parse::<u64>().ok())
             {
                 // The marker makes this narrow test window observable after startup health has
                 // succeeded, before the lease request can reach the replacement daemon.
@@ -2743,8 +2743,7 @@ async fn adopt_current_claude_daemon(
 /// The product version of this running front, the reference every adopted daemon is compared to.
 /// Returns the installed front version, with a validated test seam for release-version scenarios.
 fn front_version() -> String {
-    std::env::var("AGENT_IDE_TEST_FRONT_VERSION")
-        .ok()
+    agent_ide::test_seams::var("AGENT_IDE_TEST_FRONT_VERSION")
         .filter(|value| {
             !value.is_empty()
                 && value.len() <= 32
@@ -3008,10 +3007,9 @@ const OWNED_DAEMON_READINESS_BUDGET: Duration = Duration::from_secs(30);
 ///
 /// The daemon sleeps before any rendezvous-visible work, so a cold loaded machine's slow start —
 /// the exact condition that killed replacements inside shorter health windows — can be reproduced
-/// deterministically. Only product tests set the variable; production never does.
+/// deterministically. Only a `test-seams` build reads the variable.
 async fn stall_daemon_startup_for_test() {
-    let Some(milliseconds) = std::env::var("AGENT_IDE_DAEMON_STARTUP_STALL_MS")
-        .ok()
+    let Some(milliseconds) = agent_ide::test_seams::var("AGENT_IDE_DAEMON_STARTUP_STALL_MS")
         .and_then(|value| value.parse::<u64>().ok())
     else {
         return;

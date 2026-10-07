@@ -388,6 +388,7 @@ fn js_and_stderr_toolchains_report_versions_not_unresponsive() {
 
 /// Spawns one health-only daemon at `runtime`, optionally reporting a test version, and waits for
 /// its socket to answer before returning the child for the caller to terminate.
+#[cfg(feature = "test-seams")]
 fn spawn_health_daemon(runtime: &std::path::Path, version: Option<&str>) -> std::process::Child {
     use std::process::Stdio;
     let mut command = agent_ide();
@@ -420,6 +421,7 @@ fn spawn_health_daemon(runtime: &std::path::Path, version: Option<&str>) -> std:
 }
 
 /// Terminates a test-spawned daemon through the same orderly SIGTERM path as production.
+#[cfg(feature = "test-seams")]
 fn stop_health_daemon(mut child: std::process::Child) {
     unsafe {
         libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
@@ -429,6 +431,7 @@ fn stop_health_daemon(mut child: std::process::Child) {
 
 /// The daemons component lists this user's live daemons with their reported versions and flags
 /// the outdated one, while the install pieces stay at their own findings (0.6.7).
+#[cfg(feature = "test-seams")]
 #[test]
 fn live_daemons_are_listed_with_versions_and_outdated_ones_flagged() {
     let layout = Layout::new("daemons");

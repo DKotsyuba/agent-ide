@@ -253,8 +253,9 @@ fn collect_non_rust(dir: &Path, out: &mut Vec<String>) -> Result<()> {
 }
 
 /// The full CI gate in one command: standard checks, fmt, the workspace tests (serialized, with
-/// the three gopls skips and `--no-fail-fast`), the four ignored provider tests, clippy, rustdoc,
-/// the release build and the contract snapshot check.
+/// the three gopls skips and `--no-fail-fast`, built with the `test-seams` feature the seam-driven
+/// product tests need), one default-build run proving a release build ignores those seams, the
+/// four ignored provider tests, clippy, rustdoc, the release build and the contract snapshot check.
 fn check(root: &Path) -> Result<()> {
     standard(root)?;
     run(root, "cargo", &["fmt", "--all", "--check"])?;
@@ -268,11 +269,31 @@ fn check(root: &Path) -> Result<()> {
         root,
         "cargo",
         &[
-            vec!["test", "--locked", "--workspace", "--no-fail-fast", "--"],
+            vec![
+                "test",
+                "--locked",
+                "--workspace",
+                "--features",
+                "test-seams",
+                "--no-fail-fast",
+                "--",
+            ],
             vec!["--test-threads=1"],
             skip_refs,
         ]
         .concat(),
+    )?;
+    // A release build (no `test-seams` feature) must ignore every environment seam.
+    run(
+        root,
+        "cargo",
+        &[
+            "test",
+            "--locked",
+            "--test",
+            "service_lifecycle_contract",
+            "release_build_ignores_the_version_seams",
+        ],
     )?;
     // The provider tests read their toolchains from the AGENT_IDE_* environment exactly as CI
     // prepares it; nothing here defaults to a developer's local interpreter paths.

@@ -1145,6 +1145,7 @@ async fn serving_generation(runtime: &Path) -> (String, Option<String>) {
 /// A front newer than an idle daemon replaces it at the rendezvous: the outdated daemon is asked
 /// to stop, the current binary serves instead, exactly one daemon remains, and the session's first
 /// start carries the same restart guidance a mid-call replacement gives (0.6.7).
+#[cfg(feature = "test-seams")]
 #[tokio::test]
 async fn newer_front_replaces_an_idle_outdated_daemon() {
     let candidate = init_repo();
@@ -1199,6 +1200,7 @@ async fn newer_front_replaces_an_idle_outdated_daemon() {
 
 /// A front newer than a daemon another session still binds keeps serving that daemon — never
 /// stopping it under the live binding — and says so in one honest line on the start card (0.6.7).
+#[cfg(feature = "test-seams")]
 #[tokio::test]
 async fn newer_front_keeps_an_outdated_daemon_bound_by_another_session() {
     let candidate = init_repo();
@@ -1256,6 +1258,7 @@ async fn newer_front_keeps_an_outdated_daemon_bound_by_another_session() {
 
 /// A pre-0.6.7 daemon reports no version and cannot be asked to stop, so a newer front keeps
 /// serving it with the honest line naming that reason instead, until it idles out on its own.
+#[cfg(feature = "test-seams")]
 #[tokio::test]
 async fn newer_front_keeps_a_legacy_daemon_that_reports_no_version() {
     let candidate = init_repo();
@@ -1300,6 +1303,7 @@ async fn newer_front_keeps_a_legacy_daemon_that_reports_no_version() {
 }
 
 /// A daemon of the front's own version, or newer, is adopted untouched: no replacement, no note.
+#[cfg(feature = "test-seams")]
 #[tokio::test]
 async fn equal_and_newer_daemons_are_adopted_untouched() {
     let candidate = init_repo();
@@ -1362,4 +1366,36 @@ async fn equal_and_newer_daemons_are_adopted_untouched() {
     }
 
     let _ = std::fs::remove_dir_all(candidate);
+}
+
+/// F-27: a release build (no `test-seams` feature) ignores the daemon and front version seams.
+///
+/// A session started with both variables inherited must still serve under the real product
+/// version: the daemon reports it, and the front neither replaces nor annotates that daemon as
+/// outdated. The tests above prove the same variables are honoured when the feature is on.
+#[cfg(not(feature = "test-seams"))]
+#[tokio::test]
+async fn release_build_ignores_the_version_seams() {
+    let candidate = init_repo();
+    let runtime = expected_runtime_path(&candidate);
+    let _guard = DaemonGuard(runtime.clone());
+    let template = write_launcher_template(&candidate);
+
+    let mcp = Mcp::start_with_env(
+        &template,
+        &candidate,
+        &[
+            ("AGENT_IDE_TEST_FRONT_VERSION", "0.6.7"),
+            ("AGENT_IDE_TEST_DAEMON_VERSION", "0.6.4"),
+        ],
+    )
+    .await;
+    wait_for_healthy_locked_daemon(&runtime).await;
+    let (_, version) = serving_generation(&runtime).await;
+    assert_eq!(
+        version.as_deref(),
+        Some(env!("CARGO_PKG_VERSION")),
+        "a release build must report its real version"
+    );
+    mcp.close().await;
 }

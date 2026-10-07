@@ -1329,10 +1329,10 @@ fn new_generation() -> Result<String, AppError> {
 ///
 /// The `AGENT_IDE_TEST_DROP_REPLY` seam names one method (`edit`, `read`, `stop`, ...): the first
 /// such call executes normally and its connection then closes without a reply, exactly the lost
-/// reply a front must report as an unknown outcome. Production never sets it.
+/// reply a front must report as an unknown outcome. Only a `test-seams` build reads it.
 fn drop_reply_for_test(method: AssistanceMethod) -> bool {
     static DROPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let Ok(seamed) = std::env::var("AGENT_IDE_TEST_DROP_REPLY") else {
+    let Some(seamed) = crate::test_seams::var("AGENT_IDE_TEST_DROP_REPLY") else {
         return false;
     };
     let named = match method {
@@ -1357,10 +1357,9 @@ fn drop_reply_for_test(method: AssistanceMethod) -> bool {
 /// The `AGENT_IDE_TEST_DAEMON_VERSION` seam lets a product test start a daemon that reports an
 /// older or newer version than the binary actually running — or, as `legacy`, no version at all,
 /// exactly the pre-0.6.7 shape — so upgrade decisions can be exercised without a second binary;
-/// production never sets it, and an unusable value is ignored.
+/// a release build (no `test-seams` feature) ignores it, and an unusable value is ignored.
 fn reported_version() -> Option<String> {
-    let seamed = std::env::var("AGENT_IDE_TEST_DAEMON_VERSION")
-        .ok()
+    let seamed = crate::test_seams::var("AGENT_IDE_TEST_DAEMON_VERSION")
         .filter(|value| !value.is_empty() && value.len() <= 32 && value.is_ascii());
     match seamed.as_deref() {
         Some("legacy") => None,

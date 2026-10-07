@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Changed
+
+- The environment variables that exist only for the product tests (`AGENT_IDE_TEST_DROP_REPLY`,
+  `AGENT_IDE_TEST_DAEMON_VERSION`, `AGENT_IDE_TEST_FRONT_VERSION`,
+  `AGENT_IDE_TEST_LEGACY_CLAUDE_DAEMON`, `AGENT_IDE_DAEMON_STARTUP_STALL_MS`,
+  `AGENT_IDE_MANAGED_CODEX_RESTART_STALL_MS`, `AGENT_IDE_CODEX_RENDEZVOUS_STALL_MS`) are read only
+  by builds with the `test-seams` cargo feature. A release build ignores them, so a wrapper or CI
+  job that inherits one can no longer change binding or transport behaviour.
+
 ## 0.10.3 — 2026-10-06
 
 ### Fixed
