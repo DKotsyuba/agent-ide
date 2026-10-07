@@ -142,6 +142,18 @@ impl LanguageServer for RustServer {
         &["rs"]
     }
 
+    /// Manifests, lock file, toolchain pins and Cargo configuration rust-analyzer loads.
+    fn project_inputs(&self) -> &'static [&'static str] {
+        &[
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain",
+            "rust-toolchain.toml",
+            "rust-project.json",
+            "config.toml",
+        ]
+    }
+
     /// Starts with no views and no sessions.
     fn new_backend(&self) -> Box<dyn ServerBackend> {
         Box::new(RustBackend::default())
@@ -186,7 +198,9 @@ impl RustBackend {
     ///
     /// `job` supplies binding ownership, cancellation, and spawn authority; `launch` is the
     /// accepted analyzer profile; `source` fixes the worktree and authority epoch. Admission,
-    /// profile, spawn, initialization, and cancellation failures return a bounded code.
+    /// profile, spawn, initialization, and cancellation failures return a bounded code. Every
+    /// `ProviderUnavailable` it returns first names its stage on `job` (`rust: view refused`,
+    /// `spawn failed`, `initialize failed` or `initialize timeout`), so no refusal is stage-less.
     async fn ensure(
         &mut self,
         host: &mut dyn ProviderHost,
@@ -338,6 +352,8 @@ impl RustBackend {
     /// Answers a Rust context request from the binding's long-lived analyzer session, starting
     /// one on first use. Readiness is probed for at most 100 ms; a loading non-edit job records a
     /// 300 ms resume time so the worker can run other work while the analyzer keeps loading.
+    /// A `ProviderUnavailable` answer names its stage on `job` (`rust: workspace load failed`, or
+    /// `rust: request failed` after which the failed session is retired).
     async fn answer(
         &mut self,
         host: &mut dyn ProviderHost,

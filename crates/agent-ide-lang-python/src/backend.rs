@@ -126,6 +126,19 @@ impl LanguageServer for PyrightServer {
         &["py", "pyi"]
     }
 
+    /// Project metadata Pyright reads when it resolves imports.
+    fn project_inputs(&self) -> &'static [&'static str] {
+        &[
+            "pyproject.toml",
+            "pyrightconfig.json",
+            "setup.cfg",
+            "setup.py",
+            "requirements.txt",
+            "Pipfile",
+            "poetry.lock",
+        ]
+    }
+
     /// Pyright's call hierarchy answers nothing for constructors and partially for everything
     /// else, so callers and graphs are reported unavailable rather than misleadingly partial.
     fn call_hierarchy(&self) -> bool {
@@ -180,7 +193,8 @@ impl PyrightBackend {
     /// every use: a session whose interpreter identity no longer matches is released and
     /// restarted with the new one. A replaced child is shut down before another is admitted.
     /// Profile, authority, capacity, spawn, handshake, and cancellation failures return their
-    /// bounded `FailureCode`.
+    /// bounded `FailureCode`; every `ProviderUnavailable` first names its stage on `job`
+    /// (`python: view refused`, `spawn failed` or `initialize failed`).
     async fn ensure(
         &mut self,
         host: &mut dyn ProviderHost,
@@ -345,7 +359,8 @@ impl PyrightBackend {
     ///
     /// The exchange always waits (bounded) for the document's diagnostics push. A failed or
     /// cancelled exchange retires the session; cancellation maps to `Cancelled`, any other
-    /// failure to `ProviderUnavailable`. When the worktree has no Python environment at all, the
+    /// failure to `ProviderUnavailable` after naming the stage `python: request failed` on `job`.
+    /// When the worktree has no Python environment at all, the
     /// push's per-import `Import "..." could not be resolved` flood is collapsed into the single
     /// line [`MISSING_ENVIRONMENT_IMPORTS`] (see [`summarize_missing_environment`]); every other
     /// diagnostic survives untouched.

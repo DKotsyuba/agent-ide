@@ -1439,6 +1439,10 @@ pub(crate) mod testing {
         fn session_extensions(&self) -> &'static [&'static str] {
             &["epsilon"]
         }
+        /// The one project input file of the fixture language, `epsilon.cfg`.
+        fn project_inputs(&self) -> &'static [&'static str] {
+            &["epsilon.cfg"]
+        }
         /// A fresh recording backend.
         fn new_backend(&self) -> Box<dyn crate::intelligence::server::ServerBackend> {
             Box::new(FixtureBackend::default())

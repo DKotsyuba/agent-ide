@@ -143,6 +143,14 @@ pub trait LanguageServer: Send + Sync + 'static {
         &[]
     }
 
+    /// File names (not paths) of the project inputs whose change can make a failed session
+    /// workable again: manifests, lock files and configuration the server reads while loading its
+    /// workspace. The worker retires a failed session once any of them changed or Git's `HEAD`
+    /// moved, and never otherwise. Empty (the default) leaves only a moved `HEAD` as the signal.
+    fn project_inputs(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Whether the server's call hierarchy is reliable enough to render callers and graphs.
     /// Defaults to `true`.
     fn call_hierarchy(&self) -> bool {

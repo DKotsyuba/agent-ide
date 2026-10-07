@@ -2750,6 +2750,7 @@ impl<'a> Worker<'a> {
     /// Rechecks queued liveness, executes only the selected owner operation, and fences every result.
     async fn perform(&mut self, job: &mut Job) {
         let binding = job.invocation.binding_ref().clone();
+        self.providers.current = None;
         let was_parked = job.park_until.take().is_some();
         // Read/query jobs can restart from the top after readiness probes: observe records a fresh
         // source snapshot, and ensure_live_* reuses the same alive per-binding session.
@@ -2852,6 +2853,7 @@ impl<'a> Worker<'a> {
         if job.park_until.is_some() {
             return;
         }
+        self.settle_session_health(job, result.as_ref().err()).await;
         let (reply, authority, source) = match result {
             Ok(result) => result,
             Err(code) => {
@@ -7073,6 +7075,7 @@ mod stop_retry_tests {
             stage: None,
             session_binding: None,
         };
+        worker.providers.current = None;
         let outcome = worker
             .live_session_for(&mut job, &observed)
             .await
@@ -7081,6 +7084,10 @@ mod stop_retry_tests {
             job.session_binding.is_none(),
             "the borrowed owner is cleared after the provider call"
         );
+        // What `perform` does when a job ends: settle the health of the session it used.
+        worker
+            .settle_session_health(&job, outcome.as_ref().err())
+            .await;
         (outcome, job.failure_detail)
     }
 
@@ -7962,6 +7969,79 @@ mod stop_retry_tests {
                 .iter()
                 .filter(|event| **event == format!("close-failed:{tag}"))
                 .count(),
+            2,
+            "{events:?}"
+        );
+    }
+
+    /// A failed provider session is retired exactly when its project inputs change or Git's
+    /// `HEAD` moves: repeated calls against an unchanged invalid project keep the failed session
+    /// (no restart loop), and the first call after a changed input or a commit starts afresh.
+    #[tokio::test]
+    async fn failed_session_retires_only_on_changed_inputs_or_head_movement() {
+        use crate::lang::testing::{fixture_fail_next_ensure, fixture_tag};
+        let fixture = Fixture::new();
+        let file = epsilon_source(&fixture);
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let reader = provider_start(&mut worker, "rc-reader", "rc-start", true, None)
+            .await
+            .unwrap();
+        let tag = fixture_tag(&reader);
+        let (ensure, release) = (format!("ensure:{tag}"), format!("release:{tag}"));
+        let mut call = 0;
+        let mut next = async |worker: &mut Worker<'_>| {
+            call += 1;
+            provider_symbol_call(worker, "rc-reader", &format!("rc-{call}"), &file).await
+        };
+
+        assert_eq!(next(&mut worker).await, Err(FailureCode::ProviderLoading));
+        // The session fails a call: it is marked, but unchanged inputs never restart it.
+        fixture_fail_next_ensure(&reader, false);
+        assert_eq!(
+            next(&mut worker).await,
+            Err(FailureCode::ProviderUnavailable)
+        );
+        for _ in 0..3 {
+            assert_eq!(next(&mut worker).await, Err(FailureCode::ProviderLoading));
+        }
+        let (events, _) = provider_events(&[&reader]);
+        assert!(!events.contains(&release), "no restart loop: {events:?}");
+
+        // A changed project input retires the failed session before the next call.
+        std::fs::write(fixture.root.join("epsilon.cfg"), "fixed\n").unwrap();
+        assert_eq!(next(&mut worker).await, Err(FailureCode::ProviderLoading));
+        let (events, _) = provider_events(&[&reader]);
+        assert_eq!(
+            events.iter().filter(|event| **event == release).count(),
+            1,
+            "{events:?}"
+        );
+        assert_eq!(events.last(), Some(&ensure), "{events:?}");
+
+        // Fail again against the new basis: still no restart until something changes.
+        fixture_fail_next_ensure(&reader, false);
+        assert_eq!(
+            next(&mut worker).await,
+            Err(FailureCode::ProviderUnavailable)
+        );
+        assert_eq!(next(&mut worker).await, Err(FailureCode::ProviderLoading));
+        let (events, _) = provider_events(&[&reader]);
+        assert_eq!(
+            events.iter().filter(|event| **event == release).count(),
+            1,
+            "{events:?}"
+        );
+
+        // A moved HEAD retires it.
+        std::fs::write(fixture.root.join("moved.txt"), "commit\n").unwrap();
+        git_commit(&fixture.root, "move head");
+        assert_eq!(next(&mut worker).await, Err(FailureCode::ProviderLoading));
+        let (events, _) = provider_events(&[&reader]);
+        assert_eq!(
+            events.iter().filter(|event| **event == release).count(),
             2,
             "{events:?}"
         );

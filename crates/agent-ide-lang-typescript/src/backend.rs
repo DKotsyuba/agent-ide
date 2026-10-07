@@ -495,6 +495,18 @@ impl LanguageServer for TypeScriptServer {
         &["js", "jsx", "ts", "tsx"]
     }
 
+    /// Project configuration and lock files the TypeScript project resolution reads.
+    fn project_inputs(&self) -> &'static [&'static str] {
+        &[
+            "tsconfig.json",
+            "jsconfig.json",
+            "package.json",
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+        ]
+    }
+
     /// Symbol tools use the live bridge session for every JavaScript/TypeScript module extension.
     fn session_extensions(&self) -> &'static [&'static str] {
         &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"]
@@ -568,7 +580,9 @@ impl TypeScriptBackend {
     /// `job` supplies cancellation and binding ownership; `launch` provides the accepted bundle;
     /// `source` selects and verifies project inputs. A different worktree, bundle, or captured
     /// project file set shuts down the old session before a new one is admitted. Unverified inputs,
-    /// authority, capacity, spawn, handshake, and cancellation failures return a bounded code.
+    /// authority, capacity, spawn, handshake, and cancellation failures return a bounded code;
+    /// every `ProviderUnavailable` first names its stage on `job` (`typescript: project
+    /// quarantined`, `view refused`, `spawn failed` or `initialize failed`).
     async fn ensure(
         &mut self,
         host: &mut dyn ProviderHost,
@@ -769,7 +783,8 @@ impl TypeScriptBackend {
     /// Answers TypeScript context requests through the binding's persistent server session.
     ///
     /// The exchange always waits (bounded) for the diagnostics push. A failed or cancelled
-    /// exchange retires the session. The result is then checked against the session's project
+    /// exchange retires the session and answers `ProviderUnavailable` with the stage
+    /// `typescript: request failed`. The result is then checked against the session's project
     /// snapshot and answers `ResolutionUnverified` (with the failure detail set) when the project
     /// changed.
     async fn answer(

@@ -293,6 +293,10 @@ fn environment_refusal(detail: &str) -> Option<(String, &str)> {
 }
 
 /// Extracts a producer's trailing detail payload without depending on prefix byte lengths.
+///
+/// For the no-server shape `<tool>:provider_unavailable ext=<ext>[ (provider: …)]` the payload is
+/// the bare extension: it ends at the first space, so the optional trailing parenthesised stage
+/// the journal carries never reaches the rendered sentence.
 fn resolution_message(detail: &str) -> &str {
     let Some((_, stage_detail)) = detail.split_once(':') else {
         return detail;
