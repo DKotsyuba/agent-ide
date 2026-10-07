@@ -2382,8 +2382,10 @@ struct ProcessIdentity {
 }
 
 impl ProcessIdentity {
-    /// Returns the identity of `pid` and its parent PID, or `None` when it is gone or a zombie.
-    fn of(pid: libc::pid_t) -> Option<(Self, libc::pid_t)> {
+    /// Returns the identity of `pid`, its parent PID and its kernel run state (`SZOMB` for an
+    /// exited process its parent has not reaped, `SSTOP` once a `SIGSTOP` has taken effect), or
+    /// `None` once the kernel no longer lists it.
+    fn of(pid: libc::pid_t) -> Option<(Self, libc::pid_t, u32)> {
         // SAFETY: an all-zero `proc_bsdinfo` is a valid plain-data value for the kernel to fill.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -2397,18 +2399,26 @@ impl ProcessIdentity {
                 size,
             )
         };
-        (written == size && info.pbi_status != libc::SZOMB).then_some((
+        (written == size).then_some((
             Self {
                 pid,
                 started: (info.pbi_start_tvsec, info.pbi_start_tvusec),
             },
             info.pbi_ppid as libc::pid_t,
+            info.pbi_status,
         ))
     }
 
-    /// Reports whether this exact process (not a later holder of its PID) is still running.
-    fn alive(self) -> bool {
-        Self::of(self.pid).is_some_and(|(now, _)| now == self)
+    /// Reports whether the kernel still lists this exact process (not a later holder of its PID),
+    /// a zombie included: an exited provider only counts as gone once its parent or `launchd`
+    /// has reaped it.
+    fn exists(self) -> bool {
+        Self::of(self.pid).is_some_and(|(now, _, _)| now == self)
+    }
+
+    /// Reports whether this exact process is still running, that is listed and not a zombie.
+    fn running(self) -> bool {
+        Self::of(self.pid).is_some_and(|(now, _, state)| now == self && state != libc::SZOMB)
     }
 
     /// Lists the live direct children of `parent`; only call it while `parent` is a process this
@@ -2422,24 +2432,24 @@ impl ProcessIdentity {
             .take(usize::try_from(listed).unwrap_or(0))
             .filter(|pid| *pid > 0)
             .filter_map(Self::of)
-            .filter(|(_, ppid)| *ppid == parent)
-            .map(|(identity, _)| identity)
+            .filter(|(_, ppid, _)| *ppid == parent)
+            .map(|(identity, _, _)| identity)
             .collect()
     }
 
     /// Terminates the still-running `owned` processes: `SIGTERM`, then `SIGKILL` after five
-    /// seconds, and returns once none of them is running.
+    /// seconds, and returns once the kernel no longer lists any of them (the exact processes are
+    /// reaped by their parent, or by `launchd` once the daemon that owned them is gone).
     ///
     /// A process that leads its own group (a daemon-spawned provider) is signalled as a group so
     /// its helpers die with it; any other process is signalled alone, never through a group it
     /// merely belongs to.
     fn terminate(owned: &[Self]) {
         for signal in [libc::SIGTERM, libc::SIGKILL] {
-            let live: Vec<_> = owned.iter().copied().filter(|id| id.alive()).collect();
-            if live.is_empty() {
+            if !owned.iter().any(|id| id.exists()) {
                 return;
             }
-            for id in live {
+            for id in owned.iter().copied().filter(|id| id.running()) {
                 // SAFETY: `id` was verified a moment ago to be the exact process that was
                 // captured as a child of this test's daemon; a group is addressed only when
                 // that process leads it.
@@ -2449,7 +2459,7 @@ impl ProcessIdentity {
                 }
             }
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while std::time::Instant::now() < deadline && owned.iter().any(|id| id.alive()) {
+            while std::time::Instant::now() < deadline && owned.iter().any(|id| id.exists()) {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
@@ -2492,9 +2502,46 @@ impl OwnedDaemon {
         }
     }
 
-    /// Kills the daemon like [`Child::kill`] after snapshotting the children it would orphan.
+    /// Stops the daemon in place with `SIGSTOP` so it can fork no further provider, while its
+    /// unreaped handle still proves the PID is ours; a later `SIGKILL` ends it as usual.
+    fn freeze(&self) {
+        const SSTOP: u32 = 4;
+        if let Some(pid) = self.child.id().map(|pid| pid as libc::pid_t) {
+            // SAFETY: the unreaped `Child` handle proves `pid` is this test's own daemon.
+            unsafe { libc::kill(pid, libc::SIGSTOP) };
+            // The signal takes effect asynchronously: wait until the kernel reports the stop, or
+            // the daemon is gone, before anyone snapshots its children.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < deadline
+                && ProcessIdentity::of(pid)
+                    .is_some_and(|(_, _, state)| state != SSTOP && state != libc::SZOMB)
+            {
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        }
+    }
+
+    /// Snapshots the children of the frozen daemon until the list stops growing.
+    ///
+    /// A child that is mid-`fork` or mid-`exec` can be missing from the first listing and show up
+    /// a few milliseconds later, so the listing repeats until a pause adds nothing new.
+    fn adopt_frozen_children(&mut self) {
+        for _ in 0..25 {
+            let known = self.owned.len();
+            self.adopt_children();
+            std::thread::sleep(Duration::from_millis(20));
+            self.adopt_children();
+            if self.owned.len() == known {
+                return;
+            }
+        }
+    }
+
+    /// Kills the daemon like [`Child::kill`], first freezing it and snapshotting the children it
+    /// would orphan, so no provider born after the snapshot can escape.
     async fn kill(&mut self) -> std::io::Result<()> {
-        self.adopt_children();
+        self.freeze();
+        self.adopt_frozen_children();
         self.child.kill().await
     }
 
@@ -2544,12 +2591,14 @@ impl OwnedDaemon {
 
 impl std::ops::Deref for OwnedDaemon {
     type Target = Child;
+    /// Borrows the daemon process handle, so a test uses it like the plain [`Child`].
     fn deref(&self) -> &Child {
         &self.child
     }
 }
 
 impl std::ops::DerefMut for OwnedDaemon {
+    /// Mutably borrows the daemon process handle (`wait`, `try_wait`, `stderr`, ...).
     fn deref_mut(&mut self) -> &mut Child {
         &mut self.child
     }
@@ -2563,7 +2612,8 @@ impl Drop for OwnedDaemon {
             // SAFETY: the unreaped `Child` handle proves `pid` is this test's own daemon.
             unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
             if !self.wait_for_exit(Duration::from_secs(10)) {
-                self.adopt_children();
+                self.freeze();
+                self.adopt_frozen_children();
                 ProcessIdentity::terminate(&self.owned);
                 let _ = self.child.start_kill();
                 self.wait_for_exit(Duration::from_secs(5));
@@ -20995,7 +21045,7 @@ async fn spawn_daemon_with_gated_wrapper(
             .ok()
             .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
         {
-            let (identity, parent) = ProcessIdentity::of(pid).unwrap();
+            let (identity, parent, _) = ProcessIdentity::of(pid).unwrap();
             assert_eq!(parent as u32, daemon.id().unwrap());
             return (daemon, identity);
         }
@@ -21007,7 +21057,7 @@ async fn spawn_daemon_with_gated_wrapper(
 /// Asserts that a failed fixture ended its wrapper and removed its tree; the test's own
 /// identity-checked terminate ends a survivor first, so a failing assertion never leaks the loop.
 fn assert_wrapper_reaped(wrapper: ProcessIdentity, base: &Path) {
-    let survived = wrapper.alive();
+    let survived = wrapper.exists();
     ProcessIdentity::terminate(&[wrapper]);
     assert!(!survived, "the gated wrapper outlived its fixture");
     assert!(!base.exists(), "the fixture tree must be deleted");
@@ -21044,4 +21094,77 @@ async fn fixture_guard_reaps_a_gated_provider_after_a_panic_and_a_timeout() {
     assert!(timed_out.is_err());
     let (wrapper, base) = survivor.lock().unwrap().take().unwrap();
     assert_wrapper_reaped(wrapper, &base);
+}
+
+/// F-11: a provider the daemon forks while it is being killed still dies with its owner.
+///
+/// The fake daemon forks a new gate-held wrapper (own process group) as fast as it can and never
+/// stops. `OwnedDaemon::kill` must freeze it before snapshotting its children, so no wrapper born
+/// between the snapshot and the `SIGKILL` can escape the owner's teardown. The window is a few
+/// microseconds wide, so the scenario repeats until a lost race would be all but certain.
+#[tokio::test]
+async fn owned_daemon_kill_reaps_a_provider_forked_during_the_kill() {
+    for round in 0..25 {
+        let fixture = ProductFixture::skeleton();
+        let gate = fixture.base.join("gate");
+        let log = fixture.base.join("wrapper-log");
+        let wrapper = fixture.base.join("wrapper");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\n",
+                log.display(),
+                gate.display()
+            ),
+        )
+        .unwrap();
+        fixture.guard_gate(&gate);
+        let mut daemon = OwnedDaemon::new(
+            Command::new("/usr/bin/perl")
+                .args([
+                    "-e",
+                    "while (1) { my $p = fork(); if (!$p) { setpgrp(0, 0); exec '/bin/sh', $ARGV[0]; } }",
+                ])
+                .arg(&wrapper)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap(),
+        );
+        let recorded = |log: &Path| -> Vec<libc::pid_t> {
+            std::fs::read_to_string(log)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect()
+        };
+        for _ in 0..500 {
+            if recorded(&log).len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(recorded(&log).len() >= 3, "the fake daemon never forked");
+        daemon.kill().await.unwrap();
+        drop(daemon);
+        // A recorded PID may be reused by a short-lived helper of another wrapper, so only a
+        // process that is still listed after a grace period counts as a survivor.
+        let mut survivors = Vec::new();
+        for _ in 0..100 {
+            survivors = recorded(&log)
+                .into_iter()
+                .filter(|pid| ProcessIdentity::of(*pid).is_some())
+                .collect();
+            if survivors.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            survivors.is_empty(),
+            "round {round}: wrappers forked during the kill survived: {survivors:?}"
+        );
+    }
 }
