@@ -180,7 +180,7 @@ Common practice across these tools:
 - **Not part of the activation digest** (durable.rs:379-389). Repeating `ide.start` with the same `activation_id` and a new `environment` applies the new value and returns the refreshed card. The agent loop is: start, read the candidates, start again with a choice.
 - **Validation** uses the existing closed vocabulary:
   - unknown candidate: `error: invalid_detail (environment: python ".venv-py9" not found; candidates .venv, .venv-py314)`
-  - a path outside both the worktree and every allowed root: `error: outside_allowed_roots (environment python /opt/envs/x)` (same `admit_path`, launcher.rs:753)
+  - a path outside both the worktree and every allowed root: `error: outside_allowed_roots (environment python /opt/envs/x)`, followed by a dedicated recovery text that names the selector and the project venv form (`ide.start` with `environment {"python": ".venv"}`, the directory that holds `bin/python`) instead of the generic project-root text (same `admit_path`, launcher.rs:753)
   - a Pyright pin in force: refused as in §5.1.
 - **No new tool**, and nothing new in `ide.context` for P1. Add `kind:"environment"` later only if more than 4 candidates per root become common.
 

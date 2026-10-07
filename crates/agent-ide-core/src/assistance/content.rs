@@ -116,6 +116,8 @@ fn project(
     // Strict-undefined rendering expects these fields on every reply.
     context["cause_tag"] = serde_json::Value::String(String::new());
     context["resolution_message"] = serde_json::Value::String(String::new());
+    context["environment_key"] = serde_json::Value::String(String::new());
+    context["environment_selector"] = serde_json::Value::String(String::new());
     context["tool_name"] = serde_json::Value::String(tool_name.unwrap_or_default().to_owned());
     context["test_status_id"] =
         test_status_id.map_or(serde_json::Value::Null, serde_json::Value::from);
@@ -124,6 +126,10 @@ fn project(
         context["resolution_detail"] = serde_json::Value::String(detail.to_owned());
         context["resolution_message"] =
             serde_json::Value::String(resolution_message(detail).to_owned());
+        if let Some((key, selector)) = environment_refusal(detail) {
+            context["environment_key"] = serde_json::Value::String(key.to_owned());
+            context["environment_selector"] = serde_json::Value::String(selector.to_owned());
+        }
         if let Some(fields) = structured.as_object_mut() {
             fields.remove("detail");
         }
@@ -212,7 +218,13 @@ fn escape_untrusted_labels(context: &mut serde_json::Value) {
         field(code, "no_such_file");
         field(code, "unsupported_file");
     }
-    for key in ["resolution_detail", "resolution_message", "cause_tag"] {
+    for key in [
+        "resolution_detail",
+        "resolution_message",
+        "cause_tag",
+        "environment_key",
+        "environment_selector",
+    ] {
         field(context, key);
     }
     if let Some(result) = context.get_mut("result") {
@@ -257,6 +269,17 @@ fn display_safe(label: &str) -> String {
         }
     }
     escaped
+}
+
+/// Splits an environment-selector refusal detail, `environment <root key> <selector>`, into the
+/// root key (`python` or `python:<relative root>`) and the selector exactly as the agent sent it.
+///
+/// Returns `None` for every other detail. The selector may contain spaces: only the first two
+/// separators split.
+fn environment_refusal(detail: &str) -> Option<(&str, &str)> {
+    let rest = detail.strip_prefix("environment ")?;
+    let (key, selector) = rest.split_once(' ')?;
+    (!key.is_empty() && !selector.is_empty()).then_some((key, selector))
 }
 
 /// Extracts a producer's trailing detail payload without depending on prefix byte lengths.
@@ -1199,6 +1222,43 @@ mod tests {
         )
         .unwrap();
         assert!(text_of(&unresolved).contains("Check the path and retry ide.start from its root"));
+    }
+
+    /// An environment selector refused outside `allowed_roots` names the selector and the project
+    /// venv form instead of telling the agent to move the project root (F-28), while an ordinary
+    /// root refusal keeps its own text.
+    #[test]
+    fn environment_selector_refusal_names_the_selector_and_the_venv_form() {
+        let refused = render(
+            PeerReply::Error {
+                code: FailureCode::OutsideAllowedRoots,
+                detail: Some("environment python:service /usr/local/bin/python3.14".to_owned()),
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        let line = text_of(&refused);
+        for fact in [
+            "environment selector /usr/local/bin/python3.14 for python:service",
+            "inside the worktree",
+            "bin/python",
+            "not a base interpreter",
+            "{\"python\": \".venv\"}",
+            "allowed_roots",
+        ] {
+            assert!(line.contains(fact), "missing {fact:?}: {line}");
+        }
+        assert!(!line.contains("requested project root"), "{line}");
+
+        let ordinary = render(
+            PeerReply::Error {
+                code: FailureCode::OutsideAllowedRoots,
+                detail: None,
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        assert!(text_of(&ordinary).contains("the requested project root is outside"));
     }
 
     /// Edit and test refusals share the exact read-only response shape and current-writer field.

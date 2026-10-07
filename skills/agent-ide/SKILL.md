@@ -197,7 +197,9 @@ loading — `ide.context {"kind":"problems"}` shows the project check.
    other candidates. A nested root without its own environment uses the worktree root's.
    Switch with `ide.start {"environment": {"python": "<candidate or path>"}}`
    (`python:<root>` for a nested root, `auto` resets); the choice persists for the worktree,
-   and a `read_only` activation cannot change it.
+   and a `read_only` activation cannot change it. A selector outside the worktree and every
+   allowed root is refused `outside_allowed_roots (environment <root> <selector>)`: select the
+   project's own venv directory (the one that holds `bin/python`), never a base interpreter.
    Directories without Git work; `ide.diff` and requested symbol history there answer
    `not a git repository: no git data`.
 2. Before an edit, prefer `ide.outline` the file (or `ide.symbol` the target) for its skeleton,

@@ -131,6 +131,8 @@ error: source_unavailable{% if resolution_detail %} ({{ resolution_detail }}){% 
 error: outside_allowed_roots ({{ resolution_detail }}); the requested root does not exist yet, so it cannot be activated; create it below the named ancestor or start from that ancestor, otherwise continue with native tools
 {%- elif code == "outside_allowed_roots" and resolution_detail is startingwith("start:worktree_unresolved") -%}
 error: outside_allowed_roots ({{ resolution_detail }}); the discovered worktree or Git directory is outside allowed_roots; start from an admitted worktree root
+{%- elif code == "outside_allowed_roots" and resolution_detail is startingwith("environment ") and environment_selector -%}
+error: outside_allowed_roots ({{ resolution_detail }}); the environment selector {{ environment_selector }} for {{ environment_key }} is outside the worktree and every allowed root. Select the project's own virtual-environment directory inside the worktree (the directory that holds bin/python, not a base interpreter), for example ide.start with environment {"python": ".venv"}, or ask the owner to add the directory to allowed_roots
 {%- elif code == "outside_allowed_roots" -%}
 error: outside_allowed_roots{% if resolution_detail %} ({{ resolution_detail }}){% else %} (start:outside_allowed_roots){% endif %}; the requested project root is outside every directory the IDE may open. Call ide.start with an allowed root, or continue with native tools
 {%- elif code == "workspace_activation" and resolution_detail is startingwith("start:git_discovery_failed") -%}

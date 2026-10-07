@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- A Python environment selector refused as outside the allowed roots (for example a base
+  interpreter passed instead of the project venv) now answers with a text that names the
+  selector and the expected project venv form, instead of telling the agent to move the project
+  root.
+
 ### Changed
 
 - The environment variables that exist only for the product tests (`AGENT_IDE_TEST_DROP_REPLY`,
