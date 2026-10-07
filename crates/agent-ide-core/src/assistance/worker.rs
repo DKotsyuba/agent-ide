@@ -4924,7 +4924,7 @@ impl<'a> Worker<'a> {
     /// Returns when the next background retry of the pending revokes is due, scheduling it one
     /// backoff step ahead when none is scheduled yet, or `None` while no revoke is pending.
     fn schedule_revoke_retry(&mut self) -> Option<tokio::time::Instant> {
-        if self.pending_revocations.is_empty() {
+        if self.unrevoked_bindings().is_empty() {
             self.revoke_retry_rounds = 0;
             self.next_revoke_retry = None;
             return None;
@@ -4937,16 +4937,30 @@ impl<'a> Worker<'a> {
         )
     }
 
-    /// Retries every pending revoke with its original operation id, as the daemon's own
+    /// Lists every binding whose durable grant outlives its stop: the recorded pending revokes
+    /// plus any stopped binding that still owns a grant. The second part is derived from the
+    /// grants themselves, so a stop that failed while the bounded pending set was full still has
+    /// a retry owner.
+    fn unrevoked_bindings(&self) -> Vec<BindingRef> {
+        let mut found = self.pending_revocations.clone();
+        found.extend(
+            self.grants
+                .keys()
+                .filter(|binding| self.shared.active(binding).is_err())
+                .cloned(),
+        );
+        found.into_iter().collect()
+    }
+
+    /// Retries every unrevoked stop with its original operation id, as the daemon's own
     /// background cleanup: each success releases the grant, caches, paths and lease; each failure
-    /// stays pending for the next, later round.
+    /// stays for the next, later round.
     async fn retry_pending_revocations(&mut self) {
-        let pending = self.pending_revocations.iter().cloned().collect::<Vec<_>>();
-        for binding in pending {
+        for binding in self.unrevoked_bindings() {
             let _ = self.settle_revocation(&binding).await;
         }
         self.next_revoke_retry = None;
-        self.revoke_retry_rounds = if self.pending_revocations.is_empty() {
+        self.revoke_retry_rounds = if self.unrevoked_bindings().is_empty() {
             0
         } else {
             self.revoke_retry_rounds.saturating_add(1)
@@ -8405,10 +8419,6 @@ mod stop_retry_tests {
             .unwrap()
             .stop_binding(&binding)
             .unwrap();
-        assert!(
-            worker.schedule_revoke_retry().is_none(),
-            "nothing pending yet"
-        );
 
         let lock = rusqlite::Connection::open(fixture.base.join("state.sqlite")).unwrap();
         lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
@@ -8432,6 +8442,40 @@ mod stop_retry_tests {
         assert!(worker.pending_revocations.is_empty());
         assert!(worker.grants.is_empty());
         assert_eq!(worker.revoke_retry_rounds, 0);
+        assert!(worker.schedule_revoke_retry().is_none());
+    }
+
+    /// F-12: a stop that failed while the bounded pending set was full still has a retry owner:
+    /// the stopped binding's own grant. With the pending set emptied by hand (the overflow), the
+    /// daemon still schedules and performs the retry once the store answers.
+    #[tokio::test]
+    async fn stopped_grant_is_retried_even_when_the_pending_set_overflowed() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        let (binding, _) = production_start(&mut worker, "actor-1", "call-1").await;
+        worker
+            .shared
+            .bindings
+            .lock()
+            .unwrap()
+            .stop_binding(&binding)
+            .unwrap();
+        let lock = rusqlite::Connection::open(fixture.base.join("state.sqlite")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        assert!(worker.revoke(&binding, &[]).await.is_err());
+        // The overflow: the pending set never recorded this binding.
+        worker.pending_revocations.clear();
+        assert!(worker.grants.contains_key(&binding));
+        assert!(
+            worker.schedule_revoke_retry().is_some(),
+            "the stopped grant alone schedules the retry"
+        );
+        lock.execute_batch("ROLLBACK;").unwrap();
+        drop(lock);
+        worker.retry_pending_revocations().await;
+        assert!(worker.grants.is_empty(), "the retry released the grant");
         assert!(worker.schedule_revoke_retry().is_none());
     }
 
