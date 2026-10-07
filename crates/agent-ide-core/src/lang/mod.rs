@@ -1431,6 +1431,9 @@ pub(crate) mod testing {
     /// list, and fails every call-hierarchy request with an error reply, so tests can drive the
     /// worker's real exchange-failure paths. `failing` additionally names requests
     /// (`"documentSymbol"`, `"references"`, `"workspaceSymbol"`) that fail with an error reply.
+    ///
+    /// The latest call for a binding wins, but only for the next session opened for it: a session
+    /// that already exists keeps its script until it is released.
     pub(crate) fn fixture_serve_session(
         binding: &crate::assistance::host_binding::BindingRef,
         failing: &'static [&'static str],
@@ -1462,6 +1465,11 @@ pub(crate) mod testing {
 
     /// Opens a live session against a scripted in-process language server (see
     /// [`fixture_serve_session`]).
+    ///
+    /// `source` supplies the worktree and authority epoch the session is opened for; `failing`
+    /// names the extra requests the script answers with an error reply. The in-process server runs
+    /// as a spawned task that ends with the connection, owned by the returned session. Errors are
+    /// those of opening the client and its initialize handshake.
     async fn fixture_open_session(
         source: &crate::workspace::observation::SourceObservation,
         failing: &'static [&'static str],
@@ -1708,7 +1716,8 @@ pub(crate) mod testing {
             })
         }
 
-        /// Ends the binding's pretend session and records it.
+        /// Ends the binding's pretend session and records it, and drops its scripted session (and
+        /// with it the in-process server connection) when one was opened.
         fn release_live<'a>(
             &'a mut self,
             _host: &'a mut dyn crate::intelligence::server::ProviderHost,
