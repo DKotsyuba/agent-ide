@@ -84,17 +84,41 @@ impl Lane {
             window.record(crate::errorlog::now_ms(), BUSY_JOURNAL_WINDOW_MS)
         });
         if let Some(suppressed) = due {
-            crate::errorlog::record(
-                crate::errorlog::Method::Daemon,
-                crate::errorlog::Outcome::Refused,
-                crate::errorlog::Fields {
-                    reason: Some(crate::errorlog::ReasonCode::Capacity),
-                    detail: Some(self.detail),
-                    count: (suppressed > 0).then_some(suppressed),
-                    ..crate::errorlog::Fields::default()
-                },
-            );
+            self.journal_refusals(suppressed);
         }
+    }
+
+    /// Writes the refusals counted since the last journal line, when there are any and either
+    /// their window has elapsed or `force` is set (daemon shutdown), so a burst followed by
+    /// silence is never lost.
+    fn flush_refusals(&self, force: bool) {
+        let due = self.refused.lock().ok().and_then(|mut window| {
+            let (started, suppressed) = window.parts();
+            let elapsed = started.is_some_and(|started| {
+                crate::errorlog::now_ms().saturating_sub(started) >= BUSY_JOURNAL_WINDOW_MS
+            });
+            (suppressed > 0 && (force || elapsed)).then(|| {
+                *window = crate::errorlog::RateWindow::resume(started, 0);
+                suppressed
+            })
+        });
+        if let Some(suppressed) = due {
+            self.journal_refusals(suppressed);
+        }
+    }
+
+    /// Writes one refusal journal line; `suppressed` further refusals are carried as its count.
+    fn journal_refusals(&self, suppressed: u64) {
+        crate::errorlog::record(
+            crate::errorlog::Method::Daemon,
+            crate::errorlog::Outcome::Refused,
+            crate::errorlog::Fields {
+                reason: Some(crate::errorlog::ReasonCode::Capacity),
+                detail: Some(self.detail),
+                count: (suppressed > 0).then_some(suppressed),
+                ..crate::errorlog::Fields::default()
+            },
+        );
     }
 }
 
@@ -357,9 +381,15 @@ async fn run_daemon_inner(
             crate::errorlog::Fields::default(),
         );
 
+        let mut journal_tick = tokio::time::interval(Duration::from_millis(BUSY_JOURNAL_WINDOW_MS));
         loop {
             let accepted = tokio::select! {
                 accepted = listener.accept() => accepted,
+                _ = journal_tick.tick() => {
+                    lanes.calls.flush_refusals(false);
+                    lanes.hooks.flush_refusals(false);
+                    continue;
+                }
                 _ = &mut termination => break,
                 _ = &mut idle_expired => { idle_exit = !lease.stop_requested(); break; }
                 _ = connections.join_next(), if !connections.is_empty() => continue,
@@ -382,6 +412,9 @@ async fn run_daemon_inner(
                 .await;
             });
         }
+        // Refusals still counted in an open window would otherwise die with the daemon.
+        lanes.calls.flush_refusals(true);
+        lanes.hooks.flush_refusals(true);
         Ok(())
     }
     .await;

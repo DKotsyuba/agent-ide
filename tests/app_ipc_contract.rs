@@ -690,6 +690,34 @@ async fn start_limited_daemon(
     panic!("limited daemon did not bind its private socket");
 }
 
+/// The one journal home of this test process, created and wired on first use.
+///
+/// The journal writer is initialised once per process, so every test that reads the journal
+/// shares this directory and tells its own lines apart by content.
+fn journal_home() -> &'static Path {
+    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let home = runtime_dir();
+        // SAFETY: runs once, before the journal writer exists; no test reads this variable
+        // concurrently except through the same initialisation.
+        unsafe { std::env::set_var(agent_ide::userhome::HOME_OVERRIDE_ENV, &home) };
+        agent_ide::errorlog::init_repository("0123456789abcdef");
+        home
+    })
+}
+
+/// Everything the journal of [`journal_home`] holds.
+fn journal_text() -> String {
+    fs::read_dir(journal_home().join(".agent-ide/logs/0123456789abcdef"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| fs::read_to_string(entry.path()).unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// One context dispatch with a caller-chosen request id.
 fn context_dispatch(request_id: &str) -> MethodDispatch {
     MethodDispatch::new(
@@ -718,12 +746,7 @@ fn hook_submission(request_id: &str) -> HookSubmit {
 /// refusal is counted in the journal.
 #[tokio::test]
 async fn saturated_call_lane_answers_busy_and_leaves_the_hook_lane_free() {
-    let home = runtime_dir();
-    // SAFETY: set before any thread of this test reads the variable; the journal writer is
-    // initialised once per process and only this test names it.
-    unsafe { std::env::set_var(agent_ide::userhome::HOME_OVERRIDE_ENV, &home) };
-    agent_ide::errorlog::init_repository("0123456789abcdef");
-
+    journal_home();
     let runtime_dir = runtime_dir();
     let methods = Arc::new(AtomicUsize::new(0));
     let release = Arc::new(tokio::sync::Semaphore::new(0));
@@ -766,17 +789,12 @@ async fn saturated_call_lane_answers_busy_and_leaves_the_hook_lane_free() {
         MethodDispatchTransportResult::Dispatched { .. }
     ));
 
-    let journal = fs::read_dir(home.join(".agent-ide/logs/0123456789abcdef"))
-        .unwrap()
-        .flatten()
-        .map(|entry| fs::read_to_string(entry.path()).unwrap_or_default())
-        .collect::<String>();
+    let journal = journal_text();
     assert!(
         journal.contains("\"outcome\":\"refused\"") && journal.contains("connection_busy:call"),
         "the refused connection is journaled: {journal}"
     );
     stop_assistance_daemon(task, runtime_dir).await;
-    fs::remove_dir_all(home).unwrap();
 }
 
 /// F-04: the hook lane is small and bounded too: a fifth concurrent hook is answered `busy`
@@ -837,4 +855,68 @@ async fn saturated_hook_lane_answers_busy_and_leaves_the_call_lane_free() {
         let _ = task.await;
     }
     stop_assistance_daemon(task, runtime_dir).await;
+}
+
+/// F-04: refusals still counted in an open journal window are written when the daemon stops, so a
+/// burst followed by silence loses none of them.
+///
+/// Three refused calls inside one window: the first line is written at once, the other two are
+/// only counted, and the orderly daemon exit must flush them as one `count: 2` line.
+#[tokio::test]
+async fn refusal_counts_are_flushed_when_the_daemon_stops() {
+    journal_home();
+    let runtime_dir = runtime_dir();
+    let methods = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let dispatcher = Arc::new(ParkingDispatcher {
+        methods_entered: Arc::clone(&methods),
+        hooks_entered: Arc::new(AtomicUsize::new(0)),
+        release: Arc::clone(&release),
+        park_hooks: false,
+    });
+    let task = start_limited_daemon(&runtime_dir, dispatcher, 1).await;
+    let parked_runtime = runtime_dir.clone();
+    let parked = tokio::spawn(async move {
+        dispatch_method_if_running(
+            &parked_runtime,
+            context_dispatch("parked"),
+            transport_limits(),
+        )
+        .await
+    });
+    while methods.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    for index in 0..3 {
+        let refused = dispatch_method_if_running(
+            &runtime_dir,
+            context_dispatch(&format!("refused-{index}")),
+            transport_limits(),
+        )
+        .await;
+        assert_eq!(refused, MethodDispatchTransportResult::Busy);
+    }
+    release.add_permits(8);
+    assert!(matches!(
+        parked.await.unwrap(),
+        MethodDispatchTransportResult::Dispatched { .. }
+    ));
+    // An idle daemon acknowledges `daemon.stop` and exits through its orderly path.
+    let stop = exchange(
+        &runtime_dir,
+        json!({"version": 1, "request_id": "stop", "method": "daemon.stop"}),
+    )
+    .await;
+    assert_eq!(stop["status"], "ok", "{stop}");
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the daemon stops")
+        .unwrap();
+
+    let journal = journal_text();
+    assert!(
+        journal.contains("\"count\":2"),
+        "the two refusals counted inside the window are flushed at shutdown: {journal}"
+    );
+    let _ = fs::remove_dir_all(&runtime_dir);
 }
