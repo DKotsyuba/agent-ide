@@ -1436,7 +1436,8 @@ pub(crate) mod testing {
     }
 
     impl crate::intelligence::server::ServerBackend for FixtureBackend {
-        /// Semantic context is never requested of the fixture.
+        /// Ignores its inputs and always answers `ProviderUnavailable`: no test asks the fixture for
+        /// semantic context, only for sessions.
         fn context<'a>(
             &'a mut self,
             _host: &'a mut dyn crate::intelligence::server::ProviderHost,

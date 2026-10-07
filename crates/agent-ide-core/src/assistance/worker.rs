@@ -3007,6 +3007,15 @@ impl<'a> Worker<'a> {
     /// Repeats reuse durable authority and cache ownership. Validated environment choices are
     /// stored only after cache admission; cache refusals preserve an existing binding and choice.
     ///
+    /// Provider namespace ownership: a reader retains nothing here — it claims the worktree's
+    /// namespace on its first semantic call (`Worker::resolve_session_owner`). A writer (a new
+    /// one, or a reader upgrading in place) first releases every reader owner of the worktree
+    /// (`Worker::release_reader_owners`: sessions, then non-session views, then quiescence) and
+    /// only then retains the namespace, so the namespace never has two live owners. A cleanup
+    /// failure of a reader owner refuses the writer's start (`start:reader_provider_handover`)
+    /// and leaves that reader as the namespace's sole owner; a retried start redoes the handover.
+    /// A writer downgrading to a reader releases its own sessions and namespace.
+    ///
     /// The activation root (the model's `root` or the launcher candidate) and the discovered Git
     /// worktree root and common directory must all lie below a configured allowed root.
     async fn activate(
