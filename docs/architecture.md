@@ -101,7 +101,7 @@ up to four trait implementations:
 |---|---|---|
 | `lang::LanguageSupport` | symbol tools | project detection and commands, outline normalization from document symbols, insertion sites, test-file conventions, test selection and output parsing, formatters, module docs, test naming and toolchain pinning, and an optional outline from source (`outline_from_source`) that lets a language without a server answer `ide.outline`, `ide.read`, `ide.symbol` and `ide.graph` (usages and callers then report `unavailable (<id> has no language server)` and `unavailable (<id> has no call hierarchy)`) |
 | `checks::LanguageChecks` + `checks::CheckConfig` | project problem feed | presence rule, the `project_checks.<id>` launcher section, the confined `Checker`, doctor probes, an optional sibling-cache seed |
-| `intelligence::server::LanguageServer` + `ServerBackend`, and `intelligence::session::SessionProfile` | semantic context and live sessions | the launcher `settings` identifier and extra declaration fields, cache layout, routing extensions, capabilities (call hierarchy, empty-reference answers), the per-worker backend that starts, reuses and reaps servers, and the per-session protocol knobs (configuration, identity check, readiness notification, diagnostics quirks, `didOpen` language id) |
+| `intelligence::server::LanguageServer` + `ServerBackend`, and `intelligence::session::SessionProfile` | semantic context and live sessions | the launcher `settings` identifier and extra declaration fields, cache layout, routing extensions, the project input file names whose change can revive a failed session, capabilities (call hierarchy, empty-reference answers), the per-worker backend that starts, reuses and reaps servers, and the per-session protocol knobs (configuration, identity check, readiness notification, diagnostics quirks, `didOpen` language id) |
 | `lang::names::NameFacts` | cross-language name facts (the language bridge) | the namespaces it may define and use (`coverage`), and a pure per-file `extract` of `(namespace, domain, name)` facts into the core's `FactSink` |
 
 The core reaches all of them through the handle (`language.support()`, `language.checks()`,
@@ -115,6 +115,32 @@ emits define/use facts in core-owned namespaces (`lang::names::ns`), and the cor
 a pure function of one file's text — no filesystem, server or subprocess — and a language without a
 provider is reported as uncovered, never as "zero uses". See
 [the language bridge contract](contracts/language-bridge.md).
+
+### Provider sessions: ownership, stages and recovery
+
+A worktree's provider cache namespace and live language sessions have exactly one owning binding
+at a time. While a writer holds the worktree it owns them and every reader borrows its sessions.
+A read-only activation with no writer beside it claims the namespace on its first semantic call
+(`resolve_session_owner`), further readers borrow that owner's session, and when the owner stops the
+next reader call claims it. A writer's start (a new one, or a reader upgrading in place) first
+releases every reader owner of the worktree — sessions, then non-session views, then quiescence —
+and only then retains the namespace, so it never meets a second live owner; a reader owner whose
+cleanup fails refuses the writer's start and stays the sole owner, and a retry attempts the
+cleanup again (`pending_handover`). Sibling worktrees have independent namespaces.
+
+Every `provider_unavailable` carries a parenthesised stage. A backend names its own failing step
+(`<language>: view refused | spawn failed | initialize failed | request failed | workspace load
+failed`); a bare backend refusal is named after its server and step by the caller
+(`name_bare_failure`, including a refused namespace lookup); the real "no server for this file type"
+refusal is `<tool>:provider_unavailable ext=<ext> (provider: no server for this file type)`, which
+the reply template renders as the no-server sentence; and a refusal no path named gets
+`(provider: cause not reported)` from the worker.
+
+A session whose workspace failed, or that a call failed on, is marked failed with its basis: Git's
+`HEAD` and a stamp of the server's project input files (`LanguageServer::project_inputs`, searched
+four levels deep without generated or vendored trees). Before the next provider call the worker
+retires a marked session whose basis changed; an unchanged basis keeps the staged refusal and is
+never restarted, on a timer or per call. A successful call clears the mark.
 
 ### Adding a language (recipe)
 
@@ -137,7 +163,7 @@ either (outline from source plus name facts).
 4. Optional server: `src/profile.rs` with the accepted server profile implementing
    `SessionProfile`, and `src/backend.rs` with a `LanguageServer` (unique `settings_key`,
    `option_fields`/`parse_options`/`validate_launch` for its launcher fields, cache directories,
-   context and session extensions) whose `new_backend` returns the per-worker `ServerBackend`.
+   context and session extensions, `project_inputs`) whose `new_backend` returns the per-worker `ServerBackend`.
    An exclusive stdio server follows `agent-ide-lang-python`'s backend: start on first use, keep
    one `LiveSession` per binding, reap on release.
 5. `src/lib.rs`: declare the modules and the registration entry:

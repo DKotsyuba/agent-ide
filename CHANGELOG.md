@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- A read-only activation with no writer beside it now gets working `ide.symbol`, `ide.graph` and the bare-name tools. It owns the provider namespace from its first semantic call, other readers borrow its session, and a writer that starts later takes the namespace over only after the reader owner's sessions, views and namespace were released, so a namespace never has two live owners; when the writer leaves, the next reader call claims it again. Reader upgrade, writer downgrade and sibling worktrees follow the same rule, and a reader whose cleanup fails refuses the writer's start without losing its own namespace (a retry redoes the cleanup). Until now only a writer ever retained the namespace, so every semantic call of a writer-less reader failed with a stage-less `provider_unavailable`.
+- Every `provider_unavailable` names a parenthesised stage. The Rust, Python and TypeScript backends name the view, spawn, initialize and request steps; a bare refusal is named after its server and step (a refused namespace lookup names its own cause); the bare-name search and no-anchor refusals are staged; and the real no-server refusal journals `<tool>:provider_unavailable ext=<ext> (provider: no server for this file type)` while the reply text is unchanged. A refusal that nothing named gets `(provider: cause not reported)` instead of rendering as "no language server is configured".
+- A provider session that failed its workspace load, or that a call failed on, recovers: it is retired when its project input files (manifests, lock files, configuration; `LanguageServer::project_inputs`) changed or Git's `HEAD` moved, and the next call starts a fresh session. An unchanged invalid project keeps its staged refusal and is never restarted in a loop or on a timer; a successful call clears the failure mark.
+
 ## 0.10.5 — 2026-10-07
 
 ### Fixed
