@@ -1464,6 +1464,31 @@ mod tests {
                 "error: invalid_detail (test:unknown_run); run #42 is unknown or expired. Start a new run with ide.test",
             ),
             (
+                FailureCode::Capacity,
+                "stop:busy",
+                "error: capacity (stop:busy); the IDE's state store stayed busy, so this stop was not recorded and its grant is still held. The IDE retried it already; repeat ide.stop in a moment",
+            ),
+            (
+                FailureCode::Capacity,
+                "stop:store_full",
+                "error: capacity (stop:store_full); the IDE's state store for this repository is full, so this stop was not recorded and its grant is still held. Repeating will not help: end this repository's IDE sessions so it restarts, or continue with native tools",
+            ),
+            (
+                FailureCode::Deadline,
+                "stop:store_deadline",
+                "error: deadline (stop:store_deadline); recording this stop took too long and may still complete. Repeat ide.stop, or call ide.start to check the session",
+            ),
+            (
+                FailureCode::WorkspaceAuthority,
+                "stop:store_unavailable",
+                "error: workspace_authority (stop:store_unavailable); the IDE's state store could not record this stop, so its grant is still held. Repeat ide.stop later, or continue with native tools",
+            ),
+            (
+                FailureCode::WorkspaceAuthority,
+                "stop:authority",
+                "error: workspace_authority (stop:authority); this stop conflicts with the recorded activation. Call ide.start to see the current binding, then repeat ide.stop",
+            ),
+            (
                 FailureCode::Deadline,
                 "stop:deadline",
                 "error: deadline (stop:deadline); stopping exceeded 800 ms and cleanup may still be running. Call ide.start to check the session before editing, or continue with native tools",

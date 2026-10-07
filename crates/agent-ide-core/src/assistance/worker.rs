@@ -1340,6 +1340,7 @@ impl WorkerHandle {
                 grants: BTreeMap::new(),
                 leases: BTreeMap::new(),
                 pending_revocations: std::collections::BTreeSet::new(),
+                stop_cause: None,
                 registered: BTreeMap::new(),
                 baselines: BTreeMap::new(),
                 heads: BTreeMap::new(),
@@ -2102,6 +2103,9 @@ struct Worker<'a> {
     /// receipt, caches and registrations are deliberately retained for a bounded cleanup-only
     /// retry. It never carries a physical-process uncertainty, which stays in `uncertain`.
     pending_revocations: std::collections::BTreeSet<BindingRef>,
+    /// Typed cause of the last failed durable stop (`stop:busy`, `stop:store_full`, ...), taken by
+    /// the stop job to name its failure instead of a generic authority error.
+    stop_cause: Option<&'static str>,
     /// Only explicitly requested paths are polled; no directory scanning is performed.
     registered: BTreeMap<BindingRef, std::collections::BTreeSet<std::path::PathBuf>>,
     /// Durable partial activation baselines retained for same-binding diff provenance.
@@ -2714,7 +2718,11 @@ impl<'a> Worker<'a> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            self.revoke(&binding, &uncollected).await
+            let revoked = self.revoke(&binding, &uncollected).await;
+            if revoked.is_err() {
+                job.failure_detail = self.stop_cause.take().map(str::to_owned);
+            }
+            revoked
         } else if *job.cancel.borrow() || self.shared.active(&binding).is_err() {
             if job.stage.is_some() {
                 self.edit(job).await
@@ -4705,11 +4713,25 @@ impl<'a> Worker<'a> {
             blake3::Hash::from_bytes(binding.fingerprint()).to_hex()
         ))
         .map_err(|_| FailureCode::Internal)?;
-        if let Err(error) = self
-            .workspace
-            .revoke(operation, &receipt, StopBindingHandoff::Confirmed)
-            .await
-        {
+        // The revoke is idempotent by operation id, so the daemon retries a transient store
+        // failure itself; the agent never has to repeat the stop for it.
+        let mut attempt = 1;
+        let revoked = loop {
+            let outcome = self
+                .workspace
+                .revoke(operation.clone(), &receipt, StopBindingHandoff::Confirmed)
+                .await;
+            match outcome {
+                Err(error)
+                    if attempt < STOP_REVOKE_ATTEMPTS && is_transient_stop_failure(&error) =>
+                {
+                    attempt += 1;
+                    tokio::time::sleep(STOP_REVOKE_RETRY_PAUSE).await;
+                }
+                other => break other,
+            }
+        };
+        if let Err(error) = revoked {
             // Authority that durable state already retired (a newer boot fenced it, or the same
             // grant was revoked before) is exactly what this stop asks for: answer the benign
             // nothing-active outcome instead of demanding a fresh start just to stop (E013
@@ -4728,7 +4750,9 @@ impl<'a> Worker<'a> {
             if self.pending_revocations.len() < MAX_PENDING_REVOCATIONS {
                 self.pending_revocations.insert(binding.clone());
             }
-            return Err(FailureCode::WorkspaceAuthority);
+            let (code, cause) = stop_failure(&error);
+            self.stop_cause = Some(cause);
+            return Err(code);
         }
         self.grants.remove(binding);
         self.pending_revocations.remove(binding);
@@ -5849,6 +5873,69 @@ fn validate_environment(
         ));
     }
     Ok(result)
+}
+
+/// Attempts of one durable revoke before a transient store failure is reported (F-12).
+const STOP_REVOKE_ATTEMPTS: usize = 2;
+/// Pause between two attempts of the same idempotent revoke.
+const STOP_REVOKE_RETRY_PAUSE: Duration = Duration::from_millis(100);
+
+/// Reports whether a store failure is SQLite's own "database is locked/busy": another connection
+/// held the write lock past the busy timeout, which the store surfaces as an infrastructure error
+/// carrying SQLite's message rather than as [`crate::app::store::StoreError::Busy`].
+fn is_locked_store(error: &crate::app::store::StoreError) -> bool {
+    matches!(
+        error,
+        crate::app::store::StoreError::Infrastructure(message)
+            if message.contains("locked") || message.contains("busy")
+    )
+}
+
+/// Reports whether a durable stop failure is transient: the store was busy or locked, its queue
+/// was full, or the wait expired after the work was accepted. Retrying the same operation id is
+/// then safe and returns the committed outcome if the first attempt had landed.
+fn is_transient_stop_failure(error: &crate::workspace::durable::DurableError) -> bool {
+    use crate::app::store::StoreError;
+    use crate::workspace::durable::DurableError;
+    match error {
+        DurableError::Application(error) => {
+            matches!(
+                error,
+                StoreError::Busy | StoreError::QueueFull | StoreError::OutcomeUnknown { .. }
+            ) || is_locked_store(error)
+        }
+        _ => false,
+    }
+}
+
+/// Maps one durable stop failure to its failure code and typed `stop:` cause, so a store
+/// problem is never reported as an authority problem (F-12).
+///
+/// Busy, locked or full queue: `capacity` / `stop:busy`. Receipt store full: `capacity` /
+/// `stop:store_full`. Wait expired with the outcome unknown: `deadline` / `stop:store_deadline`.
+/// Every other store or state failure: `workspace_authority` / `stop:store_unavailable`; an
+/// authority refusal or operation conflict: `workspace_authority` / `stop:authority`.
+fn stop_failure(error: &crate::workspace::durable::DurableError) -> (FailureCode, &'static str) {
+    use crate::app::store::StoreError;
+    use crate::workspace::durable::DurableError;
+    match error {
+        DurableError::Application(StoreError::Busy | StoreError::QueueFull) => {
+            (FailureCode::Capacity, "stop:busy")
+        }
+        DurableError::Application(error) if is_locked_store(error) => {
+            (FailureCode::Capacity, "stop:busy")
+        }
+        DurableError::Application(StoreError::ReceiptCapacityExhausted) => {
+            (FailureCode::Capacity, "stop:store_full")
+        }
+        DurableError::Application(StoreError::OutcomeUnknown { .. }) => {
+            (FailureCode::Deadline, "stop:store_deadline")
+        }
+        DurableError::Authority(_) | DurableError::OperationConflict => {
+            (FailureCode::WorkspaceAuthority, "stop:authority")
+        }
+        _ => (FailureCode::WorkspaceAuthority, "stop:store_unavailable"),
+    }
 }
 
 /// Refuses a discovered Git worktree root or common directory outside every allowed root.
@@ -7319,6 +7406,7 @@ mod stop_retry_tests {
             grants: BTreeMap::new(),
             leases: BTreeMap::new(),
             pending_revocations: std::collections::BTreeSet::new(),
+            stop_cause: None,
             registered: BTreeMap::new(),
             baselines: BTreeMap::new(),
             heads: BTreeMap::new(),
@@ -7965,6 +8053,106 @@ mod stop_retry_tests {
         );
     }
 
+    /// F-12: the daemon retries a transiently busy stop itself, by its operation id, so the agent
+    /// never has to: a store lock that clears inside the retry window lets the stop commit.
+    #[tokio::test]
+    async fn daemon_retries_a_busy_stop_itself() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        let (binding, _) = production_start(&mut worker, "actor-1", "call-1").await;
+        worker
+            .shared
+            .bindings
+            .lock()
+            .unwrap()
+            .stop_binding(&binding)
+            .unwrap();
+        // Hold the exact write lock the durable revoke needs. SQLite's busy wait keeps the first
+        // attempt waiting about a second before it fails "database is locked"; the lock clears
+        // while the second attempt waits, so only the daemon's own retry can commit the stop.
+        let lock = rusqlite::Connection::open(fixture.base.join("state.sqlite")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            lock.execute_batch("ROLLBACK;").unwrap();
+        };
+        let (outcome, ()) = tokio::join!(worker.revoke(&binding, &[]), release);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(worker.grants.is_empty());
+        assert!(worker.pending_revocations.is_empty());
+        assert_eq!(worker.stop_cause, None);
+    }
+
+    /// F-12: every durable stop failure names its closed typed cause.
+    #[test]
+    fn stop_failures_name_typed_causes() {
+        use crate::app::store::{OperationId, StoreError};
+        use crate::workspace::authority::AuthorityError;
+        use crate::workspace::durable::DurableError;
+        let unknown = StoreError::OutcomeUnknown {
+            operation: OperationId::new("stop-x").unwrap(),
+        };
+        for (error, expected, transient) in [
+            (
+                DurableError::Application(StoreError::Busy),
+                (FailureCode::Capacity, "stop:busy"),
+                true,
+            ),
+            (
+                DurableError::Application(StoreError::QueueFull),
+                (FailureCode::Capacity, "stop:busy"),
+                true,
+            ),
+            (
+                DurableError::Application(StoreError::ReceiptCapacityExhausted),
+                (FailureCode::Capacity, "stop:store_full"),
+                false,
+            ),
+            (
+                DurableError::Application(unknown),
+                (FailureCode::Deadline, "stop:store_deadline"),
+                true,
+            ),
+            (
+                DurableError::Application(StoreError::Infrastructure(
+                    "database is locked".to_owned(),
+                )),
+                (FailureCode::Capacity, "stop:busy"),
+                true,
+            ),
+            (
+                DurableError::Application(StoreError::Infrastructure("disk I/O error".to_owned())),
+                (FailureCode::WorkspaceAuthority, "stop:store_unavailable"),
+                false,
+            ),
+            (
+                DurableError::Application(StoreError::Unavailable),
+                (FailureCode::WorkspaceAuthority, "stop:store_unavailable"),
+                false,
+            ),
+            (
+                DurableError::CorruptState,
+                (FailureCode::WorkspaceAuthority, "stop:store_unavailable"),
+                false,
+            ),
+            (
+                DurableError::OperationConflict,
+                (FailureCode::WorkspaceAuthority, "stop:authority"),
+                false,
+            ),
+            (
+                DurableError::Authority(AuthorityError::StaleAuthority),
+                (FailureCode::WorkspaceAuthority, "stop:authority"),
+                false,
+            ),
+        ] {
+            assert_eq!(stop_failure(&error), expected, "{error:?}");
+            assert_eq!(is_transient_stop_failure(&error), transient, "{error:?}");
+        }
+    }
+
     #[tokio::test]
     async fn failed_stop_retains_pending_revoke_and_fresh_start_commits_it_first() {
         let fixture = Fixture::new();
@@ -8027,7 +8215,11 @@ mod stop_retry_tests {
         lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
 
         let outcome = worker.revoke(&old_binding, &[]).await;
-        assert!(matches!(outcome, Err(FailureCode::WorkspaceAuthority)));
+        assert!(
+            matches!(outcome, Err(FailureCode::Capacity)),
+            "a busy store is a capacity cause, not an authority one"
+        );
+        assert_eq!(worker.stop_cause, Some("stop:busy"));
         assert_eq!(worker.grants.get(&old_binding), Some(&old_receipt));
         assert!(worker.pending_revocations.contains(&old_binding));
         assert!(worker.registered.contains_key(&old_binding));

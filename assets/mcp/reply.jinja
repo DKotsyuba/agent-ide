@@ -209,6 +209,18 @@ error: deadline (stop:deadline); stopping exceeded 800 ms and cleanup may still 
 error: unsupported_git{% if resolution_detail %} ({{ resolution_detail }}){% else %} (diff:unsupported_git){% endif %}; the configured Git lacks a required exact-capture option. Continue with native tools and git diff
 {%- elif code == "launcher_configuration" -%}
 error: launcher_configuration{% if resolution_detail %} ({{ resolution_detail }}){% else %} (start:launcher_configuration){% endif %}; the IDE could not match this session to its launch configuration. Call ide.start again, or continue with native tools
+{%- elif resolution_detail in ["stop:busy", "stop:store_full", "stop:store_deadline", "stop:store_unavailable", "stop:authority"] -%}
+{%- if resolution_detail == "stop:busy" -%}
+error: {{ code }} (stop:busy); the IDE's state store stayed busy, so this stop was not recorded and its grant is still held. The IDE retried it already; repeat ide.stop in a moment
+{%- elif resolution_detail == "stop:store_full" -%}
+error: {{ code }} (stop:store_full); the IDE's state store for this repository is full, so this stop was not recorded and its grant is still held. Repeating will not help: end this repository's IDE sessions so it restarts, or continue with native tools
+{%- elif resolution_detail == "stop:store_deadline" -%}
+error: {{ code }} (stop:store_deadline); recording this stop took too long and may still complete. Repeat ide.stop, or call ide.start to check the session
+{%- elif resolution_detail == "stop:store_unavailable" -%}
+error: {{ code }} (stop:store_unavailable); the IDE's state store could not record this stop, so its grant is still held. Repeat ide.stop later, or continue with native tools
+{%- else -%}
+error: {{ code }} (stop:authority); this stop conflicts with the recorded activation. Call ide.start to see the current binding, then repeat ide.stop
+{%- endif -%}
 {%- elif code == "workspace_authority" -%}
 error: workspace_authority{% if resolution_detail %} ({{ resolution_detail }}){% else %} (inspect:authority_stale){% endif %}; this result belongs to an older IDE activation. Call ide.start, then repeat with fresh references
 {%- elif code == "capacity" -%}
