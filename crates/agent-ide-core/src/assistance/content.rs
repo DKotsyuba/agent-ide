@@ -917,7 +917,7 @@ mod tests {
                     "this host did not identify the call in a supported format. Continue with native tools"
                 }
                 other if other.starts_with("other_repository:") => {
-                    "other agents of this session work in the bound repository, so this start was refused and nothing moved. Start under the bound repository, work in the other repository from a session started there, or continue with native tools"
+                    "other agents of this session may still work in the bound repository, so this start was refused and nothing moved. Start under the bound repository, work in the other repository from a session started there, or continue with native tools"
                 }
                 moved if moved.starts_with("project_moved:") => {
                     "the IDE could not move to the requested root. Call ide.start under the session's current root, or continue with native tools"

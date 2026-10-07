@@ -2257,6 +2257,10 @@ struct ManagedConnection {
     remembered: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
     /// Set once the bounded memory above evicted an actor that may still be active: from then on
     /// the session may hold actors it no longer remembers, so no actor is assumed gone.
+    // ponytail: sticky for the rest of the session once more than 32 actors have been remembered
+    // (a refused cross-repository start then says other agents *may* still work in the bound
+    // repository); start a new session in the other repository. Upgrade by tracking active
+    // actors separately from recovery parameters if sessions with that many actors become common.
     memory_overflowed: Arc<std::sync::atomic::AtomicBool>,
     /// Orders every start and stop (identity query, dispatch, memory update), each actor
     /// recovery and lease-driven recovery, so remembered starts follow the daemon's own order.
