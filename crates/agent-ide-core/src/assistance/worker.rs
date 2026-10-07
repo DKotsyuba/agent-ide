@@ -1341,7 +1341,9 @@ impl WorkerHandle {
                 leases: BTreeMap::new(),
                 pending_revocations: std::collections::BTreeSet::new(),
                 stop_cause: None,
+                stop_attempts: Arc::default(),
                 registered: BTreeMap::new(),
+                refusal_detail: None,
                 baselines: BTreeMap::new(),
                 heads: BTreeMap::new(),
                 source_sequence: 0,
@@ -2106,8 +2108,14 @@ struct Worker<'a> {
     /// Typed cause of the last failed durable stop (`stop:busy`, `stop:store_full`, ...), taken by
     /// the stop job to name its failure instead of a generic authority error.
     stop_cause: Option<&'static str>,
+    /// Durable revoke attempts this worker has started, across all stops; read by tests that
+    /// release a held store lock only once the daemon's own retry began.
+    stop_attempts: Arc<std::sync::atomic::AtomicUsize>,
     /// Only explicitly requested paths are polled; no directory scanning is performed.
-    registered: BTreeMap<BindingRef, std::collections::BTreeSet<std::path::PathBuf>>,
+    registered: BTreeMap<BindingRef, RegisteredPaths>,
+    /// Closed `detail` of the last refusal a job path decided without a job at hand (the
+    /// registered-path budget); taken by the failing job to name its cause.
+    refusal_detail: Option<&'static str>,
     /// Durable partial activation baselines retained for same-binding diff provenance.
     baselines: BTreeMap<BindingRef, crate::workspace::git::BaselineContext>,
     /// Per binding: when `HEAD` was last probed, successfully or not, and the checked-out branch or
@@ -2772,6 +2780,9 @@ impl<'a> Worker<'a> {
             Err(code) => {
                 // Every terminal failure names its stage: the failing path's own tag when it set
                 // one, else the derived `<tool>:<reason>` default — never a bare reason.
+                if job.failure_detail.is_none() {
+                    job.failure_detail = self.refusal_detail.take().map(str::to_owned);
+                }
                 if job.failure_detail.is_none() {
                     job.failure_detail =
                         Some(crate::telemetry::adapters::default_stage(job.tool, &code));
@@ -3663,6 +3674,9 @@ impl<'a> Worker<'a> {
             store::{ObservationAdmission, ObservationDraft},
         };
         let authority = self.authority(binding).await?;
+        // The registered-path budget is checked before anything is read or recorded, so a refused
+        // read leaves no observation behind.
+        self.admit_registered_path(binding, &path)?;
         // The source read ceiling is the v0.1 reader's own bound, not the launcher's discovery and
         // check-process output budget: `limits.output_bytes` sizes bounded command captures and is
         // far smaller than a source file may legitimately be.
@@ -3737,12 +3751,35 @@ impl<'a> Worker<'a> {
             return Err(FailureCode::SourceUnavailable);
         };
         self.shared.active(binding)?;
-        let paths = self.registered.entry(binding.clone()).or_default();
-        if paths.len() >= self.shared.launcher.limits.details && !paths.contains(&path) {
-            return Err(FailureCode::Capacity);
-        }
-        paths.insert(path);
+        self.registered
+            .entry(binding.clone())
+            .or_default()
+            .insert(path);
         Ok((observed, bytes))
+    }
+
+    /// Admits `path` into the binding's registered-path working set, retiring paths unused for
+    /// [`REGISTERED_PATH_IDLE`] when the set is at its [`MAX_REGISTERED_PATHS`] budget.
+    ///
+    /// The budget is the registered paths' own: it neither shares nor shrinks with the retained
+    /// results limit, and evicting results does not touch it. A path already registered is always
+    /// admitted. When every registered path was used recently the read is refused as `capacity`
+    /// with the distinct `registered_path_limit` detail, before any observation is recorded.
+    fn admit_registered_path(
+        &mut self,
+        binding: &BindingRef,
+        path: &std::path::Path,
+    ) -> Result<(), FailureCode> {
+        let paths = self.registered.entry(binding.clone()).or_default();
+        if paths.contains(path) || paths.len() < MAX_REGISTERED_PATHS {
+            return Ok(());
+        }
+        paths.retire_idle(tokio::time::Instant::now());
+        if paths.len() < MAX_REGISTERED_PATHS {
+            return Ok(());
+        }
+        self.refusal_detail = Some("registered_path_limit");
+        Err(FailureCode::Capacity)
     }
 
     /// Reconciles native-hinted registered paths only when a new MCP call supplies current sandbox state.
@@ -3757,7 +3794,11 @@ impl<'a> Worker<'a> {
             .and_then(|mut guard| guard.take_native_change_hint(binding).ok())
             .unwrap_or(false);
         if hinted {
-            let paths = self.registered.get(binding).cloned().unwrap_or_default();
+            let paths = self
+                .registered
+                .get(binding)
+                .map(RegisteredPaths::paths)
+                .unwrap_or_default();
             for path in paths {
                 if *job.cancel.borrow() || tokio::time::Instant::now() >= job.deadline {
                     break;
@@ -4717,6 +4758,8 @@ impl<'a> Worker<'a> {
         // failure itself; the agent never has to repeat the stop for it.
         let mut attempt = 1;
         let revoked = loop {
+            self.stop_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let outcome = self
                 .workspace
                 .revoke(operation.clone(), &receipt, StopBindingHandoff::Confirmed)
@@ -5873,6 +5916,54 @@ fn validate_environment(
         ));
     }
     Ok(result)
+}
+
+/// Most distinct source paths one binding keeps registered for refresh at once (F-25): the
+/// registered-path working set's own budget, apart from the retained results limit.
+const MAX_REGISTERED_PATHS: usize = 256;
+/// A registered path unused for this long is retired when the working set is full.
+const REGISTERED_PATH_IDLE: Duration = Duration::from_secs(15 * 60);
+
+/// One binding's registered source paths with the moment each was last read.
+///
+/// Registration makes a path part of the native-hint refresh set; reading a path again counts as
+/// a use. When the set is full, [`Self::retire_idle`] drops the paths nobody used for
+/// [`REGISTERED_PATH_IDLE`], so a long session's working set follows what it reads instead of
+/// growing for its whole life.
+#[derive(Clone, Debug, Default)]
+struct RegisteredPaths(BTreeMap<std::path::PathBuf, tokio::time::Instant>);
+
+impl RegisteredPaths {
+    /// Registers `path` (or marks it used again) as of now.
+    fn insert(&mut self, path: std::path::PathBuf) {
+        self.insert_used_at(path, tokio::time::Instant::now());
+    }
+
+    /// Registers `path` as last used at `used`.
+    fn insert_used_at(&mut self, path: std::path::PathBuf, used: tokio::time::Instant) {
+        self.0.insert(path, used);
+    }
+
+    /// Reports whether `path` is registered.
+    fn contains(&self, path: &std::path::Path) -> bool {
+        self.0.contains_key(path)
+    }
+
+    /// Returns how many paths are registered.
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns the registered paths, ordered.
+    fn paths(&self) -> Vec<std::path::PathBuf> {
+        self.0.keys().cloned().collect()
+    }
+
+    /// Retires every path last used at least [`REGISTERED_PATH_IDLE`] before `now`.
+    fn retire_idle(&mut self, now: tokio::time::Instant) {
+        self.0
+            .retain(|_, used| now.saturating_duration_since(*used) < REGISTERED_PATH_IDLE);
+    }
 }
 
 /// Attempts of one durable revoke before a transient store failure is reported (F-12).
@@ -7407,7 +7498,9 @@ mod stop_retry_tests {
             leases: BTreeMap::new(),
             pending_revocations: std::collections::BTreeSet::new(),
             stop_cause: None,
+            stop_attempts: Arc::default(),
             registered: BTreeMap::new(),
+            refusal_detail: None,
             baselines: BTreeMap::new(),
             heads: BTreeMap::new(),
             source_sequence: 0,
@@ -8053,6 +8146,69 @@ mod stop_retry_tests {
         );
     }
 
+    /// F-25: the registered-path budget is its own: filling it refuses a new path with the
+    /// distinct `registered_path_limit` detail before anything is recorded, a path already
+    /// registered is still admitted, and paths idle for fifteen minutes are retired to make room.
+    #[tokio::test]
+    async fn registered_paths_have_their_own_budget_and_retire_idle_paths() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        let (binding, _) = production_start(&mut worker, "actor-1", "call-1").await;
+        std::fs::write(fixture.root.join("fresh.txt"), "fresh\n").unwrap();
+        std::fs::write(fixture.root.join("known.txt"), "known\n").unwrap();
+        let now = tokio::time::Instant::now();
+        let paths = worker.registered.entry(binding.clone()).or_default();
+        for index in 0..MAX_REGISTERED_PATHS - 1 {
+            paths.insert_used_at(std::path::PathBuf::from(format!("used-{index}.txt")), now);
+        }
+        paths.insert_used_at(std::path::PathBuf::from("known.txt"), now);
+        let sequence = worker.source_sequence;
+
+        // At the budget with every path recently used: a new path is refused with its own
+        // detail, and nothing was recorded for it.
+        let refused = worker
+            .observe(&binding, std::path::PathBuf::from("fresh.txt"))
+            .await;
+        assert!(matches!(refused, Err(FailureCode::Capacity)));
+        assert_eq!(worker.refusal_detail.take(), Some("registered_path_limit"));
+        assert_eq!(
+            worker.source_sequence, sequence,
+            "a refused read records nothing"
+        );
+        assert_eq!(worker.registered[&binding].len(), MAX_REGISTERED_PATHS);
+
+        // A path that is already registered is never refused.
+        assert!(
+            worker
+                .admit_registered_path(&binding, std::path::Path::new("known.txt"))
+                .is_ok()
+        );
+
+        // Fifteen idle minutes later the unused paths retire and the new path is admitted.
+        let idle = now
+            .checked_sub(REGISTERED_PATH_IDLE + Duration::from_secs(1))
+            .unwrap();
+        for index in 0..MAX_REGISTERED_PATHS - 1 {
+            worker
+                .registered
+                .get_mut(&binding)
+                .unwrap()
+                .insert_used_at(std::path::PathBuf::from(format!("used-{index}.txt")), idle);
+        }
+        assert!(
+            worker
+                .admit_registered_path(&binding, std::path::Path::new("fresh.txt"))
+                .is_ok()
+        );
+        assert_eq!(
+            worker.registered[&binding].paths(),
+            [std::path::PathBuf::from("known.txt")],
+            "only the idle paths were retired; the one used recently stays"
+        );
+    }
+
     /// F-12: the daemon retries a transiently busy stop itself, by its operation id, so the agent
     /// never has to: a store lock that clears inside the retry window lets the stop commit.
     #[tokio::test]
@@ -8069,13 +8225,19 @@ mod stop_retry_tests {
             .unwrap()
             .stop_binding(&binding)
             .unwrap();
-        // Hold the exact write lock the durable revoke needs. SQLite's busy wait keeps the first
-        // attempt waiting about a second before it fails "database is locked"; the lock clears
-        // while the second attempt waits, so only the daemon's own retry can commit the stop.
+        // Hold the exact write lock the durable revoke needs: the first attempt fails "database
+        // is locked" once SQLite's busy wait ends. The lock is released only after the daemon's
+        // own second attempt has started, so only that retry can commit the stop.
         let lock = rusqlite::Connection::open(fixture.base.join("state.sqlite")).unwrap();
         lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let attempts = Arc::clone(&worker.stop_attempts);
         let release = async {
-            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let _ = tokio::time::timeout(Duration::from_secs(10), async {
+                while attempts.load(Ordering::Relaxed) < 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
             lock.execute_batch("ROLLBACK;").unwrap();
         };
         let (outcome, ()) = tokio::join!(worker.revoke(&binding, &[]), release);

@@ -1116,7 +1116,7 @@ impl Worker<'_> {
         let paths = self
             .registered
             .get(&binding)
-            .map_or_else(Vec::new, |paths| paths.iter().cloned().collect());
+            .map_or_else(Vec::new, super::RegisteredPaths::paths);
         self.workspace
             .capture_baseline(
                 OperationId::new(format!("baseline-{activation_operation}"))

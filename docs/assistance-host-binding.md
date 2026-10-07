@@ -366,7 +366,7 @@ hint only for an already active binding. This applies equally to successful and 
 commands: actor/call/phase are sufficient triggers; command text, paths and tool results
 are never trusted as effects. `take_native_change_hint` consumes that bounded hint after
 a fresh liveness check. The worker invalidates old detail immediately, then reconciles only
-registered paths on the next MCP invocation.
+registered paths on the next MCP invocation. A binding keeps at most 256 distinct registered paths (a budget of its own, independent of the retained results limit); when the set is full, paths unused for 15 minutes are retired to make room, and a read that finds every registered path recently used is refused `capacity (registered_path_limit)` before anything is recorded.
 Duplicate pre-hooks, premature post-hooks and MCP-before-pre ordering reject that
 invocation for subsequent MCP validation in the remaining daemon lifetime; late hooks cannot repair it. Explicit stop revokes the
 exact binding and rejects its pending pre-hooks before any Workspace handoff could occur.

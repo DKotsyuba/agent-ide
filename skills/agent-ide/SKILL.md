@@ -290,6 +290,8 @@ loading — `ide.context {"kind":"problems"}` shows the project check.
    A diff page refused with `source_stale` means a tracked file changed after capture: call
    `ide.diff` again. A root-less start refused for `missing_pre` may also include a `retry`
    hint with the current directory as an explicit root.
+   A read refused `capacity (registered_path_limit)` found 256 source files registered and none idle
+   for 15 minutes; it recorded nothing — wait, or `ide.stop` and `ide.start` to release them.
 8. `ide.stop` at handoff to another actor, or when the task ends, to release this binding's
    activation (`activation_id` is optional). Its reply lists test runs you have not collected;
    read them with `ide.inspect {"detail_ref":"tests #N"}` before reporting results.
