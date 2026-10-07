@@ -3792,8 +3792,9 @@ impl<'a> Worker<'a> {
     /// The budget is the registered paths' own: it neither shares nor shrinks with the retained
     /// results limit, and evicting results does not touch it. A path already registered is always
     /// admitted, and a new path always is: the evicted path only stops being refreshed on native
-    /// hints, so a later edit relying on it meets the ordinary stale-source answer and the agent
-    /// re-reads it. Nothing here refuses or blocks a read.
+    /// hints. A later edit built on its retained read is judged by the file's bytes as always —
+    /// still matching, it applies; changed, it meets the ordinary stale-source answer and the
+    /// agent re-reads. Nothing here refuses or blocks a read.
     fn admit_registered_path(&mut self, binding: &BindingRef, path: &std::path::Path) {
         let paths = self.registered.entry(binding.clone()).or_default();
         if !paths.contains(path) && paths.len() >= MAX_REGISTERED_PATHS {
@@ -8327,9 +8328,10 @@ mod stop_retry_tests {
         );
     }
 
-    /// F-25: with the budget full, a read of a new path is admitted (no refusal) and an edit that
-    /// relies on the evicted oldest path gets the ordinary stale-source answer, asking for a
-    /// re-read — never a hard refusal of work.
+    /// F-25: with the budget full, a read of a new path is admitted (no refusal). Eviction only
+    /// stops the oldest path being refreshed on native hints: an edit built on its still-matching
+    /// retained read keeps working, and one whose bytes no longer match gets the ordinary
+    /// stale-source answer, asking for a re-read — never a hard refusal of work.
     #[tokio::test]
     async fn eviction_never_refuses_work_and_an_edit_on_the_evicted_path_asks_for_a_reread() {
         crate::lang::testing::install();
@@ -8385,13 +8387,8 @@ mod stop_retry_tests {
         );
         assert_eq!(kept.len(), MAX_REGISTERED_PATHS);
 
-        // a.gamma is no longer refreshed; it changes on disk, and an edit built on the old read
-        // is answered `stale_source`, asking the agent to read again.
-        std::fs::write(
-            fixture.root.join("a.gamma"),
-            "sym card\nsym btn\nmark\nx\nend\nend\n",
-        )
-        .unwrap();
+        // a.gamma is no longer refreshed, but its retained read still matches the file, so an
+        // edit built on it applies: eviction never refuses work.
         let reply = run_edit(
             &mut worker,
             &fixture.root,
@@ -8402,6 +8399,34 @@ mod stop_retry_tests {
                 "lines":"2-3",
                 "source_ref":"line-read",
                 "content":"sym btn\nmark,x\n"
+            }),
+        )
+        .await;
+        assert!(
+            matches!(
+                &reply,
+                PeerReply::Edit {
+                    result: EditResult {
+                        outcome: ChangesEditOutcome::Replaced,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+        // The file changed under that read: a second edit on the same old reference is answered
+        // `stale_source`, which asks the agent to read again.
+        let reply = run_edit(
+            &mut worker,
+            &fixture.root,
+            "after-eviction-again",
+            serde_json::json!({
+                "operation_id":"after-eviction-again-op",
+                "path":"a.gamma",
+                "lines":"2-3",
+                "source_ref":"line-read",
+                "content":"sym btn\nmark,y\n"
             }),
         )
         .await;

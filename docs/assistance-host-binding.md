@@ -366,7 +366,7 @@ hint only for an already active binding. This applies equally to successful and 
 commands: actor/call/phase are sufficient triggers; command text, paths and tool results
 are never trusted as effects. `take_native_change_hint` consumes that bounded hint after
 a fresh liveness check. The worker invalidates old detail immediately, then reconciles only
-registered paths on the next MCP invocation. A binding keeps at most 256 distinct registered paths (a budget of its own, independent of the retained results limit); when the set is full, the least recently read path is evicted to make room, so a read is never refused for it. An evicted path is no longer refreshed on native hints, and an edit that relied on it meets the ordinary `stale_source` answer, which asks for a re-read.
+registered paths on the next MCP invocation. A binding keeps at most 256 distinct registered paths (a budget of its own, independent of the retained results limit); when the set is full, the least recently read path is evicted to make room, so a read is never refused for it. An evicted path is only no longer refreshed on native hints: an edit built on its retained read is judged by the file's bytes as always — still matching, it applies; changed, it meets the ordinary `stale_source` answer, which asks for a re-read.
 Duplicate pre-hooks, premature post-hooks and MCP-before-pre ordering reject that
 invocation for subsequent MCP validation in the remaining daemon lifetime; late hooks cannot repair it. Explicit stop revokes the
 exact binding and rejects its pending pre-hooks before any Workspace handoff could occur.
