@@ -109,9 +109,10 @@ struct Job {
     park_until: Option<tokio::time::Instant>,
     /// Retained in-memory continuation for work that cannot safely be repeated from its start.
     stage: Option<JobStage>,
-    /// The binding that owns this job's provider sessions: the writer's while this job's own
-    /// activation is a reader borrowing them, else absent (the invocation binding owns them).
-    /// Set only while a provider call runs; see [`Worker::borrow_writer_session`].
+    /// The binding that owns this job's provider sessions: the worktree's writer, else the reader
+    /// that owns the namespace, while this job's own activation is a reader borrowing them; absent
+    /// when the invocation binding owns them itself.
+    /// Set only while a provider call runs; see [`Worker::resolve_session_owner`].
     session_binding: Option<BindingRef>,
 }
 
@@ -457,6 +458,9 @@ pub(super) fn admission_controller() -> crate::execution::AdmissionController {
 #[cfg(test)]
 #[test]
 fn admission_reserves_a_server_slot_per_registered_language_and_one_free_slot() {
+    // Fix the registry before reading it twice: a parallel test installing between the two reads
+    // would otherwise change the expected size.
+    crate::lang::testing::install();
     let server_slots = crate::lang::registered().len().max(1);
     let limits = admission_controller().inspect();
     assert_eq!(limits.per_owner_running_limit, server_slots + 1);
@@ -3313,13 +3317,28 @@ impl<'a> Worker<'a> {
             self.quiesce_worktree_caches(&binding);
         }
         let launches = job.target.providers.clone();
-        // A reader holds no provider namespace of its own: it borrows the writer's sessions for
-        // semantic reads (see `borrow_writer_session`), so the single-owner namespace stays with
-        // the writer. A second concurrent *writer* on the same physical worktree still cannot
-        // share one namespace: fail its activation with the finite reason and roll its own grant
-        // back, so the actor that already owns the cache keeps running and can hand off.
+        // A reader retains no namespace at start: it borrows the writer's sessions for semantic
+        // reads, or claims the namespace itself on its first semantic call when no writer is
+        // beside it (see `resolve_session_owner`). A writer takes the namespace over from any
+        // reader owner of the worktree first, so it never meets a second live owner. A second
+        // concurrent *writer* on the same physical worktree still cannot share one namespace:
+        // fail its activation with the finite reason and roll its own grant back, so the actor
+        // that already owns the cache keeps running and can hand off.
         if authority.role() == crate::workspace::authority::StartRole::Writer
-            && let Err(code) = self.retain_worktree_caches(&binding, &authority, &launches, true)
+            && let Err(code) = match self
+                .release_reader_owners(
+                    &binding,
+                    previous_role == Some(crate::workspace::authority::StartRole::Reader),
+                    &authority,
+                )
+                .await
+            {
+                Ok(()) => self.retain_worktree_caches(&binding, &authority, &launches, true),
+                Err(code) => {
+                    job.failure_detail = Some("start:reader_provider_handover".to_owned());
+                    Err(code)
+                }
+            }
         {
             if code == FailureCode::Conflict {
                 job.failure_detail = Some("start:provider_cache_namespace_conflict".to_owned());
@@ -3612,26 +3631,6 @@ impl<'a> Worker<'a> {
             }
             _ => "none".to_owned(),
         }
-    }
-
-    /// Points one read job of a reader activation at the writer's binding for provider sessions:
-    /// while a writer holds this worktree, its binding owns every live session and cache
-    /// namespace, so the reader borrows them instead of starting its own (E013 item 2). No-op
-    /// for a writer's or a writer-less reader's own jobs.
-    fn borrow_writer_session(&self, job: &mut Job) {
-        job.session_binding = self
-            .grants
-            .get(job.invocation.binding_ref())
-            .filter(|receipt| receipt.role() == crate::workspace::authority::StartRole::Reader)
-            .and_then(|receipt| {
-                self.grants
-                    .iter()
-                    .find(|(_, writer)| {
-                        writer.role() == crate::workspace::authority::StartRole::Writer
-                            && writer.worktree().id() == receipt.worktree().id()
-                    })
-                    .map(|(binding, _)| binding.clone())
-            });
     }
 
     /// Maps one durable holder record onto this daemon's live binding for it, when the worker
@@ -6928,6 +6927,15 @@ mod stop_retry_tests {
     /// Builds the fixture launcher with the worktree's temporary base as its allowed root and
     /// the requested details ceiling.
     fn production_launcher(root: &std::path::Path, details: usize) -> LauncherConfig {
+        production_launcher_with(root, details, serde_json::json!([]))
+    }
+
+    /// [`production_launcher`] with the given accepted provider declarations on its one target.
+    fn production_launcher_with(
+        root: &std::path::Path,
+        details: usize,
+        providers: Value,
+    ) -> LauncherConfig {
         let git = std::path::Path::new("/usr/bin/git");
         let executable = serde_json::json!({
             "path":git,
@@ -6942,10 +6950,115 @@ mod stop_retry_tests {
                 "attachment":"stop-retry",
                 "candidate":root,
                 "git":executable,
-                "providers":[]
+                "providers":providers
             }]
         });
         LauncherConfig::parse(config.to_string().as_bytes()).unwrap()
+    }
+
+    /// Returns the target of a launcher that accepts the recording fixture provider of the
+    /// `.epsilon` test language, so provider ownership runs through the production worker paths.
+    fn provider_target(root: &std::path::Path) -> LaunchTarget {
+        let git = std::path::Path::new("/usr/bin/git");
+        production_launcher_with(
+            root,
+            8,
+            serde_json::json!([{
+                "executable":{
+                    "path":git,
+                    "identity":"fixture-provider",
+                    "blake3":blake3::hash(&std::fs::read(git).unwrap()).to_hex().to_string()
+                },
+                "settings":"fixture_epsilon",
+                "toolchain":"fixture-toolchain",
+                "trust":"fixture-trust",
+                "cache_namespace":"fixture-epsilon-cache"
+            }]),
+        )
+        .target("stop-retry")
+        .unwrap()
+        .clone()
+    }
+
+    /// Runs the production `Worker::activate` with the fixture provider configured, for `root`
+    /// when given (a sibling worktree) and the fixture worktree otherwise, in the requested mode.
+    /// Returns the binding.
+    async fn provider_start(
+        worker: &mut Worker<'_>,
+        actor: &str,
+        id: &str,
+        read_only: bool,
+        root: Option<&std::path::Path>,
+    ) -> Result<BindingRef, FailureCode> {
+        crate::lang::testing::install();
+        let invocation = production_call(worker, actor, id);
+        let binding = invocation.binding_ref().clone();
+        let (_cancel_sender, cancel) = watch::channel(false);
+        let mut parameters = serde_json::json!({"activation_id":actor,"read_only":read_only});
+        if let Some(root) = root {
+            parameters["root"] = serde_json::json!(root);
+        }
+        let mut job = Job {
+            reference: format!("provider-{id}"),
+            invocation,
+            tool: AssistanceTool::Start,
+            parameters,
+            target: provider_target(&worker.runtime),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            cancel,
+            stop_reply: None,
+            native_epoch: 0,
+            failure_detail: None,
+            format_note: None,
+            check_scheduled: false,
+            park_until: None,
+            stage: None,
+            session_binding: None,
+        };
+        worker.activate(&mut job).await?;
+        Ok(binding)
+    }
+
+    /// Resolves `file` (an `.epsilon` source in `worktree`) through the production
+    /// `Worker::live_session_for` as `actor`'s symbol call, returning how it answered. The
+    /// recording fixture provider answers `ProviderLoading` once it holds the retained namespace.
+    async fn provider_symbol_call(
+        worker: &mut Worker<'_>,
+        actor: &str,
+        call: &str,
+        file: &std::path::Path,
+    ) -> Result<(), FailureCode> {
+        let invocation = production_call(worker, actor, call);
+        let binding = invocation.binding_ref().clone();
+        let (observed, _) = worker.observe(&binding, file.to_path_buf()).await?;
+        let (cancel_sender, cancel) = watch::channel(false);
+        let _keep = cancel_sender;
+        let mut job = Job {
+            reference: format!("provider-{call}"),
+            invocation,
+            tool: AssistanceTool::Symbol,
+            parameters: serde_json::json!({}),
+            target: provider_target(&worker.runtime),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            cancel,
+            stop_reply: None,
+            native_epoch: 0,
+            failure_detail: None,
+            format_note: None,
+            check_scheduled: false,
+            park_until: None,
+            stage: None,
+            session_binding: None,
+        };
+        let outcome = worker
+            .live_session_for(&mut job, &observed)
+            .await
+            .map(|_| ());
+        assert!(
+            job.session_binding.is_none(),
+            "the borrowed owner is cleared after the provider call"
+        );
+        outcome
     }
 
     /// Returns the target selected by the fixture's trusted launcher attachment.
@@ -7396,6 +7509,363 @@ mod stop_retry_tests {
             "the upgrade keeps the reader's activation operation"
         );
         assert!(worker.settle_revocation(&writer_binding).await.unwrap());
+    }
+
+    /// Writes the fixture worktree's `.epsilon` source that provider calls resolve and returns its
+    /// worktree-relative path, the form every tool call observes sources by. Registers the test
+    /// languages first: the registry is fixed by its first caller and sizes the worker's
+    /// admission ceiling, so a test must register before it builds its worker.
+    fn epsilon_source(fixture: &Fixture) -> std::path::PathBuf {
+        crate::lang::testing::install();
+        std::fs::write(fixture.root.join("a.epsilon"), "one\n").unwrap();
+        std::path::PathBuf::from("a.epsilon")
+    }
+
+    /// The `ensure:<binding>:<namespace>` lines of the recording fixture provider for `bindings`,
+    /// reduced to `ensure:<tag>` / `release:<tag>` plus the distinct namespaces they named.
+    fn provider_events(bindings: &[&BindingRef]) -> (Vec<String>, Vec<String>) {
+        let mut namespaces = Vec::new();
+        let events = crate::lang::testing::fixture_events(bindings)
+            .into_iter()
+            .map(|line| {
+                let mut parts = line.splitn(3, ':');
+                let (event, tag) = (parts.next().unwrap(), parts.next().unwrap());
+                if let Some(namespace) = parts.next()
+                    && !namespaces.iter().any(|seen| seen == namespace)
+                {
+                    namespaces.push(namespace.to_owned());
+                }
+                format!("{event}:{tag}")
+            })
+            .collect();
+        (events, namespaces)
+    }
+
+    /// QW-1: a read-only activation with no writer beside it owns the provider namespace, so its
+    /// semantic calls reach the provider (0.10.5 refused every one with a stage-less
+    /// `provider_unavailable` because only a writer retained the namespace). A second reader
+    /// borrows the first reader's session, and the owner's stop hands the namespace to the
+    /// survivor's next call.
+    #[tokio::test]
+    async fn writerless_reader_owns_the_provider_namespace_and_hands_it_to_a_surviving_reader() {
+        use crate::lang::testing::fixture_tag;
+        let fixture = Fixture::new();
+        let file = epsilon_source(&fixture);
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        let first = provider_start(&mut worker, "wl-first", "wl-first-start", true, None)
+            .await
+            .unwrap();
+        let second = provider_start(&mut worker, "wl-second", "wl-second-start", true, None)
+            .await
+            .unwrap();
+        assert!(
+            !worker.test_binding_owns_caches(&first),
+            "a reader retains nothing at start"
+        );
+
+        // The first reader's semantic call claims the namespace and reaches the provider.
+        assert_eq!(
+            provider_symbol_call(&mut worker, "wl-first", "wl-first-1", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+        assert!(worker.test_binding_owns_caches(&first));
+        // The second reader borrows the first reader's session instead of claiming a second one.
+        assert_eq!(
+            provider_symbol_call(&mut worker, "wl-second", "wl-second-1", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+        assert!(!worker.test_binding_owns_caches(&second));
+        let (events, namespaces) = provider_events(&[&first, &second]);
+        let (first_tag, second_tag) = (fixture_tag(&first), fixture_tag(&second));
+        assert_eq!(
+            events,
+            [format!("ensure:{first_tag}"), format!("ensure:{first_tag}")],
+            "both readers' calls were served by the first reader's session"
+        );
+        assert_eq!(namespaces.len(), 1, "{namespaces:?}");
+
+        // The owner stops: its session is released, and the survivor claims the same namespace.
+        assert!(worker.settle_revocation(&first).await.unwrap());
+        assert!(!worker.test_binding_owns_caches(&first));
+        assert_eq!(
+            provider_symbol_call(&mut worker, "wl-second", "wl-second-2", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+        assert!(worker.test_binding_owns_caches(&second));
+        let (events, namespaces) = provider_events(&[&first, &second]);
+        assert_eq!(
+            events[2..],
+            [
+                format!("release:{first_tag}"),
+                format!("ensure:{second_tag}")
+            ]
+        );
+        assert_eq!(
+            namespaces.len(),
+            1,
+            "the worktree's namespace is handed over: {namespaces:?}"
+        );
+    }
+
+    /// A writer that starts beside a reader-owned session takes the namespace over only after the
+    /// reader's session is released, the reader keeps answering through the writer, and the
+    /// reader claims the namespace back when the writer departs. A rejected second writer leaves
+    /// the first writer's ownership untouched.
+    #[tokio::test]
+    async fn writer_takes_the_namespace_from_a_reader_owner_and_returns_it_on_departure() {
+        use crate::lang::testing::fixture_tag;
+        let fixture = Fixture::new();
+        let file = epsilon_source(&fixture);
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        let reader = provider_start(&mut worker, "wa-reader", "wa-reader-start", true, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider_symbol_call(&mut worker, "wa-reader", "wa-reader-1", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+        assert!(worker.test_binding_owns_caches(&reader));
+
+        // Writer arrival: the reader's session is released before the writer retains.
+        let writer = provider_start(&mut worker, "wa-writer", "wa-writer-start", false, None)
+            .await
+            .unwrap();
+        assert!(!worker.test_binding_owns_caches(&reader));
+        assert!(worker.test_binding_owns_caches(&writer));
+        assert_eq!(
+            provider_symbol_call(&mut worker, "wa-reader", "wa-reader-2", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+        assert!(
+            !worker.test_binding_owns_caches(&reader),
+            "a reader beside a writer borrows and never owns"
+        );
+
+        // A second writer is refused and the first writer keeps the namespace and the reader.
+        let mut refused = start_job(
+            &worker,
+            "wa-third",
+            "wa-third-start",
+            serde_json::json!({"activation_id":"wa-third"}),
+        );
+        assert_eq!(
+            worker.activate(&mut refused.0).await,
+            Err(FailureCode::Conflict)
+        );
+        assert!(worker.test_binding_owns_caches(&writer));
+        assert_eq!(
+            provider_symbol_call(&mut worker, "wa-reader", "wa-reader-3", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+
+        // Writer departure: the reader's next call claims the namespace again.
+        assert!(worker.settle_revocation(&writer).await.unwrap());
+        assert!(!worker.test_binding_owns_caches(&writer));
+        assert_eq!(
+            provider_symbol_call(&mut worker, "wa-reader", "wa-reader-4", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+        assert!(worker.test_binding_owns_caches(&reader));
+
+        let (events, namespaces) = provider_events(&[&reader, &writer]);
+        let (reader_tag, writer_tag) = (fixture_tag(&reader), fixture_tag(&writer));
+        assert_eq!(
+            events,
+            [
+                format!("ensure:{reader_tag}"),
+                format!("release:{reader_tag}"),
+                format!("ensure:{writer_tag}"),
+                format!("ensure:{writer_tag}"),
+                format!("release:{writer_tag}"),
+                format!("ensure:{reader_tag}"),
+            ],
+            "reader session, handover, writer sessions, departure, reader session again"
+        );
+        assert_eq!(
+            namespaces.len(),
+            1,
+            "one namespace changes owners: {namespaces:?}"
+        );
+    }
+
+    /// A reader upgrading to a writer releases its own reader-owned session first; a writer
+    /// downgrading to a reader releases its session and lets its next call claim the namespace as
+    /// a reader again.
+    #[tokio::test]
+    async fn reader_upgrade_and_writer_downgrade_keep_one_owner_of_the_namespace() {
+        use crate::lang::testing::fixture_tag;
+        let fixture = Fixture::new();
+        let file = epsilon_source(&fixture);
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        let actor = provider_start(&mut worker, "ud-actor", "ud-start-reader", true, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider_symbol_call(&mut worker, "ud-actor", "ud-1", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+        assert!(worker.test_binding_owns_caches(&actor));
+
+        // Upgrade in place: the reader-owned session is released, the writer retains afresh.
+        provider_start(&mut worker, "ud-actor", "ud-start-writer", false, None)
+            .await
+            .unwrap();
+        assert!(worker.test_binding_owns_caches(&actor));
+        assert_eq!(
+            provider_symbol_call(&mut worker, "ud-actor", "ud-2", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+
+        // Downgrade in place: nothing is owned until the next call claims it as a reader.
+        provider_start(&mut worker, "ud-actor", "ud-start-reader-again", true, None)
+            .await
+            .unwrap();
+        assert!(!worker.test_binding_owns_caches(&actor));
+        assert_eq!(
+            provider_symbol_call(&mut worker, "ud-actor", "ud-3", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+        assert!(worker.test_binding_owns_caches(&actor));
+
+        let (events, namespaces) = provider_events(&[&actor]);
+        let tag = fixture_tag(&actor);
+        assert_eq!(
+            events,
+            [
+                format!("ensure:{tag}"),
+                format!("release:{tag}"),
+                format!("ensure:{tag}"),
+                format!("release:{tag}"),
+                format!("ensure:{tag}"),
+            ]
+        );
+        assert_eq!(namespaces.len(), 1, "{namespaces:?}");
+    }
+
+    /// A reader owner whose cleanup fails during a writer's handover leaves the writer's start
+    /// refused with no second owner: the writer holds nothing, the reader keeps the namespace and
+    /// its next call is still answered, and a retried writer start then takes the namespace over.
+    #[tokio::test]
+    async fn failed_reader_cleanup_refuses_the_writer_without_a_second_owner_and_retry_succeeds() {
+        use crate::lang::testing::{fixture_fail_next_close, fixture_tag};
+        let fixture = Fixture::new();
+        let file = epsilon_source(&fixture);
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        let reader = provider_start(&mut worker, "fc-reader", "fc-reader-start", true, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider_symbol_call(&mut worker, "fc-reader", "fc-reader-1", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+        fixture_fail_next_close(&reader);
+
+        let refused = provider_start(&mut worker, "fc-writer", "fc-writer-start-1", false, None)
+            .await
+            .err();
+        assert_eq!(refused, Some(FailureCode::Internal));
+        assert!(
+            worker.test_binding_owns_caches(&reader),
+            "the reader keeps the namespace its cleanup could not release"
+        );
+        assert_eq!(
+            provider_symbol_call(&mut worker, "fc-reader", "fc-reader-2", &file).await,
+            Err(FailureCode::ProviderLoading),
+            "the reader still answers; the refused writer holds nothing"
+        );
+
+        // Retry: the cleanup succeeds and the writer takes the namespace over.
+        let writer = provider_start(&mut worker, "fc-writer", "fc-writer-start-2", false, None)
+            .await
+            .unwrap();
+        assert!(!worker.test_binding_owns_caches(&reader));
+        assert!(worker.test_binding_owns_caches(&writer));
+        let (events, namespaces) = provider_events(&[&reader, &writer]);
+        let (reader_tag, writer_tag) = (fixture_tag(&reader), fixture_tag(&writer));
+        assert!(
+            events.windows(2).all(|pair| !(pair[0].starts_with("ensure")
+                && pair[1].starts_with("ensure")
+                && pair[0] != pair[1])),
+            "no writer session starts while the reader still owns: {events:?}"
+        );
+        assert!(
+            !events.contains(&format!("ensure:{writer_tag}")),
+            "{events:?}"
+        );
+        assert_eq!(events.first(), Some(&format!("ensure:{reader_tag}")));
+        assert_eq!(namespaces.len(), 1, "{namespaces:?}");
+    }
+
+    /// Readers of sibling worktrees own independent namespaces: a writer arriving on one worktree
+    /// releases only that worktree's reader owner.
+    #[tokio::test]
+    async fn sibling_worktrees_keep_independent_reader_owned_namespaces() {
+        let fixture = Fixture::new();
+        let sibling = fixture.base.join("sibling-root");
+        std::fs::create_dir_all(&sibling).unwrap();
+        let file = epsilon_source(&fixture);
+        std::fs::write(sibling.join("b.epsilon"), "two\n").unwrap();
+        let sibling_file = std::path::PathBuf::from("b.epsilon");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        let here = provider_start(&mut worker, "sw-here", "sw-here-start", true, None)
+            .await
+            .unwrap();
+        let there = provider_start(
+            &mut worker,
+            "sw-there",
+            "sw-there-start",
+            true,
+            Some(&sibling),
+        )
+        .await
+        .unwrap();
+        for (actor, call, path) in [
+            ("sw-here", "sw-here-1", &file),
+            ("sw-there", "sw-there-1", &sibling_file),
+        ] {
+            assert_eq!(
+                provider_symbol_call(&mut worker, actor, call, path).await,
+                Err(FailureCode::ProviderLoading),
+                "{actor}"
+            );
+        }
+        assert!(worker.test_binding_owns_caches(&here));
+        assert!(worker.test_binding_owns_caches(&there));
+        let (_, here_namespaces) = provider_events(&[&here]);
+        let (_, there_namespaces) = provider_events(&[&there]);
+        assert_ne!(here_namespaces, there_namespaces);
+
+        provider_start(&mut worker, "sw-writer", "sw-writer-start", false, None)
+            .await
+            .unwrap();
+        assert!(
+            !worker.test_binding_owns_caches(&here),
+            "released by the writer"
+        );
+        assert!(
+            worker.test_binding_owns_caches(&there),
+            "the sibling worktree's reader owner is untouched"
+        );
     }
 
     /// A second stop after authority release is a benign completion, not a workspace refusal.
@@ -10221,7 +10691,11 @@ mod stop_retry_tests {
             )
         };
         let limit = worker.admission().inspect().per_owner_running_limit;
-        assert_eq!(limit, 5, "one slot per server language plus one");
+        assert_eq!(
+            limit,
+            crate::lang::registered().len().max(1) + 1,
+            "one slot per registered language plus one"
+        );
         for index in 1..limit {
             let granted = server(&mut worker.admission(), format!("server-{index}"));
             assert!(matches!(granted, ProviderLeaseAdmission::Granted(_)));

@@ -332,7 +332,9 @@ impl Worker<'_> {
     /// The server is chosen by `source`'s extension ([`LanguageServer::context_extensions`]);
     /// `Ok(None)` when no server owns the extension or the target configures none for it.
     /// Persistent sessions admit the source under fresh invoking-actor authority, even when
-    /// borrowing the writer's transport; a mismatched source returns `WorkspaceAuthority`.
+    /// borrowing the worktree's session owner's transport (the writer, else the reader that owns
+    /// the namespace; see [`Worker::resolve_session_owner`]); a mismatched source returns
+    /// `WorkspaceAuthority`.
     pub(super) async fn semantic_context(
         &mut self,
         job: &mut Job,
@@ -362,9 +364,10 @@ impl Worker<'_> {
             return Ok(None);
         };
         let source_authority = self.authority(job.invocation.binding_ref()).await?;
+        // A reader's semantic call serves from the worktree's session owner for this one backend
+        // call; a writer-less reader becomes that owner first.
+        self.resolve_session_owner(job, &source_authority).await?;
         let mut backend = self.providers.take_backend(index)?;
-        // A reader's semantic call borrows the writer's session for this one backend call.
-        self.borrow_writer_session(job);
         let result = async {
             if server.session_extensions().contains(&extension) {
                 backend.ensure_live(self, job, &launch, source).await?;
@@ -394,16 +397,20 @@ impl Worker<'_> {
     /// jobs, while edit diagnostics return `ProviderLoading` without parking so a prior write can
     /// settle. Workspace failure and dead transport remain errors; a dead transport retires the
     /// session. The invoking actor's fresh authority admits `source` into the selected transport;
-    /// borrowing a writer session does not replace the reader's source identity or its epoch.
+    /// borrowing the owner's session (the writer's, or the owning reader's when no writer holds the
+    /// worktree) does not replace the invoking reader's source identity or its epoch. A reader with
+    /// no writer and no reading owner beside it claims the namespace first
+    /// ([`Worker::resolve_session_owner`]).
     pub(super) async fn live_session_for(
         &mut self,
         job: &mut Job,
         source: &SourceObservation,
     ) -> Result<&mut LiveSession, FailureCode> {
         let source_authority = self.authority(job.invocation.binding_ref()).await?;
-        // A reader's semantic tools borrow the writer's session for this whole resolution; the
-        // mapping is cleared again below so no non-provider path of the same job ever sees it.
-        self.borrow_writer_session(job);
+        // A reader's semantic tools serve from the worktree's session owner for this whole
+        // resolution (a writer-less reader becomes that owner first); the mapping is cleared
+        // again below so no non-provider path of the same job ever sees it.
+        self.resolve_session_owner(job, &source_authority).await?;
         let binding = job
             .session_binding
             .clone()
@@ -506,6 +513,108 @@ impl Worker<'_> {
     /// Returns the language server whose live session answers `path`, for capability checks.
     pub(super) fn session_server(&self, path: &Path) -> Option<&'static dyn LanguageServer> {
         self.providers.session_server(path)
+    }
+
+    /// Names the binding whose live sessions and cache namespace serve `binding`'s provider
+    /// calls, or `None` when `binding` serves itself.
+    ///
+    /// Only a reader borrows. While a writer holds the worktree it owns every session and the
+    /// namespace; with no writer, the first reader that needed the provider owns them
+    /// ([`Worker::resolve_session_owner`]) and the other readers of that worktree borrow from it.
+    /// A writer, an unknown binding and a reader nobody owns for yet serve themselves.
+    fn session_owner_of(&self, binding: &BindingRef) -> Option<BindingRef> {
+        use crate::workspace::authority::StartRole;
+        let receipt = self
+            .grants
+            .get(binding)
+            .filter(|receipt| receipt.role() == StartRole::Reader)?;
+        let same_tree = |other: &StartReceipt| other.worktree().id() == receipt.worktree().id();
+        self.grants
+            .iter()
+            .find(|(_, other)| other.role() == StartRole::Writer && same_tree(other))
+            .or_else(|| {
+                self.grants.iter().find(|(other, grant)| {
+                    *other != binding
+                        && same_tree(grant)
+                        && self.providers.binding_caches.contains_key(*other)
+                })
+            })
+            .map(|(owner, _)| owner.clone())
+    }
+
+    /// Points `job` at the binding that serves its provider calls and makes sure that binding
+    /// owns the worktree's cache namespace, so a writer-less reader gets the same semantic tools
+    /// as a writer (QW-1).
+    ///
+    /// `job.session_binding` is set to the borrowed owner or left `None` when the invoking binding
+    /// serves itself; callers clear it once their provider call ends. A reader with neither a
+    /// writer nor a reading owner beside it claims the namespace now, retaining it exactly like a
+    /// writer's start would; a writer's later start releases it again
+    /// ([`Worker::release_reader_owners`]) and the next reader call claims it back after the
+    /// writer leaves. Fails `ProviderUnavailable` with a named stage when the claim is refused.
+    pub(super) async fn resolve_session_owner(
+        &mut self,
+        job: &mut Job,
+        authority: &AuthorityStamp,
+    ) -> Result<(), FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        job.session_binding = self.session_owner_of(&binding);
+        let reader = self.grants.get(&binding).is_some_and(|receipt| {
+            receipt.role() == crate::workspace::authority::StartRole::Reader
+        });
+        if job.session_binding.is_some() || !reader {
+            return Ok(());
+        }
+        let launches = job.target.providers.clone();
+        self.retain_worktree_caches(&binding, authority, &launches, true)
+            .map_err(|code| {
+                let stage = match code {
+                    FailureCode::Conflict => "provider: cache namespace held by another session",
+                    FailureCode::Capacity => "provider: cache namespaces exhausted",
+                    _ => "provider: cache namespace unavailable",
+                };
+                job.set_stage_failure(&FailureCode::ProviderUnavailable, stage);
+                FailureCode::ProviderUnavailable
+            })
+    }
+
+    /// Releases every reader-owned session and namespace of the worktree `writer` is about to
+    /// own, so the writer's retention never meets a second live owner.
+    ///
+    /// Each reader owner's live sessions are shut down and reaped, its non-session provider views
+    /// closed and its namespace quiesced, in that order, before this returns; the readers keep
+    /// working and borrow the writer's sessions from their next call on. `writer_was_reader` is
+    /// true when the incoming writer upgrades its own reader activation, which then releases its
+    /// own reader-owned state too. Fails with the first cleanup failure; the namespace of a reader
+    /// whose cleanup failed stays non-quiescent, so the writer's start refuses instead of sharing it.
+    pub(super) async fn release_reader_owners(
+        &mut self,
+        writer: &BindingRef,
+        writer_was_reader: bool,
+        authority: &AuthorityStamp,
+    ) -> Result<(), FailureCode> {
+        use crate::workspace::authority::StartRole;
+        let owners: Vec<BindingRef> = self
+            .providers
+            .binding_caches
+            .keys()
+            .filter(|owner| {
+                if *owner == writer {
+                    return writer_was_reader;
+                }
+                self.grants.get(*owner).is_some_and(|grant| {
+                    grant.role() == StartRole::Reader
+                        && grant.worktree().id() == authority.worktree().id()
+                })
+            })
+            .cloned()
+            .collect();
+        for owner in owners {
+            self.release_live(&owner).await;
+            self.close_provider(&owner).await?;
+            self.quiesce_worktree_caches(&owner);
+        }
+        Ok(())
     }
 
     /// Shuts down and reaps every live language session owned by one binding, in server order.

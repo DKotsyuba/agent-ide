@@ -894,8 +894,9 @@ pub fn kind_of(kind: lsp::SymbolKind) -> SymbolKind {
 /// They carry identity, ordering, extensions and a root-marker presence rule but no real
 /// language behaviour, so core tests never depend on a bundled language. `ALPHA`, `BETA` and
 /// `GAMMA` have project checks (present when `<id>.toml` exists at the worktree root) and tiny
-/// token-based name-fact providers; `GAMMA` also outlines from source (it has no server, like
-/// every test language); `DELTA` has neither. Their identifiers sort in that order.
+/// token-based name-fact providers; `GAMMA` also outlines from source; `DELTA` has neither. None
+/// of those four has a server. `EPSILON` alone has one, the recording [`FixtureServer`], for tests
+/// of provider ownership. Their identifiers sort alpha, beta, delta, epsilon, gamma.
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
@@ -909,7 +910,7 @@ pub(crate) mod testing {
         fn language(&self) -> Language {
             Language::by_id(self.0)
                 .or_else(|| {
-                    [ALPHA, BETA, GAMMA, DELTA]
+                    [ALPHA, BETA, GAMMA, DELTA, EPSILON]
                         .into_iter()
                         .find(|l| l.name() == self.0)
                 })
@@ -1315,6 +1316,216 @@ pub(crate) mod testing {
         names: None,
     };
 
+    /// Descriptor of the test language that alone has a language server: the fixture server below.
+    static EPSILON_DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
+        id: "epsilon",
+        display_name: "Epsilon",
+        extensions: &["epsilon"],
+        card_manifest: None,
+        home_tool_dirs: &[],
+        support: &Support("epsilon"),
+        checks: None,
+        server: Some(&FixtureServer),
+        names: None,
+    };
+
+    /// The events every fixture backend recorded, as `<event>:<binding tag>[:<detail>]` lines in
+    /// order. Tests filter by the binding tags of their own actors, so concurrent tests that use
+    /// distinct actor names never see each other's lines.
+    static FIXTURE_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Short stable tag of one binding in [`FIXTURE_LOG`] lines: its fingerprint's first four
+    /// bytes in hex.
+    pub(crate) fn fixture_tag(binding: &crate::assistance::host_binding::BindingRef) -> String {
+        binding.fingerprint()[..4]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// Returns the [`FIXTURE_LOG`] lines whose binding tag is one of `bindings`, in order.
+    pub(crate) fn fixture_events(
+        bindings: &[&crate::assistance::host_binding::BindingRef],
+    ) -> Vec<String> {
+        let tags: Vec<String> = bindings
+            .iter()
+            .map(|binding| fixture_tag(binding))
+            .collect();
+        FIXTURE_LOG
+            .lock()
+            .expect("fixture log")
+            .iter()
+            .filter(|line| tags.iter().any(|tag| line.split(':').nth(1) == Some(tag)))
+            .cloned()
+            .collect()
+    }
+
+    /// Binding tags whose next `close_binding` on the fixture server fails once, so a test can
+    /// make a reader owner's cleanup fail during a writer's handover.
+    static FIXTURE_CLOSE_FAILURES: std::sync::Mutex<Vec<String>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// Makes the next fixture-server `close_binding` of `binding` fail with `Internal`, once.
+    pub(crate) fn fixture_fail_next_close(binding: &crate::assistance::host_binding::BindingRef) {
+        FIXTURE_CLOSE_FAILURES
+            .lock()
+            .expect("fixture close failures")
+            .push(fixture_tag(binding));
+    }
+
+    /// Appends one line to [`FIXTURE_LOG`].
+    fn fixture_record(line: String) {
+        FIXTURE_LOG.lock().expect("fixture log").push(line);
+    }
+
+    /// Language server of [`EPSILON`]: it spawns nothing. Its backend resolves the retained cache
+    /// namespace exactly like the real backends do before they spawn, records which binding it did
+    /// so for, and then reports the server as still loading, so a unit test can observe namespace
+    /// ownership and release order through the production worker paths without a real server.
+    pub(crate) struct FixtureServer;
+
+    impl crate::intelligence::server::LanguageServer for FixtureServer {
+        /// The fixture language.
+        fn language(&self) -> Language {
+            EPSILON
+        }
+        /// Launcher `settings` identifier selecting the fixture server.
+        fn settings_key(&self) -> &'static str {
+            "fixture_epsilon"
+        }
+        /// Any declaration is acceptable.
+        fn validate_launch(&self, _launch: &crate::assistance::launcher::ProviderLaunch) -> bool {
+            true
+        }
+        /// Reply name of the fixture server.
+        fn name(&self) -> &'static str {
+            "fixtureserver"
+        }
+        /// Fixed cache settings identity.
+        fn cache_settings(&self) -> &'static str {
+            "epsilon-settings"
+        }
+        /// Fixed configuration identity.
+        fn effective_configuration(&self) -> &'static str {
+            "epsilon-configuration"
+        }
+        /// One private subdirectory.
+        fn cache_directories(&self) -> &'static [&'static str] {
+            &["epsilon-state"]
+        }
+        /// Context requests for `.epsilon` files.
+        fn context_extensions(&self) -> &'static [&'static str] {
+            &["epsilon"]
+        }
+        /// Symbol tools for `.epsilon` files use the fixture session.
+        fn session_extensions(&self) -> &'static [&'static str] {
+            &["epsilon"]
+        }
+        /// A fresh recording backend.
+        fn new_backend(&self) -> Box<dyn crate::intelligence::server::ServerBackend> {
+            Box::new(FixtureBackend::default())
+        }
+    }
+
+    /// Per-worker state of [`FixtureServer`]: the bindings that currently hold a (pretend)
+    /// session.
+    #[derive(Default)]
+    struct FixtureBackend {
+        /// Bindings whose session `ensure_live` established and `release_live` has not yet ended.
+        live: std::collections::BTreeSet<crate::assistance::host_binding::BindingRef>,
+    }
+
+    impl crate::intelligence::server::ServerBackend for FixtureBackend {
+        /// Semantic context is never requested of the fixture.
+        fn context<'a>(
+            &'a mut self,
+            _host: &'a mut dyn crate::intelligence::server::ProviderHost,
+            _job: &'a mut dyn crate::intelligence::server::ProviderJob,
+            _launch: &'a crate::assistance::launcher::ProviderLaunch,
+            _source: &'a crate::workspace::observation::SourceObservation,
+            _bytes: &'a [u8],
+            _query: crate::intelligence::context::ContextQuery,
+        ) -> crate::checks::BoxFuture<
+            'a,
+            Result<
+                crate::intelligence::server::ProviderContext,
+                crate::assistance::reply::FailureCode,
+            >,
+        > {
+            Box::pin(async { Err(crate::assistance::reply::FailureCode::ProviderUnavailable) })
+        }
+
+        /// Resolves the job binding's retained namespace like a real backend, records it, marks
+        /// the binding live, and answers `ProviderLoading` (the namespace was obtained; a real
+        /// server would now be starting). A binding without a retained namespace gets the real
+        /// backends' bare `ProviderUnavailable`.
+        fn ensure_live<'a>(
+            &'a mut self,
+            host: &'a mut dyn crate::intelligence::server::ProviderHost,
+            job: &'a mut dyn crate::intelligence::server::ProviderJob,
+            launch: &'a crate::assistance::launcher::ProviderLaunch,
+            _source: &'a crate::workspace::observation::SourceObservation,
+        ) -> crate::checks::BoxFuture<'a, Result<(), crate::assistance::reply::FailureCode>>
+        {
+            Box::pin(async move {
+                let binding = job.binding().clone();
+                let authority = host.authority(&binding).await?;
+                let namespace = host.cache_namespace(
+                    &binding,
+                    &authority,
+                    launch,
+                    &crate::intelligence::server::effective_trust(launch),
+                )?;
+                fixture_record(format!("ensure:{}:{namespace}", fixture_tag(&binding)));
+                self.live.insert(binding);
+                Err(crate::assistance::reply::FailureCode::ProviderLoading)
+            })
+        }
+
+        /// Ends the binding's pretend session and records it.
+        fn release_live<'a>(
+            &'a mut self,
+            _host: &'a mut dyn crate::intelligence::server::ProviderHost,
+            binding: &'a crate::assistance::host_binding::BindingRef,
+        ) -> crate::checks::BoxFuture<'a, ()> {
+            if self.live.remove(binding) {
+                fixture_record(format!("release:{}", fixture_tag(binding)));
+            }
+            Box::pin(async {})
+        }
+
+        /// Releases no resource, but fails once for a binding armed by [`fixture_fail_next_close`]
+        /// and records the failure.
+        fn close_binding<'a>(
+            &'a mut self,
+            _host: &'a mut dyn crate::intelligence::server::ProviderHost,
+            binding: &'a crate::assistance::host_binding::BindingRef,
+        ) -> crate::checks::BoxFuture<'a, Result<(), crate::assistance::reply::FailureCode>>
+        {
+            let tag = fixture_tag(binding);
+            let mut armed = FIXTURE_CLOSE_FAILURES
+                .lock()
+                .expect("fixture close failures");
+            let failing = armed.iter().position(|armed| *armed == tag);
+            if let Some(position) = failing {
+                armed.remove(position);
+                fixture_record(format!("close-failed:{tag}"));
+            }
+            Box::pin(async move {
+                if failing.is_some() {
+                    Err(crate::assistance::reply::FailureCode::Internal)
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        /// The bindings holding a pretend session.
+        fn live_bindings(&self) -> Vec<crate::assistance::host_binding::BindingRef> {
+            self.live.iter().cloned().collect()
+        }
+    }
+
     /// First checked test language.
     pub(crate) const ALPHA: Language = Language::of(&ALPHA_DESCRIPTOR);
     /// Second checked test language.
@@ -1323,10 +1534,12 @@ pub(crate) mod testing {
     pub(crate) const GAMMA: Language = Language::of(&GAMMA_DESCRIPTOR);
     /// Unchecked test language.
     pub(crate) const DELTA: Language = Language::of(&DELTA_DESCRIPTOR);
+    /// Unchecked test language whose server is the recording [`FixtureServer`].
+    pub(crate) const EPSILON: Language = Language::of(&EPSILON_DESCRIPTOR);
 
     /// Registers the test languages (idempotent) for tests that look languages up by path or id.
     pub(crate) fn install() {
-        super::install(&[ALPHA, BETA, GAMMA, DELTA]);
+        super::install(&[ALPHA, BETA, GAMMA, DELTA, EPSILON]);
     }
 }
 
