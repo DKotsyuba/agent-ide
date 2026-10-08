@@ -3634,10 +3634,10 @@ impl Drop for ManagedCodexCleanup {
                 {
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                if agent_ide_core::app::lock_is_held(&path) {
-                    // The daemon survived: keep its runtime so the leftover stays visible.
-                    continue;
-                }
+            }
+            if agent_ide_core::app::lock_is_held(&path) {
+                // A daemon survived (or its pid was unreadable): keep its runtime visible.
+                continue;
             }
             let _ = std::fs::remove_dir_all(&path);
         }
