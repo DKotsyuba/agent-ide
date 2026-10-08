@@ -1386,35 +1386,44 @@ impl WorkerHandle {
             }
             let _ = ready.send(Ok(()));
             let supervised = shared.clone();
-            let worker = Worker {
-                admission: shared.admission.clone(),
-                shared,
-                workspace,
-                observations,
-                edits,
-                grants: BTreeMap::new(),
-                leases: BTreeMap::new(),
-                pending_revocations: std::collections::BTreeSet::new(),
-                stop_cause: None,
-                stop_attempts: Arc::default(),
-                revoke_retry_rounds: 0,
-                next_revoke_retry: None,
-                registered: BTreeMap::new(),
-                baselines: BTreeMap::new(),
-                heads: BTreeMap::new(),
-                source_sequence: 0,
-                uncertain: std::collections::BTreeSet::new(),
-                uncertain_snapshots: Vec::new(),
-                runtime,
-                providers: providers::Providers::new(),
-                names: Default::default(),
-                telemetry,
-                activity: BTreeMap::new(),
+            // Constructing the worker (a backend constructor included) is inside the supervised
+            // future too: a panic there must mark the daemon failed like one in the loop.
+            let worker = async move {
+                if fault_seam("worker_construct") {
+                    panic!("agent-ide test seam: deliberate worker construction panic");
+                }
+                Worker {
+                    admission: shared.admission.clone(),
+                    shared,
+                    workspace,
+                    observations,
+                    edits,
+                    grants: BTreeMap::new(),
+                    leases: BTreeMap::new(),
+                    pending_revocations: std::collections::BTreeSet::new(),
+                    stop_cause: None,
+                    stop_attempts: Arc::default(),
+                    revoke_retry_rounds: 0,
+                    next_revoke_retry: None,
+                    registered: BTreeMap::new(),
+                    baselines: BTreeMap::new(),
+                    heads: BTreeMap::new(),
+                    source_sequence: 0,
+                    uncertain: std::collections::BTreeSet::new(),
+                    uncertain_snapshots: Vec::new(),
+                    runtime,
+                    providers: providers::Providers::new(),
+                    names: Default::default(),
+                    telemetry,
+                    activity: BTreeMap::new(),
+                }
+                .run(receiver)
+                .await
             };
             // The worker is the daemon's only job task: a panic that escapes the per-job guard
             // (the loop around `perform`), or a return outside shutdown, leaves a daemon that
             // accepts calls nobody will run. Either marks it failed so it is replaced.
-            if catch_panic(worker.run(receiver)).await.is_err() {
+            if catch_panic(worker).await.is_err() {
                 supervised.mark_failed("worker_panic");
             } else if !supervised
                 .shutting_down
@@ -2802,11 +2811,13 @@ impl<'a> Worker<'a> {
             }
         }
     }
-    /// Answers every job still queued with `internal`, unexecuted, once the daemon has failed.
+    /// Answers every job still queued, unexecuted, once the daemon has failed.
     ///
-    /// A queued job never ran, so nothing was applied and the caller may repeat it on the
-    /// replacement daemon; waiting for the connection to be dropped instead would turn a mutation
-    /// into an unknown outcome it is not. Idempotent; the queue is empty afterwards.
+    /// A queued job that never ran answers `internal`: nothing was applied and the caller may
+    /// repeat it on the replacement daemon; waiting for the connection to be dropped instead would
+    /// turn a mutation into an unknown outcome it is not. An edit parked for its project check
+    /// already wrote, so it answers its settled result with unknown diagnostics. Idempotent; the
+    /// queue is empty afterwards.
     fn refuse_queued_after_failure(&mut self) {
         let queued: Vec<Job> = self
             .shared
@@ -2816,12 +2827,22 @@ impl<'a> Worker<'a> {
             .unwrap_or_default();
         for mut job in queued {
             job.park_until = None;
-            let reply = PeerReply::Error {
-                code: FailureCode::Internal,
-                detail: Some(crate::telemetry::adapters::default_stage(
-                    job.tool,
-                    &FailureCode::Internal,
-                )),
+            // An edit parked for its project check already wrote: it answers its settled result
+            // with unknown diagnostics, never `internal`, so nothing resends the write.
+            let reply = match job.stage.take() {
+                Some(JobStage::EditAwaitingCheck { result, .. }) => PeerReply::Edit {
+                    result,
+                    diagnostics: EditDiagnostics::Unknown {},
+                    note: None,
+                    operation: edit_operation(&job.parameters),
+                },
+                None => PeerReply::Error {
+                    code: FailureCode::Internal,
+                    detail: Some(crate::telemetry::adapters::default_stage(
+                        job.tool,
+                        &FailureCode::Internal,
+                    )),
+                },
             };
             self.shared
                 .complete(&job.reference, reply.clone(), None, None, job.native_epoch);
@@ -6510,7 +6531,7 @@ fn panic_seam(_job: &Job) {}
 
 /// Test seam: reports `true` exactly once per flag file when `AGENT_IDE_TEST_FAULT` names `point`,
 /// so a product test can inject one fault into a named place of the daemon (`inspection`, `ensure`,
-/// `loop`, `worker_exit`, `edit_after_write`) that survives a daemon replacement.
+/// `loop`, `worker_exit`, `worker_construct`, `edit_after_write`) that survives a daemon replacement.
 ///
 /// The variable reads `<point>:<absolute flag file>`; the fault fires when the flag file exists
 /// and this call is the one that removes it, so only the first daemon to reach the point fails and
