@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.10.7 — 2026-10-08
+
 ### Fixed
 
 - A read-only activation no longer schedules a project check: its `ide.start`, native post-edit triggers and environment changes start none, so three readers no longer kick a cold `cargo check`, and a writer's results are not marked stale by a reader's start. A reader still sees the problems a writer's check produced.
