@@ -589,8 +589,39 @@ struct Shared {
     /// stay silent for a channel that never started (or already stopped) instead of emitting
     /// native hints nothing can consume.
     activated: Mutex<BTreeSet<[u8; 32]>>,
+    /// Set, once and for good, when the daemon's own execution machinery failed: a job panicked
+    /// (caught), or the worker loop or the inspection task ended outside shutdown. State the
+    /// unwind abandoned is never trusted again, so the application layer reads this flag, answers
+    /// `restarting`, and exits keeping the runtime store; see [`Shared::mark_failed`].
+    failed: tokio::sync::watch::Sender<bool>,
 }
 impl Shared {
+    /// Marks the daemon failed: from now on it reports itself unhealthy and is replaced.
+    ///
+    /// Idempotent; only the first call writes the daemon journal line (`fatal`, reason
+    /// `internal`), whose detail is the closed `cause` and, when a panic hook saw one, the panic's
+    /// source location — never the payload text. The flag is never cleared: crash-only recovery
+    /// is a fresh daemon, not repair of half-unwound state.
+    fn mark_failed(&self, cause: &str) {
+        if self.failed.send_replace(true) {
+            return;
+        }
+        let place = crate::errorlog::take_panic_place();
+        let detail = match place {
+            Some(place) => format!("{cause}: {place}"),
+            None => cause.to_owned(),
+        };
+        crate::errorlog::record(
+            crate::errorlog::Method::Daemon,
+            crate::errorlog::Outcome::Fatal,
+            crate::errorlog::Fields {
+                reason: Some(FailureCode::Internal.into()),
+                detail: Some(&detail),
+                ..Default::default()
+            },
+        );
+    }
+
     /// Refreshes file-resolved identities and invalidates checks for changed languages.
     fn refresh_environments(&self, worktree: &Path) {
         if let Ok(mut state) = self.environments.lock() {
@@ -967,6 +998,28 @@ impl Drop for WorkerHandle {
     }
 }
 impl WorkerHandle {
+    /// Reports whether the daemon's execution machinery failed and the daemon must be replaced.
+    ///
+    /// True after a caught job panic, after the worker loop or the inspection task ended outside
+    /// shutdown, and when the worker task is found finished outside shutdown. Never reverts.
+    pub fn is_failed(&self) -> bool {
+        *self.shared.failed.borrow()
+            || (!self
+                .shared
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+                && self
+                    .task
+                    .lock()
+                    .is_ok_and(|task| task.as_ref().is_some_and(|task| task.is_finished())))
+    }
+
+    /// Resolves once [`Self::is_failed`] became true through [`Shared::mark_failed`].
+    pub async fn failed(&self) {
+        let mut flag = self.shared.failed.subscribe();
+        let _ = flag.wait_for(|failed| *failed).await;
+    }
+
     /// Returns whether this worker owns the exact launcher or lease-registered attachment.
     /// Discovery-only dispatchers have no worker and retain their unavailable behavior.
     pub fn accepts_attachment(&self, attachment: &str) -> bool {
@@ -1080,6 +1133,7 @@ impl WorkerHandle {
                 git_notices: Mutex::new(BTreeMap::new()),
                 environments: Mutex::default(),
                 activated: Mutex::new(BTreeSet::new()),
+                failed: tokio::sync::watch::Sender::new(false),
             }),
             inspect,
             receiver: Mutex::new(Some(receiver)),
@@ -1331,7 +1385,8 @@ impl WorkerHandle {
                 *configured = Some(ingress);
             }
             let _ = ready.send(Ok(()));
-            Worker {
+            let supervised = shared.clone();
+            let worker = Worker {
                 admission: shared.admission.clone(),
                 shared,
                 workspace,
@@ -1355,9 +1410,18 @@ impl WorkerHandle {
                 names: Default::default(),
                 telemetry,
                 activity: BTreeMap::new(),
+            };
+            // The worker is the daemon's only job task: a panic that escapes the per-job guard
+            // (the loop around `perform`), or a return outside shutdown, leaves a daemon that
+            // accepts calls nobody will run. Either marks it failed so it is replaced.
+            if catch_panic(worker.run(receiver)).await.is_err() {
+                supervised.mark_failed("worker_panic");
+            } else if !supervised
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                supervised.mark_failed("worker_ended");
             }
-            .run(receiver)
-            .await;
         });
         *self.task.lock().map_err(|_| FailureCode::Internal)? = Some(task);
         wait.await.map_err(|_| FailureCode::Internal)?
@@ -1703,6 +1767,7 @@ impl WorkerHandle {
             .shared
             .shutting_down
             .load(std::sync::atomic::Ordering::Acquire)
+            || *self.shared.failed.borrow()
         {
             return Err(FailureCode::Internal.into());
         }
@@ -2615,18 +2680,37 @@ impl<'a> Worker<'a> {
     /// `ide.inspect`. Shutdown first cancels the current operation, allowing its provider or forwarder
     /// child to reap, then this loop closes retained providers before returning.
     ///
-    /// A job that panics does not end the loop: its call settles `internal` (see
-    /// `settle_panicked`), the error journal gets the panic's source location and the call's
-    /// method but never the payload text, and the next queued job runs normally.
+    /// A job that panics is contained crash-only: its own call settles (see `settle_panicked`: an
+    /// edit as the unknown outcome, every other tool `internal`), the error journal gets the
+    /// panic's source location and the call's method but never the payload text, and the daemon is
+    /// marked failed (see `Shared::mark_failed`). From then on the loop executes nothing more: every
+    /// job still queued is answered `internal` unexecuted (so nothing queued behind the panic ever
+    /// writes through half-unwound state, and the front may repeat it on the replacement daemon),
+    /// and the loop only waits for the shutdown the application layer starts, whose cleanup still
+    /// releases the live sessions and closes the providers.
     async fn run(mut self, inspections: mpsc::Receiver<Inspection>)
     where
         'a: 'static,
     {
-        let inspector = tokio::spawn(inspection_loop(
-            self.workspace.clone(),
-            self.shared.clone(),
-            inspections,
-        ));
+        let supervised = self.shared.clone();
+        let workspace = self.workspace.clone();
+        let inspector = tokio::spawn(async move {
+            // A panic in one inspection ends the loop and drops that inspection's reply (its
+            // caller answers `internal`); every later `ide.inspect` of this daemon would then be
+            // refused, so the daemon is marked failed and replaced. A return outside shutdown
+            // (the channel closing) is the same dead end.
+            if catch_panic(inspection_loop(workspace, supervised.clone(), inspections))
+                .await
+                .is_err()
+            {
+                supervised.mark_failed("inspection_panic");
+            } else if !supervised
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                supervised.mark_failed("inspection_ended");
+            }
+        });
         let _inspector = AbortOnDrop(inspector);
         loop {
             if fault_seam("loop") {
@@ -2647,6 +2731,16 @@ impl<'a> Worker<'a> {
                     *failure = Some(code);
                 }
                 return;
+            }
+            // A failed daemon (a caught panic here, or the inspection task's) executes nothing
+            // more: state the unwind abandoned is never trusted again. Queued work is refused
+            // unexecuted and the worker waits for the shutdown that replaces this daemon.
+            if *self.shared.failed.borrow() {
+                let shared = self.shared.clone();
+                let wake = shared.notify.notified();
+                self.refuse_queued_after_failure();
+                wake.await;
+                continue;
             }
             // Failed stops stay pending and the daemon retries them itself (F-12), between jobs
             // as well as when idle, on a doubling schedule.
@@ -2677,7 +2771,11 @@ impl<'a> Worker<'a> {
                     // (never the payload); the worker is the daemon's only job task, so it must
                     // outlive every job.
                     if catch_panic(self.perform(&mut job)).await.is_err() {
+                        // The call is answered first; the unwound state is then never trusted
+                        // again: the daemon marks itself failed and is replaced (crash-only).
                         self.settle_panicked(&mut job);
+                        self.providers.repair_after_panic();
+                        shared.mark_failed("job_panic");
                     }
                     if let Ok(mut ledger) = shared.ledger.lock() {
                         ledger.in_flight = ledger.in_flight.saturating_sub(1);
@@ -2704,17 +2802,78 @@ impl<'a> Worker<'a> {
             }
         }
     }
-    /// Settles a job whose execution panicked: the caller's call answers `internal` under the
-    /// tool's default stage (never the panic text), the error journal gets one line under the job's
-    /// correlation id naming the panic's source location and the call's method, and no
-    /// later run of the job is queued. The shared worker state it leaves behind is whatever the
-    /// unwind stopped at; every later job re-derives its own inputs, so the worker keeps serving.
+    /// Answers every job still queued with `internal`, unexecuted, once the daemon has failed.
+    ///
+    /// A queued job never ran, so nothing was applied and the caller may repeat it on the
+    /// replacement daemon; waiting for the connection to be dropped instead would turn a mutation
+    /// into an unknown outcome it is not. Idempotent; the queue is empty afterwards.
+    fn refuse_queued_after_failure(&mut self) {
+        let queued: Vec<Job> = self
+            .shared
+            .ledger
+            .lock()
+            .map(|mut ledger| ledger.queue.drain(..).collect())
+            .unwrap_or_default();
+        for mut job in queued {
+            job.park_until = None;
+            let reply = PeerReply::Error {
+                code: FailureCode::Internal,
+                detail: Some(crate::telemetry::adapters::default_stage(
+                    job.tool,
+                    &FailureCode::Internal,
+                )),
+            };
+            self.shared
+                .complete(&job.reference, reply.clone(), None, None, job.native_epoch);
+            if let Some(sender) = job.stop_reply.take() {
+                let _ = sender.send(reply);
+            }
+        }
+    }
+    /// Settles a job whose execution panicked: the error journal gets one line under the job's
+    /// correlation id naming the panic's source location and the call's method, and no later run of
+    /// the job is queued.
+    ///
+    /// The caller's call answers `internal` under the tool's default stage (never the panic text),
+    /// except an `ide.edit`, which may already have written before it panicked: it answers the
+    /// unknown outcome its durable receipt also keeps, so no one resends it. The worker does not
+    /// serve again after this: the shared state the unwind left behind is whatever it stopped at,
+    /// so the caller marks the daemon failed (crash-only) right after.
     fn settle_panicked(&mut self, job: &mut Job) {
         job.park_until = None;
         let detail = crate::telemetry::adapters::default_stage(job.tool, &FailureCode::Internal);
-        let reply = PeerReply::Error {
-            code: FailureCode::Internal,
-            detail: Some(detail),
+        // An edit that panicked may already have written: its reply is the unknown outcome the
+        // durable receipt also keeps, never `internal`, so nothing resends it.
+        let unknown_edit = (job.tool == AssistanceTool::Edit)
+            .then(|| {
+                let operation = job.parameters.get("operation_id")?.as_str()?;
+                let path = job.parameters.get("path").and_then(Value::as_str).or_else(|| {
+                    job.parameters
+                        .get("symbol")?
+                        .as_str()?
+                        .split_once('#')
+                        .map(|(path, _)| path)
+                })?;
+                EditResult::new(
+                    operation.to_owned(),
+                    path.to_owned(),
+                    ChangesEditOutcome::OutcomeUnknown,
+                    None,
+                )
+                .ok()
+            })
+            .flatten();
+        let reply = match unknown_edit {
+            Some(result) => PeerReply::Edit {
+                result,
+                diagnostics: EditDiagnostics::Unknown {},
+                note: None,
+                operation: None,
+            },
+            None => PeerReply::Error {
+                code: FailureCode::Internal,
+                detail: Some(detail),
+            },
         };
         let method = errorlog_method(job.tool);
         let place = crate::errorlog::take_panic_place()
@@ -7697,6 +7856,7 @@ mod stop_retry_tests {
                 git_notices: Mutex::new(BTreeMap::new()),
                 environments: Mutex::default(),
                 activated: Mutex::new(BTreeSet::new()),
+                failed: tokio::sync::watch::Sender::new(false),
             }),
             workspace,
             observations: WorkspaceStore::new(store),
