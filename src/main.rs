@@ -2013,9 +2013,9 @@ async fn run_managed_claude_hook() {
     // A present but unusable project directory (a removed session worktree) is not an absent one:
     // without its repository identity the cwd route cannot be told apart from another registered
     // repository's, so the pre is dropped locally rather than routed unrestricted.
-    let project_dir = match std::env::var_os("CLAUDE_PROJECT_DIR").filter(|raw| !raw.is_empty()) {
+    let project_dir = match std::env::var_os("CLAUDE_PROJECT_DIR") {
         None => None,
-        Some(raw) => match fs::canonicalize(PathBuf::from(raw)) {
+        Some(raw) => match canonical_claude_project(Some(raw)) {
             Ok(path) => Some(path),
             Err(_) => {
                 log("hook_project_dir_invalid");

@@ -7044,28 +7044,36 @@ async fn managed_claude_hook_with_a_vanished_project_dir_never_routes_to_another
     assert_eq!(started["kind"], "activation", "{started}");
     next += 1;
 
-    let call = format!("managed-claude-{next}");
-    let pre = managed_claude_hook_from(
-        &vanished,
-        &other_repo.root,
-        managed_claude_event("PreToolUse", "shared-session", None, &call),
-    )
-    .await;
-    assert!(pre.status.success() && pre.stdout.is_empty() && pre.stderr.is_empty());
-    let refused = other
-        .exchange(
-            json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{
-                "name":"ide.context","arguments":{"kind":"problems"},
-                "_meta":{"claudecode/toolUseId":call}
-            }}),
+    // A removed worktree, an empty value and a relative one are all present-but-unusable.
+    for project in [
+        vanished.as_path(),
+        Path::new(""),
+        Path::new("relative-project"),
+    ] {
+        let call = format!("managed-claude-{next}");
+        let pre = managed_claude_hook_from(
+            project,
+            &other_repo.root,
+            managed_claude_event("PreToolUse", "shared-session", None, &call),
         )
         .await;
-    assert!(
-        refused["result"]["content"][0]["text"]
-            .as_str()
-            .is_some_and(|text| text.starts_with("unavailable: host_binding")),
-        "a pre of an unresolvable project never reaches the repository the shell stands in: {refused}"
-    );
+        assert!(pre.status.success() && pre.stdout.is_empty() && pre.stderr.is_empty());
+        let refused = other
+            .exchange(
+                json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{
+                    "name":"ide.context","arguments":{"kind":"problems"},
+                    "_meta":{"claudecode/toolUseId":call}
+                }}),
+            )
+            .await;
+        assert!(
+            refused["result"]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("unavailable: host_binding")),
+            "a pre of unusable project {project:?} never reaches the repository the shell stands in: {refused}"
+        );
+        next += 1;
+    }
     other.close().await;
 }
 
