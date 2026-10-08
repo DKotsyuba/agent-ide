@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.10.6 — 2026-10-08
+
 ### Fixed
 
 - The fault report recognizes only the journal producers' panic record shapes. An observation failure mentioning a file such as `panic at.txt` no longer raises a panic alert; real hook, job and containment panic records still do.
