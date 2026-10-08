@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- Cache eviction is no longer paused by development and test builds of `agent-ide` (a gate's or scratch `target/debug/agent-ide`). A running `agent-ide` whose executable file embeds the lease-protocol proof of this source and was not rebuilt since the process started counts as lease-taking; installed 0.9.1 and older releases, older dev builds without the proof and unreadable executables still pause eviction, and `agent-ide cache status` lists both groups. See `docs/cache-retention.md`, rule 3.
+- Telemetry write-ahead logs are bounded. Writable stores keep at most 1 MiB of WAL after a reset (`journal_size_limit`), and the telemetry writer truncates the WAL on the store's owner connection (`wal_checkpoint(TRUNCATE)`) after its shutdown drain and whenever it has been quiet for 30 seconds; a checkpoint blocked by a reader is retried at the next quiet period. WAL files are never deleted by hand and no `VACUUM` runs.
+- A launch now publishes its telemetry marker atomically (fresh `0600` file, synced and renamed under the launch directory's lease, read back) instead of an unchecked write, replaces a torn or historical `0644` marker and refuses a symlink or foreign file. When the marker cannot be published the daemon starts with runtime-local telemetry and the failure is journaled as `telemetry_marker_unavailable`, so no new persistent store is left without a marker.
+- Stale Claude hook key hints (`/private/tmp/ai-k-*`; 5,206 were found on one machine) are collected by the hourly sweep and `agent-ide cache prune`: only private directories older than a day whose cached key path and runtime directory definitely do not exist, under an exclusive directory lock the publisher shares. `cache status` counts them; collection pauses while an older front that publishes without the lock is alive.
+
 ## 0.10.6 — 2026-10-08
 
 ### Fixed
