@@ -39,7 +39,7 @@ flowchart LR
   Application[Local application: IPC, config, store, cache directories]
 ```
 
-These are runtime relationships, not a serial implementation schedule. Application composes the components. Workspace owns lifecycle identity; persistent analysis cache follows that worktree lifecycle independently of actor/session changes. A failed assistance component cannot veto native agent work.
+These are runtime relationships, not a serial implementation schedule. Application composes the components. Workspace owns lifecycle identity; persistent analysis cache follows that worktree lifecycle independently of actor/session changes. A failed assistance component cannot veto native agent work. The daemon is crash-only: a caught panic or unexpected task end marks it failed, it answers `restarting`, exits keeping its runtime store and receipts, and the front starts a replacement in the same directory without ever replaying a mutation (a written edit stays `outcome_unknown`); a daemon whose health path stays silent for 30 seconds is force-replaced after the lock holder is verified ([Core IPC](contracts/core-ipc.md)).
 
 ## v0.3 MVP: project problem feed
 

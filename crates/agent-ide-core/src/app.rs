@@ -990,7 +990,7 @@ fn current_lock_holder(lock_path: &Path) -> Result<LockHolder, &'static str> {
 /// Eligibility is enforced here, not by the caller: `probes` failed probes spanning `span` must
 /// reach [`WEDGE_MIN_PROBES`] and [`WEDGE_MIN_SPAN`] (they are the caller's evidence and also reach
 /// the journal), and a given `expected_pid` (the holder the evidence was collected against) must
-/// still be the holder. The holder must then validate ([`current_lock_holder`]) and one more probe
+/// still be the holder. The holder must then validate (`current_lock_holder`) and one more probe
 /// must still find the control path silent, again before `SIGKILL` — a daemon whose control path answers is never signalled,
 /// however long its jobs run. The holder is revalidated and compared with the first one
 /// immediately before `SIGTERM` and again before `SIGKILL`; any change refuses without signalling.

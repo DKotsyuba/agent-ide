@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed
+
+- A daemon whose worker, inspection task or provider backend failed no longer keeps answering `ok` while every call hangs or answers `internal` until the transport deadline. Any caught panic or unexpected task end now marks the daemon failed: its health answers `restarting`, new calls are refused as `restarting` ("nothing was applied; repeat this call"), queued jobs are answered without running, and it exits by itself after 500 ms, keeping its runtime store and receipts (an orderly exit still removes them). A call that panicked after an edit wrote answers `outcome_unknown`, never `internal`, and the edit is never replayed. A panic inside the provider's session start no longer leaves the language-server slot empty. `accept` errors from descriptor or memory exhaustion are retried instead of ending the daemon.
+- The front now recovers on its own. A call that times out, loses its reply or answers `internal` triggers one liveness probe of the daemon's health path (served independently of the job queue): a daemon that says `restarting` or has left is re-established at once, in place for managed Codex (store and receipts kept); a daemon whose health path answers nothing across at least two probes spanning 30 seconds is force-replaced (`SIGTERM`, 8 s, `SIGKILL`) after the front verified the lock holder (the daemon lock now records its pid; only a live process running the `agent-ide` executable that still holds the lock), and the replacement is journaled once (`wedged_daemon_replaced`). A daemon whose health path answers is never signalled however long its jobs run, and a shorter stall keeps its daemon and binding.
+- A transport timeout of a tool call (connect or reply) is now written to the client error journal (`timeout`, reason `deadline`, `transport:<phase>_timed_out:<tool>`) instead of leaving no trace.
+
+### Changed
+
+- Timing assertions are separated from correctness in four flaky tests (scheduler cancelled-check lease, second-worktree name index, durable-unavailable reprobes, warm Rust inline answers); a combination smoke reads `.log`, `.md` and `.toml` files in every form (path, lines, ranges, batch, mixed batch, symbol-only batch), each followed by a second call.
+- The test-only variable `AGENT_IDE_TEST_FAULT=<point>:<flag file>` (points `inspection`, `loop`, `worker_exit`, `worker_construct`, `ensure`, `edit_after_write`) injects one fault per consumed flag file; like the panic seam it exists only in builds with the `test-seams` feature.
+
 ## 0.10.5 — 2026-10-07
 
 ### Fixed

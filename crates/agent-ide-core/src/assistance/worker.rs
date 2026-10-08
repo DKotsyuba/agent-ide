@@ -1014,7 +1014,7 @@ impl WorkerHandle {
                     .is_ok_and(|task| task.as_ref().is_some_and(|task| task.is_finished())))
     }
 
-    /// Resolves once [`Self::is_failed`] became true through [`Shared::mark_failed`].
+    /// Resolves once [`Self::is_failed`] became true through `Shared::mark_failed`.
     pub async fn failed(&self) {
         let mut flag = self.shared.failed.subscribe();
         let _ = flag.wait_for(|failed| *failed).await;
