@@ -3561,12 +3561,14 @@ fn managed_runtime_paths(fixture: &ProductFixture) -> std::collections::BTreeSet
 ///
 /// A managed Codex test that fails or panics ends its MCP with `SIGKILL`, which skips the MCP's own
 /// cleanup and orphans the daemon it owns (possibly `SIGSTOP`-ed or stalled in a seam). The guard
-/// finds the runtimes created since `before` that still name this fixture, resumes then kills each
-/// exact lock holder, and removes the runtime directory. On a passing test every daemon is already
-/// gone and the guard does nothing; it never touches another fixture's runtime.
+/// finds the runtimes created since `before` whose launcher record targets exactly this fixture's
+/// repository, resumes then kills the pid the daemon recorded in its held lock, waits (at most five
+/// seconds) for the lock to be released and removes the runtime directory. On a passing test every
+/// daemon is already gone and the guard does nothing; it signals nothing it did not identify
+/// through the lock and never touches another fixture's runtime.
 struct ManagedCodexCleanup {
-    /// The fixture's base directory, which its runtimes' launcher records name.
-    base: String,
+    /// The fixture's repository root, as its runtimes' launcher records name it.
+    roots: [PathBuf; 2],
     /// Runtime directories that existed before the test started.
     before: std::collections::BTreeSet<PathBuf>,
 }
@@ -3575,17 +3577,40 @@ impl ManagedCodexCleanup {
     /// Starts guarding the runtimes the fixture creates after `before` was observed.
     fn new(fixture: &ProductFixture, before: &std::collections::BTreeSet<PathBuf>) -> Self {
         Self {
-            base: fixture.base.to_string_lossy().into_owned(),
+            roots: [
+                fixture.root.clone(),
+                std::fs::canonicalize(&fixture.root).unwrap_or_else(|_| fixture.root.clone()),
+            ],
             before: before.clone(),
         }
+    }
+
+    /// Reports whether the runtime's launcher record targets exactly this fixture's repository.
+    fn owns(&self, runtime: &Path) -> bool {
+        let Some(launcher) = std::fs::read_to_string(runtime.join("launcher.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        else {
+            return false;
+        };
+        launcher["targets"].as_array().is_some_and(|targets| {
+            targets.iter().any(|target| {
+                target["candidate"].as_str().is_some_and(|candidate| {
+                    self.roots.iter().any(|root| root == Path::new(candidate))
+                })
+            })
+        })
     }
 }
 
 impl Drop for ManagedCodexCleanup {
-    /// Resumes and kills the lock holder of each leftover runtime of this fixture, then removes it.
+    /// Resumes and kills the recorded lock holder of each leftover runtime of this fixture, waits
+    /// boundedly for the lock to be released, then removes the runtime. Never panics.
     fn drop(&mut self) {
-        let Ok(entries) = std::fs::read_dir(std::fs::canonicalize(std::env::temp_dir()).unwrap())
-        else {
+        let Ok(temp) = std::fs::canonicalize(std::env::temp_dir()) else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(temp) else {
             return;
         };
         for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
@@ -3593,24 +3618,20 @@ impl Drop for ManagedCodexCleanup {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with("ai-") && name.len() == 19);
-            let ours = std::fs::read_to_string(path.join("launcher.json"))
-                .is_ok_and(|launcher| launcher.contains(&self.base));
-            if !named || !ours || self.before.contains(&path) {
+            if !named || self.before.contains(&path) || !self.owns(&path) {
                 continue;
             }
-            if let Ok(output) = std::process::Command::new("/usr/sbin/lsof")
-                .arg("-t")
-                .arg(path.join("agent-ide.lock"))
-                .output()
-            {
-                for pid in String::from_utf8_lossy(&output.stdout).split_whitespace() {
-                    if let Ok(pid) = pid.parse::<libc::pid_t>() {
-                        // SAFETY: the pid holds this fixture's own runtime lock.
-                        unsafe {
-                            libc::kill(pid, libc::SIGCONT);
-                            libc::kill(pid, libc::SIGKILL);
-                        }
+            if let Some(pid) = agent_ide_core::app::lock_holder_pid(&path) {
+                // SAFETY: the pid is the one this fixture's own daemon recorded in its held lock.
+                unsafe {
+                    libc::kill(pid, libc::SIGCONT);
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                for _ in 0..100 {
+                    if !agent_ide_core::app::lock_is_held(&path) {
+                        break;
                     }
+                    std::thread::sleep(Duration::from_millis(50));
                 }
             }
             let _ = std::fs::remove_dir_all(&path);
