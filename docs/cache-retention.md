@@ -93,7 +93,7 @@ reason other than `NotFound` (the key path of a live repository exists), a busy 
 younger than a day keeps the hint. A hint of a deleted worktree whose repository still exists is
 therefore kept: nothing guesses the worktree from the digest. Fronts older than this change publish
 without the lock, so the collection is **paused while any live `agent-ide` process is not this
-executable or a proven build** (the same file proof as rule 3; version numbers are not trusted) or the
+executable or a build proven to lock** (a second file proof, `HINT_LOCK_BUILD_PROOF`, embedded only together with the lock, so a build that merely takes leases does not count; version numbers are not trusted) or the
 process list is unreadable; `cache status` and `cache prune` name the blocking processes, and the
 sweep records `hook_key_hints paused=N`. Hooks only read hints and never lock.
 

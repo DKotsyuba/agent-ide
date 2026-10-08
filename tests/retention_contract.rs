@@ -110,6 +110,13 @@ fn status_view_of_a_copied_build(name: &str, strip_proof: bool) -> (bool, bool) 
         .filter(|window| *window == proof)
         .count();
     assert!(found > 0, "the product binary carries its lease proof");
+    let lock_proof: &[u8] = b"agent-ide/hint-publish-lock/proof-1";
+    assert!(
+        bytes
+            .windows(lock_proof.len())
+            .any(|window| window == lock_proof),
+        "the product binary carries its hint-lock proof"
+    );
     if strip_proof {
         for at in (0..bytes.len() - proof.len())
             .filter(|&at| &bytes[at..at + proof.len()] == proof)

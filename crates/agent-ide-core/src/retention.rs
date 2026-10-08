@@ -45,7 +45,13 @@ const LEGACY_BOUNDARY: (u64, u64, u64) = (0, 9, 1);
 /// without keeping older builds recognizable only by their release version.
 #[used]
 static LEASE_BUILD_PROOF: &[u8] = b"agent-ide/worktree-lease-protocol/proof-1";
-/// Largest executable scanned for [`LEASE_BUILD_PROOF`]; a larger one is unproven.
+/// Present only in executables whose Claude hook key hint publishers take the directory lock a
+/// collection relies on (`hook_hints::PublishGuard`), which first shipped after
+/// [`LEASE_BUILD_PROOF`] did: a lease-only build is no proof that hints are published under the
+/// lock.
+#[used]
+static HINT_LOCK_BUILD_PROOF: &[u8] = b"agent-ide/hint-publish-lock/proof-1";
+/// Largest executable scanned for a build proof; a larger one is unproven.
 const PROOF_SCAN_LIMIT: u64 = 1 << 30;
 /// Marker naming the worktree (checks) or launch directory (telemetry) of one cache directory.
 pub const MARKER_FILE_NAME: &str = "worktree.path";
@@ -709,6 +715,10 @@ fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
     parts.next().is_none().then_some(version)
 }
 
+/// An executable's identity (device, inode, length, mtime) and which proof was scanned for
+/// (`true`: the hint lock, `false`: the lease protocol).
+type ProofKey = (u64, u64, u64, SystemTime, bool);
+
 /// What a sweeping process knows about itself to classify other `agent-ide` processes.
 #[derive(Debug)]
 struct Identity {
@@ -721,7 +731,7 @@ struct Identity {
     /// When a process started, so a rebuilt file is not mistaken for the code it runs.
     started: fn(i32) -> Option<SystemTime>,
     /// Scan verdicts by executable identity (device, inode, length, mtime): one scan per build.
-    proofs: RefCell<BTreeMap<(u64, u64, u64, SystemTime), bool>>,
+    proofs: RefCell<BTreeMap<ProofKey, bool>>,
 }
 
 /// How the live `agent-ide` processes divide for one sweep.
@@ -777,15 +787,17 @@ impl Identity {
 
     /// Returns the live `agent-ide` processes that may still publish hook key hints without the
     /// directory lock a collection relies on: every one that is not this very executable or a
-    /// proven build of this source (which contains [`LEASE_BUILD_PROOF`], first embedded together
-    /// with that lock). An installed release is proven by its contents like any other file, never
-    /// by its version number, so every release before the lock keeps the collection paused.
+    /// build proven to lock ([`HINT_LOCK_BUILD_PROOF`], embedded only together with that lock; a
+    /// lease-only build proves nothing here). An installed release is proven by its contents like
+    /// any other file, never by its version number, so every release before the lock keeps the
+    /// collection paused.
     fn hint_unsafe(&self, processes: &[Process]) -> Vec<Process> {
         processes
             .iter()
             .filter(|(pid, exe)| {
                 !exe.as_deref().is_some_and(|exe| {
-                    (self.own.is_some() && file_id(exe) == self.own) || self.proven_build(*pid, exe)
+                    (self.own.is_some() && file_id(exe) == self.own)
+                        || self.build_contains(*pid, exe, HINT_LOCK_BUILD_PROOF)
                 })
             })
             .cloned()
@@ -817,6 +829,11 @@ impl Identity {
     /// ponytail: an executable replaced by a file with an older mtime than the process start is
     /// not noticed; the process list offers no inode to compare.
     fn proven_build(&self, pid: i32, exe: &Path) -> bool {
+        self.build_contains(pid, exe, LEASE_BUILD_PROOF)
+    }
+
+    /// [`Self::proven_build`] for the given build proof `needle`.
+    fn build_contains(&self, pid: i32, exe: &Path, needle: &'static [u8]) -> bool {
         let Ok(file) = File::open(exe) else {
             return false;
         };
@@ -829,11 +846,19 @@ impl Identity {
         if !metadata.is_file() || metadata.len() > PROOF_SCAN_LIMIT || modified > started {
             return false;
         }
-        let key = (metadata.dev(), metadata.ino(), metadata.len(), modified);
+        // The cache tells the two proofs apart: a lease-only build never answers for the lock.
+        let lock = needle == HINT_LOCK_BUILD_PROOF;
+        let key = (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            modified,
+            lock,
+        );
         if let Some(proven) = self.proofs.borrow().get(&key) {
             return *proven;
         }
-        let proven = contains_proof(&file);
+        let proven = contains_proof(&file, needle);
         // A rebuild during the scan changed the file or replaced the path: no verdict at all.
         let unchanged = |now: fs::Metadata| {
             (now.dev(), now.ino(), now.len(), now.modified().ok())
@@ -889,10 +914,9 @@ fn process_start(pid: i32) -> Option<SystemTime> {
     })
 }
 
-/// Whether the stream contains [`LEASE_BUILD_PROOF`]; any read error means no.
-fn contains_proof(mut file: &File) -> bool {
+/// Whether the stream contains the build proof `needle`; any read error means no.
+fn contains_proof(mut file: &File, needle: &[u8]) -> bool {
     use std::io::Read as _;
-    let needle = LEASE_BUILD_PROOF;
     let mut buffer = vec![0u8; (1 << 20) + needle.len()];
     let mut kept = 0;
     loop {

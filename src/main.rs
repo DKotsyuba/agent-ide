@@ -1650,7 +1650,7 @@ async fn run_cache(prune: bool) -> ExitCode {
 }
 
 /// Explains why hook key hints cannot be collected now, or is empty when they can: a live
-/// `agent-ide` process that is not a proven build of this source may still refresh a hint without
+/// `agent-ide` process that is not a build proven to lock hint publication may still refresh a hint without
 /// taking the directory lock a collection relies on, so none is collected while one exists.
 fn hint_pause_note() -> String {
     match agent_ide::retention::hint_publishers_unsafe(&agent_ide::retention::process_snapshot) {

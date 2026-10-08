@@ -400,18 +400,29 @@ fn identity_started(home: &Path, started: fn(i32) -> Option<SystemTime>) -> Iden
     }
 }
 
-/// Writes an executable named `agent-ide` below `dir`, with the build proof when `proven`.
-fn fake_build(dir: &Path, proven: bool) -> PathBuf {
+/// Writes an executable named `agent-ide` below `dir` containing each of `proofs`.
+fn fake_build_with(dir: &Path, proofs: &[&[u8]]) -> PathBuf {
     fs::create_dir_all(dir).unwrap();
     let exe = dir.join("agent-ide");
     let mut bytes = vec![0xCFu8; 3 << 20];
-    if proven {
-        // Straddles the first read boundary, as a proof in the middle of a real binary may.
-        let at = (1 << 20) - 7;
-        bytes[at..at + LEASE_BUILD_PROOF.len()].copy_from_slice(LEASE_BUILD_PROOF);
+    for (index, proof) in proofs.iter().enumerate() {
+        // The first straddles the first read boundary, as a proof in the middle of a real binary
+        // may; the rest sit further on.
+        let at = (1 << 20) - 7 + index * (1 << 20);
+        bytes[at..at + proof.len()].copy_from_slice(proof);
     }
     fs::write(&exe, bytes).unwrap();
     exe
+}
+
+/// Writes an executable named `agent-ide` below `dir`; `proven` embeds both build proofs, as
+/// every build of this source does.
+fn fake_build(dir: &Path, proven: bool) -> PathBuf {
+    if proven {
+        fake_build_with(dir, &[LEASE_BUILD_PROOF, HINT_LOCK_BUILD_PROOF])
+    } else {
+        fake_build_with(dir, &[])
+    }
 }
 
 /// A development or test build proven to take leases does not pause eviction, an installed
@@ -934,4 +945,24 @@ fn hint_collection_pauses_for_any_publisher_not_proven_to_lock() {
         Some(vec![1])
     );
     assert_eq!(pids(hint_publishers_unsafe_as(&later, &|| None)), None);
+}
+
+/// A build that has the lease proof but predates the hint lock (a development build between the
+/// two changes) takes leases, yet may publish hints without the directory lock: it is a build for
+/// eviction and an unsafe publisher for hint collection, whichever is asked first.
+#[test]
+fn a_lease_only_build_is_not_a_hint_locking_publisher() {
+    let home = scratch("lease-only");
+    let lease_only = fake_build_with(&home.join("mid/target/debug"), &[LEASE_BUILD_PROOF]);
+    let hint_only = fake_build_with(&home.join("odd/target/debug"), &[HINT_LOCK_BUILD_PROOF]);
+    let later = identity_started(&home, |_| Some(SystemTime::now() + DAY));
+    let processes = vec![(1, Some(lease_only)), (2, Some(hint_only))];
+    let pids = |list: Vec<Process>| list.into_iter().map(|(pid, _)| pid).collect::<Vec<_>>();
+
+    // Either question first: the cache must keep the two proofs apart.
+    assert_eq!(pids(later.hint_unsafe(&processes)), [1]);
+    assert_eq!(pids(later.classify(&processes).builds), [1]);
+    let again = identity_started(&home, |_| Some(SystemTime::now() + DAY));
+    assert_eq!(pids(again.classify(&processes).builds), [1]);
+    assert_eq!(pids(again.hint_unsafe(&processes)), [1]);
 }
