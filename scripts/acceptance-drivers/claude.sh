@@ -277,6 +277,18 @@ verify_l1b() {
     require_transcript_text "$t" "left-python-bad" A_L1B_DIFF_CONTENT || return 1
 }
 
+# Requires one native file edit in a Claude transcript: the Edit, MultiEdit or Write tool, or
+# the shell (Bash). Step 4 allows the shell as well as the Edit tool, like the Codex driver's
+# apply_patch-or-shell check, and recent Claude Code versions pick the shell for a one-line
+# insert; the content checks in verify_l2 prove the file really changed outside the IDE.
+require_claude_native_edit() {
+    count=$(jq -s '[.[] | select(.type == "assistant")
+        | .message.content[]? | select(.type == "tool_use")
+        | select(.name == "Edit" or .name == "MultiEdit" or .name == "Write" or .name == "Bash")]
+        | length' "$1" 2>>"$DIAG_LOG")
+    [ "$count" -ge 1 ] || { note "$2" "expected a native edit (Edit, MultiEdit, Write or Bash) in $(basename -- "$1")"; return 1; }
+}
+
 # Verifies the L2 native fallback and the zero-write stale refusal.
 #
 # A byte-exact compare against a fixed expectation is too strict: the native Edit
@@ -285,7 +297,7 @@ verify_l1b() {
 # prove the same fact without pinning the native tool's exact formatting.
 verify_l2() {
     t=$DIAG_DIR/transcript-l2.jsonl
-    require_tool_use "$t" Edit A_L2_NATIVE_EDIT || return 1
+    require_claude_native_edit "$t" A_L2_NATIVE_EDIT || return 1
     require_transcript_text "$t" "LEFT_FALLBACK_OK" A_L2_FINAL || return 1
     require_transcript_text "$t" "stale_source" A_L2_STALE_OUTCOME || return 1
     left_py=$LEFT/acceptance-fixture/fixture.py
