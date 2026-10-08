@@ -146,7 +146,9 @@ New records:
 - **Refused hook** — a hook the daemon refuses on a channel that already holds a binding writes
   one per-call `hook` warn, `detail` `hook_refused:<cause>`, `correlation` the call id, from the
   one place every refusal exit passes through; on a channel that never bound anything it stays
-  rate-limited bookkeeping. The `claude-hook` process also writes one per-call warn
+  rate-limited bookkeeping. The `claude-hook` process writes one per-call warn
+  `hook_submit_timeout` when its submission outlived its own 250 ms budget (a lost pre; the call it
+  belongs to is then refused `missing_pre`), and one per-call warn
   `hook_cwd_rerouted:<reason>` when a pre paired only through `CLAUDE_PROJECT_DIR` because the
   payload cwd found no rendezvous of the session (QW-8), and `hook_project_dir_invalid` when a
   present `CLAUDE_PROJECT_DIR` cannot be resolved (the pre is then dropped locally).

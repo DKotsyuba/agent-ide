@@ -271,7 +271,10 @@ most one line per detail per ten-minute window, carrying `count=N` of the events
 since the last line (the stateless client keeps its window in a tiny stamp file beside the
 journal, whose content — not its mtime, which every counter update rewrites — carries the
 window start). `warn` and `error` stay reserved for hooks of a session that did activate and
-then fail, and for real ingress failures (`hook_input_*`, `hook_no_cwd`). Large host payloads
+then fail, and for real ingress failures (`hook_input_*`, `hook_no_cwd`): the daemon journals a
+hook it refuses on a channel that already holds a binding per call (`hook_refused:<cause>`), and
+the client journals a submission that outlived its 250 ms budget per call (`hook_submit_timeout`,
+a lost pre). Large host payloads
 no longer drop their event: the hook reads up to 8 MiB on the same deadline and projects the
 payload down to the identity fields the daemon consumes, so a multi-megabyte Read/Write tool
 body is discarded rather than the lifecycle; only a projection that itself exceeds the 64 KiB

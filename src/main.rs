@@ -1857,6 +1857,24 @@ fn claude_hook_route(
     }
 }
 
+/// The closed journal detail of a managed Claude hook whose submission did not reach the daemon.
+///
+/// A submission that outlived the hook's own 250 ms budget (`now` at or past `deadline`) is a lost
+/// pre: the call it belongs to will be refused `missing_pre`, so it gets its own detail,
+/// `hook_submit_timeout`, which is journaled as a per-call warn (QW-4). Any other refusal keeps the
+/// rate-limited bookkeeping detail `hook_submit_refused:unavailable`; the daemon journals a refusal
+/// of a channel that already holds a binding itself, per call.
+fn submit_refusal_detail(
+    now: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+) -> &'static str {
+    if now >= deadline {
+        "hook_submit_timeout"
+    } else {
+        "hook_submit_refused:unavailable"
+    }
+}
+
 /// Window for one client-side hook skip: at most one journal line per detail per ten minutes.
 const HOOK_SKIP_WINDOW: Duration = Duration::from_secs(600);
 
@@ -2057,7 +2075,7 @@ async fn run_managed_claude_hook() {
     )
     .await
     {
-        log("hook_submit_refused:unavailable");
+        log(submit_refusal_detail(tokio::time::Instant::now(), deadline));
     }
 }
 
@@ -3771,6 +3789,26 @@ mod tests {
             assert_eq!(request(&[known]), None, "{known}");
             assert!(USAGE.contains(known), "usage lacks {known}");
         }
+    }
+
+    /// QW-4: a hook submission that outlived its 250 ms budget is a lost pre and is journaled
+    /// per call; any other refusal stays rate-limited bookkeeping.
+    #[test]
+    fn a_submission_past_the_hook_budget_is_a_lost_pre() {
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_millis(250);
+        assert_eq!(
+            submit_refusal_detail(start + Duration::from_millis(10), deadline),
+            "hook_submit_refused:unavailable"
+        );
+        assert_eq!(
+            submit_refusal_detail(deadline, deadline),
+            "hook_submit_timeout"
+        );
+        assert_eq!(
+            submit_refusal_detail(deadline + Duration::from_millis(5), deadline),
+            "hook_submit_timeout"
+        );
     }
 
     /// The reader's `git`-free fallback resolves a repository, a linked worktree and a path inside
