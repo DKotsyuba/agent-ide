@@ -126,7 +126,10 @@ path on that local bundle. The release workflow verifies the tag against the Car
 packaging. The temporary build directory may be removed after installation. Use a new version for
 changed source: the installer never overwrites an existing version with different bytes (source
 builds may pass `self-install --replace` — `scripts/install-local.sh` does — to rebuild a
-same-version release).
+same-version release; it refuses while a live process, a running front or daemon, executes from
+that release directory). A scratch install that names `--home` or `--prefix` without `--bin-dir`
+and `--share-dir` puts the launcher in `<home or prefix>/bin` and the plugin root in
+`<home or prefix>/share/agent-ide`, never in `~/.local`.
 
 For a development install without a release bundle, `scripts/install-local.sh [--prefix DIR]
 [--no-build]` builds this checkout, packages and extracts the sealed bundle, and installs it

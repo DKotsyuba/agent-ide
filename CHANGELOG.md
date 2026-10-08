@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- A long-lived daemon no longer reaches a receipt limit. The 65,536-receipt lifetime cap and its `COUNT(*)` per write are gone: every 64 admissions (and at open) the store retires settled receipts (`committed`, `rolled_back`, `busy`) older than the newest `store.receipt_capacity` admissions into a 16-byte tombstone, one transaction per batch. A replay of a retired operation ID is refused as `ReceiptExpired` (an edit answers `outcome_unknown`), never executed, also after a restart. A queued, started, `outcome_unknown` or unrecognized receipt is never retired and never limits admission. Followup: tombstones are kept forever (16 bytes each) and unresolved receipts are never aged; the durable-store rework owns their retention.
+- `self-install --replace` no longer replaces or deletes a release directory that a live process (a running front or daemon, or the installer itself) executes from: it refuses and names the process, or refuses when the process list is unavailable. A retired copy that is still in use is kept and swept by a later install.
+- A scratch install with `--home` or `--prefix` no longer rewrites the live `~/.local/bin/agent-ide` launcher: without `--bin-dir` and `--share-dir` they follow the scratch root (`<home or prefix>/bin`, `<home or prefix>/share/agent-ide`).
+- `agent-ide cache --help` (and `-h` after any subcommand) prints the usage instead of `invalid daemon response`.
+
 ## 0.10.6 — 2026-10-08
 
 ### Fixed

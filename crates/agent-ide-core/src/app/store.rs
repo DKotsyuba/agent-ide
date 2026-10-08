@@ -446,8 +446,11 @@ impl Store {
     ///
     /// `sql` receives the live [`Transaction`] and must not manually begin, commit, or roll back a
     /// top-level transaction. Its value is delivered only after a commit that atomically includes the
-    /// `Committed` receipt. A duplicate operation returns its prior state without calling `sql`. After
-    /// an accepted timeout, callers must use [`Self::outcome`] and never resubmit this operation ID.
+    /// `Committed` receipt. A duplicate operation returns its prior state without calling `sql`, and an
+    /// ID whose settled receipt was retired behind the replay horizon returns
+    /// [`StoreError::ReceiptExpired`], also without calling `sql`. Unresolved receipts are kept
+    /// indefinitely and keep answering as duplicates. After an accepted timeout, callers must use
+    /// [`Self::outcome`] and never resubmit this operation ID.
     pub async fn execute<T, F>(&self, operation: OperationId, sql: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
@@ -606,8 +609,8 @@ impl Store {
 
     /// Looks up the durable mechanics receipt without replaying domain SQL.
     ///
-    /// Missing, interrupted, or corrupt receipts return `OutcomeUnknown`; that condition does not
-    /// authorize a retry. Lookup is bounded by the same owner queue and request deadline as execute.
+    /// Missing, interrupted, corrupt, or retired (expired) receipts return `OutcomeUnknown`; that
+    /// condition does not authorize a retry. Lookup is bounded by the same owner queue and request deadline as execute.
     pub async fn outcome(&self, operation: OperationId) -> Result<StoreOutcome, StoreError> {
         let (reply_sender, reply_receiver) = oneshot::channel();
         match self.sender.try_send(StoreMessage::Lookup {
