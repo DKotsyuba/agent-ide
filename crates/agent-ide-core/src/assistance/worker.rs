@@ -480,6 +480,19 @@ fn terminal_stage(tool: AssistanceTool, code: &FailureCode) -> String {
     }
 }
 
+/// Binds a freshly activated worktree into the problem feed. A reader borrows the problems a
+/// writer's check produced and schedules no check itself, so it never starts a cold check.
+fn feed_activated(feed: &ProjectProblemFeed, binding: &BindingRef, authority: &AuthorityStamp) {
+    feed.activated_with_denies(
+        binding.fingerprint(),
+        authority.worktree().worktree_path(),
+        authority.worktree().git_common_dir(),
+        false,
+        authority.role() == crate::workspace::authority::StartRole::Reader,
+        Vec::new(),
+    );
+}
+
 /// Shared bounded transport-side bookkeeping; no lock survives an I/O await.
 struct Ledger {
     /// Jobs popped for execution and not yet settled; maintained in the same locked section that
@@ -3265,13 +3278,7 @@ impl<'a> Worker<'a> {
                     },
                     Some(authority),
                 ) if job.tool == AssistanceTool::Start => {
-                    feed.activated_with_denies(
-                        binding.fingerprint(),
-                        authority.worktree().worktree_path(),
-                        authority.worktree().git_common_dir(),
-                        false,
-                        Vec::new(),
-                    );
+                    feed_activated(feed, &binding, authority);
                 }
                 (PeerReply::Edit { result, .. }, _)
                     if result.outcome.has_post_source() && !job.check_scheduled =>
@@ -7872,6 +7879,61 @@ mod stop_retry_tests {
                 .root(&binding.fingerprint())
                 .is_none()
         );
+        scheduler.shutdown().await;
+    }
+
+    /// A reader's start binds the feed without scheduling a check; a writer's start schedules one.
+    #[tokio::test]
+    async fn reader_start_schedules_no_project_check_but_writer_start_does() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("alpha.toml"), "").unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let language = crate::lang::testing::ALPHA;
+        let checker = Arc::new(crate::checks::FakeChecker::new(
+            language,
+            crate::checks::ProblemSnapshot::from_problems(
+                language,
+                crate::checks::CheckState::Ready,
+                Vec::new(),
+                1,
+                0,
+            ),
+        ));
+        let scheduler = crate::checks::scheduler::Scheduler::new(
+            vec![checker.clone()],
+            Duration::from_millis(1),
+            1,
+            fixture.base.join("cache"),
+        );
+        let feed = Arc::new(ProjectProblemFeed::new(
+            scheduler.clone(),
+            vec![fixture.root.clone()],
+            vec![language],
+        ));
+        let (reader, _) = production_start_mode(&mut worker, "reader", "reader-start", true).await;
+        let authority = worker.authority(&reader).await.unwrap();
+        feed_activated(&feed, &reader, &authority);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            checker.requests().is_empty(),
+            "a reader start must not check"
+        );
+        assert!(scheduler.latest(&fixture.root).is_empty());
+
+        let (writer, _) = production_start(&mut worker, "writer", "writer-start").await;
+        let authority = worker.authority(&writer).await.unwrap();
+        feed_activated(&feed, &writer, &authority);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while scheduler.latest(&fixture.root).is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a writer start still schedules the first check");
         scheduler.shutdown().await;
     }
 
