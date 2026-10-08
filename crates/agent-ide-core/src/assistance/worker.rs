@@ -1341,6 +1341,7 @@ impl WorkerHandle {
                 leases: BTreeMap::new(),
                 pending_revocations: std::collections::BTreeSet::new(),
                 stop_cause: None,
+                store_cause: std::sync::Mutex::new(None),
                 stop_attempts: Arc::default(),
                 revoke_retry_rounds: 0,
                 next_revoke_retry: None,
@@ -2109,6 +2110,11 @@ struct Worker<'a> {
     /// Typed cause of the last failed durable stop (`stop:busy`, `stop:store_full`, ...), taken by
     /// the stop job to name its failure instead of a generic authority error.
     stop_cause: Option<&'static str>,
+    /// Typed cause of the last store failure outside stop (`store:busy`, `store:store_full`,
+    /// `store:store_deadline`), taken by the job that failed with it so its reply names the store
+    /// instead of a generic authority or source refusal (QW-6). Behind a mutex because the
+    /// authority check runs on `&self`.
+    store_cause: std::sync::Mutex<Option<&'static str>>,
     /// Durable revoke attempts this worker has started, across all stops; read by tests that
     /// release a held store lock only once the daemon's own retry began.
     stop_attempts: Arc<std::sync::atomic::AtomicUsize>,
@@ -2768,6 +2774,10 @@ impl<'a> Worker<'a> {
         } else {
             None
         };
+        *self
+            .store_cause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let result = if let Some(code) = reader_refusal {
             Err(code)
         } else if job.tool == AssistanceTool::Stop {
@@ -2838,7 +2848,16 @@ impl<'a> Worker<'a> {
             Ok(result) => result,
             Err(code) => {
                 // Every terminal failure names its stage: the failing path's own tag when it set
-                // one, else the derived `<tool>:<reason>` default — never a bare reason.
+                // one, else the typed store cause of a store failure, else the derived
+                // `<tool>:<reason>` default — never a bare reason.
+                if job.failure_detail.is_none() {
+                    job.failure_detail = self
+                        .store_cause
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                        .map(str::to_owned);
+                }
                 if job.failure_detail.is_none() {
                     job.failure_detail =
                         Some(crate::telemetry::adapters::default_stage(job.tool, &code));
@@ -3713,7 +3732,34 @@ impl<'a> Worker<'a> {
         self.workspace
             .authority(receipt, &active)
             .await
-            .map_err(|_| FailureCode::WorkspaceAuthority)
+            .map_err(|error| match &error {
+                crate::workspace::durable::DurableError::Application(error) => {
+                    self.note_store_failure(error, FailureCode::WorkspaceAuthority)
+                }
+                _ => FailureCode::WorkspaceAuthority,
+            })
+    }
+
+    /// Maps a store failure outside stop to its typed code and remembers the closed cause for the
+    /// failing job's reply and journal (QW-6); any other failure keeps `default`.
+    ///
+    /// Busy, locked or full queue: `capacity` / `store:busy`; receipt store full: `capacity` /
+    /// `store:store_full`; wait expired with the outcome unknown: `deadline` /
+    /// `store:store_deadline`. The cause is overwritten by a later failure and cleared when the
+    /// next job starts.
+    fn note_store_failure(
+        &self,
+        error: &crate::app::store::StoreError,
+        default: FailureCode,
+    ) -> FailureCode {
+        let Some((code, cause)) = store_failure(error) else {
+            return default;
+        };
+        *self
+            .store_cause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cause);
+        code
     }
 
     /// Reads and persists one registered file under fresh durable authority, preserving missing
@@ -3810,12 +3856,22 @@ impl<'a> Worker<'a> {
         self.workspace
             .authorize(&authority, &active)
             .await
-            .map_err(|_| FailureCode::WorkspaceAuthority)?;
+            .map_err(|error| match &error {
+                crate::workspace::durable::DurableError::Application(error) => {
+                    self.note_store_failure(error, FailureCode::WorkspaceAuthority)
+                }
+                _ => FailureCode::WorkspaceAuthority,
+            })?;
         let ObservationAdmission::Recorded(observed) = self
             .observations
             .record(draft)
             .await
-            .map_err(|_| FailureCode::SourceUnavailable)?
+            .map_err(|error| match &error {
+                crate::workspace::store::WorkspaceStoreError::Application(error) => {
+                    self.note_store_failure(error, FailureCode::SourceUnavailable)
+                }
+                _ => FailureCode::SourceUnavailable,
+            })?
         else {
             return Err(FailureCode::SourceUnavailable);
         };
@@ -6133,6 +6189,24 @@ fn is_transient_stop_failure(error: &crate::workspace::durable::DurableError) ->
     }
 }
 
+/// Maps a store failure outside stop to its failure code and typed `store:` cause, or `None` when
+/// the failure is not a store capacity or timing problem (QW-6; the stop family is
+/// [`stop_failure`]).
+///
+/// Busy, locked or full queue: `capacity` / `store:busy`. Receipt store full: `capacity` /
+/// `store:store_full`. Wait expired with the outcome unknown: `deadline` /
+/// `store:store_deadline`.
+fn store_failure(error: &crate::app::store::StoreError) -> Option<(FailureCode, &'static str)> {
+    use crate::app::store::StoreError;
+    match error {
+        StoreError::Busy | StoreError::QueueFull => Some((FailureCode::Capacity, "store:busy")),
+        StoreError::ReceiptCapacityExhausted => Some((FailureCode::Capacity, "store:store_full")),
+        StoreError::OutcomeUnknown { .. } => Some((FailureCode::Deadline, "store:store_deadline")),
+        error if is_locked_store(error) => Some((FailureCode::Capacity, "store:busy")),
+        _ => None,
+    }
+}
+
 /// Maps one durable stop failure to its failure code and typed `stop:` cause, so a store
 /// problem is never reported as an authority problem (F-12).
 ///
@@ -7667,6 +7741,7 @@ mod stop_retry_tests {
             leases: BTreeMap::new(),
             pending_revocations: std::collections::BTreeSet::new(),
             stop_cause: None,
+            store_cause: std::sync::Mutex::new(None),
             stop_attempts: Arc::default(),
             revoke_retry_rounds: 0,
             next_revoke_retry: None,
@@ -8719,6 +8794,68 @@ mod stop_retry_tests {
             assert_eq!(stop_failure(&error), expected, "{error:?}");
             assert_eq!(is_transient_stop_failure(&error), transient, "{error:?}");
         }
+    }
+
+    /// QW-6: a store failure outside stop maps to a typed `store:` cause and a capacity or
+    /// deadline code; anything else keeps the caller's default.
+    #[test]
+    fn store_failures_outside_stop_are_typed() {
+        use crate::app::store::StoreError;
+        let cases = [
+            (
+                StoreError::Busy,
+                Some((FailureCode::Capacity, "store:busy")),
+            ),
+            (
+                StoreError::QueueFull,
+                Some((FailureCode::Capacity, "store:busy")),
+            ),
+            (
+                StoreError::Infrastructure("database is locked".to_owned()),
+                Some((FailureCode::Capacity, "store:busy")),
+            ),
+            (
+                StoreError::ReceiptCapacityExhausted,
+                Some((FailureCode::Capacity, "store:store_full")),
+            ),
+            (
+                StoreError::Infrastructure("disk I/O error".to_owned()),
+                None,
+            ),
+            (StoreError::Unavailable, None),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(store_failure(&error), expected, "{error:?}");
+        }
+    }
+
+    /// QW-6: a read whose observation cannot be recorded because the store is busy fails with
+    /// `capacity` and the cause `store:busy`, not a generic `source_unavailable`.
+    #[tokio::test]
+    async fn busy_store_names_its_cause_when_an_observation_is_recorded() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        workspace
+            .resolve_worktree(
+                fixture.root.clone(),
+                fixture.root.clone(),
+                std::path::PathBuf::from(".git"),
+            )
+            .await
+            .unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        let (binding, _) = production_start(&mut worker, "actor-1", "call-1").await;
+        let lock = rusqlite::Connection::open(fixture.base.join("state.sqlite")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let outcome = worker
+            .observe(&binding, std::path::PathBuf::from("src/lib.rs"))
+            .await;
+        assert!(
+            matches!(outcome, Err(FailureCode::Capacity)),
+            "a busy store is a capacity cause, not an unreadable source: {outcome:?}"
+        );
+        assert_eq!(*worker.store_cause.lock().unwrap(), Some("store:busy"));
     }
 
     #[tokio::test]

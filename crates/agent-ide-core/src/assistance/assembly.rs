@@ -55,6 +55,30 @@ pub struct ProductDispatcher {
     pre_attachments: Mutex<std::collections::BTreeMap<(String, String), String>>,
 }
 
+/// Names the closed host-binding cause of an ingress step that failed (QW-6), so no early exit of
+/// the dispatcher answers a bare `unavailable: host_binding`.
+trait OrCause<T> {
+    /// Keeps the success value, or fails with `cause`.
+    fn or_cause(self, cause: HostBindingCause) -> Result<T, HostBindingCause>;
+}
+
+impl<T> OrCause<T> for Option<T> {
+    fn or_cause(self, cause: HostBindingCause) -> Result<T, HostBindingCause> {
+        self.ok_or(cause)
+    }
+}
+
+impl<T, E> OrCause<T> for Result<T, E> {
+    fn or_cause(self, cause: HostBindingCause) -> Result<T, HostBindingCause> {
+        self.map_err(|_| cause)
+    }
+}
+
+/// The closed cause a guard refusal is reported with.
+fn binding_cause(reason: super::host_binding::BindingUnavailable) -> HostBindingCause {
+    HostBindingCause::from_binding(reason).unwrap_or(HostBindingCause::InvalidMetadata)
+}
+
 /// Most actor tags one `claudecode/recover` announcement may carry.
 const MAX_RECOVER_TAGS: usize = 32;
 
@@ -520,7 +544,7 @@ impl ProductDispatcher {
         request: &AssistanceDispatch,
         status: &mut Option<String>,
     ) -> Option<PeerReply> {
-        self.handle_tagged(request, status, &mut None).await
+        self.handle_tagged(request, status, &mut None).await.ok()
     }
 
     /// [`Self::handle`], additionally writing `tag` with the private actor tag a current managed
@@ -530,12 +554,15 @@ impl ProductDispatcher {
         request: &AssistanceDispatch,
         status: &mut Option<String>,
         tag: &mut Option<String>,
-    ) -> Option<PeerReply> {
+    ) -> Result<PeerReply, HostBindingCause> {
         match request {
             AssistanceDispatch::HookSubmit(hook) => {
                 let observation: Value =
-                    serde_json::from_str(hook.sanitized_observation_json().as_str()).ok()?;
-                let object = observation.as_object()?;
+                    serde_json::from_str(hook.sanitized_observation_json().as_str())
+                        .or_cause(HostBindingCause::InvalidMetadata)?;
+                let object = observation
+                    .as_object()
+                    .or_cause(HostBindingCause::InvalidMetadata)?;
                 if self
                     .worker
                     .as_ref()
@@ -546,7 +573,7 @@ impl ProductDispatcher {
                     if let Some(host) = observed_host(object) {
                         log_hook_inactive(&self.hook_noise, host);
                     }
-                    return None;
+                    return Err(HostBindingCause::InvalidAttachment);
                 }
                 // Six fixed relayed fields plus the optional post-phase `tool_name` and the
                 // writer tool's optional `tool_file` (the changed file whose language alone is
@@ -566,17 +593,22 @@ impl ProductDispatcher {
                 .filter(|field| object.contains_key(**field))
                 .count();
                 if relayed != object.len() {
-                    return None;
+                    return Err(HostBindingCause::InvalidMetadata);
                 }
-                let phase = match object.get("phase")?.as_str()? {
+                let phase = match object
+                    .get("phase")
+                    .and_then(Value::as_str)
+                    .or_cause(HostBindingCause::MissingField)?
+                {
                     "pre" => "PreToolUse",
                     "post" => "PostToolUse",
                     "post_failure" => "PostToolUseFailure",
                     "permission_denied" => "PermissionDenied",
                     "post_batch" => "PostToolBatch",
-                    _ => return None,
+                    _ => return Err(HostBindingCause::UnsupportedHookPhase),
                 };
-                let event = match object.get("host")?.as_str()? {
+                let event = (|| {
+                    Some(match object.get("host")?.as_str()? {
                     "codex" => parse_hook_event(
                         json!({"hook_event_name":phase,"session_id":object.get("session_id")?,"agent_id":(object.get("actor_id")? != object.get("session_id")?).then_some(object.get("actor_id")?),"tool_use_id":object.get("call_id")?,"tool_name":object.get("tool_name")})
                             .to_string().as_bytes(),
@@ -586,12 +618,16 @@ impl ProductDispatcher {
                             .to_string().as_bytes(),
                     ),
                     _ => return None,
-                }
-                .ok()?;
+                    })
+                })()
+                .or_cause(HostBindingCause::MissingField)?
+                .map_err(binding_cause)?;
                 if event.optional_call_id().unwrap_or("post-tool-batch") != hook.correlation_id() {
-                    return None;
+                    return Err(HostBindingCause::Mismatch);
                 }
-                let channel = self.channel(hook.opaque_attachment())?;
+                let channel = self
+                    .channel(hook.opaque_attachment())
+                    .or_cause(HostBindingCause::InvalidAttachment)?;
                 let call_id = event.optional_call_id().map(str::to_owned);
                 // EYES-r2 §5/§6: a hook-delivering host's paired native post both triggers a
                 // project check (`triggers_check` is host-specific; T29B §4) and evaluates the
@@ -619,8 +655,14 @@ impl ProductDispatcher {
                     // Recorded under both locks (map, then guard) together with the observation
                     // itself, so no concurrent prune can drop a record whose pre is about to be
                     // pending: a pending managed Claude pre always has its attachment record.
-                    let mut recorded = self.pre_attachments.lock().ok()?;
-                    let mut bindings = self.bindings.lock().ok()?;
+                    let mut recorded = self
+                        .pre_attachments
+                        .lock()
+                        .or_cause(HostBindingCause::InternalLock)?;
+                    let mut bindings = self
+                        .bindings
+                        .lock()
+                        .or_cause(HostBindingCause::InternalLock)?;
                     if self.shared_claude_channel
                         && event.host() == HostKind::Claude
                         && event.phase() == HookPhase::Pre
@@ -639,7 +681,7 @@ impl ProductDispatcher {
                     bindings.observe_hook(event.clone(), channel.clone())
                 };
                 match status {
-                    BindingStatus::PreObserved => Some(PeerReply::HookObserved {}),
+                    BindingStatus::PreObserved => Ok(PeerReply::HookObserved {}),
                     BindingStatus::Settled(binding) => {
                         // Settlement itself stays silent and never rechecks; but the settled MCP
                         // call may just have completed an activation or a check, so a due status
@@ -659,9 +701,9 @@ impl ProductDispatcher {
                                 |plate| plate.len() <= super::reply::MAX_FEEDBACK_BYTES,
                             )
                         {
-                            return Some(PeerReply::Feedback { text: block });
+                            return Ok(PeerReply::Feedback { text: block });
                         }
-                        Some(PeerReply::HookSettled {})
+                        Ok(PeerReply::HookSettled {})
                     }
                     BindingStatus::NativeObserved(binding) => {
                         if let Some(worker) = &self.worker {
@@ -713,10 +755,10 @@ impl ProductDispatcher {
                                 (block, feedback) => block.or(feedback),
                             };
                             if let Some(text) = text {
-                                return Some(PeerReply::Feedback { text });
+                                return Ok(PeerReply::Feedback { text });
                             }
                         }
-                        Some(PeerReply::NativeHookObserved {})
+                        Ok(PeerReply::NativeHookObserved {})
                     }
                     _ => {
                         // A hook that cannot correlate for a channel that never activated is
@@ -728,18 +770,24 @@ impl ProductDispatcher {
                         {
                             log_hook_inactive(&self.hook_noise, event.host());
                         }
-                        None
+                        Err(HostBindingCause::Mismatch)
                     }
                 }
             }
             AssistanceDispatch::MethodDispatch(method) => {
-                let envelope: Value = serde_json::from_str(method.params_json().as_str()).ok()?;
-                let object = envelope.as_object()?;
+                let envelope: Value = serde_json::from_str(method.params_json().as_str())
+                    .or_cause(HostBindingCause::InvalidMetadata)?;
+                let object = envelope
+                    .as_object()
+                    .or_cause(HostBindingCause::InvalidMetadata)?;
                 if object.len() != 2 {
-                    return None;
+                    return Err(HostBindingCause::InvalidMetadata);
                 }
-                let meta = object.get("host_meta")?.as_object()?;
-                let host = parse_host_kind(meta).ok()?;
+                let meta = object
+                    .get("host_meta")
+                    .and_then(Value::as_object)
+                    .or_cause(HostBindingCause::MissingField)?;
+                let host = parse_host_kind(meta).map_err(binding_cause)?;
                 let tool = match method.method() {
                     AssistanceMethod::Start => super::facade::AssistanceTool::Start,
                     AssistanceMethod::Context => super::facade::AssistanceTool::Context,
@@ -752,10 +800,16 @@ impl ProductDispatcher {
                     AssistanceMethod::Symbol => super::facade::AssistanceTool::Symbol,
                     AssistanceMethod::Graph => super::facade::AssistanceTool::Graph,
                     AssistanceMethod::Test => super::facade::AssistanceTool::Test,
-                    AssistanceMethod::HookSubmit => return None,
+                    AssistanceMethod::HookSubmit => return Err(HostBindingCause::InvalidMetadata),
                 };
-                let call =
-                    super::facade::validate_call(tool, object.get("parameters")?.clone()).ok()?;
+                let call = super::facade::validate_call(
+                    tool,
+                    object
+                        .get("parameters")
+                        .or_cause(HostBindingCause::InvalidParameters)?
+                        .clone(),
+                )
+                .or_cause(HostBindingCause::InvalidParameters)?;
                 if self
                     .worker
                     .as_ref()
@@ -763,12 +817,14 @@ impl ProductDispatcher {
                 {
                     // This daemon never registered the calling attachment, so it has also never
                     // received a hook on its channel (T15B).
-                    return Some(PeerReply::Unavailable {
+                    return Ok(PeerReply::Unavailable {
                         reason: MissingPeer::HostBinding,
                         cause: Some(HostBindingCause::HooksNotDelivered),
                     });
                 }
-                let channel = self.channel(method.opaque_attachment())?;
+                let channel = self
+                    .channel(method.opaque_attachment())
+                    .or_cause(HostBindingCause::InvalidAttachment)?;
                 // Trusted re-activation ingress (T15B restart recovery): the managed Claude MCP
                 // marks the start that re-runs a remembered activation after the daemon it had
                 // activated on was replaced. The marker rides host metadata, never model
@@ -821,7 +877,7 @@ impl ProductDispatcher {
                     Some(tags) => match actor_tags(tags) {
                         Some(tags) => Some(tags),
                         None => {
-                            return Some(PeerReply::Unavailable {
+                            return Ok(PeerReply::Unavailable {
                                 reason: MissingPeer::HostBinding,
                                 cause: Some(HostBindingCause::InvalidMetadata),
                             });
@@ -858,14 +914,18 @@ impl ProductDispatcher {
                     }
                 }
                 if let Some(real) = whois {
-                    let owner = self.bindings.lock().ok()?.claude_pre_owner(real, &channel);
+                    let owner = self
+                        .bindings
+                        .lock()
+                        .or_cause(HostBindingCause::InternalLock)?
+                        .claude_pre_owner(real, &channel);
                     *tag = Some(
                         owner
                             .as_deref()
                             .map(super::host_binding::actor_tag)
                             .unwrap_or_default(),
                     );
-                    return Some(PeerReply::Unavailable {
+                    return Ok(PeerReply::Unavailable {
                         reason: MissingPeer::HostBinding,
                         cause: owner.err().and_then(HostBindingCause::from_binding),
                     });
@@ -878,7 +938,10 @@ impl ProductDispatcher {
                         AssistanceMethod::Start | AssistanceMethod::Stop
                     )
                 {
-                    let bindings = self.bindings.lock().ok()?;
+                    let bindings = self
+                        .bindings
+                        .lock()
+                        .or_cause(HostBindingCause::InternalLock)?;
                     if let Some(actor) =
                         bindings.claude_pre_actor(method.correlation_id(), &channel)
                         && bindings.claude_never_bound(&actor, &channel)
@@ -888,7 +951,7 @@ impl ProductDispatcher {
                             .is_some_and(|tags| tags.contains(&actor.as_str()))
                     {
                         *tag = Some(actor);
-                        return Some(PeerReply::Unavailable {
+                        return Ok(PeerReply::Unavailable {
                             reason: MissingPeer::HostBinding,
                             cause: Some(HostBindingCause::RecoveryNeeded),
                         });
@@ -915,7 +978,7 @@ impl ProductDispatcher {
                         .as_deref()
                         != Some(expected)
                 {
-                    return Some(mismatch);
+                    return Ok(mismatch);
                 }
                 // A start activates the worktree its own pre arrived through (managed Claude);
                 // every other call, and every other daemon, keeps the calling attachment. The
@@ -929,7 +992,7 @@ impl ProductDispatcher {
                     {
                         self.bindings
                             .lock()
-                            .ok()?
+                            .or_cause(HostBindingCause::InternalLock)?
                             .claude_pre_actor(method.correlation_id(), &channel)
                     }
                     _ => None,
@@ -959,7 +1022,7 @@ impl ProductDispatcher {
                         .as_ref()
                         .is_none_or(|worker| worker.target(attachment).is_some())
                 }) else {
-                    return Some(PeerReply::Error {
+                    return Ok(PeerReply::Error {
                         code: super::reply::FailureCode::LauncherConfiguration,
                         detail: None,
                     });
@@ -977,7 +1040,10 @@ impl ProductDispatcher {
                         && invocation.binding_ref() == &invocation.binding_ref().channel_identity()
                 };
                 let invocation = {
-                    let mut bindings = self.bindings.lock().ok()?;
+                    let mut bindings = self
+                        .bindings
+                        .lock()
+                        .or_cause(HostBindingCause::InternalLock)?;
                     if let Some(expected) = expected
                         && !reactivation
                         && bindings
@@ -987,7 +1053,7 @@ impl ProductDispatcher {
                             .as_deref()
                             != Some(expected)
                     {
-                        return Some(mismatch);
+                        return Ok(mismatch);
                     }
                     // This exact call's own genuine pre is hook evidence too, even once the
                     // guard below consumes it: a refusal then names the missing binding, never
@@ -1003,13 +1069,13 @@ impl ProductDispatcher {
                             .as_ref()
                             != Some(actor)
                     {
-                        return Some(mismatch);
+                        return Ok(mismatch);
                     }
                     let status = match host {
                         HostKind::Codex => {
-                            let candidate = parse_candidate(meta).ok()?;
+                            let candidate = parse_candidate(meta).map_err(binding_cause)?;
                             if candidate.call_id() != method.correlation_id() {
-                                return None;
+                                return Err(HostBindingCause::Mismatch);
                             }
                             if self.managed_codex && method.method() == AssistanceMethod::Start {
                                 bindings.establish_managed_codex_start(candidate, channel.clone())
@@ -1027,9 +1093,9 @@ impl ProductDispatcher {
                             }
                         }
                         HostKind::Claude => {
-                            let call_id = parse_claude_call_id(meta).ok()?;
+                            let call_id = parse_claude_call_id(meta).map_err(binding_cause)?;
                             if call_id != method.correlation_id() {
-                                return None;
+                                return Err(HostBindingCause::Mismatch);
                             }
                             if method.method() == AssistanceMethod::Start && reactivation {
                                 match reactivation_actor.clone() {
@@ -1060,7 +1126,7 @@ impl ProductDispatcher {
                             let hooks_delivered =
                                 own_pre || bindings.channel_observed_hook(&channel);
                             drop(bindings);
-                            return Some(PeerReply::Unavailable {
+                            return Ok(PeerReply::Unavailable {
                                 reason: MissingPeer::HostBinding,
                                 cause: host_binding_cause(
                                     self.worker.as_ref(),
@@ -1070,12 +1136,16 @@ impl ProductDispatcher {
                                 ),
                             });
                         }
-                        return None;
+                        return Err(HostBindingCause::Mismatch);
                     };
                     if method.method() == AssistanceMethod::Stop {
-                        bindings.stop_binding(invocation.binding_ref()).ok()?;
+                        bindings
+                            .stop_binding(invocation.binding_ref())
+                            .map_err(binding_cause)?;
                     } else if !stopped(&invocation) {
-                        bindings.consume_active(invocation.binding_ref()).ok()?;
+                        bindings
+                            .consume_active(invocation.binding_ref())
+                            .map_err(binding_cause)?;
                     }
                     invocation
                 };
@@ -1083,12 +1153,12 @@ impl ProductDispatcher {
                 // and touches no worktree state, like `ide.stop`'s own.
                 let stopped = stopped(&invocation);
                 let Some(worker) = &self.worker else {
-                    return Some(if method.method() == AssistanceMethod::Stop {
+                    return Ok(if method.method() == AssistanceMethod::Stop {
                         PeerReply::HostStopped {}
                     } else {
                         PeerReply::Unavailable {
                             reason: MissingPeer::WorkspaceActivation,
-                            cause: None,
+                            cause: Some(HostBindingCause::WorkerUnavailable),
                         }
                     });
                 };
@@ -1122,7 +1192,10 @@ impl ProductDispatcher {
                         worker
                             .inspect(
                                 invocation.binding_ref().clone(),
-                                call.parameters()["detail_ref"].as_str()?.to_owned(),
+                                call.parameters()["detail_ref"]
+                                    .as_str()
+                                    .or_cause(HostBindingCause::InvalidParameters)?
+                                    .to_owned(),
                                 method.opaque_attachment(),
                                 None,
                             )
@@ -1193,7 +1266,7 @@ impl ProductDispatcher {
                         });
                     }
                 }
-                Some(reply)
+                Ok(reply)
             }
         }
     }
@@ -1271,9 +1344,9 @@ impl AssistanceDispatcher for ProductDispatcher {
             let mut result = self
                 .handle_tagged(&request, &mut status, &mut tag)
                 .await
-                .unwrap_or(PeerReply::Unavailable {
+                .unwrap_or_else(|cause| PeerReply::Unavailable {
                     reason: MissingPeer::HostBinding,
-                    cause: None,
+                    cause: Some(cause),
                 });
             // Hook payloads are intentionally never accepted by telemetry adapters or the log.
             if let AssistanceDispatch::MethodDispatch(method) = &request {
@@ -1448,6 +1521,83 @@ async fn host_shaped_mixed_metadata_is_unavailable_at_daemon_ingress() {
     assert_eq!(dispatcher.handle(&request, &mut None).await, None);
 }
 
+/// QW-6: no early exit of the dispatcher answers a bare `unavailable: host_binding`; each names
+/// its closed cause (malformed envelope, invalid parameters, unknown hook phase, mismatched call).
+#[tokio::test]
+async fn ingress_exits_name_a_typed_cause() {
+    use crate::app::transport::{HookSubmit, MethodDispatch, OpaqueJson};
+
+    let dispatcher = ProductDispatcher::default();
+    let method = |params: Value, name: AssistanceMethod| {
+        AssistanceDispatch::MethodDispatch(
+            MethodDispatch::new(
+                "request",
+                "call",
+                "attachment",
+                name,
+                OpaqueJson::from_value(&params, 64 * 1024).unwrap(),
+            )
+            .unwrap(),
+        )
+    };
+    let cause_of = |request: AssistanceDispatch| {
+        let dispatcher = &dispatcher;
+        async move {
+            let mut status = None;
+            dispatcher
+                .handle_tagged(&request, &mut status, &mut None)
+                .await
+        }
+    };
+    // Envelope with a stray key: invalid metadata.
+    assert_eq!(
+        cause_of(method(
+            json!({"parameters":{},"host_meta":{},"extra":1}),
+            AssistanceMethod::Context
+        ))
+        .await,
+        Err(HostBindingCause::InvalidMetadata)
+    );
+    // No `host_meta` object: a missing field.
+    assert_eq!(
+        cause_of(method(
+            json!({"parameters":{},"x":1}),
+            AssistanceMethod::Context
+        ))
+        .await,
+        Err(HostBindingCause::MissingField)
+    );
+    // A hook with an unsupported phase.
+    let hook = |phase: &str| {
+        AssistanceDispatch::HookSubmit(
+            HookSubmit::new(
+                "request",
+                "call",
+                "attachment",
+                OpaqueJson::from_value(
+                    &json!({"host":"claude","phase":phase,"actor_id":"s","call_id":"call","session_id":"s","agent_type":null}),
+                    64 * 1024,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+    };
+    assert_eq!(
+        cause_of(hook("bogus")).await,
+        Err(HostBindingCause::UnsupportedHookPhase)
+    );
+    // Valid envelope, but parameters the daemon's validator rejects: invalid parameters.
+    assert_eq!(
+        cause_of(method(
+            json!({"parameters":{"nope":1},"host_meta":{"claudecode/toolUseId":"call"}}),
+            AssistanceMethod::Read
+        ))
+        .await,
+        Err(HostBindingCause::InvalidParameters)
+    );
+}
+
 /// An anonymous (0.10.2-slot) re-activation names the real call and binds its actor only when
 /// that call's pre came through the calling front's own attachment: a subagent's pending start
 /// that arrived through another attachment never lends its actor to the slot.
@@ -1513,7 +1663,7 @@ async fn anonymous_reactivation_binds_only_its_own_attachments_named_call() {
             .await,
         Some(PeerReply::Unavailable {
             reason: MissingPeer::WorkspaceActivation,
-            cause: None,
+            cause: Some(HostBindingCause::WorkerUnavailable),
         })
     );
 }
@@ -1567,7 +1717,7 @@ async fn claude_start_without_worker_is_unavailable_after_correlation() {
         dispatcher.handle(&method, &mut None).await,
         Some(PeerReply::Unavailable {
             reason: MissingPeer::WorkspaceActivation,
-            cause: None
+            cause: Some(HostBindingCause::WorkerUnavailable)
         })
     );
 
@@ -1614,7 +1764,7 @@ async fn claude_start_without_worker_is_unavailable_after_correlation() {
         dispatcher.handle(&next_method, &mut None).await,
         Some(PeerReply::Unavailable {
             reason: MissingPeer::WorkspaceActivation,
-            cause: None
+            cause: Some(HostBindingCause::WorkerUnavailable)
         })
     );
 }

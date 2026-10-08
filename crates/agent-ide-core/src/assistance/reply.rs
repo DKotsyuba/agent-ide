@@ -70,6 +70,13 @@ pub enum HostBindingCause {
     CapacityExceeded,
     /// The caller's `_meta` names no supported host contract, so no invocation can correlate.
     HostUnrecognized,
+    /// The call's parameters or envelope did not validate on this daemon (a newer front's
+    /// parameter an older daemon rejects included).
+    InvalidParameters,
+    /// A daemon lock was poisoned by an earlier fault, so the call could not be bound.
+    InternalLock,
+    /// The daemon has no worker, so no workspace operation can run.
+    WorkerUnavailable,
     /// `ide.start {root}` named a directory other than the session's bound project.
     ProjectMoved {
         /// Home-shortened bounded path the session is currently bound to.
@@ -143,6 +150,9 @@ impl HostBindingCause {
             Self::RecoveryNeeded => "recovery_needed".to_owned(),
             Self::CapacityExceeded => "capacity_exceeded".to_owned(),
             Self::HostUnrecognized => "host_unrecognized".to_owned(),
+            Self::InvalidParameters => "invalid_parameters".to_owned(),
+            Self::InternalLock => "internal_lock".to_owned(),
+            Self::WorkerUnavailable => "worker_unavailable".to_owned(),
             Self::ProjectMoved { bound, asked } => {
                 format!("project_moved: bound to {bound}, asked {asked}")
             }
