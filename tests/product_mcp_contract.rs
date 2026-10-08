@@ -4113,10 +4113,11 @@ async fn managed_codex_transient_transport_timeout_keeps_daemon_and_binding() {
     mcp.close().await;
 }
 
-/// Waits until the runtime's lock file names a live process other than `old`, i.e. until a
-/// replacement daemon holds the runtime, and returns its pid.
+/// Waits until the runtime's lock file names a live process other than `old` that also answers
+/// health `ok`, i.e. until a replacement daemon serves the runtime, and returns its pid.
 ///
-/// The lock records its holder's pid, so no `lsof` race with the instant the lock is free.
+/// The lock records its holder's pid (published before startup completes, hence the health check),
+/// so there is no `lsof` race with the instant the lock is free.
 async fn replacement_daemon_pid(runtime: &Path, old: libc::pid_t, bound: Duration) -> libc::pid_t {
     tokio::time::timeout(bound, async {
         loop {
@@ -4126,6 +4127,8 @@ async fn replacement_daemon_pid(runtime: &Path, old: libc::pid_t, bound: Duratio
             if let Some(pid) = pid
                 && pid != old
                 && unsafe { libc::kill(pid, 0) } == 0
+                && agent_ide::app::probe_health(runtime).await
+                    == agent_ide::app::HealthProbe::Healthy
             {
                 return pid;
             }
