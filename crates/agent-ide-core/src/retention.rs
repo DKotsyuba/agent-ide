@@ -46,9 +46,8 @@ const LEGACY_BOUNDARY: (u64, u64, u64) = (0, 9, 1);
 #[used]
 static LEASE_BUILD_PROOF: &[u8] = b"agent-ide/worktree-lease-protocol/proof-1";
 /// Present only in executables whose Claude hook key hint publishers take the directory lock a
-/// collection relies on (`hook_hints::PublishGuard`), which first shipped after
-/// [`LEASE_BUILD_PROOF`] did: a lease-only build is no proof that hints are published under the
-/// lock.
+/// collection relies on (`hook_hints::PublishGuard`), which was introduced after
+/// [`LEASE_BUILD_PROOF`]: a lease-only build is no proof that hints are published under the lock.
 #[used]
 static HINT_LOCK_BUILD_PROOF: &[u8] = b"agent-ide/hint-publish-lock/proof-1";
 /// Largest executable scanned for a build proof; a larger one is unproven.
@@ -832,7 +831,8 @@ impl Identity {
         self.build_contains(pid, exe, LEASE_BUILD_PROOF)
     }
 
-    /// [`Self::proven_build`] for the given build proof `needle`.
+    /// [`Self::proven_build`] for the build proof `needle`, which must be [`LEASE_BUILD_PROOF`] or
+    /// [`HINT_LOCK_BUILD_PROOF`]: the proof cache tells exactly those two kinds apart.
     fn build_contains(&self, pid: i32, exe: &Path, needle: &'static [u8]) -> bool {
         let Ok(file) = File::open(exe) else {
             return false;
