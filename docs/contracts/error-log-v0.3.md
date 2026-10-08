@@ -76,6 +76,11 @@ is one line. The daemon is then marked failed and exits crash-only. Other caught
 are journaled by containment as `daemon fatal`, reason `internal`, with the closed cause and panic
 location. The report alerts from either original panic record, even when nobody inspects the job;
 the separate `job_panic` daemon-fatal line never duplicates the consumed panic evidence.
+Panic alerts accept only `failed` tool or daemon records whose detail starts with `panic at `,
+or `daemon fatal` records whose detail starts with a closed containment cause followed by
+`: panic at `. The actual causes are `worker_panic`, `worker_ended`, `inspection_panic`,
+`inspection_ended` and `job_panic` (a worker-construction panic uses `worker_panic`). A filename
+mentioning this text elsewhere in an observation-failure detail is never panic evidence.
 
 Every typed tool reply leaving the dispatcher is logged once from the dispatcher itself
 (`adapters::log_tool_reply`), independently of whether the durable telemetry sink is available:

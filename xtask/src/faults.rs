@@ -508,13 +508,33 @@ impl Report {
     }
 
     /// Counts daemon, client and hook lifecycle facts and panic evidence from any job, even
-    /// when nobody collected its result. These events never add a terminal tool call.
+    /// when nobody collected its result. Panic evidence must match the hook/job failure prefix
+    /// or a closed containment cause followed by that prefix; filenames in other failure details
+    /// never count. These events never add a terminal tool call.
     fn lifecycle_line(&mut self, record: &Value) {
         let detail = text(record, "detail");
-        if detail.contains("panic at") {
+        let method = text(record, "method");
+        let outcome = text(record, "outcome");
+        let panic = match (method, outcome) {
+            (method, "failed") if method == "daemon" || TOOLS.contains(&method) => {
+                detail.starts_with("panic at ")
+            }
+            ("daemon", "fatal") => detail.split_once(": ").is_some_and(|(cause, place)| {
+                matches!(
+                    cause,
+                    "worker_panic"
+                        | "worker_ended"
+                        | "inspection_panic"
+                        | "inspection_ended"
+                        | "job_panic"
+                ) && place.starts_with("panic at ")
+            }),
+            _ => false,
+        };
+        if panic {
             *self.lifecycle.panics.entry(detail.to_owned()).or_default() += 1;
         }
-        match (text(record, "method"), text(record, "outcome")) {
+        match (method, outcome) {
             ("daemon", "started") => self.lifecycle.daemon_starts += 1,
             ("daemon", "failed" | "fatal") => {
                 *self
@@ -1766,6 +1786,112 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].contains("panic at crates/x.rs:1:1"), "{alerts:?}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A lexical observation failure mentioning a filename is a tool fault, never evidence of a
+    /// panic: the real pending/job line shapes must leave the panic-only alert silent.
+    #[test]
+    fn observation_failure_with_panic_named_file_does_not_alert() {
+        let lines = [
+            r#"{"ts":"2026-10-01T10:00:00Z","method":"context","outcome":"pending","version":"0.10.5","request":"context-call","correlation":"context-result","duration_ms":3}"#,
+            r#"{"ts":"2026-10-01T10:00:01Z","method":"context","outcome":"failed","reason":"source_unavailable","request":"context-call","correlation":"context-result","duration_ms":3,"detail":"context:observation_failed:\"panic at.txt\""}"#,
+        ];
+        let dir = journal("panic-filename", "00000000000000f1", &lines);
+        let report = Report::build(&dir, "2026-10-01", "2026-10-01", Scope::All).unwrap();
+        assert_eq!(report.malformed, 0);
+        assert_eq!(report.calls.len(), 1);
+        assert!(report.alerts(&parse(&[]).unwrap()).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Only the panic hook, caught tool failures and the actual closed containment causes can
+    /// raise panic alerts; another method, outcome, detail prefix or cause cannot impersonate one.
+    #[test]
+    fn panic_alerts_require_the_producers_record_shapes() {
+        for (method, outcome, detail, panic) in [
+            (
+                "read",
+                "failed",
+                "panic at crates/job.rs:1:1 during read",
+                true,
+            ),
+            ("daemon", "failed", "panic at crates/hook.rs:1:1", true),
+            (
+                "daemon",
+                "fatal",
+                "worker_panic: panic at crates/worker.rs:1:1",
+                true,
+            ),
+            (
+                "daemon",
+                "fatal",
+                "worker_ended: panic at crates/worker.rs:1:1",
+                true,
+            ),
+            (
+                "daemon",
+                "fatal",
+                "inspection_panic: panic at crates/worker.rs:1:1",
+                true,
+            ),
+            (
+                "daemon",
+                "fatal",
+                "inspection_ended: panic at crates/worker.rs:1:1",
+                true,
+            ),
+            (
+                "daemon",
+                "fatal",
+                "job_panic: panic at crates/worker.rs:1:1",
+                true,
+            ),
+            ("check", "failed", "panic at crates/job.rs:1:1", false),
+            ("read", "completed", "panic at crates/job.rs:1:1", false),
+            ("daemon", "started", "panic at crates/job.rs:1:1", false),
+            (
+                "daemon",
+                "failed",
+                "observation_failed: panic at.txt",
+                false,
+            ),
+            (
+                "daemon",
+                "fatal",
+                "unknown: panic at crates/job.rs:1:1",
+                false,
+            ),
+            (
+                "daemon",
+                "fatal",
+                "worker_panic_extra: panic at crates/job.rs:1:1",
+                false,
+            ),
+            (
+                "daemon",
+                "fatal",
+                "worker_construct: panic at crates/job.rs:1:1",
+                false,
+            ),
+            ("daemon", "fatal", "worker_panic: panic at.txt", false),
+            ("read", "failed", "panic at.txt", false),
+        ] {
+            let line = serde_json::json!({
+                "ts": "2026-10-01T10:00:00Z",
+                "method": method,
+                "outcome": outcome,
+                "detail": detail
+            })
+            .to_string();
+            let dir = journal("panic-shapes", "00000000000000f2", &[&line]);
+            let report = Report::build(&dir, "2026-10-01", "2026-10-01", Scope::All).unwrap();
+            assert_eq!(
+                !report.alerts(&parse(&[]).unwrap()).is_empty(),
+                panic,
+                "{line}"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     /// Dates round-trip and the default window starts the requested days before the end.
