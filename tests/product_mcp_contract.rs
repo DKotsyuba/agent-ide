@@ -4113,6 +4113,103 @@ async fn managed_codex_transient_transport_timeout_keeps_daemon_and_binding() {
     mcp.close().await;
 }
 
+/// Waits until the runtime's lock file names a live process other than `old`, i.e. until a
+/// replacement daemon holds the runtime, and returns its pid.
+///
+/// The lock records its holder's pid, so no `lsof` race with the instant the lock is free.
+async fn replacement_daemon_pid(runtime: &Path, old: libc::pid_t, bound: Duration) -> libc::pid_t {
+    tokio::time::timeout(bound, async {
+        loop {
+            let pid = std::fs::read_to_string(runtime.join("agent-ide.lock"))
+                .ok()
+                .and_then(|text| text.trim().parse::<libc::pid_t>().ok());
+            if let Some(pid) = pid
+                && pid != old
+                && unsafe { libc::kill(pid, 0) } == 0
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("the wedged daemon must be replaced without any agent action")
+}
+
+/// A managed Codex daemon that stays stopped (a genuine wedge: it holds its runtime and answers
+/// nothing) is replaced without agent action once repeated probes spanned 30 seconds, and the
+/// replacement starts in the same runtime directory so the runtime store survives.
+///
+/// The one call that met the wedge keeps its own failed outcome and is never resent; only a later
+/// call lands on the replacement. A stall that ends sooner keeps its daemon
+/// ([`managed_codex_transient_transport_timeout_keeps_daemon_and_binding`]).
+#[tokio::test]
+async fn managed_codex_wedged_daemon_is_replaced_in_place_without_agent_action() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let before = managed_runtime_paths(&fixture);
+    let mut mcp = Mcp::start_managed(&fixture.config, &fixture.root).await;
+    let runtime = managed_runtime_paths(&fixture)
+        .difference(&before)
+        .next()
+        .cloned()
+        .expect("managed daemon runtime");
+    let state = fixture.state();
+    let actor = "wedged";
+    let mut next = 10;
+    let started = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.start",
+        json!({"activation_id":"wedged-1"}),
+        &state,
+    )
+    .await;
+    let started = settle_managed(&mut mcp, &mut next, actor, &state, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let pid = managed_daemon_pid(&runtime).await;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let _paused = PausedDaemon(pid);
+    next += 1;
+    let lost = tokio::time::timeout(
+        Duration::from_secs(20),
+        mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context","arguments":{"path":"tracked.txt"},"_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})),
+    )
+    .await
+    .expect("the call that met the wedge returns its own failure");
+    assert_eq!(lost["result"]["isError"], true, "{lost}");
+    let fresh = replacement_daemon_pid(&runtime, pid, Duration::from_secs(120)).await;
+    assert_ne!(fresh, pid);
+    assert!(
+        runtime.join("state.sqlite").exists(),
+        "the replacement starts in the same runtime directory with its store"
+    );
+    // The first call on the new generation reports the restart (its old binding died with the
+    // daemon); the next `ide.start` establishes a binding on the replacement.
+    next += 1;
+    let mut restarted = json!(null);
+    for attempt in 0..2 {
+        let reply = managed_call(
+            &mut mcp,
+            next,
+            actor,
+            "ide.start",
+            json!({"activation_id":format!("wedged-after-{attempt}")}),
+            &state,
+        )
+        .await;
+        restarted = settle_managed(&mut mcp, &mut next, actor, &state, reply).await;
+        if restarted["kind"] == "activation" {
+            break;
+        }
+        assert_eq!(restarted["reason"], "host_binding", "{restarted}");
+        next += 1;
+    }
+    assert_eq!(restarted["kind"], "activation", "{restarted}");
+    mcp.close().await;
+}
+
 /// SIGTERM while a replacement cannot acknowledge its lease still reaps the child and runtime.
 #[cfg(feature = "test-seams")]
 #[tokio::test]
@@ -21538,6 +21635,55 @@ async fn managed_claude_lost_edit_reply_is_reported_and_never_resent() {
         text.contains("host_binding (replay)") && !text.contains("missing_pre"),
         "{text}"
     );
+    claude_read_ok(&mut mcp, &fixture.root, &mut next, session, None).await;
+    mcp.close().await;
+}
+
+/// The shared Claude daemon, stopped for good (it holds its runtime and answers nothing), is
+/// replaced without agent action once repeated probes spanned 30 seconds: the front signals the
+/// verified lock holder, a replacement starts in the same runtime directory, and the next call
+/// recovers the actor on it. The call that met the wedge keeps its own failure and is not resent.
+#[tokio::test]
+async fn managed_claude_wedged_shared_daemon_is_replaced_without_agent_action() {
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let session = "wedged-shared";
+    let mut next = 10;
+    claude_start_actor(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        session,
+        None,
+        json!({"activation_id":"wedged"}),
+    )
+    .await;
+    let pid = std::fs::read_to_string(runtime.join("agent-ide.lock"))
+        .unwrap()
+        .trim()
+        .parse::<libc::pid_t>()
+        .expect("the daemon lock records its holder");
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let _paused = PausedDaemon(pid);
+    next += 1;
+    let call = format!("managed-claude-{next}");
+    // The pre-hook meets the stopped daemon too; whatever it answers, the call is still sent.
+    let _ = managed_claude_hook(
+        Some(&fixture.root),
+        managed_claude_event("PreToolUse", session, None, &call),
+    )
+    .await;
+    let lost = tokio::time::timeout(
+        Duration::from_secs(40),
+        mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.read","arguments":{"path":"src/lib.rs","lines":"1-2"},"_meta":{"claudecode/toolUseId":call}}})),
+    )
+    .await
+    .expect("the call that met the wedge returns its own failure");
+    assert_eq!(lost["result"]["isError"], true, "{lost}");
+    let fresh = replacement_daemon_pid(&runtime, pid, Duration::from_secs(120)).await;
+    assert_ne!(fresh, pid);
     claude_read_ok(&mut mcp, &fixture.root, &mut next, session, None).await;
     mcp.close().await;
 }
