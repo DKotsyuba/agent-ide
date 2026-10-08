@@ -3274,10 +3274,17 @@ impl<'a> Worker<'a> {
                 );
                 return Err(FailureCode::Conflict);
             }
-            Err(
-                crate::workspace::durable::DurableError::Application(_)
-                | crate::workspace::durable::DurableError::CorruptState,
-            ) => {
+            Err(crate::workspace::durable::DurableError::Application(error)) => {
+                // The activation may have committed: stay uncertain exactly as before, but name
+                // the store cause instead of a generic durable-state refusal (QW-6).
+                self.uncertain.insert(binding.clone());
+                let (_, cause) = store_failure(&error, FailureCode::WorkspaceActivation);
+                job.failure_detail = Some(format!(
+                    "start:durable_state: the durable activation state refused or failed ({cause})"
+                ));
+                return Err(FailureCode::WorkspaceActivation);
+            }
+            Err(crate::workspace::durable::DurableError::CorruptState) => {
                 self.uncertain.insert(binding.clone());
                 job.failure_detail = Some(
                     "start:durable_state: the durable activation state refused or failed"
@@ -3696,6 +3703,11 @@ impl<'a> Worker<'a> {
                 };
                 Err((detail, holder))
             }
+            Err(crate::workspace::durable::DurableError::Application(error)) => {
+                // A store failure is never reported as an identity problem (QW-6).
+                let (_, cause) = store_failure(&error, FailureCode::WorkspaceActivation);
+                Err((format!("start:worktree_unresolved:{cause}"), None))
+            }
             Err(_) => Err(("start:worktree_unresolved:identity_commit".to_owned(), None)),
         }
     }
@@ -3741,20 +3753,17 @@ impl<'a> Worker<'a> {
     }
 
     /// Maps a store failure outside stop to its typed code and remembers the closed cause for the
-    /// failing job's reply and journal (QW-6); any other failure keeps `default`.
+    /// failing job's reply and journal (QW-6).
     ///
-    /// Busy, locked or full queue: `capacity` / `store:busy`; receipt store full: `capacity` /
-    /// `store:store_full`; wait expired with the outcome unknown: `deadline` /
-    /// `store:store_deadline`. The cause is overwritten by a later failure and cleared when the
-    /// next job starts.
+    /// The code and cause come from [`store_failure`] (`default` is the code of a failure that is
+    /// neither a capacity nor a timing problem). The cause is overwritten by a later failure and
+    /// cleared when the next job starts.
     fn note_store_failure(
         &self,
         error: &crate::app::store::StoreError,
         default: FailureCode,
     ) -> FailureCode {
-        let Some((code, cause)) = store_failure(error) else {
-            return default;
-        };
+        let (code, cause) = store_failure(error, default);
         *self
             .store_cause
             .lock()
@@ -6189,21 +6198,25 @@ fn is_transient_stop_failure(error: &crate::workspace::durable::DurableError) ->
     }
 }
 
-/// Maps a store failure outside stop to its failure code and typed `store:` cause, or `None` when
-/// the failure is not a store capacity or timing problem (QW-6; the stop family is
-/// [`stop_failure`]).
+/// Maps a store failure outside stop to its failure code and closed `store:` cause (QW-6; the
+/// stop family is [`stop_failure`]). Total: every store failure gets a cause.
 ///
 /// Busy, locked or full queue: `capacity` / `store:busy`. Receipt store full: `capacity` /
 /// `store:store_full`. Wait expired with the outcome unknown: `deadline` /
-/// `store:store_deadline`.
-fn store_failure(error: &crate::app::store::StoreError) -> Option<(FailureCode, &'static str)> {
+/// `store:store_deadline`. Every other store failure (stopped owner, SQLite or setup failure)
+/// keeps the caller's `default` code with `store:unavailable`. Only the code and detail change;
+/// callers keep their own uncertain-mutation handling.
+fn store_failure(
+    error: &crate::app::store::StoreError,
+    default: FailureCode,
+) -> (FailureCode, &'static str) {
     use crate::app::store::StoreError;
     match error {
-        StoreError::Busy | StoreError::QueueFull => Some((FailureCode::Capacity, "store:busy")),
-        StoreError::ReceiptCapacityExhausted => Some((FailureCode::Capacity, "store:store_full")),
-        StoreError::OutcomeUnknown { .. } => Some((FailureCode::Deadline, "store:store_deadline")),
-        error if is_locked_store(error) => Some((FailureCode::Capacity, "store:busy")),
-        _ => None,
+        StoreError::Busy | StoreError::QueueFull => (FailureCode::Capacity, "store:busy"),
+        StoreError::ReceiptCapacityExhausted => (FailureCode::Capacity, "store:store_full"),
+        StoreError::OutcomeUnknown { .. } => (FailureCode::Deadline, "store:store_deadline"),
+        error if is_locked_store(error) => (FailureCode::Capacity, "store:busy"),
+        _ => (default, "store:unavailable"),
     }
 }
 
@@ -8802,30 +8815,31 @@ mod stop_retry_tests {
     fn store_failures_outside_stop_are_typed() {
         use crate::app::store::StoreError;
         let cases = [
-            (
-                StoreError::Busy,
-                Some((FailureCode::Capacity, "store:busy")),
-            ),
-            (
-                StoreError::QueueFull,
-                Some((FailureCode::Capacity, "store:busy")),
-            ),
+            (StoreError::Busy, (FailureCode::Capacity, "store:busy")),
+            (StoreError::QueueFull, (FailureCode::Capacity, "store:busy")),
             (
                 StoreError::Infrastructure("database is locked".to_owned()),
-                Some((FailureCode::Capacity, "store:busy")),
+                (FailureCode::Capacity, "store:busy"),
             ),
             (
                 StoreError::ReceiptCapacityExhausted,
-                Some((FailureCode::Capacity, "store:store_full")),
+                (FailureCode::Capacity, "store:store_full"),
             ),
             (
                 StoreError::Infrastructure("disk I/O error".to_owned()),
-                None,
+                (FailureCode::SourceUnavailable, "store:unavailable"),
             ),
-            (StoreError::Unavailable, None),
+            (
+                StoreError::Unavailable,
+                (FailureCode::SourceUnavailable, "store:unavailable"),
+            ),
         ];
         for (error, expected) in cases {
-            assert_eq!(store_failure(&error), expected, "{error:?}");
+            assert_eq!(
+                store_failure(&error, FailureCode::SourceUnavailable),
+                expected,
+                "{error:?}"
+            );
         }
     }
 

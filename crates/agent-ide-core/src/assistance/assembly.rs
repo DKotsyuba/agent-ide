@@ -62,13 +62,18 @@ trait OrCause<T> {
     fn or_cause(self, cause: HostBindingCause) -> Result<T, HostBindingCause>;
 }
 
+/// An absent value fails with the supplied cause.
 impl<T> OrCause<T> for Option<T> {
+    /// `Some(value)` keeps `value`; `None` fails with `cause`.
     fn or_cause(self, cause: HostBindingCause) -> Result<T, HostBindingCause> {
         self.ok_or(cause)
     }
 }
 
+/// Any error fails with the supplied cause; the error itself is dropped, because it may carry
+/// caller-supplied text that must never reach a reply or the journal.
 impl<T, E> OrCause<T> for Result<T, E> {
+    /// `Ok(value)` keeps `value`; any `Err` fails with `cause`.
     fn or_cause(self, cause: HostBindingCause) -> Result<T, HostBindingCause> {
         self.map_err(|_| cause)
     }
@@ -547,8 +552,16 @@ impl ProductDispatcher {
         self.handle_tagged(request, status, &mut None).await.ok()
     }
 
-    /// [`Self::handle`], additionally writing `tag` with the private actor tag a current managed
-    /// Claude front receives beside the reply (see [`super::host_binding::actor_tag`]).
+    /// Parses and commits one ingress request, additionally writing `tag` with the private actor
+    /// tag a current managed Claude front receives beside the reply (see
+    /// [`super::host_binding::actor_tag`]).
+    ///
+    /// Returns the typed reply, or `Err(cause)` when an ingress step refused before any reply
+    /// could be built (malformed or oversized envelope, unknown host or phase, invalid
+    /// parameters, an unknown attachment, a call id that differs from its correlation id, a
+    /// poisoned daemon lock, a failed guard). `dispatch` answers `Err(cause)` as
+    /// `unavailable: host_binding` carrying that closed cause, so no early exit is cause-less
+    /// (QW-6). The cause is a closed enum value: nothing from the request is echoed back.
     async fn handle_tagged(
         &self,
         request: &AssistanceDispatch,
@@ -1540,13 +1553,22 @@ async fn ingress_exits_name_a_typed_cause() {
             .unwrap(),
         )
     };
+    // The serialized reply the front receives from `dispatch`, decoded: a refused ingress is
+    // `unavailable: host_binding`, and the test fails on a bare one (no cause).
     let cause_of = |request: AssistanceDispatch| {
         let dispatcher = &dispatcher;
         async move {
-            let mut status = None;
-            dispatcher
-                .handle_tagged(&request, &mut status, &mut None)
-                .await
+            let reply = match dispatcher.dispatch(request).await.unwrap() {
+                AssistanceDispatchReply::HookSubmit(reply)
+                | AssistanceDispatchReply::MethodDispatch(reply) => reply,
+            };
+            match PeerReply::decode(reply.as_str()).unwrap() {
+                PeerReply::Unavailable {
+                    reason: MissingPeer::HostBinding,
+                    cause: Some(cause),
+                } => cause,
+                other => panic!("expected a typed host_binding refusal, got {other:?}"),
+            }
         }
     };
     // Envelope with a stray key: invalid metadata.
@@ -1556,7 +1578,7 @@ async fn ingress_exits_name_a_typed_cause() {
             AssistanceMethod::Context
         ))
         .await,
-        Err(HostBindingCause::InvalidMetadata)
+        HostBindingCause::InvalidMetadata
     );
     // No `host_meta` object: a missing field.
     assert_eq!(
@@ -1565,7 +1587,7 @@ async fn ingress_exits_name_a_typed_cause() {
             AssistanceMethod::Context
         ))
         .await,
-        Err(HostBindingCause::MissingField)
+        HostBindingCause::MissingField
     );
     // A hook with an unsupported phase.
     let hook = |phase: &str| {
@@ -1585,7 +1607,7 @@ async fn ingress_exits_name_a_typed_cause() {
     };
     assert_eq!(
         cause_of(hook("bogus")).await,
-        Err(HostBindingCause::UnsupportedHookPhase)
+        HostBindingCause::UnsupportedHookPhase
     );
     // Valid envelope, but parameters the daemon's validator rejects: invalid parameters.
     assert_eq!(
@@ -1594,7 +1616,7 @@ async fn ingress_exits_name_a_typed_cause() {
             AssistanceMethod::Read
         ))
         .await,
-        Err(HostBindingCause::InvalidParameters)
+        HostBindingCause::InvalidParameters
     );
 }
 
