@@ -277,8 +277,10 @@ pub enum StoreError {
         /// The existing durable outcome that must be reconciled instead of replayed.
         existing: StoreOutcome,
     },
-    /// Durable mechanics receipts reached their hard bounded capacity, so no SQL was started.
+    /// Retained for the stable error vocabulary; the store no longer caps receipts, so it never returns this.
     ReceiptCapacityExhausted,
+    /// The operation ID's settled receipt was retired behind the replay horizon; its closure was not run.
+    ReceiptExpired,
     /// SQLite's configured busy wait expired without starting the domain transaction.
     Busy,
     /// The owner confirmed transaction rollback after the domain SQL closure returned an error.
@@ -311,6 +313,7 @@ impl Display for StoreError {
             Self::ReceiptCapacityExhausted => {
                 formatter.write_str("store receipt capacity is exhausted")
             }
+            Self::ReceiptExpired => formatter.write_str("store receipt expired"),
             Self::Busy => formatter.write_str("SQLite is busy"),
             Self::RolledBack => formatter.write_str("store transaction rolled back"),
             Self::Infrastructure(message) => {
@@ -476,8 +479,11 @@ impl Store {
     ///
     /// `sql` receives the live [`Transaction`] and must not manually begin, commit, or roll back a
     /// top-level transaction. Its value is delivered only after a commit that atomically includes the
-    /// `Committed` receipt. A duplicate operation returns its prior state without calling `sql`. After
-    /// an accepted timeout, callers must use [`Self::outcome`] and never resubmit this operation ID.
+    /// `Committed` receipt. A duplicate operation returns its prior state without calling `sql`, and an
+    /// ID whose settled receipt was retired behind the replay horizon returns
+    /// [`StoreError::ReceiptExpired`], also without calling `sql`. Unresolved receipts are kept
+    /// indefinitely and keep answering as duplicates. After an accepted timeout, callers must use
+    /// [`Self::outcome`] and never resubmit this operation ID.
     pub async fn execute<T, F>(&self, operation: OperationId, sql: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
@@ -636,8 +642,8 @@ impl Store {
 
     /// Looks up the durable mechanics receipt without replaying domain SQL.
     ///
-    /// Missing, interrupted, or corrupt receipts return `OutcomeUnknown`; that condition does not
-    /// authorize a retry. Lookup is bounded by the same owner queue and request deadline as execute.
+    /// Missing, interrupted, corrupt, or retired (expired) receipts return `OutcomeUnknown`; that
+    /// condition does not authorize a retry. Lookup is bounded by the same owner queue and request deadline as execute.
     pub async fn outcome(&self, operation: OperationId) -> Result<StoreOutcome, StoreError> {
         let (reply_sender, reply_receiver) = oneshot::channel();
         match self.sender.try_send(StoreMessage::Lookup {
@@ -956,6 +962,10 @@ fn owner_thread(
             return;
         }
     };
+    let mut window = ReceiptWindow::default();
+    if !read_only {
+        window.sweep(&mut connection, config.receipt_capacity);
+    }
     while let Ok(message) = receiver.recv() {
         match message {
             StoreMessage::Read { job } => job.run(&connection),
@@ -964,7 +974,7 @@ fn owner_thread(
                 execute_untracked_one(&mut connection, job);
             }
             StoreMessage::Execute { operation, job } => {
-                execute_one(&mut connection, config, operation, job);
+                execute_one(&mut connection, config, &mut window, operation, job);
             }
             StoreMessage::Lookup { operation, reply } => {
                 let _ = reply.send(read_outcome(&connection, &operation));
@@ -1013,6 +1023,9 @@ fn open_connection(
                  operation_id TEXT PRIMARY KEY NOT NULL,
                  outcome TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS application_expired_receipts (
+                 fingerprint BLOB PRIMARY KEY NOT NULL
+             ) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS application_domain_migrations (
                  domain TEXT NOT NULL,
                  migration_key TEXT NOT NULL,
@@ -1224,7 +1237,11 @@ fn database_is_fresh_for_domain(
         .query_row(
             "SELECT COUNT(*) FROM sqlite_schema
              WHERE name NOT LIKE 'sqlite_%'
-               AND name NOT IN ('application_operation_receipts', 'application_domain_migrations')",
+               AND name NOT IN (
+                   'application_operation_receipts',
+                   'application_expired_receipts',
+                   'application_domain_migrations'
+               )",
             [],
             |row| row.get::<_, usize>(0),
         )
@@ -1295,6 +1312,7 @@ fn hex_digest(digest: MigrationDigest) -> String {
 fn execute_one(
     connection: &mut Connection,
     config: StoreConfig,
+    window: &mut ReceiptWindow,
     operation: OperationId,
     job: Box<dyn StoreJob>,
 ) {
@@ -1309,10 +1327,18 @@ fn execute_one(
             return;
         }
     }
-    if let Err(error) = ensure_receipt_capacity(connection, config.receipt_capacity) {
-        job.fail(error);
-        return;
+    match receipt_expired(connection, &operation) {
+        Ok(false) => {}
+        Ok(true) => {
+            job.fail(StoreError::ReceiptExpired);
+            return;
+        }
+        Err(error) => {
+            job.fail(error);
+            return;
+        }
     }
+    window.admit(connection, config.receipt_capacity);
     if let Err(error) = write_outcome(connection, &operation, StoreOutcome::Queued) {
         job.fail(error);
         return;
@@ -1454,19 +1480,120 @@ fn write_outcome(
     Ok(())
 }
 
-/// Refuses new admission after durable mechanics receipts reach their hard bounded capacity.
-fn ensure_receipt_capacity(connection: &Connection, capacity: usize) -> Result<(), StoreError> {
-    let count = connection
+/// Receipts admitted between two retirement sweeps; keeps the per-write cost O(1).
+const SWEEP_INTERVAL: u32 = 64;
+
+/// Settled receipts retired per transaction, bounding how long one sweep holds the write lock.
+const SWEEP_BATCH: usize = 512;
+
+/// Outcomes that are definite and carry no effect still in doubt; the only retirable receipts.
+const SETTLED_SQL: &str = "('committed', 'rolled_back', 'busy')";
+
+/// Owner-thread bookkeeping for the receipt replay horizon.
+///
+/// Settled receipts older than the newest `receipt_capacity` admissions are retired into a
+/// 16-byte tombstone so a replay of the ID is refused as expired and never re-executed. A
+/// queued, started, unknown, or unrecognized receipt is never retired and never blocks admission.
+#[derive(Default)]
+struct ReceiptWindow {
+    /// Admissions since the last sweep.
+    since_sweep: u32,
+}
+
+impl ReceiptWindow {
+    /// Counts one admission and sweeps on schedule.
+    fn admit(&mut self, connection: &mut Connection, horizon: usize) {
+        self.since_sweep += 1;
+        if self.since_sweep >= SWEEP_INTERVAL {
+            self.sweep(connection, horizon);
+        }
+    }
+
+    /// Retires settled receipts beyond the horizon.
+    ///
+    /// Housekeeping is best effort: a failure keeps every receipt and is retried at the next sweep.
+    fn sweep(&mut self, connection: &mut Connection, horizon: usize) {
+        self.since_sweep = 0;
+        let _ = retire_settled(connection, horizon);
+    }
+}
+
+/// Fixed-size identity of a retired operation ID; a collision can only refuse, never replay.
+fn receipt_fingerprint(operation_id: &str) -> [u8; 16] {
+    let mut fingerprint = [0u8; 16];
+    fingerprint.copy_from_slice(&blake3::hash(operation_id.as_bytes()).as_bytes()[..16]);
+    fingerprint
+}
+
+/// Reports whether the ID's settled receipt was retired behind the replay horizon.
+fn receipt_expired(connection: &Connection, operation: &OperationId) -> Result<bool, StoreError> {
+    connection
         .query_row(
-            "SELECT COUNT(*) FROM application_operation_receipts",
+            "SELECT EXISTS(SELECT 1 FROM application_expired_receipts WHERE fingerprint = ?1)",
+            params![receipt_fingerprint(operation.as_str()).as_slice()],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(infrastructure)
+}
+
+/// Moves every settled receipt older than the newest `horizon` rowids into a tombstone.
+///
+/// The receipt row and its tombstone change in one transaction, so a crash leaves the ID either
+/// fully recorded or fully expired. Rowids grow with admission order, which makes the horizon an
+/// age without a clock or a per-write count.
+fn retire_settled(connection: &mut Connection, horizon: usize) -> Result<(), StoreError> {
+    let newest = connection
+        .query_row(
+            "SELECT MAX(rowid) FROM application_operation_receipts",
             [],
-            |row| row.get::<_, usize>(0),
+            |row| row.get::<_, Option<i64>>(0),
         )
         .map_err(infrastructure)?;
-    if count >= capacity {
-        Err(StoreError::ReceiptCapacityExhausted)
-    } else {
-        Ok(())
+    let Some(cutoff) =
+        newest.and_then(|newest| newest.checked_sub(i64::try_from(horizon).unwrap_or(i64::MAX)))
+    else {
+        return Ok(());
+    };
+    loop {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(infrastructure)?;
+        let victims = {
+            let mut statement = transaction
+                .prepare(&format!(
+                    "SELECT rowid, operation_id FROM application_operation_receipts
+                     WHERE rowid <= ?1 AND outcome IN {SETTLED_SQL} ORDER BY rowid LIMIT ?2"
+                ))
+                .map_err(infrastructure)?;
+            statement
+                .query_map(params![cutoff, SWEEP_BATCH as i64], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(infrastructure)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(infrastructure)?
+        };
+        for (rowid, operation_id) in &victims {
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO application_expired_receipts (fingerprint) VALUES (?1)",
+                    params![receipt_fingerprint(operation_id).as_slice()],
+                )
+                .map_err(infrastructure)?;
+            transaction
+                .execute(
+                    &format!(
+                        "DELETE FROM application_operation_receipts
+                         WHERE rowid = ?1 AND outcome IN {SETTLED_SQL}"
+                    ),
+                    params![rowid],
+                )
+                .map_err(infrastructure)?;
+        }
+        transaction.commit().map_err(infrastructure)?;
+        if victims.len() < SWEEP_BATCH {
+            return Ok(());
+        }
     }
 }
 

@@ -385,9 +385,11 @@ impl<'a> EditReceiptStore<'a> {
             {
                 reconcile_loaded(self, request).await
             }
-            Err(StoreError::DuplicateOperation { .. } | StoreError::OutcomeUnknown { .. }) => {
-                Ok(PrepareAdmission::OutcomeUnknown(unknown(&request)))
-            }
+            Err(
+                StoreError::DuplicateOperation { .. }
+                | StoreError::OutcomeUnknown { .. }
+                | StoreError::ReceiptExpired,
+            ) => Ok(PrepareAdmission::OutcomeUnknown(unknown(&request))),
             Err(error) => Err(error.into()),
         }
     }
@@ -433,9 +435,11 @@ impl<'a> EditReceiptStore<'a> {
             {
                 self.settled_duplicate(&prepared.request, &result).await
             }
-            Err(StoreError::DuplicateOperation { .. } | StoreError::OutcomeUnknown { .. }) => {
-                Ok(unknown(&prepared.request))
-            }
+            Err(
+                StoreError::DuplicateOperation { .. }
+                | StoreError::OutcomeUnknown { .. }
+                | StoreError::ReceiptExpired,
+            ) => Ok(unknown(&prepared.request)),
             Err(error) => Err(error.into()),
         }
     }

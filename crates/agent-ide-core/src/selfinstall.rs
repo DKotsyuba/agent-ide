@@ -60,9 +60,10 @@ pub struct Args {
     pub home: Option<PathBuf>,
     /// Standalone prefix; default is `<home>/standalone`.
     pub prefix: Option<PathBuf>,
-    /// Launcher directory; default is `<home>/.local/bin`.
+    /// Launcher directory; default is `<user home>/.local/bin`, or `<root>/bin` for a scratch install.
     pub bin_dir: Option<PathBuf>,
-    /// Plugin root parent; default is `<home>/.local/share/agent-ide`.
+    /// Plugin root parent; default is `<user home>/.local/share/agent-ide`, or
+    /// `<root>/share/agent-ide` for a scratch install.
     pub share_dir: Option<PathBuf>,
     /// Source builds only: replace an already installed release of the same version whose
     /// bytes differ instead of refusing (published releases never change bytes).
@@ -185,11 +186,15 @@ fn set_path(slot: &mut Option<PathBuf>, flag: &str, value: &str) -> Result<(), S
 /// Resolves the documented defaults: `--home` is the effective user home plus `.agent-ide`,
 /// `--prefix` is `<home>/standalone`, `--bin-dir` is `<user home>/.local/bin`, and
 /// `--share-dir` is `<user home>/.local/share/agent-ide`. `AGENT_IDE_HOME` relocates the
-/// whole per-user tree, exactly as the daemon and the journal treat it. Every result is absolute, normalized,
-/// not the filesystem root, and free of single quotes so the launcher shim can quote it.
+/// whole per-user tree, exactly as the daemon and the journal treat it. A scratch install, one
+/// that names `--home` or `--prefix`, never defaults into the user's live tree: `--bin-dir` is
+/// `<root>/bin` and `--share-dir` is `<root>/share/agent-ide`, where `<root>` is `--home`, else
+/// `--prefix`. Every result is absolute, normalized, not the filesystem root, and free of single
+/// quotes so the launcher shim can quote it.
 pub fn resolve(args: Args) -> Result<Options, String> {
     checked_version(&args.version)?;
     let default_home = userhome::user_home();
+    let scratch_root = args.home.clone().or_else(|| args.prefix.clone());
     let home = match args.home {
         Some(home) => home,
         None => default_home
@@ -200,6 +205,7 @@ pub fn resolve(args: Args) -> Result<Options, String> {
     let prefix = args.prefix.unwrap_or_else(|| home.join("standalone"));
     let bin_dir = match args.bin_dir {
         Some(bin_dir) => bin_dir,
+        None if scratch_root.is_some() => scratch_root.clone().unwrap().join("bin"),
         None => default_home
             .clone()
             .ok_or("cannot resolve the user home; pass --bin-dir or set AGENT_IDE_HOME")?
@@ -207,6 +213,7 @@ pub fn resolve(args: Args) -> Result<Options, String> {
     };
     let share_dir = match args.share_dir {
         Some(share_dir) => share_dir,
+        None if scratch_root.is_some() => scratch_root.unwrap().join("share/agent-ide"),
         None => default_home
             .ok_or("cannot resolve the user home; pass --share-dir or set AGENT_IDE_HOME")?
             .join(".local/share/agent-ide"),
@@ -302,6 +309,13 @@ fn install(options: &Options) -> Result<Summary, String> {
                         "refusing to overwrite a different immutable release: {reason}"
                     ));
                 }
+                if let Some(user) = release_user(&selected)? {
+                    return Err(format!(
+                        "refusing to replace {}: {user}; stop it and retry",
+                        selected.display()
+                    ));
+                }
+                pause_seam();
                 Reinstall::Replace
             }
         },
@@ -310,7 +324,7 @@ fn install(options: &Options) -> Result<Summary, String> {
     // Launcher ownership and the remaining writability proofs.
     let launcher = options.bin_dir.join(BINARY_NAME);
     create_dir(&options.bin_dir)?;
-    ensure_launcher_owned(options, &launcher)?;
+    ensure_launcher_owned(options, &launcher, false)?;
     let plugin_root = options.share_dir.join(PLUGIN_DIR);
     create_dir(&plugin_root)?;
 
@@ -332,12 +346,32 @@ fn install(options: &Options) -> Result<Summary, String> {
             ));
             fs::rename(&selected, &retired)
                 .map_err(|error| format!("{}: {error}", selected.display()))?;
-            let _ = fs::remove_dir_all(&retired);
+            // The earlier check can race a process that started afterwards. Once renamed, any
+            // process still running from the old copy reports the retired path, so look again
+            // and put the release back untouched rather than replace one in use.
+            let still_used = match release_user(&retired) {
+                Ok(None) => None,
+                Ok(Some(user)) => Some(user),
+                Err(reason) => Some(reason),
+            };
+            if let Some(user) = still_used {
+                fs::rename(&retired, &selected).map_err(|error| {
+                    format!(
+                        "{}: {user}; restoring it failed: {error}",
+                        selected.display()
+                    )
+                })?;
+                return Err(format!(
+                    "refusing to replace {}: {user}; stop it and retry",
+                    selected.display()
+                ));
+            }
             install_release(&options.release, &selected, &options.version)?;
         }
         Reinstall::Identical => {}
     }
     let launcher = write_launcher(options)?;
+    sweep_retired(&releases);
     let current = options.prefix.join("current");
     // `current` names the versioned release below `releases/`; the link target stays relative.
     let current_target_name = format!("{RELEASES_DIR}/{}", options.version);
@@ -360,6 +394,55 @@ fn install(options: &Options) -> Result<Summary, String> {
         plugin_current: plugin_root.join("current"),
         action,
     })
+}
+
+/// Test seam: `AGENT_IDE_TEST_INSTALL_PAUSE=<dir>` stops the installer right after its first
+/// live-process check. It writes `<dir>/paused` and waits (at most 30 s) for `<dir>/resume`, so a
+/// product test can start a process from the release inside the window the post-rename recheck
+/// closes. Without the `test-seams` feature the variable is never read.
+fn pause_seam() {
+    let Some(dir) = crate::test_seams::var("AGENT_IDE_TEST_INSTALL_PAUSE") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let _ = fs::write(dir.join("paused"), b"");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !dir.join("resume").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Describes a live process executing from inside `release`, or `None` when none does.
+///
+/// An unreadable process list or an uninspectable `agent-ide` process counts as a user: a
+/// release is never removed on an unproven absence.
+fn release_user(release: &Path) -> Result<Option<String>, String> {
+    let release = fs::canonicalize(release).unwrap_or_else(|_| release.to_path_buf());
+    let processes = crate::retention::process_snapshot()
+        .ok_or("cannot list running processes to prove the release is unused")?;
+    Ok(processes.into_iter().find_map(|(pid, exe)| match exe {
+        Some(exe) if !exe.starts_with(&release) => None,
+        Some(_) => Some(format!("pid {pid} runs from it")),
+        None => Some(format!("pid {pid} could not be inspected")),
+    }))
+}
+
+/// Removes retired `.replaced-*` release copies that no live process uses; a copy still in use
+/// stays for a later install. Failures keep the copy.
+fn sweep_retired(releases: &Path) {
+    let Ok(entries) = fs::read_dir(releases) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".replaced-")
+            && matches!(release_user(&entry.path()), Ok(None))
+        {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// What the release step must do with `releases/<version>`, decided read-only before any write.
@@ -636,7 +719,7 @@ fn current_target(link: &Path) -> Option<String> {
 fn write_launcher(options: &Options) -> Result<PathBuf, String> {
     create_dir(&options.bin_dir)?;
     let launcher = options.bin_dir.join(BINARY_NAME);
-    ensure_launcher_owned(options, &launcher)?;
+    ensure_launcher_owned(options, &launcher, true)?;
     let shim = launcher_shim(options);
     let temporary = options
         .bin_dir
@@ -681,8 +764,9 @@ fn parse_shim(contents: &[u8]) -> Option<(String, String)> {
 
 /// Accepts an existing launcher path only when this product owns it: absent, a managed shim,
 /// a symlink into the prefix `current`, or a previously installed Mach-O binary — which moves
-/// aside exactly once as `agent-ide.bak-<old version>`.
-fn ensure_launcher_owned(options: &Options, launcher: &Path) -> Result<(), String> {
+/// aside exactly once as `agent-ide.bak-<old version>` when `migrate` is set. The preflight
+/// passes `false`, so a refusal later in the install leaves the launcher where it was.
+fn ensure_launcher_owned(options: &Options, launcher: &Path, migrate: bool) -> Result<(), String> {
     let metadata = match fs::symlink_metadata(launcher) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -728,6 +812,9 @@ fn ensure_launcher_owned(options: &Options, launcher: &Path) -> Result<(), Strin
         return Ok(());
     }
     if metadata.permissions().mode() & 0o111 != 0 && is_macho(&contents) {
+        if !migrate {
+            return Ok(());
+        }
         let label = binary_version_label(launcher);
         let mut backup = launcher.with_file_name(format!("{BINARY_NAME}.bak-{label}"));
         if fs::symlink_metadata(&backup).is_ok() {

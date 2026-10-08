@@ -17,7 +17,7 @@ pub enum ConfigKey {
     StoreBusyTimeout,
     /// Maximum caller wait after a store submission is accepted.
     StoreRequestDeadline,
-    /// Maximum retained operation receipts before Application refuses further admission.
+    /// Replay horizon: settled operation receipts retained before older ones become tombstones.
     StoreReceiptCapacity,
 }
 
@@ -49,7 +49,7 @@ pub struct AppConfigPatch {
     pub store_busy_timeout: Option<Duration>,
     /// Optional upper bound for a caller waiting on accepted SQL work.
     pub store_request_deadline: Option<Duration>,
-    /// Optional upper bound for Application mechanics receipts retained in SQLite.
+    /// Optional replay horizon for settled Application mechanics receipts retained in SQLite.
     pub store_receipt_capacity: Option<usize>,
 }
 
@@ -80,7 +80,7 @@ pub struct StoreConfig {
     pub busy_timeout: Duration,
     /// Total caller wait after accepted work, after which reconciliation is required.
     pub request_deadline: Duration,
-    /// Bounded count of receipts retained for operation reconciliation before new admission is refused.
+    /// Newest receipts kept for duplicate reconciliation; older settled ones are retired to tombstones.
     pub receipt_capacity: usize,
 }
 
@@ -191,9 +191,8 @@ pub fn effective_config(
             queue_capacity: 32,
             busy_timeout: Duration::from_secs(1),
             request_deadline: Duration::from_secs(2),
-            // A hard cap with no eviction (docs/contracts/application.md): it has to outlast the
-            // runtime store, which lives as long as the repository's runtime directory, not one
-            // daemon. Observations no longer take receipts; activations, baselines and edits do.
+            // The replay horizon (docs/contracts/application.md), not a cap: older settled receipts
+            // become tombstones, so the repository's runtime store never reaches a lifetime limit.
             receipt_capacity: 65_536,
         },
         provenance: ConfigProvenance {

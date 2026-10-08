@@ -31,8 +31,8 @@ usage_text() {
         '  --version X.Y.Z   install this version (a leading `v` is allowed); default: latest release' \
         '  --home DIR        state home (default: ~/.agent-ide; AGENT_IDE_HOME relocates the user home)' \
         '  --prefix DIR      standalone prefix (default: <home>/standalone)' \
-        '  --bin-dir DIR     launcher directory (default: ~/.local/bin)' \
-        '  --share-dir DIR   plugin root parent (default: ~/.local/share/agent-ide)' \
+        '  --bin-dir DIR     launcher directory (default: ~/.local/bin; <home or prefix>/bin with --home or --prefix)' \
+        '  --share-dir DIR   plugin root parent (default: ~/.local/share/agent-ide; <home or prefix>/share/agent-ide with --home or --prefix)' \
         '  --downloader TOOL force `curl` or `wget` (default: auto-detect)' \
         '  -h                print this help' \
         '' \

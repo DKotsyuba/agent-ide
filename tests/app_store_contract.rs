@@ -156,24 +156,168 @@ async fn restart_marks_incomplete_receipts_unknown() {
     remove_database(&path);
 }
 
-/// Refuses fresh operation admission at the hard receipt cap instead of forgetting an old ID.
-#[tokio::test]
-async fn receipt_capacity_never_evicts_operation_ids() {
-    let path = database_path();
-    let store = Store::open(&path, test_config(1)).unwrap();
+/// Runs one marker-setting operation and reports whether its closure executed.
+async fn run_marked(store: &Store, id: &str) -> Result<bool, StoreError> {
+    let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let marker = ran.clone();
     store
-        .execute(OperationId::new("first").unwrap(), |_| {
+        .execute(OperationId::new(id).unwrap(), move |_| {
+            marker.store(true, Ordering::SeqCst);
             Ok::<_, rusqlite::Error>(())
         })
-        .await
+        .await?;
+    Ok(ran.load(Ordering::SeqCst))
+}
+
+/// Counts receipt rows through a second connection.
+fn receipt_rows(path: &Path) -> usize {
+    Connection::open(path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM application_operation_receipts",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// A store keeps accepting new operations far past its receipt horizon instead of hitting a lifetime cap.
+#[tokio::test]
+async fn store_past_the_receipt_horizon_keeps_accepting_writes() {
+    let path = database_path();
+    let store = Store::open(&path, test_config(4)).unwrap();
+    for index in 0..300 {
+        assert!(
+            run_marked(&store, &format!("op-{index}")).await.unwrap(),
+            "op-{index}"
+        );
+    }
+    // Retired settled receipts leave a bounded window, not one row per operation ever admitted.
+    assert!(receipt_rows(&path) < 4 + 64 + 1, "{}", receipt_rows(&path));
+    drop(store);
+    remove_database(&path);
+}
+
+/// Replaying a settled ID retired behind the horizon is refused as expired and never re-executed,
+/// including after a restart; a recent ID still answers as a duplicate.
+#[tokio::test]
+async fn a_retired_operation_id_is_expired_and_never_re_executed() {
+    let path = database_path();
+    let store = Store::open(&path, test_config(4)).unwrap();
+    for index in 0..300 {
+        run_marked(&store, &format!("op-{index}")).await.unwrap();
+    }
+    assert_eq!(
+        run_marked(&store, "op-0").await.unwrap_err(),
+        StoreError::ReceiptExpired
+    );
+    assert_eq!(
+        run_marked(&store, "op-299").await.unwrap_err(),
+        StoreError::DuplicateOperation {
+            existing: StoreOutcome::Committed
+        }
+    );
+    drop(store);
+    let store = Store::open(&path, test_config(4)).unwrap();
+    assert_eq!(
+        run_marked(&store, "op-0").await.unwrap_err(),
+        StoreError::ReceiptExpired
+    );
+    drop(store);
+    remove_database(&path);
+}
+
+/// Unresolved receipts (queued, started, unknown, unrecognized) are never retired, never block new
+/// work even beyond the horizon, and are never re-executed; a settled legacy receipt is retired.
+#[tokio::test]
+async fn unresolved_receipts_survive_the_horizon_and_are_never_re_executed() {
+    let path = database_path();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE application_operation_receipts (
+                 operation_id TEXT PRIMARY KEY NOT NULL,
+                 outcome TEXT NOT NULL
+             );
+             INSERT INTO application_operation_receipts VALUES
+                 ('old-unknown', 'outcome_unknown'),
+                 ('old-started', 'started'),
+                 ('old-queued', 'queued'),
+                 ('old-corrupt', 'bogus'),
+                 ('old-committed', 'committed');
+             WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 20)
+             INSERT INTO application_operation_receipts
+                 SELECT 'seed-unknown-' || i, 'outcome_unknown' FROM n;",
+        )
         .unwrap();
-    let error = store
-        .execute(OperationId::new("second").unwrap(), |_| {
-            Ok::<_, rusqlite::Error>(())
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(error, StoreError::ReceiptCapacityExhausted);
+    drop(connection);
+    // More unresolved receipts than the horizon: admission must stay open.
+    let store = Store::open(&path, test_config(4)).unwrap();
+    for index in 0..300 {
+        assert!(run_marked(&store, &format!("new-{index}")).await.unwrap());
+    }
+    for id in ["old-unknown", "old-started", "old-queued", "old-corrupt"] {
+        assert_eq!(
+            run_marked(&store, id).await.unwrap_err(),
+            StoreError::DuplicateOperation {
+                existing: StoreOutcome::OutcomeUnknown
+            },
+            "{id}"
+        );
+    }
+    assert_eq!(
+        run_marked(&store, "seed-unknown-7").await.unwrap_err(),
+        StoreError::DuplicateOperation {
+            existing: StoreOutcome::OutcomeUnknown
+        }
+    );
+    assert_eq!(
+        run_marked(&store, "old-committed").await.unwrap_err(),
+        StoreError::ReceiptExpired
+    );
+    drop(store);
+    remove_database(&path);
+}
+
+/// An oversized horizon retains every receipt instead of wrapping into a negative cutoff.
+#[tokio::test]
+async fn an_oversized_horizon_retires_nothing() {
+    let path = database_path();
+    let store = Store::open(&path, test_config(usize::MAX)).unwrap();
+    for index in 0..150 {
+        run_marked(&store, &format!("op-{index}")).await.unwrap();
+    }
+    assert_eq!(
+        run_marked(&store, "op-0").await.unwrap_err(),
+        StoreError::DuplicateOperation {
+            existing: StoreOutcome::Committed
+        }
+    );
+    assert_eq!(receipt_rows(&path), 150);
+    drop(store);
+    remove_database(&path);
+}
+
+/// A legacy ledger holding more unresolved receipts than the default horizon still accepts new work.
+#[tokio::test]
+async fn a_legacy_unknown_ledger_past_the_default_horizon_accepts_new_work() {
+    let path = database_path();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE application_operation_receipts (
+                 operation_id TEXT PRIMARY KEY NOT NULL,
+                 outcome TEXT NOT NULL
+             );
+             WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 65600)
+             INSERT INTO application_operation_receipts
+                 SELECT 'legacy-' || i, 'outcome_unknown' FROM n;",
+        )
+        .unwrap();
+    drop(connection);
+    let store = Store::open(&path, test_config(65_536)).unwrap();
+    assert!(run_marked(&store, "fresh").await.unwrap());
+    assert_eq!(receipt_rows(&path), 65_601 + 1);
     drop(store);
     remove_database(&path);
 }

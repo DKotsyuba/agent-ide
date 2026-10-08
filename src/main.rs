@@ -681,11 +681,15 @@ enum UsageRequest {
     Unknown,
 }
 
-/// Classifies only the first argument; a known subcommand with bad arguments keeps its own error.
+/// Classifies the first argument, plus a lone `--help`/`-h` after a known subcommand; any other
+/// known subcommand with bad arguments keeps its own error.
 fn usage_request(arguments: &[OsString]) -> Option<UsageRequest> {
     match arguments.first().map(|first| first.to_str()) {
         Some(Some("--help" | "-h" | "help")) => Some(UsageRequest::Help),
-        Some(Some(first)) if SUBCOMMANDS.contains(&first) => None,
+        Some(Some(first)) if SUBCOMMANDS.contains(&first) => match arguments {
+            [_, flag] if flag == "--help" || flag == "-h" => Some(UsageRequest::Help),
+            _ => None,
+        },
         _ => Some(UsageRequest::Unknown),
     }
 }
@@ -4128,6 +4132,10 @@ mod tests {
         );
         for known in SUBCOMMANDS {
             assert_eq!(request(&[known]), None, "{known}");
+            for help in ["--help", "-h"] {
+                assert_eq!(request(&[known, help]), Some(UsageRequest::Help), "{known}");
+            }
+            assert_eq!(request(&[known, "--help", "x"]), None, "{known}");
             assert!(USAGE.contains(known), "usage lacks {known}");
         }
     }
