@@ -1032,9 +1032,13 @@ pub async fn evict_wedged_daemon(
     // instant ago, and the lock file identity and pid record are unchanged.
     unsafe { libc::kill(holder.pid, libc::SIGTERM) };
     let mut killed = false;
-    let mut waited = Duration::ZERO;
+    // Monotonic deadlines, not counted sleeps: a loaded host delays a sleep, never the grace.
+    let mut deadline = tokio::time::Instant::now() + WEDGE_TERM_GRACE;
     while inspect_lock(&lock_path) == DoctorLockState::Held {
-        if waited >= WEDGE_TERM_GRACE && !killed {
+        if tokio::time::Instant::now() >= deadline {
+            if killed {
+                return EvictOutcome::StillHeld { pid: holder.pid };
+            }
             // A daemon that resumed and answers (even `restarting`) is leaving by itself: never
             // killed on the evidence of the silence that is over. The holder is revalidated after
             // that awaited probe, immediately before the signal, as before `SIGTERM`.
@@ -1047,12 +1051,9 @@ pub async fn evict_wedged_daemon(
             killed = true;
             // SAFETY: as above, revalidated just now; SIGTERM did not release the lock.
             unsafe { libc::kill(holder.pid, libc::SIGKILL) };
-        }
-        if waited >= WEDGE_TERM_GRACE + Duration::from_secs(5) {
-            return EvictOutcome::StillHeld { pid: holder.pid };
+            deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-        waited += Duration::from_millis(100);
     }
     record_forced_replacement(holder.pid, probes, span, killed);
     EvictOutcome::Terminated {
