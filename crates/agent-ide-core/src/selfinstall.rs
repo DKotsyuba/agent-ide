@@ -323,7 +323,7 @@ fn install(options: &Options) -> Result<Summary, String> {
     // Launcher ownership and the remaining writability proofs.
     let launcher = options.bin_dir.join(BINARY_NAME);
     create_dir(&options.bin_dir)?;
-    ensure_launcher_owned(options, &launcher)?;
+    ensure_launcher_owned(options, &launcher, false)?;
     let plugin_root = options.share_dir.join(PLUGIN_DIR);
     create_dir(&plugin_root)?;
 
@@ -702,7 +702,7 @@ fn current_target(link: &Path) -> Option<String> {
 fn write_launcher(options: &Options) -> Result<PathBuf, String> {
     create_dir(&options.bin_dir)?;
     let launcher = options.bin_dir.join(BINARY_NAME);
-    ensure_launcher_owned(options, &launcher)?;
+    ensure_launcher_owned(options, &launcher, true)?;
     let shim = launcher_shim(options);
     let temporary = options
         .bin_dir
@@ -747,8 +747,9 @@ fn parse_shim(contents: &[u8]) -> Option<(String, String)> {
 
 /// Accepts an existing launcher path only when this product owns it: absent, a managed shim,
 /// a symlink into the prefix `current`, or a previously installed Mach-O binary — which moves
-/// aside exactly once as `agent-ide.bak-<old version>`.
-fn ensure_launcher_owned(options: &Options, launcher: &Path) -> Result<(), String> {
+/// aside exactly once as `agent-ide.bak-<old version>` when `migrate` is set. The preflight
+/// passes `false`, so a refusal later in the install leaves the launcher where it was.
+fn ensure_launcher_owned(options: &Options, launcher: &Path, migrate: bool) -> Result<(), String> {
     let metadata = match fs::symlink_metadata(launcher) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -794,6 +795,9 @@ fn ensure_launcher_owned(options: &Options, launcher: &Path) -> Result<(), Strin
         return Ok(());
     }
     if metadata.permissions().mode() & 0o111 != 0 && is_macho(&contents) {
+        if !migrate {
+            return Ok(());
+        }
         let label = binary_version_label(launcher);
         let mut backup = launcher.with_file_name(format!("{BINARY_NAME}.bak-{label}"));
         if fs::symlink_metadata(&backup).is_ok() {

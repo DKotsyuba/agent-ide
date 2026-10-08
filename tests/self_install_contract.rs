@@ -640,6 +640,7 @@ fn replace_install(bundle: &Path, root: &Path) -> Output {
 struct KillOnDrop(std::process::Child);
 
 impl Drop for KillOnDrop {
+    /// Kills the child and waits for it, ignoring a child that already exited.
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
@@ -687,6 +688,10 @@ fn replace_refuses_a_release_a_live_process_runs_from() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let manifest = fs::read(release.join("SHA256SUMS")).unwrap();
+    // A previously installed plain binary at the launcher path must also survive the refusal.
+    let launcher = root.join("bin/agent-ide");
+    fs::copy(env!("CARGO_BIN_EXE_agent-ide"), &launcher).unwrap();
+    let launcher_bytes = fs::read(&launcher).unwrap();
     let other = sealed_bundle_named(&root, "bundle-other", VERSION, "rebuilt bytes");
     let refused = replace_install(&other, &root);
     assert!(!refused.status.success(), "replace must be refused");
@@ -698,6 +703,8 @@ fn replace_refuses_a_release_a_live_process_runs_from() {
     );
     assert_eq!(fs::read(release.join("SHA256SUMS")).unwrap(), manifest);
     assert!(release.join("agent-ide").is_file());
+    assert_eq!(fs::read(&launcher).unwrap(), launcher_bytes);
+    assert_eq!(fs::read_dir(root.join("bin")).unwrap().count(), 1);
     // Release and reap the child; the replace then goes through.
     drop(child);
     let accepted = replace_install(&other, &root);
