@@ -1605,7 +1605,7 @@ async fn run_cache(prune: bool) -> ExitCode {
             "{}",
             agent_ide::retention::sweep(&root, false).render(false)
         );
-        let hints = agent_ide::hook_hints::collect(tmp, false, SystemTime::now());
+        let hints = agent_ide::hook_hints::collect(tmp, false, SystemTime::now(), &|| true);
         println!(
             "hook key hints: {} in {}, {} stale and removable",
             hints.hints,
@@ -1631,7 +1631,12 @@ async fn run_cache(prune: bool) -> ExitCode {
     print!("{}", report.render(true));
     let pause = hint_pause_note();
     if pause.is_empty() {
-        let hints = agent_ide::hook_hints::collect(tmp, true, SystemTime::now());
+        let hints = agent_ide::hook_hints::collect(
+            tmp,
+            true,
+            SystemTime::now(),
+            &agent_ide::retention::hint_publishers_safe(),
+        );
         println!(
             "hook key hints: {} in {}, {} stale removed",
             hints.hints,

@@ -210,8 +210,17 @@ fn still_the_directory(held: &File, path: &Path) -> bool {
 /// (a publisher holds the shared one), and the directory is checked to still be the one locked
 /// before it is judged and again before it is removed, so a hint refreshed or replaced meanwhile
 /// is never lost. A dry run takes no lock.
-pub fn collect(tmp_root: &Path, apply: bool, now: SystemTime) -> Collection {
-    collect_with(tmp_root, apply, now, &|_| {})
+///
+/// `publishers_safe` is asked immediately before every removal, after the directory was judged
+/// stale and locked, and must answer `true` only while no process that publishes hints without
+/// the lock can exist; a `false` keeps the hint.
+pub fn collect(
+    tmp_root: &Path,
+    apply: bool,
+    now: SystemTime,
+    publishers_safe: &dyn Fn() -> bool,
+) -> Collection {
+    collect_with(tmp_root, apply, now, publishers_safe, &|_| {})
 }
 
 /// [`collect`] calling `opened` with each candidate path between opening and locking it.
@@ -219,6 +228,7 @@ fn collect_with(
     tmp_root: &Path,
     apply: bool,
     now: SystemTime,
+    publishers_safe: &dyn Fn() -> bool,
     opened: &dyn Fn(&Path),
 ) -> Collection {
     let mut found = Collection::default();
@@ -246,6 +256,7 @@ fn collect_with(
         if still_the_directory(&dir, &path)
             && is_stale(&path, tmp_root, now)
             && still_the_directory(&dir, &path)
+            && publishers_safe()
         {
             found.stale += usize::from(fs::remove_dir_all(&path).is_ok());
         }

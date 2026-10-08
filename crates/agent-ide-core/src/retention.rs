@@ -854,6 +854,19 @@ pub fn hint_publishers_unsafe(snapshot: &dyn Fn() -> Option<Vec<Process>>) -> Op
     hint_publishers_unsafe_as(&Identity::current(&state_root()?), snapshot)
 }
 
+/// Returns the question hook key hint collection asks right before every removal: `true` only while
+/// a fresh process snapshot shows every live `agent-ide` to be this executable or a proven build.
+/// One proof cache serves all questions of a pass.
+pub fn hint_publishers_safe() -> impl Fn() -> bool {
+    let identity = state_root().map(|root| Identity::current(&root));
+    move || {
+        identity.as_ref().is_some_and(|identity| {
+            hint_publishers_unsafe_as(identity, &process_snapshot)
+                .is_some_and(|unsafe_publishers| unsafe_publishers.is_empty())
+        })
+    }
+}
+
 /// [`hint_publishers_unsafe`] classifying processes as `identity` does.
 fn hint_publishers_unsafe_as(
     identity: &Identity,
@@ -1585,6 +1598,7 @@ pub async fn run_periodically() {
                             Path::new(crate::hook_hints::TMP_ROOT),
                             true,
                             SystemTime::now(),
+                            &hint_publishers_safe(),
                         );
                         (
                             Outcome::Completed,

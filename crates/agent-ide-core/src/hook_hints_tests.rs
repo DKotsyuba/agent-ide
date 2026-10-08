@@ -90,7 +90,7 @@ fn only_hints_nothing_can_use_are_collected() {
     let upper = tmp.join("ai-k-ZZZZZZZZZZZZZZZZ");
     fs::create_dir(&upper).unwrap();
 
-    let dry = collect(&tmp, false, SystemTime::now());
+    let dry = collect(&tmp, false, SystemTime::now(), &|| true);
     assert_eq!(
         dry,
         Collection {
@@ -103,7 +103,7 @@ fn only_hints_nothing_can_use_are_collected() {
         "a dry run removes nothing"
     );
 
-    let done = collect(&tmp, true, SystemTime::now());
+    let done = collect(&tmp, true, SystemTime::now(), &|| true);
     assert_eq!(
         done,
         Collection {
@@ -135,10 +135,10 @@ fn a_publisher_and_a_collection_exclude_each_other() {
     let dir = hint(&tmp, "00000000000000b1", Some(&gone_key), OLD);
 
     let guard = PublishGuard::acquire(&dir).expect("shared lock");
-    assert_eq!(collect(&tmp, true, SystemTime::now()).stale, 0);
+    assert_eq!(collect(&tmp, true, SystemTime::now(), &|| true).stale, 0);
     assert!(dir.exists(), "a hint being published is not collected");
     drop(guard);
-    assert_eq!(collect(&tmp, true, SystemTime::now()).stale, 1);
+    assert_eq!(collect(&tmp, true, SystemTime::now(), &|| true).stale, 1);
     assert!(!dir.exists());
     assert!(
         PublishGuard::acquire(&dir).is_none(),
@@ -188,7 +188,7 @@ fn a_directory_replaced_before_the_lock_is_never_removed() {
         backdate(path, OLD);
         *publisher.borrow_mut() = Some(PublishGuard::acquire(path).expect("publisher lock"));
     };
-    let found = collect_with(&tmp, true, SystemTime::now(), &replace);
+    let found = collect_with(&tmp, true, SystemTime::now(), &|| true, &replace);
     assert_eq!(found.stale, 0);
     assert!(
         dir.join(KEY_FILE).exists(),
@@ -196,4 +196,36 @@ fn a_directory_replaced_before_the_lock_is_never_removed() {
     );
     assert!(tmp.join("moved-away").exists());
     drop(publisher);
+}
+
+/// Safety is asked again right before each removal: when an unsafe publisher appears mid-pass,
+/// the hints not yet removed stay, though they were judged stale.
+#[test]
+fn an_unsafe_publisher_appearing_mid_pass_keeps_the_remaining_hints() {
+    let tmp = scratch("mid-pass");
+    let gone_key = tmp.join("deleted/.git");
+    for slot in ["00000000000000d1", "00000000000000d2", "00000000000000d3"] {
+        hint(&tmp, slot, Some(&gone_key), OLD);
+    }
+    let asked = std::cell::Cell::new(0);
+    // Safe for the first removal only: an old front starts after that.
+    let safe = || {
+        asked.set(asked.get() + 1);
+        asked.get() == 1
+    };
+    let found = collect(&tmp, true, SystemTime::now(), &safe);
+    assert_eq!(found, Collection { hints: 3, stale: 1 });
+    assert_eq!(asked.get(), 3, "asked before every removal, never skipped");
+    let left = fs::read_dir(&tmp)
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("ai-k-")
+        })
+        .count();
+    assert_eq!(left, 2);
 }
