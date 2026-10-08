@@ -1711,11 +1711,13 @@ pub(crate) mod testing {
                 let Some(failing) = serving else {
                     return Err(crate::assistance::reply::FailureCode::ProviderLoading);
                 };
-                if !self.sessions.contains_key(&binding) {
+                if let std::collections::btree_map::Entry::Vacant(slot) =
+                    self.sessions.entry(binding)
+                {
                     let session = fixture_open_session(source, failing)
                         .await
                         .map_err(|_| crate::assistance::reply::FailureCode::ProviderUnavailable)?;
-                    self.sessions.insert(binding, session);
+                    slot.insert(session);
                 }
                 Ok(())
             })
