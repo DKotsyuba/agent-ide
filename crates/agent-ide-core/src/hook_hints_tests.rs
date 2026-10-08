@@ -55,15 +55,12 @@ fn only_hints_nothing_can_use_are_collected() {
 
     let stale = hint(&tmp, "0000000000000001", Some(&gone_key), OLD);
     let empty = hint(&tmp, "0000000000000002", None, OLD);
-    let unusable = {
-        let dir = hint(
-            &tmp,
-            "0000000000000003",
-            Some(Path::new("relative/key")),
-            OLD,
-        );
-        dir
-    };
+    let unusable = hint(
+        &tmp,
+        "0000000000000003",
+        Some(Path::new("relative/key")),
+        OLD,
+    );
     let live = hint(&tmp, "0000000000000004", Some(&live_key), OLD);
     let runtime = hint(&tmp, "0000000000000005", Some(&served_key), OLD);
     let young = hint(
