@@ -12367,6 +12367,22 @@ async fn configured_product_pending_call_and_old_reference_survive_a_crash_only_
         .await;
     let started = actor.settle(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
+    // With a live activation on the replacement the old reference is still not a result: it is
+    // refused as the typed `invalid_detail` error, and a fresh read answers.
+    let stale = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
+        .await;
+    assert_eq!(stale["state"], "error", "{stale}");
+    assert_eq!(stale["code"], "invalid_detail", "{stale}");
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"src/lib.rs","lines":"1-2"}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    assert_eq!(read["kind"], "read", "{read}");
     actor.mcp.close().await;
     replacement.kill().await.unwrap();
     replacement.wait().await.unwrap();
