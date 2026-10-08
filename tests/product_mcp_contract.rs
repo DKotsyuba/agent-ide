@@ -11022,7 +11022,9 @@ async fn product_graph_names_use_sites_the_server_cannot_outline() {
 }
 
 /// A second worktree of the repository inherits the name index by content: its activation card
-/// reports the index summary at once and its first `.btn` card answers inline.
+/// reports the index summary at once and its first `.btn` card carries the inherited rows. The
+/// card is settled rather than timed, so a loaded host that answers it as `pending` first still
+/// passes; only a card without the inherited rows fails.
 #[tokio::test]
 async fn product_second_worktree_inherits_the_name_index() {
     let fixture = ProductFixture::new(json!([]));
@@ -11413,28 +11415,34 @@ async fn configured_product_cold_symbol_test_accepts_inline_or_pending() {
     daemon.wait().await.unwrap();
 }
 
-/// Proves warm Rust outline and symbol calls finish inline without pending inspection round trips.
+/// Proves warm Rust outline and symbol calls answer with their closed result once settled.
 ///
-/// Correctness only: the replies are `complete` (the daemon's own inline wait bounds them) and no
-/// call takes a pending round trip. The wall-clock bound lives in
-/// [`configured_product_warm_rust_calls_stay_within_three_seconds`], so a loaded host fails the
-/// timing job and never this one.
+/// Correctness only: each call settles (a `pending` first reply on a loaded host is followed
+/// through `ide.inspect`) to a `complete` outline or symbol card. Whether the reply was inline and
+/// how long it took live in [`configured_product_warm_rust_calls_stay_within_three_seconds`], so a
+/// loaded host fails the timing job and never this one.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment"]
 async fn configured_product_warm_rust_calls_complete_inline() {
     warm_rust_inline_replies(false).await;
 }
 
-/// The timing half of the warm Rust inline contract: the same warm calls finish within three
-/// seconds each. Load-sensitive by nature, so it is a separate ignored test (the performance job),
-/// never part of the correctness gate.
+/// The timing half of the warm Rust inline contract: the same warm calls answer `complete`
+/// inline, without a pending round trip, within three seconds each. Load-sensitive by nature, so
+/// it is a separate ignored test (the performance job), never part of the correctness gate.
 #[tokio::test]
 #[ignore = "timing: requires accepted AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment and an unloaded host"]
 async fn configured_product_warm_rust_calls_stay_within_three_seconds() {
     warm_rust_inline_replies(true).await;
 }
 
-/// Shared body of the two warm Rust inline tests; `timed` adds the three-second bound per call.
+/// Shared body of the two warm Rust inline tests.
+///
+/// Owns a [`symbol_test_fixture`], one daemon and one actor, all closed before return (a failed
+/// assertion panics first and the fixture's `Drop` removes its directories). Both modes warm the
+/// analyzer the same way. `timed` additionally requires the first reply of each call to be
+/// `complete` (no pending round trip) within three seconds; untimed, any reply that settles to
+/// `complete` passes. Panics on the first violated expectation.
 async fn warm_rust_inline_replies(timed: bool) {
     let fixture = symbol_test_fixture();
     let mut daemon = fixture.daemon().await;
@@ -11474,6 +11482,11 @@ async fn warm_rust_inline_replies(timed: bool) {
         let began = tokio::time::Instant::now();
         let reply = actor.call(&fixture, tool, params).await;
         let elapsed = began.elapsed();
+        let reply = if timed {
+            reply
+        } else {
+            actor.settle(&fixture, reply).await
+        };
         assert_eq!(reply["state"], "complete", "{tool}: {reply}");
         assert!(
             !timed || elapsed < Duration::from_secs(3),
