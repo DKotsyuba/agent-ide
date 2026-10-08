@@ -87,6 +87,9 @@ struct CallFacts {
     binding: Option<super::host_binding::BindingRef>,
     /// The binding's activation role *before* the call ran (a stop removes it).
     role: Option<errorlog::Role>,
+    /// Set by the inspection this call performs when it hands a retained terminal result to the
+    /// call's caller; this call's own flag, shared with no other inspection.
+    delivery: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The closed cause a guard refusal is reported with.
@@ -1279,16 +1282,17 @@ impl ProductDispatcher {
                         worker.stop(invocation, method.opaque_attachment()).await
                     }
                     AssistanceMethod::Inspect => {
+                        let inspection = worker.inspect(
+                            invocation.binding_ref().clone(),
+                            call.parameters()["detail_ref"]
+                                .as_str()
+                                .or_cause(HostBindingCause::InvalidParameters)?
+                                .to_owned(),
+                            method.opaque_attachment(),
+                            None,
+                        );
                         worker
-                            .inspect(
-                                invocation.binding_ref().clone(),
-                                call.parameters()["detail_ref"]
-                                    .as_str()
-                                    .or_cause(HostBindingCause::InvalidParameters)?
-                                    .to_owned(),
-                                method.opaque_attachment(),
-                                None,
-                            )
+                            .with_delivery(facts.delivery.clone(), inspection)
                             .await
                     }
                     AssistanceMethod::Context
@@ -1303,14 +1307,15 @@ impl ProductDispatcher {
                             .await
                     }
                     _ => {
+                        let submission = worker.submit(
+                            invocation,
+                            tool,
+                            call.parameters().clone(),
+                            &target_attachment,
+                            Some(method.correlation_id()),
+                        );
                         worker
-                            .submit(
-                                invocation,
-                                tool,
-                                call.parameters().clone(),
-                                &target_attachment,
-                                Some(method.correlation_id()),
-                            )
+                            .with_delivery(facts.delivery.clone(), submission)
                             .await
                     }
                 };
@@ -1499,10 +1504,12 @@ impl AssistanceDispatcher for ProductDispatcher {
                                     .as_deref()
                                     .is_some_and(|reference| worker.reference_degraded(reference))
                         });
-                    // The inspection path itself says whether it delivered a retained result.
+                    // The inspection this very call performed says whether it delivered a retained
+                    // terminal result (a flag of this call alone); only a call that retrieves a
+                    // result by reference carries it.
                     let delivered = requested
-                        .as_deref()
-                        .and_then(|reference| Some(self.worker.as_ref()?.take_delivery(reference)));
+                        .as_ref()
+                        .map(|_| facts.delivery.load(std::sync::atomic::Ordering::Acquire));
                     // The front's actor query is the product's own probe, not an agent's call.
                     let probe = envelope
                         .as_ref()

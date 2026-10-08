@@ -537,6 +537,16 @@ struct Inspection {
     expected: Option<(AssistanceTool, [u8; 32])>,
     /// Finite IPC caller waiting for the current authorized result.
     reply: oneshot::Sender<PeerReply>,
+    /// Set by the inspection when it hands a retained terminal result to this caller (QW-4); the
+    /// flag of the invocation that asked for it through [`WorkerHandle::with_delivery`], so it is
+    /// never shared with another inspection.
+    delivery: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+tokio::task_local! {
+    /// The delivery flag of the dispatch currently awaiting an inspection (see
+    /// [`WorkerHandle::with_delivery`]).
+    static DELIVERY: Arc<std::sync::atomic::AtomicBool>;
 }
 
 /// Cloneable state shared by ingress and the single worker task, never by independent worker loops.
@@ -602,11 +612,6 @@ struct Shared {
     /// every successful inspection of that result is journaled as degraded too (QW-4). Bounded
     /// like [`Shared::requests`].
     degraded_references: Mutex<RequestIds>,
-    /// References whose retained result an inspection just delivered to its caller (typed
-    /// evidence from the inspection path itself, QW-4); the inspection's journal line takes it.
-    /// A refused retrieval (stale authority, expired or unknown reference, ...) never sets it.
-    /// Bounded like [`Shared::requests`].
-    delivered: Mutex<RequestIds>,
 }
 
 /// Most queued-job call ids [`Shared::requests`] and [`Shared::degraded`] keep; past it the oldest
@@ -660,17 +665,6 @@ impl Shared {
         {
             degraded.insert(request);
         }
-    }
-
-    /// Takes the evidence that an inspection delivered the result retained under `reference`.
-    fn take_delivery(&self, reference: &str) -> bool {
-        self.delivered.lock().is_ok_and(|mut delivered| {
-            let present = delivered.by_reference.remove(reference).is_some();
-            if present {
-                delivered.order.retain(|kept| kept != reference);
-            }
-            present
-        })
     }
 
     /// Whether the answer retained under `reference` was built through a weaker path; unlike
@@ -1180,7 +1174,6 @@ impl WorkerHandle {
                 requests: Mutex::default(),
                 degraded: Mutex::default(),
                 degraded_references: Mutex::default(),
-                delivered: Mutex::default(),
             }),
             inspect,
             receiver: Mutex::new(Some(receiver)),
@@ -1689,6 +1682,7 @@ impl WorkerHandle {
             reference,
             expected,
             reply,
+            delivery: DELIVERY.try_with(Arc::clone).ok(),
         });
         wait.await.unwrap_or(PeerReply::Error {
             code: FailureCode::Internal,
@@ -1746,10 +1740,16 @@ impl WorkerHandle {
         self.shared.take_degraded(request)
     }
 
-    /// Takes the typed evidence that an inspection just delivered the retained result behind
-    /// `reference` to its caller (QW-4); `false` for a refused retrieval.
-    pub fn take_delivery(&self, reference: &str) -> bool {
-        self.shared.take_delivery(reference)
+    /// Runs `future` (a [`Self::inspect`] or [`Self::submit`] of one call) so that an inspection it
+    /// performs sets `delivery` when it hands a retained terminal result to this call's caller
+    /// (QW-4). The flag is per call: it is the typed evidence the call's journal line reports,
+    /// and no other inspection can set or take it.
+    pub async fn with_delivery<F: std::future::Future>(
+        &self,
+        delivery: Arc<std::sync::atomic::AtomicBool>,
+        future: F,
+    ) -> F::Output {
+        DELIVERY.scope(delivery, future).await
     }
 
     /// Whether the result behind `reference` was built through a weaker path (QW-4); retained, so
@@ -5672,19 +5672,24 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
         Ok::<_, InspectFailure>(reply)
     }
     .await;
-    // A retained job result reached the caller: the inspection path itself says so, whatever the
-    // result is (a cached failed read is delivered too), unlike a refused retrieval.
-    if result.is_ok()
+    // Whether this very inspection hands a retained terminal job result to its caller (QW-4): the
+    // inspection path itself says so, whatever the result is (a cached failed read is delivered
+    // too), unlike a refused retrieval, a test-run status or a result still `pending`.
+    let retrieved = result.is_ok()
         && test_run_handle(&request.reference).is_none()
-        && poll_hint_run(&request.reference).is_none()
-        && let Ok(mut delivered) = shared.delivered.lock()
-    {
-        delivered.insert(request.reference.clone(), String::new());
-    }
+        && poll_hint_run(&request.reference).is_none();
     let reply = result.unwrap_or_else(|failure| PeerReply::Error {
         code: failure.code,
         detail: Some(failure.stage),
     });
+    if retrieved
+        && !matches!(reply, PeerReply::Pending { .. })
+        && let Some(delivery) = &request.delivery
+    {
+        // The flag belongs to this one invocation, so no other inspection of the reference (or
+        // of another binding's) can take it; a caller that already left never reads it.
+        delivery.store(true, std::sync::atomic::Ordering::Release);
+    }
     // This is the actual submission boundary for the managed path: `reply` is about to be handed
     // to the real caller of either the initial `submit()` or a later `ide.inspect`. Marking must
     // wait for the send's own outcome — a request whose receiving side already closed must not
@@ -7977,7 +7982,6 @@ mod stop_retry_tests {
                 requests: Mutex::default(),
                 degraded: Mutex::default(),
                 degraded_references: Mutex::default(),
-                delivered: Mutex::default(),
             }),
             workspace,
             observations: WorkspaceStore::new(store),
@@ -9188,9 +9192,11 @@ mod stop_retry_tests {
         );
     }
 
-    /// QW-4: the inspection path itself says whether it delivered a retained result: a settled
-    /// success and a cached *failed* result are delivered, a reference this daemon never minted or
-    /// no longer retains is not, and the evidence is taken once.
+    /// QW-4: delivery evidence is a flag of one inspection invocation, set only when that very
+    /// inspection hands a retained terminal result to its caller: a settled success and a cached
+    /// *failed* result are delivered; a reference this daemon never minted or no longer retains, a
+    /// result still `pending`, and a caller that already left are not — and no other inspection of
+    /// the same reference can take or inherit the evidence.
     #[tokio::test]
     async fn inspection_reports_typed_delivery_evidence() {
         let fixture = Fixture::new();
@@ -9233,48 +9239,97 @@ mod stop_retry_tests {
                     detail: Some("store:busy".into()),
                 }),
             );
+            ledger.details.insert(
+                "pending-ref".into(),
+                retained(PeerReply::Pending {
+                    detail_ref: "pending-ref".into(),
+                }),
+            );
         }
-        let inspect = |reference: &str| {
+        // One inspection invocation: its own flag and whether its caller stays to receive.
+        let inspect = |reference: &str, caller_stays: bool| {
+            let delivery = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (reply, reply_rx) = oneshot::channel();
             let request = Inspection {
                 binding: binding.clone(),
                 reference: reference.to_owned(),
                 expected: None,
                 reply,
+                delivery: Some(delivery.clone()),
             };
             let (workspace, shared) = (&worker.workspace, &worker.shared);
             async move {
+                if !caller_stays {
+                    drop(reply_rx);
+                    serve_inspection(workspace, shared, request).await;
+                    return (None, delivery.load(std::sync::atomic::Ordering::Acquire));
+                }
                 serve_inspection(workspace, shared, request).await;
-                reply_rx.await.unwrap()
+                (
+                    Some(reply_rx.await.unwrap()),
+                    delivery.load(std::sync::atomic::Ordering::Acquire),
+                )
             }
         };
-        assert!(matches!(
-            inspect("ok-ref").await,
-            PeerReply::Complete { .. }
-        ));
-        assert!(worker.shared.take_delivery("ok-ref"));
-        assert!(!worker.shared.take_delivery("ok-ref"), "taken once");
-        assert!(matches!(
-            inspect("failed-ref").await,
-            PeerReply::Error {
-                code: FailureCode::Capacity,
-                ..
-            }
-        ));
+        let (reply, delivered) = inspect("ok-ref", true).await;
+        assert!(matches!(reply, Some(PeerReply::Complete { .. })) && delivered);
+        let (reply, delivered) = inspect("failed-ref", true).await;
         assert!(
-            worker.shared.take_delivery("failed-ref"),
+            matches!(
+                reply,
+                Some(PeerReply::Error {
+                    code: FailureCode::Capacity,
+                    ..
+                })
+            ) && delivered,
             "a cached failed result is delivered"
         );
+        let (reply, delivered) = inspect("pending-ref", true).await;
+        assert!(
+            matches!(reply, Some(PeerReply::Pending { .. })) && !delivered,
+            "a result still pending is not a delivered terminal result"
+        );
+        let (reply, delivered) = inspect("never-minted-ref", true).await;
+        assert!(
+            matches!(
+                reply,
+                Some(PeerReply::Error {
+                    code: FailureCode::InvalidDetail,
+                    ..
+                })
+            ) && !delivered,
+            "a refused retrieval delivers nothing"
+        );
+        // A caller that already left (receiver dropped): its own invocation is never read, and the
+        // next inspection of the same reference starts from its own clean flag — here a refusal
+        // (another binding's view of the reference) must not inherit a stale true.
+        let (_, _) = inspect("ok-ref", false).await;
+        let (other_reply, other_rx) = oneshot::channel();
+        let other_delivery = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        serve_inspection(
+            &worker.workspace,
+            &worker.shared,
+            Inspection {
+                binding: production_call(&worker, "delivery-other", "other-call")
+                    .binding_ref()
+                    .clone(),
+                reference: "ok-ref".into(),
+                expected: None,
+                reply: other_reply,
+                delivery: Some(other_delivery.clone()),
+            },
+        )
+        .await;
         assert!(matches!(
-            inspect("never-minted-ref").await,
+            other_rx.await.unwrap(),
             PeerReply::Error {
                 code: FailureCode::InvalidDetail,
                 ..
             }
         ));
         assert!(
-            !worker.shared.take_delivery("never-minted-ref"),
-            "a refused retrieval delivers nothing"
+            !other_delivery.load(std::sync::atomic::Ordering::Acquire),
+            "a refused inspection of the same reference inherits nothing from a dropped one"
         );
     }
 
@@ -10381,6 +10436,7 @@ mod stop_retry_tests {
                     reference: job.reference.clone(),
                     expected: None,
                     reply: reply_tx,
+                    delivery: None,
                 },
             )
             .await;
@@ -10496,6 +10552,7 @@ mod stop_retry_tests {
                     reference: job.reference.clone(),
                     expected: None,
                     reply: reply_tx,
+                    delivery: None,
                 },
             )
             .await;
@@ -10602,6 +10659,7 @@ mod stop_retry_tests {
                 reference: "never-retained".into(),
                 expected: None,
                 reply: reply_tx,
+                delivery: None,
             },
         )
         .await;
@@ -10652,6 +10710,7 @@ mod stop_retry_tests {
                 reference: "foreign-detail".into(),
                 expected: None,
                 reply: reply_tx,
+                delivery: None,
             },
         )
         .await;
@@ -10938,6 +10997,7 @@ mod stop_retry_tests {
                 reference,
                 expected: None,
                 reply: reply_tx,
+                delivery: None,
             };
             let (workspace, shared) = (&worker.workspace, &worker.shared);
             async move {
@@ -10997,6 +11057,7 @@ mod stop_retry_tests {
                     reference,
                     expected: None,
                     reply: reply_tx,
+                    delivery: None,
                 },
             )
             .await;
@@ -11137,6 +11198,7 @@ mod stop_retry_tests {
                 reference: "start-first".into(),
                 expected: Some((AssistanceTool::Start, selection(&retry))),
                 reply: reply_tx,
+                delivery: None,
             },
         )
         .await;
@@ -11682,6 +11744,7 @@ mod stop_retry_tests {
                     reference: "never-issued".to_owned(),
                     expected: None,
                     reply: reply_tx,
+                    delivery: None,
                 },
             )
             .await;
