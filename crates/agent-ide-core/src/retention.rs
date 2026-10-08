@@ -221,6 +221,136 @@ fn try_exclusive(path: &Path) -> Option<File> {
     flock(&file, libc::LOCK_EX | libc::LOCK_NB).then_some(file)
 }
 
+/// Names `launch` in the marker of its telemetry store directory `store`, atomically, so a store
+/// the launch uses is never left marker-less (which keeps it behind the machine-wide `any` lease).
+///
+/// `store` must be exactly `<state_root>/telemetry/<full BLAKE3 hex of launch>`, with all three
+/// being private real directories. The shared lease of `launch` is taken first (a sweeper's claim,
+/// which locks that lease or `any`, then cannot run) and the chain and the store's identity are
+/// validated again under it, so a store a sweeper moved to trash or a directory replaced while
+/// waiting is refused. The marker is written to a fresh `0600` sibling, synced and renamed over
+/// any existing one, then read back. An existing marker that is a private regular file already
+/// naming `launch` is left untouched; one with other content (a torn write) or a non-private mode
+/// is replaced (so a historical `0644` marker is migrated to `0600`); a symlink, any other non-file or a marker writable by others is refused, never followed. A live telemetry
+/// writer is unaffected (the marker is no part of its SQLite state, and its lock is not taken).
+/// Publishing counts as a use of the store: it touches the directory's mtime, which delays its
+/// idle expiry by up to the idle age (the launch is a use anyway).
+pub fn adopt_marker(state_root: &Path, store: &Path, launch: &Path) -> std::io::Result<()> {
+    use std::io::{Error, Read as _, Write as _};
+    let refused = |message: &'static str| Error::new(ErrorKind::InvalidInput, message);
+    let digest = blake3::hash(launch.as_os_str().as_bytes()).to_hex();
+    let telemetry = state_root.join("telemetry");
+    if !launch.is_absolute()
+        || store.file_name().map(OsStr::as_bytes) != Some(digest.as_bytes())
+        || store.parent() != Some(telemetry.as_path())
+    {
+        return Err(refused("not the telemetry store of this launch directory"));
+    }
+    // The three directories are private real directories; returns the store's identity.
+    let chain = || -> std::io::Result<(u64, u64)> {
+        let private =
+            |dir: &Path| safe_dir(dir) && fs::metadata(dir).is_ok_and(|m| m.mode() & 0o077 == 0);
+        if ![state_root, telemetry.as_path(), store]
+            .into_iter()
+            .all(private)
+        {
+            return Err(refused("telemetry state is not private"));
+        }
+        let metadata = fs::symlink_metadata(store)?;
+        Ok((metadata.dev(), metadata.ino()))
+    };
+    let before = chain()?;
+    let _lease = Lease::acquire(state_root, launch)
+        .ok_or_else(|| Error::new(ErrorKind::PermissionDenied, "worktree lease unavailable"))?;
+    if chain()? != before {
+        return Err(refused(
+            "telemetry store changed while waiting for its lease",
+        ));
+    }
+    let marker = store.join(MARKER_FILE_NAME);
+    let wanted = launch.as_os_str().as_bytes();
+    // `Some(true)` when the marker is a private regular file of this user naming exactly
+    // `launch`, `Some(false)` when it is one with other content or a wider mode, `None` when
+    // missing; anything else is an error.
+    let current = || -> std::io::Result<Option<bool>> {
+        let metadata = match fs::symlink_metadata(&marker) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        // SAFETY: `geteuid` has no preconditions.
+        if !metadata.file_type().is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "marker is not a file of this user",
+            ));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&marker)?;
+        let opened = file.metadata()?;
+        if (opened.dev(), opened.ino()) != (metadata.dev(), metadata.ino()) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "marker was replaced while read",
+            ));
+        }
+        // Version 0.10.6 wrote markers with the process umask (`0644`): safe inside the private
+        // store, republished as `0600`. A marker others can write is refused.
+        if opened.mode() & 0o022 != 0 {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "marker is writable by others",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(wanted.len() as u64 + 1).read_to_end(&mut bytes)?;
+        Ok(Some(bytes == wanted && opened.mode() & 0o077 == 0))
+    };
+    if current()? == Some(true) {
+        return Ok(());
+    }
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = store.join(format!(
+        "{MARKER_FILE_NAME}.{}-{nanos}.tmp",
+        std::process::id()
+    ));
+    let published = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.write_all(wanted)?;
+            file.sync_all()
+        })
+        .and_then(|()| {
+            if chain()? != before {
+                return Err(refused(
+                    "telemetry store changed before its marker was published",
+                ));
+            }
+            fs::rename(&temporary, &marker)
+        });
+    if let Err(error) = published {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if current()? == Some(true) {
+        Ok(())
+    } else {
+        Err(Error::new(
+            ErrorKind::InvalidData,
+            "marker changed while it was published",
+        ))
+    }
+}
+
 /// One cache family the sweep manages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {

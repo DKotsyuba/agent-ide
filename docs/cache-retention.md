@@ -50,6 +50,25 @@ after the next quiet period. WAL and shared-memory files are never unlinked or e
 product, and no routine `VACUUM` runs; a store that no process owns is only ever reduced by the
 SQLite connection of its next owner or removed whole by the rules above.
 
+## Telemetry marker adoption
+
+Every managed launch publishes the marker of its telemetry store before the daemon is started
+(`retention::adopt_marker`, called from `managed_telemetry_database_in`), so no new store waits
+behind the machine-wide `any` lease. The store must be exactly
+`<state root>/telemetry/<full BLAKE3 hex of the launch directory>`, and all three directories
+private; the launch directory's shared lease is held meanwhile (a sweeper's claim locks that lease,
+or `any` for a marker-less store, so it cannot run) and the chain and the store's identity are
+validated again under it. The marker is a fresh `0600` file synced and renamed over the old one, then
+read back: a marker already naming the launch is left alone, a torn one or a historical `0644`
+one (0.10.6 wrote them with the umask) is replaced, a symlink, other non-file or marker writable by
+others is refused. A live writer is unaffected (its lock is not taken and no SQLite state is
+touched). Publishing counts as a use of the store: it touches the directory's mtime, which delays
+its idle expiry. When the marker cannot be published the launch does not create a persistent
+store: the failed (empty) directory is removed, the daemon starts with its runtime-local telemetry
+database, and `errors` shows `daemon unavailable … telemetry_marker_unavailable:<io kind>`. Stores
+written before this version and never relaunched stay marker-less and keep the `any` rule above;
+nothing guesses their launch directory from the digest.
+
 ## When
 
 Each long-lived daemon runs a background task: the first sweep 60 seconds after start (so a

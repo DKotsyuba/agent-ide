@@ -724,3 +724,171 @@ fn sweeps_are_serialized_and_spaced() {
         "an explicit prune ignores the spacing"
     );
 }
+
+/// Creates `<home>/telemetry/<digest of launch>` as a private store with a small database file.
+fn marker_less_store(home: &Path, launch: &Path) -> PathBuf {
+    let store = home.join("telemetry").join(
+        blake3::hash(launch.as_os_str().as_bytes())
+            .to_hex()
+            .as_str(),
+    );
+    fs::create_dir_all(&store).unwrap();
+    for dir in [home.join("telemetry"), store.clone()] {
+        fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    }
+    fs::write(store.join("state.sqlite"), vec![1u8; 4096]).unwrap();
+    store
+}
+
+/// Adopting publishes a private marker naming the launch directory, leaves a correct one alone,
+/// migrates a historical `0644` one and repairs a torn one, never leaving a temporary file.
+#[test]
+fn adopting_a_marker_publishes_migrates_and_repairs_atomically() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let home = scratch("adopt");
+    let launch = home.join("project");
+    let store = marker_less_store(&home, &launch);
+    let marker = store.join(MARKER_FILE_NAME);
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let id = |path: &Path| fs::metadata(path).unwrap().ino();
+
+    adopt_marker(&home, &store, &launch).unwrap();
+    assert_eq!(fs::read(&marker).unwrap(), launch.as_os_str().as_bytes());
+    assert_eq!(mode(&marker), 0o600);
+
+    // A correct private marker is not rewritten.
+    let before = id(&marker);
+    adopt_marker(&home, &store, &launch).unwrap();
+    assert_eq!(id(&marker), before);
+
+    // A 0.10.6 marker (`fs::write` under umask 022) is safe and migrated to 0600.
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
+    adopt_marker(&home, &store, &launch).unwrap();
+    assert_eq!(mode(&marker), 0o600);
+    assert_ne!(id(&marker), before);
+
+    // A torn marker is replaced whole, and one writable by others is refused.
+    fs::write(&marker, b"/proj").unwrap();
+    adopt_marker(&home, &store, &launch).unwrap();
+    assert_eq!(fs::read(&marker).unwrap(), launch.as_os_str().as_bytes());
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(adopt_marker(&home, &store, &launch).is_err());
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let names: Vec<_> = fs::read_dir(&store)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        names.len(),
+        2,
+        "only the database and the marker remain: {names:?}"
+    );
+}
+
+/// A symlink or directory at the marker path, a store outside `<root>/telemetry`, one that is not
+/// named by the launch's digest, and a nonprivate store are all refused without touching anything.
+#[test]
+fn adopting_a_marker_refuses_unsafe_or_misplaced_state() {
+    let home = scratch("adopt-refused");
+    let launch = home.join("project");
+    let store = marker_less_store(&home, &launch);
+    let marker = store.join(MARKER_FILE_NAME);
+    let outside = home.join("outside");
+    fs::write(&outside, b"keep").unwrap();
+
+    std::os::unix::fs::symlink(&outside, &marker).unwrap();
+    assert!(adopt_marker(&home, &store, &launch).is_err());
+    assert_eq!(fs::read(&outside).unwrap(), b"keep");
+    fs::remove_file(&marker).unwrap();
+    fs::create_dir(&marker).unwrap();
+    assert!(adopt_marker(&home, &store, &launch).is_err());
+    fs::remove_dir(&marker).unwrap();
+
+    // Wrong root, wrong name, nonprivate store, replaced-by-symlink store.
+    let other_root = scratch("adopt-other-root");
+    assert!(adopt_marker(&other_root, &store, &launch).is_err());
+    assert!(adopt_marker(&home, &store, &home.join("another")).is_err());
+    let loose = marker_less_store(&home, &home.join("loose"));
+    fs::set_permissions(&loose, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    assert!(adopt_marker(&home, &loose, &home.join("loose")).is_err());
+    let moved = home.join("moved-away");
+    fs::rename(&store, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &store).unwrap();
+    assert!(adopt_marker(&home, &store, &launch).is_err());
+    assert!(!moved.join(MARKER_FILE_NAME).exists());
+}
+
+/// A live telemetry writer (its lifetime lock held) does not stop the marker from being
+/// published, and the lock stays held.
+#[test]
+fn adopting_a_marker_leaves_a_live_writer_alone() {
+    let home = scratch("adopt-writer");
+    let launch = home.join("project");
+    let store = marker_less_store(&home, &launch);
+    let writer = try_exclusive(&store.join(TELEMETRY_LOCK)).expect("writer lock");
+    adopt_marker(&home, &store, &launch).unwrap();
+    assert_eq!(
+        fs::read(store.join(MARKER_FILE_NAME)).unwrap(),
+        launch.as_os_str().as_bytes()
+    );
+    assert!(
+        try_exclusive(&store.join(TELEMETRY_LOCK)).is_none(),
+        "the writer still holds its lock"
+    );
+    drop(writer);
+}
+
+/// Adoption waits for a sweeper's exclusive claim, and refuses when the store it validated was
+/// moved to trash and replaced meanwhile instead of publishing into the stranger.
+#[test]
+fn adopting_a_marker_waits_for_a_claim_and_revalidates_the_store() {
+    let home = scratch("adopt-claim");
+    let launch = home.join("project");
+    let store = marker_less_store(&home, &launch);
+    let key = worktree_key(&launch);
+    let claim = try_exclusive(&home.join(LOCKS_DIR).join(format!("{key}.lock"))).expect("claim");
+
+    let adopting = {
+        let (home, store, launch) = (home.clone(), store.clone(), launch.clone());
+        std::thread::spawn(move || adopt_marker(&home, &store, &launch))
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !adopting.is_finished(),
+        "adoption waits behind the exclusive claim"
+    );
+    // The sweeper's rename: the validated directory is gone, another one takes its name.
+    fs::rename(&store, home.join("trashed")).unwrap();
+    let replacement = marker_less_store(&home, &launch);
+    drop(claim);
+    assert!(
+        adopting.join().unwrap().is_err(),
+        "the replaced store is refused"
+    );
+    assert!(!replacement.join(MARKER_FILE_NAME).exists());
+}
+
+/// The report's starvation case: a marker-less store is held by any unrelated lease, the adopted
+/// store (its launch directory gone) is claimable at once.
+#[test]
+fn an_adopted_store_is_no_longer_protected_by_an_unrelated_lease() {
+    let home = scratch("adopt-starvation");
+    let launch = home.join("deleted-project");
+    let store = marker_less_store(&home, &launch);
+    backdate(&store, 40 * DAY);
+    let unrelated = Lease::acquire(&home, &home.join("somewhere-else")).expect("lease");
+    let kept = sweep_with(&home, false, SystemTime::now(), &nobody);
+    assert_eq!(
+        verdict(&kept, &store).fate,
+        Fate::InUse,
+        "marker-less waits for any lease"
+    );
+
+    // Adoption takes the launch lease as well as the unrelated one held here.
+    adopt_marker(&home, &store, &launch).unwrap();
+    backdate(&store, 40 * DAY);
+    let freed = sweep_with(&home, false, SystemTime::now(), &nobody);
+    assert_eq!(verdict(&freed, &store).fate, Fate::Removed);
+    drop(unrelated);
+}

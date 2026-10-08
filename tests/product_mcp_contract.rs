@@ -21230,6 +21230,80 @@ async fn eyes_codex_two_sessions_on_one_repository_deliver_once_across_routes() 
     std::fs::remove_dir_all(base).unwrap();
 }
 
+/// A telemetry store whose marker cannot be published is journaled, never ignored: with a
+/// directory preplaced where the launch marker belongs, the managed Codex MCP still starts and
+/// serves an activation, the foreign entry is left alone, no persistent telemetry database is
+/// created for the launch, and the repository journal carries `telemetry_marker_unavailable`.
+#[tokio::test]
+async fn an_unpublishable_telemetry_marker_is_journaled_and_the_managed_start_still_serves() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let home = fixture.base.join("home-marker");
+    let launch = std::fs::canonicalize(&fixture.root).unwrap();
+    let state = home.join(".agent-ide");
+    let store = state.join("telemetry").join(
+        blake3::hash(launch.as_os_str().as_bytes())
+            .to_hex()
+            .as_str(),
+    );
+    for dir in [&home, &state, &state.join("telemetry"), &store] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::fs::create_dir(store.join("worktree.path")).unwrap();
+    let base = rendezvous_area("marker-refused");
+    let root = base.join("rendezvous");
+    let mut mcp =
+        Mcp::start_managed_custom(&fixture.config, &fixture.root, Some(&home), Some(&root)).await;
+    let state_value = fixture.state();
+    let mut next = 100;
+    let started = managed_root_call(
+        &mut mcp,
+        next,
+        "marker-actor",
+        "marker-session",
+        "ide.start",
+        json!({"activation_id":"marker-start"}),
+        &state_value,
+    )
+    .await;
+    let started = settle_managed(&mut mcp, &mut next, "marker-actor", &state_value, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    assert!(
+        store.join("worktree.path").is_dir(),
+        "the foreign entry stays"
+    );
+    assert!(
+        !store.join("state.sqlite").exists(),
+        "no persistent store was started"
+    );
+
+    let journal = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let lines = std::fs::read_dir(state.join("logs"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .flat_map(|dir| agent_ide::errorlog::read_events(&dir.path()))
+                .map(|event| agent_ide::errorlog::format_line(&event))
+                .filter(|line| line.contains("telemetry_marker_unavailable"))
+                .collect::<Vec<_>>();
+            if !lines.is_empty() {
+                return lines;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the marker failure is journaled");
+    assert!(
+        journal[0].contains(" warn daemon unavailable "),
+        "{journal:?}"
+    );
+    mcp.close().await;
+    let _ = std::fs::remove_dir_all(base);
+}
+
 /// Managed Codex hook lifecycles that must never speak: a post without its pre, the MCP call's
 /// own paired native hooks in the real host order Pre → admission → Post, a call rejected before
 /// admission whose self-MCP post must stay silent, stop → restart → the old Post, malformed and
