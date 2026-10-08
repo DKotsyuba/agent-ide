@@ -327,10 +327,14 @@ struct Settlement {
 struct Lifecycle {
     /// Daemon `started` lines.
     daemon_starts: usize,
-    /// Daemon `failed` lines by `detail` (panics are `panic at ...`).
+    /// Daemon `failed` and `fatal` lines by their closed failure detail.
     daemon_failed: BTreeMap<String, usize>,
     /// Client `reestablished` lines.
     client_reestablished: usize,
+    /// Forced daemon replacements, counted as lifecycle events rather than tool calls.
+    forced_replacements: usize,
+    /// Panic evidence from daemon or job lines, counted once at the producer's journal site.
+    panics: BTreeMap<String, usize>,
     /// Hook warn lines by `detail`.
     hook_warns: BTreeMap<String, usize>,
 }
@@ -503,12 +507,16 @@ impl Report {
         });
     }
 
-    /// Counts daemon and hook lifecycle facts.
+    /// Counts daemon, client and hook lifecycle facts and panic evidence from any job, even
+    /// when nobody collected its result. These events never add a terminal tool call.
     fn lifecycle_line(&mut self, record: &Value) {
         let detail = text(record, "detail");
+        if detail.contains("panic at") {
+            *self.lifecycle.panics.entry(detail.to_owned()).or_default() += 1;
+        }
         match (text(record, "method"), text(record, "outcome")) {
             ("daemon", "started") => self.lifecycle.daemon_starts += 1,
-            ("daemon", "failed") => {
+            ("daemon", "failed" | "fatal") => {
                 *self
                     .lifecycle
                     .daemon_failed
@@ -523,6 +531,9 @@ impl Report {
                     .or_default() += 1;
             }
             ("client", "reestablished") => self.lifecycle.client_reestablished += 1,
+            ("client", "failed") if detail.starts_with("wedged_daemon_replaced") => {
+                self.lifecycle.forced_replacements += 1;
+            }
             ("hook", _) if text(record, "level") == "warn" => {
                 *self
                     .lifecycle
@@ -567,10 +578,8 @@ impl Report {
                 percent(ide, total)
             ));
         }
-        for (detail, count) in &self.lifecycle.daemon_failed {
-            if detail.contains("panic at") {
-                alerts.push(format!("{count} panic(s) journaled: {detail}"));
-            }
+        for (detail, count) in &self.lifecycle.panics {
+            alerts.push(format!("{count} panic(s) journaled: {detail}"));
         }
         alerts
     }
@@ -855,9 +864,10 @@ impl Report {
         let l = &self.lifecycle;
         let _ = writeln!(
             out,
-            "\ndaemon: {} starts, {} client re-establishments, failed: {}",
+            "\ndaemon: {} starts, {} client re-establishments, {} forced replacements, failed: {}",
             l.daemon_starts,
             l.client_reestablished,
+            l.forced_replacements,
             if l.daemon_failed.is_empty() {
                 "none".to_owned()
             } else {

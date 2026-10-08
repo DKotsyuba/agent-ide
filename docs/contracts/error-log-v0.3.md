@@ -69,9 +69,13 @@ daemon installs a panic hook (`errorlog::install_panic_hook`) that writes `metho
 `outcome` `failed`, `reason` `internal` with `detail` `panic at <file>:<line>:<column>` (the
 crate-relative source path the compiler recorded, or only the file name when it is absolute) and
 never the payload text, which can carry paths, source or secrets. A panic inside one job is caught
-by the worker (the call answers `internal`, the worker keeps serving) and journaled once under the
-call's own `method` and `correlation` with `detail` `panic at <file>:<line>:<column> during
-<method>`; the hook leaves those to the catcher so one panic is one line.
+by the worker (the call answers `internal`, or an edit answers `outcome_unknown`) and journaled once
+under the call's own `method`, `correlation` and `request` with `detail`
+`panic at <file>:<line>:<column> during <method>`; the hook leaves those to the catcher so one panic
+is one line. The daemon is then marked failed and exits crash-only. Other caught machinery panics
+are journaled by containment as `daemon fatal`, reason `internal`, with the closed cause and panic
+location. The report alerts from either original panic record, even when nobody inspects the job;
+the separate `job_panic` daemon-fatal line never duplicates the consumed panic evidence.
 
 Every typed tool reply leaving the dispatcher is logged once from the dispatcher itself
 (`adapters::log_tool_reply`), independently of whether the durable telemetry sink is available:
@@ -110,7 +114,8 @@ Fields (all closed values or opaque ids; never source text, a path, a model-chos
 request value):
 
 - `version` — the serving product version (`CARGO_PKG_VERSION`), on every dispatch, front and
-  daemon-failure line. Its presence marks a line of the current format.
+  staged daemon-failure line. Its presence marks a line of the current format; containment's
+  `daemon fatal` lines are recognized by their lifecycle tags even without this field.
 - `role` — `reader`, `writer`, or `none` (the call has no activation). Read before the call ran, so
   a stop keeps its role.
 - `language` — the registered language id of the file the request names (by extension alone),
@@ -145,7 +150,9 @@ New records:
 - **Completion record** — a job that finishes after its caller was told `pending` writes one line
   with `detail` `pending_completion`, its `correlation` (the result reference), the job's `request`
   and its own classified outcome and reason (a refused or unknown edit is not a success). A failed
-  job keeps its existing job-failure line, which now carries `request` too.
+  job keeps its existing job-failure line, which now carries `request` too. Crash-drained queued
+  jobs use the same failure and lost-waiter completion journaling as normal execution; an edit
+  already settled as `outcome_unknown` retains that outcome, never a success.
 - **Front transport outcome** — a call whose front outcome carries no typed reply (invalid input,
   missing host metadata, transport unavailable, timed out, busy, outcome unknown, not
   re-established, incomplete, refused as restarting by a failed daemon) writes one line with
@@ -161,7 +168,12 @@ New records:
   payload cwd found no rendezvous of the session (QW-8), and `hook_project_dir_invalid` when a
   present `CLAUDE_PROJECT_DIR` cannot be resolved (the pre is then dropped locally).
 - **Daemon failure** — `daemon failed` carries `detail` `<stage>:<class>` (stage `initialize`,
-  `serving` or `shutdown`; class an application error name or `io:<ErrorKind>`).
+  `serving` or `shutdown`; class an application error name or `io:<ErrorKind>`). Crash containment's
+  `daemon fatal` lines also count as daemon failures.
+- **Forced replacement** — `client failed`, reason `deadline`, detail beginning
+  `wedged_daemon_replaced` records the verified holder pid, failed probes, their elapsed span and
+  whether `SIGKILL` was needed. The report counts and displays these as forced replacements in its
+  lifecycle summary, without adding another terminal tool call.
 
 Typed causes: no ingress exit of the dispatcher answers a bare `unavailable: host_binding`
 (`invalid_metadata`, `missing_field`, `invalid_parameters`, `unsupported_hook_phase`, `mismatch`,
@@ -187,7 +199,8 @@ daemon line shares a call id with each count once. Every failed call is one clas
 `fault` (known mechanism), `unexplained` (not attributable, counted with faults), `caller`
 (wrong request) and `honest` (correct refusal of real state). It prints per-day and per-class
 tables (known versus unexplained), splits by method and repository, the longest outage streak,
-pending settlement, daemon starts, failures and panics, and hook warns. `--scope field` (default)
+pending settlement, daemon starts, failures, panics and forced replacements, and hook warns.
+`--scope field` (default)
 excludes keys whose every worktree is a gate, matrix or acceptance clone.
 
 Alerts (exit status 1): the IDE-fault rate above `--alert-threshold` with at least `--min-calls`

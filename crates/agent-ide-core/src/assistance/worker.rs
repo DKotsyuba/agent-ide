@@ -2995,7 +2995,8 @@ impl<'a> Worker<'a> {
     /// repeat it on the replacement daemon; waiting for the connection to be dropped instead would
     /// turn a mutation into an unknown outcome it is not. An edit parked for its project check
     /// already wrote, so it answers its settled result with unknown diagnostics. Idempotent; the
-    /// queue is empty afterwards.
+    /// queue is empty afterwards. Failures and lost-waiter completions use the same terminal
+    /// journaling as normal execution, so an uncollected job remains attributable to its request.
     fn refuse_queued_after_failure(&mut self) {
         let queued: Vec<Job> = self
             .shared
@@ -3022,16 +3023,15 @@ impl<'a> Worker<'a> {
                     )),
                 },
             };
+            self.journal_job_failure(&job, &reply);
             self.shared
                 .complete(&job.reference, reply.clone(), None, None, job.native_epoch);
-            if let Some(sender) = job.stop_reply.take() {
-                let _ = sender.send(reply);
-            }
+            self.deliver_job_reply(&mut job, reply);
         }
     }
     /// Settles a job whose execution panicked: the error journal gets one line under the job's
-    /// correlation id naming the panic's source location and the call's method, and no later run of
-    /// the job is queued.
+    /// correlation and request ids naming the panic's source location and the call's method.
+    /// No later run of the job is queued.
     ///
     /// The caller's call answers `internal` under the tool's default stage (never the panic text),
     /// except an `ide.edit`, which may already have written before it panicked: it answers the
@@ -3088,6 +3088,7 @@ impl<'a> Worker<'a> {
                 reason: Some(FailureCode::Internal.into()),
                 correlation: Some(job.reference.as_str()),
                 detail: Some(&format!("{place} during {}", method.as_str())),
+                request: self.shared.request_of(&job.reference).as_deref(),
                 ..Default::default()
             },
         );
@@ -3251,28 +3252,7 @@ impl<'a> Worker<'a> {
             },
             other => other,
         };
-        let request = self.shared.request_of(&job.reference);
-        if let PeerReply::Error { code, .. } = &reply {
-            // T26B: a queued job's terminal failure must reach the error log with its closed
-            // reason even when no caller view ever does — the dispatch path only logs the initial
-            // `pending` placeholder a slow job returns, and daemon shutdown drops retained
-            // details, so this line is otherwise the only record the job ever failed.
-            let lifetime = Duration::from_millis(self.shared.launcher.limits.operation_ms);
-            let started = job.deadline.checked_sub(lifetime).unwrap_or(job.deadline);
-            crate::errorlog::record(
-                errorlog_method(job.tool),
-                job_failure_outcome(code.clone()),
-                crate::errorlog::Fields {
-                    reason: Some(code.clone().into()),
-                    correlation: Some(job.reference.as_str()),
-                    detail: job.failure_detail.as_deref(),
-                    duration_ms: u32::try_from(started.elapsed().as_millis()).ok(),
-                    request: request.as_deref(),
-                    ..Default::default()
-                },
-            );
-        }
-        let failed = matches!(reply, PeerReply::Error { .. });
+        self.journal_job_failure(job, &reply);
         if let Some(authority) = &authority {
             self.observe_head(&binding, authority);
         }
@@ -3343,6 +3323,42 @@ impl<'a> Worker<'a> {
             self.activity
                 .insert(binding.fingerprint(), crate::errorlog::now_ms());
         }
+        self.deliver_job_reply(job, reply);
+    }
+
+    /// Journals a terminal typed job failure with its request id and classified outcome, even
+    /// when its caller stopped waiting. Successful and edit replies have their own completion
+    /// record in `deliver_job_reply`; this writes no duplicate dispatch line.
+    fn journal_job_failure(&self, job: &Job, reply: &PeerReply) {
+        let request = self.shared.request_of(&job.reference);
+        if let PeerReply::Error { code, detail } = reply {
+            // T26B: a queued job's terminal failure must reach the error log with its closed
+            // reason even when no caller view ever does — the dispatch path only logs the initial
+            // `pending` placeholder a slow job returns, and daemon shutdown drops retained
+            // details, so this line is otherwise the only record the job ever failed.
+            let lifetime = Duration::from_millis(self.shared.launcher.limits.operation_ms);
+            let started = job.deadline.checked_sub(lifetime).unwrap_or(job.deadline);
+            crate::errorlog::record(
+                errorlog_method(job.tool),
+                job_failure_outcome(code.clone()),
+                crate::errorlog::Fields {
+                    reason: Some(code.clone().into()),
+                    correlation: Some(job.reference.as_str()),
+                    detail: detail.as_deref(),
+                    duration_ms: u32::try_from(started.elapsed().as_millis()).ok(),
+                    request: request.as_deref(),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    /// Sends a settled reply to the original waiter, marking delivered feedback and pages only
+    /// after a successful send. A lost waiter leaves the normal classified pending completion
+    /// record (typed errors already have a job-failure line), retaining the job's request id.
+    fn deliver_job_reply(&self, job: &mut Job, reply: PeerReply) {
+        let binding = job.invocation.binding_ref().clone();
+        let request = self.shared.request_of(&job.reference);
         if let Some(sender) = job.stop_reply.take() {
             // The oneshot send is the actual submission boundary for this synchronous-wait path
             // (Claude Start/Context/Diff/Stop): it only succeeds while the caller's own `wait`
@@ -3388,7 +3404,7 @@ impl<'a> Worker<'a> {
                 // the job's own terminal reply like a dispatch line, its reference joins it to the
                 // pending dispatch line and to any later `ide.inspect`, and a failure already has
                 // its own line above.
-                Err(undelivered) if !failed => {
+                Err(undelivered) if !matches!(undelivered, PeerReply::Error { .. }) => {
                     let degraded = request
                         .as_deref()
                         .is_some_and(|request| self.shared.take_degraded(request));
@@ -9279,6 +9295,286 @@ mod stop_retry_tests {
             telemetry: None,
             activity: BTreeMap::new(),
         }
+    }
+
+    /// Persists the real producer's captured records without absent optional fields, then runs
+    /// the official fault-report CLI over that journal. No daemon or Unix socket is required;
+    /// the child Cargo process inherits the caller's target directory and build-job limit.
+    fn report_captured(fixture: &Fixture) -> (bool, String) {
+        let root = fixture.base.join("journals");
+        let writer = crate::errorlog::Writer::new(root.join("0000000000000001"));
+        for event in crate::errorlog::capture_take() {
+            let mut record = serde_json::to_value(event).unwrap();
+            record
+                .as_object_mut()
+                .unwrap()
+                .retain(|_, value| !value.is_null());
+            writer.append(&serde_json::to_vec(&record).unwrap());
+        }
+        let output = std::process::Command::new(env!("CARGO"))
+            .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+            .args([
+                "run",
+                "--quiet",
+                "--locked",
+                "-p",
+                "xtask",
+                "--",
+                "fault-report",
+                "--root",
+            ])
+            .arg(&root)
+            .args([
+                "--since",
+                "1970-01-01",
+                "--until",
+                "2100-01-01",
+                "--scope",
+                "all",
+            ])
+            .output()
+            .unwrap();
+        let report = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            report.contains("terminal tool calls"),
+            "{}\n{}",
+            report,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (output.status.success(), report)
+    }
+
+    /// Gives a direct fixture job the request id and dropped waiter that the real enqueue/timeout
+    /// path retains, then journals its pending dispatch through the product adapter.
+    fn journal_pending(worker: &Worker<'_>, job: &mut Job) {
+        let request = format!("request-{}", job.reference);
+        worker
+            .shared
+            .requests
+            .lock()
+            .unwrap()
+            .insert(job.reference.clone(), request.clone());
+        let (send, wait) = oneshot::channel();
+        drop(wait);
+        job.stop_reply = Some(send);
+        crate::telemetry::adapters::log_tool_reply(
+            job.tool,
+            &PeerReply::Pending {
+                detail_ref: job.reference.clone(),
+            },
+            Duration::from_millis(1),
+            None,
+            &crate::telemetry::adapters::DispatchContext {
+                request: Some(&request),
+                parameters: Some(&job.parameters),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Every supervised panic raises exactly one report alert from its original evidence,
+    /// including job panics whose catcher consumes the location before marking the daemon failed.
+    #[tokio::test]
+    async fn fault_report_caught_panics_alert_once() {
+        crate::errorlog::install_panic_hook();
+        for cause in ["worker_panic", "inspection_panic", "job_panic"] {
+            let fixture = Fixture::new();
+            let store = fixture.store();
+            let workspace = DurableWorkspace::open(&store).await.unwrap();
+            let mut worker = worker(&store, workspace, fixture.root.clone());
+            let (mut job, _cancel) =
+                start_job(&worker, "panic-actor", "panic-call", serde_json::json!({}));
+            job.tool = AssistanceTool::Read;
+            crate::errorlog::capture_start();
+            assert!(
+                catch_panic(async { panic!("private panic payload") })
+                    .await
+                    .is_err()
+            );
+            if cause == "job_panic" {
+                worker.settle_panicked(&mut job);
+            }
+            worker.shared.mark_failed(cause);
+            worker.shared.mark_failed(cause);
+            let (success, report) = report_captured(&fixture);
+            assert!(!success, "{cause}: {report}");
+            assert_eq!(
+                report.matches("ALERT: 1 panic(s) journaled:").count(),
+                1,
+                "{cause}: {report}"
+            );
+            assert_eq!(report.matches("ALERT:").count(), 1, "{cause}: {report}");
+            assert!(report.contains("0 terminal tool calls"), "{report}");
+            assert!(report.contains(cause), "{report}");
+            assert!(!report.contains("private panic payload"), "{report}");
+        }
+    }
+
+    /// Crash draining writes the normal terminal record for abandoned pending reads and edits;
+    /// an edit already settled as outcome_unknown stays a fault and is never a success.
+    #[tokio::test]
+    async fn fault_report_crash_drained_jobs_have_terminal_records() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, _) = production_start(&mut worker, "drain-actor", "drain-start").await;
+        let authority = worker.authority(&binding).await.unwrap();
+        let (mut read, _read_cancel) = start_job(
+            &worker,
+            "drain-actor",
+            "queued-read",
+            serde_json::json!({"path":"main.alpha"}),
+        );
+        read.tool = AssistanceTool::Read;
+        let (mut edit, _edit_cancel) = start_job(
+            &worker,
+            "drain-actor",
+            "parked-edit",
+            serde_json::json!({"operation_id":"written-edit","path":"main.alpha","content":"written"}),
+        );
+        edit.tool = AssistanceTool::Edit;
+        edit.park_until = Some(tokio::time::Instant::now() + Duration::from_secs(1));
+        edit.stage = Some(JobStage::EditAwaitingCheck {
+            result: EditResult::new(
+                "written-edit".to_owned(),
+                "main.alpha".to_owned(),
+                ChangesEditOutcome::OutcomeUnknown,
+                None,
+            )
+            .unwrap(),
+            refreshed: None,
+            authority,
+            path: "main.alpha".to_owned(),
+            fallback: EditDiagnostics::Unknown {},
+            generation: 1,
+            worktree: fixture.root.clone(),
+            wanted: "main.alpha".to_owned(),
+            preexisting: BTreeMap::new(),
+            language: crate::lang::testing::ALPHA,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+        });
+        std::fs::write(fixture.root.join("main.alpha"), "written").unwrap();
+        crate::errorlog::capture_start();
+        journal_pending(&worker, &mut read);
+        journal_pending(&worker, &mut edit);
+        worker
+            .shared
+            .ledger
+            .lock()
+            .unwrap()
+            .queue
+            .extend([read, edit]);
+        worker.shared.mark_failed("inspection_ended");
+        worker.refuse_queued_after_failure();
+        worker.refuse_queued_after_failure();
+        assert!(worker.shared.ledger.lock().unwrap().queue.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("main.alpha")).unwrap(),
+            "written"
+        );
+        let (success, report) = report_captured(&fixture);
+        assert!(success, "{report}");
+        assert!(
+            report.contains("2 terminal tool calls (+2 pending replies"),
+            "{report}"
+        );
+        assert!(report.contains("0 completed (completion record), 1 refused or unknown (completion record), 1 failed (job line), 0 unknown"), "{report}");
+        assert!(
+            report.contains("daemon: internal") && report.contains("timeout: edit outcome unknown"),
+            "{report}"
+        );
+        let events = crate::errorlog::read_events(&fixture.base.join("journals/0000000000000001"));
+        let terminals: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.outcome != "pending" && ["read", "edit"].contains(&event.method.as_str())
+            })
+            .collect();
+        assert_eq!(terminals.len(), 2, "{events:?}");
+        assert!(
+            terminals.iter().all(|event| event.request.is_some()),
+            "{events:?}"
+        );
+        assert!(
+            terminals.iter().any(|event| event.outcome == "incomplete"
+                && event.reason.as_deref() == Some("edit_outcome_unknown")),
+            "{events:?}"
+        );
+        assert!(
+            terminals
+                .iter()
+                .all(|event| !["completed", "degraded"].contains(&event.outcome.as_str())),
+            "{events:?}"
+        );
+    }
+
+    /// A panicked pending job nobody inspects still contributes one classified IDE fault,
+    /// because its real panic record carries the request id retained by enqueue.
+    #[tokio::test]
+    async fn fault_report_uncollected_panicked_job_counts_once() {
+        crate::errorlog::install_panic_hook();
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        let (mut job, _cancel) = start_job(
+            &worker,
+            "orphan-actor",
+            "orphan-read",
+            serde_json::json!({"path":"main.alpha"}),
+        );
+        job.tool = AssistanceTool::Read;
+        crate::errorlog::capture_start();
+        journal_pending(&worker, &mut job);
+        assert!(
+            catch_panic(async { panic!("private orphan payload") })
+                .await
+                .is_err()
+        );
+        worker.settle_panicked(&mut job);
+        worker.shared.mark_failed("job_panic");
+        let (success, report) = report_captured(&fixture);
+        assert!(
+            report.contains("1 terminal tool calls (+1 pending replies"),
+            "{report}"
+        );
+        assert!(!success, "{report}");
+        assert!(
+            report.contains("1 failed (job line), 0 unknown"),
+            "{report}"
+        );
+        assert!(report.contains("daemon: internal"), "{report}");
+        assert_eq!(
+            report.matches("ALERT: 1 panic(s) journaled:").count(),
+            1,
+            "{report}"
+        );
+        let events = crate::errorlog::read_events(&fixture.base.join("journals/0000000000000001"));
+        let panic = events
+            .iter()
+            .find(|event| event.method == "read" && event.outcome == "failed")
+            .unwrap();
+        assert_eq!(panic.request.as_deref(), Some("request-start-orphan-read"));
+    }
+
+    /// Forced replacements appear once each in lifecycle reporting without adding tool calls.
+    #[tokio::test]
+    async fn fault_report_forced_replacement_is_a_lifecycle_event() {
+        let fixture = Fixture::new();
+        crate::errorlog::capture_start();
+        crate::app::record_forced_replacement(123, 2, Duration::from_secs(30), false);
+        crate::app::record_forced_replacement(456, 3, Duration::from_secs(40), true);
+        let (success, report) = report_captured(&fixture);
+        assert!(success, "{report}");
+        assert!(report.contains("2 forced replacements"), "{report}");
+        assert!(
+            report.contains("0 terminal tool calls (+0 pending replies"),
+            "{report}"
+        );
+        assert!(!report.contains("ALERT:"), "{report}");
     }
 
     /// Proves managed edits chain completed source references with exact effects.
