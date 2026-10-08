@@ -110,6 +110,25 @@ impl Method {
     }
 }
 
+/// Role of the activation a journaled call belongs to (QW-4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Role {
+    /// A read-only activation: it never edits and owns no provider session of its own.
+    Reader,
+    /// The worktree's writing activation.
+    Writer,
+}
+
+impl Role {
+    /// Renders the closed lowercase tag used in the log line.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reader => "reader",
+            Self::Writer => "writer",
+        }
+    }
+}
+
 /// Closed severity class, always a pure function of [`Outcome`] so it can never disagree with it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Level {
@@ -169,6 +188,10 @@ pub enum Outcome {
     LeaseClosed,
     /// An event was deliberately not acted on because its session never activated; not a failure.
     Skipped,
+    /// A call succeeded, but through a weaker path than the caller asked for (a lexical answer
+    /// instead of the language server's, post-edit diagnostics left unknown): not a failure, but
+    /// not a full success either (QW-4).
+    Degraded,
 }
 
 impl Outcome {
@@ -192,6 +215,7 @@ impl Outcome {
             Self::LeaseOpened => "lease_opened",
             Self::LeaseClosed => "lease_closed",
             Self::Skipped => "skipped",
+            Self::Degraded => "degraded",
         }
     }
 
@@ -205,6 +229,7 @@ impl Outcome {
             | Self::Unavailable
             | Self::Cancelled
             | Self::Refused
+            | Self::Degraded
             | Self::Timeout => Level::Warn,
             Self::Completed
             | Self::Pending
@@ -691,6 +716,20 @@ pub struct Fields<'a> {
     pub count: Option<u64>,
     /// Elapsed wall-clock duration of the logged operation, saturated to whole milliseconds.
     pub duration_ms: Option<u32>,
+    /// The serving product version (`CARGO_PKG_VERSION`), on dispatch lines (QW-4).
+    pub version: Option<&'static str>,
+    /// Whether the calling activation is a reader or a writer, when it has one (QW-4).
+    pub role: Option<Role>,
+    /// Registered language identifier of the request's file, when it names one (QW-4).
+    pub language: Option<&'static str>,
+    /// Closed request form, derived from the request's parameter *names* only (QW-4).
+    pub form: Option<&'static str>,
+    /// Opaque transport request id shared by the front's call, the daemon's dispatch line and the
+    /// job the call queued (QW-4); never model text.
+    pub request: Option<&'a str>,
+    /// `false` when the request was refused as input (it never validated), `true` when it was a
+    /// well-formed request; absent when the line does not describe a request (QW-4).
+    pub eligible: Option<bool>,
 }
 
 /// Records one event, best-effort: never blocks, never panics, never surfaces an error.
@@ -862,6 +901,39 @@ pub(crate) fn build_line(
     if let Some(count) = fields.count {
         object.insert("count".to_owned(), serde_json::Value::Number(count.into()));
     }
+    if let Some(version) = fields.version {
+        object.insert(
+            "version".to_owned(),
+            serde_json::Value::String(version.to_owned()),
+        );
+    }
+    if let Some(role) = fields.role {
+        object.insert(
+            "role".to_owned(),
+            serde_json::Value::String(role.as_str().to_owned()),
+        );
+    }
+    if let Some(language) = fields.language {
+        object.insert(
+            "language".to_owned(),
+            serde_json::Value::String(language.to_owned()),
+        );
+    }
+    if let Some(form) = fields.form {
+        object.insert(
+            "form".to_owned(),
+            serde_json::Value::String(form.to_owned()),
+        );
+    }
+    if let Some(request) = fields.request {
+        object.insert(
+            "request".to_owned(),
+            serde_json::Value::String(bounded_detail(request).to_owned()),
+        );
+    }
+    if let Some(eligible) = fields.eligible {
+        object.insert("eligible".to_owned(), serde_json::Value::Bool(eligible));
+    }
     if let Some(duration_ms) = fields.duration_ms {
         object.insert(
             "duration_ms".to_owned(),
@@ -959,6 +1031,24 @@ pub struct LoggedEvent {
     /// Elapsed duration of the logged operation in milliseconds, when the event carried one.
     #[serde(default)]
     pub duration_ms: Option<u32>,
+    /// Serving product version, when the event carried one.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// `reader` or `writer`, when the event carried one.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Registered language identifier, when the event carried one.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Closed request form, when the event carried one.
+    #[serde(default)]
+    pub form: Option<String>,
+    /// Opaque transport request id, when the event carried one.
+    #[serde(default)]
+    pub request: Option<String>,
+    /// Whether the request was well formed, when the event carried the flag.
+    #[serde(default)]
+    pub eligible: Option<bool>,
 }
 
 impl Default for LoggedEvent {
@@ -975,6 +1065,12 @@ impl Default for LoggedEvent {
             correlation: None,
             detail: None,
             duration_ms: None,
+            version: None,
+            role: None,
+            language: None,
+            form: None,
+            request: None,
+            eligible: None,
         }
     }
 }
@@ -1284,6 +1380,43 @@ mod tests {
         assert_eq!(events[0].correlation.as_deref(), Some("detail-ref-42"));
         assert_eq!(events[0].duration_ms, Some(7));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// QW-4: a dispatch line carries the closed context fields, and the reader decodes them back;
+    /// a line without them still decodes (older journals), and a degraded success is a `warn`.
+    #[test]
+    fn dispatch_context_fields_round_trip_and_older_lines_still_decode() {
+        let line = build_line(
+            Method::Context,
+            Outcome::Degraded,
+            Fields {
+                version: Some("1.2.3"),
+                host: Some(HostKind::Claude),
+                role: Some(Role::Reader),
+                language: Some("rust"),
+                form: Some("file"),
+                request: Some("req-1"),
+                eligible: Some(true),
+                ..Default::default()
+            },
+            0,
+        );
+        let event = parse_line(std::str::from_utf8(&line).unwrap()).unwrap();
+        assert_eq!(event.level, "warn");
+        assert_eq!(event.outcome, "degraded");
+        assert_eq!(event.version.as_deref(), Some("1.2.3"));
+        assert_eq!(event.host.as_deref(), Some("claude"));
+        assert_eq!(event.role.as_deref(), Some("reader"));
+        assert_eq!(event.language.as_deref(), Some("rust"));
+        assert_eq!(event.form.as_deref(), Some("file"));
+        assert_eq!(event.request.as_deref(), Some("req-1"));
+        assert_eq!(event.eligible, Some(true));
+        let old = parse_line(r#"{"ts":"x","level":"info","method":"read","outcome":"completed"}"#)
+            .unwrap();
+        assert_eq!(
+            (old.version, old.role, old.form, old.eligible),
+            (None, None, None, None)
+        );
     }
 
     #[test]
