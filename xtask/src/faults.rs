@@ -383,6 +383,7 @@ impl Report {
 
     /// Counts one journal key's lines inside the window.
     fn scan_key(&mut self, key: &str, records: &[Value], since: &str, until: &str) {
+        let first_call = self.calls.len();
         let in_window = |record: &Value| {
             let ts = text(record, "ts");
             let day = ts.get(..10).unwrap_or("");
@@ -485,6 +486,9 @@ impl Report {
                 self.settlement.uncollected_unknown += 1;
             }
         }
+        // Orphan terminal rows are appended after the lines that follow them in the journal; put
+        // the key's calls in time order (stable) so the outage streak reads chronologically.
+        self.calls[first_call..].sort_by(|a, b| a.ts.cmp(&b.ts));
     }
 
     /// Records one counted terminal call.
@@ -1642,6 +1646,28 @@ mod tests {
             report
                 .render(&dir, "2026-10-01", "2026-10-01", Scope::All)
                 .contains("1 internal probe lines")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The outage streak reads chronologically even when an orphan terminal row (journaled earlier
+    /// than a later refused inspection but counted after it) is appended last.
+    #[test]
+    fn the_outage_streak_is_chronological_with_orphan_rows() {
+        let lines = [
+            r#"{"ts":"2026-10-01T10:00:00Z","method":"read","outcome":"pending","correlation":"o-1","duration_ms":8000,"version":"1","request":"c-1"}"#.to_owned(),
+            // The refused inspection comes later in the journal than the orphan job failure it
+            // does not collect, but the orphan is counted after it.
+            r#"{"ts":"2026-10-01T10:00:02Z","method":"inspect","outcome":"failed","reason":"workspace_authority","detail":"inspect:authority_stale","correlation":"o-1","delivered":false,"version":"1","request":"i-1","origin":"c-1","duration_ms":3}"#.to_owned(),
+            r#"{"ts":"2026-10-01T10:00:01Z","method":"read","outcome":"failed","reason":"internal","correlation":"o-1","request":"c-1","duration_ms":9}"#.to_owned(),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let dir = journal("outage", "00000000000000c3", &refs);
+        let report = Report::build(&dir, "2026-10-01", "2026-10-01", Scope::All).unwrap();
+        let (count, _, first, last) = report.longest_outage().expect("two consecutive faults");
+        assert_eq!(
+            (count, first, last),
+            (2, "2026-10-01T10:00:01Z", "2026-10-01T10:00:02Z")
         );
         let _ = fs::remove_dir_all(&dir);
     }
