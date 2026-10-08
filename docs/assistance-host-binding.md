@@ -143,7 +143,19 @@ and the codex app-servers — set none of those markers. Codex also keeps its ex
 The plugin's `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, and `PermissionDenied` handlers run
 the argument-free `agent-ide claude-hook`. That command resolves the hook payload's canonical `cwd`
 to the nearest worktree with a private candidate cache, then validates the shared runtime and bounded
-attachment file's owner, exact modes, shape, and full repository digest. It reads that worktree's
+attachment file's owner, exact modes, shape, and full repository digest. A Claude shell can leave the
+project (`cd` into a log directory) while the session's MCP stays registered under its own
+`CLAUDE_PROJECT_DIR`, so a `cwd` route is accepted only inside the *same repository* as that
+project (a shell that wandered into another registered repository never delivers the session's
+pre there), and when the `cwd` route finds no rendezvous of the session — no cached key, runtime or
+candidate attachment, or another repository — the hook routes the pre through `CLAUDE_PROJECT_DIR`'s
+own registration instead. That fallback names the session's own registration and nothing else, so it
+can never reach a different registered repository; `allowed_roots`, the attachment and session
+checks and exact `toolUseId` pairing are untouched, and the miss is journaled as a per-call `warn`
+(`hook_cwd_rerouted:<reason>`, never the cwd). A `CLAUDE_PROJECT_DIR` that is present but cannot be
+resolved with the MCP's own rules (empty, relative, not a directory, removed) drops the pre locally
+(`hook_project_dir_invalid`): the session's repository is then unknown and no route may be trusted.
+The hook reads the matched worktree's
 daemon-minted lease attachment from the private cache and reuses the existing Claude parser and
 connect-only transport. Missing
 or corrupt state is silent fail-open. Root and child lifecycle identity, permission denial, failed-tool settlement and feedback output are unchanged.
