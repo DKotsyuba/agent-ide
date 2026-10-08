@@ -892,3 +892,46 @@ fn an_adopted_store_is_no_longer_protected_by_an_unrelated_lease() {
     assert_eq!(verdict(&freed, &store).fate, Fate::Removed);
     drop(unrelated);
 }
+
+/// Hook key hints are collected only while every live `agent-ide` process is this executable or a
+/// proven build: an installed release without the proof (whatever its version) may refresh a hint
+/// without the directory lock, as may an unreadable or unverifiable executable.
+#[test]
+fn hint_collection_pauses_for_any_publisher_not_proven_to_lock() {
+    let home = scratch("hint-publishers");
+    let proven = fake_build(&home.join("gate/target/debug"), true);
+    let unproven = fake_build(&home.join("old/releases/0.10.6"), false);
+    let later = identity_started(&home, |_| Some(SystemTime::now() + DAY));
+    let pids = |list: Option<Vec<Process>>| {
+        list.map(|list| list.into_iter().map(|(pid, _)| pid).collect::<Vec<_>>())
+    };
+    let snapshot = |processes: Vec<Process>| move || Some(processes.clone());
+
+    let calm = snapshot(vec![(1, Some(proven.clone()))]);
+    assert_eq!(pids(hint_publishers_unsafe_as(&later, &calm)), Some(vec![]));
+    let own = std::env::current_exe().unwrap();
+    let with_self = snapshot(vec![(1, Some(proven.clone())), (2, Some(own))]);
+    assert_eq!(
+        pids(hint_publishers_unsafe_as(&later, &with_self)),
+        Some(vec![])
+    );
+
+    let mixed = snapshot(vec![
+        (1, Some(proven.clone())),
+        (2, Some(unproven)),
+        (3, None),
+        (4, Some(home.join("gone/agent-ide"))),
+    ]);
+    assert_eq!(
+        pids(hint_publishers_unsafe_as(&later, &mixed)),
+        Some(vec![2, 3, 4])
+    );
+
+    // A rebuilt-after-start file or an unreadable start time proves nothing either.
+    let earlier = identity_started(&home, |_| Some(SystemTime::UNIX_EPOCH));
+    assert_eq!(
+        pids(hint_publishers_unsafe_as(&earlier, &calm)),
+        Some(vec![1])
+    );
+    assert_eq!(pids(hint_publishers_unsafe_as(&later, &|| None)), None);
+}

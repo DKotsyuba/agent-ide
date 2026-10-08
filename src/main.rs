@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use agent_ide::app::{
     AppError, DaemonStop, DoctorLockState, DoctorReport, DoctorStatus, RuntimeDir,
@@ -1305,13 +1305,13 @@ fn absolute_local_path(path: &Path) -> bool {
 }
 
 /// Fixed short namespace for deterministic shared per-repository Claude runtimes below `/private/tmp`.
-const CLAUDE_RUNTIME_PREFIX: &str = "ai-r-";
+const CLAUDE_RUNTIME_PREFIX: &str = agent_ide::hook_hints::RUNTIME_PREFIX;
 /// Bounded deadline for the local `git` rendezvous-key probe; a real repository answers instantly.
 const GIT_COMMON_DIR_TIMEOUT: Duration = Duration::from_secs(2);
 /// Fixed owner-only file carrying the full project identity and random transport attachment.
 const CLAUDE_ATTACHMENT_FILE: &str = agent_ide::app::CLAUDE_ATTACHMENT_FILE;
 /// Per-candidate attachment cache written only after the daemon registers that candidate.
-const CLAUDE_CANDIDATE_ATTACHMENT_FILE: &str = "candidate-attachment";
+const CLAUDE_CANDIDATE_ATTACHMENT_FILE: &str = agent_ide::hook_hints::ATTACHMENT_FILE;
 /// Exact record length: 64 digest bytes, one separator, 64 attachment bytes, and one newline.
 const CLAUDE_ATTACHMENT_BYTES: u64 = 130;
 
@@ -1347,9 +1347,7 @@ fn canonical_claude_project(value: Option<OsString>) -> std::io::Result<PathBuf>
 
 /// Returns the full BLAKE3 digest of one canonical rendezvous key's raw path bytes.
 fn claude_rendezvous_identity(key: &Path) -> String {
-    blake3::hash(key.as_os_str().as_bytes())
-        .to_hex()
-        .to_string()
+    agent_ide::hook_hints::rendezvous_identity(key)
 }
 
 /// Resolves the repository-wide rendezvous key shared by every worktree of one Claude candidate.
@@ -1417,9 +1415,9 @@ async fn git_common_dir(candidate: &Path) -> Option<PathBuf> {
 }
 
 /// Fixed short namespace for one candidate's non-authoritative cached rendezvous key.
-const CLAUDE_KEY_CACHE_PREFIX: &str = "ai-k-";
+const CLAUDE_KEY_CACHE_PREFIX: &str = agent_ide::hook_hints::KEY_CACHE_PREFIX;
 /// Fixed owner-only file name holding one candidate's cached rendezvous key bytes.
-const CLAUDE_KEY_CACHE_FILE: &str = "key";
+const CLAUDE_KEY_CACHE_FILE: &str = agent_ide::hook_hints::KEY_FILE;
 
 /// Derives the deterministic per-candidate path of [`claude_rendezvous_key`]'s hot-path cache.
 ///
@@ -1445,9 +1443,11 @@ fn write_claude_key_cache(candidate: &Path, key: &Path) {
     let Ok(cache) = claude_key_cache_path(candidate) else {
         return;
     };
-    if prepare_private_persistent_directory(&cache).is_err() {
+    // Shared with a hint collection's exclusive lock: a stale hint being collected is prepared
+    // again, and a hint being published is never collected.
+    let Some(_publishing) = lock_claude_key_cache(&cache) else {
         return;
-    }
+    };
     let Ok(nonce) = random_hex(8) else {
         return;
     };
@@ -1464,6 +1464,15 @@ fn write_claude_key_cache(candidate: &Path, key: &Path) {
     let _ = fs::remove_file(temporary);
 }
 
+/// Prepares one private key-cache directory and takes its shared publication lock, preparing it
+/// again when a collection removed or replaced it while waiting.
+fn lock_claude_key_cache(cache: &Path) -> Option<agent_ide::hook_hints::PublishGuard> {
+    (0..3).find_map(|_| {
+        prepare_private_persistent_directory(cache).ok()?;
+        agent_ide::hook_hints::PublishGuard::acquire(cache)
+    })
+}
+
 /// Caches the daemon-minted candidate attachment in the existing private key-cache directory.
 fn write_claude_candidate_attachment(candidate: &Path, attachment: &str) {
     if !valid_random_attachment(attachment) {
@@ -1473,6 +1482,9 @@ fn write_claude_candidate_attachment(candidate: &Path, attachment: &str) {
         return;
     }
     let Ok(cache) = claude_key_cache_path(candidate) else {
+        return;
+    };
+    let Some(_publishing) = agent_ide::hook_hints::PublishGuard::acquire(&cache) else {
         return;
     };
     let path = cache.join(CLAUDE_CANDIDATE_ATTACHMENT_FILE);
@@ -1587,11 +1599,20 @@ async fn run_cache(prune: bool) -> ExitCode {
         eprintln!("agent-ide: cannot resolve the user home");
         return ExitCode::from(2);
     };
+    let tmp = Path::new(agent_ide::hook_hints::TMP_ROOT);
     if !prune {
         print!(
             "{}",
             agent_ide::retention::sweep(&root, false).render(false)
         );
+        let hints = agent_ide::hook_hints::collect(tmp, false, SystemTime::now());
+        println!(
+            "hook key hints: {} in {}, {} stale and removable",
+            hints.hints,
+            tmp.display(),
+            hints.stale
+        );
+        print!("{}", hint_pause_note());
         return ExitCode::SUCCESS;
     }
     let Some(_lock) = agent_ide::retention::SweepLock::try_acquire(&root, None) else {
@@ -1608,7 +1629,44 @@ async fn run_cache(prune: bool) -> ExitCode {
     let report = agent_ide::retention::sweep(&root, true);
     report.record();
     print!("{}", report.render(true));
+    let pause = hint_pause_note();
+    if pause.is_empty() {
+        let hints = agent_ide::hook_hints::collect(tmp, true, SystemTime::now());
+        println!(
+            "hook key hints: {} in {}, {} stale removed",
+            hints.hints,
+            tmp.display(),
+            hints.stale
+        );
+    } else {
+        print!("hook key hints: collection paused\n{pause}");
+    }
     ExitCode::SUCCESS
+}
+
+/// Explains why hook key hints cannot be collected now, or is empty when they can: a live
+/// `agent-ide` process that is not a proven build of this source may still refresh a hint without
+/// taking the directory lock a collection relies on, so none is collected while one exists.
+fn hint_pause_note() -> String {
+    match agent_ide::retention::hint_publishers_unsafe(&agent_ide::retention::process_snapshot) {
+        Some(blocking) if blocking.is_empty() => String::new(),
+        Some(blocking) => {
+            let mut note = format!(
+                "hook key hints are not collected while {} agent-ide process(es) that may refresh a hint \
+                 without the hint lock run (only builds containing it are safe):\n",
+                blocking.len()
+            );
+            for (pid, exe) in blocking.iter().take(10) {
+                let exe = exe.as_deref().map_or("?".into(), Path::to_string_lossy);
+                note.push_str(&format!("  pid {pid} {exe}\n"));
+            }
+            if blocking.len() > 10 {
+                note.push_str(&format!("  … and {} more\n", blocking.len() - 10));
+            }
+            note
+        }
+        None => "hook key hints are not collected: the process list could not be read\n".to_owned(),
+    }
 }
 
 /// Why a candidate's persistent telemetry database path could not be derived.

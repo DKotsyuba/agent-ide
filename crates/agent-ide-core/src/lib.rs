@@ -48,6 +48,9 @@ pub mod userhome;
 /// Removes unused per-user caches automatically under worktree leases (`docs/cache-retention.md`).
 pub mod retention;
 
+/// Collects the stale Claude hook key hints below `/private/tmp` (`docs/cache-retention.md`).
+pub mod hook_hints;
+
 /// Implements the `init` command: per-user home tree and launcher template creation.
 pub mod init;
 

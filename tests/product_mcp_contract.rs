@@ -21268,16 +21268,8 @@ async fn an_unpublishable_telemetry_marker_is_journaled_and_the_managed_start_st
     )
     .await;
     let started = settle_managed(&mut mcp, &mut next, "marker-actor", &state_value, started).await;
-    assert_eq!(started["kind"], "activation", "{started}");
-    assert!(
-        store.join("worktree.path").is_dir(),
-        "the foreign entry stays"
-    );
-    assert!(
-        !store.join("state.sqlite").exists(),
-        "no persistent store was started"
-    );
-
+    let marker_kept = store.join("worktree.path").is_dir();
+    let store_started = store.join("state.sqlite").exists();
     let journal = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let lines = std::fs::read_dir(state.join("logs"))
@@ -21294,14 +21286,19 @@ async fn an_unpublishable_telemetry_marker_is_journaled_and_the_managed_start_st
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
-    .await
-    .expect("the marker failure is journaled");
+    .await;
+    // Shut the MCP (and with it the managed daemon) down before any assertion can fail, so a
+    // failing run leaves no daemon behind.
+    mcp.close().await;
+    let _ = std::fs::remove_dir_all(base);
+    assert_eq!(started["kind"], "activation", "{started}");
+    assert!(marker_kept, "the foreign entry stays");
+    assert!(!store_started, "no persistent store was started");
+    let journal = journal.expect("the marker failure is journaled");
     assert!(
         journal[0].contains(" warn daemon unavailable "),
         "{journal:?}"
     );
-    mcp.close().await;
-    let _ = std::fs::remove_dir_all(base);
 }
 
 /// Managed Codex hook lifecycles that must never speak: a post without its pre, the MCP call's

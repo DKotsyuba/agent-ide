@@ -775,6 +775,23 @@ impl Identity {
         classified
     }
 
+    /// Returns the live `agent-ide` processes that may still publish hook key hints without the
+    /// directory lock a collection relies on: every one that is not this very executable or a
+    /// proven build of this source (which contains [`LEASE_BUILD_PROOF`], first embedded together
+    /// with that lock). An installed release is proven by its contents like any other file, never
+    /// by its version number, so every release before the lock keeps the collection paused.
+    fn hint_unsafe(&self, processes: &[Process]) -> Vec<Process> {
+        processes
+            .iter()
+            .filter(|(pid, exe)| {
+                !exe.as_deref().is_some_and(|exe| {
+                    (self.own.is_some() && file_id(exe) == self.own) || self.proven_build(*pid, exe)
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Returns the live `agent-ide` processes that are not known to take leases.
     fn legacy(&self, processes: &[Process]) -> Vec<Process> {
         self.classify(processes).legacy
@@ -828,6 +845,21 @@ impl Identity {
         self.proofs.borrow_mut().insert(key, proven);
         proven
     }
+}
+
+/// Lists the live `agent-ide` processes that may publish Claude hook key hints without the
+/// directory lock, or `None` when the process list is unavailable; hint collection
+/// ([`crate::hook_hints::collect`]) must not apply while either is non-empty or `None`.
+pub fn hint_publishers_unsafe(snapshot: &dyn Fn() -> Option<Vec<Process>>) -> Option<Vec<Process>> {
+    hint_publishers_unsafe_as(&Identity::current(&state_root()?), snapshot)
+}
+
+/// [`hint_publishers_unsafe`] classifying processes as `identity` does.
+fn hint_publishers_unsafe_as(
+    identity: &Identity,
+    snapshot: &dyn Fn() -> Option<Vec<Process>>,
+) -> Option<Vec<Process>> {
+    Some(identity.hint_unsafe(&snapshot()?))
 }
 
 /// When process `pid` started, or `None` when it cannot be inspected.
@@ -1544,6 +1576,37 @@ pub async fn run_periodically() {
             };
             if let Some(_lock) = SweepLock::try_acquire(&root, Some(SWEEP_SPACING)) {
                 sweep(&root, true).record();
+                // The Claude hook key hints below the temporary root go with the same round, but
+                // only while no process that may publish one without the lock is alive.
+                use crate::errorlog::{Fields, Method, Outcome, record};
+                let (outcome, detail) = match hint_publishers_unsafe(&process_snapshot) {
+                    Some(unsafe_publishers) if unsafe_publishers.is_empty() => {
+                        let hints = crate::hook_hints::collect(
+                            Path::new(crate::hook_hints::TMP_ROOT),
+                            true,
+                            SystemTime::now(),
+                        );
+                        (
+                            Outcome::Completed,
+                            format!("hook_key_hints removed={}", hints.stale),
+                        )
+                    }
+                    Some(unsafe_publishers) => (
+                        Outcome::Skipped,
+                        format!("hook_key_hints paused={}", unsafe_publishers.len()),
+                    ),
+                    None => (Outcome::Skipped, "hook_key_hints paused=unknown".to_owned()),
+                };
+                if outcome == Outcome::Skipped || detail != "hook_key_hints removed=0" {
+                    record(
+                        Method::Retention,
+                        outcome,
+                        Fields {
+                            detail: Some(&detail),
+                            ..Default::default()
+                        },
+                    );
+                }
             }
         })
         .await;

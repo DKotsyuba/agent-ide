@@ -207,3 +207,26 @@ fn a_copied_product_build_is_proven_by_its_executable_and_an_unproven_one_pauses
         (false, true)
     );
 }
+
+/// `cache status` reports the Claude hook key hints below the temporary root as a dry run: how
+/// many it found and how many a prune or the hourly sweep would remove.
+#[test]
+fn cache_status_reports_the_hook_key_hints() {
+    let home = scratch("hint-status");
+    let state = home.join(".agent-ide");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::set_permissions(&state, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+        .args(["cache", "status"])
+        .env("AGENT_IDE_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("hook key hints: "))
+        .unwrap_or_else(|| panic!("no hint line in {text}"));
+    assert!(line.ends_with("stale and removable"), "{line}");
+    let _ = std::fs::remove_dir_all(&home);
+}

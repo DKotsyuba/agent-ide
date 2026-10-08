@@ -69,6 +69,34 @@ database, and `errors` shows `daemon unavailable … telemetry_marker_unavailabl
 written before this version and never relaunched stay marker-less and keep the `any` rule above;
 nothing guesses their launch directory from the digest.
 
+## Claude hook key hints
+
+The managed Claude MCP leaves one hint directory `/private/tmp/ai-k-<16 hex of the worktree path
+digest>` per candidate (`key`, the cached rendezvous key; `candidate-attachment`). The candidate
+cannot be recovered from the truncated digest, so a hint is judged only by what it names
+(`hook_hints::collect`, run by the hourly sweep under the sweep lock and by `cache prune`;
+`cache status` counts what would go). It is removed only when **all** hold, each re-checked under
+its exclusive non-blocking directory `flock`, which a publisher (`write_claude_key_cache`,
+`write_claude_candidate_attachment`) holds shared while it writes:
+
+- a private (`0700`) real directory of this user, held open without following links and still the
+  directory at its path before it is judged and before it is removed, containing only regular
+  files of this user named `key`, `candidate-attachment` or a `key-*` temporary;
+- the directory and every file older than a day;
+- no `key` file (never published), or one whose path is unusable to a hook (not absolute and
+  normalized), or one naming a path that definitely does not exist (`NotFound`) **and** whose
+  runtime directory `ai-r-<16 hex of the key digest>` does not exist either, so no daemon a hook
+  could reach is keyed by it.
+
+A symlink, another owner or mode, an unexpected entry, an unreadable file, any lookup failing for a
+reason other than `NotFound` (the key path of a live repository exists), a busy lock or a hint
+younger than a day keeps the hint. A hint of a deleted worktree whose repository still exists is
+therefore kept: nothing guesses the worktree from the digest. Fronts older than this change publish
+without the lock, so the collection is **paused while any live `agent-ide` process is not this
+executable or a proven build** (the same file proof as rule 3; version numbers are not trusted) or the
+process list is unreadable; `cache status` and `cache prune` name the blocking processes, and the
+sweep records `hook_key_hints paused=N`. Hooks only read hints and never lock.
+
 ## When
 
 Each long-lived daemon runs a background task: the first sweep 60 seconds after start (so a
