@@ -315,6 +315,7 @@ fn install(options: &Options) -> Result<Summary, String> {
                         selected.display()
                     ));
                 }
+                pause_seam();
                 Reinstall::Replace
             }
         },
@@ -393,6 +394,22 @@ fn install(options: &Options) -> Result<Summary, String> {
         plugin_current: plugin_root.join("current"),
         action,
     })
+}
+
+/// Test seam: `AGENT_IDE_TEST_INSTALL_PAUSE=<dir>` stops the installer right after its first
+/// live-process check. It writes `<dir>/paused` and waits (at most 30 s) for `<dir>/resume`, so a
+/// product test can start a process from the release inside the window the post-rename recheck
+/// closes. Without the `test-seams` feature the variable is never read.
+fn pause_seam() {
+    let Some(dir) = crate::test_seams::var("AGENT_IDE_TEST_INSTALL_PAUSE") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let _ = fs::write(dir.join("paused"), b"");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !dir.join("resume").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// Describes a live process executing from inside `release`, or `None` when none does.

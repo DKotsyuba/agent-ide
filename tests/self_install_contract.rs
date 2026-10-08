@@ -647,6 +647,36 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// Waits until the process `pid` is listed as executing from inside `release`.
+fn wait_for_process_in(release: &Path, pid: u32) {
+    let release = fs::canonicalize(release).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !agent_ide::retention::process_snapshot()
+        .unwrap()
+        .iter()
+        .any(|(found, exe)| {
+            *found == pid as i32 && exe.as_deref().is_some_and(|exe| exe.starts_with(&release))
+        })
+    {
+        assert!(std::time::Instant::now() < deadline, "child never appeared");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Spawns an installed release binary that blocks reading `fifo`, with all stdio detached.
+fn spawn_blocked(release: &Path, fifo: &Path) -> KillOnDrop {
+    KillOnDrop(
+        Command::new(release.join("agent-ide"))
+            .args(["launcher", "check"])
+            .arg(fifo)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    )
+}
+
 /// `--replace` never replaces or deletes a release directory a live process runs from: it is
 /// refused with the release byte-identical, and succeeds once the process has exited.
 #[test]
@@ -664,29 +694,8 @@ fn replace_refuses_a_release_a_live_process_runs_from() {
             .unwrap()
             .success()
     );
-    let child = KillOnDrop(
-        Command::new(release.join("agent-ide"))
-            .args(["launcher", "check"])
-            .arg(&fifo)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    let running = fs::canonicalize(&release).unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !agent_ide::retention::process_snapshot()
-        .unwrap()
-        .iter()
-        .any(|(pid, exe)| {
-            *pid == child.0.id() as i32
-                && exe.as_deref().is_some_and(|exe| exe.starts_with(&running))
-        })
-    {
-        assert!(std::time::Instant::now() < deadline, "child never appeared");
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    let child = spawn_blocked(&release, &fifo);
+    wait_for_process_in(&release, child.0.id());
     let manifest = fs::read(release.join("SHA256SUMS")).unwrap();
     // A previously installed plain binary at the launcher path must also survive the refusal.
     let launcher = root.join("bin/agent-ide");
@@ -764,5 +773,72 @@ fn a_scratch_install_never_rewrites_the_live_launcher() {
         );
     }
     assert!(!user.join(".local/share").exists());
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A process that starts from the release after the installer's first check (a scheduler pause
+/// between the check and the swap) still keeps its release: the installer sees it under the
+/// retired path, puts the release back, refuses, and leaves a plain-binary launcher in place.
+/// Needs the pause seam, so run it with `--features test-seams`.
+#[cfg(feature = "test-seams")]
+#[test]
+fn a_process_started_after_the_first_check_keeps_its_release_and_the_launcher() {
+    let root = unique_root("race");
+    install_ok(&sealed_bundle(&root, VERSION, "original"), &root, VERSION);
+    let release = root.join("prefix/releases").join(VERSION);
+    let launcher = root.join("bin/agent-ide");
+    fs::copy(env!("CARGO_BIN_EXE_agent-ide"), &launcher).unwrap();
+    let launcher_bytes = fs::read(&launcher).unwrap();
+    let manifest = fs::read(release.join("SHA256SUMS")).unwrap();
+    let fifo = root.join("block.fifo");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let pause = root.join("pause");
+    fs::create_dir_all(&pause).unwrap();
+    let other = sealed_bundle_named(&root, "bundle-other", VERSION, "rebuilt bytes");
+    let log = fs::File::create(root.join("installer.log")).unwrap();
+    let mut installer = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_agent-ide"))
+            .args(["self-install", "--replace", "--release"])
+            .arg(&other)
+            .args(["--version", VERSION])
+            .args(["--home", &root.join("home").to_string_lossy()])
+            .args(["--prefix", &root.join("prefix").to_string_lossy()])
+            .args(["--bin-dir", &root.join("bin").to_string_lossy()])
+            .args(["--share-dir", &root.join("share").to_string_lossy()])
+            .env("AGENT_IDE_TEST_INSTALL_PAUSE", &pause)
+            .stdout(std::process::Stdio::null())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !pause.join("paused").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "installer never paused"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let child = spawn_blocked(&release, &fifo);
+    wait_for_process_in(&release, child.0.id());
+    fs::write(pause.join("resume"), b"").unwrap();
+    let status = installer.0.wait().unwrap();
+    let stderr = fs::read_to_string(root.join("installer.log")).unwrap();
+    assert!(!status.success(), "replace must be refused: {stderr}");
+    assert!(stderr.contains("refusing to replace"), "{stderr}");
+    assert_eq!(fs::read(release.join("SHA256SUMS")).unwrap(), manifest);
+    assert!(release.join("agent-ide").is_file());
+    assert!(
+        fs::read(&launcher).unwrap() == launcher_bytes,
+        "launcher changed"
+    );
+    assert_eq!(fs::read_dir(root.join("bin")).unwrap().count(), 1);
+    drop(child);
     let _ = fs::remove_dir_all(&root);
 }
