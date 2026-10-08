@@ -54,6 +54,20 @@ const CLIENT_LEASE_OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 const HOOK_CONNECTIONS: usize = 4;
 /// Window of the journal line that counts refused connections: one line per lane per minute.
 const BUSY_JOURNAL_WINDOW_MS: u64 = 60_000;
+/// How long a failed daemon keeps serving after its dispatcher reported the failure, answering
+/// health `restarting` and every new call a typed `restarting` reply, so a reply that is already
+/// being written (the panicked call's own) reaches its peer before the connections are dropped.
+const FAULT_DRAIN: Duration = Duration::from_millis(500);
+/// Pause before the accept loop tries again after a transient `accept` error (descriptor or
+/// memory exhaustion, an aborted handshake): long enough for the pressure to ease, short enough
+/// that no call waits noticeably.
+const ACCEPT_RETRY_PAUSE: Duration = Duration::from_millis(50);
+/// File name of the launcher record a managed daemon generation is started with, inside its
+/// runtime directory; a crash-only exit removes it so a replacement can write its own at once.
+pub const LAUNCHER_FILE: &str = "launcher.json";
+/// File name of the Claude attachment record of a managed daemon generation, inside its runtime
+/// directory; removed together with [`LAUNCHER_FILE`] by a crash-only exit.
+pub const CLAUDE_ATTACHMENT_FILE: &str = "attachment";
 
 /// One bounded connection lane: its permits, and the rate window of its refusal journal line.
 #[derive(Clone)]
@@ -365,6 +379,7 @@ async fn run_daemon_inner(
     let idle_expired = lease.idle_expired();
     tokio::pin!(idle_expired);
     let mut idle_exit = false;
+    let mut fault_exit = false;
     let serving = async {
         let socket_path = runtime_dir.socket_path();
         retire_stale_socket(&socket_path, ipc.connection_deadline).await?;
@@ -383,7 +398,19 @@ async fn run_daemon_inner(
         );
 
         let mut journal_tick = tokio::time::interval(Duration::from_millis(BUSY_JOURNAL_WINDOW_MS));
+        // Crash-only containment: the dispatcher reports its own failure through `failed()`; the
+        // daemon then keeps serving only `restarting` answers for `FAULT_DRAIN` and exits.
+        let failure = async {
+            match &dispatcher {
+                Some(dispatcher) => dispatcher.failed().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(failure);
+        let mut drain_until: Option<tokio::time::Instant> = None;
+        let mut accept_failing = false;
         loop {
+            let draining = drain_until;
             let accepted = tokio::select! {
                 accepted = listener.accept() => accepted,
                 _ = journal_tick.tick() => {
@@ -394,8 +421,42 @@ async fn run_daemon_inner(
                 _ = &mut termination => break,
                 _ = &mut idle_expired => { idle_exit = !lease.stop_requested(); break; }
                 _ = connections.join_next(), if !connections.is_empty() => continue,
+                () = &mut failure, if draining.is_none() => {
+                    drain_until = Some(tokio::time::Instant::now() + FAULT_DRAIN);
+                    continue;
+                }
+                () = tokio::time::sleep_until(draining.unwrap_or_else(tokio::time::Instant::now)),
+                    if draining.is_some() => {
+                    fault_exit = true;
+                    break;
+                }
             };
-            let (stream, _) = accepted?;
+            let (stream, _) = match accepted {
+                Ok(accepted) => {
+                    accept_failing = false;
+                    accepted
+                }
+                Err(error) if transient_accept_error(&error) => {
+                    // An exhausted descriptor table or a handshake that died in the queue must
+                    // not end the daemon every session of the repository shares. One journal
+                    // line per streak of failures keeps a long exhaustion from flooding it.
+                    if !accept_failing {
+                        accept_failing = true;
+                        crate::errorlog::record(
+                            crate::errorlog::Method::Daemon,
+                            crate::errorlog::Outcome::Refused,
+                            crate::errorlog::Fields {
+                                reason: Some(crate::errorlog::ReasonCode::Capacity),
+                                detail: Some("accept_retry"),
+                                ..crate::errorlog::Fields::default()
+                            },
+                        );
+                    }
+                    tokio::time::sleep(ACCEPT_RETRY_PAUSE).await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let generation = generation.clone();
             let dispatcher = dispatcher.clone();
             let lanes = lanes.clone();
@@ -423,6 +484,10 @@ async fn run_daemon_inner(
         retention.abort();
     }
     let result = finish_daemon(serving, &mut connections, dispatcher.as_ref(), &lease).await;
+    // The dispatcher's failure flag, not the exit branch that happened to win, decides whether this
+    // exit is crash-only: a termination signal or idle expiry racing the fault drain must not turn
+    // a failed generation into an orderly one that deletes the runtime store.
+    let fault_exit = fault_exit || dispatcher.as_deref().is_some_and(|owner| owner.is_failed());
     crate::errorlog::record(
         crate::errorlog::Method::Daemon,
         if result.is_err() {
@@ -432,9 +497,18 @@ async fn run_daemon_inner(
         } else {
             crate::errorlog::Outcome::Stopped
         },
-        crate::errorlog::Fields::default(),
+        crate::errorlog::Fields {
+            detail: fault_exit.then_some("fault_exit"),
+            ..crate::errorlog::Fields::default()
+        },
     );
-    if result.is_ok()
+    if fault_exit {
+        // Crash-only exit: the runtime directory keeps `state.sqlite` with its receipts, so the
+        // replacement daemon finds every written edit as the unknown outcome it is and never
+        // repeats one. Only this generation's launcher and attachment records go, so the
+        // replacement can write its own at once instead of waiting out a stale-record race.
+        retire_generation_records(runtime_dir.path());
+    } else if result.is_ok()
         && owned_socket.is_some()
         && let Some(identity) = runtime_identity
     {
@@ -442,6 +516,32 @@ async fn run_daemon_inner(
     }
     drop((owned_socket, _lock));
     result
+}
+
+/// Removes the launcher and Claude attachment records of the generation that is exiting after a
+/// fault, leaving every other file of the runtime directory (the store, its backups, caches).
+///
+/// Best effort: a record that is already gone, or cannot be removed, changes nothing for the
+/// replacement beyond the front's existing stale-record handling.
+fn retire_generation_records(runtime_dir: &Path) {
+    for name in [LAUNCHER_FILE, CLAUDE_ATTACHMENT_FILE] {
+        let _ = fs::remove_file(runtime_dir.join(name));
+    }
+}
+
+/// Reports whether an `accept` error is transient pressure rather than a broken listener.
+fn transient_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::OutOfMemory
+    ) || matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    )
 }
 
 /// Removes `path` only if it is still the exact directory identity captured when this daemon
@@ -673,6 +773,13 @@ async fn doctor_socket(socket_path: PathBuf, deadline: Duration) -> Result<Docto
         Ok(Ok(response)) => response,
         Ok(Err(_)) | Err(_) => return Ok(DoctorStatus::Unavailable),
     };
+    // A failed daemon that answers `restarting` is exiting to be replaced: reachable, not healthy.
+    if response.version == WIRE_VERSION
+        && response.request_id == request.request_id
+        && response.status == "restarting"
+    {
+        return Ok(DoctorStatus::Unavailable);
+    }
     if response.version != WIRE_VERSION
         || response.request_id != request.request_id
         || response.status != "ok"
@@ -816,9 +923,10 @@ async fn serve_accepted_connection(
     let version = request.get("version").and_then(Value::as_u64);
     let identified = match version {
         Some(1) => {
+            let failed = dispatcher.as_deref().is_some_and(|owner| owner.is_failed());
             let _ = tokio::time::timeout_at(
                 connection_deadline,
-                serve_v1_request(&mut stream, request, generation, &lease),
+                serve_v1_request(&mut stream, request, generation, &lease, failed),
             )
             .await;
             None
@@ -844,7 +952,15 @@ async fn serve_accepted_connection(
                 let hook =
                     request.get("method").and_then(Value::as_str) == Some("assistance.hook_submit");
                 let lane = if hook { &lanes.hooks } else { &lanes.calls };
-                if let Ok(_permit) = Arc::clone(&lane.permits).try_acquire_owned() {
+                if dispatcher.is_failed() {
+                    // Failed and exiting: nothing is dispatched, so nothing ran and the front may
+                    // send the call to the replacement.
+                    let _ = tokio::time::timeout_at(
+                        connection_deadline,
+                        write_status_reply(&mut stream, &request, version, "restarting"),
+                    )
+                    .await;
+                } else if let Ok(_permit) = Arc::clone(&lane.permits).try_acquire_owned() {
                     let method = request.get("method").and_then(Value::as_str)
                         == Some("assistance.method_dispatch");
                     let budget = if method {
@@ -862,7 +978,7 @@ async fn serve_accepted_connection(
                     lane.note_refused();
                     let _ = tokio::time::timeout_at(
                         connection_deadline,
-                        write_busy_reply(&mut stream, &request, version),
+                        write_status_reply(&mut stream, &request, version, "busy"),
                     )
                     .await;
                 }
@@ -877,16 +993,19 @@ async fn serve_accepted_connection(
     }
 }
 
-/// Answers a call or hook that found its lane full with the typed `busy` reply.
+/// Answers a call or hook the daemon refused before dispatching it with a typed status reply:
+/// `busy` (its lane was full) or `restarting` (the daemon failed and is exiting).
 ///
 /// The reply carries the request's own version, `request_id` (and `correlation_id` for a hook)
-/// and `"status": "busy"`, and no result: the daemon refused the request before dispatching it, so
-/// nothing ran and the front may report that and let the caller repeat it. A request without a
-/// usable `request_id` is dropped as before. The write is best-effort; the peer may be gone.
-async fn write_busy_reply(
+/// and `"status"`, and no result: the daemon refused the request before dispatching it, so
+/// nothing ran and the front may report that and let the caller repeat it (for `restarting`, on
+/// the replacement daemon). A request without a usable `request_id` is dropped as before. The
+/// write is best-effort; the peer may be gone.
+async fn write_status_reply(
     stream: &mut UnixStream,
     request: &Value,
     version: Option<u64>,
+    status: &str,
 ) -> io::Result<()> {
     let Some(request_id) = request.get("request_id").and_then(Value::as_str) else {
         return Ok(());
@@ -897,7 +1016,7 @@ async fn write_busy_reply(
     let mut reply = json!({
         "version": version.unwrap_or_default(),
         "request_id": request_id,
-        "status": "busy",
+        "status": status,
     });
     if let Some(correlation) = request.get("correlation_id").and_then(Value::as_str) {
         reply["correlation_id"] = Value::String(correlation.to_owned());
@@ -933,6 +1052,10 @@ async fn serve_client_lease_handshake(
         || request.request_id.len() > MAX_REQUEST_ID_BYTES
         || request.method != "assistance.client_lease"
     {
+        return Ok(None);
+    }
+    // A failed daemon is exiting: a lease on it would only be dropped again.
+    if dispatcher.is_some_and(|owner| owner.is_failed()) {
         return Ok(None);
     }
     let Some(guard) = lease.try_admit() else {
@@ -1009,6 +1132,7 @@ pub async fn open_claude_client_lease(
 }
 
 /// Routes one version-one frame to its fixed method: health, or `daemon.stop` (0.6.7).
+/// `failed` is the dispatcher's failure flag, which turns the health answer into `restarting`.
 ///
 /// Every other method name is dropped without a reply, exactly as before; a pre-0.6.7 front
 /// therefore never learns `daemon.stop` existed, and a pre-0.6.7 daemon stays silent for it.
@@ -1017,10 +1141,11 @@ async fn serve_v1_request(
     request: Value,
     generation: String,
     lease: &lease::LeaseController,
+    failed: bool,
 ) -> io::Result<()> {
     match request.get("method").and_then(Value::as_str) {
         Some("daemon.stop") => serve_daemon_stop(stream, request, lease).await,
-        _ => serve_health(stream, request, generation).await,
+        _ => serve_health(stream, request, generation, failed).await,
     }
 }
 
@@ -1060,10 +1185,14 @@ async fn serve_daemon_stop(
 }
 
 /// Validates the unchanged v1 health request and emits only its existing correlated health reply.
+///
+/// The reply keeps its shape; only its `status` changes: `ok`, or `restarting` once the
+/// dispatcher `failed`, so a front never adopts a daemon that is exiting to be replaced.
 async fn serve_health(
     stream: &mut UnixStream,
     request: Value,
     generation: String,
+    failed: bool,
 ) -> io::Result<()> {
     let request: HealthRequest = serde_json::from_value(request)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -1077,7 +1206,7 @@ async fn serve_health(
     let response = HealthResponse {
         version: WIRE_VERSION,
         request_id: request.request_id,
-        status: "ok".to_owned(),
+        status: if failed { "restarting" } else { "ok" }.to_owned(),
         daemon_generation: generation,
     };
     write_frame(stream, &response, MAX_V1_FRAME_BYTES).await
@@ -1263,6 +1392,11 @@ fn parse_method_dispatch_reply(
     // The daemon refused the request before dispatching it: it never ran and may be repeated.
     if object.get("status").and_then(Value::as_str) == Some("busy") {
         return Ok(MethodDispatchTransportResult::Busy);
+    }
+    // Same guarantee from a failed daemon that is exiting: it never ran, but this daemon must not
+    // be asked again.
+    if object.get("status").and_then(Value::as_str) == Some("restarting") {
+        return Ok(MethodDispatchTransportResult::Restarting);
     }
     // An explicit unavailable reply (for example a result over the payload bound) can follow an
     // executed call: the request was delivered, so its outcome is unknown, never "not sent".

@@ -1556,6 +1556,10 @@ pub enum FacadeOutcome {
     /// The daemon answered a typed `busy` reply: every connection of its lane was taken, the call
     /// never ran (nothing was applied), and repeating it is safe.
     Busy,
+    /// The daemon answered a typed `restarting` reply: it failed internally and is exiting to be
+    /// replaced, the call never ran (nothing was applied), and a managed client re-establishes a
+    /// daemon and sends it once more.
+    Restarting,
     /// Writing the request began but no usable reply arrived, or a mutating call's reply timed
     /// out: the call may have executed, so it is never resent and no reconnect is attempted.
     OutcomeUnknown,
@@ -1687,14 +1691,22 @@ impl AssistanceFacade {
         let mut tag = None;
         let outcome = match dispatch_method_if_running(runtime_dir, request, self.limits).await {
             MethodDispatchTransportResult::Unavailable => FacadeOutcome::Unavailable,
-            MethodDispatchTransportResult::TimedOut => FacadeOutcome::TimedOut,
+            MethodDispatchTransportResult::TimedOut => {
+                journal_transport_timeout(tool, "connect");
+                FacadeOutcome::TimedOut
+            }
             MethodDispatchTransportResult::Busy => FacadeOutcome::Busy,
+            MethodDispatchTransportResult::Restarting => FacadeOutcome::Restarting,
             MethodDispatchTransportResult::OutcomeUnknown => FacadeOutcome::OutcomeUnknown,
             // A read-only call that timed out after delivery changed nothing worth checking.
             MethodDispatchTransportResult::WrittenTimedOut if tool.mutates() => {
+                journal_transport_timeout(tool, "reply");
                 FacadeOutcome::OutcomeUnknown
             }
-            MethodDispatchTransportResult::WrittenTimedOut => FacadeOutcome::TimedOut,
+            MethodDispatchTransportResult::WrittenTimedOut => {
+                journal_transport_timeout(tool, "reply");
+                FacadeOutcome::TimedOut
+            }
             MethodDispatchTransportResult::Dispatched { opaque_result_json } => {
                 let (actor, delivered) = match untag_reply(opaque_result_json.as_str()) {
                     // Only an identity query may be answered with no actor; on any other call the
@@ -1739,6 +1751,49 @@ impl AssistanceFacade {
         };
         (outcome, tag)
     }
+}
+
+/// Longest the front waits for the liveness probe's health answer.
+const LIVENESS_PROBE_BUDGET: Duration = Duration::from_secs(3);
+
+/// Reports whether a delivered call's outcome is the kind a wedged daemon produces: a transport
+/// timeout, a lost reply, or the daemon's own `internal` refusal.
+fn suspects_wedged_daemon(outcome: &FacadeOutcome) -> bool {
+    match outcome {
+        FacadeOutcome::TimedOut | FacadeOutcome::OutcomeUnknown => true,
+        FacadeOutcome::Reply(reply, _) => matches!(
+            reply.as_ref(),
+            PeerReply::Error {
+                code: FailureCode::Internal,
+                ..
+            }
+        ),
+        _ => false,
+    }
+}
+
+/// The bounded liveness probe: one health exchange with the daemon at `runtime_dir`, true only
+/// when it answers `ok` within [`LIVENESS_PROBE_BUDGET`]. A daemon that answers `restarting`, does
+/// not answer or answers garbage is not healthy; a probe never starts or stops anything.
+async fn daemon_answers_healthy(runtime_dir: &Path) -> bool {
+    matches!(
+        tokio::time::timeout(LIVENESS_PROBE_BUDGET, crate::app::doctor(runtime_dir)).await,
+        Ok(Ok(crate::app::DoctorStatus::Healthy { .. }))
+    )
+}
+
+/// Writes the client journal line of one transport timeout, which leaves no other trace: the
+/// failed phase (`connect` or `reply`) and the tool, never any parameter or reply content.
+fn journal_transport_timeout(tool: AssistanceTool, phase: &str) {
+    crate::errorlog::record(
+        crate::errorlog::Method::Client,
+        crate::errorlog::Outcome::Timeout,
+        crate::errorlog::Fields {
+            reason: Some(crate::errorlog::ReasonCode::Deadline),
+            detail: Some(&format!("transport:{phase}_timed_out:{}", tool.mcp_name())),
+            ..Default::default()
+        },
+    );
 }
 
 /// The answer to an `ide.stop` that was not sent because its actor could not be identified.
@@ -2799,9 +2854,25 @@ impl StdioFacade {
         let Some(reconnect) = &self.reconnect else {
             return (outcome, resume, tag);
         };
-        // Only a call that was never delivered may be sent again; a written call whose reply was
+        // Only a call that was never delivered may be sent again: not reached (`Unavailable`), or
+        // refused by a failed daemon before it ran (`Restarting`). A written call whose reply was
         // lost or late is never resent (OutcomeUnknown/TimedOut).
-        if !matches!(outcome, FacadeOutcome::Unavailable) {
+        if !matches!(
+            outcome,
+            FacadeOutcome::Unavailable | FacadeOutcome::Restarting
+        ) {
+            // Self-heal (stability QW-7): a delivered call that timed out, lost its reply or came
+            // back `internal` may have met a wedged daemon. One bounded liveness probe decides;
+            // only a daemon that does not answer healthy is re-established, so the next call
+            // lands on a live one. The call in hand keeps its outcome and is never resent.
+            if suspects_wedged_daemon(&outcome) && !daemon_answers_healthy(&runtime_dir).await {
+                if let Some((new_runtime, new_attachment)) = (reconnect.reestablish)().await {
+                    if new_runtime != runtime_dir || new_attachment != attachment {
+                        reconnect.mark_replaced();
+                    }
+                    reconnect.store(new_runtime, new_attachment).await;
+                }
+            }
             return (outcome, resume, tag);
         }
         let Some((new_runtime, new_attachment)) = (reconnect.reestablish)().await else {
@@ -3488,6 +3559,11 @@ impl StdioFacade {
             // The daemon refused the call before running it, so even a mutation applied nothing.
             FacadeOutcome::Busy => {
                 "error: busy: the IDE is serving too many calls at once and did not run this one, so nothing was applied; repeat this call in a moment"
+            }
+            // The daemon refused the call before running it (and a managed client already tried
+            // the replacement once), so even a mutation applied nothing.
+            FacadeOutcome::Restarting => {
+                "error: restarting: the IDE restarted after an internal fault and did not run this call, so nothing was applied; repeat this call"
             }
             // Never resent: the daemon may have executed the call, and a resend could only repeat
             // a change or be refused for its already consumed pre-hook.

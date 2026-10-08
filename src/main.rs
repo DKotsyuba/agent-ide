@@ -1174,7 +1174,7 @@ impl ManagedRuntime {
     /// The returned absolute path is passed only to the exact daemon child. Existing files are
     /// never overwritten, and a short write leaves managed startup unavailable.
     fn write_launcher(&self, bytes: &[u8]) -> std::io::Result<PathBuf> {
-        let path = self.path.join("launcher.json");
+        let path = self.path.join(agent_ide::app::LAUNCHER_FILE);
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1309,7 +1309,7 @@ const CLAUDE_RUNTIME_PREFIX: &str = "ai-r-";
 /// Bounded deadline for the local `git` rendezvous-key probe; a real repository answers instantly.
 const GIT_COMMON_DIR_TIMEOUT: Duration = Duration::from_secs(2);
 /// Fixed owner-only file carrying the full project identity and random transport attachment.
-const CLAUDE_ATTACHMENT_FILE: &str = "attachment";
+const CLAUDE_ATTACHMENT_FILE: &str = agent_ide::app::CLAUDE_ATTACHMENT_FILE;
 /// Per-candidate attachment cache written only after the daemon registers that candidate.
 const CLAUDE_CANDIDATE_ATTACHMENT_FILE: &str = "candidate-attachment";
 /// Exact record length: 64 digest bytes, one separator, 64 attachment bytes, and one newline.
@@ -2091,8 +2091,10 @@ async fn run_managed_codex_mcp(
 /// Restarts this MCP's owned Codex daemon once after transport loss, restoring its lease and hooks.
 ///
 /// The guard serializes calls with shutdown. A transport fault preserves the exact live child and
-/// runtime; only a reaped child or replaced runtime is restarted. A fresh runtime enters teardown
-/// state before startup awaits, so cancellation cannot leave it behind.
+/// runtime; only a reaped child or replaced runtime is restarted. A reaped child's own directory is
+/// reused in place (its store and receipts survive a crash-only exit); a missing or replaced
+/// directory is replaced by a fresh one, which enters teardown state before startup awaits, so
+/// cancellation cannot leave it behind.
 fn codex_reestablish_hook(
     launcher_template: PathBuf,
     candidate: PathBuf,
@@ -2139,12 +2141,32 @@ fn codex_reestablish_hook(
             }
             terminate_owned_daemon(Arc::clone(&child)).await;
             *lease.lock().await = None;
-            if let Some(old) = runtime.current.lock().expect("owned runtime mutex").take() {
-                let _ = old.remove();
-            }
-            let fresh = ManagedRuntime::create().ok()?;
+            // The reaped daemon's directory still holds its store and receipts when it exited
+            // crash-only (an internal fault) or was killed: the replacement runs in that same
+            // directory, so a written edit stays the unknown outcome it is and is never repeated.
+            // Only a directory that is gone or no longer this MCP's own is replaced by a new one.
+            let kept = runtime
+                .current
+                .lock()
+                .expect("owned runtime mutex")
+                .clone()
+                .filter(|old| matches!(old.identity_matches(), Ok(true)));
+            let in_place = kept.is_some();
+            let fresh = match kept {
+                Some(old) => {
+                    clear_claude_generation(&old);
+                    old
+                }
+                None => {
+                    if let Some(old) = runtime.current.lock().expect("owned runtime mutex").take() {
+                        let _ = old.remove();
+                    }
+                    let fresh = ManagedRuntime::create().ok()?;
+                    *runtime.current.lock().expect("owned runtime mutex") = Some(fresh.clone());
+                    fresh
+                }
+            };
             let path = fresh.path.clone();
-            *runtime.current.lock().expect("owned runtime mutex") = Some(fresh.clone());
             let started = start_managed_daemon(
                 &fresh,
                 &launcher_template,
@@ -2154,7 +2176,9 @@ fn codex_reestablish_hook(
             )
             .await;
             let Ok((attachment, mut new_child)) = started else {
-                if let Some(fresh) = runtime.current.lock().expect("owned runtime mutex").take() {
+                if !in_place
+                    && let Some(fresh) = runtime.current.lock().expect("owned runtime mutex").take()
+                {
                     let _ = fresh.remove();
                 }
                 return None;
@@ -2177,7 +2201,9 @@ fn codex_reestablish_hook(
                 // must be force-reaped before its fenced runtime is removed.
                 let _ = new_child.start_kill();
                 let _ = new_child.wait().await;
-                if let Some(fresh) = runtime.current.lock().expect("owned runtime mutex").take() {
+                if !in_place
+                    && let Some(fresh) = runtime.current.lock().expect("owned runtime mutex").take()
+                {
                     let _ = fresh.remove();
                 }
                 return None;
@@ -2700,6 +2726,7 @@ async fn rendezvous_with_claude_daemon(
         if let Some(attachment) = adopt_current_claude_daemon(path, key, note).await {
             return Some((path.to_owned(), attachment));
         }
+        wait_for_exiting_daemon(path).await;
         if let Ok(runtime) = ManagedRuntime::ensure_deterministic(path.to_owned()) {
             if let Some(attachment) =
                 spawn_claude_daemon(&runtime, key, launcher_template, candidate, note).await
@@ -2719,6 +2746,30 @@ async fn rendezvous_with_claude_daemon(
         note_last_resort_daemon(path, note).await;
     }
     adopted
+}
+
+/// Waits a bounded interval while a daemon still holds the runtime lock without answering healthy.
+///
+/// Such a daemon is either starting (another front's spawn) or exiting after an internal fault
+/// (it answers `restarting`, then releases the lock); spawning over it would only start a child
+/// that loses the lock and exits. The wait ends as soon as the lock is released or the daemon
+/// answers healthy, and at the latest after eight seconds, so a hung daemon never blocks the
+/// attach.
+async fn wait_for_exiting_daemon(path: &Path) {
+    let _ = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            match doctor_report(path).await {
+                Ok(report)
+                    if report.lock == DoctorLockState::Held
+                        && !matches!(report.status, DoctorStatus::Healthy { .. }) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                _ => return,
+            }
+        }
+    })
+    .await;
 }
 
 /// Adopts an existing daemon only after its directory identity, lock, and health all check out.
@@ -2921,13 +2972,14 @@ async fn spawn_claude_daemon(
     }
 }
 
-/// Best-effort removal of one shared Claude runtime's generation-specific launcher/attachment files.
+/// Best-effort removal of one managed runtime's generation-specific launcher/attachment files, for
+/// a shared Claude runtime and for a Codex runtime restarted in place.
 ///
 /// Never removes the shared rendezvous directory itself, and never fails the caller: a missing file
 /// is already clean, and any other removal error is silently accepted, since a live daemon's own
 /// files (if this race was lost) are recreated identically by nothing else touching this directory.
 fn clear_claude_generation(runtime: &ManagedRuntime) {
-    let _ = fs::remove_file(runtime.path.join("launcher.json"));
+    let _ = fs::remove_file(runtime.path.join(agent_ide::app::LAUNCHER_FILE));
     let _ = fs::remove_file(runtime.path.join(CLAUDE_ATTACHMENT_FILE));
 }
 

@@ -440,6 +440,10 @@ pub enum MethodDispatchTransportResult {
     /// The daemon read the request and refused it before dispatching because every connection of
     /// its lane was taken: the call never ran, so repeating it is safe, and the daemon is alive.
     Busy,
+    /// The daemon read the request and refused it before dispatching because it is failed and
+    /// exiting to be replaced: the call never ran (nothing was applied), so a fresh daemon may be
+    /// sent it, and this daemon must not be asked again.
+    Restarting,
 }
 
 /// Checks the common bounded opaque identifier invariant without making an identity claim.
