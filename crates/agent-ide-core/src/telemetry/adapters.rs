@@ -195,6 +195,60 @@ fn request_language(parameters: &serde_json::Value) -> Option<&'static str> {
     crate::lang::Language::for_path(std::path::Path::new(file)).map(crate::lang::Language::name)
 }
 
+/// Journals the front's own transport outcome of one call that never produced a typed reply
+/// (QW-4): the daemon cannot write these, because the call never reached it, was cut by its
+/// budget, or its reply was lost. One `warn` line per call, keyed by the same opaque `request` id
+/// as the daemon's dispatch line when it got that far, with a closed `front:<kind>` detail.
+/// Returns without writing for an outcome that carries a typed reply.
+///
+/// `parameters` supplies only the request form and eligibility; no value is written.
+pub fn log_front_outcome(
+    tool: AssistanceTool,
+    outcome: &crate::assistance::facade::FacadeOutcome,
+    elapsed: Duration,
+    context: &DispatchContext<'_>,
+) {
+    use crate::assistance::facade::FacadeOutcome;
+    use crate::errorlog::Outcome;
+    let (journal_outcome, detail, eligible) = match outcome {
+        FacadeOutcome::Reply(..) => return,
+        FacadeOutcome::InvalidParameters => (Outcome::Invalid, "front:invalid_parameters", false),
+        FacadeOutcome::MissingHostMetadata => {
+            (Outcome::Unavailable, "front:missing_host_metadata", true)
+        }
+        FacadeOutcome::Unavailable => (Outcome::Unavailable, "front:unavailable", true),
+        FacadeOutcome::TimedOut => (Outcome::Incomplete, "front:timed_out", true),
+        FacadeOutcome::Busy => (Outcome::Unavailable, "front:busy", true),
+        FacadeOutcome::OutcomeUnknown => (Outcome::Incomplete, "front:outcome_unknown", true),
+        FacadeOutcome::ReestablishFailed => {
+            (Outcome::Unavailable, "front:reestablish_failed", true)
+        }
+        FacadeOutcome::Incomplete => (Outcome::Incomplete, "front:incomplete", true),
+    };
+    let (form, language) = match context.parameters {
+        Some(parameters) => (
+            Some(crate::assistance::facade::request_form(tool, parameters)),
+            request_language(parameters),
+        ),
+        None => (None, None),
+    };
+    crate::errorlog::record(
+        errorlog_method(tool_method(tool)),
+        journal_outcome,
+        crate::errorlog::Fields {
+            duration_ms: elapsed.as_millis().try_into().ok(),
+            detail: Some(detail),
+            version: Some(env!("CARGO_PKG_VERSION")),
+            host: context.host,
+            language,
+            form: form.as_deref(),
+            request: context.request,
+            eligible: Some(eligible),
+            ..Default::default()
+        },
+    );
+}
+
 /// Returns the stage tag an error or cause-tagged unavailable reply already carries, if any.
 fn reply_detail(reply: &PeerReply) -> Option<String> {
     match reply {
@@ -511,6 +565,86 @@ mod tests {
     use super::*;
     use crate::telemetry::{Filter, TelemetryConfig, ToolMethod};
     use std::time::Duration;
+
+    /// QW-4: every front outcome that never produced a typed reply leaves one closed `front:`
+    /// line sharing the call's request id; a typed reply leaves none (the daemon wrote its line).
+    #[test]
+    fn front_transport_outcomes_are_journaled_with_the_request_id() {
+        use crate::assistance::facade::FacadeOutcome;
+        let parameters = serde_json::json!({"path":"SECRET/path.rs","lines":"1-2"});
+        let context = DispatchContext {
+            host: Some(crate::assistance::host_binding::HostKind::Claude),
+            role: None,
+            request: Some("17"),
+            parameters: Some(&parameters),
+        };
+        let cases = [
+            (
+                FacadeOutcome::Unavailable,
+                "unavailable",
+                "front:unavailable",
+            ),
+            (FacadeOutcome::TimedOut, "incomplete", "front:timed_out"),
+            (FacadeOutcome::Busy, "unavailable", "front:busy"),
+            (
+                FacadeOutcome::OutcomeUnknown,
+                "incomplete",
+                "front:outcome_unknown",
+            ),
+            (
+                FacadeOutcome::ReestablishFailed,
+                "unavailable",
+                "front:reestablish_failed",
+            ),
+            (FacadeOutcome::Incomplete, "incomplete", "front:incomplete"),
+            (
+                FacadeOutcome::MissingHostMetadata,
+                "unavailable",
+                "front:missing_host_metadata",
+            ),
+            (
+                FacadeOutcome::InvalidParameters,
+                "invalid",
+                "front:invalid_parameters",
+            ),
+        ];
+        crate::errorlog::capture_start();
+        for (outcome, _, _) in &cases {
+            log_front_outcome(
+                AssistanceTool::Read,
+                outcome,
+                Duration::from_millis(4),
+                &context,
+            );
+        }
+        log_front_outcome(
+            AssistanceTool::Read,
+            &FacadeOutcome::Reply(Box::new(PeerReply::HostStopped {}), None),
+            Duration::from_millis(1),
+            &context,
+        );
+        let events = crate::errorlog::capture_take();
+        assert_eq!(
+            events.len(),
+            cases.len(),
+            "a typed reply is not journaled: {events:?}"
+        );
+        for (event, (_, outcome, detail)) in events.iter().zip(&cases) {
+            assert_eq!(event.method, "read");
+            assert_eq!(event.outcome, *outcome, "{detail}");
+            assert_eq!(event.detail.as_deref(), Some(*detail));
+            assert_eq!(event.request.as_deref(), Some("17"));
+            assert_eq!(event.host.as_deref(), Some("claude"));
+            assert_eq!(event.form.as_deref(), Some("path+lines"));
+            assert_eq!(event.eligible, Some(*detail != "front:invalid_parameters"));
+        }
+        assert!(
+            events
+                .iter()
+                .all(|event| !format!("{event:?}").contains("SECRET")),
+            "no request value is journaled"
+        );
+    }
 
     /// Every failure derives a non-empty `<tool>:<reason>` journal stage, and an error reply's
     /// own detail always wins over the derivation.

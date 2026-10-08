@@ -7122,6 +7122,17 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
     )
     .await;
     assert_ne!(context["state"], "unavailable", "{context}");
+    // A request the front itself refuses never reaches the daemon; the front journals it.
+    next += 1;
+    let refused = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{
+                "name":"ide.read","arguments":{"symbol":"a.rs#f","path":"a.rs","caller_secret_key":"CALLER_SECRET_VALUE"},
+                "_meta":{"claudecode/toolUseId":format!("managed-claude-{next}")}
+            }}),
+        )
+        .await;
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
     mcp.close().await;
 
     let raw = std::fs::read_to_string(journal.join("events.jsonl")).unwrap_or_default();
@@ -7144,6 +7155,21 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
     assert_eq!(context.role.as_deref(), Some("writer"));
     assert_eq!(context.form.as_deref(), Some("kind"));
     assert_eq!(context.eligible, Some(true));
+    let front = events
+        .iter()
+        .find(|event| event.detail.as_deref() == Some("front:invalid_parameters"))
+        .unwrap_or_else(|| panic!("a front transport line: {raw}"));
+    assert_eq!(
+        (front.method.as_str(), front.eligible),
+        ("read", Some(false))
+    );
+    assert_eq!(front.form.as_deref(), Some("symbol+path"));
+    assert_eq!(front.host.as_deref(), Some("claude"));
+    assert!(front.request.is_some());
+    assert!(
+        !raw.contains("caller_secret_key") && !raw.contains("CALLER_SECRET_VALUE"),
+        "the front journal carries no model-chosen name or value: {raw}"
+    );
 }
 
 /// Bounded host binding generations one daemon retains, mirroring `host_binding::MAX_BINDINGS`.

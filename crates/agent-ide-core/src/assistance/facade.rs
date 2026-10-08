@@ -3258,7 +3258,22 @@ impl StdioFacade {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let stage_parameters = parameters.clone();
+        let call_started = std::time::Instant::now();
+        let request_id = context.id.to_string();
+        // The front's own journal lines (QW-4) share the daemon dispatch line's request id.
+        let front_context = crate::telemetry::adapters::DispatchContext {
+            host: parse_host_kind(&context.meta).ok(),
+            role: None,
+            request: Some(&request_id),
+            parameters: Some(&stage_parameters),
+        };
         if let Err(error) = validate_call(tool, parameters.clone()) {
+            crate::telemetry::adapters::log_front_outcome(
+                tool,
+                &FacadeOutcome::InvalidParameters,
+                call_started.elapsed(),
+                &front_context,
+            );
             return CallToolResult::error(vec![ContentBlock::text(error.message(tool))]);
         }
         let envelope = match parse_host_kind(&context.meta) {
@@ -3443,6 +3458,12 @@ impl StdioFacade {
         if tool == AssistanceTool::Stop && expected.is_none() && may_have_applied {
             self.forget_remembered_activation().await;
         }
+        crate::telemetry::adapters::log_front_outcome(
+            tool,
+            &outcome,
+            call_started.elapsed(),
+            &front_context,
+        );
         let message = match outcome {
             FacadeOutcome::Reply(reply, status) if resume != Resume::Fresh => {
                 let note = self.references_predate_replacement(&reply).await;
