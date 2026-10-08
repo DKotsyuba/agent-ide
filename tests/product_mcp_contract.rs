@@ -4259,8 +4259,10 @@ async fn managed_codex_sigterm_during_restart_removes_pending_runtime() {
     mcp.send(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.start","arguments":{"activation_id":"restart"},"_meta":{"threadId":"restart-shutdown","callId":format!("restart-shutdown-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})).await;
     let fresh = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
+            // The replacement restarts in the killed daemon's own runtime directory (its store and
+            // receipts are kept, M-004), so the pending marker appears in `old` itself.
             for path in managed_runtime_paths(&fixture).difference(&before) {
-                if path != &old && path.join("restart-lease-pending").is_file() {
+                if path.join("restart-lease-pending").is_file() {
                     return path.clone();
                 }
             }

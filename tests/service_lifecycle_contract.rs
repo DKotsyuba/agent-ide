@@ -785,7 +785,9 @@ async fn mcp_client_reopens_its_lease_after_re_establishing_a_lost_shared_daemon
 
     // Stands in for idle shutdown, a crash, or a binary upgrade while the MCP process keeps running.
     terminate_shared_daemon(&runtime);
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // Orderly termination is quick (M-004 added no work to it); the margin only absorbs a loaded
+    // host, where a bare 5 seconds failed once at a load average of 60-86.
+    tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             if !runtime.exists() {
                 return;
