@@ -1556,6 +1556,10 @@ pub enum FacadeOutcome {
     /// The daemon answered a typed `busy` reply: every connection of its lane was taken, the call
     /// never ran (nothing was applied), and repeating it is safe.
     Busy,
+    /// The daemon answered a typed `restarting` reply: it failed internally and is exiting to be
+    /// replaced, the call never ran (nothing was applied), and a managed client re-establishes a
+    /// daemon and sends it once more.
+    Restarting,
     /// Writing the request began but no usable reply arrived, or a mutating call's reply timed
     /// out: the call may have executed, so it is never resent and no reconnect is attempted.
     OutcomeUnknown,
@@ -1687,14 +1691,22 @@ impl AssistanceFacade {
         let mut tag = None;
         let outcome = match dispatch_method_if_running(runtime_dir, request, self.limits).await {
             MethodDispatchTransportResult::Unavailable => FacadeOutcome::Unavailable,
-            MethodDispatchTransportResult::TimedOut => FacadeOutcome::TimedOut,
+            MethodDispatchTransportResult::TimedOut => {
+                journal_transport_timeout(tool, "connect");
+                FacadeOutcome::TimedOut
+            }
             MethodDispatchTransportResult::Busy => FacadeOutcome::Busy,
+            MethodDispatchTransportResult::Restarting => FacadeOutcome::Restarting,
             MethodDispatchTransportResult::OutcomeUnknown => FacadeOutcome::OutcomeUnknown,
             // A read-only call that timed out after delivery changed nothing worth checking.
             MethodDispatchTransportResult::WrittenTimedOut if tool.mutates() => {
+                journal_transport_timeout(tool, "reply");
                 FacadeOutcome::OutcomeUnknown
             }
-            MethodDispatchTransportResult::WrittenTimedOut => FacadeOutcome::TimedOut,
+            MethodDispatchTransportResult::WrittenTimedOut => {
+                journal_transport_timeout(tool, "reply");
+                FacadeOutcome::TimedOut
+            }
             MethodDispatchTransportResult::Dispatched { opaque_result_json } => {
                 let (actor, delivered) = match untag_reply(opaque_result_json.as_str()) {
                     // Only an identity query may be answered with no actor; on any other call the
@@ -1739,6 +1751,36 @@ impl AssistanceFacade {
         };
         (outcome, tag)
     }
+}
+
+/// Reports whether a delivered call's outcome is the kind a wedged daemon produces: a transport
+/// timeout, a lost reply, or the daemon's own `internal` refusal.
+fn suspects_wedged_daemon(outcome: &FacadeOutcome) -> bool {
+    match outcome {
+        FacadeOutcome::TimedOut | FacadeOutcome::OutcomeUnknown => true,
+        FacadeOutcome::Reply(reply, _) => matches!(
+            reply.as_ref(),
+            PeerReply::Error {
+                code: FailureCode::Internal,
+                ..
+            }
+        ),
+        _ => false,
+    }
+}
+
+/// Writes the client journal line of one transport timeout, which leaves no other trace: the
+/// failed phase (`connect` or `reply`) and the tool, never any parameter or reply content.
+fn journal_transport_timeout(tool: AssistanceTool, phase: &str) {
+    crate::errorlog::record(
+        crate::errorlog::Method::Client,
+        crate::errorlog::Outcome::Timeout,
+        crate::errorlog::Fields {
+            reason: Some(crate::errorlog::ReasonCode::Deadline),
+            detail: Some(&format!("transport:{phase}_timed_out:{}", tool.mcp_name())),
+            ..Default::default()
+        },
+    );
 }
 
 /// The answer to an `ide.stop` that was not sent because its actor could not be identified.
@@ -2110,6 +2152,22 @@ impl FeedbackLedger {
 pub type ReestablishFn =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<(PathBuf, String)>> + Send>> + Send + Sync>;
 
+/// Forcibly ends the daemon a managed front owns or shares when it stayed wedged: it holds its
+/// runtime but its control path answered nothing across repeated probes.
+///
+/// Called by the facade's wedge watch with the runtime directory it probed, the pid of the daemon
+/// whose silence it observed (when known), the number of failed probes and the time they span (evidence for the journal), only after at least [`crate::app::WEDGE_MIN_PROBES`] probes
+/// spanning [`crate::app::WEDGE_MIN_SPAN`]. The implementation owns every safety check and the journal line; it must
+/// never signal a daemon whose control path answers. The facade re-establishes afterwards.
+pub type EvictFn = Arc<
+    dyn Fn(PathBuf, Option<i32>, u32, Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Pause between the wedge watch's probes.
+const WEDGE_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Re-roots one managed Claude session to the root directory a refused `ide.start` named (T15B).
 ///
 /// The closure receives the model's exact `root` argument when the call carried one, or `None`
@@ -2282,6 +2340,10 @@ struct ManagedConnection {
     note: Option<SharedDaemonNote>,
     reroot: Option<RerootFn>,
     reestablish: ReestablishFn,
+    /// Force-replaces a daemon that stayed wedged; absent for a connection with no such authority.
+    evict: Option<EvictFn>,
+    /// Set while a background wedge watch runs, so one watch serves every concurrent failure.
+    watching: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ManagedConnection {
@@ -2298,6 +2360,8 @@ impl ManagedConnection {
             note: None,
             reroot: None,
             reestablish,
+            evict: None,
+            watching: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -2416,6 +2480,83 @@ impl ManagedConnection {
             .store(true, std::sync::atomic::Ordering::Release);
         self.replaced
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Re-establishes the daemon and publishes the new pair for later calls, marking the session
+    /// replaced when the pair changed. A failed re-establishment changes nothing.
+    async fn heal(&self, runtime_dir: &Path, attachment: &str) {
+        if let Some((new_runtime, new_attachment)) = (self.reestablish)().await {
+            if new_runtime != runtime_dir || new_attachment != attachment {
+                self.mark_replaced();
+            }
+            self.store(new_runtime, new_attachment).await;
+        }
+    }
+
+    /// Starts the background liveness check of a daemon a delivered call just suspected of being
+    /// wedged (it timed out, lost its reply or answered `internal`), unless one already runs.
+    ///
+    /// The call in hand has its outcome and is never resent; nothing here delays it. The check
+    /// probes the daemon's control path once: a healthy daemon is left alone however busy; one that
+    /// says `restarting`, or is gone, is re-established at once; one that is silent but still holds
+    /// its runtime is watched every [`WEDGE_PROBE_INTERVAL`]. Once
+    /// [`crate::app::WEDGE_MIN_PROBES`] probes failed over at least [`crate::app::WEDGE_MIN_SPAN`]
+    /// the watch calls `evict` (when this connection has that authority) and re-establishes the
+    /// daemon, so the next call lands on a live one without any agent action. A daemon that
+    /// answers again ends the watch with nothing signalled; it gives up after ten probes.
+    fn check_suspect_daemon(&self, runtime_dir: PathBuf, attachment: String) {
+        if self
+            .watching
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let connection = self.clone();
+        tokio::spawn(async move {
+            let began = tokio::time::Instant::now();
+            let mut probes = 0_u32;
+            let mut pinned: Option<Option<i32>> = None;
+            for round in 0..10 {
+                if round > 0 {
+                    tokio::time::sleep(WEDGE_PROBE_INTERVAL).await;
+                }
+                match crate::app::probe_health(&runtime_dir).await {
+                    crate::app::HealthProbe::Healthy => break,
+                    crate::app::HealthProbe::Restarting => {
+                        connection.heal(&runtime_dir, &attachment).await;
+                        break;
+                    }
+                    crate::app::HealthProbe::Silent => {}
+                }
+                if !crate::app::lock_is_held(&runtime_dir) {
+                    // The daemon left its runtime: nothing to wait for or signal.
+                    connection.heal(&runtime_dir, &attachment).await;
+                    break;
+                }
+                // The evidence belongs to one daemon generation: when the connection moved to
+                // another pair, or another process took the lock, this watch is over.
+                let holder = crate::app::lock_holder_pid(&runtime_dir);
+                let pinned_holder = *pinned.get_or_insert(holder);
+                if connection.current().await != (runtime_dir.clone(), attachment.clone())
+                    || holder != pinned_holder
+                {
+                    break;
+                }
+                probes += 1;
+                let span = began.elapsed();
+                if let Some(evict) = &connection.evict
+                    && probes >= crate::app::WEDGE_MIN_PROBES
+                    && span >= crate::app::WEDGE_MIN_SPAN
+                {
+                    evict(runtime_dir.clone(), pinned_holder, probes, span).await;
+                    connection.heal(&runtime_dir, &attachment).await;
+                    break;
+                }
+            }
+            connection
+                .watching
+                .store(false, std::sync::atomic::Ordering::Release);
+        });
     }
 
     /// Marks a successful activation: the binding is current again.
@@ -2572,6 +2713,16 @@ impl StdioFacade {
             publisher: None,
             router: Self::described_tool_router(),
         })
+    }
+
+    /// Gives this managed facade the authority to force-replace a wedged daemon through `evict`
+    /// (see [`EvictFn`]); without it a silent daemon is only probed and re-established when it
+    /// leaves by itself.
+    pub fn with_wedge_eviction(mut self, evict: EvictFn) -> Self {
+        if let Some(reconnect) = &mut self.reconnect {
+            reconnect.evict = Some(evict);
+        }
+        self
     }
 
     /// Publishes this process's actor route for the managed Codex native hook, best-effort.
@@ -2799,9 +2950,20 @@ impl StdioFacade {
         let Some(reconnect) = &self.reconnect else {
             return (outcome, resume, tag);
         };
-        // Only a call that was never delivered may be sent again; a written call whose reply was
+        // Only a call that was never delivered may be sent again: not reached (`Unavailable`), or
+        // refused by a failed daemon before it ran (`Restarting`). A written call whose reply was
         // lost or late is never resent (OutcomeUnknown/TimedOut).
-        if !matches!(outcome, FacadeOutcome::Unavailable) {
+        if !matches!(
+            outcome,
+            FacadeOutcome::Unavailable | FacadeOutcome::Restarting
+        ) {
+            // Self-heal (stability QW-7): a delivered call that timed out, lost its reply or came
+            // back `internal` may have met a wedged daemon. A background liveness check decides
+            // (see `check_suspect_daemon`), so the next call lands on a live one. The call in hand
+            // keeps its outcome at once and is never resent.
+            if suspects_wedged_daemon(&outcome) {
+                reconnect.check_suspect_daemon(runtime_dir.clone(), attachment.clone());
+            }
             return (outcome, resume, tag);
         }
         let Some((new_runtime, new_attachment)) = (reconnect.reestablish)().await else {
@@ -3488,6 +3650,11 @@ impl StdioFacade {
             // The daemon refused the call before running it, so even a mutation applied nothing.
             FacadeOutcome::Busy => {
                 "error: busy: the IDE is serving too many calls at once and did not run this one, so nothing was applied; repeat this call in a moment"
+            }
+            // The daemon refused the call before running it (and a managed client already tried
+            // the replacement once), so even a mutation applied nothing.
+            FacadeOutcome::Restarting => {
+                "error: restarting: the IDE restarted after an internal fault and did not run this call, so nothing was applied; repeat this call"
             }
             // Never resent: the daemon may have executed the call, and a resend could only repeat
             // a change or be refused for its already consumed pre-hook.

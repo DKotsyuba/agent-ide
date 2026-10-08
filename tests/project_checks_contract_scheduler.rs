@@ -237,6 +237,20 @@ async fn settle(total: Duration, step: Duration) {
     }
 }
 
+/// Advances the paused clock by `step` at a time, yielding the real thread between steps so the
+/// blocking pool can finish, until `ready` holds (at most 5,000 steps, then the caller's own
+/// assertion reports the failure). Use it instead of a fixed [`advance`] whenever the awaited
+/// state is produced by `spawn_blocking`, whose completion depends on real scheduling.
+async fn settle_until(ready: impl Fn() -> bool, step: Duration) {
+    for _ in 0..5_000 {
+        if ready() {
+            return;
+        }
+        advance(step).await;
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// Ten triggers within one debounce window collapse into exactly one check, whose cache dir is 0700.
 #[tokio::test(start_paused = true)]
 async fn scheduler_burst_of_triggers_debounces_to_one_check() {
@@ -826,7 +840,10 @@ async fn scheduler_cancelled_check_keeps_its_lease_for_the_process_lifetime() {
         home.join("checks"),
     );
     scheduler.trigger("repo", &worktree);
-    advance(Duration::from_millis(20)).await;
+    // A readiness barrier, not a fixed advance: the run reaches the checker through
+    // `spawn_blocking`, whose completion paused virtual time cannot order, so a loaded machine
+    // needs more than one 20 ms step before the check is live.
+    settle_until(|| checker.live() == 1, Duration::from_millis(10)).await;
     assert_eq!(checker.live(), 1);
     let dir = worktree_cache_dir(&checker.calls()[0].cache_dir);
 

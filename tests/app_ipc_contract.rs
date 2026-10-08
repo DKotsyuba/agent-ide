@@ -603,3 +603,574 @@ async fn hook_and_method_keep_connect_write_within_the_configured_deadline() {
     }
     clock_guard.abort();
 }
+
+/// A dispatcher whose failure the test raises on demand, counting what it was asked to run.
+struct FailableDispatcher {
+    /// The failure flag; `true` once [`AssistanceDispatcher::is_failed`] must report it.
+    failed: tokio::sync::watch::Sender<bool>,
+    /// How many requests reached [`AssistanceDispatcher::dispatch`].
+    dispatched: AtomicUsize,
+}
+
+impl FailableDispatcher {
+    /// Builds a healthy dispatcher that has run nothing.
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            failed: tokio::sync::watch::Sender::new(false),
+            dispatched: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl AssistanceDispatcher for FailableDispatcher {
+    /// Answers like [`TestDispatcher`] and counts the request.
+    fn dispatch(
+        &self,
+        request: AssistanceDispatch,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = Result<AssistanceDispatchReply, AssistanceDispatchUnavailable>>
+                + Send
+                + '_,
+        >,
+    > {
+        self.dispatched.fetch_add(1, Ordering::SeqCst);
+        TestDispatcher.dispatch(request)
+    }
+
+    /// Reports the flag the test raised.
+    fn is_failed(&self) -> bool {
+        *self.failed.borrow()
+    }
+
+    /// Resolves once the test raised the flag.
+    fn failed(&self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let mut flag = self.failed.subscribe();
+        Box::pin(async move {
+            let _ = flag.wait_for(|failed| *failed).await;
+        })
+    }
+}
+
+/// Starts the in-process daemon over `dispatcher` and returns its task, whose result the caller
+/// inspects, once its private socket accepts connections.
+async fn start_failable_daemon(
+    runtime_dir: &Path,
+    dispatcher: Arc<FailableDispatcher>,
+) -> tokio::task::JoinHandle<Result<(), agent_ide::app::AppError>> {
+    let daemon_runtime = RuntimeDir::prepare_for_daemon(runtime_dir).unwrap();
+    let task = tokio::spawn(run_daemon_with_assistance(
+        daemon_runtime,
+        dispatcher,
+        EffectiveConfig::defaults(),
+        agent_ide::app::lease::DEFAULT_IDLE_TIMEOUT,
+    ));
+    let socket = runtime_dir.join("agent-ide.sock");
+    for _ in 0..200 {
+        if UnixStream::connect(&socket).await.is_ok() {
+            return task;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("Assistance daemon did not bind its private socket");
+}
+
+/// Sends one method call and returns the transport outcome.
+async fn one_context_call(runtime_dir: &Path, id: &str) -> MethodDispatchTransportResult {
+    dispatch_method_if_running(
+        runtime_dir,
+        MethodDispatch::new(
+            id,
+            id,
+            "attachment",
+            agent_ide::app::transport::AssistanceMethod::Context,
+            OpaqueJson::new("{}", 64).unwrap(),
+        )
+        .unwrap(),
+        transport_limits(),
+    )
+    .await
+}
+
+/// A failed dispatcher turns the daemon crash-only (stability QW-3): health answers `restarting`,
+/// a new call is refused as `restarting` without reaching the dispatcher, and the daemon then
+/// exits keeping its runtime directory with the store (`state.sqlite`) and receipts, retiring only
+/// the generation's launcher and attachment records.
+///
+/// Before the fix health answered `ok` for ever, the call was dispatched to the dead dispatcher, and
+/// an orderly exit deleted the whole runtime directory.
+#[tokio::test]
+async fn a_failed_dispatcher_answers_restarting_and_exits_keeping_the_runtime_store() {
+    let runtime_dir = runtime_dir();
+    let dispatcher = FailableDispatcher::new();
+    let task = start_failable_daemon(&runtime_dir, dispatcher.clone()).await;
+    fs::write(runtime_dir.join("state.sqlite"), b"receipts").unwrap();
+    fs::write(runtime_dir.join("launcher.json"), b"{}").unwrap();
+    fs::write(runtime_dir.join("attachment"), b"record").unwrap();
+    let healthy = exchange(
+        &runtime_dir,
+        json!({"version": 1, "request_id": "before", "method": "health"}),
+    )
+    .await;
+    assert_eq!(healthy["status"], "ok");
+    assert!(matches!(
+        one_context_call(&runtime_dir, "served").await,
+        MethodDispatchTransportResult::Dispatched { .. }
+    ));
+    let before = dispatcher.dispatched.load(Ordering::SeqCst);
+
+    dispatcher.failed.send_replace(true);
+    // The daemon keeps answering for a short drain, then exits; both answers must be seen in it.
+    let (mut health, mut call) = (false, false);
+    let until = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !(health && call) && tokio::time::Instant::now() < until && !task.is_finished() {
+        if let Ok(stream) = UnixStream::connect(runtime_dir.join("agent-ide.sock")).await {
+            drop(stream);
+            let reply = exchange(
+                &runtime_dir,
+                json!({"version": 1, "request_id": "during", "method": "health"}),
+            )
+            .await;
+            health |= reply["status"] == "restarting";
+        }
+        call |= one_context_call(&runtime_dir, "refused").await
+            == MethodDispatchTransportResult::Restarting;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        health,
+        "health must answer restarting once the dispatcher failed"
+    );
+    assert!(
+        call,
+        "a call must be refused as restarting once the dispatcher failed"
+    );
+    assert_eq!(
+        dispatcher.dispatched.load(Ordering::SeqCst),
+        before,
+        "a refused call never reaches the failed dispatcher"
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("a failed daemon must exit")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fs::read(runtime_dir.join("state.sqlite")).unwrap(),
+        b"receipts"
+    );
+    assert!(
+        !runtime_dir.join("launcher.json").exists() && !runtime_dir.join("attachment").exists(),
+        "the generation's own records are retired so a replacement writes its own at once"
+    );
+    fs::remove_dir_all(runtime_dir).unwrap();
+}
+
+/// The failure flag, not the exit branch that wins, decides whether the runtime store survives: an
+/// exit that ends the daemon before the fault drain does (here the idle expiry; a termination
+/// signal is the same branch) must not take the orderly path that deletes the runtime directory.
+///
+/// The dispatcher is failed before the daemon starts and the idle timeout (50 ms) is far shorter
+/// than the 500 ms fault drain, so the idle branch wins; only the flag read at exit keeps the store.
+#[tokio::test]
+async fn a_failure_racing_an_idle_exit_still_keeps_the_runtime_store() {
+    let runtime_dir = runtime_dir();
+    fs::write(runtime_dir.join("state.sqlite"), b"receipts").unwrap();
+    let dispatcher = FailableDispatcher::new();
+    dispatcher.failed.send_replace(true);
+    let daemon_runtime = RuntimeDir::prepare_for_daemon(&runtime_dir).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_daemon_with_assistance(
+            daemon_runtime,
+            dispatcher,
+            EffectiveConfig::defaults(),
+            Duration::from_millis(50),
+        ),
+    )
+    .await
+    .expect("the daemon must exit")
+    .unwrap();
+    assert_eq!(
+        fs::read(runtime_dir.join("state.sqlite")).unwrap(),
+        b"receipts",
+        "a failed generation keeps the store whichever exit branch ends it"
+    );
+    fs::remove_dir_all(runtime_dir).unwrap();
+}
+
+/// Without a failure the same idle exit is orderly and removes the runtime directory, so the two
+/// tests above pin the difference to the failure flag alone.
+#[tokio::test]
+async fn an_unfailed_idle_exit_removes_the_runtime_directory() {
+    let runtime_dir = runtime_dir();
+    let daemon_runtime = RuntimeDir::prepare_for_daemon(&runtime_dir).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_daemon_with_assistance(
+            daemon_runtime,
+            FailableDispatcher::new(),
+            EffectiveConfig::defaults(),
+            Duration::from_millis(50),
+        ),
+    )
+    .await
+    .expect("the daemon must exit")
+    .unwrap();
+    assert!(
+        !runtime_dir.exists(),
+        "an orderly exit removes the runtime directory"
+    );
+}
+
+/// Returns the pid of a spawned child, which the test owns and kills at the end.
+fn pid_of(child: &Child) -> i32 {
+    child.id().expect("a live child has a pid") as i32
+}
+
+/// Reports whether the process still exists (signal 0 only checks).
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 delivers nothing.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Evidence large enough for a forced replacement: three silent probes over 31 seconds.
+const ENOUGH: (u32, Duration) = (3, Duration::from_secs(31));
+
+/// A forced replacement needs repeated silence: fewer probes or a shorter span refuse without
+/// signalling anything, even for a daemon that really is stopped (stability QW-7: a stall of a few
+/// seconds keeps its daemon).
+#[tokio::test]
+async fn eviction_without_enough_evidence_signals_nothing() {
+    let runtime_dir = runtime_dir();
+    let child = start_daemon(&runtime_dir).await;
+    let pid = pid_of(&child);
+    // SAFETY: `pid` is this test's own daemon child.
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    for (probes, span) in [
+        (1, Duration::from_secs(60)),
+        (3, Duration::from_secs(29)),
+        (0, Duration::ZERO),
+    ] {
+        assert_eq!(
+            agent_ide::app::evict_wedged_daemon(&runtime_dir, None, probes, span).await,
+            agent_ide::app::EvictOutcome::Refused("insufficient_evidence"),
+            "{probes} probes over {span:?}"
+        );
+    }
+    // SAFETY: as above.
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    assert!(alive(pid), "the stalled daemon was never signalled");
+    let reply = exchange(
+        &runtime_dir,
+        json!({"version": 1, "request_id": "after-stall", "method": "health"}),
+    )
+    .await;
+    assert_eq!(reply["status"], "ok", "it answers again once it resumes");
+    stop_daemon(child, runtime_dir).await;
+}
+
+/// A daemon whose control path answers is never signalled, however much evidence the caller
+/// presents: a busy daemon is not a wedged one.
+#[tokio::test]
+async fn eviction_never_signals_a_daemon_that_answers_health() {
+    let runtime_dir = runtime_dir();
+    let child = start_daemon(&runtime_dir).await;
+    let pid = pid_of(&child);
+    assert_eq!(
+        agent_ide::app::evict_wedged_daemon(&runtime_dir, None, ENOUGH.0, ENOUGH.1).await,
+        agent_ide::app::EvictOutcome::Refused("answering")
+    );
+    assert!(alive(pid));
+    let reply = exchange(
+        &runtime_dir,
+        json!({"version": 1, "request_id": "still-served", "method": "health"}),
+    )
+    .await;
+    assert_eq!(reply["status"], "ok");
+    stop_daemon(child, runtime_dir).await;
+}
+
+/// Holds an exclusive lock on `runtime_dir/agent-ide.lock` that records `pid`, standing in for a
+/// daemon, and returns the file whose lifetime is the lock's.
+fn hold_lock_recording(runtime_dir: &Path, pid: i32) -> fs::File {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(runtime_dir.join("agent-ide.lock"))
+        .unwrap();
+    // SAFETY: the descriptor is valid for the file's lifetime.
+    assert_eq!(
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    writeln!(file, "{pid}").unwrap();
+    file
+}
+
+/// A lock that is not held, a holder that is not an `agent-ide` executable and this very process
+/// are never signalled: the recorded pid is only a hint, validated at the moment of the call.
+#[tokio::test]
+async fn eviction_refuses_an_unheld_lock_a_foreign_executable_and_itself() {
+    let runtime_dir = runtime_dir();
+    let mut other = Command::new("/bin/sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let other_pid = pid_of(&other);
+
+    // A pid recorded in a lock file nobody holds.
+    fs::write(runtime_dir.join("agent-ide.lock"), format!("{other_pid}\n")).unwrap();
+    fs::set_permissions(
+        runtime_dir.join("agent-ide.lock"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_ide::app::evict_wedged_daemon(&runtime_dir, None, ENOUGH.0, ENOUGH.1).await,
+        agent_ide::app::EvictOutcome::Refused("not_held")
+    );
+    assert!(alive(other_pid));
+
+    // A held lock whose recorded pid runs another program (a reused pid, or a stale record).
+    let held = hold_lock_recording(&runtime_dir, other_pid);
+    assert_eq!(
+        agent_ide::app::evict_wedged_daemon(&runtime_dir, None, ENOUGH.0, ENOUGH.1).await,
+        agent_ide::app::EvictOutcome::Refused("not_agent_ide")
+    );
+    assert!(alive(other_pid), "a foreign executable is never signalled");
+
+    // A held lock that records this process.
+    drop(held);
+    let held = hold_lock_recording(&runtime_dir, std::process::id() as i32);
+    assert_eq!(
+        agent_ide::app::evict_wedged_daemon(&runtime_dir, None, ENOUGH.0, ENOUGH.1).await,
+        agent_ide::app::EvictOutcome::Refused("dead")
+    );
+    drop(held);
+    other.kill().await.unwrap();
+    fs::remove_dir_all(runtime_dir).unwrap();
+}
+
+/// A genuinely wedged daemon (stopped, holding the lock, answering nothing) is terminated after the
+/// evidence minimum: `SIGTERM` stays pending on a stopped process, so `SIGKILL` follows the grace.
+/// The lock is released, the runtime directory with the store stays, and a replacement daemon
+/// starts in the same directory and answers.
+#[tokio::test]
+async fn a_wedged_daemon_is_terminated_and_its_replacement_starts_in_the_same_directory() {
+    let runtime_dir = runtime_dir();
+    let mut child = start_daemon(&runtime_dir).await;
+    let pid = pid_of(&child);
+    fs::write(runtime_dir.join("state.sqlite"), b"receipts").unwrap();
+    // SAFETY: `pid` is this test's own daemon child.
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    assert_eq!(
+        agent_ide::app::evict_wedged_daemon(&runtime_dir, None, ENOUGH.0, ENOUGH.1).await,
+        agent_ide::app::EvictOutcome::Terminated { pid, killed: true }
+    );
+    let status = child.wait().await.unwrap();
+    assert!(!status.success(), "the wedged daemon was killed: {status}");
+    assert_eq!(
+        agent_ide::app::doctor_report(&runtime_dir)
+            .await
+            .unwrap()
+            .lock,
+        agent_ide::app::DoctorLockState::Unheld,
+        "the lock is released"
+    );
+    assert_eq!(
+        fs::read(runtime_dir.join("state.sqlite")).unwrap(),
+        b"receipts"
+    );
+
+    let replacement = start_daemon(&runtime_dir).await;
+    let reply = exchange(
+        &runtime_dir,
+        json!({"version": 1, "request_id": "replacement", "method": "health"}),
+    )
+    .await;
+    assert_eq!(reply["status"], "ok");
+    assert_eq!(
+        fs::read(runtime_dir.join("state.sqlite")).unwrap(),
+        b"receipts"
+    );
+    stop_daemon(replacement, runtime_dir).await;
+}
+
+/// A forced `SIGTERM` that the resumed daemon handles as an orderly shutdown still keeps the
+/// runtime store: the eviction leaves the retain marker first, so the orderly path that deletes the
+/// directory is not taken. The daemon is stopped and evicted; it resumes one second after the
+/// `SIGTERM`, so the pending signal is delivered and handled orderly instead of the `SIGKILL`.
+#[tokio::test]
+async fn a_forced_sigterm_handled_orderly_still_keeps_the_runtime_store() {
+    let runtime_dir = runtime_dir();
+    let mut child = start_daemon(&runtime_dir).await;
+    let pid = pid_of(&child);
+    fs::write(runtime_dir.join("state.sqlite"), b"receipts").unwrap();
+    // SAFETY: `pid` is this test's own daemon child.
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    let resume = tokio::spawn(async move {
+        // After the first probe (2 s of silence) and the `SIGTERM`, which stays pending.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        // SAFETY: as above.
+        unsafe { libc::kill(pid, libc::SIGCONT) };
+    });
+    let outcome =
+        agent_ide::app::evict_wedged_daemon(&runtime_dir, Some(pid), ENOUGH.0, ENOUGH.1).await;
+    resume.await.unwrap();
+    assert_eq!(
+        outcome,
+        agent_ide::app::EvictOutcome::Terminated { pid, killed: false }
+    );
+    let status = child.wait().await.unwrap();
+    assert!(
+        status.success(),
+        "the daemon exited orderly on SIGTERM: {status}"
+    );
+    assert_eq!(
+        fs::read(runtime_dir.join("state.sqlite")).unwrap(),
+        b"receipts",
+        "an orderly exit forced by a front keeps the store"
+    );
+    // The next daemon in the directory removes the spent marker and serves.
+    let replacement = start_daemon(&runtime_dir).await;
+    assert!(!runtime_dir.join(agent_ide::app::RETAIN_STORE_FILE).exists());
+    stop_daemon(replacement, runtime_dir).await;
+}
+
+/// Evidence collected against one daemon never justifies signalling another: when the pid the watch
+/// pinned is not the lock holder any more, nothing is signalled.
+#[tokio::test]
+async fn eviction_pinned_to_another_generation_signals_nothing() {
+    let runtime_dir = runtime_dir();
+    let child = start_daemon(&runtime_dir).await;
+    let pid = pid_of(&child);
+    // SAFETY: `pid` is this test's own daemon child.
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    assert_eq!(
+        agent_ide::app::evict_wedged_daemon(&runtime_dir, Some(pid + 1), ENOUGH.0, ENOUGH.1).await,
+        agent_ide::app::EvictOutcome::Refused("changed")
+    );
+    // SAFETY: as above.
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    assert!(alive(pid));
+    stop_daemon(child, runtime_dir).await;
+}
+
+/// Answers every health request on `listener` with `ok` while `answering` is set and otherwise
+/// accepts and holds the connection without replying, like a daemon whose control path is stuck.
+fn serve_health_when(listener: UnixListener, answering: Arc<std::sync::atomic::AtomicBool>) {
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            if !answering.load(Ordering::SeqCst) {
+                held.push(stream);
+                continue;
+            }
+            let mut length = [0_u8; 4];
+            if stream.read_exact(&mut length).await.is_err() {
+                continue;
+            }
+            let mut body = vec![0; u32::from_be_bytes(length) as usize];
+            if stream.read_exact(&mut body).await.is_err() {
+                continue;
+            }
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            let reply = serde_json::to_vec(&json!({
+                "version": 1,
+                "request_id": request["request_id"],
+                "status": "ok",
+                "daemon_generation": "0.0.0-fake-generation-for-the-test",
+            }))
+            .unwrap();
+            let _ = stream.write_all(&(reply.len() as u32).to_be_bytes()).await;
+            let _ = stream.write_all(&reply).await;
+        }
+    });
+}
+
+/// A daemon that resumed and answers its control path between the `SIGTERM` and the `SIGKILL` is
+/// never killed: the second probe before `SIGKILL` sees it answer.
+///
+/// The stand-in is a copy of the product binary named `agent-ide`, running its plain stdio `mcp`
+/// mode (which installs no `SIGTERM` handler) with `SIGTERM` ignored (an ignored disposition
+/// survives `exec`), so only the `SIGKILL` could end it; the test holds the lock recording its pid
+/// and serves a control path that stays silent for the first probes and answers during the
+/// `SIGTERM` grace.
+#[tokio::test]
+async fn a_daemon_that_answers_before_sigkill_is_not_killed() {
+    use std::os::unix::process::CommandExt;
+    let runtime_dir = runtime_dir();
+    let program = runtime_dir.join("agent-ide");
+    fs::copy(env!("CARGO_BIN_EXE_agent-ide"), &program).unwrap();
+    let mut command = std::process::Command::new(&program);
+    command
+        .args(["mcp", "--runtime-dir"])
+        .arg(runtime_dir.join("unused"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // SAFETY: only async-signal-safe `signal` runs between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let mut standin = tokio::process::Command::from(command);
+    let mut standin = standin.kill_on_drop(true).spawn().unwrap();
+    let pid = pid_of(&standin);
+    let held = hold_lock_recording(&runtime_dir, pid);
+    let answering = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    serve_health_when(
+        UnixListener::bind(runtime_dir.join("agent-ide.sock")).unwrap(),
+        answering.clone(),
+    );
+    let flip = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        answering.store(true, Ordering::SeqCst);
+    });
+    let outcome =
+        agent_ide::app::evict_wedged_daemon(&runtime_dir, Some(pid), ENOUGH.0, ENOUGH.1).await;
+    flip.await.unwrap();
+    assert_eq!(outcome, agent_ide::app::EvictOutcome::Refused("answering"));
+    assert!(alive(pid), "an answering daemon is never killed");
+    drop(held);
+    standin.kill().await.unwrap();
+    fs::remove_dir_all(runtime_dir).unwrap();
+}
+
+/// Without the retain marker an orderly `SIGTERM` exit would delete the receipts, so an eviction
+/// that cannot create it (here the name is a symlink, which is never followed) signals nothing.
+#[tokio::test]
+async fn eviction_that_cannot_create_the_retain_marker_signals_nothing() {
+    let runtime_dir = runtime_dir();
+    let child = start_daemon(&runtime_dir).await;
+    let pid = pid_of(&child);
+    std::os::unix::fs::symlink(
+        "/dev/null",
+        runtime_dir.join(agent_ide::app::RETAIN_STORE_FILE),
+    )
+    .unwrap();
+    // SAFETY: `pid` is this test's own daemon child.
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    assert_eq!(
+        agent_ide::app::evict_wedged_daemon(&runtime_dir, Some(pid), ENOUGH.0, ENOUGH.1).await,
+        agent_ide::app::EvictOutcome::Refused("retain_failed")
+    );
+    // SAFETY: as above.
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    assert!(alive(pid), "nothing was signalled");
+    stop_daemon(child, runtime_dir).await;
+}

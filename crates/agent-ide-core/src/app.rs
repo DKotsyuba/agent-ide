@@ -13,7 +13,7 @@ pub mod transport;
 
 use std::fmt::{self, Display};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -54,6 +54,24 @@ const CLIENT_LEASE_OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 const HOOK_CONNECTIONS: usize = 4;
 /// Window of the journal line that counts refused connections: one line per lane per minute.
 const BUSY_JOURNAL_WINDOW_MS: u64 = 60_000;
+/// How long a failed daemon keeps serving after its dispatcher reported the failure, answering
+/// health `restarting` and every new call a typed `restarting` reply, so a reply that is already
+/// being written (the panicked call's own) reaches its peer before the connections are dropped.
+const FAULT_DRAIN: Duration = Duration::from_millis(500);
+/// Pause before the accept loop tries again after a transient `accept` error (descriptor or
+/// memory exhaustion, an aborted handshake): long enough for the pressure to ease, short enough
+/// that no call waits noticeably.
+const ACCEPT_RETRY_PAUSE: Duration = Duration::from_millis(50);
+/// File name of the launcher record a managed daemon generation is started with, inside its
+/// runtime directory; a crash-only exit removes it so a replacement can write its own at once.
+pub const LAUNCHER_FILE: &str = "launcher.json";
+/// File name of the marker a front creates in a runtime directory just before it force-signals the
+/// daemon that holds it: a daemon that finds it at exit keeps the runtime store whichever way it
+/// exits (even an orderly `SIGTERM`), and a daemon that starts removes a stale one.
+pub const RETAIN_STORE_FILE: &str = "retain-store";
+/// File name of the Claude attachment record of a managed daemon generation, inside its runtime
+/// directory; removed together with [`LAUNCHER_FILE`] by a crash-only exit.
+pub const CLAUDE_ATTACHMENT_FILE: &str = "attachment";
 
 /// One bounded connection lane: its permits, and the rate window of its refusal journal line.
 #[derive(Clone)]
@@ -335,6 +353,8 @@ async fn run_daemon_inner(
     crate::errorlog::init(runtime_dir.path());
     crate::errorlog::install_panic_hook();
     let _lock = DaemonLock::acquire(runtime_dir.lock_path())?;
+    // A marker left by an earlier generation's forced replacement has done its work.
+    let _ = fs::remove_file(runtime_dir.path().join(RETAIN_STORE_FILE));
     let runtime_identity = fs::symlink_metadata(runtime_dir.path())
         .ok()
         .map(|metadata| (metadata.dev(), metadata.ino()));
@@ -365,6 +385,7 @@ async fn run_daemon_inner(
     let idle_expired = lease.idle_expired();
     tokio::pin!(idle_expired);
     let mut idle_exit = false;
+    let mut fault_exit = false;
     let serving = async {
         let socket_path = runtime_dir.socket_path();
         retire_stale_socket(&socket_path, ipc.connection_deadline).await?;
@@ -383,7 +404,19 @@ async fn run_daemon_inner(
         );
 
         let mut journal_tick = tokio::time::interval(Duration::from_millis(BUSY_JOURNAL_WINDOW_MS));
+        // Crash-only containment: the dispatcher reports its own failure through `failed()`; the
+        // daemon then keeps serving only `restarting` answers for `FAULT_DRAIN` and exits.
+        let failure = async {
+            match &dispatcher {
+                Some(dispatcher) => dispatcher.failed().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(failure);
+        let mut drain_until: Option<tokio::time::Instant> = None;
+        let mut accept_failing = false;
         loop {
+            let draining = drain_until;
             let accepted = tokio::select! {
                 accepted = listener.accept() => accepted,
                 _ = journal_tick.tick() => {
@@ -394,8 +427,42 @@ async fn run_daemon_inner(
                 _ = &mut termination => break,
                 _ = &mut idle_expired => { idle_exit = !lease.stop_requested(); break; }
                 _ = connections.join_next(), if !connections.is_empty() => continue,
+                () = &mut failure, if draining.is_none() => {
+                    drain_until = Some(tokio::time::Instant::now() + FAULT_DRAIN);
+                    continue;
+                }
+                () = tokio::time::sleep_until(draining.unwrap_or_else(tokio::time::Instant::now)),
+                    if draining.is_some() => {
+                    fault_exit = true;
+                    break;
+                }
             };
-            let (stream, _) = accepted?;
+            let (stream, _) = match accepted {
+                Ok(accepted) => {
+                    accept_failing = false;
+                    accepted
+                }
+                Err(error) if transient_accept_error(&error) => {
+                    // An exhausted descriptor table or a handshake that died in the queue must
+                    // not end the daemon every session of the repository shares. One journal
+                    // line per streak of failures keeps a long exhaustion from flooding it.
+                    if !accept_failing {
+                        accept_failing = true;
+                        crate::errorlog::record(
+                            crate::errorlog::Method::Daemon,
+                            crate::errorlog::Outcome::Refused,
+                            crate::errorlog::Fields {
+                                reason: Some(crate::errorlog::ReasonCode::Capacity),
+                                detail: Some("accept_retry"),
+                                ..crate::errorlog::Fields::default()
+                            },
+                        );
+                    }
+                    tokio::time::sleep(ACCEPT_RETRY_PAUSE).await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let generation = generation.clone();
             let dispatcher = dispatcher.clone();
             let lanes = lanes.clone();
@@ -423,6 +490,13 @@ async fn run_daemon_inner(
         retention.abort();
     }
     let result = finish_daemon(serving, &mut connections, dispatcher.as_ref(), &lease).await;
+    // The dispatcher's failure flag (or the retain marker a front leaves before force-signalling a
+    // wedged daemon), not the exit branch that happened to win, decides whether this exit is
+    // crash-only: a termination signal or idle expiry racing the fault drain, or the `SIGTERM` of a
+    // forced replacement that the daemon handles orderly, must not delete the runtime store.
+    let fault_exit = fault_exit
+        || dispatcher.as_deref().is_some_and(|owner| owner.is_failed())
+        || runtime_dir.path().join(RETAIN_STORE_FILE).exists();
     crate::errorlog::record(
         crate::errorlog::Method::Daemon,
         if result.is_err() {
@@ -432,9 +506,18 @@ async fn run_daemon_inner(
         } else {
             crate::errorlog::Outcome::Stopped
         },
-        crate::errorlog::Fields::default(),
+        crate::errorlog::Fields {
+            detail: fault_exit.then_some("fault_exit"),
+            ..crate::errorlog::Fields::default()
+        },
     );
-    if result.is_ok()
+    if fault_exit {
+        // Crash-only exit: the runtime directory keeps `state.sqlite` with its receipts, so the
+        // replacement daemon finds every written edit as the unknown outcome it is and never
+        // repeats one. Only this generation's launcher and attachment records go, so the
+        // replacement can write its own at once instead of waiting out a stale-record race.
+        retire_generation_records(runtime_dir.path());
+    } else if result.is_ok()
         && owned_socket.is_some()
         && let Some(identity) = runtime_identity
     {
@@ -442,6 +525,32 @@ async fn run_daemon_inner(
     }
     drop((owned_socket, _lock));
     result
+}
+
+/// Removes the launcher and Claude attachment records of the generation that is exiting after a
+/// fault, leaving every other file of the runtime directory (the store, its backups, caches).
+///
+/// Best effort: a record that is already gone, or cannot be removed, changes nothing for the
+/// replacement beyond the front's existing stale-record handling.
+fn retire_generation_records(runtime_dir: &Path) {
+    for name in [LAUNCHER_FILE, CLAUDE_ATTACHMENT_FILE] {
+        let _ = fs::remove_file(runtime_dir.join(name));
+    }
+}
+
+/// Reports whether an `accept` error is transient pressure rather than a broken listener.
+fn transient_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::OutOfMemory
+    ) || matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    )
 }
 
 /// Removes `path` only if it is still the exact directory identity captured when this daemon
@@ -673,6 +782,13 @@ async fn doctor_socket(socket_path: PathBuf, deadline: Duration) -> Result<Docto
         Ok(Ok(response)) => response,
         Ok(Err(_)) | Err(_) => return Ok(DoctorStatus::Unavailable),
     };
+    // A failed daemon that answers `restarting` is exiting to be replaced: reachable, not healthy.
+    if response.version == WIRE_VERSION
+        && response.request_id == request.request_id
+        && response.status == "restarting"
+    {
+        return Ok(DoctorStatus::Unavailable);
+    }
     if response.version != WIRE_VERSION
         || response.request_id != request.request_id
         || response.status != "ok"
@@ -705,6 +821,278 @@ pub async fn doctor_report(runtime_dir: &Path) -> Result<DoctorReport, AppError>
         lock,
         config,
     })
+}
+
+/// What one health probe of a daemon's control path found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealthProbe {
+    /// The daemon answered `ok` within the connection deadline.
+    Healthy,
+    /// The daemon answered `restarting`: it failed internally and is exiting to be replaced.
+    Restarting,
+    /// Nothing usable answered: no socket, a refused or stalled connection, or a bad reply.
+    Silent,
+}
+
+/// Probes the control path of the daemon at `runtime_dir` once, without starting or stopping
+/// anything.
+///
+/// The health request is served by the daemon's accept loop, never by its job queue or worker, so a
+/// daemon that is busy with long jobs still answers [`HealthProbe::Healthy`]. The probe is bounded
+/// by the configured connection deadline for the connect and for the reply.
+pub async fn probe_health(runtime_dir: &Path) -> HealthProbe {
+    let (runtime, endpoint, _) = inspect_runtime(runtime_dir);
+    if (runtime, endpoint) != (DoctorRuntimeState::Private, DoctorEndpointState::Socket) {
+        return HealthProbe::Silent;
+    }
+    let deadline = config::EffectiveConfig::defaults()
+        .ipc()
+        .connection_deadline;
+    let Ok(Ok(stream)) =
+        tokio::time::timeout(deadline, UnixStream::connect(runtime_dir.join(SOCKET_NAME))).await
+    else {
+        return HealthProbe::Silent;
+    };
+    let request = HealthRequest::new("probe");
+    let Ok(Ok(response)) = tokio::time::timeout(deadline, exchange(stream, &request)).await else {
+        return HealthProbe::Silent;
+    };
+    if response.version != WIRE_VERSION || response.request_id != request.request_id {
+        return HealthProbe::Silent;
+    }
+    match response.status.as_str() {
+        "ok" => HealthProbe::Healthy,
+        "restarting" => HealthProbe::Restarting,
+        _ => HealthProbe::Silent,
+    }
+}
+
+/// Reports whether a daemon currently holds the runtime lock at `runtime_dir` (a nonblocking
+/// probe that releases at once any lock it takes).
+pub fn lock_is_held(runtime_dir: &Path) -> bool {
+    inspect_lock(&runtime_dir.join(LOCK_NAME)) == DoctorLockState::Held
+}
+
+/// Returns the pid the current lock holder recorded, when the lock is held and the record parses.
+///
+/// A hint for pinning a wedge watch to one daemon generation; [`evict_wedged_daemon`] validates the
+/// pid itself before it signals anything.
+pub fn lock_holder_pid(runtime_dir: &Path) -> Option<i32> {
+    let lock_path = runtime_dir.join(LOCK_NAME);
+    if inspect_lock(&lock_path) != DoctorLockState::Held {
+        return None;
+    }
+    fs::read_to_string(lock_path)
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|pid| *pid > 1)
+}
+
+/// Asks the daemon that holds `runtime_dir` to keep its runtime store when it exits, however it
+/// exits, by creating [`RETAIN_STORE_FILE`] (owner-only; never followed through a symlink).
+///
+/// A front calls it right before force-signalling a wedged daemon, so even an orderly `SIGTERM`
+/// exit keeps the receipts, and must not signal when it fails: without the marker an orderly exit
+/// deletes the runtime directory.
+pub fn retain_runtime_store(runtime_dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(runtime_dir.join(RETAIN_STORE_FILE))
+        .map(drop)
+}
+
+/// How long a forced replacement waits for the daemon to leave after `SIGTERM` before `SIGKILL`.
+pub const WEDGE_TERM_GRACE: Duration = Duration::from_secs(8);
+/// Failed liveness probes required before a wedged daemon may be force-replaced.
+pub const WEDGE_MIN_PROBES: u32 = 2;
+/// Time the failed probes must span before a wedged daemon may be force-replaced: a stall of a few
+/// seconds (a load spike, a stopped process that resumes) keeps its daemon and its binding.
+pub const WEDGE_MIN_SPAN: Duration = Duration::from_secs(30);
+/// Executable file name a lock holder must have to be signalled; nothing else is ever signalled.
+const DAEMON_EXECUTABLE_NAME: &[u8] = b"agent-ide";
+
+/// The closed result of one attempt to replace a wedged shared daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvictOutcome {
+    /// The holder was signalled and no longer holds the lock; `killed` says `SIGKILL` was needed.
+    Terminated {
+        /// Process id of the signalled daemon.
+        pid: i32,
+        /// Whether `SIGTERM` did not suffice within [`WEDGE_TERM_GRACE`].
+        killed: bool,
+    },
+    /// The holder was signalled but still holds the lock after `SIGKILL` and a further wait: no
+    /// replacement happened, and nothing is journaled as one.
+    StillHeld {
+        /// Process id of the daemon that did not leave.
+        pid: i32,
+    },
+    /// Eviction was refused; the reason is a closed tag (`insufficient_evidence`, `not_held`,
+    /// `no_pid`, `dead`, `not_agent_ide`, `answering`, `changed`, `retain_failed`). Before
+    /// `SIGTERM` nothing was signalled; `answering` and `changed` can also come back after the
+    /// `SIGTERM` (the pre-`SIGKILL` check found the daemon answering again or the holder replaced),
+    /// in which case only `SIGTERM` was sent and the daemon is left to leave by itself.
+    Refused(&'static str),
+}
+
+/// The lock holder a forced replacement may signal: its pid as recorded in the lock file and the
+/// identity (device and inode) of the lock file that record came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LockHolder {
+    /// Pid the holder wrote into the lock file at acquire.
+    pid: i32,
+    /// Device of the lock file.
+    device: u64,
+    /// Inode of the lock file.
+    inode: u64,
+}
+
+/// Re-reads and fully validates the current lock holder, or names why nothing may be signalled.
+///
+/// Every check runs at the moment of the call: the lock file is a private regular file, its lock
+/// is still held (the holder is alive), the pid it records is a live process other than this one
+/// whose executable file name is exactly `agent-ide`. Callers call it again immediately before
+/// each signal and compare the result with the holder they first saw, so a lock handed to a
+/// replacement daemon, a released lock or a reused pid never receives a signal meant for another.
+fn current_lock_holder(lock_path: &Path) -> Result<LockHolder, &'static str> {
+    if inspect_lock(lock_path) != DoctorLockState::Held {
+        return Err("not_held");
+    }
+    let metadata = fs::symlink_metadata(lock_path).map_err(|_| "not_held")?;
+    let pid = fs::read_to_string(lock_path)
+        .ok()
+        .and_then(|text| text.trim().parse::<i32>().ok())
+        .filter(|pid| *pid > 1)
+        .ok_or("no_pid")?;
+    // SAFETY: signal 0 only checks that the process exists.
+    if pid as u32 == std::process::id() || unsafe { libc::kill(pid, 0) } != 0 {
+        return Err("dead");
+    }
+    if !pid_is_agent_ide(pid) {
+        return Err("not_agent_ide");
+    }
+    Ok(LockHolder {
+        pid,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+/// Replaces a daemon that holds the runtime lock but does not answer its control path.
+///
+/// Eligibility is enforced here, not by the caller: `probes` failed probes spanning `span` must
+/// reach [`WEDGE_MIN_PROBES`] and [`WEDGE_MIN_SPAN`] (they are the caller's evidence and also reach
+/// the journal), and a given `expected_pid` (the holder the evidence was collected against) must
+/// still be the holder. The holder must then validate (`current_lock_holder`) and one more probe
+/// must still find the control path silent, again before `SIGKILL` — a daemon whose control path answers is never signalled,
+/// however long its jobs run. The holder is revalidated and compared with the first one
+/// immediately before `SIGTERM` and again before `SIGKILL`; any change refuses without signalling.
+/// `SIGTERM`, up to [`WEDGE_TERM_GRACE`] for the lock to be released, then `SIGKILL` and a further
+/// five seconds. Only a released lock is reported as [`EvictOutcome::Terminated`] and journaled
+/// ([`record_forced_replacement`]); a holder that stays is [`EvictOutcome::StillHeld`]. The runtime
+/// directory is left as it is: the next daemon starts in it and finds the store and its receipts.
+pub async fn evict_wedged_daemon(
+    runtime_dir: &Path,
+    expected_pid: Option<i32>,
+    probes: u32,
+    span: Duration,
+) -> EvictOutcome {
+    if probes < WEDGE_MIN_PROBES || span < WEDGE_MIN_SPAN {
+        return EvictOutcome::Refused("insufficient_evidence");
+    }
+    let lock_path = runtime_dir.join(LOCK_NAME);
+    let holder = match current_lock_holder(&lock_path) {
+        Ok(holder) => holder,
+        Err(reason) => return EvictOutcome::Refused(reason),
+    };
+    // The evidence belongs to one daemon generation: a replacement that took the lock since is a
+    // different daemon and is never signalled on the old one's silence.
+    if expected_pid.is_some_and(|pid| pid != holder.pid) {
+        return EvictOutcome::Refused("changed");
+    }
+    if probe_health(runtime_dir).await != HealthProbe::Silent {
+        return EvictOutcome::Refused("answering");
+    }
+    if current_lock_holder(&lock_path) != Ok(holder) {
+        return EvictOutcome::Refused("changed");
+    }
+    // The signal may be handled as an orderly shutdown by a daemon that resumed; the marker keeps
+    // its runtime store (and so the receipts) in that case too.
+    if retain_runtime_store(runtime_dir).is_err() {
+        return EvictOutcome::Refused("retain_failed");
+    }
+    // SAFETY: the pid was validated as the live lock holder running the agent-ide executable an
+    // instant ago, and the lock file identity and pid record are unchanged.
+    unsafe { libc::kill(holder.pid, libc::SIGTERM) };
+    let mut killed = false;
+    // Monotonic deadlines, not counted sleeps: a loaded host delays a sleep, never the grace.
+    let mut deadline = tokio::time::Instant::now() + WEDGE_TERM_GRACE;
+    while inspect_lock(&lock_path) == DoctorLockState::Held {
+        if tokio::time::Instant::now() >= deadline {
+            if killed {
+                return EvictOutcome::StillHeld { pid: holder.pid };
+            }
+            // A daemon that resumed and answers (even `restarting`) is leaving by itself: never
+            // killed on the evidence of the silence that is over. The holder is revalidated after
+            // that awaited probe, immediately before the signal, as before `SIGTERM`.
+            if probe_health(runtime_dir).await != HealthProbe::Silent {
+                return EvictOutcome::Refused("answering");
+            }
+            if current_lock_holder(&lock_path) != Ok(holder) {
+                return EvictOutcome::Refused("changed");
+            }
+            killed = true;
+            // SAFETY: as above, revalidated just now; SIGTERM did not release the lock.
+            unsafe { libc::kill(holder.pid, libc::SIGKILL) };
+            deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    record_forced_replacement(holder.pid, probes, span, killed);
+    EvictOutcome::Terminated {
+        pid: holder.pid,
+        killed,
+    }
+}
+
+/// Reports whether `pid` runs an executable whose file name is exactly `agent-ide`.
+fn pid_is_agent_ide(pid: i32) -> bool {
+    let mut path = vec![0_u8; 4096];
+    // SAFETY: `path` is writable for its full length, which is passed as its size.
+    let length = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
+    if length <= 0 {
+        return false;
+    }
+    Path::new(std::ffi::OsStr::from_bytes(&path[..length as usize]))
+        .file_name()
+        .is_some_and(|name| name.as_bytes() == DAEMON_EXECUTABLE_NAME)
+}
+
+/// Writes the one typed journal line of a forced daemon replacement: the pid, the failed probes
+/// that justified it, the time they spanned and whether `SIGKILL` was needed.
+///
+/// The daily fault report counts these lines (client journal, reason `deadline`, detail starting
+/// `wedged_daemon_replaced`). Best effort like every journal write.
+pub fn record_forced_replacement(pid: i32, probes: u32, span: Duration, killed: bool) {
+    crate::errorlog::record(
+        crate::errorlog::Method::Client,
+        crate::errorlog::Outcome::Failed,
+        crate::errorlog::Fields {
+            reason: Some(crate::errorlog::ReasonCode::Deadline),
+            detail: Some(&format!(
+                "wedged_daemon_replaced pid={pid} probes={probes} span_s={} kill={killed}",
+                span.as_secs()
+            )),
+            ..crate::errorlog::Fields::default()
+        },
+    );
 }
 
 /// Classifies only existing runtime paths; every missing or unsafe path remains non-mutating.
@@ -816,9 +1204,10 @@ async fn serve_accepted_connection(
     let version = request.get("version").and_then(Value::as_u64);
     let identified = match version {
         Some(1) => {
+            let failed = dispatcher.as_deref().is_some_and(|owner| owner.is_failed());
             let _ = tokio::time::timeout_at(
                 connection_deadline,
-                serve_v1_request(&mut stream, request, generation, &lease),
+                serve_v1_request(&mut stream, request, generation, &lease, failed),
             )
             .await;
             None
@@ -844,7 +1233,15 @@ async fn serve_accepted_connection(
                 let hook =
                     request.get("method").and_then(Value::as_str) == Some("assistance.hook_submit");
                 let lane = if hook { &lanes.hooks } else { &lanes.calls };
-                if let Ok(_permit) = Arc::clone(&lane.permits).try_acquire_owned() {
+                if dispatcher.is_failed() {
+                    // Failed and exiting: nothing is dispatched, so nothing ran and the front may
+                    // send the call to the replacement.
+                    let _ = tokio::time::timeout_at(
+                        connection_deadline,
+                        write_status_reply(&mut stream, &request, version, "restarting"),
+                    )
+                    .await;
+                } else if let Ok(_permit) = Arc::clone(&lane.permits).try_acquire_owned() {
                     let method = request.get("method").and_then(Value::as_str)
                         == Some("assistance.method_dispatch");
                     let budget = if method {
@@ -862,7 +1259,7 @@ async fn serve_accepted_connection(
                     lane.note_refused();
                     let _ = tokio::time::timeout_at(
                         connection_deadline,
-                        write_busy_reply(&mut stream, &request, version),
+                        write_status_reply(&mut stream, &request, version, "busy"),
                     )
                     .await;
                 }
@@ -877,16 +1274,19 @@ async fn serve_accepted_connection(
     }
 }
 
-/// Answers a call or hook that found its lane full with the typed `busy` reply.
+/// Answers a call or hook the daemon refused before dispatching it with a typed status reply:
+/// `busy` (its lane was full) or `restarting` (the daemon failed and is exiting).
 ///
 /// The reply carries the request's own version, `request_id` (and `correlation_id` for a hook)
-/// and `"status": "busy"`, and no result: the daemon refused the request before dispatching it, so
-/// nothing ran and the front may report that and let the caller repeat it. A request without a
-/// usable `request_id` is dropped as before. The write is best-effort; the peer may be gone.
-async fn write_busy_reply(
+/// and `"status"`, and no result: the daemon refused the request before dispatching it, so
+/// nothing ran and the front may report that and let the caller repeat it (for `restarting`, on
+/// the replacement daemon). A request without a usable `request_id` is dropped as before. The
+/// write is best-effort; the peer may be gone.
+async fn write_status_reply(
     stream: &mut UnixStream,
     request: &Value,
     version: Option<u64>,
+    status: &str,
 ) -> io::Result<()> {
     let Some(request_id) = request.get("request_id").and_then(Value::as_str) else {
         return Ok(());
@@ -897,7 +1297,7 @@ async fn write_busy_reply(
     let mut reply = json!({
         "version": version.unwrap_or_default(),
         "request_id": request_id,
-        "status": "busy",
+        "status": status,
     });
     if let Some(correlation) = request.get("correlation_id").and_then(Value::as_str) {
         reply["correlation_id"] = Value::String(correlation.to_owned());
@@ -933,6 +1333,10 @@ async fn serve_client_lease_handshake(
         || request.request_id.len() > MAX_REQUEST_ID_BYTES
         || request.method != "assistance.client_lease"
     {
+        return Ok(None);
+    }
+    // A failed daemon is exiting: a lease on it would only be dropped again.
+    if dispatcher.is_some_and(|owner| owner.is_failed()) {
         return Ok(None);
     }
     let Some(guard) = lease.try_admit() else {
@@ -1009,6 +1413,7 @@ pub async fn open_claude_client_lease(
 }
 
 /// Routes one version-one frame to its fixed method: health, or `daemon.stop` (0.6.7).
+/// `failed` is the dispatcher's failure flag, which turns the health answer into `restarting`.
 ///
 /// Every other method name is dropped without a reply, exactly as before; a pre-0.6.7 front
 /// therefore never learns `daemon.stop` existed, and a pre-0.6.7 daemon stays silent for it.
@@ -1017,10 +1422,11 @@ async fn serve_v1_request(
     request: Value,
     generation: String,
     lease: &lease::LeaseController,
+    failed: bool,
 ) -> io::Result<()> {
     match request.get("method").and_then(Value::as_str) {
         Some("daemon.stop") => serve_daemon_stop(stream, request, lease).await,
-        _ => serve_health(stream, request, generation).await,
+        _ => serve_health(stream, request, generation, failed).await,
     }
 }
 
@@ -1060,10 +1466,14 @@ async fn serve_daemon_stop(
 }
 
 /// Validates the unchanged v1 health request and emits only its existing correlated health reply.
+///
+/// The reply keeps its shape; only its `status` changes: `ok`, or `restarting` once the
+/// dispatcher `failed`, so a front never adopts a daemon that is exiting to be replaced.
 async fn serve_health(
     stream: &mut UnixStream,
     request: Value,
     generation: String,
+    failed: bool,
 ) -> io::Result<()> {
     let request: HealthRequest = serde_json::from_value(request)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -1077,7 +1487,7 @@ async fn serve_health(
     let response = HealthResponse {
         version: WIRE_VERSION,
         request_id: request.request_id,
-        status: "ok".to_owned(),
+        status: if failed { "restarting" } else { "ok" }.to_owned(),
         daemon_generation: generation,
     };
     write_frame(stream, &response, MAX_V1_FRAME_BYTES).await
@@ -1264,6 +1674,11 @@ fn parse_method_dispatch_reply(
     if object.get("status").and_then(Value::as_str) == Some("busy") {
         return Ok(MethodDispatchTransportResult::Busy);
     }
+    // Same guarantee from a failed daemon that is exiting: it never ran, but this daemon must not
+    // be asked again.
+    if object.get("status").and_then(Value::as_str) == Some("restarting") {
+        return Ok(MethodDispatchTransportResult::Restarting);
+    }
     // An explicit unavailable reply (for example a result over the payload bound) can follow an
     // executed call: the request was delivered, so its outcome is unknown, never "not sent".
     let Some(payload) = object.get("opaque_result_json") else {
@@ -1373,6 +1788,9 @@ fn validate_private_directory(path: &Path, metadata: &fs::Metadata) -> Result<()
 }
 
 /// Takes the exclusive nonblocking daemon lock and keeps its file descriptor open for daemon life.
+///
+/// The holder writes its pid into the lock file once it owns the lock; the file's content is only
+/// a hint for [`evict_wedged_daemon`], which trusts it only while the lock is still held.
 struct DaemonLock {
     _file: File,
 }
@@ -1389,6 +1807,11 @@ impl DaemonLock {
             .open(path)?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result == 0 {
+            // Best effort: the holder's pid lets a front find a daemon that holds the lock but
+            // answers nothing (see `evict_wedged_daemon`). The descriptor is close-on-exec (the
+            // std default), so no language server or check the daemon spawns ever inherits the lock.
+            let _ = file.set_len(0);
+            let _ = (&file).write_all(format!("{}\n", std::process::id()).as_bytes());
             Ok(Self { _file: file })
         } else if io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
             Err(AppError::AlreadyRunning)
@@ -1944,5 +2367,53 @@ mod tests {
 
         assert!(matches!(error, AppError::InvalidResponse));
         assert!(probe.shutdown_called.load(Ordering::SeqCst));
+    }
+
+    /// Descriptor or memory exhaustion and a handshake that died in the queue are transient accept
+    /// errors the daemon retries; a closed or invalid listener is not, and ends the daemon.
+    #[test]
+    fn transient_accept_errors_are_retried_and_listener_failures_are_not() {
+        for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert!(
+                transient_accept_error(&io::Error::from_raw_os_error(code)),
+                "{code}"
+            );
+        }
+        for kind in [
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::Interrupted,
+        ] {
+            assert!(transient_accept_error(&io::Error::from(kind)), "{kind:?}");
+        }
+        for code in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
+            assert!(
+                !transient_accept_error(&io::Error::from_raw_os_error(code)),
+                "{code}"
+            );
+        }
+    }
+
+    /// The daemon lock records its holder's pid for a front to find a wedged daemon, and its
+    /// descriptor is close-on-exec, so no language server or check the daemon spawns inherits it.
+    #[test]
+    fn the_daemon_lock_records_its_pid_and_is_close_on_exec() {
+        let dir = std::env::temp_dir().join(format!("agent-ide-lock-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(LOCK_NAME);
+        let lock = DaemonLock::acquire(path.clone()).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        // SAFETY: the descriptor is valid while `lock` lives.
+        let flags = unsafe { libc::fcntl(lock._file.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0, "{flags}");
+        assert!(matches!(
+            DaemonLock::acquire(path),
+            Err(AppError::AlreadyRunning)
+        ));
+        drop(lock);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

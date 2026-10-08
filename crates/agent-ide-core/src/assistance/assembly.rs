@@ -1253,6 +1253,20 @@ impl AssistanceDispatcher for ProductDispatcher {
                 .and_then(WorkerHandle::project_feed)
                 .is_some_and(|feed| feed.is_busy())
     }
+    /// Reports whether the worker's execution machinery failed (a caught job panic, or the worker
+    /// or inspection task ended outside shutdown), so Application answers `restarting` and exits.
+    fn is_failed(&self) -> bool {
+        self.worker.as_ref().is_some_and(WorkerHandle::is_failed)
+    }
+    /// Resolves when [`Self::is_failed`] turns true; never for a discovery-only dispatcher.
+    fn failed(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            match &self.worker {
+                Some(worker) => worker.failed().await,
+                None => std::future::pending().await,
+            }
+        })
+    }
     /// Returns bounded closed outcomes; slow jobs become pending while short inspections stay finite.
     fn dispatch(
         &self,

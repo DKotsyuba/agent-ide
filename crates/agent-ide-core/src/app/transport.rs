@@ -363,6 +363,22 @@ pub trait AssistanceDispatcher: Send + Sync {
         false
     }
 
+    /// Reports whether the dispatcher's own execution machinery failed (a caught panic, or its
+    /// worker or inspection task ended outside shutdown), so this daemon must be replaced.
+    ///
+    /// Application then answers health `restarting` and every new call a typed `restarting`
+    /// reply instead of dispatching it, and exits without removing the runtime directory. Must
+    /// return promptly. Never reverts to `false` once `true`. Default dispatchers cannot fail.
+    fn is_failed(&self) -> bool {
+        false
+    }
+
+    /// Resolves once [`Self::is_failed`] became `true`; pending forever for a dispatcher that
+    /// never fails (the default). Must be cancel-safe: Application drops it on every other exit.
+    fn failed(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::pending())
+    }
+
     /// Starts one finite Assistance operation and resolves its opaque result within the caller budget.
     fn dispatch(
         &self,
@@ -424,6 +440,10 @@ pub enum MethodDispatchTransportResult {
     /// The daemon read the request and refused it before dispatching because every connection of
     /// its lane was taken: the call never ran, so repeating it is safe, and the daemon is alive.
     Busy,
+    /// The daemon read the request and refused it before dispatching because it is failed and
+    /// exiting to be replaced: the call never ran (nothing was applied), so a fresh daemon may be
+    /// sent it, and this daemon must not be asked again.
+    Restarting,
 }
 
 /// Checks the common bounded opaque identifier invariant without making an identity claim.

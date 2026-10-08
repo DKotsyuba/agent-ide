@@ -3557,6 +3557,93 @@ fn managed_runtime_paths(fixture: &ProductFixture) -> std::collections::BTreeSet
         .collect()
 }
 
+/// Reaps, when dropped, every managed daemon of this fixture that a test left behind.
+///
+/// A managed Codex test that fails or panics ends its MCP with `SIGKILL`, which skips the MCP's own
+/// cleanup and orphans the daemon it owns (possibly `SIGSTOP`-ed or stalled in a seam). The guard
+/// finds the runtimes created since `before` whose launcher record targets exactly this fixture's
+/// repository, resumes then kills the pid the daemon recorded in its held lock, and waits (at most
+/// five seconds, by a monotonic deadline) for the lock to be released. It removes the runtime
+/// directory only once the lock is released, so a daemon that survives stays visible instead of
+/// losing its files. On a passing test every daemon is already gone and the guard does nothing; it
+/// signals nothing it did not identify through the lock and never touches another fixture's runtime.
+struct ManagedCodexCleanup {
+    /// The fixture's repository root, as its runtimes' launcher records name it.
+    roots: [PathBuf; 2],
+    /// Runtime directories that existed before the test started.
+    before: std::collections::BTreeSet<PathBuf>,
+}
+
+impl ManagedCodexCleanup {
+    /// Starts guarding the runtimes the fixture creates after `before` was observed.
+    fn new(fixture: &ProductFixture, before: &std::collections::BTreeSet<PathBuf>) -> Self {
+        Self {
+            roots: [
+                fixture.root.clone(),
+                std::fs::canonicalize(&fixture.root).unwrap_or_else(|_| fixture.root.clone()),
+            ],
+            before: before.clone(),
+        }
+    }
+
+    /// Reports whether the runtime's launcher record targets exactly this fixture's repository.
+    fn owns(&self, runtime: &Path) -> bool {
+        let Some(launcher) = std::fs::read_to_string(runtime.join("launcher.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        else {
+            return false;
+        };
+        launcher["targets"].as_array().is_some_and(|targets| {
+            targets.iter().any(|target| {
+                target["candidate"].as_str().is_some_and(|candidate| {
+                    self.roots.iter().any(|root| root == Path::new(candidate))
+                })
+            })
+        })
+    }
+}
+
+impl Drop for ManagedCodexCleanup {
+    /// Resumes and kills the recorded lock holder of each leftover runtime of this fixture, waits
+    /// boundedly for the lock to be released, then removes the runtime. Never panics.
+    fn drop(&mut self) {
+        let Ok(temp) = std::fs::canonicalize(std::env::temp_dir()) else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(temp) else {
+            return;
+        };
+        for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+            let named = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("ai-") && name.len() == 19);
+            if !named || self.before.contains(&path) || !self.owns(&path) {
+                continue;
+            }
+            if let Some(pid) = agent_ide_core::app::lock_holder_pid(&path) {
+                // SAFETY: the pid is the one this fixture's own daemon recorded in its held lock.
+                unsafe {
+                    libc::kill(pid, libc::SIGCONT);
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while agent_ide_core::app::lock_is_held(&path)
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            if agent_ide_core::app::lock_is_held(&path) {
+                // A daemon survived (or its pid was unreadable): keep its runtime visible.
+                continue;
+            }
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
 /// Returns the exact managed daemon holding this runtime's lock, without process-name matching.
 async fn managed_daemon_pid(runtime: &Path) -> libc::pid_t {
     let output = Command::new("/usr/sbin/lsof")
@@ -3950,6 +4037,7 @@ async fn managed_codex_context_after_crash_requires_start_and_republishes_route(
     let base = rendezvous_area("daemon-exit-retire");
     let root = base.join("rendezvous");
     let before = managed_runtime_paths(&fixture);
+    let _cleanup = ManagedCodexCleanup::new(&fixture, &before);
     let mut mcp = Mcp::start_managed_with_rendezvous(&fixture.config, &fixture.root, &root).await;
     let during = managed_runtime_paths(&fixture);
     let mut runtimes = during.difference(&before).cloned().collect::<Vec<_>>();
@@ -4060,6 +4148,7 @@ async fn managed_codex_transient_transport_timeout_keeps_daemon_and_binding() {
     let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
     let fixture = ProductFixture::new(json!([]));
     let before = managed_runtime_paths(&fixture);
+    let _cleanup = ManagedCodexCleanup::new(&fixture, &before);
     let mut mcp = Mcp::start_managed(&fixture.config, &fixture.root).await;
     let runtime = managed_runtime_paths(&fixture)
         .difference(&before)
@@ -4113,6 +4202,107 @@ async fn managed_codex_transient_transport_timeout_keeps_daemon_and_binding() {
     mcp.close().await;
 }
 
+/// Waits until the runtime's lock file names a live process other than `old` that also answers
+/// health `ok`, i.e. until a replacement daemon serves the runtime, and returns its pid.
+///
+/// The lock records its holder's pid (published before startup completes, hence the health check),
+/// so there is no `lsof` race with the instant the lock is free.
+async fn replacement_daemon_pid(runtime: &Path, old: libc::pid_t, bound: Duration) -> libc::pid_t {
+    tokio::time::timeout(bound, async {
+        loop {
+            let pid = std::fs::read_to_string(runtime.join("agent-ide.lock"))
+                .ok()
+                .and_then(|text| text.trim().parse::<libc::pid_t>().ok());
+            if let Some(pid) = pid
+                && pid != old
+                && unsafe { libc::kill(pid, 0) } == 0
+                && agent_ide::app::probe_health(runtime).await
+                    == agent_ide::app::HealthProbe::Healthy
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("the wedged daemon must be replaced without any agent action")
+}
+
+/// A managed Codex daemon that stays stopped (a genuine wedge: it holds its runtime and answers
+/// nothing) is replaced without agent action once repeated probes spanned 30 seconds, and the
+/// replacement starts in the same runtime directory so the runtime store survives.
+///
+/// The one call that met the wedge keeps its own failed outcome and is never resent; only a later
+/// call lands on the replacement. A stall that ends sooner keeps its daemon
+/// ([`managed_codex_transient_transport_timeout_keeps_daemon_and_binding`]).
+#[tokio::test]
+async fn managed_codex_wedged_daemon_is_replaced_in_place_without_agent_action() {
+    let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
+    let fixture = ProductFixture::new(json!([]));
+    let before = managed_runtime_paths(&fixture);
+    let _cleanup = ManagedCodexCleanup::new(&fixture, &before);
+    let mut mcp = Mcp::start_managed(&fixture.config, &fixture.root).await;
+    let runtime = managed_runtime_paths(&fixture)
+        .difference(&before)
+        .next()
+        .cloned()
+        .expect("managed daemon runtime");
+    let state = fixture.state();
+    let actor = "wedged";
+    let mut next = 10;
+    let started = managed_call(
+        &mut mcp,
+        next,
+        actor,
+        "ide.start",
+        json!({"activation_id":"wedged-1"}),
+        &state,
+    )
+    .await;
+    let started = settle_managed(&mut mcp, &mut next, actor, &state, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let pid = managed_daemon_pid(&runtime).await;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let _paused = PausedDaemon(pid);
+    next += 1;
+    let lost = tokio::time::timeout(
+        Duration::from_secs(20),
+        mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.context","arguments":{"path":"tracked.txt"},"_meta":{"threadId":actor,"callId":format!("managed-{actor}-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})),
+    )
+    .await
+    .expect("the call that met the wedge returns its own failure");
+    assert_eq!(lost["result"]["isError"], true, "{lost}");
+    let fresh = replacement_daemon_pid(&runtime, pid, Duration::from_secs(120)).await;
+    assert_ne!(fresh, pid);
+    assert!(
+        runtime.join("state.sqlite").exists(),
+        "the replacement starts in the same runtime directory with its store"
+    );
+    // The first call on the new generation reports the restart (its old binding died with the
+    // daemon); the next `ide.start` establishes a binding on the replacement.
+    next += 1;
+    let mut restarted = json!(null);
+    for attempt in 0..2 {
+        let reply = managed_call(
+            &mut mcp,
+            next,
+            actor,
+            "ide.start",
+            json!({"activation_id":format!("wedged-after-{attempt}")}),
+            &state,
+        )
+        .await;
+        restarted = settle_managed(&mut mcp, &mut next, actor, &state, reply).await;
+        if restarted["kind"] == "activation" {
+            break;
+        }
+        assert_eq!(restarted["reason"], "host_binding", "{restarted}");
+        next += 1;
+    }
+    assert_eq!(restarted["kind"], "activation", "{restarted}");
+    mcp.close().await;
+}
+
 /// SIGTERM while a replacement cannot acknowledge its lease still reaps the child and runtime.
 #[cfg(feature = "test-seams")]
 #[tokio::test]
@@ -4120,6 +4310,7 @@ async fn managed_codex_sigterm_during_restart_removes_pending_runtime() {
     let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
     let fixture = ProductFixture::new(json!([]));
     let before = managed_runtime_paths(&fixture);
+    let _cleanup = ManagedCodexCleanup::new(&fixture, &before);
     let mut mcp = Mcp::start_managed_custom_with_env(
         &fixture.config,
         &fixture.root,
@@ -4159,8 +4350,10 @@ async fn managed_codex_sigterm_during_restart_removes_pending_runtime() {
     mcp.send(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.start","arguments":{"activation_id":"restart"},"_meta":{"threadId":"restart-shutdown","callId":format!("restart-shutdown-{next}"),"x-codex-turn-metadata":{},"codex/sandbox-state-meta":state}}})).await;
     let fresh = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
+            // The replacement restarts in the killed daemon's own runtime directory (its store and
+            // receipts are kept, M-004), so the pending marker appears in `old` itself.
             for path in managed_runtime_paths(&fixture).difference(&before) {
-                if path != &old && path.join("restart-lease-pending").is_file() {
+                if path.join("restart-lease-pending").is_file() {
                     return path.clone();
                 }
             }
@@ -6304,13 +6497,168 @@ async fn non_code_file_line_edits_work_from_every_text_read_ref() {
     daemon.wait().await.unwrap();
 }
 
-/// A job that panics answers that one call `internal`, the error journal records the panic's
-/// source location and the call's method but never the payload text, and the daemon's single
-/// worker stays alive: the next read still answers. Driven by the `test-seams` panic seam, which panics an `ide.read` of
-/// the one path it names.
+/// Combination smoke (stability plan QW-9): every read form of every kind of text file no IDE
+/// language reads (`.log`, `.md`, `.toml`) answers a read, and a second, known-good call after each
+/// one still answers.
+///
+/// The forms are the bare path, `lines`, `ranges`, a bare-path `{symbols}` batch, a batch mixing two
+/// of the files, and a batch holding only a symbol address (an all-refused batch that delivers no
+/// file). The 2026-10-07 field incident (`sources.drain(..1)` on the empty source list of a
+/// `.log` ranges read) failed exactly this shape: the first call of a combination broke the daemon
+/// and the second one with it. Every combination runs before any assertion so one failure lists
+/// all of them.
+#[tokio::test]
+async fn text_file_read_forms_each_answer_and_a_second_call_still_answers() {
+    let fixture = ProductFixture::new(json!([]));
+    let files = [
+        ("run.log", "one\ntwo\nthree\n"),
+        ("notes.md", "# title\nbody\nend\n"),
+        ("config.toml", "[package]\nname = \"x\"\nversion = \"1\"\n"),
+    ];
+    for (name, text) in files {
+        std::fs::write(fixture.root.join(name), text).unwrap();
+    }
+    fixture.git(&["add", "--", "run.log", "notes.md", "config.toml"]);
+    fixture.git(&["commit", "--quiet", "-m", "smoke fixtures"]);
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "read-smoke").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"read-smoke"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let mut failures = Vec::new();
+    for (path, text) in files {
+        let first = text.lines().next().unwrap();
+        let second = text.lines().nth(1).unwrap();
+        let other = if path == "run.log" {
+            "notes.md"
+        } else {
+            "run.log"
+        };
+        let forms = [
+            ("path", json!({"path":path}), first),
+            ("lines", json!({"path":path,"lines":"1-2"}), first),
+            ("ranges", json!({"path":path,"ranges":["1-1","2-2"]}), first),
+            ("batch", json!({"symbols":[path]}), first),
+            ("mixed batch", json!({"symbols":[path, other]}), first),
+            (
+                "symbol-only batch",
+                json!({"symbols":[format!("{path}#missing")]}),
+                "has no code symbols",
+            ),
+        ];
+        for (form, arguments, expected) in forms {
+            let (reply, text) = settled_read(&mut actor, &fixture, arguments.clone()).await;
+            if reply["kind"] != "read" || !text.contains(expected) {
+                failures.push(format!("{path} {form} {arguments}: {reply} {text}"));
+            }
+            let (after, text) =
+                settled_read(&mut actor, &fixture, json!({"path":path,"lines":"2-2"})).await;
+            if after["kind"] != "read" || !text.contains(second) {
+                failures.push(format!(
+                    "{path} {form}: the second call broke: {after} {text}"
+                ));
+            }
+        }
+    }
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+    assert!(
+        failures.is_empty(),
+        "every read form must answer and leave the daemon answering:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// Returns the `AGENT_IDE_TEST_FAULT` value arming `point` once through a flag file under the
+/// fixture, and the flag file's path (absent until the test creates it, unless `armed`).
+///
+/// The seam fires when the flag file exists and the firing call removes it, so a daemon spawned
+/// with this value after the flag was consumed runs clean.
+#[cfg(feature = "test-seams")]
+fn fault_flag(fixture: &ProductFixture, point: &str, armed: bool) -> (String, PathBuf) {
+    let flag = fixture.base.join(format!("fault-{point}"));
+    if armed {
+        std::fs::write(&flag, b"").unwrap();
+    }
+    (format!("{point}:{}", flag.display()), flag)
+}
+
+/// Waits for a crash-only daemon to exit by itself and asserts how it left its runtime directory:
+/// the store (`state.sqlite`) stays, so the receipts of written edits survive for the replacement.
+#[cfg(feature = "test-seams")]
+async fn assert_crash_only_exit(daemon: &mut OwnedDaemon, fixture: &ProductFixture) {
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("a failed daemon must exit by itself")
+        .unwrap();
+    assert!(
+        status.success(),
+        "a crash-only exit is a clean exit: {status}"
+    );
+    assert!(
+        fixture.runtime.join("state.sqlite").exists(),
+        "a crash-only exit keeps the runtime store with its receipts"
+    );
+}
+
+/// Reads the error journal of the fixture's daemon, empty when none was written.
+#[cfg(feature = "test-seams")]
+fn daemon_journal(home: &Path, fixture: &ProductFixture) -> String {
+    std::fs::read_to_string(
+        home.join(".agent-ide/logs")
+            .join(agent_ide::errorlog::repository_key(&fixture.runtime))
+            .join("events.jsonl"),
+    )
+    .unwrap_or_default()
+}
+
+/// A fault in the daemon's own execution machinery — the worker loop panicking, the worker
+/// returning outside shutdown, a panic while the worker is constructed — marks the daemon failed
+/// at once: it exits by itself keeping its runtime store, and its journal names the closed cause.
+///
+/// Before containment the daemon stayed up answering `ok` while every call was queued behind a
+/// worker nobody ran (stability D1: an hour of `internal` and 10 s timeouts).
 #[cfg(feature = "test-seams")]
 #[tokio::test]
-async fn a_panicking_job_answers_internal_journals_the_panic_and_keeps_the_worker_alive() {
+async fn a_fault_in_the_worker_machinery_exits_the_daemon_crash_only_keeping_its_store() {
+    for (point, cause) in [
+        ("loop", "worker_panic"),
+        ("worker_exit", "worker_ended"),
+        ("worker_construct", "worker_panic"),
+    ] {
+        let fixture = ProductFixture::new(json!([]));
+        let home = enable_fake_rust_checks(&fixture, &fixture.base);
+        let (fault, _) = fault_flag(&fixture, point, true);
+        let mut daemon = fixture
+            .spawn_configured_daemon_with_env(
+                Some(&home),
+                false,
+                Duration::from_secs(30),
+                None,
+                &[("AGENT_IDE_TEST_FAULT", &fault)],
+            )
+            .await;
+        assert_crash_only_exit(&mut daemon, &fixture).await;
+        let journal = daemon_journal(&home, &fixture);
+        assert!(
+            journal.contains("\"outcome\":\"fatal\"") && journal.contains(cause),
+            "{point}: the failed daemon journals its closed cause {cause}: {journal}"
+        );
+    }
+}
+
+/// A job that panics answers that one call `internal` (never the panic text), the error journal
+/// records the panic's source location and the call's method but never the payload text, and the
+/// daemon then fails crash-only: no later call is served by the half-unwound worker, and the
+/// daemon exits keeping its runtime store. Driven by the `test-seams` panic seam, which panics an
+/// `ide.read` of the one path it names.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn a_panicking_job_answers_internal_journals_the_panic_and_the_daemon_exits_crash_only() {
     let fixture = ProductFixture::new(json!([]));
     std::fs::write(fixture.root.join("boom.log"), "one\n").unwrap();
     std::fs::write(fixture.root.join("fine.log"), "two\n").unwrap();
@@ -6346,38 +6694,31 @@ async fn a_panicking_job_answers_internal_journals_the_panic_and_keeps_the_worke
         !text.contains("deliberate") && !text.contains("example-secret"),
         "the panic text never reaches the caller: {text}"
     );
-    // Both later calls run before any assertion, so a failure shows whether the worker survived.
-    let (after, after_text) = settled_read(
-        &mut actor,
-        &fixture,
-        json!({"path":"fine.log","lines":"1-1"}),
-    )
-    .await;
-    let (again, _) = settled_read(
-        &mut actor,
-        &fixture,
-        json!({"path":"boom.log","lines":"1-1"}),
-    )
-    .await;
+    // The daemon's state after the unwind is never trusted again: a later read is not served by
+    // it (it answers `restarting`, or the daemon is already gone), and the daemon leaves.
+    actor.next += 1;
+    let after = actor
+        .mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
+            "name":"ide.read","arguments":{"path":"fine.log","lines":"1-1"},
+            "_meta":{"threadId":actor.actor,"callId":"after-panic","x-codex-turn-metadata":{},
+            "codex/sandbox-state-meta":actor.state}}}),
+        )
+        .await;
     assert!(
-        after["kind"] == "read" && after_text.contains("1\ttwo"),
-        "the worker must survive the panic: {after} {after_text}"
+        after["result"]["isError"] == true && !after.to_string().contains("1\\ttwo"),
+        "a failed daemon serves nothing: {after}"
     );
-    assert_eq!(
-        again["code"], "internal",
-        "the seam panics every time: {again}"
-    );
-    let journal = home
-        .join(".agent-ide/logs")
-        .join(agent_ide::errorlog::repository_key(&fixture.runtime))
-        .join("events.jsonl");
-    let events = std::fs::read_to_string(journal).unwrap_or_default();
+    assert_crash_only_exit(&mut daemon, &fixture).await;
+    let events = daemon_journal(&home, &fixture);
     assert!(
         events.contains("panic at crates/agent-ide-core/src/assistance/worker.rs:")
             && events.contains(" during read\"")
             && events.contains("\"method\":\"read\"")
-            && events.contains("\"reason\":\"internal\""),
-        "the failed call is journaled with the panic location and its method: {events}"
+            && events.contains("\"reason\":\"internal\"")
+            && events.contains("job_panic"),
+        "the failed call is journaled with the panic location and its method, and the daemon with its cause: {events}"
     );
     assert!(
         !events.contains("example-secret")
@@ -6385,15 +6726,152 @@ async fn a_panicking_job_answers_internal_journals_the_panic_and_keeps_the_worke
             && !events.contains("boom.log"),
         "the panic payload text never reaches the journal: {events}"
     );
-    actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
-    daemon.kill().await.unwrap();
-    daemon.wait().await.unwrap();
 }
 
-/// A release build (no `test-seams` feature) ignores `AGENT_IDE_TEST_PANIC_READ_PATH`: the read it
-/// names answers its text and nothing is journaled as a panic. `xtask check` runs it in its
-/// default-build pass beside the version-seam check.
+/// A panic in the inspection task costs that one call (`internal`) and no more: the dead task
+/// would refuse every later `ide.inspect` of the daemon, so the daemon fails crash-only instead of
+/// staying up half-dead. Before containment it stayed up answering `ok` for ever.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn an_inspection_task_panic_costs_one_call_and_the_daemon_exits_crash_only() {
+    let fixture = ProductFixture::new(json!([]));
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let (fault, flag) = fault_flag(&fixture, "inspection", false);
+    let mut daemon = fixture
+        .spawn_configured_daemon_with_env(
+            Some(&home),
+            false,
+            Duration::from_secs(30),
+            None,
+            &[("AGENT_IDE_TEST_FAULT", &fault)],
+        )
+        .await;
+    let mut actor = ProductActor::new(&fixture, "inspection-fault").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"inspection"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"src/lib.rs","lines":"1-2"}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let reference = read["detail_ref"].as_str().unwrap().to_owned();
+    std::fs::write(&flag, b"").unwrap();
+    let faulted = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
+        .await;
+    assert_eq!(faulted["code"], "internal", "{faulted}");
+    assert_crash_only_exit(&mut daemon, &fixture).await;
+    let journal = daemon_journal(&home, &fixture);
+    assert!(
+        journal.contains("inspection_panic"),
+        "the failed daemon journals its closed cause: {journal}"
+    );
+    actor.mcp.close().await;
+}
+
+/// An edit whose reply is lost to a panic after the write answers the unknown outcome — never
+/// `internal`, which an agent would retry — and the write is never repeated: the daemon fails
+/// crash-only keeping its store, and a replacement daemon in the same directory answers the same
+/// operation as `outcome_unknown` from the surviving receipt without writing again.
+///
+/// The second daemon starts after the file was changed externally; a replay would overwrite that
+/// change, so its survival proves the edit was not applied twice.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn a_panic_after_an_edit_wrote_reports_unknown_and_never_repeats_the_write() {
+    let fixture = ProductFixture::new(json!([]));
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let (fault, _) = fault_flag(&fixture, "edit_after_write", true);
+    let mut daemon = fixture
+        .spawn_configured_daemon_with_env(
+            Some(&home),
+            false,
+            Duration::from_secs(30),
+            None,
+            &[("AGENT_IDE_TEST_FAULT", &fault)],
+        )
+        .await;
+    let mut actor = ProductActor::new(&fixture, "edit-fault").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"edit-fault"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let read = actor
+        .call(&fixture, "ide.read", json!({"path":"src/lib.rs"}))
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let source_ref = read["detail_ref"].as_str().unwrap().to_owned();
+    let content = "pub fn value() -> i32 { 8 }\npub fn caller() -> i32 { value() }\n";
+    let edit_arguments = json!({
+        "operation_id":"panic-after-write","path":"src/lib.rs",
+        "source_ref":source_ref,"content":content
+    });
+    let lost = actor
+        .call(&fixture, "ide.edit", edit_arguments.clone())
+        .await;
+    let lost = actor.settle(&fixture, lost).await;
+    assert_eq!(
+        lost["state"], "edit",
+        "an edit never answers internal after it wrote: {lost}"
+    );
+    assert_eq!(lost["result"]["outcome"], "outcome_unknown", "{lost}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap(),
+        content,
+        "the write happened before the panic"
+    );
+    assert_crash_only_exit(&mut daemon, &fixture).await;
+    actor.mcp.close().await;
+
+    let external = format!("{content}// changed outside the IDE\n");
+    std::fs::write(fixture.root.join("src/lib.rs"), &external).unwrap();
+    let mut replacement = fixture
+        .spawn_configured_daemon_with_env(
+            Some(&home),
+            false,
+            Duration::from_secs(30),
+            None,
+            &[("AGENT_IDE_TEST_FAULT", &fault)],
+        )
+        .await;
+    let mut again = ProductActor::new(&fixture, "edit-fault-again").await;
+    let started = again
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"edit-fault-2"}),
+        )
+        .await;
+    assert_eq!(again.settle(&fixture, started).await["kind"], "activation");
+    let repeat = again.call(&fixture, "ide.edit", edit_arguments).await;
+    let repeat = again.settle(&fixture, repeat).await;
+    // The surviving receipt, not a stale `source_ref` refusal, answers: the prepared row of the
+    // first generation is still in the kept store, so the same operation is the unknown outcome.
+    assert_eq!(
+        repeat["result"]["outcome"], "outcome_unknown",
+        "the kept receipt answers the repeated operation as unknown: {repeat}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap(),
+        external,
+        "the repeated operation did not write again"
+    );
+    again.call(&fixture, "ide.stop", json!({})).await;
+    again.mcp.close().await;
+    replacement.kill().await.unwrap();
+    replacement.wait().await.unwrap();
+}
+
+/// A release build (no `test-seams` feature) ignores `AGENT_IDE_TEST_PANIC_READ_PATH` and
+/// `AGENT_IDE_TEST_FAULT`: the read it names answers its text, nothing is journaled as a panic, and
+/// the armed fault flag is never consumed (the daemon keeps serving and the flag file stays).
+/// `xtask check` runs it in its default-build pass beside the version-seam check.
 #[cfg(not(feature = "test-seams"))]
 #[tokio::test]
 async fn release_build_ignores_the_panic_seam() {
@@ -6402,13 +6880,19 @@ async fn release_build_ignores_the_panic_seam() {
     fixture.git(&["add", "--", "boom.log"]);
     fixture.git(&["commit", "--quiet", "-m", "panic fixture"]);
     let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let flag = fixture.base.join("fault-loop");
+    std::fs::write(&flag, b"").unwrap();
+    let fault = format!("loop:{}", flag.display());
     let mut daemon = fixture
         .spawn_configured_daemon_with_env(
             Some(&home),
             false,
             Duration::from_secs(30),
             None,
-            &[("AGENT_IDE_TEST_PANIC_READ_PATH", "boom.log")],
+            &[
+                ("AGENT_IDE_TEST_PANIC_READ_PATH", "boom.log"),
+                ("AGENT_IDE_TEST_FAULT", &fault),
+            ],
         )
         .await;
     let mut actor = ProductActor::new(&fixture, "release-panic-seam").await;
@@ -6436,6 +6920,14 @@ async fn release_build_ignores_the_panic_seam() {
         .join("events.jsonl");
     let events = std::fs::read_to_string(journal).unwrap_or_default();
     assert!(!events.contains("panic at"), "no panic: {events}");
+    assert!(
+        flag.exists(),
+        "a release build never consumes the fault flag"
+    );
+    assert!(
+        !events.contains("fatal"),
+        "no fault was injected into a release build: {events}"
+    );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
@@ -11020,7 +11512,9 @@ async fn product_graph_names_use_sites_the_server_cannot_outline() {
 }
 
 /// A second worktree of the repository inherits the name index by content: its activation card
-/// reports the index summary at once and its first `.btn` card answers inline.
+/// reports the index summary at once and its first `.btn` card carries the inherited rows. The
+/// card is settled rather than timed, so a loaded host that answers it as `pending` first still
+/// passes; only a card without the inherited rows fails.
 #[tokio::test]
 async fn product_second_worktree_inherits_the_name_index() {
     let fixture = ProductFixture::new(json!([]));
@@ -11070,9 +11564,12 @@ async fn product_second_worktree_inherits_the_name_index() {
         text.contains("links: class, id, style-variable facts from css, html (indexed 3 files, "),
         "{text}"
     );
+    // The card must carry the inherited index's rows. Whether it answers inline or first as
+    // `pending` depends on the machine's load, so it is settled, not timed (stability QW-9).
     let card = next
         .call(&fixture, "ide.symbol", json!({"symbol":"styles.css#.btn"}))
         .await;
+    let card = next.settle(&fixture, card).await;
     assert_eq!(card["state"], "complete", "{card}");
     assert!(
         card["text"]
@@ -11408,10 +11905,35 @@ async fn configured_product_cold_symbol_test_accepts_inline_or_pending() {
     daemon.wait().await.unwrap();
 }
 
-/// Proves warm Rust outline and symbol calls finish inline without pending inspection round trips.
+/// Proves warm Rust outline and symbol calls answer with their closed result once settled.
+///
+/// Correctness only: each call settles (a `pending` first reply on a loaded host is followed
+/// through `ide.inspect`) to a `complete` outline or symbol card. Whether the reply was inline and
+/// how long it took live in [`configured_product_warm_rust_calls_stay_within_three_seconds`], so a
+/// loaded host fails the timing job and never this one.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment"]
-async fn configured_product_warm_rust_calls_complete_inline_within_three_seconds() {
+async fn configured_product_warm_rust_calls_complete_inline() {
+    warm_rust_inline_replies(false).await;
+}
+
+/// The timing half of the warm Rust inline contract: the same warm calls answer `complete`
+/// inline, without a pending round trip, within three seconds each. Load-sensitive by nature, so
+/// it is a separate ignored test (the performance job), never part of the correctness gate.
+#[tokio::test]
+#[ignore = "timing: requires accepted AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment and an unloaded host"]
+async fn configured_product_warm_rust_calls_stay_within_three_seconds() {
+    warm_rust_inline_replies(true).await;
+}
+
+/// Shared body of the two warm Rust inline tests.
+///
+/// Owns a [`symbol_test_fixture`], one daemon and one actor, all closed before return (a failed
+/// assertion panics first and the fixture's `Drop` removes its directories). Both modes warm the
+/// analyzer the same way. `timed` additionally requires the first reply of each call to be
+/// `complete` (no pending round trip) within three seconds; untimed, any reply that settles to
+/// `complete` passes. Panics on the first violated expectation.
+async fn warm_rust_inline_replies(timed: bool) {
     let fixture = symbol_test_fixture();
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "warm-rust-inline").await;
@@ -11450,8 +11972,16 @@ async fn configured_product_warm_rust_calls_complete_inline_within_three_seconds
         let began = tokio::time::Instant::now();
         let reply = actor.call(&fixture, tool, params).await;
         let elapsed = began.elapsed();
+        let reply = if timed {
+            reply
+        } else {
+            actor.settle(&fixture, reply).await
+        };
         assert_eq!(reply["state"], "complete", "{tool}: {reply}");
-        assert!(elapsed < Duration::from_secs(3), "{tool} took {elapsed:?}");
+        assert!(
+            !timed || elapsed < Duration::from_secs(3),
+            "{tool} took {elapsed:?}"
+        );
     }
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
@@ -11783,6 +12313,249 @@ const waitReady = () => {
 };
 waitReady();
 "#;
+
+/// A panic while the provider backend is out of its slot (`live_session_for` across the
+/// `ensure_live` await) answers that call `internal` and fails the daemon crash-only: it exits by
+/// itself keeping its runtime store, and its shutdown leaves no language server of the binding
+/// behind (the backend returns to the slot before the unwind continues, so the shutdown reap
+/// still reaches the session retained by the earlier call).
+///
+/// Before containment the panic dropped the backend (the slot answered `internal` for every later
+/// call) and the daemon stayed up.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_NODE environment"]
+async fn configured_product_provider_ensure_panic_fails_the_daemon_crash_only_and_reaps_the_retained_session()
+ {
+    use std::os::unix::fs::PermissionsExt;
+
+    let node = std::env::var("AGENT_IDE_NODE").unwrap();
+    let fixture = symbol_test_fixture();
+    let stub = fixture.base.join("ensure-stub-server.mjs");
+    let ready = fixture.base.join("ensure-stub-ready");
+    let pids = fixture.base.join("ensure-stub-pids");
+    std::fs::write(&stub, COLD_STUB_SERVER).unwrap();
+    std::fs::write(&ready, "ready").unwrap();
+    let wrapper = fixture.base.join("ensure-rust-provider");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\necho $$ >> '{}'\nexec '{}' '{}' '{}'\n",
+            pids.display(),
+            node,
+            stub.display(),
+            ready.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN")
+        .unwrap_or_else(|_| "1.98.1-aarch64-apple-darwin".into());
+    fixture.write_config(json!([{
+        "executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
+        "settings":"rust_cache_priming_disabled_v1",
+        "toolchain":toolchain,
+        "cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),
+        "cargo_version":"cargo 1.98.1",
+        "rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),
+        "rustc_version":"rustc 1.98.1",
+        "trust":"fixture-disabled",
+        "cache_namespace":"fixture-ensure-panic-cache"
+    }]));
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "/// Answers.\npub fn value() -> i32 { 7 }\n\npub fn caller() -> i32 { value() }\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "src/lib.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "ensure panic fixture"]);
+    let (fault, flag) = fault_flag(&fixture, "ensure", false);
+    let mut daemon = fixture
+        .spawn_configured_daemon_with_env(
+            None,
+            false,
+            Duration::from_secs(30),
+            None,
+            &[("AGENT_IDE_TEST_FAULT", &fault)],
+        )
+        .await;
+    let mut actor = ProductActor::new(&fixture, "ensure-panic").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"ensure-panic"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    // A first symbol call retains the language server's session for the binding.
+    let symbol = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#value"}))
+        .await;
+    let symbol = actor.settle(&fixture, symbol).await;
+    assert_eq!(symbol["kind"], "symbol", "{symbol}");
+    let server_pid: libc::pid_t = std::fs::read_to_string(&pids)
+        .unwrap()
+        .lines()
+        .next()
+        .expect("the language server was spawned")
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(server_pid, 0) }, 0, "server is running");
+    std::fs::write(&flag, b"").unwrap();
+    let panicked = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"src/lib.rs#caller"}),
+        )
+        .await;
+    assert_eq!(panicked["code"], "internal", "{panicked}");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("a failed daemon must exit by itself")
+        .unwrap();
+    assert!(status.success(), "{status}");
+    assert!(
+        fixture.runtime.join("state.sqlite").exists(),
+        "a crash-only exit keeps the runtime store"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while unsafe { libc::kill(server_pid, 0) } == 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the retained language server must be reaped by the failed daemon's shutdown");
+    actor.mcp.close().await;
+}
+
+/// A call parked behind a loading language server is lost with a failed daemon, and its
+/// reference does not hang the agent: after the crash-only exit and a replacement daemon in the
+/// same runtime directory, inspecting the old `detail_ref` answers a settled typed reply at once
+/// (never `pending`), and the replacement serves new calls.
+///
+/// The parked job is never executed by the failed daemon and never replayed by the replacement.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_NODE environment"]
+async fn configured_product_pending_call_and_old_reference_survive_a_crash_only_restart() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let node = std::env::var("AGENT_IDE_NODE").unwrap();
+    let fixture = symbol_test_fixture();
+    let stub = fixture.base.join("pending-stub-server.mjs");
+    let ready = fixture.base.join("pending-stub-ready");
+    std::fs::write(&stub, COLD_STUB_SERVER).unwrap();
+    let wrapper = fixture.base.join("pending-rust-provider");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec '{}' '{}' '{}'\n",
+            node,
+            stub.display(),
+            ready.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN")
+        .unwrap_or_else(|_| "1.98.1-aarch64-apple-darwin".into());
+    fixture.write_config(json!([{
+        "executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
+        "settings":"rust_cache_priming_disabled_v1",
+        "toolchain":toolchain,
+        "cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),
+        "cargo_version":"cargo 1.98.1",
+        "rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),
+        "rustc_version":"rustc 1.98.1",
+        "trust":"fixture-disabled",
+        "cache_namespace":"fixture-pending-restart-cache"
+    }]));
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "/// Answers.\npub fn value() -> i32 { 7 }\n\npub fn caller() -> i32 { value() }\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "src/lib.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "pending restart fixture"]);
+    let (fault, flag) = fault_flag(&fixture, "loop", false);
+    let mut daemon = fixture
+        .spawn_configured_daemon_with_env(
+            None,
+            false,
+            Duration::from_secs(30),
+            None,
+            &[("AGENT_IDE_TEST_FAULT", &fault)],
+        )
+        .await;
+    let mut actor = ProductActor::new(&fixture, "pending-restart").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"pending-1"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    // The server never becomes ready, so this call parks and answers `pending`.
+    let parked = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#value"}))
+        .await;
+    assert_eq!(parked["state"], "pending", "{parked}");
+    let reference = parked["detail_ref"].as_str().unwrap().to_owned();
+    std::fs::write(&flag, b"").unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("the daemon fails at its next worker turn and exits by itself")
+        .unwrap();
+    assert!(status.success(), "{status}");
+    assert!(
+        fixture.runtime.join("state.sqlite").exists(),
+        "a crash-only exit keeps the runtime store"
+    );
+    assert!(!flag.exists(), "the fault fired exactly once");
+    let mut replacement = fixture
+        .spawn_configured_daemon_with_env(
+            None,
+            false,
+            Duration::from_secs(30),
+            None,
+            &[("AGENT_IDE_TEST_FAULT", &fault)],
+        )
+        .await;
+    let old = tokio::time::timeout(
+        Duration::from_secs(20),
+        actor.call(&fixture, "ide.inspect", json!({"detail_ref":reference})),
+    )
+    .await
+    .expect("an old reference must not hang the agent");
+    assert_ne!(
+        old["state"], "pending",
+        "the parked job died with the failed daemon and is not replayed: {old}"
+    );
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"pending-2"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    // With a live activation on the replacement the old reference is still not a result: it is
+    // refused as the typed `invalid_detail` error, and a fresh read answers.
+    let stale = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
+        .await;
+    assert_eq!(stale["state"], "error", "{stale}");
+    assert_eq!(stale["code"], "invalid_detail", "{stale}");
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"src/lib.rs","lines":"1-2"}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    assert_eq!(read["kind"], "read", "{read}");
+    actor.mcp.close().await;
+    replacement.kill().await.unwrap();
+    replacement.wait().await.unwrap();
+}
 
 /// While the registered Rust server is still loading, `ide.outline`, `ide.read` and the
 /// symbol-addressed `ide.edit` answer at once from the lexical outline and say so in one
@@ -21281,6 +22054,55 @@ async fn managed_claude_lost_edit_reply_is_reported_and_never_resent() {
     mcp.close().await;
 }
 
+/// The shared Claude daemon, stopped for good (it holds its runtime and answers nothing), is
+/// replaced without agent action once repeated probes spanned 30 seconds: the front signals the
+/// verified lock holder, a replacement starts in the same runtime directory, and the next call
+/// recovers the actor on it. The call that met the wedge keeps its own failure and is not resent.
+#[tokio::test]
+async fn managed_claude_wedged_shared_daemon_is_replaced_without_agent_action() {
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let session = "wedged-shared";
+    let mut next = 10;
+    claude_start_actor(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        session,
+        None,
+        json!({"activation_id":"wedged"}),
+    )
+    .await;
+    let pid = std::fs::read_to_string(runtime.join("agent-ide.lock"))
+        .unwrap()
+        .trim()
+        .parse::<libc::pid_t>()
+        .expect("the daemon lock records its holder");
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let _paused = PausedDaemon(pid);
+    next += 1;
+    let call = format!("managed-claude-{next}");
+    // The pre-hook meets the stopped daemon too; whatever it answers, the call is still sent.
+    let _ = managed_claude_hook(
+        Some(&fixture.root),
+        managed_claude_event("PreToolUse", session, None, &call),
+    )
+    .await;
+    let lost = tokio::time::timeout(
+        Duration::from_secs(40),
+        mcp.exchange(json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.read","arguments":{"path":"src/lib.rs","lines":"1-2"},"_meta":{"claudecode/toolUseId":call}}})),
+    )
+    .await
+    .expect("the call that met the wedge returns its own failure");
+    assert_eq!(lost["result"]["isError"], true, "{lost}");
+    let fresh = replacement_daemon_pid(&runtime, pid, Duration::from_secs(120)).await;
+    assert_ne!(fresh, pid);
+    claude_read_ok(&mut mcp, &fixture.root, &mut next, session, None).await;
+    mcp.close().await;
+}
+
 /// A stopped actor is never re-bound by restart recovery — neither after a confirmed stop nor
 /// after a stop whose reply was lost — while its sibling still recovers.
 #[cfg(feature = "test-seams")]
@@ -21499,6 +22321,7 @@ async fn managed_codex_stop_after_daemon_restart_reports_already_stopped() {
     let _lock = MANAGED_CODEX_TEST_LOCK.lock().await;
     let fixture = ProductFixture::new(json!([]));
     let before = managed_runtime_paths(&fixture);
+    let _cleanup = ManagedCodexCleanup::new(&fixture, &before);
     let mut mcp = Mcp::start_managed(&fixture.config, &fixture.root).await;
     let runtime = managed_runtime_paths(&fixture)
         .difference(&before)

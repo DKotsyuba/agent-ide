@@ -239,6 +239,21 @@ impl Providers {
             .ok_or(FailureCode::Internal)
     }
 
+    /// Gives every slot whose backend a panic dropped mid-operation a fresh idle backend.
+    ///
+    /// A panic unwinds through an operation that had taken its backend out of the slot, so the
+    /// backend (and the sessions it held) is gone and the slot would answer `internal` for every
+    /// later call of that language. The replacement holds no session; dropping the old backend
+    /// already requested its owned children's cleanup. The daemon is marked failed right after
+    /// and replaced, so this only keeps the remaining shutdown path total.
+    pub(super) fn repair_after_panic(&mut self) {
+        for slot in &mut self.slots {
+            if slot.backend.is_none() {
+                slot.backend = Some(slot.server.new_backend());
+            }
+        }
+    }
+
     /// Returns a backend taken with [`Providers::take_backend`] to its slot.
     fn put_backend(&mut self, index: usize, backend: Box<dyn ServerBackend>) {
         if let Some(slot) = self.slots.get_mut(index) {
@@ -555,6 +570,12 @@ impl Worker<'_> {
     /// no accepted server serves. A session this job's owner had failed is retired first when its
     /// project inputs changed or Git's `HEAD` moved since ([`Worker::retire_changed_session`]);
     /// the session used is recorded so the job's end settles its health.
+    ///
+    /// The slot's backend is taken out for the `ensure_live` await. A panic inside it is caught
+    /// here only to put that backend back (with the sessions it already retained, which the
+    /// shutdown reap still releases explicitly) before the unwind continues to the worker's
+    /// per-job guard, so a contained panic never leaves the slot empty for later calls. The
+    /// panic is never swallowed: the worker marks the daemon failed and it is replaced.
     pub(super) async fn live_session_for(
         &mut self,
         job: &mut Job,
@@ -600,9 +621,22 @@ impl Worker<'_> {
         self.providers.current = Some((binding.clone(), index));
         let mut backend = self.providers.take_backend(index)?;
         self.providers.clear_refusal();
-        let ensured = backend.ensure_live(self, job, &launch, source).await;
+        // A panic while the backend is out of its slot must not strand it: the backend returns
+        // to the slot (keeping the sessions it already retained reachable for the shutdown reap)
+        // and the unwind then continues to the worker's per-job guard.
+        let ensured = catch_panic(async {
+            if super::fault_seam("ensure") {
+                panic!("agent-ide test seam: deliberate provider ensure panic");
+            }
+            backend.ensure_live(self, job, &launch, source).await
+        })
+        .await;
         self.providers.put_backend(index, backend);
         job.session_binding = None;
+        let ensured = match ensured {
+            Ok(ensured) => ensured,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
         if let Err(code) = &ensured {
             self.providers
                 .name_bare_failure(job, server, "session could not start", code);

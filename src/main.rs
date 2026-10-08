@@ -20,7 +20,7 @@ use agent_ide::assistance::{
     assembly::ProductDispatcher,
     codex_rendezvous::ManagedCodexPublisher,
     facade::{
-        DaemonCurrencyNote, ReestablishFn, RerootFn, RerootOutcome, SharedCodexPublisher,
+        DaemonCurrencyNote, EvictFn, ReestablishFn, RerootFn, RerootOutcome, SharedCodexPublisher,
         SharedDaemonNote, StdioFacade,
     },
     host_binding::HostKind,
@@ -1174,7 +1174,7 @@ impl ManagedRuntime {
     /// The returned absolute path is passed only to the exact daemon child. Existing files are
     /// never overwritten, and a short write leaves managed startup unavailable.
     fn write_launcher(&self, bytes: &[u8]) -> std::io::Result<PathBuf> {
-        let path = self.path.join("launcher.json");
+        let path = self.path.join(agent_ide::app::LAUNCHER_FILE);
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1309,7 +1309,7 @@ const CLAUDE_RUNTIME_PREFIX: &str = "ai-r-";
 /// Bounded deadline for the local `git` rendezvous-key probe; a real repository answers instantly.
 const GIT_COMMON_DIR_TIMEOUT: Duration = Duration::from_secs(2);
 /// Fixed owner-only file carrying the full project identity and random transport attachment.
-const CLAUDE_ATTACHMENT_FILE: &str = "attachment";
+const CLAUDE_ATTACHMENT_FILE: &str = agent_ide::app::CLAUDE_ATTACHMENT_FILE;
 /// Per-candidate attachment cache written only after the daemon registers that candidate.
 const CLAUDE_CANDIDATE_ATTACHMENT_FILE: &str = "candidate-attachment";
 /// Exact record length: 64 digest bytes, one separator, 64 attachment bytes, and one newline.
@@ -2063,6 +2063,19 @@ async fn run_managed_codex_mcp(
                     StdioFacade::with_reestablishing_attachment(runtime_path, attachment, reconnect)
                 }
             };
+            let evict: EvictFn = {
+                let child = Arc::clone(&child);
+                Arc::new(
+                    move |runtime_dir: PathBuf, pid: Option<i32>, probes: u32, span: Duration| {
+                        let child = Arc::clone(&child);
+                        Box::pin(async move {
+                            terminate_wedged_owned_daemon(child, &runtime_dir, pid, probes, span)
+                                .await;
+                        })
+                    },
+                )
+            };
+            let facade = facade.map(|facade| facade.with_wedge_eviction(evict));
             let Some(facade) = facade else {
                 terminate_owned_daemon(child).await;
                 if let Some(runtime) = runtime.current.lock().expect("owned runtime mutex").take() {
@@ -2091,8 +2104,10 @@ async fn run_managed_codex_mcp(
 /// Restarts this MCP's owned Codex daemon once after transport loss, restoring its lease and hooks.
 ///
 /// The guard serializes calls with shutdown. A transport fault preserves the exact live child and
-/// runtime; only a reaped child or replaced runtime is restarted. A fresh runtime enters teardown
-/// state before startup awaits, so cancellation cannot leave it behind.
+/// runtime; only a reaped child or replaced runtime is restarted. A reaped child's own directory is
+/// reused in place (its store and receipts survive a crash-only exit); a missing or replaced
+/// directory is replaced by a fresh one, which enters teardown state before startup awaits, so
+/// cancellation cannot leave it behind.
 fn codex_reestablish_hook(
     launcher_template: PathBuf,
     candidate: PathBuf,
@@ -2133,18 +2148,49 @@ fn codex_reestablish_hook(
                     .is_some_and(|owned| {
                         owned.path != connection.0 || matches!(owned.identity_matches(), Ok(false))
                     });
-                if !exited && !foreign {
+                if !exited
+                    && !foreign
+                    && agent_ide::app::probe_health(&connection.0).await
+                        != agent_ide::app::HealthProbe::Restarting
+                {
                     return Some(connection);
+                }
+                if !exited && !foreign {
+                    // The daemon answered `restarting`: it failed internally and exits by itself
+                    // within moments. Waiting a bounded time for that exit lets this very call
+                    // find the replacement instead of the daemon that is leaving.
+                    let mut child = child.lock().await;
+                    let _ = tokio::time::timeout(Duration::from_secs(8), child.wait()).await;
                 }
             }
             terminate_owned_daemon(Arc::clone(&child)).await;
             *lease.lock().await = None;
-            if let Some(old) = runtime.current.lock().expect("owned runtime mutex").take() {
-                let _ = old.remove();
-            }
-            let fresh = ManagedRuntime::create().ok()?;
+            // The reaped daemon's directory still holds its store and receipts when it exited
+            // crash-only (an internal fault) or was killed: the replacement runs in that same
+            // directory, so a written edit stays the unknown outcome it is and is never repeated.
+            // Only a directory that is gone or no longer this MCP's own is replaced by a new one.
+            let kept = runtime
+                .current
+                .lock()
+                .expect("owned runtime mutex")
+                .clone()
+                .filter(|old| matches!(old.identity_matches(), Ok(true)));
+            let in_place = kept.is_some();
+            let fresh = match kept {
+                Some(old) => {
+                    clear_claude_generation(&old);
+                    old
+                }
+                None => {
+                    if let Some(old) = runtime.current.lock().expect("owned runtime mutex").take() {
+                        let _ = old.remove();
+                    }
+                    let fresh = ManagedRuntime::create().ok()?;
+                    *runtime.current.lock().expect("owned runtime mutex") = Some(fresh.clone());
+                    fresh
+                }
+            };
             let path = fresh.path.clone();
-            *runtime.current.lock().expect("owned runtime mutex") = Some(fresh.clone());
             let started = start_managed_daemon(
                 &fresh,
                 &launcher_template,
@@ -2154,7 +2200,9 @@ fn codex_reestablish_hook(
             )
             .await;
             let Ok((attachment, mut new_child)) = started else {
-                if let Some(fresh) = runtime.current.lock().expect("owned runtime mutex").take() {
+                if !in_place
+                    && let Some(fresh) = runtime.current.lock().expect("owned runtime mutex").take()
+                {
                     let _ = fresh.remove();
                 }
                 return None;
@@ -2177,7 +2225,9 @@ fn codex_reestablish_hook(
                 // must be force-reaped before its fenced runtime is removed.
                 let _ = new_child.start_kill();
                 let _ = new_child.wait().await;
-                if let Some(fresh) = runtime.current.lock().expect("owned runtime mutex").take() {
+                if !in_place
+                    && let Some(fresh) = runtime.current.lock().expect("owned runtime mutex").take()
+                {
                     let _ = fresh.remove();
                 }
                 return None;
@@ -2382,6 +2432,15 @@ async fn run_managed_claude_mcp(
         Arc::clone(&note),
         candidate.clone(),
     );
+    // A shared daemon that holds its runtime but stays silent across repeated probes is replaced
+    // by the facade's wedge watch; every safety check lives in `evict_wedged_daemon`.
+    let evict: EvictFn = Arc::new(
+        |runtime_dir: PathBuf, pid: Option<i32>, probes: u32, span: Duration| {
+            Box::pin(async move {
+                let _ = agent_ide::app::evict_wedged_daemon(&runtime_dir, pid, probes, span).await;
+            })
+        },
+    );
     match StdioFacade::with_reestablishing_claude_attachment(
         runtime_path,
         attachment,
@@ -2389,7 +2448,9 @@ async fn run_managed_claude_mcp(
         reestablish,
         reroot,
         note,
-    ) {
+    )
+    .map(|facade| facade.with_wedge_eviction(evict))
+    {
         Some(facade) => {
             // The held lease stream is a live death notice for the shared daemon: watching it
             // heals the session the moment a generation ends, instead of at the next failed tool
@@ -2700,6 +2761,7 @@ async fn rendezvous_with_claude_daemon(
         if let Some(attachment) = adopt_current_claude_daemon(path, key, note).await {
             return Some((path.to_owned(), attachment));
         }
+        wait_for_exiting_daemon(path).await;
         if let Ok(runtime) = ManagedRuntime::ensure_deterministic(path.to_owned()) {
             if let Some(attachment) =
                 spawn_claude_daemon(&runtime, key, launcher_template, candidate, note).await
@@ -2719,6 +2781,30 @@ async fn rendezvous_with_claude_daemon(
         note_last_resort_daemon(path, note).await;
     }
     adopted
+}
+
+/// Waits a bounded interval while a daemon still holds the runtime lock without answering healthy.
+///
+/// Such a daemon is either starting (another front's spawn) or exiting after an internal fault
+/// (it answers `restarting`, then releases the lock); spawning over it would only start a child
+/// that loses the lock and exits. The wait ends as soon as the lock is released or the daemon
+/// answers healthy, and at the latest after eight seconds, so a hung daemon never blocks the
+/// attach.
+async fn wait_for_exiting_daemon(path: &Path) {
+    let _ = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            match doctor_report(path).await {
+                Ok(report)
+                    if report.lock == DoctorLockState::Held
+                        && !matches!(report.status, DoctorStatus::Healthy { .. }) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                _ => return,
+            }
+        }
+    })
+    .await;
 }
 
 /// Adopts an existing daemon only after its directory identity, lock, and health all check out.
@@ -2921,13 +3007,14 @@ async fn spawn_claude_daemon(
     }
 }
 
-/// Best-effort removal of one shared Claude runtime's generation-specific launcher/attachment files.
+/// Best-effort removal of one managed runtime's generation-specific launcher/attachment files, for
+/// a shared Claude runtime and for a Codex runtime restarted in place.
 ///
 /// Never removes the shared rendezvous directory itself, and never fails the caller: a missing file
 /// is already clean, and any other removal error is silently accepted, since a live daemon's own
 /// files (if this race was lost) are recreated identically by nothing else touching this directory.
 fn clear_claude_generation(runtime: &ManagedRuntime) {
-    let _ = fs::remove_file(runtime.path.join("launcher.json"));
+    let _ = fs::remove_file(runtime.path.join(agent_ide::app::LAUNCHER_FILE));
     let _ = fs::remove_file(runtime.path.join(CLAUDE_ATTACHMENT_FILE));
 }
 
@@ -3240,6 +3327,64 @@ fn managed_termination_signal() -> impl std::future::Future<Output = ()> {
             _ = interrupt.recv() => {}
             _ = terminate.recv() => {}
         }
+    }
+}
+
+/// Force-replaces the exact daemon child this MCP owns after its wedge watch found it silent.
+///
+/// Signals only that owned child, and only if the evidence reaches the same minimum the shared
+/// path enforces (`WEDGE_MIN_PROBES` probes over `WEDGE_MIN_SPAN`), the child is still the daemon
+/// whose silence was observed (`expected_pid`), and a probe of its control path at `runtime_dir`,
+/// made while this function holds the child, still finds it silent (a daemon that answers is never
+/// signalled, however busy). Holding the child slot serializes this with a restart, so a
+/// replacement that took the slot meanwhile is never signalled. The runtime store is marked for
+/// retention first ([`agent_ide::app::retain_runtime_store`]), so even an orderly exit on `SIGTERM`
+/// keeps the receipts. `SIGTERM`, up to [`agent_ide::app::WEDGE_TERM_GRACE`] for it to exit, a
+/// second probe (a daemon that resumed and answers is not killed), then `SIGKILL`; the caller then
+/// restarts the daemon in the same directory. Journals the replacement with the probe count and
+/// span (see `agent_ide::app::record_forced_replacement`) only when the child is really gone.
+async fn terminate_wedged_owned_daemon(
+    child: SharedChild,
+    runtime_dir: &Path,
+    expected_pid: Option<i32>,
+    probes: u32,
+    span: Duration,
+) {
+    if probes < agent_ide::app::WEDGE_MIN_PROBES || span < agent_ide::app::WEDGE_MIN_SPAN {
+        return;
+    }
+    let mut child = child.lock().await;
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    let Some(pid) = child.id() else {
+        return;
+    };
+    if expected_pid.is_some_and(|expected| expected != pid as i32)
+        || agent_ide::app::probe_health(runtime_dir).await != agent_ide::app::HealthProbe::Silent
+    {
+        return;
+    }
+    if agent_ide::app::retain_runtime_store(runtime_dir).is_err() {
+        return;
+    }
+    let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let mut killed = false;
+    if tokio::time::timeout(agent_ide::app::WEDGE_TERM_GRACE, child.wait())
+        .await
+        .is_err()
+    {
+        // A child that resumed and answers is leaving by itself and is left to finish.
+        if agent_ide::app::probe_health(runtime_dir).await != agent_ide::app::HealthProbe::Silent {
+            return;
+        }
+        killed = true;
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    }
+    // Only a child that is really gone was replaced; one that survived `SIGKILL` is not claimed.
+    if child.try_wait().ok().flatten().is_some() {
+        agent_ide::app::record_forced_replacement(pid as i32, probes, span, killed);
     }
 }
 
