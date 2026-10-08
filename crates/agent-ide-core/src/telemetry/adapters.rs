@@ -92,8 +92,21 @@ pub fn log_tool_reply(
     reply: &PeerReply,
     elapsed: Duration,
     requested: Option<&str>,
+    context: &DispatchContext<'_>,
 ) {
     let reason = reply_reason(reply);
+    let (form, language) = match context.parameters {
+        Some(parameters) => (
+            Some(crate::assistance::facade::request_form(tool, parameters)),
+            request_language(parameters),
+        ),
+        None => (None, None),
+    };
+    let outcome = if degraded_success(reply) {
+        crate::errorlog::Outcome::Degraded
+    } else {
+        errorlog_outcome(reply)
+    };
     // Every failure line names its stage: the reply's own detail when the failing path set one,
     // else the derived `<tool>:<reason>` default, so no failed reply journals without a stage.
     let stage = reply_detail(reply).or_else(|| {
@@ -103,15 +116,83 @@ pub fn log_tool_reply(
     });
     crate::errorlog::record(
         errorlog_method(reply_method(tool, reply)),
-        errorlog_outcome(reply),
+        outcome,
         crate::errorlog::Fields {
             reason,
             correlation: reply_correlation(reply).or(requested),
             duration_ms: elapsed.as_millis().try_into().ok(),
             detail: stage.as_deref(),
+            version: Some(env!("CARGO_PKG_VERSION")),
+            host: context.host,
+            role: context.role,
+            language,
+            form: form.as_deref(),
+            request: context.request,
+            eligible: Some(context.parameters.is_some_and(|parameters| {
+                crate::assistance::facade::validate_call(tool, parameters.clone()).is_ok()
+            })),
             ..Default::default()
         },
     );
+}
+
+/// The closed facts one dispatch gathers for its journal line (QW-4). Every field is a closed
+/// value or an opaque id: the host kind, the activation's role, the transport request id, and the
+/// request's own parameters, from which only the *names* of defined fields and the registered
+/// language of the named file are ever journaled (never a value, path or source text).
+#[derive(Default)]
+pub struct DispatchContext<'a> {
+    /// Host contract of the call, when its metadata named one.
+    pub host: Option<crate::assistance::host_binding::HostKind>,
+    /// Role of the calling activation, when it holds one.
+    pub role: Option<crate::errorlog::Role>,
+    /// Opaque transport request id shared with the front's own journal line and the queued job.
+    pub request: Option<&'a str>,
+    /// The call's model parameters; `None` when the envelope carried none (refused as input).
+    pub parameters: Option<&'a serde_json::Value>,
+}
+
+/// Fixed text of the lexical-fallback note a symbol or outline reply carries when it was built
+/// from the source outline instead of the language server (see `Symbols::lexical_note`).
+pub(crate) const LEXICAL_OUTLINE_NOTE: &str = "outline: from source, exact (";
+/// Fixed header of an `ide.context` reply built lexically (see `Worker::context`).
+const LEXICAL_CONTEXT_MODE: &str = "mode: lexical (";
+
+/// Reports a reply that succeeded through a weaker path than asked for (QW-4): a lexical context
+/// or outline answer, or an edit whose post-edit diagnostics stayed unknown. Detection reads
+/// only the daemon's own fixed sentences and closed diagnostics state, never model text.
+fn degraded_success(reply: &PeerReply) -> bool {
+    match reply {
+        PeerReply::Complete { text, .. } => {
+            text.contains(LEXICAL_CONTEXT_MODE) || text.contains(LEXICAL_OUTLINE_NOTE)
+        }
+        PeerReply::Edit {
+            result,
+            diagnostics: EditDiagnostics::Unknown {},
+            ..
+        } => matches!(
+            result.outcome,
+            EditOutcome::Created | EditOutcome::Replaced | EditOutcome::Unchanged
+        ),
+        _ => false,
+    }
+}
+
+/// The registered language of the file one request names (`path`, else the file part of a
+/// `path#Owner/name` symbol address), by extension alone; `None` when it names no file or none a
+/// registered language owns.
+fn request_language(parameters: &serde_json::Value) -> Option<&'static str> {
+    let field = |name: &str| parameters.get(name).and_then(serde_json::Value::as_str);
+    let file = field("path")
+        .or_else(|| {
+            parameters
+                .get("symbols")
+                .and_then(|list| list.get(0))
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| field("symbol"))?;
+    let file = file.split_once('#').map_or(file, |(file, _)| file);
+    crate::lang::Language::for_path(std::path::Path::new(file)).map(crate::lang::Language::name)
 }
 
 /// Returns the stage tag an error or cause-tagged unavailable reply already carries, if any.

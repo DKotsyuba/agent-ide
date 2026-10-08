@@ -42,6 +42,7 @@ async fn typed_failures_and_check_starts_are_logged_without_telemetry() {
             &PeerReply::Error { code, detail: None },
             Duration::from_millis(3),
             Some("requested-ref"),
+            &adapters::DispatchContext::default(),
         );
     }
     let logged = errorlog::read_events(&dir);

@@ -1640,7 +1640,8 @@ impl Worker<'_> {
             Lexical::Unverified { cause } => format!("project resolution unverified: {cause}"),
         };
         Some(format!(
-            "outline: from source, exact ({} {state}; no need to repeat)",
+            "{}{} {state}; no need to repeat)",
+            crate::telemetry::adapters::LEXICAL_OUTLINE_NOTE,
             server.name()
         ))
     }

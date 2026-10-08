@@ -723,7 +723,7 @@ pub struct Fields<'a> {
     /// Registered language identifier of the request's file, when it names one (QW-4).
     pub language: Option<&'static str>,
     /// Closed request form, derived from the request's parameter *names* only (QW-4).
-    pub form: Option<&'static str>,
+    pub form: Option<&'a str>,
     /// Opaque transport request id shared by the front's call, the daemon's dispatch line and the
     /// job the call queued (QW-4); never model text.
     pub request: Option<&'a str>,
@@ -738,6 +738,10 @@ pub struct Fields<'a> {
 /// otherwise unavailable. `level` is derived from `outcome` (see [`Outcome::level`]) so it can
 /// never disagree with it.
 pub fn record(method: Method, outcome: Outcome, fields: Fields<'_>) {
+    #[cfg(test)]
+    if capture_line(&build_line(method, outcome, fields, 0)) {
+        return;
+    }
     let Some(Some(writer)) = WRITER.get() else {
         return;
     };
@@ -746,6 +750,38 @@ pub fn record(method: Method, outcome: Outcome, fields: Fields<'_>) {
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
     writer.append(&build_line(method, outcome, fields, timestamp));
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Lines [`record`] captured on this thread while a unit test holds a capture open (the
+    /// process-wide writer is shared by every test of the crate, so a test cannot read it back).
+    static CAPTURED: std::cell::RefCell<Option<Vec<LoggedEvent>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Appends `line` to this thread's open capture; reports whether a capture swallowed it.
+#[cfg(test)]
+fn capture_line(line: &[u8]) -> bool {
+    CAPTURED.with(|captured| match captured.borrow_mut().as_mut() {
+        Some(events) => {
+            events.extend(parse_line(&String::from_utf8_lossy(line)));
+            true
+        }
+        None => false,
+    })
+}
+
+/// Opens a capture on this thread: every [`record`] call until [`capture_take`] is decoded into
+/// the capture instead of being written. Unit tests on a single-threaded runtime only.
+#[cfg(test)]
+pub(crate) fn capture_start() {
+    CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+}
+
+/// Closes this thread's capture and returns what it caught, oldest first.
+#[cfg(test)]
+pub(crate) fn capture_take() -> Vec<LoggedEvent> {
+    CAPTURED.with(|captured| captured.borrow_mut().take().unwrap_or_default())
 }
 
 std::thread_local! {
@@ -1393,7 +1429,7 @@ mod tests {
                 version: Some("1.2.3"),
                 host: Some(HostKind::Claude),
                 role: Some(Role::Reader),
-                language: Some("rust"),
+                language: Some("alpha"),
                 form: Some("file"),
                 request: Some("req-1"),
                 eligible: Some(true),
@@ -1407,7 +1443,7 @@ mod tests {
         assert_eq!(event.version.as_deref(), Some("1.2.3"));
         assert_eq!(event.host.as_deref(), Some("claude"));
         assert_eq!(event.role.as_deref(), Some("reader"));
-        assert_eq!(event.language.as_deref(), Some("rust"));
+        assert_eq!(event.language.as_deref(), Some("alpha"));
         assert_eq!(event.form.as_deref(), Some("file"));
         assert_eq!(event.request.as_deref(), Some("req-1"));
         assert_eq!(event.eligible, Some(true));

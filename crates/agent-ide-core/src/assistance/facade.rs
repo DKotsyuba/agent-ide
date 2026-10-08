@@ -655,6 +655,22 @@ const CONTEXT_TARGET_MESSAGE: &str =
 /// Model-facing text for an outline request without its required path.
 const OUTLINE_TARGET_MESSAGE: &str = "invalid bounded parameters: ide.outline needs \"path\" (a file or directory relative to the worktree root)";
 
+/// The closed request form of one call for the journal (QW-4): the names of the parameters the
+/// tool defines that the call carries, in the tool's own order, joined by `+` (for example
+/// `path+lines`). Only fixed field names ever appear, never a value or a name the model chose, so
+/// the result is bounded by the tool's field list.
+pub(crate) fn request_form(tool: AssistanceTool, parameters: &Value) -> String {
+    let Some(object) = parameters.as_object() else {
+        return String::new();
+    };
+    allowed_fields(tool)
+        .iter()
+        .filter(|field| object.contains_key(**field))
+        .copied()
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
 /// Returns the closed allowed field list for one logical tool.
 fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
     match tool {

@@ -7077,6 +7077,75 @@ async fn managed_claude_hook_with_a_vanished_project_dir_never_routes_to_another
     other.close().await;
 }
 
+/// QW-4: through a real managed Claude daemon, every dispatch line of the project journal carries
+/// the serving version, the host, the activation's role, the closed request form, the front's
+/// request id and the eligibility flag, and the journal still carries no request value.
+#[tokio::test]
+async fn managed_claude_dispatch_lines_carry_closed_context() {
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let journal = hook_journal_dir(&fixture.root);
+    let _ = std::fs::remove_dir_all(&journal);
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+
+    let mut next = 1;
+    let pending = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "context-session",
+        None,
+        "ide.start",
+        json!({"activation_id":"context-start"}),
+    )
+    .await;
+    let started = settle_managed_claude_start(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        "context-session",
+        None,
+        &pending,
+    )
+    .await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    next += 1;
+    let context = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "context-session",
+        None,
+        "ide.context",
+        json!({"kind":"problems"}),
+    )
+    .await;
+    assert_ne!(context["state"], "unavailable", "{context}");
+    mcp.close().await;
+
+    let raw = std::fs::read_to_string(journal.join("events.jsonl")).unwrap_or_default();
+    let events = raw
+        .lines()
+        .filter_map(agent_ide::errorlog::parse_line)
+        .collect::<Vec<_>>();
+    let start = events
+        .iter()
+        .find(|event| event.method == "start" && event.request.is_some())
+        .unwrap_or_else(|| panic!("a start dispatch line: {raw}"));
+    assert_eq!(start.role.as_deref(), Some("writer"), "{start:?}");
+    assert_eq!(start.form.as_deref(), Some("activation_id"));
+    let context = events
+        .iter()
+        .find(|event| event.method == "context" && event.request.is_some())
+        .unwrap_or_else(|| panic!("a context dispatch line: {raw}"));
+    assert_eq!(context.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(context.host.as_deref(), Some("claude"));
+    assert_eq!(context.role.as_deref(), Some("writer"));
+    assert_eq!(context.form.as_deref(), Some("kind"));
+    assert_eq!(context.eligible, Some(true));
+}
+
 /// Bounded host binding generations one daemon retains, mirroring `host_binding::MAX_BINDINGS`.
 const MAX_HOST_BINDINGS: usize = 64;
 

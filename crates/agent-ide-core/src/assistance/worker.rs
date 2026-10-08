@@ -588,8 +588,16 @@ struct Shared {
     /// Binding fingerprints whose channel currently holds an activation, so the hook ingress can
     /// stay silent for a channel that never started (or already stopped) instead of emitting
     /// native hints nothing can consume.
-    activated: Mutex<BTreeSet<[u8; 32]>>,
+    /// Each entry also records the role the channel activated with (journal context only).
+    activated: Mutex<BTreeMap<[u8; 32], crate::errorlog::Role>>,
+    /// Transport request id of the call that queued each live job, by result reference, so the
+    /// job's own journal lines carry the id of the front call that started it (QW-4). Bounded by
+    /// [`MAX_JOB_REQUESTS`]; an entry leaves when its job settles.
+    requests: Mutex<BTreeMap<String, String>>,
 }
+
+/// Most queued-job request ids [`Shared::requests`] keeps; past it a job simply journals no id.
+const MAX_JOB_REQUESTS: usize = 4096;
 impl Shared {
     /// Refreshes file-resolved identities and invalidates checks for changed languages.
     fn refresh_environments(&self, worktree: &Path) {
@@ -1079,7 +1087,8 @@ impl WorkerHandle {
                 test_runs: TestRuns::default(),
                 git_notices: Mutex::new(BTreeMap::new()),
                 environments: Mutex::default(),
-                activated: Mutex::new(BTreeSet::new()),
+                activated: Mutex::new(BTreeMap::new()),
+                requests: Mutex::new(BTreeMap::new()),
             }),
             inspect,
             receiver: Mutex::new(Some(receiver)),
@@ -1209,6 +1218,7 @@ impl WorkerHandle {
             parameters,
             attachment,
             Some(send),
+            None,
         ) {
             return PeerReply::Error {
                 detail: (code.code == FailureCode::Capacity).then_some(code.stage),
@@ -1420,12 +1430,16 @@ impl WorkerHandle {
     /// later completion with `ide.inspect`. The initial inspection permit is reserved before
     /// enqueueing so timeout always has capacity to return the current detail. A completed reply
     /// uses the worker's normal delivery path, preserving continuation and feedback semantics.
+    ///
+    /// `request` is the front's opaque transport request id; the queued job journals it beside its
+    /// own result reference so the front call, its job and later inspections can be followed.
     pub async fn submit(
         &self,
         invocation: ValidatedInvocation,
         tool: AssistanceTool,
         parameters: Value,
         attachment: &str,
+        request: Option<&str>,
     ) -> PeerReply {
         let binding = invocation.binding_ref().clone();
         let expected = Some((tool, selection(&parameters)));
@@ -1442,7 +1456,14 @@ impl WorkerHandle {
         }
         let (send, wait) = oneshot::channel();
         match admit_initial_inspection(&self.inspect, || {
-            self.enqueue(invocation, tool, parameters, attachment, Some(send))
+            self.enqueue(
+                invocation,
+                tool,
+                parameters,
+                attachment,
+                Some(send),
+                request,
+            )
         }) {
             Ok((reference, permit)) => match tokio::time::timeout(INLINE_REPLY_WAIT, wait).await {
                 Ok(Ok(reply)) => reply,
@@ -1513,6 +1534,7 @@ impl WorkerHandle {
             serde_json::json!({ "uncollected_test_runs": uncollected }),
             attachment,
             Some(send),
+            None,
         ) {
             return PeerReply::Error {
                 detail: (code.code == FailureCode::Capacity).then_some(code.stage),
@@ -1617,7 +1639,17 @@ impl WorkerHandle {
         self.shared
             .activated
             .lock()
-            .is_ok_and(|activated| activated.contains(&binding.fingerprint()))
+            .is_ok_and(|activated| activated.contains_key(&binding.fingerprint()))
+    }
+
+    /// The role (reader or writer) this binding's channel activated with, while it holds an
+    /// activation; `None` before the first start and after the stop. Journal context only.
+    pub fn role_of(&self, binding: &BindingRef) -> Option<crate::errorlog::Role> {
+        self.shared
+            .activated
+            .lock()
+            .ok()
+            .and_then(|activated| activated.get(&binding.fingerprint()).copied())
     }
 
     /// Invalidates cached results on native hints; reads wait for a current MCP sandbox observation.
@@ -1699,6 +1731,7 @@ impl WorkerHandle {
         parameters: Value,
         attachment: &str,
         stop_reply: Option<oneshot::Sender<PeerReply>>,
+        request: Option<&str>,
     ) -> Result<String, InspectFailure> {
         if self
             .shared
@@ -1836,6 +1869,12 @@ impl WorkerHandle {
         }
         if let Some(key) = start {
             ledger.starts.insert(key, reference.clone());
+        }
+        if let Some(request) = request
+            && let Ok(mut requests) = self.shared.requests.lock()
+            && requests.len() < MAX_JOB_REQUESTS
+        {
+            requests.insert(reference.clone(), request.to_owned());
         }
         let job = Job {
             reference: reference.clone(),
@@ -2888,6 +2927,12 @@ impl<'a> Worker<'a> {
             },
             other => other,
         };
+        let request = self
+            .shared
+            .requests
+            .lock()
+            .ok()
+            .and_then(|mut requests| requests.remove(&job.reference));
         if let PeerReply::Error { code, .. } = &reply {
             // T26B: a queued job's terminal failure must reach the error log with its closed
             // reason even when no caller view ever does — the dispatch path only logs the initial
@@ -2903,10 +2948,12 @@ impl<'a> Worker<'a> {
                     correlation: Some(job.reference.as_str()),
                     detail: job.failure_detail.as_deref(),
                     duration_ms: u32::try_from(started.elapsed().as_millis()).ok(),
+                    request: request.as_deref(),
                     ..Default::default()
                 },
             );
         }
+        let failed = matches!(reply, PeerReply::Error { .. });
         if let Some(authority) = &authority {
             self.observe_head(&binding, authority);
         }
@@ -3015,6 +3062,21 @@ impl<'a> Worker<'a> {
                     // lost receiver leaves the page undelivered and fresh.
                     self.shared.mark_page_delivered(&job.reference);
                 }
+            } else if !failed {
+                // The caller stopped waiting and was told `pending`; a result nobody collects
+                // would otherwise leave no trace at all (QW-4). The line is the job's completion
+                // record: its own reference as `correlation` joins it to the pending dispatch line
+                // and to any later `ide.inspect`, and a failure already has its own line above.
+                crate::errorlog::record(
+                    errorlog_method(job.tool),
+                    crate::errorlog::Outcome::Completed,
+                    crate::errorlog::Fields {
+                        correlation: Some(job.reference.as_str()),
+                        detail: Some("pending_completion"),
+                        request: request.as_deref(),
+                        ..Default::default()
+                    },
+                );
             }
         }
     }
@@ -3310,7 +3372,13 @@ impl<'a> Worker<'a> {
         // The one shared fact a hook ingress can check before emitting a native hint: this
         // channel's binding now holds an activation.
         if let Ok(mut activated) = self.shared.activated.lock() {
-            activated.insert(binding.fingerprint());
+            activated.insert(
+                binding.fingerprint(),
+                match next_role {
+                    crate::workspace::authority::StartRole::Writer => crate::errorlog::Role::Writer,
+                    crate::workspace::authority::StartRole::Reader => crate::errorlog::Role::Reader,
+                },
+            );
         }
         let authority = match self.authority(&binding).await {
             Ok(authority) => authority,
@@ -6997,8 +7065,12 @@ mod stop_retry_tests {
             .activated
             .lock()
             .unwrap()
-            .insert(binding.fingerprint());
+            .insert(binding.fingerprint(), crate::errorlog::Role::Writer);
         assert!(handle.channel_activated(&binding));
+        assert_eq!(
+            handle.role_of(&binding),
+            Some(crate::errorlog::Role::Writer)
+        );
     }
 
     /// Creates one current host binding for a managed job.
@@ -7771,7 +7843,8 @@ mod stop_retry_tests {
                 test_runs: TestRuns::default(),
                 git_notices: Mutex::new(BTreeMap::new()),
                 environments: Mutex::default(),
-                activated: Mutex::new(BTreeSet::new()),
+                activated: Mutex::new(BTreeMap::new()),
+                requests: Mutex::new(BTreeMap::new()),
             }),
             workspace,
             observations: WorkspaceStore::new(store),
@@ -8919,6 +8992,68 @@ mod stop_retry_tests {
         assert_eq!(released.get(), 2);
     }
 
+    /// QW-4: a job whose caller stopped waiting (and was told `pending`) leaves a completion
+    /// record carrying its own reference and the front's request id; a job whose caller received
+    /// the result leaves none, so the record means exactly "finished with nobody waiting".
+    #[tokio::test]
+    async fn pending_job_leaves_a_completion_record_with_its_request_id() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        production_start(&mut worker, "pending-actor", "pending-start").await;
+        let run = |reference: &str, receiver_alive: bool| {
+            let invocation = production_call(&worker, "pending-actor", reference);
+            let (_cancel_sender, cancel) = watch::channel(false);
+            let (send, wait) = oneshot::channel();
+            let wait = receiver_alive.then_some(wait);
+            worker
+                .shared
+                .requests
+                .lock()
+                .unwrap()
+                .insert(reference.to_owned(), format!("req-for-{reference}"));
+            let job = Job {
+                reference: reference.to_owned(),
+                invocation,
+                tool: AssistanceTool::Context,
+                parameters: serde_json::json!({"kind":"problems"}),
+                target: production_target(&worker.runtime),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+                cancel,
+                stop_reply: Some(send),
+                native_epoch: 0,
+                failure_detail: None,
+                format_note: None,
+                check_scheduled: false,
+                park_until: None,
+                stage: None,
+                session_binding: None,
+            };
+            (job, wait)
+        };
+        let (mut abandoned, _) = run("abandoned-ref", false);
+        let (mut collected, _wait) = run("collected-ref", true);
+        crate::errorlog::capture_start();
+        worker.perform(&mut abandoned).await;
+        worker.perform(&mut collected).await;
+        let events = crate::errorlog::capture_take();
+        let records = events
+            .iter()
+            .filter(|event| event.detail.as_deref() == Some("pending_completion"))
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "{events:?}");
+        assert_eq!(records[0].method, "context");
+        assert_eq!(records[0].outcome, "completed");
+        assert_eq!(records[0].correlation.as_deref(), Some("abandoned-ref"));
+        assert_eq!(records[0].request.as_deref(), Some("req-for-abandoned-ref"));
+        assert!(
+            worker.shared.requests.lock().unwrap().is_empty(),
+            "a settled job releases its request id"
+        );
+    }
+
     /// QW-6: a start whose worktree identity cannot be committed because the store is busy names
     /// `store:busy`, not the identity step (`identity_commit`) it used to collapse into.
     #[tokio::test]
@@ -9462,6 +9597,7 @@ mod stop_retry_tests {
                         serde_json::json!({"activation_id":"same","environment":{"alpha":choice}}),
                         "stop-retry",
                         None,
+                        None,
                     )
                     .unwrap(),
             );
@@ -9494,6 +9630,7 @@ mod stop_retry_tests {
                 AssistanceTool::Context,
                 serde_json::json!({"path":"main.rs"}),
                 "stop-retry",
+                None,
                 None,
             )
             .map_err(|failure| failure.code)

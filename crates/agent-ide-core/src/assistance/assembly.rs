@@ -79,6 +79,16 @@ impl<T, E> OrCause<T> for Result<T, E> {
     }
 }
 
+/// Closed journal context a call's ingress establishes on its way through [`ProductDispatcher::
+/// handle_tagged`] (QW-4); every field stays empty for a call that never got that far.
+#[derive(Default)]
+struct CallFacts {
+    /// The validated host binding the call belongs to.
+    binding: Option<super::host_binding::BindingRef>,
+    /// The binding's activation role *before* the call ran (a stop removes it).
+    role: Option<errorlog::Role>,
+}
+
 /// The closed cause a guard refusal is reported with.
 fn binding_cause(reason: super::host_binding::BindingUnavailable) -> HostBindingCause {
     HostBindingCause::from_binding(reason).unwrap_or(HostBindingCause::InvalidMetadata)
@@ -549,7 +559,9 @@ impl ProductDispatcher {
         request: &AssistanceDispatch,
         status: &mut Option<String>,
     ) -> Option<PeerReply> {
-        self.handle_tagged(request, status, &mut None).await.ok()
+        self.handle_tagged(request, status, &mut None, &mut CallFacts::default())
+            .await
+            .ok()
     }
 
     /// Parses and commits one ingress request, additionally writing `tag` with the private actor
@@ -562,11 +574,15 @@ impl ProductDispatcher {
     /// poisoned daemon lock, a failed guard). `dispatch` answers `Err(cause)` as
     /// `unavailable: host_binding` carrying that closed cause, so no early exit is cause-less
     /// (QW-6). The cause is a closed enum value: nothing from the request is echoed back.
+    ///
+    /// `facts` is written, as far as the request got, with the closed journal context the ingress
+    /// established (QW-4): the validated binding and its activation role.
     async fn handle_tagged(
         &self,
         request: &AssistanceDispatch,
         status: &mut Option<String>,
         tag: &mut Option<String>,
+        facts: &mut CallFacts,
     ) -> Result<PeerReply, HostBindingCause> {
         match request {
             AssistanceDispatch::HookSubmit(hook) => {
@@ -1165,6 +1181,11 @@ impl ProductDispatcher {
                 // Only a read-only call answers a stopped generation: its reply stays plate-free
                 // and touches no worktree state, like `ide.stop`'s own.
                 let stopped = stopped(&invocation);
+                facts.binding = Some(invocation.binding_ref().clone());
+                facts.role = self
+                    .worker
+                    .as_ref()
+                    .and_then(|worker| worker.role_of(invocation.binding_ref()));
                 let Some(worker) = &self.worker else {
                     return Ok(if method.method() == AssistanceMethod::Stop {
                         PeerReply::HostStopped {}
@@ -1232,6 +1253,7 @@ impl ProductDispatcher {
                                 tool,
                                 call.parameters().clone(),
                                 &target_attachment,
+                                Some(method.request_id()),
                             )
                             .await
                     }
@@ -1354,8 +1376,9 @@ impl AssistanceDispatcher for ProductDispatcher {
             let started = std::time::Instant::now();
             let mut status = None;
             let mut tag = None;
+            let mut facts = CallFacts::default();
             let mut result = self
-                .handle_tagged(&request, &mut status, &mut tag)
+                .handle_tagged(&request, &mut status, &mut tag, &mut facts)
                 .await
                 .unwrap_or_else(|cause| PeerReply::Unavailable {
                     reason: MissingPeer::HostBinding,
@@ -1378,9 +1401,15 @@ impl AssistanceDispatcher for ProductDispatcher {
                     AssistanceMethod::HookSubmit => None,
                 };
                 if let Some(tool) = tool {
-                    let parameters = serde_json::from_str::<Value>(method.params_json().as_str())
-                        .ok()
+                    let envelope =
+                        serde_json::from_str::<Value>(method.params_json().as_str()).ok();
+                    let parameters = envelope
+                        .as_ref()
                         .and_then(|envelope| envelope.get("parameters").cloned());
+                    let host = envelope
+                        .as_ref()
+                        .and_then(|envelope| envelope.get("host_meta")?.as_object())
+                        .and_then(|meta| parse_host_kind(meta).ok());
                     let requested = parameters.as_ref().and_then(|parameters| {
                         parameters
                             .get("detail_ref")
@@ -1395,11 +1424,23 @@ impl AssistanceDispatcher for ProductDispatcher {
                     {
                         *detail = Some(super::facade::staged_detail(tool, code, parameters));
                     }
+                    // The role is read before the call ran; a start has none yet, so it reads the
+                    // role the activation just took.
+                    let role = facts.role.or_else(|| {
+                        let (worker, binding) = (self.worker.as_ref()?, facts.binding.as_ref()?);
+                        worker.role_of(binding)
+                    });
                     adapters::log_tool_reply(
                         tool,
                         &result,
                         started.elapsed(),
                         requested.as_deref(),
+                        &adapters::DispatchContext {
+                            host,
+                            role,
+                            request: Some(method.request_id()),
+                            parameters: parameters.as_ref(),
+                        },
                     );
                     if let Some(telemetry) = self.worker.as_ref().and_then(WorkerHandle::telemetry)
                     {
