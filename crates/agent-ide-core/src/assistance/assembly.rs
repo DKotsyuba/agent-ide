@@ -1609,6 +1609,33 @@ async fn ingress_exits_name_a_typed_cause() {
         cause_of(hook("bogus")).await,
         HostBindingCause::UnsupportedHookPhase
     );
+    // A daemon lock poisoned by an earlier fault: a valid Claude pre can no longer be recorded.
+    let poisoned = ProductDispatcher {
+        managed_claude: true,
+        shared_claude_channel: true,
+        ..ProductDispatcher::default()
+    };
+    let _ = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let _guard = poisoned.pre_attachments.lock().unwrap();
+                panic!("poison the pre-attachment map");
+            })
+            .join()
+    });
+    let reply = match poisoned.dispatch(hook("pre")).await.unwrap() {
+        AssistanceDispatchReply::HookSubmit(reply)
+        | AssistanceDispatchReply::MethodDispatch(reply) => {
+            PeerReply::decode(reply.as_str()).unwrap()
+        }
+    };
+    assert_eq!(
+        reply,
+        PeerReply::Unavailable {
+            reason: MissingPeer::HostBinding,
+            cause: Some(HostBindingCause::InternalLock),
+        }
+    );
     // Valid envelope, but parameters the daemon's validator rejects: invalid parameters.
     assert_eq!(
         cause_of(method(

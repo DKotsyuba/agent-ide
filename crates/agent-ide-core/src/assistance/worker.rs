@@ -8852,6 +8852,12 @@ mod stop_retry_tests {
                 (FailureCode::Capacity, "store:store_full"),
             ),
             (
+                StoreError::OutcomeUnknown {
+                    operation: crate::app::store::OperationId::new("op-1").unwrap(),
+                },
+                (FailureCode::Deadline, "store:store_deadline"),
+            ),
+            (
                 StoreError::Infrastructure("disk I/O error".to_owned()),
                 (FailureCode::SourceUnavailable, "store:unavailable"),
             ),
@@ -8911,6 +8917,29 @@ mod stop_retry_tests {
             (FailureCode::WorkspaceAuthority, "inspect:authority_stale")
         );
         assert_eq!(released.get(), 2);
+    }
+
+    /// QW-6: a start whose worktree identity cannot be committed because the store is busy names
+    /// `store:busy`, not the identity step (`identity_commit`) it used to collapse into.
+    #[tokio::test]
+    async fn busy_store_names_its_cause_when_a_worktree_is_resolved() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let worker = worker(&store, workspace, fixture.root.clone());
+        let lock = rusqlite::Connection::open(fixture.base.join("state.sqlite")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let discovered = (
+            fixture.root.clone(),
+            fixture.root.clone(),
+            std::path::PathBuf::from(".git"),
+        );
+        let (detail, holder) = worker
+            .resolve_worktree_named(&discovered)
+            .await
+            .expect_err("a busy store cannot commit the identity");
+        assert_eq!(detail, "start:worktree_unresolved:store:busy");
+        assert!(holder.is_none());
     }
 
     /// QW-6: a read whose observation cannot be recorded because the store is busy fails with
