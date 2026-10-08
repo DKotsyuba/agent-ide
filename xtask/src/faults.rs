@@ -133,9 +133,14 @@ pub fn parse(args: &[String]) -> Result<Options> {
         };
         match flag.as_str() {
             "--root" => options.root = Some(PathBuf::from(value()?)),
-            "--since" => options.since = Some(value()?.clone()),
-            "--until" => options.until = Some(value()?.clone()),
-            "--days" => options.days = value()?.parse()?,
+            "--since" => options.since = Some(checked_day(value()?)?),
+            "--until" => options.until = Some(checked_until(value()?)?),
+            "--days" => {
+                options.days = value()?.parse()?;
+                if options.days == 0 {
+                    return Err(format!("--days must be at least 1; usage: {USAGE}").into());
+                }
+            }
             "--scope" => {
                 options.scope = match value()?.as_str() {
                     "all" => Scope::All,
@@ -144,9 +149,9 @@ pub fn parse(args: &[String]) -> Result<Options> {
                     other => return Err(format!("unknown scope {other}; usage: {USAGE}").into()),
                 }
             }
-            "--alert-threshold" => options.alert_threshold = Some(value()?.parse()?),
+            "--alert-threshold" => options.alert_threshold = Some(percentage(value()?)?),
             "--min-calls" => options.min_calls = value()?.parse()?,
-            "--unexplained-threshold" => options.unexplained_threshold = value()?.parse()?,
+            "--unexplained-threshold" => options.unexplained_threshold = percentage(value()?)?,
             other => return Err(format!("unknown argument {other}; usage: {USAGE}").into()),
         }
     }
@@ -162,6 +167,11 @@ pub fn run(options: &Options) -> Result<()> {
         .since
         .clone()
         .unwrap_or_else(|| day_before(&until, options.days));
+    if since.get(..10).unwrap_or("") > until.get(..10).unwrap_or("") {
+        return Err(
+            format!("the window is empty: --since {since} is after --until {until}").into(),
+        );
+    }
     let report = Report::build(&root, &since, &until, options.scope)?;
     print!("{}", report.render(&root, &since, &until, options.scope));
     for warning in report.warnings(options) {
@@ -178,15 +188,86 @@ pub fn run(options: &Options) -> Result<()> {
     }
 }
 
-/// `AGENT_IDE_LOG_ROOT`, else `$HOME/.agent-ide/logs`.
+/// The journal root when `--root` is absent: `AGENT_IDE_LOG_ROOT`, else
+/// `$AGENT_IDE_HOME/.agent-ide/logs` (the product's own absolute per-user override), else
+/// `$HOME/.agent-ide/logs`. A host that substitutes `HOME` (an agent runner) must pass `--root`;
+/// the chosen root is the first line of the report.
 fn default_root() -> PathBuf {
+    let home = std::env::var_os("AGENT_IDE_HOME")
+        .filter(|home| Path::new(home).is_absolute())
+        .or_else(|| std::env::var_os("HOME"))
+        .unwrap_or_default();
     std::env::var_os("AGENT_IDE_LOG_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-                .join(".agent-ide")
-                .join("logs")
-        })
+        .unwrap_or_else(|| PathBuf::from(home).join(".agent-ide").join("logs"))
+}
+
+/// A real calendar day `YYYY-MM-DD` (a leap day only in a leap year), or an error.
+fn checked_day(text: &str) -> Result<String> {
+    let parse =
+        |range: std::ops::Range<usize>| text.get(range).and_then(|part| part.parse::<i64>().ok());
+    let shape = text.len() == 10
+        && text.as_bytes()[4] == b'-'
+        && text.as_bytes()[7] == b'-'
+        && text
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit());
+    let valid = shape
+        && matches!(
+            (parse(0..4), parse(5..7), parse(8..10)),
+            (Some(year), Some(month @ 1..=12), Some(day @ 1..=31))
+                if civil_from_days(days_from_civil(year, month as u32, day as u32))
+                    == (year, month as u32, day as u32)
+        );
+    if valid {
+        Ok(text.to_owned())
+    } else {
+        Err(format!("{text:?} is not a calendar day YYYY-MM-DD; usage: {USAGE}").into())
+    }
+}
+
+/// A calendar day, or a UTC instant `YYYY-MM-DDTHH:MM:SSZ` on a real calendar day, or an error.
+fn checked_until(text: &str) -> Result<String> {
+    if text.len() == 10 {
+        return checked_day(text);
+    }
+    let clock = text.get(10..).unwrap_or("");
+    let digits = |range: std::ops::Range<usize>| {
+        clock
+            .get(range)
+            .filter(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|part| part.parse::<u32>().ok())
+    };
+    let valid = text.len() == 20
+        && clock.len() == 10
+        && clock.as_bytes()[0] == b'T'
+        && clock.as_bytes()[3] == b':'
+        && clock.as_bytes()[6] == b':'
+        && clock.ends_with('Z')
+        && matches!(
+            (digits(1..3), digits(4..6), digits(7..9)),
+            (Some(0..=23), Some(0..=59), Some(0..=59))
+        )
+        && text.get(..10).is_some_and(|day| checked_day(day).is_ok());
+    if valid {
+        Ok(text.to_owned())
+    } else {
+        Err(
+            format!("{text:?} is not a day or a UTC instant YYYY-MM-DDTHH:MM:SSZ; usage: {USAGE}")
+                .into(),
+        )
+    }
+}
+
+/// A finite percentage in `0..=100`, or an error (a NaN would silently disable its alert).
+fn percentage(text: &str) -> Result<f64> {
+    let value: f64 = text.parse()?;
+    if value.is_finite() && (0.0..=100.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("{text:?} is not a percentage between 0 and 100; usage: {USAGE}").into())
+    }
 }
 
 /// One counted terminal call with the facts the tables need.
@@ -217,6 +298,8 @@ pub struct Report {
     lifecycle: Lifecycle,
     /// Number of journal keys counted.
     keys: usize,
+    /// Journal lines that were not valid JSON and were skipped (disclosed in the report).
+    malformed: usize,
 }
 
 /// What became of the calls that answered `pending`.
@@ -256,21 +339,30 @@ impl Report {
             settlement: Settlement::default(),
             lifecycle: Lifecycle::default(),
             keys: 0,
+            malformed: 0,
         };
         let journals = journal_files(root)?;
         if journals.is_empty() {
             return Err(format!("no journals found under {}", root.display()).into());
         }
         for (key, files) in journals {
-            let records: Vec<Value> = files
-                .iter()
-                .filter_map(|path| fs::read_to_string(path).ok())
-                .flat_map(|text| {
-                    text.lines()
-                        .filter_map(|line| serde_json::from_str(line).ok())
-                        .collect::<Vec<Value>>()
-                })
-                .collect();
+            let mut records: Vec<Value> = Vec::new();
+            for path in &files {
+                // An unreadable journal is an error, not an empty one; invalid UTF-8 is replaced
+                // (the reference classifier does the same) and a line that is not JSON is skipped
+                // and counted, so a damaged input is disclosed instead of looking healthy.
+                let bytes =
+                    fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+                for line in String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                {
+                    match serde_json::from_str(line) {
+                        Ok(record) => records.push(record),
+                        Err(_) => report.malformed += 1,
+                    }
+                }
+            }
             let test_key = is_test_key(&records);
             match scope {
                 Scope::Field if test_key => continue,
@@ -318,7 +410,7 @@ impl Report {
                     let (class, kind) = match outcome {
                         "completed" => (String::new(), Kind::Ok),
                         "degraded" => (String::new(), Kind::Degraded),
-                        _ => classify(text(record, "reason"), text(record, "detail")),
+                        _ => classify_dispatch(record),
                     };
                     self.push(key, record, day, class, kind);
                 }
@@ -532,9 +624,17 @@ impl Report {
         let _ = writeln!(
             out,
             "window {since}..{until}, scope {scope:?}: {total} terminal tool calls \
-             (+{pending} pending replies, excluded) in {} journal keys\n",
+             (+{pending} pending replies, excluded) in {} journal keys",
             self.keys
         );
+        if self.malformed > 0 {
+            let _ = writeln!(
+                out,
+                "WARNING: {} journal lines were not valid JSON and were skipped; the counts are a lower bound",
+                self.malformed
+            );
+        }
+        out.push('\n');
         let days: Vec<&str> = self
             .calls
             .iter()
@@ -910,6 +1010,31 @@ fn classify_front(detail: &str) -> (String, Kind) {
             Kind::Fault,
         ),
     }
+}
+
+/// The class and kind of one failed dispatch line. A line of the older format (no `version`) is
+/// classified by the published rules alone. A current-format line additionally honors its
+/// `eligible` flag (a request refused as input is the caller's, whatever reason the refusal
+/// carried) and never lets a reason the rules do not know leave the conservative numerator: it is
+/// `unexplained`, not `unclassified`.
+fn classify_dispatch(record: &Value) -> (String, Kind) {
+    let (class, kind) = classify(text(record, "reason"), text(record, "detail"));
+    if record.get("version").is_none() {
+        return (class, kind);
+    }
+    if record.get("eligible").and_then(Value::as_bool) == Some(false) {
+        return (
+            "caller: request refused as input (not eligible)".to_owned(),
+            Kind::Caller,
+        );
+    }
+    if kind == Kind::Unclassified {
+        return (
+            class.replacen("unclassified:", "unexplained (new reason):", 1),
+            Kind::Unexplained,
+        );
+    }
+    (class, kind)
 }
 
 /// Puts one failed dispatch line in exactly one class by its `reason` and `detail`; the first
@@ -1506,6 +1631,87 @@ mod tests {
         assert_eq!(civil_from_days(days_from_civil(2026, 10, 7)), (2026, 10, 7));
         assert!(parse(&["--scope".into(), "nope".into()]).is_err());
         assert!(parse(&["--bogus".into()]).is_err());
+    }
+
+    /// Arguments are validated: a NaN, infinite or out-of-range percentage would silently disable
+    /// an alert, and an impossible date or an empty window would silently report nothing.
+    #[test]
+    fn invalid_arguments_are_refused() {
+        let args = |flag: &str, value: &str| parse(&[flag.to_owned(), value.to_owned()]);
+        for bad in ["NaN", "inf", "-1", "100.5", "abc", ""] {
+            assert!(args("--alert-threshold", bad).is_err(), "{bad}");
+            assert!(args("--unexplained-threshold", bad).is_err(), "{bad}");
+        }
+        assert!(args("--alert-threshold", "2.5").is_ok());
+        for bad in [
+            "2026-13-01",
+            "2026-02-30",
+            "2025-02-29",
+            "26-10-01",
+            "2026/10/01",
+            "x",
+        ] {
+            assert!(args("--since", bad).is_err(), "{bad}");
+        }
+        assert!(args("--since", "2024-02-29").is_ok());
+        for bad in [
+            "2026-10-01T25:00:00Z",
+            "2026-10-01T10:61:00Z",
+            "2026-10-01 10:00:00Z",
+            "2026-10-01T10:00:00",
+        ] {
+            assert!(args("--until", bad).is_err(), "{bad}");
+        }
+        assert!(args("--until", "2026-10-07T19:30:00Z").is_ok());
+        assert!(args("--days", "0").is_err());
+        assert!(args("--min-calls", "x").is_err());
+    }
+
+    /// A current-format failure honors its `eligible` flag and an unknown reason stays in the
+    /// conservative numerator; the older format keeps the published rules (unknown stays
+    /// unclassified); a damaged journal line is counted and disclosed, an unreadable one fails.
+    #[test]
+    fn current_format_lines_honor_eligibility_and_unknown_reasons_and_damage_is_disclosed() {
+        let lines = [
+            // Old format, unknown reason: unclassified (published rules).
+            dispatch("2026-10-01T10:00:00Z", "read", "failed", "brand_new", ""),
+            // Current format, unknown reason: unexplained.
+            r#"{"ts":"2026-10-01T10:00:01Z","method":"read","outcome":"failed","reason":"restarting","version":"1","eligible":true,"duration_ms":2}"#.to_owned(),
+            // Current format, refused as input, whatever reason it carries: the caller's.
+            r#"{"ts":"2026-10-01T10:00:02Z","method":"read","outcome":"unavailable","detail":"internal_lock","version":"1","eligible":false,"duration_ms":2}"#.to_owned(),
+            "this is not json".to_owned(),
+            "{\"truncated\":".to_owned(),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let dir = journal("current", "00000000000000a1", &refs);
+        let report = Report::build(&dir, "2026-10-01", "2026-10-01", Scope::All).unwrap();
+        let counts = report.tally(|_| true);
+        assert_eq!(
+            (
+                counts[&Kind::Unclassified],
+                counts[&Kind::Unexplained],
+                counts[&Kind::Caller]
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(report.malformed, 2);
+        assert!(
+            report
+                .render(&dir, "2026-10-01", "2026-10-01", Scope::All)
+                .contains("2 journal lines were not valid JSON")
+        );
+        // An unreadable journal is an error, not an empty report.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let path = dir.join("00000000000000a1.jsonl");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+            if fs::read(&path).is_err() {
+                assert!(Report::build(&dir, "2026-10-01", "2026-10-01", Scope::All).is_err());
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The frozen section (b) journals (when present) reproduce the published numbers: 16,379

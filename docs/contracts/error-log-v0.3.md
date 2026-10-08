@@ -165,8 +165,13 @@ Typed causes: no ingress exit of the dispatcher answers a bare `unavailable: hos
 field|test|all] [--alert-threshold PERCENT] [--min-calls N] [--unexplained-threshold PERCENT]`
 replaces the `errstats.py` counter with the stability plan's section (b) taxonomy. It reads
 `<root>/<key>/events.jsonl` (+ `.1`) or flat `<key>.jsonl` copies (`--root`, else
-`AGENT_IDE_LOG_ROOT`, else `~/.agent-ide/logs`), for the last `--days` (default 7) or an explicit
-window. The unit is the terminal dispatch line of a tool call; `pending` replies are excluded; an
+`AGENT_IDE_LOG_ROOT`, else `$AGENT_IDE_HOME/.agent-ide/logs`, else `$HOME/.agent-ide/logs`; a host
+that substitutes `HOME` passes `--root`), for the last `--days` (default 7) or an explicit window
+(`--since`/`--until` are validated calendar days or UTC instants, percentages must be finite and in
+`0..=100`). An unreadable journal fails the command, and journal lines that are not JSON are skipped
+but counted and disclosed in the header, so a damaged input never looks healthy. A failure line of
+the current format honors its `eligible` flag (refused as input is the caller's) and a reason the
+rules do not know is `unexplained`, never dropped from the fault numerator. The unit is the terminal dispatch line of a tool call; `pending` replies are excluded; an
 uncollected pending job's completion record (or current-format failure line) and a front line no
 daemon line shares a call id with each count once. Every failed call is one class of four kinds:
 `fault` (known mechanism), `unexplained` (not attributable, counted with faults), `caller`
