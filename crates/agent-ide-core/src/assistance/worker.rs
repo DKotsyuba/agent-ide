@@ -3365,7 +3365,12 @@ impl<'a> Worker<'a> {
             self.workspace
                 .set_environment(authority.worktree(), choices)
                 .await
-                .map_err(|_| FailureCode::Internal)?;
+                .map_err(|error| match &error {
+                    crate::workspace::durable::DurableError::Application(error) => {
+                        self.note_store_failure(error, FailureCode::Internal)
+                    }
+                    _ => FailureCode::Internal,
+                })?;
         }
         self.shared
             .refresh_environments(authority.worktree().worktree_path());
@@ -5139,6 +5144,31 @@ struct InspectFailure {
     stage: String,
 }
 
+/// Maps a failed re-authorization of a retained inspection result to its failure (QW-6).
+///
+/// A store failure keeps its typed [`store_failure`] code and `store:` stage instead of reporting
+/// the result stale; a busy or timed-out store (`capacity` / `deadline`) leaves the retained
+/// evidence in place so the caller can repeat the inspection, while any other failure releases it
+/// through `invalidate` exactly as a genuinely stale authority does (`inspect:authority_stale`).
+fn reauthorize_failure(
+    error: &crate::workspace::durable::DurableError,
+    invalidate: &dyn Fn(FailureCode) -> FailureCode,
+) -> InspectFailure {
+    if let crate::workspace::durable::DurableError::Application(error) = error {
+        let (code, cause) = store_failure(error, FailureCode::WorkspaceAuthority);
+        let code = if matches!(code, FailureCode::Capacity | FailureCode::Deadline) {
+            code
+        } else {
+            invalidate(code)
+        };
+        return InspectFailure::stage(code, cause);
+    }
+    InspectFailure::stage(
+        invalidate(FailureCode::WorkspaceAuthority),
+        "inspect:authority_stale",
+    )
+}
+
 impl From<FailureCode> for InspectFailure {
     /// Keeps the closed code and derives its default stage when an ingress check has no finer cause.
     fn from(code: FailureCode) -> Self {
@@ -5292,12 +5322,10 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             code
         };
         if let Some(authority) = &authority {
-            workspace.authorize(authority, &active).await.map_err(|_| {
-                InspectFailure::stage(
-                    invalidate(FailureCode::WorkspaceAuthority),
-                    "inspect:authority_stale",
-                )
-            })?;
+            workspace
+                .authorize(authority, &active)
+                .await
+                .map_err(|error| reauthorize_failure(&error, &invalidate))?;
             // Cached disclosure adds the conservative lstat preflight: a symlink component below
             // the worktree root refuses disclosure of cached bytes. The real guard for later reads
             // stays the descriptor-relative `O_NOFOLLOW` reader; a preflight can never secure a
@@ -5336,12 +5364,10 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             .active(&request.binding)
             .map_err(InspectFailure::new)?;
         if let Some(authority) = &authority {
-            workspace.authorize(authority, &active).await.map_err(|_| {
-                InspectFailure::stage(
-                    invalidate(FailureCode::WorkspaceAuthority),
-                    "inspect:authority_stale",
-                )
-            })?;
+            workspace
+                .authorize(authority, &active)
+                .await
+                .map_err(|error| reauthorize_failure(&error, &invalidate))?;
         }
         shared
             .active(&request.binding)
@@ -8841,6 +8867,50 @@ mod stop_retry_tests {
                 "{error:?}"
             );
         }
+    }
+
+    /// QW-6: re-authorizing a retained inspection result reports a store problem with its typed
+    /// stage (keeping the evidence of a transient one), and only a real authority refusal as
+    /// stale.
+    #[test]
+    fn inspection_reauthorization_separates_store_failures_from_stale_authority() {
+        use crate::app::store::StoreError;
+        use crate::workspace::authority::AuthorityError;
+        use crate::workspace::durable::DurableError;
+        use std::cell::Cell;
+        let released = Cell::new(0);
+        let invalidate = |code: FailureCode| {
+            released.set(released.get() + 1);
+            code
+        };
+        let busy = reauthorize_failure(&DurableError::Application(StoreError::Busy), &invalidate);
+        assert_eq!(
+            (busy.code, busy.stage.as_str()),
+            (FailureCode::Capacity, "store:busy")
+        );
+        assert_eq!(
+            released.get(),
+            0,
+            "a transient store failure keeps the evidence"
+        );
+        let gone = reauthorize_failure(
+            &DurableError::Application(StoreError::Unavailable),
+            &invalidate,
+        );
+        assert_eq!(
+            (gone.code, gone.stage.as_str()),
+            (FailureCode::WorkspaceAuthority, "store:unavailable")
+        );
+        assert_eq!(released.get(), 1);
+        let stale = reauthorize_failure(
+            &DurableError::Authority(AuthorityError::StaleAuthority),
+            &invalidate,
+        );
+        assert_eq!(
+            (stale.code, stale.stage.as_str()),
+            (FailureCode::WorkspaceAuthority, "inspect:authority_stale")
+        );
+        assert_eq!(released.get(), 2);
     }
 
     /// QW-6: a read whose observation cannot be recorded because the store is busy fails with
