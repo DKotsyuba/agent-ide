@@ -1,10 +1,12 @@
 //! Development automation for Agent IDE: one gate (`check`), the declarative
 //! family standard checks (`standard check`), the exported tool-contract
-//! snapshot (`contract check|update`) and the release flow (`package`,
+//! snapshot (`contract check|update`), the daily fault report (`fault-report`, see
+//! `faults.rs`) and the release flow (`package`,
 //! `package verify`, `release prepare|manifest|publish|wait`, see `release.rs`).
 //! Std and `serde_json` only — no runtime interpreter; the only remote writes
 //! are `release publish` inside the release workflow.
 #![allow(clippy::print_stdout, reason = "Developer CLI, not MCP")]
+mod faults;
 mod release;
 
 use std::{
@@ -462,6 +464,7 @@ fn contract(root: &Path, update: bool) -> Result<()> {
 
 fn usage() -> &'static str {
     "usage: cargo xtask check | standard check | contract check|update
+       | fault-report [--root DIR] [--since DAY] [--until DAY|RFC3339] [--days N] [--scope field|test|all] [--alert-threshold PERCENT] [--min-calls N]
        | package BINARY TAG [OUTPUT_DIR] | package verify ARCHIVE
        | release prepare VERSION [--apply] | release manifest DIR | release publish DIR
        | release wait --repo OWNER/NAME --tag vX.Y.Z --commit SHA [--run-id N] [--timeout S] [--result-file PATH]"
@@ -475,6 +478,7 @@ fn main_result() -> Result<()> {
         [task, sub] if task == "standard" && sub == "check" => standard(&root),
         [task, sub] if task == "contract" && sub == "check" => contract(&root, false),
         [task, sub] if task == "contract" && sub == "update" => contract(&root, true),
+        [task, rest @ ..] if task == "fault-report" => faults::run(&faults::parse(rest)?),
         [task, sub, asset] if task == "package" && sub == "verify" => {
             release::verify(Path::new(asset))
         }

@@ -1,6 +1,6 @@
 # Error log v0.3 contract
 
-Revision: ERRORLOG-r2. Provider: `errorlog`. Direct consumers: Assistance, Checks, Application, the
+Revision: ERRORLOG-r3. Provider: `errorlog`. Direct consumers: Assistance, Checks, Application, the
 `errors` CLI reader. Vocabulary: [common](common.md).
 
 ## Purpose and relationship to telemetry
@@ -99,6 +99,104 @@ are ever recorded — never paths or OS error strings. The same closed cause app
 agent-facing `execution_profile` refusal text. An activation whose root, discovered worktree
 root or Git common directory is not below a configured allowed root is refused with reason
 `outside_allowed_roots`; the log never names the path.
+
+## r3: complete journal (stability W1-C)
+
+Revision ERRORLOG-r3 adds closed fields and records so every fault can be attributed and the daily
+fault report (`cargo xtask fault-report`, below) can count every call once. Older lines stay valid:
+every new field is optional on read.
+
+Fields (all closed values or opaque ids; never source text, a path, a model-chosen name or a
+request value):
+
+- `version` — the serving product version (`CARGO_PKG_VERSION`), on every dispatch, front and
+  daemon-failure line. Its presence marks a line of the current format.
+- `role` — `reader`, `writer`, or `none` (the call has no activation). Read before the call ran, so
+  a stop keeps its role.
+- `language` — the registered language id of the file the request names (by extension alone),
+  `unknown` for a file no registered language owns, `none` when the request names no file.
+- `form` — the request form: the names of the parameters the tool defines that the call carries,
+  in the tool's order, joined by `+` (`path+lines`, `symbol`, `kind`); `none` for a request with no
+  defined parameter. A model-chosen parameter name is never written.
+- `request` — the host call id (`toolUseId` / `callId`), unique per call, shared by the front's
+  line, the daemon's dispatch line and the line of the job the call queued. (The JSON-RPC id
+  restarts per MCP front and is not used.)
+- `origin` — on an inspection's line, the `request` of the call that queued the inspected result,
+  beside the inspection's own `request`; `correlation` stays the result's `detail_ref`.
+- `delivered` — on the line of a call that retrieves a retained result by `detail_ref`: `true`
+  when the inspection path itself delivered that result to the caller (a cached failed result is
+  delivered too), `false` for a refused retrieval (stale authority, expired or unknown reference, a
+  host-binding refusal). The report's notion of "collected" is this typed evidence, never failure
+  prose or the method spelling.
+- `probe` — `whois` on the line of the front's private actor query, which is the product's own
+  probe and not an agent's call; the report excludes it from its counts.
+- `eligible` — `true` when the request validated, `false` when it was refused as input.
+- `host` — `claude`, `codex` or `unknown`.
+
+Every dispatch line (`log_tool_reply`) and every front line carries `version`, `host`, `role`,
+`language`, `form`, `request` and `eligible`; a value the call could not name is the explicit
+`unknown` / `none`, never an absent field.
+
+New records:
+
+- **Degraded success** — outcome `degraded` (a `warn`): the call succeeded through a weaker path,
+  either the lexical context or outline fallback (the worker marks the call, the reply text is
+  never scanned) or an edit whose post-edit diagnostics are `unknown`.
+- **Completion record** — a job that finishes after its caller was told `pending` writes one line
+  with `detail` `pending_completion`, its `correlation` (the result reference), the job's `request`
+  and its own classified outcome and reason (a refused or unknown edit is not a success). A failed
+  job keeps its existing job-failure line, which now carries `request` too.
+- **Front transport outcome** — a call whose front outcome carries no typed reply (invalid input,
+  missing host metadata, transport unavailable, timed out, busy, outcome unknown, not
+  re-established, incomplete, refused as restarting by a failed daemon) writes one line with
+  `detail` `front:<kind>` and the call's `request`, because the daemon never saw it or could not
+  answer.
+- **Refused hook** — a hook the daemon refuses on a channel that already holds a binding writes
+  one per-call `hook` warn, `detail` `hook_refused:<cause>`, `correlation` the call id, from the
+  one place every refusal exit passes through; on a channel that never bound anything it stays
+  rate-limited bookkeeping. The `claude-hook` process writes one per-call warn
+  `hook_submit_timeout` when its submission outlived its own 250 ms budget (a lost pre; the call it
+  belongs to is then refused `missing_pre`), and one per-call warn
+  `hook_cwd_rerouted:<reason>` when a pre paired only through `CLAUDE_PROJECT_DIR` because the
+  payload cwd found no rendezvous of the session (QW-8), and `hook_project_dir_invalid` when a
+  present `CLAUDE_PROJECT_DIR` cannot be resolved (the pre is then dropped locally).
+- **Daemon failure** — `daemon failed` carries `detail` `<stage>:<class>` (stage `initialize`,
+  `serving` or `shutdown`; class an application error name or `io:<ErrorKind>`).
+
+Typed causes: no ingress exit of the dispatcher answers a bare `unavailable: host_binding`
+(`invalid_metadata`, `missing_field`, `invalid_parameters`, `unsupported_hook_phase`, `mismatch`,
+`invalid_attachment`, `internal_lock`, `worker_unavailable`), and a store failure outside stop is
+`capacity (store:busy | store:store_full)`, `deadline (store:store_deadline)` or the sole fallback
+`store:unavailable`, on reads, activation, inspection re-authorization and environment choices.
+
+## Daily fault report
+
+`cargo xtask fault-report [--root DIR] [--since DAY] [--until DAY|RFC3339] [--days N] [--scope
+field|test|all] [--alert-threshold PERCENT] [--min-calls N] [--unexplained-threshold PERCENT]`
+replaces the `errstats.py` counter with the stability plan's section (b) taxonomy. It reads
+`<root>/<key>/events.jsonl` (+ `.1`) or flat `<key>.jsonl` copies (`--root`, else
+`AGENT_IDE_LOG_ROOT`, else `$AGENT_IDE_HOME/.agent-ide/logs`, else `$HOME/.agent-ide/logs`; a host
+that substitutes `HOME` passes `--root`), for the last `--days` (default 7) or an explicit window
+(`--since`/`--until` are validated calendar days or UTC instants, percentages must be finite and in
+`0..=100`). An unreadable journal fails the command, and journal lines that are not JSON are skipped
+but counted and disclosed in the header, so a damaged input never looks healthy. A failure line of
+the current format honors its `eligible` flag (refused as input is the caller's) and a reason the
+rules do not know is `unexplained`, never dropped from the fault numerator. The unit is the terminal dispatch line of a tool call; `pending` replies are excluded; an
+uncollected pending job's completion record (or current-format failure line) and a front line no
+daemon line shares a call id with each count once. Every failed call is one class of four kinds:
+`fault` (known mechanism), `unexplained` (not attributable, counted with faults), `caller`
+(wrong request) and `honest` (correct refusal of real state). It prints per-day and per-class
+tables (known versus unexplained), splits by method and repository, the longest outage streak,
+pending settlement, daemon starts, failures and panics, and hook warns. `--scope field` (default)
+excludes keys whose every worktree is a gate, matrix or acceptance clone.
+
+Alerts (exit status 1): the IDE-fault rate above `--alert-threshold` with at least `--min-calls`
+(default 300) calls, and any journaled panic. Warnings (printed, exit 0): unexplained faults above
+`--unexplained-threshold` (default 0.1%, an instrumentation backlog that stays in the numerator)
+and a fault class that doubled day over day with at least ten events. On the frozen section (b)
+input (`target/stability/journals`, window 2026-09-28 .. 2026-10-07T19:30:00Z, scope field) it
+reproduces 16,379 terminal calls, 692 IDE faults (500 known + 192 unexplained, 4.22%), 491 caller
+mistakes, 163 honest refusals and 727 pending replies.
 
 ## Failure semantics
 

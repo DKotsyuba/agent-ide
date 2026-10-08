@@ -555,6 +555,16 @@ struct Inspection {
     expected: Option<(AssistanceTool, [u8; 32])>,
     /// Finite IPC caller waiting for the current authorized result.
     reply: oneshot::Sender<PeerReply>,
+    /// Set by the inspection when it hands a retained terminal result to this caller (QW-4); the
+    /// flag of the invocation that asked for it through [`WorkerHandle::with_delivery`], so it is
+    /// never shared with another inspection.
+    delivery: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+tokio::task_local! {
+    /// The delivery flag of the dispatch currently awaiting an inspection (see
+    /// [`WorkerHandle::with_delivery`]).
+    static DELIVERY: Arc<std::sync::atomic::AtomicBool>;
 }
 
 /// Cloneable state shared by ingress and the single worker task, never by independent worker loops.
@@ -606,14 +616,95 @@ struct Shared {
     /// Binding fingerprints whose channel currently holds an activation, so the hook ingress can
     /// stay silent for a channel that never started (or already stopped) instead of emitting
     /// native hints nothing can consume.
-    activated: Mutex<BTreeSet<[u8; 32]>>,
+    /// Each entry also records the role the channel activated with (journal context only).
+    activated: Mutex<BTreeMap<[u8; 32], crate::errorlog::Role>>,
+    /// Call id of the call that queued each job, by result reference, so the job's own journal
+    /// lines and every later inspection of its result carry the id of the call that started it
+    /// (QW-4). Bounded by [`MAX_JOB_REQUESTS`]; the oldest entries are forgotten first.
+    requests: Mutex<RequestIds>,
+    /// Call ids whose successful answer was built through a weaker path (the lexical context or
+    /// outline fallback), set by the job and taken by whoever journals the call's terminal line
+    /// (QW-4). Bounded by [`MAX_JOB_REQUESTS`].
+    degraded: Mutex<BTreeSet<String>>,
+    /// Result references whose answer was built through a weaker path, retained (not consumed) so
+    /// every successful inspection of that result is journaled as degraded too (QW-4). Bounded
+    /// like [`Shared::requests`].
+    degraded_references: Mutex<RequestIds>,
     /// Set, once and for good, when the daemon's own execution machinery failed: a job panicked
     /// (caught), or the worker loop or the inspection task ended outside shutdown. State the
     /// unwind abandoned is never trusted again, so the application layer reads this flag, answers
     /// `restarting`, and exits keeping the runtime store; see [`Shared::mark_failed`].
     failed: tokio::sync::watch::Sender<bool>,
 }
+
+/// Most queued-job call ids [`Shared::requests`] and [`Shared::degraded`] keep; past it the oldest
+/// request is forgotten and a degraded mark is simply not recorded.
+const MAX_JOB_REQUESTS: usize = 4096;
+
+/// Bounded first-in-first-out memory of which call queued which result reference.
+#[derive(Default)]
+struct RequestIds {
+    /// Call id by result reference.
+    by_reference: BTreeMap<String, String>,
+    /// References in insertion order, oldest first.
+    order: std::collections::VecDeque<String>,
+}
+
+impl RequestIds {
+    /// Remembers `request` for `reference`, forgetting the oldest entry past the bound.
+    fn insert(&mut self, reference: String, request: String) {
+        while self.order.len() >= MAX_JOB_REQUESTS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_reference.remove(&oldest);
+            }
+        }
+        if self
+            .by_reference
+            .insert(reference.clone(), request)
+            .is_none()
+        {
+            self.order.push_back(reference);
+        }
+    }
+}
 impl Shared {
+    /// The call id of the call that queued the job behind `reference`, while it is remembered.
+    fn request_of(&self, reference: &str) -> Option<String> {
+        self.requests
+            .lock()
+            .ok()
+            .and_then(|requests| requests.by_reference.get(reference).cloned())
+    }
+
+    /// Marks the call that queued the job behind `reference` as answered through a weaker path
+    /// (QW-4); a job nobody can attribute to a call (no id remembered) marks nothing.
+    fn mark_degraded(&self, reference: &str) {
+        if let Ok(mut references) = self.degraded_references.lock() {
+            references.insert(reference.to_owned(), String::new());
+        }
+        if let Some(request) = self.request_of(reference)
+            && let Ok(mut degraded) = self.degraded.lock()
+            && degraded.len() < MAX_JOB_REQUESTS
+        {
+            degraded.insert(request);
+        }
+    }
+
+    /// Whether the answer retained under `reference` was built through a weaker path; unlike
+    /// [`Self::take_degraded`] it is not consumed, so every inspection of the result agrees.
+    fn reference_degraded(&self, reference: &str) -> bool {
+        self.degraded_references
+            .lock()
+            .is_ok_and(|references| references.by_reference.contains_key(reference))
+    }
+
+    /// Takes the degraded mark of the call `request`: `true` once per marked call.
+    fn take_degraded(&self, request: &str) -> bool {
+        self.degraded
+            .lock()
+            .is_ok_and(|mut degraded| degraded.remove(request))
+    }
+
     /// Marks the daemon failed: from now on it reports itself unhealthy and is replaced.
     ///
     /// Idempotent; only the first call writes the daemon journal line (`fatal`, reason
@@ -1150,8 +1241,11 @@ impl WorkerHandle {
                 test_runs: TestRuns::default(),
                 git_notices: Mutex::new(BTreeMap::new()),
                 environments: Mutex::default(),
-                activated: Mutex::new(BTreeSet::new()),
+                activated: Mutex::new(BTreeMap::new()),
                 failed: tokio::sync::watch::Sender::new(false),
+                requests: Mutex::default(),
+                degraded: Mutex::default(),
+                degraded_references: Mutex::default(),
             }),
             inspect,
             receiver: Mutex::new(Some(receiver)),
@@ -1281,6 +1375,7 @@ impl WorkerHandle {
             parameters,
             attachment,
             Some(send),
+            None,
         ) {
             return PeerReply::Error {
                 detail: (code.code == FailureCode::Capacity).then_some(code.stage),
@@ -1420,6 +1515,7 @@ impl WorkerHandle {
                     leases: BTreeMap::new(),
                     pending_revocations: std::collections::BTreeSet::new(),
                     stop_cause: None,
+                    store_cause: std::sync::Mutex::new(None),
                     stop_attempts: Arc::default(),
                     revoke_retry_rounds: 0,
                     next_revoke_retry: None,
@@ -1510,12 +1606,16 @@ impl WorkerHandle {
     /// later completion with `ide.inspect`. The initial inspection permit is reserved before
     /// enqueueing so timeout always has capacity to return the current detail. A completed reply
     /// uses the worker's normal delivery path, preserving continuation and feedback semantics.
+    ///
+    /// `request` is the front's opaque transport request id; the queued job journals it beside its
+    /// own result reference so the front call, its job and later inspections can be followed.
     pub async fn submit(
         &self,
         invocation: ValidatedInvocation,
         tool: AssistanceTool,
         parameters: Value,
         attachment: &str,
+        request: Option<&str>,
     ) -> PeerReply {
         let binding = invocation.binding_ref().clone();
         let expected = Some((tool, selection(&parameters)));
@@ -1532,7 +1632,14 @@ impl WorkerHandle {
         }
         let (send, wait) = oneshot::channel();
         match admit_initial_inspection(&self.inspect, || {
-            self.enqueue(invocation, tool, parameters, attachment, Some(send))
+            self.enqueue(
+                invocation,
+                tool,
+                parameters,
+                attachment,
+                Some(send),
+                request,
+            )
         }) {
             Ok((reference, permit)) => match tokio::time::timeout(INLINE_REPLY_WAIT, wait).await {
                 Ok(Ok(reply)) => reply,
@@ -1603,6 +1710,7 @@ impl WorkerHandle {
             serde_json::json!({ "uncollected_test_runs": uncollected }),
             attachment,
             Some(send),
+            None,
         ) {
             return PeerReply::Error {
                 detail: (code.code == FailureCode::Capacity).then_some(code.stage),
@@ -1665,6 +1773,7 @@ impl WorkerHandle {
             reference,
             expected,
             reply,
+            delivery: DELIVERY.try_with(Arc::clone).ok(),
         });
         wait.await.unwrap_or(PeerReply::Error {
             code: FailureCode::Internal,
@@ -1707,7 +1816,47 @@ impl WorkerHandle {
         self.shared
             .activated
             .lock()
-            .is_ok_and(|activated| activated.contains(&binding.fingerprint()))
+            .is_ok_and(|activated| activated.contains_key(&binding.fingerprint()))
+    }
+
+    /// The call id of the call that queued the job behind result `reference`, while remembered
+    /// (QW-4): an inspection's journal line names it as the `origin` of the inspected result.
+    pub fn request_of(&self, reference: &str) -> Option<String> {
+        self.shared.request_of(reference)
+    }
+
+    /// Takes the mark that the call `request` was answered through a weaker path (QW-4): `true`
+    /// once for a marked call, so exactly one terminal journal line reports it.
+    pub fn take_degraded(&self, request: &str) -> bool {
+        self.shared.take_degraded(request)
+    }
+
+    /// Runs `future` (a [`Self::inspect`] or [`Self::submit`] of one call) so that an inspection it
+    /// performs sets `delivery` when it hands a retained terminal result to this call's caller
+    /// (QW-4). The flag is per call: it is the typed evidence the call's journal line reports,
+    /// and no other inspection can set or take it.
+    pub async fn with_delivery<F: std::future::Future>(
+        &self,
+        delivery: Arc<std::sync::atomic::AtomicBool>,
+        future: F,
+    ) -> F::Output {
+        DELIVERY.scope(delivery, future).await
+    }
+
+    /// Whether the result behind `reference` was built through a weaker path (QW-4); retained, so
+    /// a later successful inspection of a degraded result is journaled degraded as well.
+    pub fn reference_degraded(&self, reference: &str) -> bool {
+        self.shared.reference_degraded(reference)
+    }
+
+    /// The role (reader or writer) this binding's channel activated with, while it holds an
+    /// activation; `None` before the first start and after the stop. Journal context only.
+    pub fn role_of(&self, binding: &BindingRef) -> Option<crate::errorlog::Role> {
+        self.shared
+            .activated
+            .lock()
+            .ok()
+            .and_then(|activated| activated.get(&binding.fingerprint()).copied())
     }
 
     /// Invalidates cached results on native hints; reads wait for a current MCP sandbox observation.
@@ -1789,6 +1938,7 @@ impl WorkerHandle {
         parameters: Value,
         attachment: &str,
         stop_reply: Option<oneshot::Sender<PeerReply>>,
+        request: Option<&str>,
     ) -> Result<String, InspectFailure> {
         if self
             .shared
@@ -1927,6 +2077,11 @@ impl WorkerHandle {
         }
         if let Some(key) = start {
             ledger.starts.insert(key, reference.clone());
+        }
+        if let Some(request) = request
+            && let Ok(mut requests) = self.shared.requests.lock()
+        {
+            requests.insert(reference.clone(), request.to_owned());
         }
         let job = Job {
             reference: reference.clone(),
@@ -2201,6 +2356,11 @@ struct Worker<'a> {
     /// Typed cause of the last failed durable stop (`stop:busy`, `stop:store_full`, ...), taken by
     /// the stop job to name its failure instead of a generic authority error.
     stop_cause: Option<&'static str>,
+    /// Typed cause of the last store failure outside stop (`store:busy`, `store:store_full`,
+    /// `store:store_deadline`), taken by the job that failed with it so its reply names the store
+    /// instead of a generic authority or source refusal (QW-6). Behind a mutex because the
+    /// authority check runs on `&self`.
+    store_cause: std::sync::Mutex<Option<&'static str>>,
     /// Durable revoke attempts this worker has started, across all stops; read by tests that
     /// release a held store lock only once the daemon's own retry began.
     stop_attempts: Arc<std::sync::atomic::AtomicUsize>,
@@ -2977,6 +3137,10 @@ impl<'a> Worker<'a> {
         } else {
             None
         };
+        *self
+            .store_cause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let result = if let Some(code) = reader_refusal {
             Err(code)
         } else if job.tool == AssistanceTool::Stop {
@@ -3048,7 +3212,16 @@ impl<'a> Worker<'a> {
             Ok(result) => result,
             Err(code) => {
                 // Every terminal failure names its stage: the failing path's own tag when it set
-                // one, else the derived `<tool>:<reason>` default — never a bare reason.
+                // one, else the typed store cause of a store failure, else the derived
+                // `<tool>:<reason>` default — never a bare reason.
+                if job.failure_detail.is_none() {
+                    job.failure_detail = self
+                        .store_cause
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                        .map(str::to_owned);
+                }
                 if job.failure_detail.is_none() {
                     job.failure_detail = Some(terminal_stage(job.tool, &code));
                 }
@@ -3078,6 +3251,7 @@ impl<'a> Worker<'a> {
             },
             other => other,
         };
+        let request = self.shared.request_of(&job.reference);
         if let PeerReply::Error { code, .. } = &reply {
             // T26B: a queued job's terminal failure must reach the error log with its closed
             // reason even when no caller view ever does — the dispatch path only logs the initial
@@ -3093,10 +3267,12 @@ impl<'a> Worker<'a> {
                     correlation: Some(job.reference.as_str()),
                     detail: job.failure_detail.as_deref(),
                     duration_ms: u32::try_from(started.elapsed().as_millis()).ok(),
+                    request: request.as_deref(),
                     ..Default::default()
                 },
             );
         }
+        let failed = matches!(reply, PeerReply::Error { .. });
         if let Some(authority) = &authority {
             self.observe_head(&binding, authority);
         }
@@ -3190,21 +3366,41 @@ impl<'a> Worker<'a> {
                     ..
                 }
             );
-            if sender.send(reply).is_ok() {
-                if let Some(mark_reply) = mark_reply {
-                    self.shared.mark_feedback_inline_delivered(
-                        &binding,
+            match sender.send(reply) {
+                Ok(()) => {
+                    if let Some(mark_reply) = mark_reply {
+                        self.shared.mark_feedback_inline_delivered(
+                            &binding,
+                            &job.reference,
+                            &mark_reply,
+                        );
+                    }
+                    if paged {
+                        // Page one just reached the caller through this settlement, so the first
+                        // `ide.inspect` of its `detail_ref` must serve page two, not repeat page
+                        // one (T16B) — for every paged kind, symbol cards and outlines included.
+                        // Only a lost receiver leaves the page undelivered and fresh.
+                        self.shared.mark_page_delivered(&job.reference);
+                    }
+                }
+                // The caller stopped waiting and was told `pending`; a result nobody collects
+                // would otherwise leave no trace at all (QW-4). The completion record classifies
+                // the job's own terminal reply like a dispatch line, its reference joins it to the
+                // pending dispatch line and to any later `ide.inspect`, and a failure already has
+                // its own line above.
+                Err(undelivered) if !failed => {
+                    let degraded = request
+                        .as_deref()
+                        .is_some_and(|request| self.shared.take_degraded(request));
+                    crate::telemetry::adapters::log_pending_completion(
+                        job.tool,
+                        &undelivered,
                         &job.reference,
-                        &mark_reply,
+                        request.as_deref(),
+                        degraded,
                     );
                 }
-                if paged {
-                    // Page one just reached the caller through this settlement, so the first
-                    // `ide.inspect` of its `detail_ref` must serve page two, not repeat page one
-                    // (T16B) — for every paged kind, symbol cards and outlines included. Only a
-                    // lost receiver leaves the page undelivered and fresh.
-                    self.shared.mark_page_delivered(&job.reference);
-                }
+                Err(_) => {}
             }
         }
     }
@@ -3473,10 +3669,17 @@ impl<'a> Worker<'a> {
                 );
                 return Err(FailureCode::Conflict);
             }
-            Err(
-                crate::workspace::durable::DurableError::Application(_)
-                | crate::workspace::durable::DurableError::CorruptState,
-            ) => {
+            Err(crate::workspace::durable::DurableError::Application(error)) => {
+                // The activation may have committed: stay uncertain exactly as before, but name
+                // the store cause instead of a generic durable-state refusal (QW-6).
+                self.uncertain.insert(binding.clone());
+                let (_, cause) = store_failure(&error, FailureCode::WorkspaceActivation);
+                job.failure_detail = Some(format!(
+                    "start:durable_state: the durable activation state refused or failed ({cause})"
+                ));
+                return Err(FailureCode::WorkspaceActivation);
+            }
+            Err(crate::workspace::durable::DurableError::CorruptState) => {
                 self.uncertain.insert(binding.clone());
                 job.failure_detail = Some(
                     "start:durable_state: the durable activation state refused or failed"
@@ -3502,7 +3705,13 @@ impl<'a> Worker<'a> {
         // The one shared fact a hook ingress can check before emitting a native hint: this
         // channel's binding now holds an activation.
         if let Ok(mut activated) = self.shared.activated.lock() {
-            activated.insert(binding.fingerprint());
+            activated.insert(
+                binding.fingerprint(),
+                match next_role {
+                    crate::workspace::authority::StartRole::Writer => crate::errorlog::Role::Writer,
+                    crate::workspace::authority::StartRole::Reader => crate::errorlog::Role::Reader,
+                },
+            );
         }
         let authority = match self.authority(&binding).await {
             Ok(authority) => authority,
@@ -3572,7 +3781,12 @@ impl<'a> Worker<'a> {
             self.workspace
                 .set_environment(authority.worktree(), choices)
                 .await
-                .map_err(|_| FailureCode::Internal)?;
+                .map_err(|error| match &error {
+                    crate::workspace::durable::DurableError::Application(error) => {
+                        self.note_store_failure(error, FailureCode::Internal)
+                    }
+                    _ => FailureCode::Internal,
+                })?;
         }
         self.shared
             .refresh_environments(authority.worktree().worktree_path());
@@ -3890,6 +4104,11 @@ impl<'a> Worker<'a> {
                 };
                 Err((detail, holder))
             }
+            Err(crate::workspace::durable::DurableError::Application(error)) => {
+                // A store failure is never reported as an identity problem (QW-6).
+                let (_, cause) = store_failure(&error, FailureCode::WorkspaceActivation);
+                Err((format!("start:worktree_unresolved:{cause}"), None))
+            }
             Err(_) => Err(("start:worktree_unresolved:identity_commit".to_owned(), None)),
         }
     }
@@ -3926,7 +4145,31 @@ impl<'a> Worker<'a> {
         self.workspace
             .authority(receipt, &active)
             .await
-            .map_err(|_| FailureCode::WorkspaceAuthority)
+            .map_err(|error| match &error {
+                crate::workspace::durable::DurableError::Application(error) => {
+                    self.note_store_failure(error, FailureCode::WorkspaceAuthority)
+                }
+                _ => FailureCode::WorkspaceAuthority,
+            })
+    }
+
+    /// Maps a store failure outside stop to its typed code and remembers the closed cause for the
+    /// failing job's reply and journal (QW-6).
+    ///
+    /// The code and cause come from [`store_failure`] (`default` is the code of a failure that is
+    /// neither a capacity nor a timing problem). The cause is overwritten by a later failure and
+    /// cleared when the next job starts.
+    fn note_store_failure(
+        &self,
+        error: &crate::app::store::StoreError,
+        default: FailureCode,
+    ) -> FailureCode {
+        let (code, cause) = store_failure(error, default);
+        *self
+            .store_cause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cause);
+        code
     }
 
     /// Reads and persists one registered file under fresh durable authority, preserving missing
@@ -4023,12 +4266,22 @@ impl<'a> Worker<'a> {
         self.workspace
             .authorize(&authority, &active)
             .await
-            .map_err(|_| FailureCode::WorkspaceAuthority)?;
+            .map_err(|error| match &error {
+                crate::workspace::durable::DurableError::Application(error) => {
+                    self.note_store_failure(error, FailureCode::WorkspaceAuthority)
+                }
+                _ => FailureCode::WorkspaceAuthority,
+            })?;
         let ObservationAdmission::Recorded(observed) = self
             .observations
             .record(draft)
             .await
-            .map_err(|_| FailureCode::SourceUnavailable)?
+            .map_err(|error| match &error {
+                crate::workspace::store::WorkspaceStoreError::Application(error) => {
+                    self.note_store_failure(error, FailureCode::SourceUnavailable)
+                }
+                _ => FailureCode::SourceUnavailable,
+            })?
         else {
             return Err(FailureCode::SourceUnavailable);
         };
@@ -4116,11 +4369,15 @@ impl<'a> Worker<'a> {
         } else {
             self.semantic_context(job, &observed, &bytes, query).await
         };
+        let shared = self.shared.clone();
+        // A lexical answer is a success through a weaker path: the call is marked degraded (QW-4).
         let lexical = |job: &mut Job, reason: &'static str| {
-            lexical_context(&observed, &bytes, query, reason).map_err(|_| {
-                job.failure_detail = Some(format!("context:observation_failed:{path_detail}"));
-                FailureCode::SourceUnavailable
-            })
+            lexical_context(&observed, &bytes, query, reason)
+                .inspect(|_| shared.mark_degraded(&job.reference))
+                .map_err(|_| {
+                    job.failure_detail = Some(format!("context:observation_failed:{path_detail}"));
+                    FailureCode::SourceUnavailable
+                })
         };
         let (context, diagnostics) = match semantic {
             Ok(Some(result)) => (result.context, Some(result.diagnostics)),
@@ -4148,11 +4405,13 @@ impl<'a> Worker<'a> {
                     .clone()
                     .unwrap_or_else(|| "semantic project resolution is unverified".to_owned());
                 (
-                    lexical_context(&observed, &bytes, query, &reason).map_err(|_| {
-                        job.failure_detail =
-                            Some(format!("context:observation_failed:{path_detail}"));
-                        FailureCode::SourceUnavailable
-                    })?,
+                    lexical_context(&observed, &bytes, query, &reason)
+                        .inspect(|_| shared.mark_degraded(&job.reference))
+                        .map_err(|_| {
+                            job.failure_detail =
+                                Some(format!("context:observation_failed:{path_detail}"));
+                            FailureCode::SourceUnavailable
+                        })?,
                     None,
                 )
             }
@@ -5290,6 +5549,31 @@ struct InspectFailure {
     stage: String,
 }
 
+/// Maps a failed re-authorization of a retained inspection result to its failure (QW-6).
+///
+/// A store failure keeps its typed [`store_failure`] code and `store:` stage instead of reporting
+/// the result stale; a busy or timed-out store (`capacity` / `deadline`) leaves the retained
+/// evidence in place so the caller can repeat the inspection, while any other failure releases it
+/// through `invalidate` exactly as a genuinely stale authority does (`inspect:authority_stale`).
+fn reauthorize_failure(
+    error: &crate::workspace::durable::DurableError,
+    invalidate: &dyn Fn(FailureCode) -> FailureCode,
+) -> InspectFailure {
+    if let crate::workspace::durable::DurableError::Application(error) = error {
+        let (code, cause) = store_failure(error, FailureCode::WorkspaceAuthority);
+        let code = if matches!(code, FailureCode::Capacity | FailureCode::Deadline) {
+            code
+        } else {
+            invalidate(code)
+        };
+        return InspectFailure::stage(code, cause);
+    }
+    InspectFailure::stage(
+        invalidate(FailureCode::WorkspaceAuthority),
+        "inspect:authority_stale",
+    )
+}
+
 impl From<FailureCode> for InspectFailure {
     /// Keeps the closed code and derives its default stage when an ingress check has no finer cause.
     fn from(code: FailureCode) -> Self {
@@ -5446,12 +5730,10 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             code
         };
         if let Some(authority) = &authority {
-            workspace.authorize(authority, &active).await.map_err(|_| {
-                InspectFailure::stage(
-                    invalidate(FailureCode::WorkspaceAuthority),
-                    "inspect:authority_stale",
-                )
-            })?;
+            workspace
+                .authorize(authority, &active)
+                .await
+                .map_err(|error| reauthorize_failure(&error, &invalidate))?;
             // Cached disclosure adds the conservative lstat preflight: a symlink component below
             // the worktree root refuses disclosure of cached bytes. The real guard for later reads
             // stays the descriptor-relative `O_NOFOLLOW` reader; a preflight can never secure a
@@ -5490,12 +5772,10 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             .active(&request.binding)
             .map_err(InspectFailure::new)?;
         if let Some(authority) = &authority {
-            workspace.authorize(authority, &active).await.map_err(|_| {
-                InspectFailure::stage(
-                    invalidate(FailureCode::WorkspaceAuthority),
-                    "inspect:authority_stale",
-                )
-            })?;
+            workspace
+                .authorize(authority, &active)
+                .await
+                .map_err(|error| reauthorize_failure(&error, &invalidate))?;
         }
         shared
             .active(&request.binding)
@@ -5611,10 +5891,24 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
         Ok::<_, InspectFailure>(reply)
     }
     .await;
+    // Whether this very inspection hands a retained terminal job result to its caller (QW-4): the
+    // inspection path itself says so, whatever the result is (a cached failed read is delivered
+    // too), unlike a refused retrieval, a test-run status or a result still `pending`.
+    let retrieved = result.is_ok()
+        && test_run_handle(&request.reference).is_none()
+        && poll_hint_run(&request.reference).is_none();
     let reply = result.unwrap_or_else(|failure| PeerReply::Error {
         code: failure.code,
         detail: Some(failure.stage),
     });
+    if retrieved
+        && !matches!(reply, PeerReply::Pending { .. })
+        && let Some(delivery) = &request.delivery
+    {
+        // The flag belongs to this one invocation, so no other inspection of the reference (or
+        // of another binding's) can take it; a caller that already left never reads it.
+        delivery.store(true, std::sync::atomic::Ordering::Release);
+    }
     // This is the actual submission boundary for the managed path: `reply` is about to be handed
     // to the real caller of either the initial `submit()` or a later `ide.inspect`. Marking must
     // wait for the send's own outcome — a request whose receiving side already closed must not
@@ -6349,6 +6643,28 @@ fn is_transient_stop_failure(error: &crate::workspace::durable::DurableError) ->
             ) || is_locked_store(error)
         }
         _ => false,
+    }
+}
+
+/// Maps a store failure outside stop to its failure code and closed `store:` cause (QW-6; the
+/// stop family is [`stop_failure`]). Total: every store failure gets a cause.
+///
+/// Busy, locked or full queue: `capacity` / `store:busy`. Receipt store full: `capacity` /
+/// `store:store_full`. Wait expired with the outcome unknown: `deadline` /
+/// `store:store_deadline`. Every other store failure (stopped owner, SQLite or setup failure)
+/// keeps the caller's `default` code with `store:unavailable`. Only the code and detail change;
+/// callers keep their own uncertain-mutation handling.
+fn store_failure(
+    error: &crate::app::store::StoreError,
+    default: FailureCode,
+) -> (FailureCode, &'static str) {
+    use crate::app::store::StoreError;
+    match error {
+        StoreError::Busy | StoreError::QueueFull => (FailureCode::Capacity, "store:busy"),
+        StoreError::ReceiptCapacityExhausted => (FailureCode::Capacity, "store:store_full"),
+        StoreError::OutcomeUnknown { .. } => (FailureCode::Deadline, "store:store_deadline"),
+        error if is_locked_store(error) => (FailureCode::Capacity, "store:busy"),
+        _ => (default, "store:unavailable"),
     }
 }
 
@@ -7129,8 +7445,12 @@ mod stop_retry_tests {
             .activated
             .lock()
             .unwrap()
-            .insert(binding.fingerprint());
+            .insert(binding.fingerprint(), crate::errorlog::Role::Writer);
         assert!(handle.channel_activated(&binding));
+        assert_eq!(
+            handle.role_of(&binding),
+            Some(crate::errorlog::Role::Writer)
+        );
     }
 
     /// Creates one current host binding for a managed job.
@@ -8929,8 +9249,11 @@ mod stop_retry_tests {
                 test_runs: TestRuns::default(),
                 git_notices: Mutex::new(BTreeMap::new()),
                 environments: Mutex::default(),
-                activated: Mutex::new(BTreeSet::new()),
+                activated: Mutex::new(BTreeMap::new()),
                 failed: tokio::sync::watch::Sender::new(false),
+                requests: Mutex::default(),
+                degraded: Mutex::default(),
+                degraded_references: Mutex::default(),
             }),
             workspace,
             observations: WorkspaceStore::new(store),
@@ -8939,6 +9262,7 @@ mod stop_retry_tests {
             leases: BTreeMap::new(),
             pending_revocations: std::collections::BTreeSet::new(),
             stop_cause: None,
+            store_cause: std::sync::Mutex::new(None),
             stop_attempts: Arc::default(),
             revoke_retry_rounds: 0,
             next_revoke_retry: None,
@@ -9993,6 +10317,380 @@ mod stop_retry_tests {
         }
     }
 
+    /// QW-6: a store failure outside stop maps to a typed `store:` cause and a capacity or
+    /// deadline code; anything else keeps the caller's default.
+    #[test]
+    fn store_failures_outside_stop_are_typed() {
+        use crate::app::store::StoreError;
+        let cases = [
+            (StoreError::Busy, (FailureCode::Capacity, "store:busy")),
+            (StoreError::QueueFull, (FailureCode::Capacity, "store:busy")),
+            (
+                StoreError::Infrastructure("database is locked".to_owned()),
+                (FailureCode::Capacity, "store:busy"),
+            ),
+            (
+                StoreError::ReceiptCapacityExhausted,
+                (FailureCode::Capacity, "store:store_full"),
+            ),
+            (
+                StoreError::OutcomeUnknown {
+                    operation: crate::app::store::OperationId::new("op-1").unwrap(),
+                },
+                (FailureCode::Deadline, "store:store_deadline"),
+            ),
+            (
+                StoreError::Infrastructure("disk I/O error".to_owned()),
+                (FailureCode::SourceUnavailable, "store:unavailable"),
+            ),
+            (
+                StoreError::Unavailable,
+                (FailureCode::SourceUnavailable, "store:unavailable"),
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(
+                store_failure(&error, FailureCode::SourceUnavailable),
+                expected,
+                "{error:?}"
+            );
+        }
+    }
+
+    /// QW-6: re-authorizing a retained inspection result reports a store problem with its typed
+    /// stage (keeping the evidence of a transient one), and only a real authority refusal as
+    /// stale.
+    #[test]
+    fn inspection_reauthorization_separates_store_failures_from_stale_authority() {
+        use crate::app::store::StoreError;
+        use crate::workspace::authority::AuthorityError;
+        use crate::workspace::durable::DurableError;
+        use std::cell::Cell;
+        let released = Cell::new(0);
+        let invalidate = |code: FailureCode| {
+            released.set(released.get() + 1);
+            code
+        };
+        let busy = reauthorize_failure(&DurableError::Application(StoreError::Busy), &invalidate);
+        assert_eq!(
+            (busy.code, busy.stage.as_str()),
+            (FailureCode::Capacity, "store:busy")
+        );
+        assert_eq!(
+            released.get(),
+            0,
+            "a transient store failure keeps the evidence"
+        );
+        let gone = reauthorize_failure(
+            &DurableError::Application(StoreError::Unavailable),
+            &invalidate,
+        );
+        assert_eq!(
+            (gone.code, gone.stage.as_str()),
+            (FailureCode::WorkspaceAuthority, "store:unavailable")
+        );
+        assert_eq!(released.get(), 1);
+        let stale = reauthorize_failure(
+            &DurableError::Authority(AuthorityError::StaleAuthority),
+            &invalidate,
+        );
+        assert_eq!(
+            (stale.code, stale.stage.as_str()),
+            (FailureCode::WorkspaceAuthority, "inspect:authority_stale")
+        );
+        assert_eq!(released.get(), 2);
+    }
+
+    /// QW-4: a job whose caller stopped waiting (and was told `pending`) leaves a completion
+    /// record carrying its own reference and the front's request id; a job whose caller received
+    /// the result leaves none, so the record means exactly "finished with nobody waiting".
+    #[tokio::test]
+    async fn pending_job_leaves_a_completion_record_with_its_request_id() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        production_start(&mut worker, "pending-actor", "pending-start").await;
+        let run = |reference: &str, receiver_alive: bool| {
+            let invocation = production_call(&worker, "pending-actor", reference);
+            let (_cancel_sender, cancel) = watch::channel(false);
+            let (send, wait) = oneshot::channel();
+            let wait = receiver_alive.then_some(wait);
+            worker
+                .shared
+                .requests
+                .lock()
+                .unwrap()
+                .insert(reference.to_owned(), format!("req-for-{reference}"));
+            let job = Job {
+                reference: reference.to_owned(),
+                invocation,
+                tool: AssistanceTool::Context,
+                parameters: serde_json::json!({"kind":"problems"}),
+                target: production_target(&worker.runtime),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+                cancel,
+                stop_reply: Some(send),
+                native_epoch: 0,
+                failure_detail: None,
+                format_note: None,
+                check_scheduled: false,
+                park_until: None,
+                stage: None,
+                session_binding: None,
+            };
+            (job, wait)
+        };
+        let (mut abandoned, _) = run("abandoned-ref", false);
+        let (mut collected, _wait) = run("collected-ref", true);
+        crate::errorlog::capture_start();
+        worker.perform(&mut abandoned).await;
+        worker.perform(&mut collected).await;
+        let events = crate::errorlog::capture_take();
+        let records = events
+            .iter()
+            .filter(|event| event.detail.as_deref() == Some("pending_completion"))
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "{events:?}");
+        assert_eq!(records[0].method, "context");
+        assert_eq!(records[0].outcome, "completed");
+        assert_eq!(records[0].correlation.as_deref(), Some("abandoned-ref"));
+        assert_eq!(records[0].request.as_deref(), Some("req-for-abandoned-ref"));
+        assert_eq!(
+            worker.shared.request_of("collected-ref").as_deref(),
+            Some("req-for-collected-ref"),
+            "a settled job keeps its call id for later inspections"
+        );
+    }
+
+    /// QW-4: delivery evidence is a flag of one inspection invocation, set only when that very
+    /// inspection hands a retained terminal result to its caller: a settled success and a cached
+    /// *failed* result are delivered; a reference this daemon never minted or no longer retains, a
+    /// result still `pending`, and a caller that already left are not — and no other inspection of
+    /// the same reference can take or inherit the evidence.
+    #[tokio::test]
+    async fn inspection_reports_typed_delivery_evidence() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, _) = production_start(&mut worker, "delivery-actor", "delivery-start").await;
+        let retained = |reply: PeerReply| Detail {
+            binding: binding.clone(),
+            reply,
+            selection: (AssistanceTool::Read, [0; 32]),
+            authority: None,
+            source: None,
+            native_epoch: 0,
+            line_movement: None,
+            diff_page: None,
+            diff_page_fresh: false,
+            context_page: None,
+            context_page_fresh: false,
+            diff_provenance: None,
+            extra_sources: Vec::new(),
+        };
+        {
+            let mut ledger = worker.shared.ledger.lock().unwrap();
+            ledger.details.insert(
+                "ok-ref".into(),
+                retained(PeerReply::Complete {
+                    kind: ResultKind::Outline,
+                    text: "fine".into(),
+                    detail_ref: None,
+                    truncated: false,
+                    continuation: false,
+                }),
+            );
+            ledger.details.insert(
+                "failed-ref".into(),
+                retained(PeerReply::Error {
+                    code: FailureCode::Capacity,
+                    detail: Some("store:busy".into()),
+                }),
+            );
+            ledger.details.insert(
+                "pending-ref".into(),
+                retained(PeerReply::Pending {
+                    detail_ref: "pending-ref".into(),
+                }),
+            );
+        }
+        // One inspection invocation: its own flag and whether its caller stays to receive.
+        let inspect = |reference: &str, caller_stays: bool| {
+            let delivery = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (reply, reply_rx) = oneshot::channel();
+            let request = Inspection {
+                binding: binding.clone(),
+                reference: reference.to_owned(),
+                expected: None,
+                reply,
+                delivery: Some(delivery.clone()),
+            };
+            let (workspace, shared) = (&worker.workspace, &worker.shared);
+            async move {
+                if !caller_stays {
+                    drop(reply_rx);
+                    serve_inspection(workspace, shared, request).await;
+                    return (None, delivery.load(std::sync::atomic::Ordering::Acquire));
+                }
+                serve_inspection(workspace, shared, request).await;
+                (
+                    Some(reply_rx.await.unwrap()),
+                    delivery.load(std::sync::atomic::Ordering::Acquire),
+                )
+            }
+        };
+        let (reply, delivered) = inspect("ok-ref", true).await;
+        assert!(matches!(reply, Some(PeerReply::Complete { .. })) && delivered);
+        let (reply, delivered) = inspect("failed-ref", true).await;
+        assert!(
+            matches!(
+                reply,
+                Some(PeerReply::Error {
+                    code: FailureCode::Capacity,
+                    ..
+                })
+            ) && delivered,
+            "a cached failed result is delivered"
+        );
+        let (reply, delivered) = inspect("pending-ref", true).await;
+        assert!(
+            matches!(reply, Some(PeerReply::Pending { .. })) && !delivered,
+            "a result still pending is not a delivered terminal result"
+        );
+        let (reply, delivered) = inspect("never-minted-ref", true).await;
+        assert!(
+            matches!(
+                reply,
+                Some(PeerReply::Error {
+                    code: FailureCode::InvalidDetail,
+                    ..
+                })
+            ) && !delivered,
+            "a refused retrieval delivers nothing"
+        );
+        // A caller that already left (receiver dropped): its own invocation is never read, and the
+        // next inspection of the same reference starts from its own clean flag — here a refusal
+        // (another binding's view of the reference) must not inherit a stale true.
+        let (_, _) = inspect("ok-ref", false).await;
+        let (other_reply, other_rx) = oneshot::channel();
+        let other_delivery = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        serve_inspection(
+            &worker.workspace,
+            &worker.shared,
+            Inspection {
+                binding: production_call(&worker, "delivery-other", "other-call")
+                    .binding_ref()
+                    .clone(),
+                reference: "ok-ref".into(),
+                expected: None,
+                reply: other_reply,
+                delivery: Some(other_delivery.clone()),
+            },
+        )
+        .await;
+        assert!(matches!(
+            other_rx.await.unwrap(),
+            PeerReply::Error {
+                code: FailureCode::InvalidDetail,
+                ..
+            }
+        ));
+        assert!(
+            !other_delivery.load(std::sync::atomic::Ordering::Acquire),
+            "a refused inspection of the same reference inherits nothing from a dropped one"
+        );
+    }
+
+    /// QW-4: the degraded mark of a call is consumed once by the line that reports the call, while
+    /// the mark of its result stays, so a later successful inspection is degraded as well; a call
+    /// with no remembered id marks only its result.
+    #[tokio::test]
+    async fn degraded_provenance_is_taken_once_per_call_and_kept_for_the_result() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let worker = worker(&store, workspace, fixture.root.clone());
+        let shared = &worker.shared;
+        shared
+            .requests
+            .lock()
+            .unwrap()
+            .insert("ref-1".to_owned(), "call-1".to_owned());
+        assert!(!shared.reference_degraded("ref-1"));
+        shared.mark_degraded("ref-1");
+        assert!(
+            shared.take_degraded("call-1"),
+            "the call's own line takes the mark"
+        );
+        assert!(!shared.take_degraded("call-1"), "only once");
+        assert!(
+            shared.reference_degraded("ref-1"),
+            "the result stays degraded for later inspections"
+        );
+        assert!(
+            shared.reference_degraded("ref-1"),
+            "reading it consumes nothing"
+        );
+        shared.mark_degraded("ref-unattributed");
+        assert!(shared.reference_degraded("ref-unattributed"));
+    }
+
+    /// QW-6: a start whose worktree identity cannot be committed because the store is busy names
+    /// `store:busy`, not the identity step (`identity_commit`) it used to collapse into.
+    #[tokio::test]
+    async fn busy_store_names_its_cause_when_a_worktree_is_resolved() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let worker = worker(&store, workspace, fixture.root.clone());
+        let lock = rusqlite::Connection::open(fixture.base.join("state.sqlite")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let discovered = (
+            fixture.root.clone(),
+            fixture.root.clone(),
+            std::path::PathBuf::from(".git"),
+        );
+        let (detail, holder) = worker
+            .resolve_worktree_named(&discovered)
+            .await
+            .expect_err("a busy store cannot commit the identity");
+        assert_eq!(detail, "start:worktree_unresolved:store:busy");
+        assert!(holder.is_none());
+    }
+
+    /// QW-6: a read whose observation cannot be recorded because the store is busy fails with
+    /// `capacity` and the cause `store:busy`, not a generic `source_unavailable`.
+    #[tokio::test]
+    async fn busy_store_names_its_cause_when_an_observation_is_recorded() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        workspace
+            .resolve_worktree(
+                fixture.root.clone(),
+                fixture.root.clone(),
+                std::path::PathBuf::from(".git"),
+            )
+            .await
+            .unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        let (binding, _) = production_start(&mut worker, "actor-1", "call-1").await;
+        let lock = rusqlite::Connection::open(fixture.base.join("state.sqlite")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let outcome = worker
+            .observe(&binding, std::path::PathBuf::from("src/lib.rs"))
+            .await;
+        assert!(
+            matches!(outcome, Err(FailureCode::Capacity)),
+            "a busy store is a capacity cause, not an unreadable source: {outcome:?}"
+        );
+        assert_eq!(*worker.store_cause.lock().unwrap(), Some("store:busy"));
+    }
+
     #[tokio::test]
     async fn failed_stop_retains_pending_revoke_and_fresh_start_commits_it_first() {
         let fixture = Fixture::new();
@@ -10484,6 +11182,7 @@ mod stop_retry_tests {
                         serde_json::json!({"activation_id":"same","environment":{"alpha":choice}}),
                         "stop-retry",
                         None,
+                        None,
                     )
                     .unwrap(),
             );
@@ -10516,6 +11215,7 @@ mod stop_retry_tests {
                 AssistanceTool::Context,
                 serde_json::json!({"path":"main.rs"}),
                 "stop-retry",
+                None,
                 None,
             )
             .map_err(|failure| failure.code)
@@ -11008,6 +11708,7 @@ mod stop_retry_tests {
                     reference: job.reference.clone(),
                     expected: None,
                     reply: reply_tx,
+                    delivery: None,
                 },
             )
             .await;
@@ -11123,6 +11824,7 @@ mod stop_retry_tests {
                     reference: job.reference.clone(),
                     expected: None,
                     reply: reply_tx,
+                    delivery: None,
                 },
             )
             .await;
@@ -11229,6 +11931,7 @@ mod stop_retry_tests {
                 reference: "never-retained".into(),
                 expected: None,
                 reply: reply_tx,
+                delivery: None,
             },
         )
         .await;
@@ -11279,6 +11982,7 @@ mod stop_retry_tests {
                 reference: "foreign-detail".into(),
                 expected: None,
                 reply: reply_tx,
+                delivery: None,
             },
         )
         .await;
@@ -11569,6 +12273,7 @@ mod stop_retry_tests {
                 reference,
                 expected: None,
                 reply: reply_tx,
+                delivery: None,
             };
             let (workspace, shared) = (&worker.workspace, &worker.shared);
             async move {
@@ -11628,6 +12333,7 @@ mod stop_retry_tests {
                     reference,
                     expected: None,
                     reply: reply_tx,
+                    delivery: None,
                 },
             )
             .await;
@@ -11768,6 +12474,7 @@ mod stop_retry_tests {
                 reference: "start-first".into(),
                 expected: Some((AssistanceTool::Start, selection(&retry))),
                 reply: reply_tx,
+                delivery: None,
             },
         )
         .await;
@@ -12316,6 +13023,7 @@ mod stop_retry_tests {
                     reference: "never-issued".to_owned(),
                     expected: None,
                     reply: reply_tx,
+                    delivery: None,
                 },
             )
             .await;

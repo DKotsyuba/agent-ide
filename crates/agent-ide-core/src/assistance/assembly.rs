@@ -55,6 +55,48 @@ pub struct ProductDispatcher {
     pre_attachments: Mutex<std::collections::BTreeMap<(String, String), String>>,
 }
 
+/// Names the closed host-binding cause of an ingress step that failed (QW-6), so no early exit of
+/// the dispatcher answers a bare `unavailable: host_binding`.
+trait OrCause<T> {
+    /// Keeps the success value, or fails with `cause`.
+    fn or_cause(self, cause: HostBindingCause) -> Result<T, HostBindingCause>;
+}
+
+/// An absent value fails with the supplied cause.
+impl<T> OrCause<T> for Option<T> {
+    /// `Some(value)` keeps `value`; `None` fails with `cause`.
+    fn or_cause(self, cause: HostBindingCause) -> Result<T, HostBindingCause> {
+        self.ok_or(cause)
+    }
+}
+
+/// Any error fails with the supplied cause; the error itself is dropped, because it may carry
+/// caller-supplied text that must never reach a reply or the journal.
+impl<T, E> OrCause<T> for Result<T, E> {
+    /// `Ok(value)` keeps `value`; any `Err` fails with `cause`.
+    fn or_cause(self, cause: HostBindingCause) -> Result<T, HostBindingCause> {
+        self.map_err(|_| cause)
+    }
+}
+
+/// Closed journal context a call's ingress establishes on its way through [`ProductDispatcher::
+/// handle_tagged`] (QW-4); every field stays empty for a call that never got that far.
+#[derive(Default)]
+struct CallFacts {
+    /// The validated host binding the call belongs to.
+    binding: Option<super::host_binding::BindingRef>,
+    /// The binding's activation role *before* the call ran (a stop removes it).
+    role: Option<errorlog::Role>,
+    /// Set by the inspection this call performs when it hands a retained terminal result to the
+    /// call's caller; this call's own flag, shared with no other inspection.
+    delivery: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The closed cause a guard refusal is reported with.
+fn binding_cause(reason: super::host_binding::BindingUnavailable) -> HostBindingCause {
+    HostBindingCause::from_binding(reason).unwrap_or(HostBindingCause::InvalidMetadata)
+}
+
 /// Most actor tags one `claudecode/recover` announcement may carry.
 const MAX_RECOVER_TAGS: usize = 32;
 
@@ -520,63 +562,72 @@ impl ProductDispatcher {
         request: &AssistanceDispatch,
         status: &mut Option<String>,
     ) -> Option<PeerReply> {
-        self.handle_tagged(request, status, &mut None).await
+        self.handle_tagged(request, status, &mut None, &mut CallFacts::default())
+            .await
+            .ok()
     }
 
-    /// [`Self::handle`], additionally writing `tag` with the private actor tag a current managed
-    /// Claude front receives beside the reply (see [`super::host_binding::actor_tag`]).
-    async fn handle_tagged(
+    /// Parses and commits one native hook observation (the `HookSubmit` ingress) and returns its
+    /// typed reply, or the closed cause that refused it before any reply could be built.
+    ///
+    /// Only exact lifecycle correlation settles a hook: the call id must equal the transport
+    /// correlation id, the channel must be one this daemon configured, and the binding guard
+    /// decides the rest; nothing here pairs by anything looser than that.
+    async fn handle_hook(
         &self,
-        request: &AssistanceDispatch,
-        status: &mut Option<String>,
-        tag: &mut Option<String>,
-    ) -> Option<PeerReply> {
-        match request {
-            AssistanceDispatch::HookSubmit(hook) => {
-                let observation: Value =
-                    serde_json::from_str(hook.sanitized_observation_json().as_str()).ok()?;
-                let object = observation.as_object()?;
-                if self
-                    .worker
-                    .as_ref()
-                    .is_some_and(|worker| !worker.accepts_attachment(hook.opaque_attachment()))
-                {
-                    // This daemon never registered the calling attachment: its session was never
-                    // activated here, so the refused submission is bookkeeping, not a failure.
-                    if let Some(host) = observed_host(object) {
-                        log_hook_inactive(&self.hook_noise, host);
-                    }
-                    return None;
-                }
-                // Six fixed relayed fields plus the optional post-phase `tool_name` and the
-                // writer tool's optional `tool_file` (the changed file whose language alone is
-                // re-checked); any other field — for example a retired helper field — means the
-                // observation does not correlate.
-                let relayed = [
-                    "host",
-                    "phase",
-                    "actor_id",
-                    "call_id",
-                    "session_id",
-                    "agent_type",
-                    "tool_name",
-                    "tool_file",
-                ]
-                .iter()
-                .filter(|field| object.contains_key(**field))
-                .count();
-                if relayed != object.len() {
-                    return None;
-                }
-                let phase = match object.get("phase")?.as_str()? {
-                    "pre" => "PreToolUse",
-                    "post" => "PostToolUse",
-                    "post_failure" => "PostToolUseFailure",
-                    "permission_denied" => "PermissionDenied",
-                    "post_batch" => "PostToolBatch",
-                    _ => return None,
-                };
-                let event = match object.get("host")?.as_str()? {
+        hook: &crate::app::transport::HookSubmit,
+    ) -> Result<PeerReply, HostBindingCause> {
+        let observation: Value = serde_json::from_str(hook.sanitized_observation_json().as_str())
+            .or_cause(HostBindingCause::InvalidMetadata)?;
+        let object = observation
+            .as_object()
+            .or_cause(HostBindingCause::InvalidMetadata)?;
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.accepts_attachment(hook.opaque_attachment()))
+        {
+            // This daemon never registered the calling attachment: its session was never
+            // activated here, so the refused submission is bookkeeping, not a failure.
+            if let Some(host) = observed_host(object) {
+                log_hook_inactive(&self.hook_noise, host);
+            }
+            return Err(HostBindingCause::InvalidAttachment);
+        }
+        // Six fixed relayed fields plus the optional post-phase `tool_name` and the
+        // writer tool's optional `tool_file` (the changed file whose language alone is
+        // re-checked); any other field — for example a retired helper field — means the
+        // observation does not correlate.
+        let relayed = [
+            "host",
+            "phase",
+            "actor_id",
+            "call_id",
+            "session_id",
+            "agent_type",
+            "tool_name",
+            "tool_file",
+        ]
+        .iter()
+        .filter(|field| object.contains_key(**field))
+        .count();
+        if relayed != object.len() {
+            return Err(HostBindingCause::InvalidMetadata);
+        }
+        let phase = match object
+            .get("phase")
+            .and_then(Value::as_str)
+            .or_cause(HostBindingCause::MissingField)?
+        {
+            "pre" => "PreToolUse",
+            "post" => "PostToolUse",
+            "post_failure" => "PostToolUseFailure",
+            "permission_denied" => "PermissionDenied",
+            "post_batch" => "PostToolBatch",
+            _ => return Err(HostBindingCause::UnsupportedHookPhase),
+        };
+        let event = (|| {
+                    Some(match object.get("host")?.as_str()? {
                     "codex" => parse_hook_event(
                         json!({"hook_event_name":phase,"session_id":object.get("session_id")?,"agent_id":(object.get("actor_id")? != object.get("session_id")?).then_some(object.get("actor_id")?),"tool_use_id":object.get("call_id")?,"tool_name":object.get("tool_name")})
                             .to_string().as_bytes(),
@@ -586,160 +637,245 @@ impl ProductDispatcher {
                             .to_string().as_bytes(),
                     ),
                     _ => return None,
+                    })
+                })()
+                .or_cause(HostBindingCause::MissingField)?
+                .map_err(binding_cause)?;
+        if event.optional_call_id().unwrap_or("post-tool-batch") != hook.correlation_id() {
+            return Err(HostBindingCause::Mismatch);
+        }
+        let channel = self
+            .channel(hook.opaque_attachment())
+            .or_cause(HostBindingCause::InvalidAttachment)?;
+        let call_id = event.optional_call_id().map(str::to_owned);
+        // EYES-r2 §5/§6: a hook-delivering host's paired native post both triggers a
+        // project check (`triggers_check` is host-specific; T29B §4) and evaluates the
+        // due plate even when it does not trigger. Managed Codex delivers on hooks and
+        // replies at once; hosts without hook delivery take replies instead.
+        let hook_post = event.host().feed_delivery().allows_hooks()
+            && matches!(event.phase(), HookPhase::Post | HookPhase::PostFailure);
+        let triggers_check = hook_post && triggers_check(event.host(), event.tool_name());
+        // The settling post of an MCP call itself (T22B) carries a due plate only for a
+        // host whose replies can never carry one. A reply-capable host already had the
+        // first shot on this same call's terminal reply, so its settled post stays a
+        // silent carrier: everything still due reaches the next native post or reply
+        // exactly once (T29B §5).
+        let settled_plate = hook_post && !event.host().feed_delivery().allows_replies();
+        // Waiting or reading between `ide.*` calls must not discard a result the agent has
+        // not retrieved yet; only a possible writer advances the native epoch.
+        let advances_epoch = may_write(event.host(), event.tool_name());
+        // Kept for the journal line that names what advanced a native epoch.
+        let hint_cause = format!(
+            "native_hint phase={:?} tool={}",
+            event.phase(),
+            event.tool_name().unwrap_or("-")
+        );
+        let status = {
+            // Recorded under both locks (map, then guard) together with the observation
+            // itself, so no concurrent prune can drop a record whose pre is about to be
+            // pending: a pending managed Claude pre always has its attachment record.
+            let mut recorded = self
+                .pre_attachments
+                .lock()
+                .or_cause(HostBindingCause::InternalLock)?;
+            let mut bindings = self
+                .bindings
+                .lock()
+                .or_cause(HostBindingCause::InternalLock)?;
+            if self.shared_claude_channel
+                && event.host() == HostKind::Claude
+                && event.phase() == HookPhase::Pre
+                && let Some(call) = &call_id
+            {
+                if recorded.len() >= PRE_ATTACHMENT_PRUNE {
+                    recorded
+                        .retain(|(actor, call), _| bindings.has_claude_pre(actor, call, &channel));
                 }
-                .ok()?;
-                if event.optional_call_id().unwrap_or("post-tool-batch") != hook.correlation_id() {
-                    return None;
-                }
-                let channel = self.channel(hook.opaque_attachment())?;
-                let call_id = event.optional_call_id().map(str::to_owned);
-                // EYES-r2 §5/§6: a hook-delivering host's paired native post both triggers a
-                // project check (`triggers_check` is host-specific; T29B §4) and evaluates the
-                // due plate even when it does not trigger. Managed Codex delivers on hooks and
-                // replies at once; hosts without hook delivery take replies instead.
-                let hook_post = event.host().feed_delivery().allows_hooks()
-                    && matches!(event.phase(), HookPhase::Post | HookPhase::PostFailure);
-                let triggers_check = hook_post && triggers_check(event.host(), event.tool_name());
-                // The settling post of an MCP call itself (T22B) carries a due plate only for a
-                // host whose replies can never carry one. A reply-capable host already had the
-                // first shot on this same call's terminal reply, so its settled post stays a
-                // silent carrier: everything still due reaches the next native post or reply
-                // exactly once (T29B §5).
-                let settled_plate = hook_post && !event.host().feed_delivery().allows_replies();
-                // Waiting or reading between `ide.*` calls must not discard a result the agent has
-                // not retrieved yet; only a possible writer advances the native epoch.
-                let advances_epoch = may_write(event.host(), event.tool_name());
-                // Kept for the journal line that names what advanced a native epoch.
-                let hint_cause = format!(
-                    "native_hint phase={:?} tool={}",
-                    event.phase(),
-                    event.tool_name().unwrap_or("-")
+                recorded.insert(
+                    (event.actor_id().to_owned(), call.clone()),
+                    hook.opaque_attachment().to_owned(),
                 );
-                let status = {
-                    // Recorded under both locks (map, then guard) together with the observation
-                    // itself, so no concurrent prune can drop a record whose pre is about to be
-                    // pending: a pending managed Claude pre always has its attachment record.
-                    let mut recorded = self.pre_attachments.lock().ok()?;
-                    let mut bindings = self.bindings.lock().ok()?;
-                    if self.shared_claude_channel
-                        && event.host() == HostKind::Claude
-                        && event.phase() == HookPhase::Pre
-                        && let Some(call) = &call_id
-                    {
-                        if recorded.len() >= PRE_ATTACHMENT_PRUNE {
-                            recorded.retain(|(actor, call), _| {
-                                bindings.has_claude_pre(actor, call, &channel)
-                            });
-                        }
-                        recorded.insert(
-                            (event.actor_id().to_owned(), call.clone()),
-                            hook.opaque_attachment().to_owned(),
+            }
+            bindings.observe_hook(event.clone(), channel.clone())
+        };
+        match status {
+            BindingStatus::PreObserved => Ok(PeerReply::HookObserved {}),
+            BindingStatus::Settled(binding) => {
+                // Settlement itself stays silent and never rechecks; but the settled MCP
+                // call may just have completed an activation or a check, so a due status
+                // plate is still delivered on this post phase (T22B) for hosts whose
+                // replies never carry one.
+                if settled_plate
+                    && let Some(worker) = &self.worker
+                    && let Some(block) = with_git_notice(
+                        worker,
+                        &binding.binding_ref().fingerprint(),
+                        due_plate(
+                            worker.project_feed(),
+                            Some(worker),
+                            &binding.binding_ref().fingerprint(),
+                            None,
+                        ),
+                        |plate| plate.len() <= super::reply::MAX_FEEDBACK_BYTES,
+                    )
+                {
+                    return Ok(PeerReply::Feedback { text: block });
+                }
+                Ok(PeerReply::HookSettled {})
+            }
+            BindingStatus::NativeObserved(binding) => {
+                if let Some(worker) = &self.worker {
+                    // A channel with no activation has no cached result a hint could
+                    // invalidate; emitting one per native tool call is pure noise (0.6.5).
+                    if advances_epoch && worker.channel_activated(&binding) {
+                        worker.native_hint(binding.clone());
+                        errorlog::record(
+                            errorlog::Method::Hook,
+                            errorlog::Outcome::Completed,
+                            errorlog::Fields {
+                                correlation: call_id.as_deref(),
+                                detail: Some(&hint_cause),
+                                ..Default::default()
+                            },
                         );
                     }
-                    bindings.observe_hook(event.clone(), channel.clone())
-                };
-                match status {
-                    BindingStatus::PreObserved => Some(PeerReply::HookObserved {}),
-                    BindingStatus::Settled(binding) => {
-                        // Settlement itself stays silent and never rechecks; but the settled MCP
-                        // call may just have completed an activation or a check, so a due status
-                        // plate is still delivered on this post phase (T22B) for hosts whose
-                        // replies never carry one.
-                        if settled_plate
-                            && let Some(worker) = &self.worker
-                            && let Some(block) = with_git_notice(
-                                worker,
-                                &binding.binding_ref().fingerprint(),
-                                due_plate(
-                                    worker.project_feed(),
-                                    Some(worker),
-                                    &binding.binding_ref().fingerprint(),
-                                    None,
-                                ),
-                                |plate| plate.len() <= super::reply::MAX_FEEDBACK_BYTES,
-                            )
-                        {
-                            return Some(PeerReply::Feedback { text: block });
-                        }
-                        Some(PeerReply::HookSettled {})
+                    let fingerprint = binding.fingerprint();
+                    let feed = worker.project_feed().filter(|_| hook_post);
+                    if triggers_check && let Some(feed) = feed {
+                        // A writer tool that named its file makes that file's language
+                        // the forced one; `Bash` and tools without a path keep every
+                        // language on the same footing.
+                        feed.changed_file(
+                            &fingerprint,
+                            object.get("tool_file").and_then(|value| value.as_str()),
+                        );
                     }
-                    BindingStatus::NativeObserved(binding) => {
-                        if let Some(worker) = &self.worker {
-                            // A channel with no activation has no cached result a hint could
-                            // invalidate; emitting one per native tool call is pure noise (0.6.5).
-                            if advances_epoch && worker.channel_activated(&binding) {
-                                worker.native_hint(binding.clone());
-                                errorlog::record(
-                                    errorlog::Method::Hook,
-                                    errorlog::Outcome::Completed,
-                                    errorlog::Fields {
-                                        correlation: call_id.as_deref(),
-                                        detail: Some(&hint_cause),
-                                        ..Default::default()
-                                    },
-                                );
-                            }
-                            let fingerprint = binding.fingerprint();
-                            let feed = worker.project_feed().filter(|_| hook_post);
-                            if triggers_check && let Some(feed) = feed {
-                                // A writer tool that named its file makes that file's language
-                                // the forced one; `Bash` and tools without a path keep every
-                                // language on the same footing.
-                                feed.changed_file(
-                                    &fingerprint,
-                                    object.get("tool_file").and_then(|value| value.as_str()),
-                                );
-                            }
-                            let feedback =
-                                if feed.is_some_and(|feed| feed.is_read_restricted(&fingerprint)) {
-                                    None
-                                } else {
-                                    worker.take_current_feedback(binding).await
-                                };
-                            // The block is taken from in-memory snapshots only. It is skipped, and
-                            // stays due for a later hook, whenever it could not fit beside the
-                            // feedback inside one bounded hook context.
-                            let reserved = feedback.as_ref().map_or(0, |text| text.len() + 1);
-                            let block = with_git_notice(
-                                worker,
-                                &fingerprint,
-                                due_plate(feed, Some(worker), &fingerprint, feedback.as_deref()),
-                                |plate| reserved + plate.len() <= super::reply::MAX_FEEDBACK_BYTES,
-                            );
-                            let text = match (block, feedback) {
-                                (Some(block), Some(feedback)) => {
-                                    Some(format!("{block}\n{feedback}"))
-                                }
-                                (block, feedback) => block.or(feedback),
-                            };
-                            if let Some(text) = text {
-                                return Some(PeerReply::Feedback { text });
-                            }
-                        }
-                        Some(PeerReply::NativeHookObserved {})
-                    }
-                    _ => {
-                        // A hook that cannot correlate for a channel that never activated is
-                        // bookkeeping, not a failure; a channel that did activate keeps its warn.
-                        if self
-                            .bindings
-                            .lock()
-                            .is_ok_and(|bindings| !bindings.channel_bound(&channel))
-                        {
-                            log_hook_inactive(&self.hook_noise, event.host());
-                        }
+                    let feedback = if feed.is_some_and(|feed| feed.is_read_restricted(&fingerprint))
+                    {
                         None
+                    } else {
+                        worker.take_current_feedback(binding).await
+                    };
+                    // The block is taken from in-memory snapshots only. It is skipped, and
+                    // stays due for a later hook, whenever it could not fit beside the
+                    // feedback inside one bounded hook context.
+                    let reserved = feedback.as_ref().map_or(0, |text| text.len() + 1);
+                    let block = with_git_notice(
+                        worker,
+                        &fingerprint,
+                        due_plate(feed, Some(worker), &fingerprint, feedback.as_deref()),
+                        |plate| reserved + plate.len() <= super::reply::MAX_FEEDBACK_BYTES,
+                    );
+                    let text = match (block, feedback) {
+                        (Some(block), Some(feedback)) => Some(format!("{block}\n{feedback}")),
+                        (block, feedback) => block.or(feedback),
+                    };
+                    if let Some(text) = text {
+                        return Ok(PeerReply::Feedback { text });
                     }
                 }
+                Ok(PeerReply::NativeHookObserved {})
+            }
+            _ => {
+                // Refused: the cause names why, and `log_refused_hook` journals it once
+                // (a per-call warn on a channel that already holds a binding).
+                Err(match status {
+                    BindingStatus::Unavailable(reason) => binding_cause(reason),
+                    _ => HostBindingCause::Mismatch,
+                })
+            }
+        }
+    }
+
+    /// Journals one refused hook (QW-4) as a per-call `hook` warn when its channel already holds
+    /// a binding, because the call it belongs to is then refused with `missing_pre` and nothing
+    /// else would say why. Every refusal exit of [`Self::handle_hook`] is covered here, once:
+    /// a hook of a channel that never bound anything stays rate-limited bookkeeping, and a
+    /// hook whose channel cannot be resolved (unknown attachment) has no channel to be active.
+    ///
+    /// The line carries the closed refusal cause, the host, the version and the call's opaque id;
+    /// the hook payload itself is never read here.
+    fn log_refused_hook(&self, hook: &crate::app::transport::HookSubmit, cause: &HostBindingCause) {
+        let Some(channel) = self.channel(hook.opaque_attachment()) else {
+            return;
+        };
+        let Some(bound) = self
+            .bindings
+            .lock()
+            .ok()
+            .map(|bindings| bindings.channel_bound(&channel))
+        else {
+            return;
+        };
+        let host = serde_json::from_str::<Value>(hook.sanitized_observation_json().as_str())
+            .ok()
+            .and_then(|object| match object.get("host")?.as_str()? {
+                "codex" => Some(HostKind::Codex),
+                "claude" => Some(HostKind::Claude),
+                _ => None,
+            });
+        if !bound {
+            if let Some(host) = host {
+                log_hook_inactive(&self.hook_noise, host);
+            }
+            return;
+        }
+        errorlog::record(
+            errorlog::Method::Hook,
+            errorlog::Outcome::Unavailable,
+            errorlog::Fields {
+                host,
+                correlation: Some(hook.correlation_id()),
+                detail: Some(&format!("hook_refused:{}", cause.cause_tag())),
+                version: Some(env!("CARGO_PKG_VERSION")),
+                request: Some(hook.correlation_id()),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Parses and commits one ingress request, additionally writing `tag` with the private actor
+    /// tag a current managed Claude front receives beside the reply (see
+    /// [`super::host_binding::actor_tag`]).
+    ///
+    /// Returns the typed reply, or `Err(cause)` when an ingress step refused before any reply
+    /// could be built (malformed or oversized envelope, unknown host or phase, invalid
+    /// parameters, an unknown attachment, a call id that differs from its correlation id, a
+    /// poisoned daemon lock, a failed guard). `dispatch` answers `Err(cause)` as
+    /// `unavailable: host_binding` carrying that closed cause, so no early exit is cause-less
+    /// (QW-6). The cause is a closed enum value: nothing from the request is echoed back.
+    ///
+    /// `facts` is written, as far as the request got, with the closed journal context the ingress
+    /// established (QW-4): the validated binding and its activation role.
+    async fn handle_tagged(
+        &self,
+        request: &AssistanceDispatch,
+        status: &mut Option<String>,
+        tag: &mut Option<String>,
+        facts: &mut CallFacts,
+    ) -> Result<PeerReply, HostBindingCause> {
+        match request {
+            AssistanceDispatch::HookSubmit(hook) => {
+                let result = self.handle_hook(hook).await;
+                if let Err(cause) = &result {
+                    self.log_refused_hook(hook, cause);
+                }
+                result
             }
             AssistanceDispatch::MethodDispatch(method) => {
-                let envelope: Value = serde_json::from_str(method.params_json().as_str()).ok()?;
-                let object = envelope.as_object()?;
+                let envelope: Value = serde_json::from_str(method.params_json().as_str())
+                    .or_cause(HostBindingCause::InvalidMetadata)?;
+                let object = envelope
+                    .as_object()
+                    .or_cause(HostBindingCause::InvalidMetadata)?;
                 if object.len() != 2 {
-                    return None;
+                    return Err(HostBindingCause::InvalidMetadata);
                 }
-                let meta = object.get("host_meta")?.as_object()?;
-                let host = parse_host_kind(meta).ok()?;
+                let meta = object
+                    .get("host_meta")
+                    .and_then(Value::as_object)
+                    .or_cause(HostBindingCause::MissingField)?;
+                let host = parse_host_kind(meta).map_err(binding_cause)?;
                 let tool = match method.method() {
                     AssistanceMethod::Start => super::facade::AssistanceTool::Start,
                     AssistanceMethod::Context => super::facade::AssistanceTool::Context,
@@ -752,10 +888,16 @@ impl ProductDispatcher {
                     AssistanceMethod::Symbol => super::facade::AssistanceTool::Symbol,
                     AssistanceMethod::Graph => super::facade::AssistanceTool::Graph,
                     AssistanceMethod::Test => super::facade::AssistanceTool::Test,
-                    AssistanceMethod::HookSubmit => return None,
+                    AssistanceMethod::HookSubmit => return Err(HostBindingCause::InvalidMetadata),
                 };
-                let call =
-                    super::facade::validate_call(tool, object.get("parameters")?.clone()).ok()?;
+                let call = super::facade::validate_call(
+                    tool,
+                    object
+                        .get("parameters")
+                        .or_cause(HostBindingCause::InvalidParameters)?
+                        .clone(),
+                )
+                .or_cause(HostBindingCause::InvalidParameters)?;
                 if self
                     .worker
                     .as_ref()
@@ -763,12 +905,14 @@ impl ProductDispatcher {
                 {
                     // This daemon never registered the calling attachment, so it has also never
                     // received a hook on its channel (T15B).
-                    return Some(PeerReply::Unavailable {
+                    return Ok(PeerReply::Unavailable {
                         reason: MissingPeer::HostBinding,
                         cause: Some(HostBindingCause::HooksNotDelivered),
                     });
                 }
-                let channel = self.channel(method.opaque_attachment())?;
+                let channel = self
+                    .channel(method.opaque_attachment())
+                    .or_cause(HostBindingCause::InvalidAttachment)?;
                 // Trusted re-activation ingress (T15B restart recovery): the managed Claude MCP
                 // marks the start that re-runs a remembered activation after the daemon it had
                 // activated on was replaced. The marker rides host metadata, never model
@@ -821,7 +965,7 @@ impl ProductDispatcher {
                     Some(tags) => match actor_tags(tags) {
                         Some(tags) => Some(tags),
                         None => {
-                            return Some(PeerReply::Unavailable {
+                            return Ok(PeerReply::Unavailable {
                                 reason: MissingPeer::HostBinding,
                                 cause: Some(HostBindingCause::InvalidMetadata),
                             });
@@ -858,14 +1002,18 @@ impl ProductDispatcher {
                     }
                 }
                 if let Some(real) = whois {
-                    let owner = self.bindings.lock().ok()?.claude_pre_owner(real, &channel);
+                    let owner = self
+                        .bindings
+                        .lock()
+                        .or_cause(HostBindingCause::InternalLock)?
+                        .claude_pre_owner(real, &channel);
                     *tag = Some(
                         owner
                             .as_deref()
                             .map(super::host_binding::actor_tag)
                             .unwrap_or_default(),
                     );
-                    return Some(PeerReply::Unavailable {
+                    return Ok(PeerReply::Unavailable {
                         reason: MissingPeer::HostBinding,
                         cause: owner.err().and_then(HostBindingCause::from_binding),
                     });
@@ -878,7 +1026,10 @@ impl ProductDispatcher {
                         AssistanceMethod::Start | AssistanceMethod::Stop
                     )
                 {
-                    let bindings = self.bindings.lock().ok()?;
+                    let bindings = self
+                        .bindings
+                        .lock()
+                        .or_cause(HostBindingCause::InternalLock)?;
                     if let Some(actor) =
                         bindings.claude_pre_actor(method.correlation_id(), &channel)
                         && bindings.claude_never_bound(&actor, &channel)
@@ -888,7 +1039,7 @@ impl ProductDispatcher {
                             .is_some_and(|tags| tags.contains(&actor.as_str()))
                     {
                         *tag = Some(actor);
-                        return Some(PeerReply::Unavailable {
+                        return Ok(PeerReply::Unavailable {
                             reason: MissingPeer::HostBinding,
                             cause: Some(HostBindingCause::RecoveryNeeded),
                         });
@@ -915,7 +1066,7 @@ impl ProductDispatcher {
                         .as_deref()
                         != Some(expected)
                 {
-                    return Some(mismatch);
+                    return Ok(mismatch);
                 }
                 // A start activates the worktree its own pre arrived through (managed Claude);
                 // every other call, and every other daemon, keeps the calling attachment. The
@@ -929,7 +1080,7 @@ impl ProductDispatcher {
                     {
                         self.bindings
                             .lock()
-                            .ok()?
+                            .or_cause(HostBindingCause::InternalLock)?
                             .claude_pre_actor(method.correlation_id(), &channel)
                     }
                     _ => None,
@@ -959,7 +1110,7 @@ impl ProductDispatcher {
                         .as_ref()
                         .is_none_or(|worker| worker.target(attachment).is_some())
                 }) else {
-                    return Some(PeerReply::Error {
+                    return Ok(PeerReply::Error {
                         code: super::reply::FailureCode::LauncherConfiguration,
                         detail: None,
                     });
@@ -977,7 +1128,10 @@ impl ProductDispatcher {
                         && invocation.binding_ref() == &invocation.binding_ref().channel_identity()
                 };
                 let invocation = {
-                    let mut bindings = self.bindings.lock().ok()?;
+                    let mut bindings = self
+                        .bindings
+                        .lock()
+                        .or_cause(HostBindingCause::InternalLock)?;
                     if let Some(expected) = expected
                         && !reactivation
                         && bindings
@@ -987,7 +1141,7 @@ impl ProductDispatcher {
                             .as_deref()
                             != Some(expected)
                     {
-                        return Some(mismatch);
+                        return Ok(mismatch);
                     }
                     // This exact call's own genuine pre is hook evidence too, even once the
                     // guard below consumes it: a refusal then names the missing binding, never
@@ -1003,13 +1157,13 @@ impl ProductDispatcher {
                             .as_ref()
                             != Some(actor)
                     {
-                        return Some(mismatch);
+                        return Ok(mismatch);
                     }
                     let status = match host {
                         HostKind::Codex => {
-                            let candidate = parse_candidate(meta).ok()?;
+                            let candidate = parse_candidate(meta).map_err(binding_cause)?;
                             if candidate.call_id() != method.correlation_id() {
-                                return None;
+                                return Err(HostBindingCause::Mismatch);
                             }
                             if self.managed_codex && method.method() == AssistanceMethod::Start {
                                 bindings.establish_managed_codex_start(candidate, channel.clone())
@@ -1027,9 +1181,9 @@ impl ProductDispatcher {
                             }
                         }
                         HostKind::Claude => {
-                            let call_id = parse_claude_call_id(meta).ok()?;
+                            let call_id = parse_claude_call_id(meta).map_err(binding_cause)?;
                             if call_id != method.correlation_id() {
-                                return None;
+                                return Err(HostBindingCause::Mismatch);
                             }
                             if method.method() == AssistanceMethod::Start && reactivation {
                                 match reactivation_actor.clone() {
@@ -1060,7 +1214,7 @@ impl ProductDispatcher {
                             let hooks_delivered =
                                 own_pre || bindings.channel_observed_hook(&channel);
                             drop(bindings);
-                            return Some(PeerReply::Unavailable {
+                            return Ok(PeerReply::Unavailable {
                                 reason: MissingPeer::HostBinding,
                                 cause: host_binding_cause(
                                     self.worker.as_ref(),
@@ -1070,25 +1224,34 @@ impl ProductDispatcher {
                                 ),
                             });
                         }
-                        return None;
+                        return Err(HostBindingCause::Mismatch);
                     };
                     if method.method() == AssistanceMethod::Stop {
-                        bindings.stop_binding(invocation.binding_ref()).ok()?;
+                        bindings
+                            .stop_binding(invocation.binding_ref())
+                            .map_err(binding_cause)?;
                     } else if !stopped(&invocation) {
-                        bindings.consume_active(invocation.binding_ref()).ok()?;
+                        bindings
+                            .consume_active(invocation.binding_ref())
+                            .map_err(binding_cause)?;
                     }
                     invocation
                 };
                 // Only a read-only call answers a stopped generation: its reply stays plate-free
                 // and touches no worktree state, like `ide.stop`'s own.
                 let stopped = stopped(&invocation);
+                facts.binding = Some(invocation.binding_ref().clone());
+                facts.role = self
+                    .worker
+                    .as_ref()
+                    .and_then(|worker| worker.role_of(invocation.binding_ref()));
                 let Some(worker) = &self.worker else {
-                    return Some(if method.method() == AssistanceMethod::Stop {
+                    return Ok(if method.method() == AssistanceMethod::Stop {
                         PeerReply::HostStopped {}
                     } else {
                         PeerReply::Unavailable {
                             reason: MissingPeer::WorkspaceActivation,
-                            cause: None,
+                            cause: Some(HostBindingCause::WorkerUnavailable),
                         }
                     });
                 };
@@ -1119,13 +1282,17 @@ impl ProductDispatcher {
                         worker.stop(invocation, method.opaque_attachment()).await
                     }
                     AssistanceMethod::Inspect => {
+                        let inspection = worker.inspect(
+                            invocation.binding_ref().clone(),
+                            call.parameters()["detail_ref"]
+                                .as_str()
+                                .or_cause(HostBindingCause::InvalidParameters)?
+                                .to_owned(),
+                            method.opaque_attachment(),
+                            None,
+                        );
                         worker
-                            .inspect(
-                                invocation.binding_ref().clone(),
-                                call.parameters()["detail_ref"].as_str()?.to_owned(),
-                                method.opaque_attachment(),
-                                None,
-                            )
+                            .with_delivery(facts.delivery.clone(), inspection)
                             .await
                     }
                     AssistanceMethod::Context
@@ -1140,13 +1307,15 @@ impl ProductDispatcher {
                             .await
                     }
                     _ => {
+                        let submission = worker.submit(
+                            invocation,
+                            tool,
+                            call.parameters().clone(),
+                            &target_attachment,
+                            Some(method.correlation_id()),
+                        );
                         worker
-                            .submit(
-                                invocation,
-                                tool,
-                                call.parameters().clone(),
-                                &target_attachment,
-                            )
+                            .with_delivery(facts.delivery.clone(), submission)
                             .await
                     }
                 };
@@ -1193,7 +1362,7 @@ impl ProductDispatcher {
                         });
                     }
                 }
-                Some(reply)
+                Ok(reply)
             }
         }
     }
@@ -1282,12 +1451,13 @@ impl AssistanceDispatcher for ProductDispatcher {
             let started = std::time::Instant::now();
             let mut status = None;
             let mut tag = None;
+            let mut facts = CallFacts::default();
             let mut result = self
-                .handle_tagged(&request, &mut status, &mut tag)
+                .handle_tagged(&request, &mut status, &mut tag, &mut facts)
                 .await
-                .unwrap_or(PeerReply::Unavailable {
+                .unwrap_or_else(|cause| PeerReply::Unavailable {
                     reason: MissingPeer::HostBinding,
-                    cause: None,
+                    cause: Some(cause),
                 });
             // Hook payloads are intentionally never accepted by telemetry adapters or the log.
             if let AssistanceDispatch::MethodDispatch(method) = &request {
@@ -1306,9 +1476,15 @@ impl AssistanceDispatcher for ProductDispatcher {
                     AssistanceMethod::HookSubmit => None,
                 };
                 if let Some(tool) = tool {
-                    let parameters = serde_json::from_str::<Value>(method.params_json().as_str())
-                        .ok()
+                    let envelope =
+                        serde_json::from_str::<Value>(method.params_json().as_str()).ok();
+                    let parameters = envelope
+                        .as_ref()
                         .and_then(|envelope| envelope.get("parameters").cloned());
+                    let host = envelope
+                        .as_ref()
+                        .and_then(|envelope| envelope.get("host_meta")?.as_object())
+                        .and_then(|meta| parse_host_kind(meta).ok());
                     let requested = parameters.as_ref().and_then(|parameters| {
                         parameters
                             .get("detail_ref")
@@ -1323,11 +1499,51 @@ impl AssistanceDispatcher for ProductDispatcher {
                     {
                         *detail = Some(super::facade::staged_detail(tool, code, parameters));
                     }
+                    // The role is read before the call ran; a start has none yet, so it reads the
+                    // role the activation just took.
+                    let role = facts.role.or_else(|| {
+                        let (worker, binding) = (self.worker.as_ref()?, facts.binding.as_ref()?);
+                        worker.role_of(binding)
+                    });
+                    // An inspection names the call that queued the result it asks for, and a
+                    // finished answer takes the degraded mark its job left for this call (a
+                    // `pending` answer leaves it for the job's completion record).
+                    let origin = requested
+                        .as_deref()
+                        .and_then(|reference| self.worker.as_ref()?.request_of(reference));
+                    let degraded = !matches!(result, PeerReply::Pending { .. })
+                        && self.worker.as_ref().is_some_and(|worker| {
+                            worker.take_degraded(method.correlation_id())
+                                || requested
+                                    .as_deref()
+                                    .is_some_and(|reference| worker.reference_degraded(reference))
+                        });
+                    // The inspection this very call performed says whether it delivered a retained
+                    // terminal result (a flag of this call alone); only a call that retrieves a
+                    // result by reference carries it.
+                    let delivered = requested
+                        .as_ref()
+                        .map(|_| facts.delivery.load(std::sync::atomic::Ordering::Acquire));
+                    // The front's actor query is the product's own probe, not an agent's call.
+                    let probe = envelope
+                        .as_ref()
+                        .and_then(|envelope| envelope.get("host_meta")?.get("claudecode/whois"))
+                        .map(|_| "whois");
                     adapters::log_tool_reply(
                         tool,
                         &result,
                         started.elapsed(),
                         requested.as_deref(),
+                        &adapters::DispatchContext {
+                            host,
+                            role,
+                            request: Some(method.correlation_id()),
+                            origin: origin.as_deref(),
+                            degraded,
+                            delivered,
+                            probe,
+                            parameters: parameters.as_ref(),
+                        },
                     );
                     if let Some(telemetry) = self.worker.as_ref().and_then(WorkerHandle::telemetry)
                     {
@@ -1462,6 +1678,119 @@ async fn host_shaped_mixed_metadata_is_unavailable_at_daemon_ingress() {
     assert_eq!(dispatcher.handle(&request, &mut None).await, None);
 }
 
+/// QW-6: no early exit of the dispatcher answers a bare `unavailable: host_binding`; each names
+/// its closed cause (malformed envelope, invalid parameters, unknown hook phase, mismatched call).
+#[tokio::test]
+async fn ingress_exits_name_a_typed_cause() {
+    use crate::app::transport::{HookSubmit, MethodDispatch, OpaqueJson};
+
+    let dispatcher = ProductDispatcher::default();
+    let method = |params: Value, name: AssistanceMethod| {
+        AssistanceDispatch::MethodDispatch(
+            MethodDispatch::new(
+                "request",
+                "call",
+                "attachment",
+                name,
+                OpaqueJson::from_value(&params, 64 * 1024).unwrap(),
+            )
+            .unwrap(),
+        )
+    };
+    // The serialized reply the front receives from `dispatch`, decoded: a refused ingress is
+    // `unavailable: host_binding`, and the test fails on a bare one (no cause).
+    let cause_of = |request: AssistanceDispatch| {
+        let dispatcher = &dispatcher;
+        async move {
+            let reply = match dispatcher.dispatch(request).await.unwrap() {
+                AssistanceDispatchReply::HookSubmit(reply)
+                | AssistanceDispatchReply::MethodDispatch(reply) => reply,
+            };
+            match PeerReply::decode(reply.as_str()).unwrap() {
+                PeerReply::Unavailable {
+                    reason: MissingPeer::HostBinding,
+                    cause: Some(cause),
+                } => cause,
+                other => panic!("expected a typed host_binding refusal, got {other:?}"),
+            }
+        }
+    };
+    // Envelope with a stray key: invalid metadata.
+    assert_eq!(
+        cause_of(method(
+            json!({"parameters":{},"host_meta":{},"extra":1}),
+            AssistanceMethod::Context
+        ))
+        .await,
+        HostBindingCause::InvalidMetadata
+    );
+    // No `host_meta` object: a missing field.
+    assert_eq!(
+        cause_of(method(
+            json!({"parameters":{},"x":1}),
+            AssistanceMethod::Context
+        ))
+        .await,
+        HostBindingCause::MissingField
+    );
+    // A hook with an unsupported phase.
+    let hook = |phase: &str| {
+        AssistanceDispatch::HookSubmit(
+            HookSubmit::new(
+                "request",
+                "call",
+                "attachment",
+                OpaqueJson::from_value(
+                    &json!({"host":"claude","phase":phase,"actor_id":"s","call_id":"call","session_id":"s","agent_type":null}),
+                    64 * 1024,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+    };
+    assert_eq!(
+        cause_of(hook("bogus")).await,
+        HostBindingCause::UnsupportedHookPhase
+    );
+    // A daemon lock poisoned by an earlier fault: a valid Claude pre can no longer be recorded.
+    let poisoned = ProductDispatcher {
+        managed_claude: true,
+        shared_claude_channel: true,
+        ..ProductDispatcher::default()
+    };
+    let _ = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let _guard = poisoned.pre_attachments.lock().unwrap();
+                panic!("poison the pre-attachment map");
+            })
+            .join()
+    });
+    let reply = match poisoned.dispatch(hook("pre")).await.unwrap() {
+        AssistanceDispatchReply::HookSubmit(reply)
+        | AssistanceDispatchReply::MethodDispatch(reply) => {
+            PeerReply::decode(reply.as_str()).unwrap()
+        }
+    };
+    assert_eq!(
+        reply,
+        PeerReply::Unavailable {
+            reason: MissingPeer::HostBinding,
+            cause: Some(HostBindingCause::InternalLock),
+        }
+    );
+    // Valid envelope, but parameters the daemon's validator rejects: invalid parameters.
+    assert_eq!(
+        cause_of(method(
+            json!({"parameters":{"nope":1},"host_meta":{"claudecode/toolUseId":"call"}}),
+            AssistanceMethod::Read
+        ))
+        .await,
+        HostBindingCause::InvalidParameters
+    );
+}
+
 /// An anonymous (0.10.2-slot) re-activation names the real call and binds its actor only when
 /// that call's pre came through the calling front's own attachment: a subagent's pending start
 /// that arrived through another attachment never lends its actor to the slot.
@@ -1527,9 +1856,117 @@ async fn anonymous_reactivation_binds_only_its_own_attachments_named_call() {
             .await,
         Some(PeerReply::Unavailable {
             reason: MissingPeer::WorkspaceActivation,
-            cause: None,
+            cause: Some(HostBindingCause::WorkerUnavailable),
         })
     );
+}
+
+/// QW-4: a hook the daemon refuses on a channel that already holds a binding leaves one warn per
+/// call with a closed reason and the call's opaque id, while the same refusal on a channel that
+/// never bound anything stays bookkeeping (no per-call warn).
+#[tokio::test]
+async fn refused_hook_of_an_active_channel_leaves_a_per_call_warn() {
+    use crate::app::transport::{HookSubmit, MethodDispatch, OpaqueJson};
+
+    let dispatcher = ProductDispatcher::default();
+    let hook = |phase: &str, call: &str, attachment: &str| {
+        AssistanceDispatch::HookSubmit(
+            HookSubmit::new(
+                "request-1",
+                call,
+                attachment,
+                OpaqueJson::from_value(
+                    &json!({"host":"claude","phase":phase,"actor_id":"session","call_id":call,"session_id":"session","agent_type":null}),
+                    64 * 1024,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+    };
+    // A channel that never bound anything: refusals are bookkeeping, not warns.
+    errorlog::capture_start();
+    assert_eq!(
+        dispatcher
+            .handle(&hook("post", "ghost", "idle"), &mut None)
+            .await,
+        None
+    );
+    assert!(
+        errorlog::capture_take()
+            .iter()
+            .all(|event| event.detail.as_deref() != Some("hook_refused:active_channel"))
+    );
+
+    // Bind the channel: a pre, then the start it paired.
+    assert_eq!(
+        dispatcher
+            .handle(&hook("pre", "c1", "home"), &mut None)
+            .await,
+        Some(PeerReply::HookObserved {})
+    );
+    let start = AssistanceDispatch::MethodDispatch(
+        MethodDispatch::new(
+            "request-2",
+            "c1",
+            "home",
+            AssistanceMethod::Start,
+            OpaqueJson::from_value(
+                &json!({"parameters":{},"host_meta":{"claudecode/toolUseId":"c1"}}),
+                64 * 1024,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    );
+    dispatcher.handle(&start, &mut None).await;
+    // The same unmatched post on the now-bound channel is a per-call warn, and so is every
+    // repeated refused pre (a payload call id that differs from the transport correlation id):
+    // one warn per refusal, none rate limited, none doubled.
+    let mismatched_pre = |payload_call: &str, transport_call: &str| {
+        AssistanceDispatch::HookSubmit(
+            HookSubmit::new(
+                "request-1",
+                transport_call,
+                "home",
+                OpaqueJson::from_value(
+                    &json!({"host":"claude","phase":"pre","actor_id":"session","call_id":payload_call,"session_id":"session","agent_type":null}),
+                    64 * 1024,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+    };
+    errorlog::capture_start();
+    assert_eq!(
+        dispatcher
+            .handle(&hook("post", "ghost", "home"), &mut None)
+            .await,
+        None
+    );
+    for transport_call in ["t-1", "t-2"] {
+        assert_eq!(
+            dispatcher
+                .handle(&mismatched_pre("p-1", transport_call), &mut None)
+                .await,
+            None
+        );
+    }
+    let events = errorlog::capture_take();
+    let warns = events
+        .iter()
+        .filter(|event| event.method == "hook")
+        .collect::<Vec<_>>();
+    assert_eq!(warns.len(), 3, "one warn per refusal: {events:?}");
+    assert!(warns.iter().all(|warn| warn.level == "warn"));
+    assert_eq!(warns[0].correlation.as_deref(), Some("ghost"));
+    assert_eq!(warns[0].request.as_deref(), Some("ghost"));
+    assert_eq!(warns[0].detail.as_deref(), Some("hook_refused:mismatch"));
+    assert_eq!(warns[1].detail.as_deref(), Some("hook_refused:mismatch"));
+    assert_eq!(warns[2].detail.as_deref(), Some("hook_refused:mismatch"));
+    assert_eq!(warns[1].correlation.as_deref(), Some("t-1"));
+    assert_eq!(warns[2].correlation.as_deref(), Some("t-2"));
 }
 
 /// A correlated Claude request remains unavailable when this dispatcher has no configured worker.
@@ -1581,7 +2018,7 @@ async fn claude_start_without_worker_is_unavailable_after_correlation() {
         dispatcher.handle(&method, &mut None).await,
         Some(PeerReply::Unavailable {
             reason: MissingPeer::WorkspaceActivation,
-            cause: None
+            cause: Some(HostBindingCause::WorkerUnavailable)
         })
     );
 
@@ -1628,7 +2065,7 @@ async fn claude_start_without_worker_is_unavailable_after_correlation() {
         dispatcher.handle(&next_method, &mut None).await,
         Some(PeerReply::Unavailable {
             reason: MissingPeer::WorkspaceActivation,
-            cause: None
+            cause: Some(HostBindingCause::WorkerUnavailable)
         })
     );
 }

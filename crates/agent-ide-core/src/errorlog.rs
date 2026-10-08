@@ -110,6 +110,25 @@ impl Method {
     }
 }
 
+/// Role of the activation a journaled call belongs to (QW-4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Role {
+    /// A read-only activation: it never edits and owns no provider session of its own.
+    Reader,
+    /// The worktree's writing activation.
+    Writer,
+}
+
+impl Role {
+    /// Renders the closed lowercase tag used in the log line.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reader => "reader",
+            Self::Writer => "writer",
+        }
+    }
+}
+
 /// Closed severity class, always a pure function of [`Outcome`] so it can never disagree with it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Level {
@@ -169,6 +188,10 @@ pub enum Outcome {
     LeaseClosed,
     /// An event was deliberately not acted on because its session never activated; not a failure.
     Skipped,
+    /// A call succeeded, but through a weaker path than the caller asked for (a lexical answer
+    /// instead of the language server's, post-edit diagnostics left unknown): not a failure, but
+    /// not a full success either (QW-4).
+    Degraded,
 }
 
 impl Outcome {
@@ -192,6 +215,7 @@ impl Outcome {
             Self::LeaseOpened => "lease_opened",
             Self::LeaseClosed => "lease_closed",
             Self::Skipped => "skipped",
+            Self::Degraded => "degraded",
         }
     }
 
@@ -205,6 +229,7 @@ impl Outcome {
             | Self::Unavailable
             | Self::Cancelled
             | Self::Refused
+            | Self::Degraded
             | Self::Timeout => Level::Warn,
             Self::Completed
             | Self::Pending
@@ -691,6 +716,35 @@ pub struct Fields<'a> {
     pub count: Option<u64>,
     /// Elapsed wall-clock duration of the logged operation, saturated to whole milliseconds.
     pub duration_ms: Option<u32>,
+    /// The serving product version (`CARGO_PKG_VERSION`), on dispatch lines (QW-4).
+    pub version: Option<&'static str>,
+    /// Whether the calling activation is a reader or a writer, when it has one (QW-4).
+    pub role: Option<Role>,
+    /// Registered language identifier of the request's file, when it names one (QW-4).
+    pub language: Option<&'static str>,
+    /// Closed request form, derived from the request's parameter *names* only (QW-4).
+    pub form: Option<&'a str>,
+    /// Opaque transport request id shared by the front's call, the daemon's dispatch line and the
+    /// job the call queued (QW-4); never model text.
+    pub request: Option<&'a str>,
+    /// `false` when the request was refused as input (it never validated), `true` when it was a
+    /// well-formed request; absent when the line does not describe a request (QW-4).
+    pub eligible: Option<bool>,
+    /// `true` on a call's own dispatch or front line (QW-4): every context field the call could
+    /// not name is then written as an explicit closed value (`host` `unknown`, `role`, `language`,
+    /// `form` and `request` `none`; a file no registered language owns is `language` `unknown`),
+    /// so the field is present on every such line and an absent value is never a missing one.
+    pub dispatch: bool,
+    /// Request id of the call that queued the job a line is about, on an inspection's line (QW-4);
+    /// the inspection's own call id stays in `request`.
+    pub origin: Option<&'a str>,
+    /// On an inspection's line: whether the inspection delivered a retained result to its caller,
+    /// as the inspection path itself reports (QW-4) — a delivered failed result is delivered, a
+    /// refused retrieval is not. Absent on a line that retrieves nothing.
+    pub delivered: Option<bool>,
+    /// A trusted internal probe the product sends itself (not an agent's tool call), for example
+    /// `whois`, the front's actor query (QW-4); the report keeps such lines out of its call counts.
+    pub probe: Option<&'static str>,
 }
 
 /// Records one event, best-effort: never blocks, never panics, never surfaces an error.
@@ -699,6 +753,10 @@ pub struct Fields<'a> {
 /// otherwise unavailable. `level` is derived from `outcome` (see [`Outcome::level`]) so it can
 /// never disagree with it.
 pub fn record(method: Method, outcome: Outcome, fields: Fields<'_>) {
+    #[cfg(test)]
+    if capture_line(&build_line(method, outcome, fields, 0)) {
+        return;
+    }
     let Some(Some(writer)) = WRITER.get() else {
         return;
     };
@@ -707,6 +765,38 @@ pub fn record(method: Method, outcome: Outcome, fields: Fields<'_>) {
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
     writer.append(&build_line(method, outcome, fields, timestamp));
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Lines [`record`] captured on this thread while a unit test holds a capture open (the
+    /// process-wide writer is shared by every test of the crate, so a test cannot read it back).
+    static CAPTURED: std::cell::RefCell<Option<Vec<LoggedEvent>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Appends `line` to this thread's open capture; reports whether a capture swallowed it.
+#[cfg(test)]
+fn capture_line(line: &[u8]) -> bool {
+    CAPTURED.with(|captured| match captured.borrow_mut().as_mut() {
+        Some(events) => {
+            events.extend(parse_line(&String::from_utf8_lossy(line)));
+            true
+        }
+        None => false,
+    })
+}
+
+/// Opens a capture on this thread: every [`record`] call until [`capture_take`] is decoded into
+/// the capture instead of being written. Unit tests on a single-threaded runtime only.
+#[cfg(test)]
+pub(crate) fn capture_start() {
+    CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+}
+
+/// Closes this thread's capture and returns what it caught, oldest first.
+#[cfg(test)]
+pub(crate) fn capture_take() -> Vec<LoggedEvent> {
+    CAPTURED.with(|captured| captured.borrow_mut().take().unwrap_or_default())
 }
 
 std::thread_local! {
@@ -862,6 +952,67 @@ pub(crate) fn build_line(
     if let Some(count) = fields.count {
         object.insert("count".to_owned(), serde_json::Value::Number(count.into()));
     }
+    if let Some(version) = fields.version {
+        object.insert(
+            "version".to_owned(),
+            serde_json::Value::String(version.to_owned()),
+        );
+    }
+    if let Some(role) = fields.role {
+        object.insert(
+            "role".to_owned(),
+            serde_json::Value::String(role.as_str().to_owned()),
+        );
+    }
+    if let Some(language) = fields.language {
+        object.insert(
+            "language".to_owned(),
+            serde_json::Value::String(language.to_owned()),
+        );
+    }
+    if let Some(form) = fields.form {
+        object.insert(
+            "form".to_owned(),
+            serde_json::Value::String(form.to_owned()),
+        );
+    }
+    if let Some(request) = fields.request {
+        object.insert(
+            "request".to_owned(),
+            serde_json::Value::String(bounded_detail(request).to_owned()),
+        );
+    }
+    if let Some(eligible) = fields.eligible {
+        object.insert("eligible".to_owned(), serde_json::Value::Bool(eligible));
+    }
+    if let Some(origin) = fields.origin {
+        object.insert(
+            "origin".to_owned(),
+            serde_json::Value::String(bounded_detail(origin).to_owned()),
+        );
+    }
+    if let Some(delivered) = fields.delivered {
+        object.insert("delivered".to_owned(), serde_json::Value::Bool(delivered));
+    }
+    if let Some(probe) = fields.probe {
+        object.insert(
+            "probe".to_owned(),
+            serde_json::Value::String(probe.to_owned()),
+        );
+    }
+    if fields.dispatch {
+        for (name, unknown) in [
+            ("host", "unknown"),
+            ("role", "none"),
+            ("language", "none"),
+            ("form", "none"),
+            ("request", "none"),
+        ] {
+            object
+                .entry(name.to_owned())
+                .or_insert_with(|| serde_json::Value::String(unknown.to_owned()));
+        }
+    }
     if let Some(duration_ms) = fields.duration_ms {
         object.insert(
             "duration_ms".to_owned(),
@@ -959,6 +1110,33 @@ pub struct LoggedEvent {
     /// Elapsed duration of the logged operation in milliseconds, when the event carried one.
     #[serde(default)]
     pub duration_ms: Option<u32>,
+    /// Serving product version, when the event carried one.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// `reader` or `writer`, when the event carried one.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Registered language identifier, when the event carried one.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Closed request form, when the event carried one.
+    #[serde(default)]
+    pub form: Option<String>,
+    /// Opaque transport request id, when the event carried one.
+    #[serde(default)]
+    pub request: Option<String>,
+    /// Whether the request was well formed, when the event carried the flag.
+    #[serde(default)]
+    pub eligible: Option<bool>,
+    /// Request id of the call that queued the inspected job, when the event carried one.
+    #[serde(default)]
+    pub origin: Option<String>,
+    /// Whether an inspection delivered a retained result, when the event carried the flag.
+    #[serde(default)]
+    pub delivered: Option<bool>,
+    /// The internal probe the event describes, when it is not an agent's call.
+    #[serde(default)]
+    pub probe: Option<String>,
 }
 
 impl Default for LoggedEvent {
@@ -975,6 +1153,15 @@ impl Default for LoggedEvent {
             correlation: None,
             detail: None,
             duration_ms: None,
+            version: None,
+            role: None,
+            language: None,
+            form: None,
+            request: None,
+            eligible: None,
+            origin: None,
+            delivered: None,
+            probe: None,
         }
     }
 }
@@ -1284,6 +1471,43 @@ mod tests {
         assert_eq!(events[0].correlation.as_deref(), Some("detail-ref-42"));
         assert_eq!(events[0].duration_ms, Some(7));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// QW-4: a dispatch line carries the closed context fields, and the reader decodes them back;
+    /// a line without them still decodes (older journals), and a degraded success is a `warn`.
+    #[test]
+    fn dispatch_context_fields_round_trip_and_older_lines_still_decode() {
+        let line = build_line(
+            Method::Context,
+            Outcome::Degraded,
+            Fields {
+                version: Some("1.2.3"),
+                host: Some(HostKind::Claude),
+                role: Some(Role::Reader),
+                language: Some("alpha"),
+                form: Some("file"),
+                request: Some("req-1"),
+                eligible: Some(true),
+                ..Default::default()
+            },
+            0,
+        );
+        let event = parse_line(std::str::from_utf8(&line).unwrap()).unwrap();
+        assert_eq!(event.level, "warn");
+        assert_eq!(event.outcome, "degraded");
+        assert_eq!(event.version.as_deref(), Some("1.2.3"));
+        assert_eq!(event.host.as_deref(), Some("claude"));
+        assert_eq!(event.role.as_deref(), Some("reader"));
+        assert_eq!(event.language.as_deref(), Some("alpha"));
+        assert_eq!(event.form.as_deref(), Some("file"));
+        assert_eq!(event.request.as_deref(), Some("req-1"));
+        assert_eq!(event.eligible, Some(true));
+        let old = parse_line(r#"{"ts":"x","level":"info","method":"read","outcome":"completed"}"#)
+            .unwrap();
+        assert_eq!(
+            (old.version, old.role, old.form, old.eligible),
+            (None, None, None, None)
+        );
     }
 
     #[test]

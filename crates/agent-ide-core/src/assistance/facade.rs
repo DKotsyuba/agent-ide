@@ -655,6 +655,22 @@ const CONTEXT_TARGET_MESSAGE: &str =
 /// Model-facing text for an outline request without its required path.
 const OUTLINE_TARGET_MESSAGE: &str = "invalid bounded parameters: ide.outline needs \"path\" (a file or directory relative to the worktree root)";
 
+/// The closed request form of one call for the journal (QW-4): the names of the parameters the
+/// tool defines that the call carries, in the tool's own order, joined by `+` (for example
+/// `path+lines`). Only fixed field names ever appear, never a value or a name the model chose, so
+/// the result is bounded by the tool's field list.
+pub(crate) fn request_form(tool: AssistanceTool, parameters: &Value) -> String {
+    let Some(object) = parameters.as_object() else {
+        return String::new();
+    };
+    allowed_fields(tool)
+        .iter()
+        .filter(|field| object.contains_key(**field))
+        .copied()
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
 /// Returns the closed allowed field list for one logical tool.
 fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
     match tool {
@@ -3404,7 +3420,30 @@ impl StdioFacade {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let stage_parameters = parameters.clone();
+        let call_started = std::time::Instant::now();
+        let host_kind = parse_host_kind(&context.meta).ok();
+        // The host's own call id: the front's journal lines (QW-4) share it with the daemon's
+        // dispatch line and the job the call queued.
+        let call_id = match host_kind {
+            Some(HostKind::Claude) => parse_claude_call_id(&context.meta).ok(),
+            Some(HostKind::Codex) => parse_candidate(&context.meta)
+                .ok()
+                .map(|candidate| candidate.call_id().to_owned()),
+            None => None,
+        };
+        let front_context = crate::telemetry::adapters::DispatchContext {
+            host: host_kind,
+            request: call_id.as_deref(),
+            parameters: Some(&stage_parameters),
+            ..Default::default()
+        };
         if let Err(error) = validate_call(tool, parameters.clone()) {
+            crate::telemetry::adapters::log_front_outcome(
+                tool,
+                &FacadeOutcome::InvalidParameters,
+                call_started.elapsed(),
+                &front_context,
+            );
             return CallToolResult::error(vec![ContentBlock::text(error.message(tool))]);
         }
         let envelope = match parse_host_kind(&context.meta) {
@@ -3589,6 +3628,12 @@ impl StdioFacade {
         if tool == AssistanceTool::Stop && expected.is_none() && may_have_applied {
             self.forget_remembered_activation().await;
         }
+        crate::telemetry::adapters::log_front_outcome(
+            tool,
+            &outcome,
+            call_started.elapsed(),
+            &front_context,
+        );
         let message = match outcome {
             FacadeOutcome::Reply(reply, status) if resume != Resume::Fresh => {
                 let note = self.references_predate_replacement(&reply).await;
