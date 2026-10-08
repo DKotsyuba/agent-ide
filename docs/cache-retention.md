@@ -89,13 +89,19 @@ daemons run, and a failed or skipped sweep is retried an hour later. Errors neve
    immediately before every A/B claim, the sweeper takes one snapshot of the effective user's
    live processes whose name starts with `agent-ide` (`proc_listallpids`, `proc_pidinfo`,
    `proc_pidpath`). Such a process *participates* only if its executable is the sweeper's own
-   file (same device and inode) or `standalone/releases/X.Y.Z/agent-ide` with `X.Y.Z` strictly
+   file (same device and inode), or `standalone/releases/X.Y.Z/agent-ide` with `X.Y.Z` strictly
    newer than 0.9.1 — older than the sweeper or not, so a session started before an upgrade
-   never pauses the upgraded sweeper. Any other — 0.9.1 or older, a dev build, a renamed
-   backup, one whose executable was deleted or cannot be read — is legacy, and
+   never pauses the upgraded sweeper — or is a **proven build**: a regular file that contains the
+   lease-protocol proof every build of this source embeds (`LEASE_BUILD_PROOF`) and was not
+   modified after the process started (a later rebuild is not the code that runs; the file is also
+   re-checked after the scan). A gate or scratch `target/debug/agent-ide` is therefore recognized
+   by its contents, never by its path or name, and is listed by `cache status` as a build that
+   does not pause eviction. Any other — 0.9.1 or older, an older dev build without the proof, a
+   renamed backup, one whose executable was deleted, replaced or cannot be read — is legacy, and
    while one is alive **no A or B entry is removed, gone ones and trash included**. The snapshot
    is unknown (and pauses everything the same way) when the process list cannot be read or is
-   truncated, or a process other than an exited one cannot be inspected. `cache status` names them. Eviction starts once old sessions end.
+   truncated, or a process other than an exited one cannot be inspected. `cache status` names
+   both groups. Eviction starts once old sessions end.
    Invariant this relies on: every published release after 0.9.1 keeps the lease protocol.
 4. **Releases.** Release evaluation — reading `current`, listing, recovery and removal, and the
    dry run too — holds `standalone/.install.lock` exclusively and non-blocking (an install in

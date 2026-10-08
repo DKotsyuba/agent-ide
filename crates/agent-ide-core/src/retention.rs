@@ -8,6 +8,8 @@
 //! that does not take leases exists. Installed releases (`standalone/releases/`) are removed when
 //! not current, not among the newest, old enough and not executed by any live process.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
@@ -38,6 +40,13 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(3_600);
 const SWEEP_SPACING: Duration = Duration::from_secs(55 * 60);
 /// Newest version whose processes do not take worktree leases.
 const LEGACY_BOUNDARY: (u64, u64, u64) = (0, 9, 1);
+/// Present in every executable built from this source, which takes worktree leases: a running
+/// `agent-ide` whose executable file contains it is a proven participating build. Never edit it
+/// without keeping older builds recognizable only by their release version.
+#[used]
+static LEASE_BUILD_PROOF: &[u8] = b"agent-ide/worktree-lease-protocol/proof-1";
+/// Largest executable scanned for [`LEASE_BUILD_PROOF`]; a larger one is unproven.
+const PROOF_SCAN_LIMIT: u64 = 1 << 30;
 /// Marker naming the worktree (checks) or launch directory (telemetry) of one cache directory.
 pub const MARKER_FILE_NAME: &str = "worktree.path";
 /// Directory of the stable, never-removed lease files below the state root.
@@ -334,6 +343,8 @@ pub struct Report {
     /// Live `agent-ide` processes that do not take leases, or `None` when the process snapshot
     /// failed; either non-empty or `None` pauses all check and telemetry removal.
     pub legacy: Option<Vec<Process>>,
+    /// Live development or test builds proven to take leases; they never pause removal.
+    pub builds: Vec<Process>,
     /// Check cache totals before the sweep.
     pub checks: Totals,
     /// Telemetry store totals before the sweep.
@@ -378,7 +389,8 @@ impl Report {
             ),
             Some(legacy) if !legacy.is_empty() => {
                 text.push_str(
-                    "eviction of checks/telemetry paused until these older agent-ide processes exit:\n",
+                    "eviction of checks/telemetry paused until these agent-ide processes exit \
+                     (releases up to 0.9.1, or executables not proven to take leases):\n",
                 );
                 for (pid, exe) in legacy {
                     let exe = exe.as_deref().map_or(
@@ -389,6 +401,15 @@ impl Report {
                 }
             }
             Some(_) => {}
+        }
+        if !self.builds.is_empty() {
+            text.push_str(
+                "these development or test builds take leases and do not pause eviction:\n",
+            );
+            for (pid, exe) in &self.builds {
+                let exe = exe.as_deref().map_or("?".into(), Path::to_string_lossy);
+                let _ = writeln!(text, "  pid {pid} {exe}");
+            }
         }
         if self.verdicts.is_empty() {
             text.push_str("nothing to remove\n");
@@ -559,7 +580,7 @@ fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// What a sweeping process knows about itself to classify other `agent-ide` processes.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Identity {
     /// Device and inode of the sweeping executable.
     own: Option<(u64, u64)>,
@@ -567,6 +588,20 @@ struct Identity {
     releases: PathBuf,
     /// Releases strictly newer than this take leases.
     floor: (u64, u64, u64),
+    /// When a process started, so a rebuilt file is not mistaken for the code it runs.
+    started: fn(i32) -> Option<SystemTime>,
+    /// Scan verdicts by executable identity (device, inode, length, mtime): one scan per build.
+    proofs: RefCell<BTreeMap<(u64, u64, u64, SystemTime), bool>>,
+}
+
+/// How the live `agent-ide` processes divide for one sweep.
+#[derive(Clone, Debug, Default)]
+pub struct Classified {
+    /// Processes not known to take leases; any of them pauses eviction.
+    pub legacy: Vec<Process>,
+    /// Participating development or test builds outside `standalone/releases`, proven by their
+    /// executable; they never pause eviction and are listed so the report can say so.
+    pub builds: Vec<Process>,
 }
 
 impl Identity {
@@ -579,26 +614,40 @@ impl Identity {
             // Every release after the boundary takes leases, older than this build or not: a
             // session started before an upgrade must not pause the upgraded sweeper.
             floor: LEGACY_BOUNDARY,
+            started: process_start,
+            proofs: RefCell::default(),
         }
     }
 
-    /// Returns the live `agent-ide` processes that are not known to take leases.
+    /// Splits the live `agent-ide` processes into those that pause eviction and the proven
+    /// development builds that do not.
     ///
-    /// A process participates only when its executable is this process's own file, or
-    /// `releases/X.Y.Z/agent-ide` with `X.Y.Z` strictly newer than [`Identity::floor`]; one
-    /// whose executable path is unreadable never does.
-    fn legacy(&self, processes: &[Process]) -> Vec<Process> {
-        processes
-            .iter()
-            .filter(|(_, exe)| {
-                exe.as_ref().is_none_or(|exe| {
-                    exe.file_name()
-                        .is_some_and(|name| name.as_bytes().starts_with(b"agent-ide"))
-                })
+    /// A process participates when its executable is this process's own file, or
+    /// `releases/X.Y.Z/agent-ide` with `X.Y.Z` strictly newer than [`Identity::floor`], or when it
+    /// is a build proven to take leases ([`Identity::proven_build`]). One whose executable path is
+    /// unreadable never does.
+    fn classify(&self, processes: &[Process]) -> Classified {
+        let mut classified = Classified::default();
+        for process in processes.iter().filter(|(_, exe)| {
+            exe.as_ref().is_none_or(|exe| {
+                exe.file_name()
+                    .is_some_and(|name| name.as_bytes().starts_with(b"agent-ide"))
             })
-            .filter(|(_, exe)| !exe.as_deref().is_some_and(|exe| self.participates(exe)))
-            .cloned()
-            .collect()
+        }) {
+            match &process.1 {
+                Some(exe) if self.participates(exe) => {}
+                Some(exe) if self.proven_build(process.0, exe) => {
+                    classified.builds.push(process.clone());
+                }
+                _ => classified.legacy.push(process.clone()),
+            }
+        }
+        classified
+    }
+
+    /// Returns the live `agent-ide` processes that are not known to take leases.
+    fn legacy(&self, processes: &[Process]) -> Vec<Process> {
+        self.classify(processes).legacy
     }
 
     /// Whether one `agent-ide` executable is known to take leases.
@@ -612,6 +661,83 @@ impl Identity {
                 .filter(|dir| dir.parent() == Some(self.releases.as_path()))
                 .and_then(|dir| parse_version(dir.file_name()?.to_str()?))
                 .is_some_and(|version| version > self.floor)
+    }
+
+    /// Whether process `pid` runs a build of this source: its executable is a regular file not
+    /// modified since the process started (so it is the code that runs, not a later rebuild) and
+    /// contains [`LEASE_BUILD_PROOF`]. A path, name or location proves nothing.
+    ///
+    /// ponytail: an executable replaced by a file with an older mtime than the process start is
+    /// not noticed; the process list offers no inode to compare.
+    fn proven_build(&self, pid: i32, exe: &Path) -> bool {
+        let Ok(file) = File::open(exe) else {
+            return false;
+        };
+        let Ok(metadata) = file.metadata() else {
+            return false;
+        };
+        let (Some(started), Ok(modified)) = ((self.started)(pid), metadata.modified()) else {
+            return false;
+        };
+        if !metadata.is_file() || metadata.len() > PROOF_SCAN_LIMIT || modified > started {
+            return false;
+        }
+        let key = (metadata.dev(), metadata.ino(), metadata.len(), modified);
+        if let Some(proven) = self.proofs.borrow().get(&key) {
+            return *proven;
+        }
+        let proven = contains_proof(&file);
+        // A rebuild during the scan changed the file or replaced the path: no verdict at all.
+        let unchanged = |now: fs::Metadata| {
+            (now.dev(), now.ino(), now.len(), now.modified().ok())
+                == (key.0, key.1, key.2, Some(key.3))
+        };
+        if !file.metadata().is_ok_and(unchanged) || !fs::metadata(exe).is_ok_and(unchanged) {
+            return false;
+        }
+        self.proofs.borrow_mut().insert(key, proven);
+        proven
+    }
+}
+
+/// When process `pid` started, or `None` when it cannot be inspected.
+fn process_start(pid: i32) -> Option<SystemTime> {
+    // SAFETY: `proc_bsdinfo` is plain data that `proc_pidinfo` fills up to its size.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is writable for `size` bytes.
+    let filled =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    (filled == size).then(|| {
+        SystemTime::UNIX_EPOCH
+            + Duration::new(info.pbi_start_tvsec, (info.pbi_start_tvusec as u32) * 1_000)
+    })
+}
+
+/// Whether the stream contains [`LEASE_BUILD_PROOF`]; any read error means no.
+fn contains_proof(mut file: &File) -> bool {
+    use std::io::Read as _;
+    let needle = LEASE_BUILD_PROOF;
+    let mut buffer = vec![0u8; (1 << 20) + needle.len()];
+    let mut kept = 0;
+    loop {
+        let Ok(read) = file.read(&mut buffer[kept..]) else {
+            return false;
+        };
+        if read == 0 {
+            return false;
+        }
+        let end = kept + read;
+        let haystack = &buffer[..end];
+        if haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+        {
+            return true;
+        }
+        // Keep a tail so a proof split across two reads is still found.
+        kept = (needle.len() - 1).min(end);
+        buffer.copy_within(end - kept..end, 0);
     }
 }
 
@@ -1143,6 +1269,23 @@ pub fn sweep_with(
     now: SystemTime,
     snapshot: &dyn Fn() -> Option<Vec<Process>>,
 ) -> Report {
+    sweep_as(
+        &Identity::current(state_root),
+        state_root,
+        apply,
+        now,
+        snapshot,
+    )
+}
+
+/// [`sweep_with`] classifying processes as `identity` does.
+fn sweep_as(
+    identity: &Identity,
+    state_root: &Path,
+    apply: bool,
+    now: SystemTime,
+    snapshot: &dyn Fn() -> Option<Vec<Process>>,
+) -> Report {
     let mut report = Report {
         checks: Totals {
             budget: CHECKS_BUDGET_BYTES,
@@ -1157,8 +1300,12 @@ pub fn sweep_with(
     if !safe_dir(state_root) {
         return report;
     }
-    let identity = Identity::current(state_root);
-    report.legacy = snapshot().map(|processes| identity.legacy(&processes));
+    let classified = snapshot().map(|processes| identity.classify(&processes));
+    report.builds = classified
+        .as_ref()
+        .map(|classified| classified.builds.clone())
+        .unwrap_or_default();
+    report.legacy = classified.map(|classified| classified.legacy);
     let paused = report.paused();
     let locks = state_root.join(LOCKS_DIR);
     let legacy_free = || snapshot().is_some_and(|processes| identity.legacy(&processes).is_empty());

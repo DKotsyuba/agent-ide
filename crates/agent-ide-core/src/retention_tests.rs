@@ -362,6 +362,8 @@ fn only_this_binary_and_strictly_newer_releases_participate() {
         own: file_id(&own),
         releases: releases.clone(),
         floor: (0, 9, 1),
+        started: |_| None,
+        proofs: RefCell::default(),
     };
     let processes = vec![
         (1, Some(own.clone())),
@@ -388,6 +390,92 @@ fn only_this_binary_and_strictly_newer_releases_participate() {
         [3, 5, 6, 8, 9],
         "an unreadable executable is legacy"
     );
+}
+
+/// An identity whose processes all started at `started`.
+fn identity_started(home: &Path, started: fn(i32) -> Option<SystemTime>) -> Identity {
+    Identity {
+        started,
+        ..Identity::current(home)
+    }
+}
+
+/// Writes an executable named `agent-ide` below `dir`, with the build proof when `proven`.
+fn fake_build(dir: &Path, proven: bool) -> PathBuf {
+    fs::create_dir_all(dir).unwrap();
+    let exe = dir.join("agent-ide");
+    let mut bytes = vec![0xCFu8; 3 << 20];
+    if proven {
+        // Straddles the first read boundary, as a proof in the middle of a real binary may.
+        let at = (1 << 20) - 7;
+        bytes[at..at + LEASE_BUILD_PROOF.len()].copy_from_slice(LEASE_BUILD_PROOF);
+    }
+    fs::write(&exe, bytes).unwrap();
+    exe
+}
+
+/// A development or test build proven to take leases does not pause eviction, an installed
+/// release up to the boundary still does, and the report names both groups.
+#[test]
+fn a_proven_test_build_does_not_pause_eviction_but_an_old_release_does() {
+    let home = scratch("test-build");
+    let dir = check_cache(&home, &home.join("deleted"));
+    let build = fake_build(&home.join("gate/target/debug"), true);
+    let identity = identity_started(&home, |_| Some(SystemTime::now() + DAY));
+    let with_build = || Some(vec![(41, Some(build.clone()))]);
+
+    let report = sweep_as(&identity, &home, false, SystemTime::now(), &with_build);
+    assert!(!report.paused(), "{report:?}");
+    assert_eq!(verdict(&report, &dir).fate, Fate::Removed);
+    let text = report.render(false);
+    assert!(
+        text.contains("take leases and do not pause eviction"),
+        "{text}"
+    );
+    assert!(text.contains("pid 41"), "{text}");
+
+    let old = home.join("standalone/releases/0.9.1/agent-ide");
+    let both = || Some(vec![(41, Some(build.clone())), (42, Some(old.clone()))]);
+    let report = sweep_as(&identity, &home, true, SystemTime::now(), &both);
+    assert!(report.paused());
+    assert_eq!(verdict(&report, &dir).fate, Fate::Paused);
+    assert!(dir.exists());
+    let text = report.render(true);
+    assert!(text.contains("pid 42") && text.contains("pid 41"), "{text}");
+}
+
+/// Only a proof inside a file that is no newer than the process proves a build: a lookalike
+/// without the proof, a rebuild after the process started, and an unreadable path stay legacy.
+#[test]
+fn an_unproven_or_rebuilt_dev_executable_stays_legacy() {
+    let home = scratch("unproven-build");
+    let unproven = fake_build(&home.join("a/target/debug"), false);
+    let proven = fake_build(&home.join("b/target/debug"), true);
+    let processes = vec![
+        (1, Some(unproven.clone())),
+        (2, Some(proven.clone())),
+        (3, Some(home.join("gone/target/debug/agent-ide"))),
+    ];
+    let later = identity_started(&home, |_| Some(SystemTime::now() + DAY));
+    let pids = |classified: Vec<Process>| classified.into_iter().map(|p| p.0).collect::<Vec<_>>();
+    let classified = later.classify(&processes);
+    assert_eq!(pids(classified.legacy), [1, 3]);
+    assert_eq!(pids(classified.builds), [2]);
+
+    // The same file, but the process started before it was written: it runs older code.
+    let earlier = identity_started(&home, |_| Some(SystemTime::UNIX_EPOCH));
+    assert_eq!(pids(earlier.classify(&processes).legacy), [1, 2, 3]);
+    // A process whose start cannot be read is unproven.
+    let unknown = identity_started(&home, |_| None);
+    assert_eq!(pids(unknown.classify(&processes).legacy), [1, 2, 3]);
+}
+
+/// The real start time of this process is readable and not in the future.
+#[test]
+fn process_start_reads_the_real_start_time() {
+    let started = process_start(std::process::id() as i32).expect("own start time");
+    assert!(started <= SystemTime::now());
+    assert!(started > SystemTime::now() - 30 * DAY);
 }
 
 /// The participation floor is the legacy boundary whatever this build's version: every release
