@@ -1822,7 +1822,8 @@ fn hook_repository_key(dir: &Path) -> PathBuf {
 /// names the session's own registration and nothing else, so it can never reach a different
 /// registered repository, and it only ever replaces a path that would drop the pre; the daemon's
 /// attachment, session and exact call-id checks still decide the pairing. Without a `project_dir`
-/// the cwd route is the only route, unchanged.
+/// (the variable is absent; a present but unresolvable one never reaches this function) the cwd
+/// route is the only route, unchanged.
 ///
 /// Returns the route plus, when the fallback carried it, the closed reason the cwd route missed
 /// (for the caller's journal warn); on failure the closed reason of the cwd route.
@@ -1901,7 +1902,9 @@ fn hook_skip_window(dir: &Path, detail: &str) -> Option<u64> {
 ///
 /// The project is found from the payload cwd first, then from the session's own
 /// `CLAUDE_PROJECT_DIR` when the cwd finds no rendezvous (see [`claude_hook_route`]). Missing or
-/// malformed cwd, cached key, runtime, candidate attachment, or daemon returns silently to Claude
+/// malformed cwd, a present but unresolvable `CLAUDE_PROJECT_DIR` (`hook_project_dir_invalid`:
+/// the session's repository identity is unknown, so no route may be trusted), cached key, runtime,
+/// candidate attachment, or daemon returns silently to Claude
 /// while recording a closed, path-free reason in the repository error log; a pre that paired only
 /// through the fallback also leaves a per-call `warn` naming why the cwd route missed.
 /// Per EYES-r2 §3, this never spawns `git` itself and so never risks the existing bounded 250 ms
@@ -2007,9 +2010,19 @@ async fn run_managed_claude_hook() {
     };
     // The payload cwd follows the session's shell, which can leave the project; the project the
     // session's own MCP registered under (`CLAUDE_PROJECT_DIR`) is the fallback for that miss.
-    let project_dir = std::env::var_os("CLAUDE_PROJECT_DIR")
-        .map(PathBuf::from)
-        .and_then(|path| fs::canonicalize(path).ok());
+    // A present but unusable project directory (a removed session worktree) is not an absent one:
+    // without its repository identity the cwd route cannot be told apart from another registered
+    // repository's, so the pre is dropped locally rather than routed unrestricted.
+    let project_dir = match std::env::var_os("CLAUDE_PROJECT_DIR").filter(|raw| !raw.is_empty()) {
+        None => None,
+        Some(raw) => match fs::canonicalize(PathBuf::from(raw)) {
+            Ok(path) => Some(path),
+            Err(_) => {
+                log("hook_project_dir_invalid");
+                return;
+            }
+        },
+    };
     let (runtime, attachment) = match claude_hook_route(&cwd, project_dir.as_deref()) {
         Ok((route, rerouted)) => {
             if let Some(miss) = rerouted {

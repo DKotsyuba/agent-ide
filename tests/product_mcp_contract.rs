@@ -1183,7 +1183,10 @@ fn managed_claude_hook_process(project: Option<&Path>) -> Child {
         .kill_on_drop(true);
     if let Some(project) = project {
         command.env("CLAUDE_PROJECT_DIR", project);
-        command.current_dir(project);
+        // A project directory that vanished (a removed session worktree) cannot be a cwd.
+        if project.is_dir() {
+            command.current_dir(project);
+        }
     }
     command.spawn().unwrap()
 }
@@ -6896,7 +6899,7 @@ async fn managed_claude_hook_pairs_through_project_dir_when_the_shell_cwd_left_t
             .lines()
             .any(|line| line.contains("\"level\":\"warn\"")
                 && line.contains("\"method\":\"hook\"")
-                && line.contains("hook_cwd_rerouted:hook_no_key_cache")),
+                && line.contains("hook_cwd_rerouted:hook_")),
         "the cwd miss is journaled as warn: {events}"
     );
     assert!(
@@ -7001,6 +7004,68 @@ async fn managed_claude_hook_never_routes_a_wandering_cwd_to_another_registered_
         "the stray pre never reached the other repository: {refused}"
     );
     mcp.close().await;
+    other.close().await;
+}
+
+/// A session whose `CLAUDE_PROJECT_DIR` is present but no longer resolves (its worktree was
+/// removed) while the shell sits inside another registered repository drops its pre locally: the
+/// session's repository identity is unknown, so the cwd route must not be taken on trust and the
+/// other repository's call with the same tool-use id stays refused.
+#[tokio::test]
+async fn managed_claude_hook_with_a_vanished_project_dir_never_routes_to_another_repository() {
+    let other_repo = ProductFixture::new(json!([]));
+    let _other_guard = SharedClaudeDaemonGuard(managed_claude_runtime_path(&other_repo.root));
+    let mut other = Mcp::start_managed_claude(&other_repo.config, &other_repo.root).await;
+    let vanished = other_repo.base.join("removed-session-worktree");
+    assert!(!vanished.exists());
+
+    // The other repository has an activated session, so a stray pre delivered to its daemon would
+    // pair a call of that session that fired no hook of its own.
+    let mut next = 1;
+    let pending = managed_claude_call(
+        &mut other,
+        &other_repo.root,
+        next,
+        "shared-session",
+        None,
+        "ide.start",
+        json!({"activation_id":"other-start"}),
+    )
+    .await;
+    let started = settle_managed_claude_start(
+        &mut other,
+        &other_repo.root,
+        &mut next,
+        "shared-session",
+        None,
+        &pending,
+    )
+    .await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    next += 1;
+
+    let call = format!("managed-claude-{next}");
+    let pre = managed_claude_hook_from(
+        &vanished,
+        &other_repo.root,
+        managed_claude_event("PreToolUse", "shared-session", None, &call),
+    )
+    .await;
+    assert!(pre.status.success() && pre.stdout.is_empty() && pre.stderr.is_empty());
+    let refused = other
+        .exchange(
+            json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{
+                "name":"ide.context","arguments":{"kind":"problems"},
+                "_meta":{"claudecode/toolUseId":call}
+            }}),
+        )
+        .await;
+    assert!(
+        refused["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("unavailable: host_binding")),
+        "a pre of an unresolvable project never reaches the repository the shell stands in: {refused}"
+    );
     other.close().await;
 }
 
