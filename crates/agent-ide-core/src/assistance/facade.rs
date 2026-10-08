@@ -1753,9 +1753,6 @@ impl AssistanceFacade {
     }
 }
 
-/// Longest the front waits for the liveness probe's health answer.
-const LIVENESS_PROBE_BUDGET: Duration = Duration::from_secs(3);
-
 /// Reports whether a delivered call's outcome is the kind a wedged daemon produces: a transport
 /// timeout, a lost reply, or the daemon's own `internal` refusal.
 fn suspects_wedged_daemon(outcome: &FacadeOutcome) -> bool {
@@ -1770,16 +1767,6 @@ fn suspects_wedged_daemon(outcome: &FacadeOutcome) -> bool {
         ),
         _ => false,
     }
-}
-
-/// The bounded liveness probe: one health exchange with the daemon at `runtime_dir`, true only
-/// when it answers `ok` within [`LIVENESS_PROBE_BUDGET`]. A daemon that answers `restarting`, does
-/// not answer or answers garbage is not healthy; a probe never starts or stops anything.
-async fn daemon_answers_healthy(runtime_dir: &Path) -> bool {
-    matches!(
-        tokio::time::timeout(LIVENESS_PROBE_BUDGET, crate::app::doctor(runtime_dir)).await,
-        Ok(Ok(crate::app::DoctorStatus::Healthy { .. }))
-    )
 }
 
 /// Writes the client journal line of one transport timeout, which leaves no other trace: the
@@ -2165,6 +2152,19 @@ impl FeedbackLedger {
 pub type ReestablishFn =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<(PathBuf, String)>> + Send>> + Send + Sync>;
 
+/// Forcibly ends the daemon a managed front owns or shares when it stayed wedged: it holds its
+/// runtime but its control path answered nothing across repeated probes.
+///
+/// Called by the facade's wedge watch with the runtime directory it probed, the number of failed
+/// probes and the time they span (evidence for the journal), only after at least [`crate::app::WEDGE_MIN_PROBES`] probes
+/// spanning [`crate::app::WEDGE_MIN_SPAN`]. The implementation owns every safety check and the journal line; it must
+/// never signal a daemon whose control path answers. The facade re-establishes afterwards.
+pub type EvictFn =
+    Arc<dyn Fn(PathBuf, u32, Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// Pause between the wedge watch's probes.
+const WEDGE_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Re-roots one managed Claude session to the root directory a refused `ide.start` named (T15B).
 ///
 /// The closure receives the model's exact `root` argument when the call carried one, or `None`
@@ -2337,6 +2337,10 @@ struct ManagedConnection {
     note: Option<SharedDaemonNote>,
     reroot: Option<RerootFn>,
     reestablish: ReestablishFn,
+    /// Force-replaces a daemon that stayed wedged; absent for a connection with no such authority.
+    evict: Option<EvictFn>,
+    /// Set while a background wedge watch runs, so one watch serves every concurrent failure.
+    watching: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ManagedConnection {
@@ -2353,6 +2357,8 @@ impl ManagedConnection {
             note: None,
             reroot: None,
             reestablish,
+            evict: None,
+            watching: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -2471,6 +2477,55 @@ impl ManagedConnection {
             .store(true, std::sync::atomic::Ordering::Release);
         self.replaced
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Starts the background wedge watch after a liveness probe found the daemon silent while it
+    /// still holds its runtime, unless one already runs or this connection cannot evict.
+    ///
+    /// The watch probes every [`WEDGE_PROBE_INTERVAL`]. A daemon that answers again (or says
+    /// `restarting`, which exits by itself) ends the watch with nothing signalled. Once
+    /// [`crate::app::WEDGE_MIN_PROBES`] probes failed over at least [`crate::app::WEDGE_MIN_SPAN`] the watch calls `evict`
+    /// and re-establishes the daemon, publishing the new pair for the next call; no agent action is
+    /// involved and no call is resent. The watch gives up after ten probes.
+    fn start_wedge_watch(&self) {
+        let Some(evict) = self.evict.clone() else {
+            return;
+        };
+        if self
+            .watching
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let connection = self.clone();
+        tokio::spawn(async move {
+            let began = tokio::time::Instant::now();
+            let mut probes = 1_u32;
+            for _ in 0..10 {
+                tokio::time::sleep(WEDGE_PROBE_INTERVAL).await;
+                let (runtime_dir, attachment) = connection.current().await;
+                if crate::app::probe_health(&runtime_dir).await != crate::app::HealthProbe::Silent
+                {
+                    break;
+                }
+                probes += 1;
+                let span = began.elapsed();
+                if probes >= crate::app::WEDGE_MIN_PROBES && span >= crate::app::WEDGE_MIN_SPAN {
+                    evict(runtime_dir.clone(), probes, span).await;
+                    if let Some((new_runtime, new_attachment)) = (connection.reestablish)().await
+                    {
+                        if new_runtime != runtime_dir || new_attachment != attachment {
+                            connection.mark_replaced();
+                        }
+                        connection.store(new_runtime, new_attachment).await;
+                    }
+                    break;
+                }
+            }
+            connection
+                .watching
+                .store(false, std::sync::atomic::Ordering::Release);
+        });
     }
 
     /// Marks a successful activation: the binding is current again.
@@ -2627,6 +2682,16 @@ impl StdioFacade {
             publisher: None,
             router: Self::described_tool_router(),
         })
+    }
+
+    /// Gives this managed facade the authority to force-replace a wedged daemon through `evict`
+    /// (see [`EvictFn`]); without it a silent daemon is only probed and re-established when it
+    /// leaves by itself.
+    pub fn with_wedge_eviction(mut self, evict: EvictFn) -> Self {
+        if let Some(reconnect) = &mut self.reconnect {
+            reconnect.evict = Some(evict);
+        }
+        self
     }
 
     /// Publishes this process's actor route for the managed Codex native hook, best-effort.
@@ -2865,12 +2930,30 @@ impl StdioFacade {
             // back `internal` may have met a wedged daemon. One bounded liveness probe decides;
             // only a daemon that does not answer healthy is re-established, so the next call
             // lands on a live one. The call in hand keeps its outcome and is never resent.
-            if suspects_wedged_daemon(&outcome) && !daemon_answers_healthy(&runtime_dir).await {
-                if let Some((new_runtime, new_attachment)) = (reconnect.reestablish)().await {
-                    if new_runtime != runtime_dir || new_attachment != attachment {
-                        reconnect.mark_replaced();
+            if suspects_wedged_daemon(&outcome) {
+                match crate::app::probe_health(&runtime_dir).await {
+                    crate::app::HealthProbe::Healthy => {}
+                    // A daemon that says `restarting` is exiting by itself, and one that left
+                    // its runtime is gone: re-establishing now is cheap and cannot signal anything.
+                    probe => {
+                        let holds_runtime = probe == crate::app::HealthProbe::Silent
+                            && crate::app::doctor_report(&runtime_dir)
+                                .await
+                                .is_ok_and(|report| {
+                                    report.lock == crate::app::DoctorLockState::Held
+                                });
+                        if holds_runtime {
+                            // Silent but alive: only a repeated, long-enough silence is a wedge.
+                            reconnect.start_wedge_watch();
+                        } else if let Some((new_runtime, new_attachment)) =
+                            (reconnect.reestablish)().await
+                        {
+                            if new_runtime != runtime_dir || new_attachment != attachment {
+                                reconnect.mark_replaced();
+                            }
+                            reconnect.store(new_runtime, new_attachment).await;
+                        }
                     }
-                    reconnect.store(new_runtime, new_attachment).await;
                 }
             }
             return (outcome, resume, tag);

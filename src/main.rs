@@ -20,7 +20,7 @@ use agent_ide::assistance::{
     assembly::ProductDispatcher,
     codex_rendezvous::ManagedCodexPublisher,
     facade::{
-        DaemonCurrencyNote, ReestablishFn, RerootFn, RerootOutcome, SharedCodexPublisher,
+        DaemonCurrencyNote, EvictFn, ReestablishFn, RerootFn, RerootOutcome, SharedCodexPublisher,
         SharedDaemonNote, StdioFacade,
     },
     host_binding::HostKind,
@@ -2063,6 +2063,16 @@ async fn run_managed_codex_mcp(
                     StdioFacade::with_reestablishing_attachment(runtime_path, attachment, reconnect)
                 }
             };
+            let evict: EvictFn = {
+                let child = Arc::clone(&child);
+                Arc::new(move |runtime_dir: PathBuf, probes: u32, span: Duration| {
+                    let child = Arc::clone(&child);
+                    Box::pin(async move {
+                        terminate_wedged_owned_daemon(child, &runtime_dir, probes, span).await;
+                    })
+                })
+            };
+            let facade = facade.map(|facade| facade.with_wedge_eviction(evict));
             let Some(facade) = facade else {
                 terminate_owned_daemon(child).await;
                 if let Some(runtime) = runtime.current.lock().expect("owned runtime mutex").take() {
@@ -2135,8 +2145,19 @@ fn codex_reestablish_hook(
                     .is_some_and(|owned| {
                         owned.path != connection.0 || matches!(owned.identity_matches(), Ok(false))
                     });
-                if !exited && !foreign {
+                if !exited
+                    && !foreign
+                    && agent_ide::app::probe_health(&connection.0).await
+                        != agent_ide::app::HealthProbe::Restarting
+                {
                     return Some(connection);
+                }
+                if !exited && !foreign {
+                    // The daemon answered `restarting`: it failed internally and exits by itself
+                    // within moments. Waiting a bounded time for that exit lets this very call
+                    // find the replacement instead of the daemon that is leaving.
+                    let mut child = child.lock().await;
+                    let _ = tokio::time::timeout(Duration::from_secs(8), child.wait()).await;
                 }
             }
             terminate_owned_daemon(Arc::clone(&child)).await;
@@ -2408,6 +2429,13 @@ async fn run_managed_claude_mcp(
         Arc::clone(&note),
         candidate.clone(),
     );
+    // A shared daemon that holds its runtime but stays silent across repeated probes is replaced
+    // by the facade's wedge watch; every safety check lives in `evict_wedged_daemon`.
+    let evict: EvictFn = Arc::new(|runtime_dir: PathBuf, probes: u32, span: Duration| {
+        Box::pin(async move {
+            let _ = agent_ide::app::evict_wedged_daemon(&runtime_dir, probes, span).await;
+        })
+    });
     match StdioFacade::with_reestablishing_claude_attachment(
         runtime_path,
         attachment,
@@ -2415,7 +2443,9 @@ async fn run_managed_claude_mcp(
         reestablish,
         reroot,
         note,
-    ) {
+    )
+    .map(|facade| facade.with_wedge_eviction(evict))
+    {
         Some(facade) => {
             // The held lease stream is a live death notice for the shared daemon: watching it
             // heals the session the moment a generation ends, instead of at the next failed tool
@@ -3292,6 +3322,48 @@ fn managed_termination_signal() -> impl std::future::Future<Output = ()> {
             _ = interrupt.recv() => {}
             _ = terminate.recv() => {}
         }
+    }
+}
+
+/// Force-replaces the exact daemon child this MCP owns after its wedge watch found it silent.
+///
+/// Signals only that owned child, and only if the evidence reaches the same minimum the shared
+/// path enforces (`WEDGE_MIN_PROBES` probes over `WEDGE_MIN_SPAN`) and one more probe of its
+/// control path at `runtime_dir` still finds it silent (a daemon that answers is never signalled,
+/// however busy). `SIGTERM`, up to
+/// [`agent_ide::app::WEDGE_TERM_GRACE`] for it to exit, then `SIGKILL`; the caller then restarts
+/// the daemon in the same directory, which keeps its store. Journals the replacement with the
+/// probe count and span (see `agent_ide::app::record_forced_replacement`).
+async fn terminate_wedged_owned_daemon(
+    child: SharedChild,
+    runtime_dir: &Path,
+    probes: u32,
+    span: Duration,
+) {
+    if probes < agent_ide::app::WEDGE_MIN_PROBES
+        || span < agent_ide::app::WEDGE_MIN_SPAN
+        || agent_ide::app::probe_health(runtime_dir).await != agent_ide::app::HealthProbe::Silent
+    {
+        return;
+    }
+    let mut child = child.lock().await;
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    let Some(pid) = child.id() else {
+        return;
+    };
+    let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let killed = tokio::time::timeout(agent_ide::app::WEDGE_TERM_GRACE, child.wait())
+        .await
+        .is_err();
+    if killed {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    }
+    // Only a child that is really gone was replaced; one that survived `SIGKILL` is not claimed.
+    if child.try_wait().ok().flatten().is_some() {
+        agent_ide::app::record_forced_replacement(pid as i32, probes, span, killed);
     }
 }
 

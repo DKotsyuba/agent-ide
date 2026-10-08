@@ -13,7 +13,7 @@ pub mod transport;
 
 use std::fmt::{self, Display};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -814,6 +814,209 @@ pub async fn doctor_report(runtime_dir: &Path) -> Result<DoctorReport, AppError>
     })
 }
 
+/// What one health probe of a daemon's control path found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealthProbe {
+    /// The daemon answered `ok` within the connection deadline.
+    Healthy,
+    /// The daemon answered `restarting`: it failed internally and is exiting to be replaced.
+    Restarting,
+    /// Nothing usable answered: no socket, a refused or stalled connection, or a bad reply.
+    Silent,
+}
+
+/// Probes the control path of the daemon at `runtime_dir` once, without starting or stopping
+/// anything.
+///
+/// The health request is served by the daemon's accept loop, never by its job queue or worker, so a
+/// daemon that is busy with long jobs still answers [`HealthProbe::Healthy`]. The probe is bounded
+/// by the configured connection deadline for the connect and for the reply.
+pub async fn probe_health(runtime_dir: &Path) -> HealthProbe {
+    let (runtime, endpoint, _) = inspect_runtime(runtime_dir);
+    if (runtime, endpoint) != (DoctorRuntimeState::Private, DoctorEndpointState::Socket) {
+        return HealthProbe::Silent;
+    }
+    let deadline = config::EffectiveConfig::defaults().ipc().connection_deadline;
+    let Ok(Ok(stream)) =
+        tokio::time::timeout(deadline, UnixStream::connect(runtime_dir.join(SOCKET_NAME))).await
+    else {
+        return HealthProbe::Silent;
+    };
+    let request = HealthRequest::new("probe");
+    let Ok(Ok(response)) = tokio::time::timeout(deadline, exchange(stream, &request)).await else {
+        return HealthProbe::Silent;
+    };
+    if response.version != WIRE_VERSION || response.request_id != request.request_id {
+        return HealthProbe::Silent;
+    }
+    match response.status.as_str() {
+        "ok" => HealthProbe::Healthy,
+        "restarting" => HealthProbe::Restarting,
+        _ => HealthProbe::Silent,
+    }
+}
+
+/// How long a forced replacement waits for the daemon to leave after `SIGTERM` before `SIGKILL`.
+pub const WEDGE_TERM_GRACE: Duration = Duration::from_secs(8);
+/// Failed liveness probes required before a wedged daemon may be force-replaced.
+pub const WEDGE_MIN_PROBES: u32 = 2;
+/// Time the failed probes must span before a wedged daemon may be force-replaced: a stall of a few
+/// seconds (a load spike, a stopped process that resumes) keeps its daemon and its binding.
+pub const WEDGE_MIN_SPAN: Duration = Duration::from_secs(30);
+/// Executable file name a lock holder must have to be signalled; nothing else is ever signalled.
+const DAEMON_EXECUTABLE_NAME: &[u8] = b"agent-ide";
+
+/// The closed result of one attempt to replace a wedged shared daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvictOutcome {
+    /// The holder was signalled and no longer holds the lock; `killed` says `SIGKILL` was needed.
+    Terminated {
+        /// Process id of the signalled daemon.
+        pid: i32,
+        /// Whether `SIGTERM` did not suffice within [`WEDGE_TERM_GRACE`].
+        killed: bool,
+    },
+    /// The holder was signalled but still holds the lock after `SIGKILL` and a further wait: no
+    /// replacement happened, and nothing is journaled as one.
+    StillHeld {
+        /// Process id of the daemon that did not leave.
+        pid: i32,
+    },
+    /// Nothing was signalled; the reason is a closed tag (`insufficient_evidence`, `not_held`,
+    /// `no_pid`, `dead`, `not_agent_ide`, `answering`, `changed`).
+    Refused(&'static str),
+}
+
+/// The lock holder a forced replacement may signal: its pid as recorded in the lock file and the
+/// identity (device and inode) of the lock file that record came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LockHolder {
+    /// Pid the holder wrote into the lock file at acquire.
+    pid: i32,
+    /// Device of the lock file.
+    device: u64,
+    /// Inode of the lock file.
+    inode: u64,
+}
+
+/// Re-reads and fully validates the current lock holder, or names why nothing may be signalled.
+///
+/// Every check runs at the moment of the call: the lock file is a private regular file, its lock
+/// is still held (the holder is alive), the pid it records is a live process other than this one
+/// whose executable file name is exactly `agent-ide`. Callers call it again immediately before
+/// each signal and compare the result with the holder they first saw, so a lock handed to a
+/// replacement daemon, a released lock or a reused pid never receives a signal meant for another.
+fn current_lock_holder(lock_path: &Path) -> Result<LockHolder, &'static str> {
+    if inspect_lock(lock_path) != DoctorLockState::Held {
+        return Err("not_held");
+    }
+    let metadata = fs::symlink_metadata(lock_path).map_err(|_| "not_held")?;
+    let pid = fs::read_to_string(lock_path)
+        .ok()
+        .and_then(|text| text.trim().parse::<i32>().ok())
+        .filter(|pid| *pid > 1)
+        .ok_or("no_pid")?;
+    // SAFETY: signal 0 only checks that the process exists.
+    if pid as u32 == std::process::id() || unsafe { libc::kill(pid, 0) } != 0 {
+        return Err("dead");
+    }
+    if !pid_is_agent_ide(pid) {
+        return Err("not_agent_ide");
+    }
+    Ok(LockHolder {
+        pid,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+/// Replaces a daemon that holds the runtime lock but does not answer its control path.
+///
+/// Eligibility is enforced here, not by the caller: `probes` failed probes spanning `span` must
+/// reach [`WEDGE_MIN_PROBES`] and [`WEDGE_MIN_SPAN`] (they are the caller's evidence and also reach
+/// the journal). The holder must then validate ([`current_lock_holder`]) and one more probe must
+/// still find the control path silent — a daemon whose control path answers is never signalled,
+/// however long its jobs run. The holder is revalidated and compared with the first one
+/// immediately before `SIGTERM` and again before `SIGKILL`; any change refuses without signalling.
+/// `SIGTERM`, up to [`WEDGE_TERM_GRACE`] for the lock to be released, then `SIGKILL` and a further
+/// five seconds. Only a released lock is reported as [`EvictOutcome::Terminated`] and journaled
+/// ([`record_forced_replacement`]); a holder that stays is [`EvictOutcome::StillHeld`]. The runtime
+/// directory is left as it is: the next daemon starts in it and finds the store and its receipts.
+pub async fn evict_wedged_daemon(runtime_dir: &Path, probes: u32, span: Duration) -> EvictOutcome {
+    if probes < WEDGE_MIN_PROBES || span < WEDGE_MIN_SPAN {
+        return EvictOutcome::Refused("insufficient_evidence");
+    }
+    let lock_path = runtime_dir.join(LOCK_NAME);
+    let holder = match current_lock_holder(&lock_path) {
+        Ok(holder) => holder,
+        Err(reason) => return EvictOutcome::Refused(reason),
+    };
+    if probe_health(runtime_dir).await != HealthProbe::Silent {
+        return EvictOutcome::Refused("answering");
+    }
+    if current_lock_holder(&lock_path) != Ok(holder) {
+        return EvictOutcome::Refused("changed");
+    }
+    // SAFETY: the pid was validated as the live lock holder running the agent-ide executable an
+    // instant ago, and the lock file identity and pid record are unchanged.
+    unsafe { libc::kill(holder.pid, libc::SIGTERM) };
+    let mut killed = false;
+    let mut waited = Duration::ZERO;
+    while inspect_lock(&lock_path) == DoctorLockState::Held {
+        if waited >= WEDGE_TERM_GRACE && !killed {
+            if current_lock_holder(&lock_path) != Ok(holder) {
+                return EvictOutcome::Refused("changed");
+            }
+            killed = true;
+            // SAFETY: as above, revalidated just now; SIGTERM did not release the lock.
+            unsafe { libc::kill(holder.pid, libc::SIGKILL) };
+        }
+        if waited >= WEDGE_TERM_GRACE + Duration::from_secs(5) {
+            return EvictOutcome::StillHeld { pid: holder.pid };
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        waited += Duration::from_millis(100);
+    }
+    record_forced_replacement(holder.pid, probes, span, killed);
+    EvictOutcome::Terminated {
+        pid: holder.pid,
+        killed,
+    }
+}
+
+/// Reports whether `pid` runs an executable whose file name is exactly `agent-ide`.
+fn pid_is_agent_ide(pid: i32) -> bool {
+    let mut path = vec![0_u8; 4096];
+    // SAFETY: `path` is writable for its full length, which is passed as its size.
+    let length = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
+    if length <= 0 {
+        return false;
+    }
+    Path::new(std::ffi::OsStr::from_bytes(&path[..length as usize]))
+        .file_name()
+        .is_some_and(|name| name.as_bytes() == DAEMON_EXECUTABLE_NAME)
+}
+
+/// Writes the one typed journal line of a forced daemon replacement: the pid, the failed probes
+/// that justified it, the time they spanned and whether `SIGKILL` was needed.
+///
+/// The daily fault report counts these lines (client journal, reason `deadline`, detail starting
+/// `wedged_daemon_replaced`). Best effort like every journal write.
+pub fn record_forced_replacement(pid: i32, probes: u32, span: Duration, killed: bool) {
+    crate::errorlog::record(
+        crate::errorlog::Method::Client,
+        crate::errorlog::Outcome::Failed,
+        crate::errorlog::Fields {
+            reason: Some(crate::errorlog::ReasonCode::Deadline),
+            detail: Some(&format!(
+                "wedged_daemon_replaced pid={pid} probes={probes} span_s={} kill={killed}",
+                span.as_secs()
+            )),
+            ..crate::errorlog::Fields::default()
+        },
+    );
+}
+
 /// Classifies only existing runtime paths; every missing or unsafe path remains non-mutating.
 fn inspect_runtime(
     runtime_dir: &Path,
@@ -1507,6 +1710,9 @@ fn validate_private_directory(path: &Path, metadata: &fs::Metadata) -> Result<()
 }
 
 /// Takes the exclusive nonblocking daemon lock and keeps its file descriptor open for daemon life.
+///
+/// The holder writes its pid into the lock file once it owns the lock; the file's content is only
+/// a hint for [`evict_wedged_daemon`], which trusts it only while the lock is still held.
 struct DaemonLock {
     _file: File,
 }
@@ -1523,6 +1729,11 @@ impl DaemonLock {
             .open(path)?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result == 0 {
+            // Best effort: the holder's pid lets a front find a daemon that holds the lock but
+            // answers nothing (see `evict_wedged_daemon`). The descriptor is close-on-exec (the
+            // std default), so no language server or check the daemon spawns ever inherits the lock.
+            let _ = file.set_len(0);
+            let _ = (&file).write_all(format!("{}\n", std::process::id()).as_bytes());
             Ok(Self { _file: file })
         } else if io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
             Err(AppError::AlreadyRunning)
