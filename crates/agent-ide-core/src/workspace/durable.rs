@@ -594,6 +594,30 @@ impl<'a> DurableWorkspace<'a> {
     /// activation upgrades when it starts without `read_only` and the slot is free, and a writer
     /// downgrades when it starts with `read_only: true`.
     pub async fn activate(&self, request: ActivationRequest) -> Result<StartReceipt, DurableError> {
+        self.activate_inner(request, false).await
+    }
+
+    /// Like [`Self::activate`], but an actor that already holds an active start of another
+    /// worktree under this same binding hands it over: the row moves to the requested worktree in
+    /// one transaction with a fresh epoch, so the old grant stops authorizing exactly as a stop
+    /// would. A stopped binding cannot start again, so a stop followed by a start on the same
+    /// binding is impossible; the move is that pair made atomic.
+    ///
+    /// The caller decides the old activation is idle (no pending work); this only checks that the
+    /// requested worktree's writer slot is free. Any other conflict is refused as in `activate`.
+    pub async fn activate_moving(
+        &self,
+        request: ActivationRequest,
+    ) -> Result<StartReceipt, DurableError> {
+        self.activate_inner(request, true).await
+    }
+
+    /// Shared body of [`Self::activate`] and [`Self::activate_moving`].
+    async fn activate_inner(
+        &self,
+        request: ActivationRequest,
+        moving: bool,
+    ) -> Result<StartReceipt, DurableError> {
         self.validate_native(&request.worktree)?;
         let binding = request.active_use.binding_ref().fingerprint();
         let actor = request.invocation.actor_id().to_owned();
@@ -643,7 +667,7 @@ impl<'a> DurableWorkspace<'a> {
                     },
                 )
                 .optional()?
-                && (!active || previous_digest != digest)
+                && (!active || (previous_digest != digest && !moving))
             {
                 return Ok((
                     previous_digest,
@@ -686,7 +710,11 @@ impl<'a> DurableWorkspace<'a> {
                 else if !tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_worktrees WHERE incarnation=?1 AND native_key=?2 AND nonce=?3 AND closed=0)", params![incarnation,native_key.as_slice(),nonce.as_slice()], |row| row.get::<_,bool>(0))? { "identity" }
                 else if tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_starts WHERE binding=?1 AND outcome='granted' AND (boot<>?2 OR active=0))", params![binding.as_slice(),boot], |row| row.get::<_,bool>(0))? { "binding" }
                 else if let Some((own_incarnation, own_role, _)) = &own {
-                    if own_incarnation != &incarnation { "actor_owned" }
+                    if own_incarnation != &incarnation {
+                        if !moving { "actor_owned" }
+                        else if !wants_reader && writer.is_some() { "worktree_owned" }
+                        else { "move" }
+                    }
                     else if own_role == "writer" && wants_reader { "downgrade" }
                     else if own_role == "reader" && !wants_reader && writer.is_none() { "upgrade" }
                     else if own_role == "reader" && !wants_reader && writer.is_some() { "worktree_owned" }
@@ -698,6 +726,7 @@ impl<'a> DurableWorkspace<'a> {
                 else { "granted" };
             let role = match outcome {
                 "reader" | "downgrade" => "reader",
+                "move" if wants_reader => "reader",
                 _ => "writer",
             };
             // Reader receipts use the same granted marker as writers; the role column is the
@@ -707,7 +736,7 @@ impl<'a> DurableWorkspace<'a> {
             } else {
                 outcome
             };
-            let epoch = if matches!(outcome, "granted" | "upgrade" | "downgrade") {
+            let epoch = if matches!(outcome, "granted" | "upgrade" | "downgrade" | "move") {
                 let epoch: i64 = tx.query_row("SELECT epoch FROM workspace_authority_clock WHERE singleton=1", [], |row| row.get(0))?;
                 let epoch = epoch.checked_add(1).ok_or(rusqlite::Error::InvalidQuery)?;
                 tx.execute("UPDATE workspace_authority_clock SET epoch=?1 WHERE singleton=1", [epoch])?;
@@ -724,6 +753,8 @@ impl<'a> DurableWorkspace<'a> {
                 tx.execute("UPDATE workspace_starts SET operation=?1,digest=?2,role='writer',epoch=?3 WHERE actor=?4 AND binding=?5 AND active=1", params![sql_id,digest.as_slice(),epoch,sql_actor,sql_binding.as_slice()])?;
             } else if outcome == "downgrade" {
                 tx.execute("UPDATE workspace_starts SET operation=?1,digest=?2,role='reader',epoch=?3 WHERE actor=?4 AND binding=?5 AND active=1", params![sql_id,digest.as_slice(),epoch,sql_actor,sql_binding.as_slice()])?;
+            } else if outcome == "move" {
+                tx.execute("UPDATE workspace_starts SET operation=?1,digest=?2,incarnation=?3,role=?4,epoch=?5,started_ms=?6 WHERE actor=?7 AND binding=?8 AND active=1", params![sql_id,digest.as_slice(),incarnation,role,epoch,started_ms,sql_actor,sql_binding.as_slice()])?;
             } else if outcome == "granted" || outcome == "reader" {
                 // Only authority-bearing outcomes need a start row. Refusals remain retryable,
                 // including after a boot or stop, and must not collide with the activation's
@@ -785,6 +816,7 @@ impl<'a> DurableWorkspace<'a> {
             && row.3 != "reader"
             && row.3 != "upgrade"
             && row.3 != "downgrade"
+            && row.3 != "move"
             && row.3 != "historical"
         {
             return Err(rejection(&row.3));
@@ -802,7 +834,7 @@ impl<'a> DurableWorkspace<'a> {
             } else if row.3 == "granted" {
                 // A fallback read of a committed row: the role column carries the class.
                 StartRole::parse(&row.4).ok_or(DurableError::CorruptState)?
-            } else if row.3 == "downgrade" || row.3 == "historical" {
+            } else if row.3 == "downgrade" || row.3 == "move" || row.3 == "historical" {
                 // Exact retries keep the old boot and cannot pass `authority`'s boot fence.
                 StartRole::parse(&row.4).ok_or(DurableError::CorruptState)?
             } else {
@@ -851,6 +883,33 @@ impl<'a> DurableWorkspace<'a> {
             )
             .await?;
         Ok(holder)
+    }
+
+    /// Reads the closed facts of the one active start `actor` holds, whatever its worktree, so an
+    /// actor-owns-another-worktree refusal names that activation and never another actor's start
+    /// of the requested worktree. Nothing is granted and no authority is minted by this read.
+    pub async fn actor_start(&self, actor: &str) -> Result<Option<StartHolder>, DurableError> {
+        let sql = "SELECT binding,operation,epoch,started_ms,role FROM workspace_starts WHERE active=1 AND actor=?1 LIMIT 1";
+        let sql_actor = actor.to_owned();
+        let owner = sql_actor.clone();
+        Ok(self
+            .store
+            .read_one(sql, vec![Value::Text(sql_actor)], move |row| {
+                let binding: Vec<u8> = row.get(0)?;
+                let role: String = row.get(4)?;
+                Ok(StartHolder {
+                    same_actor: true,
+                    actor: owner.clone(),
+                    binding: binding.as_slice().try_into().unwrap_or([0; 32]),
+                    activation: row.get(1)?,
+                    epoch: u64::try_from(row.get::<_, i64>(2)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    started_ms: u64::try_from(row.get::<_, i64>(3)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    role: StartRole::parse(&role).ok_or(rusqlite::Error::InvalidQuery)?,
+                })
+            })
+            .await?)
     }
 
     /// Converts a committed receipt to authority only after fresh binding, native identity, and boot checks.

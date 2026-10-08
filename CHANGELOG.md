@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- A read-only activation no longer schedules a project check: its `ide.start`, native post-edit triggers and environment changes start none, so three readers no longer kick a cold `cargo check`, and a writer's results are not marked stale by a reader's start. A reader still sees the problems a writer's check produced.
+- `ide.start` of another root by the actor that already holds an activation elsewhere now hands the old activation over by itself, with no `ide.stop` first, when nothing is pending on it (no queued or pending job, no unsettled or `outcome_unknown` edit, no running test). The old authority, provider sessions, cache ownership and leases are released as a stop releases them, the same session's grant moves in one durable step (a stopped binding cannot start again; another session of the actor is revoked first), the new work of the old binding is refused while the handover settles, and the handover is journaled. With pending work the `start:actor_owns_another_worktree` refusal stays, now naming the held worktree path and what keeps it, and releases nothing. Another actor's activation is never touched.
+
 ## 0.10.6 — 2026-10-08
 
 ### Fixed

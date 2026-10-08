@@ -480,6 +480,37 @@ fn terminal_stage(tool: AssistanceTool, code: &FailureCode) -> String {
     }
 }
 
+/// Binds a freshly activated worktree into the problem feed. A reader borrows the problems a
+/// writer's check produced and schedules no check itself, so it never starts a cold check.
+fn feed_activated(feed: &ProjectProblemFeed, binding: &BindingRef, authority: &AuthorityStamp) {
+    feed.activated_with_denies(
+        binding.fingerprint(),
+        authority.worktree().worktree_path(),
+        authority.worktree().git_common_dir(),
+        false,
+        authority.role() == crate::workspace::authority::StartRole::Reader,
+        Vec::new(),
+    );
+}
+
+/// What the requesting actor holds on another worktree when a start collides with it.
+enum ActorElsewhere {
+    /// Nothing is pending there: the activation can be handed over. `holder` is its binding.
+    Idle {
+        /// Binding that owns the old activation.
+        holder: BindingRef,
+        /// Worktree the old activation is attached to.
+        path: PathBuf,
+    },
+    /// The activation stays, held by unsettled work named in `reason`.
+    Busy {
+        /// Worktree the old activation is attached to.
+        path: PathBuf,
+        /// Plain words for what is pending.
+        reason: &'static str,
+    },
+}
+
 /// Shared bounded transport-side bookkeeping; no lock survives an I/O await.
 struct Ledger {
     /// Jobs popped for execution and not yet settled; maintained in the same locked section that
@@ -508,6 +539,9 @@ struct Ledger {
     /// a later, redundant Context job for the exact same unchanged issue is never re-armed as a
     /// fresh undelivered fact. Cleared at the same points `feedback` is cleared.
     delivered: BTreeMap<BindingRef, DeliveredIssue>,
+    /// Bindings whose activation is being handed to another worktree: ingress refuses their new
+    /// work until the handover settles, so nothing can queue against the old root meanwhile.
+    handing_over: BTreeSet<BindingRef>,
 }
 impl Default for Ledger {
     /// Creates empty finite bookkeeping; no file or process work occurs.
@@ -523,6 +557,7 @@ impl Default for Ledger {
             native_epoch: BTreeMap::new(),
             feedback: BTreeMap::new(),
             delivered: BTreeMap::new(),
+            handing_over: BTreeSet::new(),
         }
     }
 }
@@ -1524,6 +1559,7 @@ impl WorkerHandle {
                     heads: BTreeMap::new(),
                     source_sequence: 0,
                     uncertain: std::collections::BTreeSet::new(),
+                    unsettled_edits: BTreeMap::new(),
                     uncertain_snapshots: Vec::new(),
                     runtime,
                     providers: providers::Providers::new(),
@@ -1999,6 +2035,12 @@ impl WorkerHandle {
             // admission again because a reader may upgrade or a writer may downgrade.
             ledger.starts.remove(key);
         }
+        if tool != AssistanceTool::Stop && ledger.handing_over.contains(&binding) {
+            return Err(InspectFailure::stage(
+                FailureCode::Capacity,
+                "worker:handover_in_progress",
+            ));
+        }
         let queue_cap = queue_capacity(self.shared.launcher.limits.queued, tool);
         let now = tokio::time::Instant::now();
         if ledger
@@ -2391,6 +2433,11 @@ struct Worker<'a> {
     admission: Arc<Mutex<crate::execution::AdmissionController>>,
     /// Bindings with uncertain physical/durable completion cannot report successful cleanup.
     uncertain: std::collections::BTreeSet<BindingRef>,
+    /// Operation ids of each binding's edits that settled as `outcome_unknown`: such an edit may
+    /// have written, so the binding stays unsettled, however long its retained result lives, until
+    /// the same operation later reconciles to a definite outcome or the binding stops. One id per
+    /// unknown edit; an agent that keeps issuing unknown edits is already unhealthy.
+    unsettled_edits: BTreeMap<BindingRef, BTreeSet<String>>,
     /// Retains private scratch files when a child has no positive reap evidence. Entries are never
     /// deleted automatically: without a positive reap we cannot prove the child is no longer
     /// writing, so quarantine is the only honest outcome. This list has no fixed capacity today;
@@ -3066,6 +3113,12 @@ impl<'a> Worker<'a> {
                 .ok()
             })
             .flatten();
+        if let Some(result) = &unknown_edit {
+            self.unsettled_edits
+                .entry(job.invocation.binding_ref().clone())
+                .or_default()
+                .insert(result.operation_id.clone());
+        }
         let reply = match unknown_edit {
             Some(result) => PeerReply::Edit {
                 result,
@@ -3238,6 +3291,7 @@ impl<'a> Worker<'a> {
         };
         // A stale source has already failed byte validation, so no retained reference can be
         // promised as a valid retry; the reply leaves the caller to obtain a fresh read.
+        self.track_unsettled_edit(&binding, &reply);
         let reply = match reply {
             PeerReply::Edit {
                 result,
@@ -3265,13 +3319,7 @@ impl<'a> Worker<'a> {
                     },
                     Some(authority),
                 ) if job.tool == AssistanceTool::Start => {
-                    feed.activated_with_denies(
-                        binding.fingerprint(),
-                        authority.worktree().worktree_path(),
-                        authority.worktree().git_common_dir(),
-                        false,
-                        Vec::new(),
-                    );
+                    feed_activated(feed, &binding, authority);
                 }
                 (PeerReply::Edit { result, .. }, _)
                     if result.outcome.has_post_source() && !job.check_scheduled =>
@@ -3456,7 +3504,7 @@ impl<'a> Worker<'a> {
             job.failure_detail = Some(format!("read_only:ide.start:{holder}"));
             return Err(FailureCode::Conflict);
         }
-        let previous_role = self.grants.get(&binding).map(StartReceipt::role);
+        let mut previous_role = self.grants.get(&binding).map(StartReceipt::role);
         let candidate = activation_root(job, self.shared.launcher.allowed_roots())?;
         let operation = DiscoveryOperationRef::new(format!("discover-{}", job.reference))
             .map_err(|_| FailureCode::Internal)?;
@@ -3644,19 +3692,13 @@ impl<'a> Worker<'a> {
         let operation = identity.finalize().to_hex().to_string();
         let requested_operation = operation.clone();
         let requested_tree = tree.clone();
-        let request = crate::workspace::authority::ActivationRequest::new(
-            operation,
+        let request = Self::activation_request(
+            job,
+            operation.clone(),
             read_only,
-            job.invocation.clone(),
             self.shared.active(&binding)?,
-            tree,
-        )
-        .map_err(|_| {
-            job.failure_detail = Some(
-                "start:durable_state: the activation request could not be recorded".to_owned(),
-            );
-            FailureCode::WorkspaceActivation
-        })?;
+            tree.clone(),
+        )?;
         // The lease exists before the activation can: a sweep never sees an activated worktree
         // without one, and an activation that cannot take it is refused.
         let Some(lease) = crate::retention::Lease::for_worktree(requested_tree.worktree_path())
@@ -3668,7 +3710,81 @@ impl<'a> Worker<'a> {
             return Err(FailureCode::WorkspaceActivation);
         };
         // Do not cancel an in-flight durable commit: preserve its recoverable receipt before fencing output.
-        let receipt = match self.workspace.activate(request).await {
+        let mut activation = self.workspace.activate(request).await;
+        // The actor already holds an activation of another worktree: move it here when nothing
+        // there is pending, otherwise refuse and name what holds it.
+        if matches!(
+            activation,
+            Err(crate::workspace::durable::DurableError::OperationConflict
+                | crate::workspace::durable::DurableError::Authority(
+                    crate::workspace::authority::AuthorityError::ActorAlreadyOwnsWorktree
+                ))
+        ) && let Some(held) =
+            self.actor_elsewhere(&requested_tree, &job.reference, job.invocation.actor_id())
+        {
+            match held {
+                ActorElsewhere::Busy { path, reason } => {
+                    let detail = self
+                        .conflict_detail(
+                            &requested_tree,
+                            job.invocation.actor_id(),
+                            &crate::workspace::durable::DurableError::Authority(
+                                crate::workspace::authority::AuthorityError::ActorAlreadyOwnsWorktree,
+                            ),
+                        )
+                        .await;
+                    job.failure_detail = Some(format!(
+                        "{detail}; worktree {}; kept: {reason}",
+                        path.display()
+                    ));
+                    return Err(FailureCode::Conflict);
+                }
+                // Another binding's activation is released only when the start is then sure to
+                // succeed: not on a reused activation id and not behind another actor's writer.
+                ActorElsewhere::Idle { holder, .. }
+                    if holder != binding
+                        && (matches!(
+                            activation,
+                            Err(crate::workspace::durable::DurableError::OperationConflict)
+                        ) || (!read_only
+                            && matches!(
+                                self.workspace.start_holder(&requested_tree, "").await,
+                                Ok(Some(writer))
+                                    if writer.role == crate::workspace::authority::StartRole::Writer
+                            ))) =>
+                {
+                    self.end_handover_fence(&holder);
+                }
+                ActorElsewhere::Idle { holder, path } => {
+                    let moved = self
+                        .hand_over(
+                            job,
+                            &holder,
+                            &requested_tree,
+                            &requested_operation,
+                            read_only,
+                        )
+                        .await;
+                    self.end_handover_fence(&holder);
+                    activation = moved?;
+                    if activation.is_ok() {
+                        previous_role = None;
+                        crate::errorlog::record(
+                            errorlog_method(job.tool),
+                            crate::errorlog::Outcome::Completed,
+                            crate::errorlog::Fields {
+                                actor: Some(job.invocation.actor_id()),
+                                worktree: Some(requested_tree.worktree_path()),
+                                correlation: Some(job.reference.as_str()),
+                                detail: Some(&format!("handover: released {}", path.display())),
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        let receipt = match activation {
             Ok(receipt) => receipt,
             Err(
                 error @ (crate::workspace::durable::DurableError::OperationConflict
@@ -3948,6 +4064,197 @@ impl<'a> Worker<'a> {
         ))
     }
 
+    /// Releases `holder`'s activation and re-runs this start: the same binding's grant is moved
+    /// in one durable transaction (a stopped binding cannot start again), another binding's is
+    /// revoked and stopped as `ide.stop` would. Returns the activation outcome; `Err` only when
+    /// the old activation's provider cleanup failed and nothing moved.
+    async fn hand_over(
+        &mut self,
+        job: &mut Job,
+        holder: &BindingRef,
+        tree: &crate::workspace::authority::WorktreeRef,
+        operation: &str,
+        read_only: bool,
+    ) -> Result<Result<StartReceipt, crate::workspace::durable::DurableError>, FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        let retry = Self::activation_request(
+            job,
+            operation.to_owned(),
+            read_only,
+            self.shared.active(&binding)?,
+            tree.clone(),
+        )?;
+        let activation = if *holder == binding {
+            // Providers close first, as a stop does: a failed move then keeps the old
+            // activation with full retry authority.
+            if let Err(code) = self.close_provider(holder).await {
+                job.failure_detail = Some("start:handover_provider_cleanup".to_owned());
+                return Err(code);
+            }
+            self.workspace.activate_moving(retry).await
+        } else if self.settle_revocation(holder).await.is_ok() {
+            if let Ok(mut guard) = self.shared.bindings.lock() {
+                let _ = guard.stop_binding(holder);
+            }
+            self.workspace.activate(retry).await
+        } else {
+            return Ok(Err(crate::workspace::durable::DurableError::Authority(
+                crate::workspace::authority::AuthorityError::ActorAlreadyOwnsWorktree,
+            )));
+        };
+        if activation.is_ok() {
+            self.finish_handover(holder, &binding, &job.reference).await;
+        }
+        Ok(activation)
+    }
+
+    /// Lets the old binding admit work again once its handover attempt has settled.
+    fn end_handover_fence(&self, holder: &BindingRef) {
+        if let Ok(mut ledger) = self.shared.ledger.lock() {
+            ledger.handing_over.remove(holder);
+        }
+    }
+
+    /// Tracks the edits of `binding` that settled as `outcome_unknown`, by operation id, so the
+    /// handover guard keeps seeing them after their retained reply is evicted. The same operation
+    /// reconciling to a definite outcome clears its id; a conflicting duplicate or an unrelated
+    /// edit clears nothing.
+    fn track_unsettled_edit(&mut self, binding: &BindingRef, reply: &PeerReply) {
+        let PeerReply::Edit { result, .. } = reply else {
+            return;
+        };
+        match result.outcome {
+            ChangesEditOutcome::OutcomeUnknown => {
+                self.unsettled_edits
+                    .entry(binding.clone())
+                    .or_default()
+                    .insert(result.operation_id.clone());
+            }
+            ChangesEditOutcome::ConflictingDuplicate => {}
+            _ => {
+                if let Some(operations) = self.unsettled_edits.get_mut(binding) {
+                    operations.remove(&result.operation_id);
+                    if operations.is_empty() {
+                        self.unsettled_edits.remove(binding);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Builds the durable activation request for this start, naming a recorded start failure.
+    fn activation_request(
+        job: &mut Job,
+        operation: String,
+        read_only: bool,
+        active: ActiveBindingUse,
+        tree: crate::workspace::authority::WorktreeRef,
+    ) -> Result<crate::workspace::authority::ActivationRequest, FailureCode> {
+        crate::workspace::authority::ActivationRequest::new(
+            operation,
+            read_only,
+            job.invocation.clone(),
+            active,
+            tree,
+        )
+        .map_err(|_| {
+            job.failure_detail = Some(
+                "start:durable_state: the activation request could not be recorded".to_owned(),
+            );
+            FailureCode::WorkspaceActivation
+        })
+    }
+
+    /// Finds this actor's activation of a worktree other than `tree` and decides whether it can be
+    /// handed over: only when nothing is pending on its binding — no queued job, unsettled or
+    /// `outcome_unknown` edit, uncertain cleanup or running test run. The start job `current`
+    /// itself is not pending work. `None` when the actor holds nothing else in this daemon.
+    fn actor_elsewhere(
+        &self,
+        tree: &crate::workspace::authority::WorktreeRef,
+        current: &str,
+        actor: &str,
+    ) -> Option<ActorElsewhere> {
+        let (holder, receipt) = self.grants.iter().find(|(_, receipt)| {
+            receipt.actor() == actor && receipt.worktree().id() != tree.id()
+        })?;
+        let path = receipt.worktree().worktree_path().to_path_buf();
+        let busy = |reason| {
+            Some(ActorElsewhere::Busy {
+                path: path.clone(),
+                reason,
+            })
+        };
+        if self.uncertain.contains(holder) {
+            return busy("an unsettled operation");
+        }
+        if self.unsettled_edits.contains_key(holder) {
+            return busy("an edit with outcome_unknown");
+        }
+        if self
+            .shared
+            .test_runs
+            .uncollected(&holder.fingerprint())
+            .iter()
+            .any(|(_, _, running)| *running)
+        {
+            return busy("a running test");
+        }
+        let Ok(mut ledger) = self.shared.ledger.lock() else {
+            return busy("an unavailable ledger");
+        };
+        {
+            if let Some(job) = ledger
+                .queue
+                .iter()
+                .find(|job| job.invocation.binding_ref() == holder)
+            {
+                return busy(if job.tool == AssistanceTool::Edit || job.stage.is_some() {
+                    "a pending edit"
+                } else {
+                    "queued work"
+                });
+            }
+            for (reference, detail) in &ledger.details {
+                if &detail.binding != holder {
+                    continue;
+                }
+                if matches!(detail.reply, PeerReply::Pending { .. }) && reference != current {
+                    return busy("a pending job");
+                }
+            }
+        }
+        // The idle verdict and the fence are one critical section: work the old binding submits
+        // while the handover settles is refused at ingress instead of racing the move.
+        ledger.handing_over.insert(holder.clone());
+        Some(ActorElsewhere::Idle {
+            holder: holder.clone(),
+            path,
+        })
+    }
+
+    /// Releases what a handed-over activation left behind once its grant is gone, as the tail of
+    /// a stop does: provider sessions and cache ownership, leases, registered paths, baselines,
+    /// the feed's delivery state, retained results and test-run bookkeeping. `current` is the
+    /// start job still being answered and keeps its retained result.
+    async fn finish_handover(&mut self, holder: &BindingRef, binding: &BindingRef, current: &str) {
+        let fingerprint = holder.fingerprint();
+        self.shared.test_runs.observe_binding(&fingerprint);
+        if let Ok(mut ledger) = self.shared.ledger.lock() {
+            ledger
+                .details
+                .retain(|reference, detail| &detail.binding != holder || reference == current);
+        }
+        if let Some(feed) = &self.shared.project_feed {
+            feed.forget(&fingerprint);
+        }
+        if holder == binding {
+            self.grants.remove(holder);
+            self.release_live(holder).await;
+            self.release_binding_state(holder);
+        }
+    }
+
     /// Locks the daemon's single admission controller for one synchronous accounting call.
     ///
     /// The guard must never be held across an await: it is a `std` mutex shared with the helper
@@ -4013,7 +4320,7 @@ impl<'a> Worker<'a> {
             DurableError::OperationConflict => "start:activation_conflict".to_owned(),
             DurableError::Authority(
                 crate::workspace::authority::AuthorityError::ActorAlreadyOwnsWorktree,
-            ) => match self.workspace.start_holder(tree, actor).await {
+            ) => match self.workspace.actor_start(actor).await {
                 Ok(Some(holder)) => format!(
                     "start:actor_owns_another_worktree: {}",
                     self.holder_facts(&holder)
@@ -5395,6 +5702,7 @@ impl<'a> Worker<'a> {
     /// Releases binding-owned state only after a committed revoke, including environment notice
     /// baselines, so stopped bindings cannot retain roots or suppress a future binding's notices.
     fn release_binding_state(&mut self, binding: &BindingRef) {
+        self.unsettled_edits.remove(binding);
         self.quiesce_worktree_caches(binding);
         self.leases.remove(binding);
         self.registered.remove(binding);
@@ -7875,6 +8183,63 @@ mod stop_retry_tests {
         scheduler.shutdown().await;
     }
 
+    /// A reader's start binds the feed without scheduling a check; a writer's start schedules one.
+    #[tokio::test]
+    async fn reader_start_schedules_no_project_check_but_writer_start_does() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("alpha.toml"), "").unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let language = crate::lang::testing::ALPHA;
+        let checker = Arc::new(crate::checks::FakeChecker::new(
+            language,
+            crate::checks::ProblemSnapshot::from_problems(
+                language,
+                crate::checks::CheckState::Ready,
+                Vec::new(),
+                1,
+                0,
+            ),
+        ));
+        let scheduler = crate::checks::scheduler::Scheduler::new(
+            vec![checker.clone()],
+            Duration::from_millis(1),
+            1,
+            fixture.base.join("cache"),
+        );
+        let feed = Arc::new(ProjectProblemFeed::new(
+            scheduler.clone(),
+            vec![fixture.root.clone()],
+            vec![language],
+        ));
+        let (reader, _) = production_start_mode(&mut worker, "reader", "reader-start", true).await;
+        let authority = worker.authority(&reader).await.unwrap();
+        feed_activated(&feed, &reader, &authority);
+        assert!(!scheduler.is_busy(), "a reader start must queue no check");
+        assert_eq!(scheduler.generation(&fixture.root), 0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            checker.requests().is_empty(),
+            "a reader start must not check"
+        );
+        assert!(scheduler.latest(&fixture.root).is_empty());
+
+        let (writer, _) = production_start(&mut worker, "writer", "writer-start").await;
+        let authority = worker.authority(&writer).await.unwrap();
+        feed_activated(&feed, &writer, &authority);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while scheduler.latest(&fixture.root).is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a writer start still schedules the first check");
+        scheduler.shutdown().await;
+    }
+
     /// Stop cleanup releases both the binding's root and its environment delivery bookkeeping.
     #[tokio::test]
     async fn review_environment_binding_is_pruned_on_stop() {
@@ -9085,6 +9450,15 @@ mod stop_retry_tests {
         worker
             .activity
             .insert(holder_binding.fingerprint(), crate::errorlog::now_ms() - 1);
+        // Pending work keeps the holder from being handed over, so the refusal stands.
+        plant_worker_detail(
+            &worker,
+            "holder-job",
+            &holder_binding,
+            PeerReply::Pending {
+                detail_ref: "holder-job".into(),
+            },
+        );
 
         let (mut refused, _cancel) = start_job(
             &worker,
@@ -9109,6 +9483,283 @@ mod stop_retry_tests {
         assert!(
             detail.contains("last activity 20"),
             "the holder facts name the last observed activity: {detail}"
+        );
+        assert!(
+            detail.contains(&format!("; worktree {}", fixture.root.display()))
+                && detail.ends_with("kept: a pending job"),
+            "the refusal names the held worktree and why it was kept: {detail}"
+        );
+    }
+
+    /// Starts `actor` on `root` through the production entry point and returns the outcome with
+    /// the recorded refusal detail.
+    async fn move_start(
+        worker: &mut Worker<'_>,
+        actor: &str,
+        call: &str,
+        parameters: serde_json::Value,
+    ) -> (Result<(), FailureCode>, Option<String>) {
+        let (mut job, _cancel) = start_job(worker, actor, call, parameters);
+        let result = worker.activate(&mut job).await.map(|_| ());
+        (result, job.failure_detail)
+    }
+
+    /// Creates a plain directory the move tests use as another allowed root.
+    fn plain_root(fixture: &Fixture, name: &str) -> std::path::PathBuf {
+        let root = fixture.base.join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// An actor's start of another root hands its idle activation over: no stop is needed, the
+    /// old authority stops working, the old worktree is free again, another actor's activation
+    /// is untouched and the handover is journaled — with explicit and with default activation ids.
+    #[tokio::test]
+    async fn same_actor_start_on_another_root_hands_the_idle_activation_over() {
+        use crate::workspace::authority::StartRole;
+        let fixture = Fixture::new();
+        let (other, third) = (
+            plain_root(&fixture, "other-root"),
+            plain_root(&fixture, "third"),
+        );
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        let (bystander, _) = production_start(&mut worker, "bystander", "by-start").await;
+        let (result, detail) = move_start(
+            &mut worker,
+            "bystander",
+            "by-first",
+            serde_json::json!({"activation_id":"by-start","root":third}),
+        )
+        .await;
+        result.unwrap_or_else(|code| panic!("{code:?} {detail:?}"));
+        let (mover, _) = production_start(&mut worker, "mover", "first").await;
+        let old = worker.authority(&mover).await.unwrap();
+
+        crate::errorlog::capture_start();
+        for (call, parameters) in [
+            (
+                "explicit",
+                serde_json::json!({"activation_id":"second","root":other}),
+            ),
+            ("default", serde_json::json!({"root":third})),
+        ] {
+            let (result, detail) = move_start(&mut worker, "mover", call, parameters).await;
+            if call == "default" {
+                assert_eq!(result, Err(FailureCode::Conflict), "{detail:?}");
+                assert!(detail.unwrap().contains("worktree_held_by_another_actor"));
+                continue;
+            }
+            result.unwrap_or_else(|code| panic!("{code:?} {detail:?}"));
+        }
+        let events = crate::errorlog::capture_take();
+        assert!(
+            events.iter().any(|event| event
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("handover: released "))
+                && event.actor.as_deref() == Some("mover")),
+            "{events:?}"
+        );
+        let held = worker.grants.get(&mover).unwrap();
+        assert!(held.worktree().worktree_path().ends_with("other-root"));
+        assert_eq!(held.role(), StartRole::Writer);
+        assert!(
+            worker
+                .workspace
+                .authorize(&old, &worker.shared.active(&mover).unwrap())
+                .await
+                .is_err(),
+            "the handed-over authority must stop working"
+        );
+        // The old worktree is free for anyone, and the bystander never lost its own.
+        let (newcomer, receipt) = production_start(&mut worker, "newcomer", "new-start").await;
+        assert_eq!(receipt.role(), StartRole::Writer);
+        worker.authority(&bystander).await.unwrap();
+        assert!(worker.settle_revocation(&mover).await.unwrap());
+        assert!(worker.settle_revocation(&newcomer).await.unwrap());
+
+        // A start without an activation id reuses one default id for every root of its binding.
+        let (mover, _) = production_start(&mut worker, "walker", "walker-1").await;
+        let (result, detail) = move_start(
+            &mut worker,
+            "walker",
+            "walker-2",
+            serde_json::json!({"activation_id":"walker-1","root":other}),
+        )
+        .await;
+        assert_eq!(
+            result,
+            Ok(()),
+            "a reused activation id must hand over too: {detail:?}"
+        );
+        assert!(
+            worker
+                .grants
+                .get(&mover)
+                .unwrap()
+                .worktree()
+                .worktree_path()
+                .ends_with("other-root")
+        );
+    }
+
+    /// With unsettled work on the old activation the refusal stays, names the held worktree and
+    /// the reason, and releases nothing.
+    #[tokio::test]
+    async fn busy_activation_is_kept_and_the_refusal_names_worktree_and_reason() {
+        let fixture = Fixture::new();
+        let other = plain_root(&fixture, "other-root");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (mover, _) = production_start(&mut worker, "mover", "first").await;
+        let parameters = serde_json::json!({"activation_id":"second","root":other});
+
+        // Each case plants one kind of pending work and undoes it afterwards.
+        let (mut edit, _edit_cancel) =
+            start_job(&worker, "mover", "queued-edit", serde_json::json!({}));
+        edit.tool = AssistanceTool::Edit;
+        worker.shared.ledger.lock().unwrap().queue.push_back(edit);
+        let (result, detail) = move_start(&mut worker, "mover", "c1", parameters.clone()).await;
+        assert_eq!(result, Err(FailureCode::Conflict));
+        let detail = detail.unwrap();
+        assert!(
+            detail.starts_with("start:actor_owns_another_worktree: actor mover"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(&format!("; worktree {}", fixture.root.display())),
+            "{detail}"
+        );
+        assert!(detail.ends_with("kept: a pending edit"), "{detail}");
+        worker.shared.ledger.lock().unwrap().queue.clear();
+
+        // The unknown outcome keeps blocking even though no retained reply exists any more.
+        worker.track_unsettled_edit(
+            &mover,
+            &PeerReply::Edit {
+                result: EditResult::new(
+                    "op".to_owned(),
+                    "a.rs".to_owned(),
+                    ChangesEditOutcome::OutcomeUnknown,
+                    None,
+                )
+                .unwrap(),
+                diagnostics: EditDiagnostics::Unknown {},
+                note: None,
+                operation: None,
+            },
+        );
+        assert!(worker.shared.ledger.lock().unwrap().details.is_empty());
+        let (_, detail) = move_start(&mut worker, "mover", "c2", parameters.clone()).await;
+        assert!(
+            detail
+                .unwrap()
+                .ends_with("kept: an edit with outcome_unknown")
+        );
+        // An unrelated successful edit clears nothing; the same operation reconciling does.
+        let edit_reply = |operation: &str, outcome: ChangesEditOutcome| PeerReply::Edit {
+            result: EditResult::new(
+                operation.to_owned(),
+                "a.rs".to_owned(),
+                outcome,
+                outcome.has_post_source().then(|| "ref".to_owned()),
+            )
+            .unwrap(),
+            diagnostics: EditDiagnostics::Unknown {},
+            note: None,
+            operation: None,
+        };
+        worker.track_unsettled_edit(
+            &mover,
+            &edit_reply("other-op", ChangesEditOutcome::Replaced),
+        );
+        worker.track_unsettled_edit(
+            &mover,
+            &edit_reply("op", ChangesEditOutcome::ConflictingDuplicate),
+        );
+        let (_, detail) = move_start(&mut worker, "mover", "c2b", parameters.clone()).await;
+        assert!(
+            detail
+                .unwrap()
+                .ends_with("kept: an edit with outcome_unknown")
+        );
+        worker.track_unsettled_edit(&mover, &edit_reply("op", ChangesEditOutcome::Replaced));
+        assert!(worker.unsettled_edits.is_empty());
+
+        plant_worker_detail(
+            &worker,
+            "other-job",
+            &mover,
+            PeerReply::Pending {
+                detail_ref: "other-job".into(),
+            },
+        );
+        let (_, detail) = move_start(&mut worker, "mover", "c3", parameters.clone()).await;
+        assert!(detail.unwrap().ends_with("kept: a pending job"));
+        worker.shared.ledger.lock().unwrap().details.clear();
+
+        worker.uncertain.insert(mover.clone());
+        let (_, detail) = move_start(&mut worker, "mover", "c4", parameters.clone()).await;
+        assert!(detail.unwrap().ends_with("kept: an unsettled operation"));
+        worker.uncertain.clear();
+
+        assert!(matches!(
+            worker.shared.test_runs.start(
+                fixture.root.clone(),
+                vec!["/bin/sleep".into(), "2".into()],
+                crate::lang::testing::ALPHA,
+                Duration::from_secs(30),
+                "run-detail".into(),
+                &mover,
+            ),
+            StartResult::Started(_)
+        ));
+        let (_, detail) = move_start(&mut worker, "mover", "c5", parameters.clone()).await;
+        assert!(detail.unwrap().ends_with("kept: a running test"));
+
+        // Nothing was released by any refusal.
+        let held = worker.grants.get(&mover).unwrap();
+        assert_eq!(
+            held.worktree().worktree_path(),
+            fixture.root.canonicalize().unwrap()
+        );
+        worker.authority(&mover).await.unwrap();
+        assert!(worker.leases.contains_key(&mover));
+    }
+
+    /// Plants one retained result for `binding` in the worker's ledger.
+    fn plant_worker_detail(
+        worker: &Worker<'_>,
+        reference: &str,
+        binding: &BindingRef,
+        reply: PeerReply,
+    ) {
+        worker.shared.ledger.lock().unwrap().details.insert(
+            reference.to_owned(),
+            Detail {
+                binding: binding.clone(),
+                reply,
+                selection: (
+                    AssistanceTool::Context,
+                    selection(&serde_json::json!({"path":"main.rs"})),
+                ),
+                authority: None,
+                source: None,
+                native_epoch: 0,
+                line_movement: None,
+                diff_page: None,
+                diff_page_fresh: false,
+                context_page: None,
+                context_page_fresh: false,
+                diff_provenance: None,
+                extra_sources: Vec::new(),
+            },
         );
     }
 
@@ -9288,6 +9939,7 @@ mod stop_retry_tests {
             source_sequence: 0,
             admission: Arc::new(Mutex::new(admission_controller())),
             uncertain: std::collections::BTreeSet::new(),
+            unsettled_edits: BTreeMap::new(),
             uncertain_snapshots: Vec::new(),
             runtime,
             providers: providers::Providers::new(),
@@ -11883,6 +12535,48 @@ mod stop_retry_tests {
         );
         assert!(!ledger.details.contains_key("detail-2"));
         assert!(ledger.details.contains_key(&reference));
+    }
+
+    /// While a handover settles, ingress refuses new work for the old binding (so nothing queues
+    /// against the root being left) and still admits its stop.
+    #[tokio::test]
+    async fn handover_fence_refuses_new_work_for_the_old_binding() {
+        let fixture = Fixture::new();
+        let handle = detail_handle(&fixture.root, 10);
+        let invocation = validated_call(&handle.shared.bindings, "fence-actor", "fence-start");
+        let binding = invocation.binding_ref().clone();
+        handle
+            .shared
+            .ledger
+            .lock()
+            .unwrap()
+            .handing_over
+            .insert(binding.clone());
+        assert_eq!(
+            enqueue_context(&handle, invocation.clone()),
+            Err(FailureCode::Capacity)
+        );
+        assert!(
+            handle
+                .enqueue(
+                    invocation.clone(),
+                    AssistanceTool::Stop,
+                    serde_json::json!({}),
+                    "stop-retry",
+                    None,
+                    None,
+                )
+                .is_ok(),
+            "a stop is never fenced"
+        );
+        handle
+            .shared
+            .ledger
+            .lock()
+            .unwrap()
+            .handing_over
+            .remove(&binding);
+        assert!(enqueue_context(&handle, invocation).is_ok());
     }
 
     /// An explicit stop still clears that binding's details and its cancellation entry.

@@ -166,7 +166,7 @@ error: conflict ({{ resolution_detail }}); another session of this actor — {{ 
 {%- elif code == "conflict" and resolution_detail == "start:actor_owns_another_worktree" -%}
 error: conflict (start:actor_owns_another_worktree); this actor's IDE activation is attached to another worktree. Call ide.stop there, then retry ide.start for this root
 {%- elif code == "conflict" and resolution_detail is startingwith("start:actor_owns_another_worktree") -%}
-error: conflict ({{ resolution_detail }}); this actor's IDE activation is attached to another worktree — {{ resolution_message }}. Call ide.stop there, then retry ide.start for this root
+error: conflict ({{ resolution_detail }}); this actor's IDE activation is attached to another worktree — {{ resolution_message }}. It was not handed over automatically because of the pending work named after `kept:`; let that work settle or call ide.stop there, then retry ide.start for this root
 {%- elif code == "conflict" and resolution_detail is startingwith("read_only:ide.edit:") -%}
 refused: read_only (ide.edit); this IDE activation is read-only (started with read_only: true). To change code, call ide.start without read_only — one writer per worktree; current writer: {{ resolution_message }}
 {%- elif code == "conflict" and resolution_detail is startingwith("read_only:ide.test:") -%}

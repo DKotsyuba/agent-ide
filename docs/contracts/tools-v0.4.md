@@ -25,7 +25,7 @@ Revision: v0.4. Provider: Agent IDE. Consumers: coding agents and IDE hosts.
 5. The language server runs as it would in a human's editor and remains alive for the session.
 6. Every host uses one path: return the result directly when it arrives within about 10 seconds; otherwise return `pending` and use `ide.inspect`.
 
-`ide.start` refusals name the actionable cause: an absent requested root includes the nearest existing ancestor under an allowed root; Git discovery failures include a short reason; unresolved worktrees and durable state failures have distinct stages. A worktree conflict says whether another actor owns it, this actor's other channel owns it, or this actor already owns another worktree, and names `ide.stop` or reuse as the remedy. Provider cache namespace conflicts have their own stage and recovery. A successful repeat by the same actor and binding reports the existing activation idempotently. The start card explains which tools can answer from source while a language server starts. Its baseline says why coverage is partial: Git metadata and source bytes are captured separately, so an atomic window is not proven.
+`ide.start` refusals name the actionable cause: an absent requested root includes the nearest existing ancestor under an allowed root; Git discovery failures include a short reason; unresolved worktrees and durable state failures have distinct stages. A worktree conflict says whether another actor owns it, this actor's other channel owns it, or this actor already owns another worktree, and names `ide.stop` or reuse as the remedy. An `ide.start` of another root by the actor that already holds an activation elsewhere hands that activation over without an `ide.stop` when nothing is pending on it (no queued or pending job, no edit that is unsettled or `outcome_unknown`, no running test): the old authority, provider ownership and leases are released as a stop would release them, the same session's grant moves to the new root in one durable step (a stopped session cannot start again), another session of the actor is revoked and stopped first, and the handover is journaled (`handover: released <path>`). Otherwise the `start:actor_owns_another_worktree` refusal stays, names the held worktree path and what keeps it (`; worktree <path>; kept: <reason>`), and releases nothing; another actor's activation is never touched. Provider cache namespace conflicts have their own stage and recovery. A successful repeat by the same actor and binding reports the existing activation idempotently. The start card explains which tools can answer from source while a language server starts. Its baseline says why coverage is partial: Git metadata and source bytes are captured separately, so an atomic window is not proven.
 
 ## 1. Common conventions
 
@@ -95,7 +95,7 @@ default derived from its session binding, so repeating it returns the same activ
 `read_only` or set it to `false` for the one writer allowed per worktree; set it to `true` for a
 reader. Readers coexist with writers and other readers. A reader can upgrade by starting without
 `read_only` when the writer slot is free, and a writer can downgrade by starting with
-`read_only: true`.
+`read_only: true`. A reader's start schedules no project check (neither the first check nor later triggers or environment restarts); it still sees the problems a writer's check produced.
 
 `environment` selects the current environment per project root: for example,
 `{"environment":{"python":".venv-py314","python:packages/alpha":".venv"}}`.

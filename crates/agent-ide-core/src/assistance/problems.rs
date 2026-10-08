@@ -164,6 +164,10 @@ struct BoundWorktree {
     /// A current host profile could not prove a supported check read policy; no check or cached
     /// diagnostic for this binding may be scheduled or disclosed.
     read_restricted: bool,
+    /// A `read_only` activation: it reads the problems a writer's check produced but schedules
+    /// no check itself (activation, native post-edit trigger or environment change), so a reader
+    /// never starts a cold check or marks the writer's results stale.
+    read_only: bool,
     /// Read exclusions captured at activation for this binding's check replies.
     read_denies: Vec<ReadDeny>,
 }
@@ -288,17 +292,29 @@ impl ProjectProblemFeed {
             worktree,
             repository_key,
             read_restricted,
+            false,
             Vec::new(),
         );
     }
 
-    /// Activates checks with the current host exclusions installed before any scheduler work.
+    /// Binds `binding` to its worktree with the current host exclusions installed before any
+    /// scheduler work, and schedules the initial warm check unless the binding is restricted or
+    /// `read_only`.
+    ///
+    /// A reader is recorded (so it reads whatever the scheduler already holds for the worktree, a
+    /// writer's results included, and its plate state is tracked) but schedules nothing here and,
+    /// while it is the binding, nothing later either: [`Self::changed`] and its variants and
+    /// [`Self::environment_changed`] admit only unrestricted writer bindings. Starting again
+    /// replaces the record, so a reader that upgrades schedules the first check and a writer that
+    /// downgrades stops scheduling. Not admitting the first check also leaves the writer's results
+    /// current: no activation generation is recorded for a reader.
     pub fn activated_with_denies(
         &self,
         binding: [u8; 32],
         worktree: &Path,
         repository_key: &Path,
         read_restricted: bool,
+        read_only: bool,
         read_denies: Vec<ReadDeny>,
     ) {
         let admitted = admit_worktree(&self.allowed_roots, worktree).is_ok();
@@ -313,7 +329,7 @@ impl ProjectProblemFeed {
                 .bindings
                 .get(&binding)
                 .is_some_and(|bound| bound.read_restricted);
-        if admitted && !read_restricted {
+        if admitted && !read_restricted && !read_only {
             self.scheduler.add_read_denies(worktree, &read_denies);
             self.scheduler.activate(&repository_key, worktree);
         }
@@ -330,6 +346,7 @@ impl ProjectProblemFeed {
                 repository_key,
                 admitted,
                 read_restricted,
+                read_only,
                 read_denies,
             },
         );
@@ -399,14 +416,16 @@ impl ProjectProblemFeed {
     }
 
     /// Invalidates environment state under the binding admission lock. Only a worktree with an
-    /// admitted, unrestricted binding may restart; all others merely discard cached results.
+    /// admitted, unrestricted writer binding may restart; all others (reader-only included)
+    /// merely discard cached results.
     pub fn environment_changed(&self, worktree: &Path, language: Language) {
         if let Ok(state) = self.state.lock() {
-            if state
-                .bindings
-                .values()
-                .any(|bound| bound.worktree == worktree && bound.admitted && !bound.read_restricted)
-            {
+            if state.bindings.values().any(|bound| {
+                bound.worktree == worktree
+                    && bound.admitted
+                    && !bound.read_restricted
+                    && !bound.read_only
+            }) {
                 self.scheduler.environment_changed(worktree, language);
             } else {
                 self.scheduler.discard_environment(worktree, language);
@@ -417,8 +436,8 @@ impl ProjectProblemFeed {
     /// Schedules a check for `binding`'s admitted worktree after a native edit or `ide.edit`
     /// that cannot name the changed file, so every configured language is re-armed.
     ///
-    /// An unknown or read-restricted binding, or a worktree outside the allowed roots, schedules
-    /// nothing.
+    /// An unknown, read-restricted or `read_only` binding, or a worktree outside the allowed
+    /// roots, schedules nothing.
     pub fn changed(&self, binding: &[u8; 32]) {
         self.changed_with(binding, None, false, || {});
     }
@@ -454,6 +473,7 @@ impl ProjectProblemFeed {
             && let Some(bound) = state.bindings.get(binding)
             && bound.admitted
             && !bound.read_restricted
+            && !bound.read_only
         {
             before_trigger();
             if urgent {
@@ -1490,6 +1510,77 @@ mod tests {
             feed.next_block(&[2; 32]),
             plate("alpha: 0 errors, 0 warnings")
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `read_only` activation schedules no check (activation, native post, environment change),
+    /// never marks a writer's result stale, and still shows what the writer's check produced.
+    #[tokio::test(start_paused = true)]
+    async fn read_only_activation_schedules_no_check_but_reads_the_writers_problems() {
+        let (feed, problems, root) = scripted_feed("read-only");
+        let worktree = root.join("wt");
+        problems
+            .lock()
+            .unwrap()
+            .push(problem("a.rs", 1, 1, Severity::Error, "writer diagnostic"));
+        let (reader, writer) = ([1; 32], [2; 32]);
+        feed.activated_with_denies(
+            reader,
+            &worktree,
+            Path::new("repo"),
+            false,
+            true,
+            Vec::new(),
+        );
+        settle().await;
+        assert!(!feed.scheduler.is_busy());
+        assert!(feed.scheduler.latest(&worktree).is_empty(), "no cold check");
+        feed.changed(&reader);
+        feed.changed_file(&reader, Some("a.rs"));
+        feed.environment_changed(&worktree, crate::lang::testing::ALPHA);
+        settle().await;
+        assert!(
+            feed.scheduler.latest(&worktree).is_empty(),
+            "no triggered check"
+        );
+
+        feed.activated(writer, &worktree, Path::new("repo"), false);
+        settle().await;
+        assert!(feed.scheduler.latest(&worktree)[0].problems.len() == 1);
+        feed.activated_with_denies(
+            reader,
+            &worktree,
+            Path::new("repo"),
+            false,
+            true,
+            Vec::new(),
+        );
+        assert!(
+            !feed.scheduler.is_busy(),
+            "a later reader start schedules nothing"
+        );
+        assert!(
+            feed.rechecks(&worktree).is_empty(),
+            "reader start leaves the writer's result current"
+        );
+        let shown = problems_text_with_rechecks(&feed.latest(&worktree), &[], None, 0);
+        assert!(shown.contains("writer diagnostic"), "{shown}");
+        assert!(feed.next_block(&reader).is_some());
+
+        // Over the writer's warm scheduler entry a reader's triggers admit nothing either.
+        let generation = feed.scheduler.generation(&worktree);
+        feed.changed(&reader);
+        assert_eq!(feed.changed_generation(&reader, Some("a.rs")), None);
+        feed.changed_file(&reader, Some("a.rs"));
+        assert!(!feed.scheduler.is_busy(), "no reader trigger schedules");
+        assert_eq!(feed.scheduler.generation(&worktree), generation);
+        feed.forget(&writer);
+        feed.environment_changed(&worktree, crate::lang::testing::ALPHA);
+        assert!(
+            !feed.scheduler.is_busy(),
+            "a reader-only environment change restarts nothing"
+        );
+        assert!(feed.changed_generation(&writer, None).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
