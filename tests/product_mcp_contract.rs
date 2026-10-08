@@ -12142,6 +12142,233 @@ const waitReady = () => {
 waitReady();
 "#;
 
+/// A panic while the provider backend is out of its slot (`live_session_for` across the
+/// `ensure_live` await) answers that call `internal` and fails the daemon crash-only: it exits by
+/// itself keeping its runtime store, and its shutdown leaves no language server of the binding
+/// behind (the backend returns to the slot before the unwind continues, so the shutdown reap
+/// still reaches the session retained by the earlier call).
+///
+/// Before containment the panic dropped the backend (the slot answered `internal` for every later
+/// call) and the daemon stayed up.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_NODE environment"]
+async fn configured_product_provider_ensure_panic_fails_the_daemon_crash_only_and_reaps_the_retained_session()
+ {
+    use std::os::unix::fs::PermissionsExt;
+
+    let node = std::env::var("AGENT_IDE_NODE").unwrap();
+    let fixture = symbol_test_fixture();
+    let stub = fixture.base.join("ensure-stub-server.mjs");
+    let ready = fixture.base.join("ensure-stub-ready");
+    let pids = fixture.base.join("ensure-stub-pids");
+    std::fs::write(&stub, COLD_STUB_SERVER).unwrap();
+    std::fs::write(&ready, "ready").unwrap();
+    let wrapper = fixture.base.join("ensure-rust-provider");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\necho $$ >> '{}'\nexec '{}' '{}' '{}'\n",
+            pids.display(),
+            node,
+            stub.display(),
+            ready.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN")
+        .unwrap_or_else(|_| "1.98.1-aarch64-apple-darwin".into());
+    fixture.write_config(json!([{
+        "executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
+        "settings":"rust_cache_priming_disabled_v1",
+        "toolchain":toolchain,
+        "cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),
+        "cargo_version":"cargo 1.98.1",
+        "rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),
+        "rustc_version":"rustc 1.98.1",
+        "trust":"fixture-disabled",
+        "cache_namespace":"fixture-ensure-panic-cache"
+    }]));
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "/// Answers.\npub fn value() -> i32 { 7 }\n\npub fn caller() -> i32 { value() }\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "src/lib.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "ensure panic fixture"]);
+    let (fault, flag) = fault_flag(&fixture, "ensure", false);
+    let mut daemon = fixture
+        .spawn_configured_daemon_with_env(
+            None,
+            false,
+            Duration::from_secs(30),
+            None,
+            &[("AGENT_IDE_TEST_FAULT", &fault)],
+        )
+        .await;
+    let mut actor = ProductActor::new(&fixture, "ensure-panic").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"ensure-panic"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    // A first symbol call retains the language server's session for the binding.
+    let symbol = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#value"}))
+        .await;
+    let symbol = actor.settle(&fixture, symbol).await;
+    assert_eq!(symbol["kind"], "symbol", "{symbol}");
+    let server_pid: libc::pid_t = std::fs::read_to_string(&pids)
+        .unwrap()
+        .lines()
+        .next()
+        .expect("the language server was spawned")
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(server_pid, 0) }, 0, "server is running");
+    std::fs::write(&flag, b"").unwrap();
+    let panicked = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"src/lib.rs#caller"}),
+        )
+        .await;
+    assert_eq!(panicked["code"], "internal", "{panicked}");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("a failed daemon must exit by itself")
+        .unwrap();
+    assert!(status.success(), "{status}");
+    assert!(
+        fixture.runtime.join("state.sqlite").exists(),
+        "a crash-only exit keeps the runtime store"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while unsafe { libc::kill(server_pid, 0) } == 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the retained language server must be reaped by the failed daemon's shutdown");
+    actor.mcp.close().await;
+}
+
+/// A call parked behind a loading language server is lost with a failed daemon, and its
+/// reference does not hang the agent: after the crash-only exit and a replacement daemon in the
+/// same runtime directory, inspecting the old `detail_ref` answers a settled typed reply at once
+/// (never `pending`), and the replacement serves new calls.
+///
+/// The parked job is never executed by the failed daemon and never replayed by the replacement.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_NODE environment"]
+async fn configured_product_pending_call_and_old_reference_survive_a_crash_only_restart() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let node = std::env::var("AGENT_IDE_NODE").unwrap();
+    let fixture = symbol_test_fixture();
+    let stub = fixture.base.join("pending-stub-server.mjs");
+    let ready = fixture.base.join("pending-stub-ready");
+    std::fs::write(&stub, COLD_STUB_SERVER).unwrap();
+    let wrapper = fixture.base.join("pending-rust-provider");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec '{}' '{}' '{}'\n",
+            node,
+            stub.display(),
+            ready.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN")
+        .unwrap_or_else(|_| "1.98.1-aarch64-apple-darwin".into());
+    fixture.write_config(json!([{
+        "executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
+        "settings":"rust_cache_priming_disabled_v1",
+        "toolchain":toolchain,
+        "cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),
+        "cargo_version":"cargo 1.98.1",
+        "rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),
+        "rustc_version":"rustc 1.98.1",
+        "trust":"fixture-disabled",
+        "cache_namespace":"fixture-pending-restart-cache"
+    }]));
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "/// Answers.\npub fn value() -> i32 { 7 }\n\npub fn caller() -> i32 { value() }\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "src/lib.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "pending restart fixture"]);
+    let (fault, flag) = fault_flag(&fixture, "loop", false);
+    let mut daemon = fixture
+        .spawn_configured_daemon_with_env(
+            None,
+            false,
+            Duration::from_secs(30),
+            None,
+            &[("AGENT_IDE_TEST_FAULT", &fault)],
+        )
+        .await;
+    let mut actor = ProductActor::new(&fixture, "pending-restart").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"pending-1"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    // The server never becomes ready, so this call parks and answers `pending`.
+    let parked = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#value"}))
+        .await;
+    assert_eq!(parked["state"], "pending", "{parked}");
+    let reference = parked["detail_ref"].as_str().unwrap().to_owned();
+    std::fs::write(&flag, b"").unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("the daemon fails at its next worker turn and exits by itself")
+        .unwrap();
+    assert!(status.success(), "{status}");
+    assert!(
+        fixture.runtime.join("state.sqlite").exists(),
+        "a crash-only exit keeps the runtime store"
+    );
+    assert!(!flag.exists(), "the fault fired exactly once");
+    let mut replacement = fixture
+        .spawn_configured_daemon_with_env(
+            None,
+            false,
+            Duration::from_secs(30),
+            None,
+            &[("AGENT_IDE_TEST_FAULT", &fault)],
+        )
+        .await;
+    let old = tokio::time::timeout(
+        Duration::from_secs(20),
+        actor.call(&fixture, "ide.inspect", json!({"detail_ref":reference})),
+    )
+    .await
+    .expect("an old reference must not hang the agent");
+    assert_ne!(
+        old["state"], "pending",
+        "the parked job died with the failed daemon and is not replayed: {old}"
+    );
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"pending-2"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    actor.mcp.close().await;
+    replacement.kill().await.unwrap();
+    replacement.wait().await.unwrap();
+}
+
 /// While the registered Rust server is still loading, `ide.outline`, `ide.read` and the
 /// symbol-addressed `ide.edit` answer at once from the lexical outline and say so in one
 /// compact line; `ide.symbol` keeps waiting for the server, and once the server reports ready
