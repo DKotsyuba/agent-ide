@@ -37,6 +37,19 @@ and gone rules run first over every entry, then the budget rule over what is lef
 entry is never kept while a recent one is evicted. The budget bounds what can be reclaimed: bytes
 held by in-use caches are protected even when they alone exceed it (`cache status` reports them).
 
+## Telemetry write-ahead log
+
+Each telemetry store runs in SQLite WAL mode. Its owner connection sets
+`journal_size_limit` (1 MiB), so any WAL reset leaves at most that much allocated, and the
+telemetry writer runs `PRAGMA wal_checkpoint(TRUNCATE)` on that same owner connection, between
+transactions: after a graceful drain (`Telemetry::shutdown`, before the writer releases the store's
+lifetime lock) and whenever the writer has been quiet for 30 seconds with frames possibly pending
+(also right after opening, which covers a migration or a WAL an earlier owner left). A busy
+checkpoint (a reader holds an old snapshot) is not an error and loses nothing: the writer retries
+after the next quiet period. WAL and shared-memory files are never unlinked or edited by the
+product, and no routine `VACUUM` runs; a store that no process owns is only ever reduced by the
+SQLite connection of its next owner or removed whole by the rules above.
+
 ## When
 
 Each long-lived daemon runs a background task: the first sweep 60 seconds after start (so a
@@ -94,10 +107,11 @@ daemons run, and a failed or skipped sweep is retried an hour later. Errors neve
    never pauses the upgraded sweeper — or is a **proven build**: a regular file that contains the
    lease-protocol proof every build of this source embeds (`LEASE_BUILD_PROOF`) and was not
    modified after the process started (a later rebuild is not the code that runs; the file is also
-   re-checked after the scan). A gate or scratch `target/debug/agent-ide` is therefore recognized
+   re-checked after the scan; a replacement file that keeps an older mtime than the process start
+   is the one case not noticed, because the process list offers no inode to compare). A gate or scratch `target/debug/agent-ide` is therefore recognized
    by its contents, never by its path or name, and is listed by `cache status` as a build that
    does not pause eviction. Any other — 0.9.1 or older, an older dev build without the proof, a
-   renamed backup, one whose executable was deleted, replaced or cannot be read — is legacy, and
+   renamed backup, one whose executable was deleted, rebuilt since it started or cannot be read — is legacy, and
    while one is alive **no A or B entry is removed, gone ones and trash included**. The snapshot
    is unknown (and pauses everything the same way) when the process list cannot be read or is
    truncated, or a process other than an exited one cannot be inspected. `cache status` names

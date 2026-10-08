@@ -20,6 +20,18 @@ use super::config::StoreConfig;
 const MAX_DOMAIN_NAME_BYTES: usize = 64;
 const MAX_MIGRATION_KEY_BYTES: usize = 128;
 const MAX_MIGRATION_SQL_BYTES: usize = 1024 * 1024;
+/// Size the write-ahead log is truncated to whenever a checkpoint resets it, so a long-lived
+/// owner never keeps a grown WAL allocated (`PRAGMA journal_size_limit`).
+const WAL_RESIDUAL_BYTES: u64 = 1024 * 1024;
+
+/// How a requested WAL checkpoint ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checkpoint {
+    /// Every frame was written back and the WAL file was truncated to zero length.
+    Truncated,
+    /// A reader or writer prevented completion; nothing is lost and a later attempt may succeed.
+    Busy,
+}
 
 /// Names a validated domain whose migrations share one monotonic version sequence.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -382,6 +394,27 @@ impl Store {
             .recv()
             .map_err(|_| StoreError::Unavailable)??;
         Ok(Self { sender, config })
+    }
+
+    /// Writes every WAL frame back and truncates the WAL file, on the owner connection between
+    /// transactions (`PRAGMA wal_checkpoint(TRUNCATE)`), waiting at most the configured busy
+    /// timeout. The WAL file is never unlinked or edited.
+    ///
+    /// A [`Checkpoint::Busy`] result is not an error: the data stays in the WAL and the next
+    /// attempt retries. A caller timeout or a stopped owner returns an error.
+    pub async fn checkpoint(&self) -> Result<Checkpoint, StoreError> {
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        match self.sender.try_send(StoreMessage::Checkpoint {
+            reply: reply_sender,
+        }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return Err(StoreError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => return Err(StoreError::Unavailable),
+        }
+        match tokio::time::timeout(self.config.request_deadline, reply_receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => Err(StoreError::Unavailable),
+        }
     }
 
     /// Admits one immutable trusted migration, allocating its next domain version only on success.
@@ -888,6 +921,11 @@ enum StoreMessage {
         /// Returns only the bounded migration admission result.
         reply: oneshot::Sender<Result<MigrationAdmission, StoreError>>,
     },
+    /// Checkpoints and truncates the WAL outside any transaction.
+    Checkpoint {
+        /// Returns whether the WAL was truncated or the checkpoint was blocked.
+        reply: oneshot::Sender<Result<Checkpoint, StoreError>>,
+    },
     /// Reads one immutable migration ledger row without executing or admitting any migration SQL.
     MigrationLookup {
         /// Domain namespace that scopes the opaque migration key.
@@ -938,6 +976,9 @@ fn owner_thread(
                     migration,
                 ));
             }
+            StoreMessage::Checkpoint { reply } => {
+                let _ = reply.send(checkpoint_truncate(&connection));
+            }
             StoreMessage::MigrationLookup { domain, key, reply } => {
                 let _ = reply.send(read_migration_admission(&connection, domain, key));
             }
@@ -964,8 +1005,9 @@ fn open_connection(
         return Ok(connection);
     }
     connection
-        .execute_batch(
+        .execute_batch(&format!(
             "PRAGMA journal_mode = WAL;
+             PRAGMA journal_size_limit = {WAL_RESIDUAL_BYTES};
              PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS application_operation_receipts (
                  operation_id TEXT PRIMARY KEY NOT NULL,
@@ -984,10 +1026,23 @@ fn open_connection(
              );
              UPDATE application_operation_receipts
                  SET outcome = 'outcome_unknown'
-                 WHERE outcome IN ('queued', 'started');",
-        )
+                 WHERE outcome IN ('queued', 'started');"
+        ))
         .map_err(infrastructure)?;
     Ok(connection)
+}
+
+/// Runs `PRAGMA wal_checkpoint(TRUNCATE)`; the connection is idle between owner messages, so no
+/// transaction of this owner is open.
+fn checkpoint_truncate(connection: &Connection) -> Result<Checkpoint, StoreError> {
+    let busy: i64 = connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+        .map_err(infrastructure)?;
+    Ok(if busy == 0 {
+        Checkpoint::Truncated
+    } else {
+        Checkpoint::Busy
+    })
 }
 
 /// Applies one immutable migration or reports its existing admission without rerunning trusted SQL.
