@@ -1154,6 +1154,29 @@ mod tests {
         );
     }
 
+    /// A kept same-actor activation names the held worktree and what keeps it in the reply.
+    #[test]
+    fn kept_activation_refusal_names_worktree_and_reason() {
+        let rendered = render(
+            PeerReply::Error {
+                code: FailureCode::Conflict,
+                detail: Some(
+                    "start:actor_owns_another_worktree: actor a (activation x, writer, since t, last activity u); worktree /w/old; kept: a pending edit"
+                        .to_owned(),
+                ),
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        let text = text_of(&rendered);
+        assert!(
+            text.contains("worktree /w/old; kept: a pending edit"),
+            "{text}"
+        );
+        assert!(text.contains("not handed over automatically"), "{text}");
+        assert!(text.contains("call ide.stop there"), "{text}");
+    }
+
     /// Start stages keep distinct causes and recovery instructions in the compact reply.
     #[test]
     fn start_refusals_name_holder_and_failure_stage() {

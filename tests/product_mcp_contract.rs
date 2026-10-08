@@ -14035,6 +14035,113 @@ async fn configured_product_resolves_a_new_linked_worktree_after_daemon_start() 
     daemon.wait().await.unwrap();
 }
 
+/// An actor that holds an activation moves to another root with a plain `ide.start`: the idle
+/// old activation is handed over without an `ide.stop`, its worktree is free for another actor,
+/// and a move onto a worktree another actor holds is refused without losing the actor's own.
+#[tokio::test]
+async fn configured_product_same_actor_start_on_another_root_hands_the_activation_over() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut mover = ProductActor::new(&fixture, "handover-mover").await;
+    let mut other = ProductActor::new_at(
+        &fixture,
+        "handover-other",
+        "private-host-channel",
+        "session_id",
+        fixture.state(),
+    )
+    .await;
+    let linked = |name: &str| {
+        let path = fixture.base.join("different-parent").join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let output = std::process::Command::new("/usr/bin/git")
+            .env_clear()
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["-C"])
+            .arg(&fixture.root)
+            .args(["worktree", "add", "--detach"])
+            .arg(&path)
+            .arg("HEAD")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        path
+    };
+    let second = linked("second");
+
+    let started = mover
+        .call(&fixture, "ide.start", json!({"activation_id":"one"}))
+        .await;
+    let started = mover.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let moved = mover
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"two","root":second}),
+        )
+        .await;
+    let moved = mover.settle(&fixture, moved).await;
+    assert_eq!(moved["kind"], "activation", "no ide.stop needed: {moved}");
+
+    // The first worktree is free again for another actor; the mover holds the second.
+    let taken = other
+        .call(&fixture, "ide.start", json!({"activation_id":"other-one"}))
+        .await;
+    let taken = other.settle(&fixture, taken).await;
+    assert_eq!(taken["kind"], "activation", "{taken}");
+    assert!(
+        taken["text"].as_str().unwrap().contains("mode: writer"),
+        "{taken}"
+    );
+    let database = rusqlite::Connection::open(fixture.runtime.join("state.sqlite")).unwrap();
+    let active: i64 = database
+        .query_row(
+            "SELECT COUNT(*) FROM workspace_starts WHERE actor='handover-mover' AND active=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(active, 1, "the actor keeps exactly one active start");
+
+    // Moving onto another actor's worktree is refused and keeps the mover where it is.
+    let refused = mover
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"three","root":fixture.root}),
+        )
+        .await;
+    let refused = mover.settle(&fixture, refused).await;
+    assert_eq!(refused["state"], "error", "{refused}");
+    assert_eq!(refused["code"], "conflict", "{refused}");
+    let still = mover
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"two","root":second}),
+        )
+        .await;
+    let still = mover.settle(&fixture, still).await;
+    assert_eq!(
+        still["kind"], "activation",
+        "the refused move kept the activation: {still}"
+    );
+    for actor in [&mut mover, &mut other] {
+        let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+        assert_eq!(stopped["kind"], "stop", "{stopped}");
+    }
+    mover.mcp.close().await;
+    other.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// The activation reply keeps its compact epoch line and appends the project card: one rendered
 /// block describing the fixture worktree (rust from Cargo.toml, typescript from package.json,
 /// plus the go module the shared fixture ships), with the layout, docs, and not-started server
