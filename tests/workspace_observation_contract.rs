@@ -12,7 +12,7 @@ use std::{
 use agent_ide::{
     app::{
         config::StoreConfig,
-        store::{OperationId, Store, StoreError},
+        store::{OperationId, Store, StoreError, StoreOutcome},
     },
     workspace::{
         authority::WorktreeRef,
@@ -403,9 +403,10 @@ async fn workspace_source_observations_are_durable_bounded_and_honest() {
     ));
 }
 
-/// Full receipt capacity refuses new effects while exact observation retries remain recoverable.
+/// Exact observation retries stay recoverable once settled receipts are retired behind the replay
+/// horizon and unresolved receipts outnumber it; tracked operations keep being admitted.
 #[tokio::test]
-async fn receipt_exhaustion_preserves_exact_observation_recovery() {
+async fn retired_and_unresolved_receipts_preserve_exact_observation_recovery() {
     let root = temporary("receipt-root");
     fs::create_dir(&root).unwrap();
     let tree = worktree(&root);
@@ -449,21 +450,23 @@ async fn receipt_exhaustion_preserves_exact_observation_recovery() {
         ObservationFreshness::Stale,
         "same-sequence rows with different source identity are not current"
     );
-    loop {
-        let count = store
-            .read_one(
-                "SELECT count(*) FROM application_operation_receipts",
-                vec![],
-                |row| row.get::<_, usize>(0),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        if count == limited.receipt_capacity {
-            break;
-        }
+    // Churn far past the horizon of 8 so settled receipts are retired, and leave more unresolved
+    // receipts than the horizon.
+    store
+        .execute(operation("seed-unresolved"), |tx| {
+            for index in 0..20 {
+                tx.execute(
+                    "INSERT INTO application_operation_receipts (operation_id, outcome) VALUES (?1, 'outcome_unknown')",
+                    [format!("unresolved-{index}")],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    for index in 0..200 {
         store
-            .execute(operation(&format!("receipt-fill-{count}")), |_| Ok(()))
+            .execute(operation(&format!("receipt-fill-{index}")), |_| Ok(()))
             .await
             .unwrap();
     }
@@ -497,21 +500,36 @@ async fn receipt_exhaustion_preserves_exact_observation_recovery() {
         SourceCoverage::Complete,
     )
     .unwrap();
-    // A new observation needs no receipt, so it still records at an exhausted cap; tracked
-    // operations stay refused there.
     assert!(matches!(
         workspace.record(unrelated).await.unwrap(),
         ObservationAdmission::Recorded(_)
     ));
+    store
+        .execute(operation("tracked-after-horizon"), |_| {
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+    // A retired settled receipt is refused as expired, an unresolved one stays a duplicate, and
+    // neither closure runs again.
     assert_eq!(
         store
             .execute(
-                operation("tracked-at-cap"),
+                operation("receipt-fill-0"),
                 |_| Ok::<_, rusqlite::Error>(())
             )
             .await
             .unwrap_err(),
-        StoreError::ReceiptCapacityExhausted
+        StoreError::ReceiptExpired
+    );
+    assert_eq!(
+        store
+            .execute(operation("unresolved-3"), |_| Ok::<_, rusqlite::Error>(()))
+            .await
+            .unwrap_err(),
+        StoreError::DuplicateOperation {
+            existing: StoreOutcome::OutcomeUnknown
+        }
     );
     drop(store);
     fs::remove_dir_all(root).unwrap();
