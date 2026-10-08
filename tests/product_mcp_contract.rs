@@ -3557,6 +3557,67 @@ fn managed_runtime_paths(fixture: &ProductFixture) -> std::collections::BTreeSet
         .collect()
 }
 
+/// Reaps, when dropped, every managed daemon of this fixture that a test left behind.
+///
+/// A managed Codex test that fails or panics ends its MCP with `SIGKILL`, which skips the MCP's own
+/// cleanup and orphans the daemon it owns (possibly `SIGSTOP`-ed or stalled in a seam). The guard
+/// finds the runtimes created since `before` that still name this fixture, resumes then kills each
+/// exact lock holder, and removes the runtime directory. On a passing test every daemon is already
+/// gone and the guard does nothing; it never touches another fixture's runtime.
+struct ManagedCodexCleanup {
+    /// The fixture's base directory, which its runtimes' launcher records name.
+    base: String,
+    /// Runtime directories that existed before the test started.
+    before: std::collections::BTreeSet<PathBuf>,
+}
+
+impl ManagedCodexCleanup {
+    /// Starts guarding the runtimes the fixture creates after `before` was observed.
+    fn new(fixture: &ProductFixture, before: &std::collections::BTreeSet<PathBuf>) -> Self {
+        Self {
+            base: fixture.base.to_string_lossy().into_owned(),
+            before: before.clone(),
+        }
+    }
+}
+
+impl Drop for ManagedCodexCleanup {
+    /// Resumes and kills the lock holder of each leftover runtime of this fixture, then removes it.
+    fn drop(&mut self) {
+        let Ok(entries) = std::fs::read_dir(std::fs::canonicalize(std::env::temp_dir()).unwrap())
+        else {
+            return;
+        };
+        for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+            let named = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("ai-") && name.len() == 19);
+            let ours = std::fs::read_to_string(path.join("launcher.json"))
+                .is_ok_and(|launcher| launcher.contains(&self.base));
+            if !named || !ours || self.before.contains(&path) {
+                continue;
+            }
+            if let Ok(output) = std::process::Command::new("/usr/sbin/lsof")
+                .arg("-t")
+                .arg(path.join("agent-ide.lock"))
+                .output()
+            {
+                for pid in String::from_utf8_lossy(&output.stdout).split_whitespace() {
+                    if let Ok(pid) = pid.parse::<libc::pid_t>() {
+                        // SAFETY: the pid holds this fixture's own runtime lock.
+                        unsafe {
+                            libc::kill(pid, libc::SIGCONT);
+                            libc::kill(pid, libc::SIGKILL);
+                        }
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
 /// Returns the exact managed daemon holding this runtime's lock, without process-name matching.
 async fn managed_daemon_pid(runtime: &Path) -> libc::pid_t {
     let output = Command::new("/usr/sbin/lsof")
@@ -3950,6 +4011,7 @@ async fn managed_codex_context_after_crash_requires_start_and_republishes_route(
     let base = rendezvous_area("daemon-exit-retire");
     let root = base.join("rendezvous");
     let before = managed_runtime_paths(&fixture);
+    let _cleanup = ManagedCodexCleanup::new(&fixture, &before);
     let mut mcp = Mcp::start_managed_with_rendezvous(&fixture.config, &fixture.root, &root).await;
     let during = managed_runtime_paths(&fixture);
     let mut runtimes = during.difference(&before).cloned().collect::<Vec<_>>();
@@ -4060,6 +4122,7 @@ async fn managed_codex_transient_transport_timeout_keeps_daemon_and_binding() {
     let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
     let fixture = ProductFixture::new(json!([]));
     let before = managed_runtime_paths(&fixture);
+    let _cleanup = ManagedCodexCleanup::new(&fixture, &before);
     let mut mcp = Mcp::start_managed(&fixture.config, &fixture.root).await;
     let runtime = managed_runtime_paths(&fixture)
         .difference(&before)
@@ -4151,6 +4214,7 @@ async fn managed_codex_wedged_daemon_is_replaced_in_place_without_agent_action()
     let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
     let fixture = ProductFixture::new(json!([]));
     let before = managed_runtime_paths(&fixture);
+    let _cleanup = ManagedCodexCleanup::new(&fixture, &before);
     let mut mcp = Mcp::start_managed(&fixture.config, &fixture.root).await;
     let runtime = managed_runtime_paths(&fixture)
         .difference(&before)
@@ -4220,6 +4284,7 @@ async fn managed_codex_sigterm_during_restart_removes_pending_runtime() {
     let _managed_runtime_guard = MANAGED_CODEX_TEST_LOCK.lock().await;
     let fixture = ProductFixture::new(json!([]));
     let before = managed_runtime_paths(&fixture);
+    let _cleanup = ManagedCodexCleanup::new(&fixture, &before);
     let mut mcp = Mcp::start_managed_custom_with_env(
         &fixture.config,
         &fixture.root,
@@ -22154,6 +22219,7 @@ async fn managed_codex_stop_after_daemon_restart_reports_already_stopped() {
     let _lock = MANAGED_CODEX_TEST_LOCK.lock().await;
     let fixture = ProductFixture::new(json!([]));
     let before = managed_runtime_paths(&fixture);
+    let _cleanup = ManagedCodexCleanup::new(&fixture, &before);
     let mut mcp = Mcp::start_managed(&fixture.config, &fixture.root).await;
     let runtime = managed_runtime_paths(&fixture)
         .difference(&before)
