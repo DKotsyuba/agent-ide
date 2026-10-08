@@ -65,6 +65,10 @@ const ACCEPT_RETRY_PAUSE: Duration = Duration::from_millis(50);
 /// File name of the launcher record a managed daemon generation is started with, inside its
 /// runtime directory; a crash-only exit removes it so a replacement can write its own at once.
 pub const LAUNCHER_FILE: &str = "launcher.json";
+/// File name of the marker a front creates in a runtime directory just before it force-signals the
+/// daemon that holds it: a daemon that finds it at exit keeps the runtime store whichever way it
+/// exits (even an orderly `SIGTERM`), and a daemon that starts removes a stale one.
+pub const RETAIN_STORE_FILE: &str = "retain-store";
 /// File name of the Claude attachment record of a managed daemon generation, inside its runtime
 /// directory; removed together with [`LAUNCHER_FILE`] by a crash-only exit.
 pub const CLAUDE_ATTACHMENT_FILE: &str = "attachment";
@@ -349,6 +353,8 @@ async fn run_daemon_inner(
     crate::errorlog::init(runtime_dir.path());
     crate::errorlog::install_panic_hook();
     let _lock = DaemonLock::acquire(runtime_dir.lock_path())?;
+    // A marker left by an earlier generation's forced replacement has done its work.
+    let _ = fs::remove_file(runtime_dir.path().join(RETAIN_STORE_FILE));
     let runtime_identity = fs::symlink_metadata(runtime_dir.path())
         .ok()
         .map(|metadata| (metadata.dev(), metadata.ino()));
@@ -484,10 +490,13 @@ async fn run_daemon_inner(
         retention.abort();
     }
     let result = finish_daemon(serving, &mut connections, dispatcher.as_ref(), &lease).await;
-    // The dispatcher's failure flag, not the exit branch that happened to win, decides whether this
-    // exit is crash-only: a termination signal or idle expiry racing the fault drain must not turn
-    // a failed generation into an orderly one that deletes the runtime store.
-    let fault_exit = fault_exit || dispatcher.as_deref().is_some_and(|owner| owner.is_failed());
+    // The dispatcher's failure flag (or the retain marker a front leaves before force-signalling a
+    // wedged daemon), not the exit branch that happened to win, decides whether this exit is
+    // crash-only: a termination signal or idle expiry racing the fault drain, or the `SIGTERM` of a
+    // forced replacement that the daemon handles orderly, must not delete the runtime store.
+    let fault_exit = fault_exit
+        || dispatcher.as_deref().is_some_and(|owner| owner.is_failed())
+        || runtime_dir.path().join(RETAIN_STORE_FILE).exists();
     crate::errorlog::record(
         crate::errorlog::Method::Daemon,
         if result.is_err() {
@@ -836,7 +845,9 @@ pub async fn probe_health(runtime_dir: &Path) -> HealthProbe {
     if (runtime, endpoint) != (DoctorRuntimeState::Private, DoctorEndpointState::Socket) {
         return HealthProbe::Silent;
     }
-    let deadline = config::EffectiveConfig::defaults().ipc().connection_deadline;
+    let deadline = config::EffectiveConfig::defaults()
+        .ipc()
+        .connection_deadline;
     let Ok(Ok(stream)) =
         tokio::time::timeout(deadline, UnixStream::connect(runtime_dir.join(SOCKET_NAME))).await
     else {
@@ -854,6 +865,47 @@ pub async fn probe_health(runtime_dir: &Path) -> HealthProbe {
         "restarting" => HealthProbe::Restarting,
         _ => HealthProbe::Silent,
     }
+}
+
+/// Reports whether a daemon currently holds the runtime lock at `runtime_dir` (a nonblocking
+/// probe that releases at once any lock it takes).
+pub fn lock_is_held(runtime_dir: &Path) -> bool {
+    inspect_lock(&runtime_dir.join(LOCK_NAME)) == DoctorLockState::Held
+}
+
+/// Returns the pid the current lock holder recorded, when the lock is held and the record parses.
+///
+/// A hint for pinning a wedge watch to one daemon generation; [`evict_wedged_daemon`] validates the
+/// pid itself before it signals anything.
+pub fn lock_holder_pid(runtime_dir: &Path) -> Option<i32> {
+    let lock_path = runtime_dir.join(LOCK_NAME);
+    if inspect_lock(&lock_path) != DoctorLockState::Held {
+        return None;
+    }
+    fs::read_to_string(lock_path)
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|pid| *pid > 1)
+}
+
+/// Asks the daemon that holds `runtime_dir` to keep its runtime store when it exits, however it
+/// exits, by creating [`RETAIN_STORE_FILE`] (owner-only; never followed through a symlink).
+///
+/// A front calls it right before force-signalling a wedged daemon, so even an orderly `SIGTERM`
+/// exit keeps the receipts, and must not signal when it fails: without the marker an orderly exit
+/// deletes the runtime directory.
+pub fn retain_runtime_store(runtime_dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(runtime_dir.join(RETAIN_STORE_FILE))
+        .map(drop)
 }
 
 /// How long a forced replacement waits for the daemon to leave after `SIGTERM` before `SIGKILL`.
@@ -882,8 +934,11 @@ pub enum EvictOutcome {
         /// Process id of the daemon that did not leave.
         pid: i32,
     },
-    /// Nothing was signalled; the reason is a closed tag (`insufficient_evidence`, `not_held`,
-    /// `no_pid`, `dead`, `not_agent_ide`, `answering`, `changed`).
+    /// Eviction was refused; the reason is a closed tag (`insufficient_evidence`, `not_held`,
+    /// `no_pid`, `dead`, `not_agent_ide`, `answering`, `changed`, `retain_failed`). Before
+    /// `SIGTERM` nothing was signalled; `answering` and `changed` can also come back after the
+    /// `SIGTERM` (the pre-`SIGKILL` check found the daemon answering again or the holder replaced),
+    /// in which case only `SIGTERM` was sent and the daemon is left to leave by itself.
     Refused(&'static str),
 }
 
@@ -934,15 +989,21 @@ fn current_lock_holder(lock_path: &Path) -> Result<LockHolder, &'static str> {
 ///
 /// Eligibility is enforced here, not by the caller: `probes` failed probes spanning `span` must
 /// reach [`WEDGE_MIN_PROBES`] and [`WEDGE_MIN_SPAN`] (they are the caller's evidence and also reach
-/// the journal). The holder must then validate ([`current_lock_holder`]) and one more probe must
-/// still find the control path silent — a daemon whose control path answers is never signalled,
+/// the journal), and a given `expected_pid` (the holder the evidence was collected against) must
+/// still be the holder. The holder must then validate ([`current_lock_holder`]) and one more probe
+/// must still find the control path silent, again before `SIGKILL` — a daemon whose control path answers is never signalled,
 /// however long its jobs run. The holder is revalidated and compared with the first one
 /// immediately before `SIGTERM` and again before `SIGKILL`; any change refuses without signalling.
 /// `SIGTERM`, up to [`WEDGE_TERM_GRACE`] for the lock to be released, then `SIGKILL` and a further
 /// five seconds. Only a released lock is reported as [`EvictOutcome::Terminated`] and journaled
 /// ([`record_forced_replacement`]); a holder that stays is [`EvictOutcome::StillHeld`]. The runtime
 /// directory is left as it is: the next daemon starts in it and finds the store and its receipts.
-pub async fn evict_wedged_daemon(runtime_dir: &Path, probes: u32, span: Duration) -> EvictOutcome {
+pub async fn evict_wedged_daemon(
+    runtime_dir: &Path,
+    expected_pid: Option<i32>,
+    probes: u32,
+    span: Duration,
+) -> EvictOutcome {
     if probes < WEDGE_MIN_PROBES || span < WEDGE_MIN_SPAN {
         return EvictOutcome::Refused("insufficient_evidence");
     }
@@ -951,11 +1012,21 @@ pub async fn evict_wedged_daemon(runtime_dir: &Path, probes: u32, span: Duration
         Ok(holder) => holder,
         Err(reason) => return EvictOutcome::Refused(reason),
     };
+    // The evidence belongs to one daemon generation: a replacement that took the lock since is a
+    // different daemon and is never signalled on the old one's silence.
+    if expected_pid.is_some_and(|pid| pid != holder.pid) {
+        return EvictOutcome::Refused("changed");
+    }
     if probe_health(runtime_dir).await != HealthProbe::Silent {
         return EvictOutcome::Refused("answering");
     }
     if current_lock_holder(&lock_path) != Ok(holder) {
         return EvictOutcome::Refused("changed");
+    }
+    // The signal may be handled as an orderly shutdown by a daemon that resumed; the marker keeps
+    // its runtime store (and so the receipts) in that case too.
+    if retain_runtime_store(runtime_dir).is_err() {
+        return EvictOutcome::Refused("retain_failed");
     }
     // SAFETY: the pid was validated as the live lock holder running the agent-ide executable an
     // instant ago, and the lock file identity and pid record are unchanged.
@@ -964,6 +1035,12 @@ pub async fn evict_wedged_daemon(runtime_dir: &Path, probes: u32, span: Duration
     let mut waited = Duration::ZERO;
     while inspect_lock(&lock_path) == DoctorLockState::Held {
         if waited >= WEDGE_TERM_GRACE && !killed {
+            // A daemon that resumed and answers (even `restarting`) is leaving by itself: never
+            // killed on the evidence of the silence that is over. The holder is revalidated after
+            // that awaited probe, immediately before the signal, as before `SIGTERM`.
+            if probe_health(runtime_dir).await != HealthProbe::Silent {
+                return EvictOutcome::Refused("answering");
+            }
             if current_lock_holder(&lock_path) != Ok(holder) {
                 return EvictOutcome::Refused("changed");
             }
@@ -2296,7 +2373,10 @@ mod tests {
     #[test]
     fn transient_accept_errors_are_retried_and_listener_failures_are_not() {
         for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
-            assert!(transient_accept_error(&io::Error::from_raw_os_error(code)), "{code}");
+            assert!(
+                transient_accept_error(&io::Error::from_raw_os_error(code)),
+                "{code}"
+            );
         }
         for kind in [
             io::ErrorKind::ConnectionAborted,
@@ -2306,7 +2386,33 @@ mod tests {
             assert!(transient_accept_error(&io::Error::from(kind)), "{kind:?}");
         }
         for code in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
-            assert!(!transient_accept_error(&io::Error::from_raw_os_error(code)), "{code}");
+            assert!(
+                !transient_accept_error(&io::Error::from_raw_os_error(code)),
+                "{code}"
+            );
         }
+    }
+
+    /// The daemon lock records its holder's pid for a front to find a wedged daemon, and its
+    /// descriptor is close-on-exec, so no language server or check the daemon spawns inherits it.
+    #[test]
+    fn the_daemon_lock_records_its_pid_and_is_close_on_exec() {
+        let dir = std::env::temp_dir().join(format!("agent-ide-lock-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(LOCK_NAME);
+        let lock = DaemonLock::acquire(path.clone()).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        // SAFETY: the descriptor is valid while `lock` lives.
+        let flags = unsafe { libc::fcntl(lock._file.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0, "{flags}");
+        assert!(matches!(
+            DaemonLock::acquire(path),
+            Err(AppError::AlreadyRunning)
+        ));
+        drop(lock);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

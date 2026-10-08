@@ -2155,12 +2155,15 @@ pub type ReestablishFn =
 /// Forcibly ends the daemon a managed front owns or shares when it stayed wedged: it holds its
 /// runtime but its control path answered nothing across repeated probes.
 ///
-/// Called by the facade's wedge watch with the runtime directory it probed, the number of failed
-/// probes and the time they span (evidence for the journal), only after at least [`crate::app::WEDGE_MIN_PROBES`] probes
+/// Called by the facade's wedge watch with the runtime directory it probed, the pid of the daemon
+/// whose silence it observed (when known), the number of failed probes and the time they span (evidence for the journal), only after at least [`crate::app::WEDGE_MIN_PROBES`] probes
 /// spanning [`crate::app::WEDGE_MIN_SPAN`]. The implementation owns every safety check and the journal line; it must
 /// never signal a daemon whose control path answers. The facade re-establishes afterwards.
-pub type EvictFn =
-    Arc<dyn Fn(PathBuf, u32, Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+pub type EvictFn = Arc<
+    dyn Fn(PathBuf, Option<i32>, u32, Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Pause between the wedge watch's probes.
 const WEDGE_PROBE_INTERVAL: Duration = Duration::from_secs(15);
@@ -2479,18 +2482,29 @@ impl ManagedConnection {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Starts the background wedge watch after a liveness probe found the daemon silent while it
-    /// still holds its runtime, unless one already runs or this connection cannot evict.
+    /// Re-establishes the daemon and publishes the new pair for later calls, marking the session
+    /// replaced when the pair changed. A failed re-establishment changes nothing.
+    async fn heal(&self, runtime_dir: &Path, attachment: &str) {
+        if let Some((new_runtime, new_attachment)) = (self.reestablish)().await {
+            if new_runtime != runtime_dir || new_attachment != attachment {
+                self.mark_replaced();
+            }
+            self.store(new_runtime, new_attachment).await;
+        }
+    }
+
+    /// Starts the background liveness check of a daemon a delivered call just suspected of being
+    /// wedged (it timed out, lost its reply or answered `internal`), unless one already runs.
     ///
-    /// The watch probes every [`WEDGE_PROBE_INTERVAL`]. A daemon that answers again (or says
-    /// `restarting`, which exits by itself) ends the watch with nothing signalled. Once
-    /// [`crate::app::WEDGE_MIN_PROBES`] probes failed over at least [`crate::app::WEDGE_MIN_SPAN`] the watch calls `evict`
-    /// and re-establishes the daemon, publishing the new pair for the next call; no agent action is
-    /// involved and no call is resent. The watch gives up after ten probes.
-    fn start_wedge_watch(&self) {
-        let Some(evict) = self.evict.clone() else {
-            return;
-        };
+    /// The call in hand has its outcome and is never resent; nothing here delays it. The check
+    /// probes the daemon's control path once: a healthy daemon is left alone however busy; one that
+    /// says `restarting`, or is gone, is re-established at once; one that is silent but still holds
+    /// its runtime is watched every [`WEDGE_PROBE_INTERVAL`]. Once
+    /// [`crate::app::WEDGE_MIN_PROBES`] probes failed over at least [`crate::app::WEDGE_MIN_SPAN`]
+    /// the watch calls `evict` (when this connection has that authority) and re-establishes the
+    /// daemon, so the next call lands on a live one without any agent action. A daemon that
+    /// answers again ends the watch with nothing signalled; it gives up after ten probes.
+    fn check_suspect_daemon(&self, runtime_dir: PathBuf, attachment: String) {
         if self
             .watching
             .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -2500,25 +2514,42 @@ impl ManagedConnection {
         let connection = self.clone();
         tokio::spawn(async move {
             let began = tokio::time::Instant::now();
-            let mut probes = 1_u32;
-            for _ in 0..10 {
-                tokio::time::sleep(WEDGE_PROBE_INTERVAL).await;
-                let (runtime_dir, attachment) = connection.current().await;
-                if crate::app::probe_health(&runtime_dir).await != crate::app::HealthProbe::Silent
+            let mut probes = 0_u32;
+            let mut pinned: Option<Option<i32>> = None;
+            for round in 0..10 {
+                if round > 0 {
+                    tokio::time::sleep(WEDGE_PROBE_INTERVAL).await;
+                }
+                match crate::app::probe_health(&runtime_dir).await {
+                    crate::app::HealthProbe::Healthy => break,
+                    crate::app::HealthProbe::Restarting => {
+                        connection.heal(&runtime_dir, &attachment).await;
+                        break;
+                    }
+                    crate::app::HealthProbe::Silent => {}
+                }
+                if !crate::app::lock_is_held(&runtime_dir) {
+                    // The daemon left its runtime: nothing to wait for or signal.
+                    connection.heal(&runtime_dir, &attachment).await;
+                    break;
+                }
+                // The evidence belongs to one daemon generation: when the connection moved to
+                // another pair, or another process took the lock, this watch is over.
+                let holder = crate::app::lock_holder_pid(&runtime_dir);
+                let pinned_holder = *pinned.get_or_insert(holder);
+                if connection.current().await != (runtime_dir.clone(), attachment.clone())
+                    || holder != pinned_holder
                 {
                     break;
                 }
                 probes += 1;
                 let span = began.elapsed();
-                if probes >= crate::app::WEDGE_MIN_PROBES && span >= crate::app::WEDGE_MIN_SPAN {
-                    evict(runtime_dir.clone(), probes, span).await;
-                    if let Some((new_runtime, new_attachment)) = (connection.reestablish)().await
-                    {
-                        if new_runtime != runtime_dir || new_attachment != attachment {
-                            connection.mark_replaced();
-                        }
-                        connection.store(new_runtime, new_attachment).await;
-                    }
+                if let Some(evict) = &connection.evict
+                    && probes >= crate::app::WEDGE_MIN_PROBES
+                    && span >= crate::app::WEDGE_MIN_SPAN
+                {
+                    evict(runtime_dir.clone(), pinned_holder, probes, span).await;
+                    connection.heal(&runtime_dir, &attachment).await;
                     break;
                 }
             }
@@ -2927,34 +2958,11 @@ impl StdioFacade {
             FacadeOutcome::Unavailable | FacadeOutcome::Restarting
         ) {
             // Self-heal (stability QW-7): a delivered call that timed out, lost its reply or came
-            // back `internal` may have met a wedged daemon. One bounded liveness probe decides;
-            // only a daemon that does not answer healthy is re-established, so the next call
-            // lands on a live one. The call in hand keeps its outcome and is never resent.
+            // back `internal` may have met a wedged daemon. A background liveness check decides
+            // (see `check_suspect_daemon`), so the next call lands on a live one. The call in hand
+            // keeps its outcome at once and is never resent.
             if suspects_wedged_daemon(&outcome) {
-                match crate::app::probe_health(&runtime_dir).await {
-                    crate::app::HealthProbe::Healthy => {}
-                    // A daemon that says `restarting` is exiting by itself, and one that left
-                    // its runtime is gone: re-establishing now is cheap and cannot signal anything.
-                    probe => {
-                        let holds_runtime = probe == crate::app::HealthProbe::Silent
-                            && crate::app::doctor_report(&runtime_dir)
-                                .await
-                                .is_ok_and(|report| {
-                                    report.lock == crate::app::DoctorLockState::Held
-                                });
-                        if holds_runtime {
-                            // Silent but alive: only a repeated, long-enough silence is a wedge.
-                            reconnect.start_wedge_watch();
-                        } else if let Some((new_runtime, new_attachment)) =
-                            (reconnect.reestablish)().await
-                        {
-                            if new_runtime != runtime_dir || new_attachment != attachment {
-                                reconnect.mark_replaced();
-                            }
-                            reconnect.store(new_runtime, new_attachment).await;
-                        }
-                    }
-                }
+                reconnect.check_suspect_daemon(runtime_dir.clone(), attachment.clone());
             }
             return (outcome, resume, tag);
         }

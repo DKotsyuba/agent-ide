@@ -2868,13 +2868,17 @@ impl<'a> Worker<'a> {
         let unknown_edit = (job.tool == AssistanceTool::Edit)
             .then(|| {
                 let operation = job.parameters.get("operation_id")?.as_str()?;
-                let path = job.parameters.get("path").and_then(Value::as_str).or_else(|| {
-                    job.parameters
-                        .get("symbol")?
-                        .as_str()?
-                        .split_once('#')
-                        .map(|(path, _)| path)
-                })?;
+                let path = job
+                    .parameters
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        job.parameters
+                            .get("symbol")?
+                            .as_str()?
+                            .split_once('#')
+                            .map(|(path, _)| path)
+                    })?;
                 EditResult::new(
                     operation.to_owned(),
                     path.to_owned(),

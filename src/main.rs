@@ -2065,12 +2065,15 @@ async fn run_managed_codex_mcp(
             };
             let evict: EvictFn = {
                 let child = Arc::clone(&child);
-                Arc::new(move |runtime_dir: PathBuf, probes: u32, span: Duration| {
-                    let child = Arc::clone(&child);
-                    Box::pin(async move {
-                        terminate_wedged_owned_daemon(child, &runtime_dir, probes, span).await;
-                    })
-                })
+                Arc::new(
+                    move |runtime_dir: PathBuf, pid: Option<i32>, probes: u32, span: Duration| {
+                        let child = Arc::clone(&child);
+                        Box::pin(async move {
+                            terminate_wedged_owned_daemon(child, &runtime_dir, pid, probes, span)
+                                .await;
+                        })
+                    },
+                )
             };
             let facade = facade.map(|facade| facade.with_wedge_eviction(evict));
             let Some(facade) = facade else {
@@ -2431,11 +2434,13 @@ async fn run_managed_claude_mcp(
     );
     // A shared daemon that holds its runtime but stays silent across repeated probes is replaced
     // by the facade's wedge watch; every safety check lives in `evict_wedged_daemon`.
-    let evict: EvictFn = Arc::new(|runtime_dir: PathBuf, probes: u32, span: Duration| {
-        Box::pin(async move {
-            let _ = agent_ide::app::evict_wedged_daemon(&runtime_dir, probes, span).await;
-        })
-    });
+    let evict: EvictFn = Arc::new(
+        |runtime_dir: PathBuf, pid: Option<i32>, probes: u32, span: Duration| {
+            Box::pin(async move {
+                let _ = agent_ide::app::evict_wedged_daemon(&runtime_dir, pid, probes, span).await;
+            })
+        },
+    );
     match StdioFacade::with_reestablishing_claude_attachment(
         runtime_path,
         attachment,
@@ -3328,22 +3333,24 @@ fn managed_termination_signal() -> impl std::future::Future<Output = ()> {
 /// Force-replaces the exact daemon child this MCP owns after its wedge watch found it silent.
 ///
 /// Signals only that owned child, and only if the evidence reaches the same minimum the shared
-/// path enforces (`WEDGE_MIN_PROBES` probes over `WEDGE_MIN_SPAN`) and one more probe of its
-/// control path at `runtime_dir` still finds it silent (a daemon that answers is never signalled,
-/// however busy). `SIGTERM`, up to
-/// [`agent_ide::app::WEDGE_TERM_GRACE`] for it to exit, then `SIGKILL`; the caller then restarts
-/// the daemon in the same directory, which keeps its store. Journals the replacement with the
-/// probe count and span (see `agent_ide::app::record_forced_replacement`).
+/// path enforces (`WEDGE_MIN_PROBES` probes over `WEDGE_MIN_SPAN`), the child is still the daemon
+/// whose silence was observed (`expected_pid`), and a probe of its control path at `runtime_dir`,
+/// made while this function holds the child, still finds it silent (a daemon that answers is never
+/// signalled, however busy). Holding the child slot serializes this with a restart, so a
+/// replacement that took the slot meanwhile is never signalled. The runtime store is marked for
+/// retention first ([`agent_ide::app::retain_runtime_store`]), so even an orderly exit on `SIGTERM`
+/// keeps the receipts. `SIGTERM`, up to [`agent_ide::app::WEDGE_TERM_GRACE`] for it to exit, a
+/// second probe (a daemon that resumed and answers is not killed), then `SIGKILL`; the caller then
+/// restarts the daemon in the same directory. Journals the replacement with the probe count and
+/// span (see `agent_ide::app::record_forced_replacement`) only when the child is really gone.
 async fn terminate_wedged_owned_daemon(
     child: SharedChild,
     runtime_dir: &Path,
+    expected_pid: Option<i32>,
     probes: u32,
     span: Duration,
 ) {
-    if probes < agent_ide::app::WEDGE_MIN_PROBES
-        || span < agent_ide::app::WEDGE_MIN_SPAN
-        || agent_ide::app::probe_health(runtime_dir).await != agent_ide::app::HealthProbe::Silent
-    {
+    if probes < agent_ide::app::WEDGE_MIN_PROBES || span < agent_ide::app::WEDGE_MIN_SPAN {
         return;
     }
     let mut child = child.lock().await;
@@ -3353,11 +3360,25 @@ async fn terminate_wedged_owned_daemon(
     let Some(pid) = child.id() else {
         return;
     };
+    if expected_pid.is_some_and(|expected| expected != pid as i32)
+        || agent_ide::app::probe_health(runtime_dir).await != agent_ide::app::HealthProbe::Silent
+    {
+        return;
+    }
+    if agent_ide::app::retain_runtime_store(runtime_dir).is_err() {
+        return;
+    }
     let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-    let killed = tokio::time::timeout(agent_ide::app::WEDGE_TERM_GRACE, child.wait())
+    let mut killed = false;
+    if tokio::time::timeout(agent_ide::app::WEDGE_TERM_GRACE, child.wait())
         .await
-        .is_err();
-    if killed {
+        .is_err()
+    {
+        // A child that resumed and answers is leaving by itself and is left to finish.
+        if agent_ide::app::probe_health(runtime_dir).await != agent_ide::app::HealthProbe::Silent {
+            return;
+        }
+        killed = true;
         let _ = child.start_kill();
         let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
     }
