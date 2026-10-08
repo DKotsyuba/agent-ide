@@ -126,6 +126,19 @@ impl LanguageServer for PyrightServer {
         &["py", "pyi"]
     }
 
+    /// Project metadata Pyright reads when it resolves imports.
+    fn project_inputs(&self) -> &'static [&'static str] {
+        &[
+            "pyproject.toml",
+            "pyrightconfig.json",
+            "setup.cfg",
+            "setup.py",
+            "requirements.txt",
+            "Pipfile",
+            "poetry.lock",
+        ]
+    }
+
     /// Pyright's call hierarchy answers nothing for constructors and partially for everything
     /// else, so callers and graphs are reported unavailable rather than misleadingly partial.
     fn call_hierarchy(&self) -> bool {
@@ -180,7 +193,9 @@ impl PyrightBackend {
     /// every use: a session whose interpreter identity no longer matches is released and
     /// restarted with the new one. A replaced child is shut down before another is admitted.
     /// Profile, authority, capacity, spawn, handshake, and cancellation failures return their
-    /// bounded `FailureCode`.
+    /// bounded `FailureCode`; the view, spawn and handshake refusals name their stage on `job`
+    /// (`python: view refused`, `spawn failed` or `initialize failed`) and a bare
+    /// `ProviderUnavailable` from the cache-namespace lookup is named by the caller.
     async fn ensure(
         &mut self,
         host: &mut dyn ProviderHost,
@@ -252,7 +267,13 @@ impl PyrightBackend {
                     host.registry().cancel_pending(&mut admission, ticket);
                     return Err(FailureCode::Capacity);
                 }
-                _ => return Err(FailureCode::ProviderUnavailable),
+                _ => {
+                    job.set_stage_failure(
+                        &FailureCode::ProviderUnavailable,
+                        "python: view refused",
+                    );
+                    return Err(FailureCode::ProviderUnavailable);
+                }
             }
         };
         let output_bytes = host.output_bytes();
@@ -277,6 +298,10 @@ impl PyrightBackend {
                     if let PyrightProfileError::Process(error) = error {
                         host.spawn_failure(error, &binding);
                     }
+                    job.set_stage_failure(
+                        &FailureCode::ProviderUnavailable,
+                        "python: spawn failed",
+                    );
                     return Err(FailureCode::ProviderUnavailable);
                 }
             }
@@ -321,6 +346,10 @@ impl PyrightBackend {
                 if job.cancelled() {
                     Err(FailureCode::Cancelled)
                 } else {
+                    job.set_stage_failure(
+                        &FailureCode::ProviderUnavailable,
+                        "python: initialize failed",
+                    );
                     Err(FailureCode::ProviderUnavailable)
                 }
             }
@@ -331,7 +360,8 @@ impl PyrightBackend {
     ///
     /// The exchange always waits (bounded) for the document's diagnostics push. A failed or
     /// cancelled exchange retires the session; cancellation maps to `Cancelled`, any other
-    /// failure to `ProviderUnavailable`. When the worktree has no Python environment at all, the
+    /// failure to `ProviderUnavailable` after naming the stage `python: request failed` on `job`.
+    /// When the worktree has no Python environment at all, the
     /// push's per-import `Import "..." could not be resolved` flood is collapsed into the single
     /// line [`MISSING_ENVIRONMENT_IMPORTS`] (see [`summarize_missing_environment`]); every other
     /// diagnostic survives untouched.
@@ -359,6 +389,10 @@ impl PyrightBackend {
                 return if job.cancelled() {
                     Err(FailureCode::Cancelled)
                 } else {
+                    job.set_stage_failure(
+                        &FailureCode::ProviderUnavailable,
+                        "python: request failed",
+                    );
                     Err(FailureCode::ProviderUnavailable)
                 };
             }

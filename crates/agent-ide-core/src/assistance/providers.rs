@@ -78,7 +78,49 @@ pub(super) struct Providers {
     /// worktrees legitimately use at once. This count is the source of truth for when the shared
     /// entry may actually transition to quiescent.
     shared_cache_refs: BTreeMap<String, usize>,
+    /// Why the last [`ProviderHost`] namespace lookup refused, so the caller that sees only a bare
+    /// `ProviderUnavailable` from a backend can still name the stage. Set by
+    /// [`Worker::retained_cache_namespace`], taken by [`Providers::name_bare_failure`].
+    refusal: std::sync::Mutex<Option<&'static str>>,
+    /// Bindings whose reader-to-writer upgrade failed while releasing their own reader-owned
+    /// state. The grant already reads `Writer`, so the retry cannot tell from its role that the
+    /// release is still owed; this marker keeps the debt until the release succeeds or the
+    /// binding's namespace is quiesced ([`Worker::release_reader_owners`]).
+    pending_handover: std::collections::BTreeSet<BindingRef>,
+    /// Sessions that failed (workspace load, or a call that used them failed), by owning binding
+    /// and server slot, with what they were started against. A session stays here, serving its
+    /// staged refusal, until a success clears it or [`Worker::retire_changed_session`] finds its
+    /// basis changed and retires it; an unchanged basis never restarts it.
+    failed: BTreeMap<(BindingRef, usize), SessionBasis>,
+    /// The owner and server slot of the session the running job used, so the worker can settle
+    /// that session's health when the job ends ([`Worker::settle_session_health`]).
+    pub(super) current: Option<(BindingRef, usize)>,
+    /// What the running job's provider calls showed about each session it used, by owner and
+    /// server slot. Recorded where the provider answers or fails, not from the tool's final
+    /// result: a tool that falls back to a source outline after the session failed still succeeds,
+    /// and the session is still failed. One session's outcome never marks or clears another's.
+    health: BTreeMap<(BindingRef, usize), SessionHealth>,
 }
+
+/// What a job's provider calls showed about the session it used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SessionHealth {
+    /// A provider call completed against the session and nothing failed.
+    Healthy,
+    /// A provider call failed against the session; sticky for the rest of the job.
+    Failed,
+}
+
+/// What a failed provider session was running against: Git's `HEAD` and the content stamp of the
+/// server's project input files. A change of either is the only reason to retire it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SessionBasis {
+    /// `HEAD` when the worktree's Git metadata validated, else `None`.
+    head: Option<crate::workspace::git::head::HeadState>,
+    /// Digest of the (relative path, length, modification time) of every project input file.
+    inputs: [u8; 32],
+}
+
 impl Providers {
     /// Creates fixed finite provider bookkeeping and one idle backend per server without launching
     /// processes.
@@ -100,8 +142,78 @@ impl Providers {
             caches: BTreeMap::new(),
             binding_caches: BTreeMap::new(),
             shared_cache_refs: BTreeMap::new(),
+            refusal: std::sync::Mutex::new(None),
+            pending_handover: std::collections::BTreeSet::new(),
+            failed: BTreeMap::new(),
+            current: None,
+            health: BTreeMap::new(),
         }
     }
+
+    /// Starts a job's session-health tracking: no session used, nothing observed.
+    pub(super) fn begin_job(&mut self) {
+        self.current = None;
+        self.health.clear();
+    }
+
+    /// Records that a provider call failed against the session the job used last (the one
+    /// [`Worker::live_session_for`] or [`Worker::semantic_context`] handed out immediately
+    /// before the call); later successes of the same job never undo it.
+    pub(super) fn note_session_fault(&mut self) {
+        if let Some(key) = self.current.clone() {
+            self.health.insert(key, SessionHealth::Failed);
+        }
+    }
+
+    /// Records that a provider call completed against the session the job used last, unless one
+    /// already failed against it.
+    fn note_session_healthy(&mut self) {
+        if let Some(key) = self.current.clone() {
+            self.health.entry(key).or_insert(SessionHealth::Healthy);
+        }
+    }
+
+    /// Forgets the recorded namespace refusal; called before a backend step so a stale cause of an
+    /// earlier call never names a later failure.
+    fn clear_refusal(&self) {
+        *self
+            .refusal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// Gives a backend's bare `ProviderUnavailable` its stage: the namespace refusal recorded
+    /// during the step, else `step`, prefixed by the server name and followed by what still
+    /// answers without the server. A failure that already set its own detail, and every other
+    /// code, is left alone.
+    ///
+    /// `step` is a closed phrase naming the failing step, never a path or payload.
+    fn name_bare_failure(
+        &self,
+        job: &mut Job,
+        server: &'static dyn LanguageServer,
+        step: &str,
+        code: &FailureCode,
+    ) {
+        let refusal = self
+            .refusal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if *code != FailureCode::ProviderUnavailable || job.failure_detail.is_some() {
+            return;
+        }
+        job.set_stage_failure(
+            code,
+            &format!(
+                "{}: {}{}",
+                server.name(),
+                refusal.unwrap_or(step),
+                session_fallback_clause(server.language().support().outline_while_loading())
+            ),
+        );
+    }
+
     /// Mints one checked protocol generation without using timing/PID as actor identity.
     fn next(&mut self) -> Result<u64, FailureCode> {
         self.generation = self
@@ -275,6 +387,10 @@ impl Worker<'_> {
     /// every divergent worktree currently sharing that one heavy listener has stopped, so a still
     /// live shared entry is never falsely retired or handed off to an unrelated actor.
     pub(super) fn quiesce_worktree_caches(&mut self, binding: &BindingRef) {
+        self.providers.pending_handover.remove(binding);
+        self.providers
+            .failed
+            .retain(|(owner, _), _| owner != binding);
         for key in self
             .providers
             .binding_caches
@@ -319,6 +435,19 @@ impl Worker<'_> {
             .map(CacheLifecycle::quiescent)
     }
 
+    /// Test-only count of sessions currently marked failed.
+    #[cfg(test)]
+    pub(super) fn test_failed_sessions(&self) -> usize {
+        self.providers.failed.len()
+    }
+
+    /// Test-only: records a failed provider call against the session the running job used, the
+    /// way a lexical fallback that swallowed a provider failure would have.
+    #[cfg(test)]
+    pub(super) fn test_note_session_fault(&mut self) {
+        self.providers.note_session_fault();
+    }
+
     /// Test-only read of whether `binding` still owns any cache keys.
     #[cfg(test)]
     pub(super) fn test_binding_owns_caches(&self, binding: &BindingRef) -> bool {
@@ -332,7 +461,10 @@ impl Worker<'_> {
     /// The server is chosen by `source`'s extension ([`LanguageServer::context_extensions`]);
     /// `Ok(None)` when no server owns the extension or the target configures none for it.
     /// Persistent sessions admit the source under fresh invoking-actor authority, even when
-    /// borrowing the writer's transport; a mismatched source returns `WorkspaceAuthority`.
+    /// borrowing the worktree's session owner's transport (the writer, else the reader that owns
+    /// the namespace; see [`Worker::resolve_session_owner`]); a mismatched source returns
+    /// `WorkspaceAuthority`. As for [`Worker::live_session_for`], a bare `ProviderUnavailable` is
+    /// named before it returns and a failed session whose inputs or `HEAD` changed is retired first.
     pub(super) async fn semantic_context(
         &mut self,
         job: &mut Job,
@@ -362,9 +494,18 @@ impl Worker<'_> {
             return Ok(None);
         };
         let source_authority = self.authority(job.invocation.binding_ref()).await?;
+        // A reader's semantic call serves from the worktree's session owner for this one backend
+        // call; a writer-less reader becomes that owner first.
+        self.resolve_session_owner(job, &source_authority).await?;
+        let owner = job
+            .session_binding
+            .clone()
+            .unwrap_or_else(|| job.invocation.binding_ref().clone());
+        self.retire_changed_session(&owner, index, &source_authority)
+            .await;
+        self.providers.current = Some((owner, index));
         let mut backend = self.providers.take_backend(index)?;
-        // A reader's semantic call borrows the writer's session for this one backend call.
-        self.borrow_writer_session(job);
+        self.providers.clear_refusal();
         let result = async {
             if server.session_extensions().contains(&extension) {
                 backend.ensure_live(self, job, &launch, source).await?;
@@ -382,6 +523,16 @@ impl Worker<'_> {
         .await;
         job.session_binding = None;
         self.providers.put_backend(index, backend);
+        match &result {
+            Err(code) => {
+                self.providers
+                    .name_bare_failure(job, server, "session request failed", code);
+                if *code == FailureCode::ProviderUnavailable {
+                    self.providers.note_session_fault();
+                }
+            }
+            Ok(_) => self.providers.note_session_healthy(),
+        }
         result.map(Some)
     }
 
@@ -394,16 +545,26 @@ impl Worker<'_> {
     /// jobs, while edit diagnostics return `ProviderLoading` without parking so a prior write can
     /// settle. Workspace failure and dead transport remain errors; a dead transport retires the
     /// session. The invoking actor's fresh authority admits `source` into the selected transport;
-    /// borrowing a writer session does not replace the reader's source identity or its epoch.
+    /// borrowing the owner's session (the writer's, or the owning reader's when no writer holds the
+    /// worktree) does not replace the invoking reader's source identity or its epoch. A reader with
+    /// no writer and no reading owner beside it claims the namespace first
+    /// ([`Worker::resolve_session_owner`]).
+    ///
+    /// Every `ProviderUnavailable` leaves `job` with a parenthesised stage: the backend's own, else
+    /// `<server>: <step>` ([`Providers::name_bare_failure`]), else the no-server form for a path
+    /// no accepted server serves. A session this job's owner had failed is retired first when its
+    /// project inputs changed or Git's `HEAD` moved since ([`Worker::retire_changed_session`]);
+    /// the session used is recorded so the job's end settles its health.
     pub(super) async fn live_session_for(
         &mut self,
         job: &mut Job,
         source: &SourceObservation,
     ) -> Result<&mut LiveSession, FailureCode> {
         let source_authority = self.authority(job.invocation.binding_ref()).await?;
-        // A reader's semantic tools borrow the writer's session for this whole resolution; the
-        // mapping is cleared again below so no non-provider path of the same job ever sees it.
-        self.borrow_writer_session(job);
+        // A reader's semantic tools serve from the worktree's session owner for this whole
+        // resolution (a writer-less reader becomes that owner first); the mapping is cleared
+        // again below so no non-provider path of the same job ever sees it.
+        self.resolve_session_owner(job, &source_authority).await?;
         let binding = job
             .session_binding
             .clone()
@@ -413,6 +574,7 @@ impl Worker<'_> {
             .session_server(source.path())
             .ok_or_else(|| {
                 job.session_binding = None;
+                set_no_server_stage(job);
                 FailureCode::ProviderUnavailable
             })?;
         let index = match self.providers.slot_of(server) {
@@ -430,12 +592,24 @@ impl Worker<'_> {
             .cloned()
             .ok_or_else(|| {
                 job.session_binding = None;
+                set_no_server_stage(job);
                 FailureCode::ProviderUnavailable
             })?;
+        self.retire_changed_session(&binding, index, &source_authority)
+            .await;
+        self.providers.current = Some((binding.clone(), index));
         let mut backend = self.providers.take_backend(index)?;
+        self.providers.clear_refusal();
         let ensured = backend.ensure_live(self, job, &launch, source).await;
         self.providers.put_backend(index, backend);
         job.session_binding = None;
+        if let Err(code) = &ensured {
+            self.providers
+                .name_bare_failure(job, server, "session could not start", code);
+            if *code == FailureCode::ProviderUnavailable {
+                self.providers.note_session_fault();
+            }
+        }
         ensured?;
         let budget = Duration::from_millis(100).min(
             job.deadline
@@ -459,6 +633,7 @@ impl Worker<'_> {
                 return Err(FailureCode::ProviderLoading);
             }
             Err(ReadinessError::WorkspaceError) => {
+                self.providers.note_session_fault();
                 job.set_stage_failure(
                     &FailureCode::ProviderUnavailable,
                     &format!(
@@ -479,6 +654,7 @@ impl Worker<'_> {
                 if cancelled {
                     return Err(FailureCode::Cancelled);
                 }
+                self.providers.note_session_fault();
                 job.set_stage_failure(
                     &FailureCode::ProviderUnavailable,
                     &format!(
@@ -500,6 +676,12 @@ impl Worker<'_> {
         live.session
             .authorize_source(&source_authority, source)
             .map_err(|_| FailureCode::WorkspaceAuthority)?;
+        self.providers.note_session_healthy();
+        let live = self.providers.slots[index]
+            .backend
+            .as_mut()
+            .and_then(|backend| backend.live_session(&binding))
+            .ok_or(FailureCode::Internal)?;
         Ok(live)
     }
 
@@ -508,8 +690,190 @@ impl Worker<'_> {
         self.providers.session_server(path)
     }
 
+    /// Names the binding whose live sessions and cache namespace serve `binding`'s provider
+    /// calls, or `None` when `binding` serves itself.
+    ///
+    /// Only a reader borrows. While a writer holds the worktree it owns every session and the
+    /// namespace; with no writer, the first reader that needed the provider owns them
+    /// ([`Worker::resolve_session_owner`]) and the other readers of that worktree borrow from it.
+    /// A writer, an unknown binding and a reader nobody owns for yet serve themselves.
+    fn session_owner_of(&self, binding: &BindingRef) -> Option<BindingRef> {
+        use crate::workspace::authority::StartRole;
+        let receipt = self
+            .grants
+            .get(binding)
+            .filter(|receipt| receipt.role() == StartRole::Reader)?;
+        let same_tree = |other: &StartReceipt| other.worktree().id() == receipt.worktree().id();
+        self.grants
+            .iter()
+            .find(|(_, other)| other.role() == StartRole::Writer && same_tree(other))
+            .or_else(|| {
+                self.grants.iter().find(|(other, grant)| {
+                    *other != binding
+                        && same_tree(grant)
+                        && self.providers.binding_caches.contains_key(*other)
+                })
+            })
+            .map(|(owner, _)| owner.clone())
+    }
+
+    /// Points `job` at the binding that serves its provider calls and makes sure that binding
+    /// owns the worktree's cache namespace, so a writer-less reader gets the same semantic tools
+    /// as a writer (QW-1).
+    ///
+    /// `job.session_binding` is set to the borrowed owner or left `None` when the invoking binding
+    /// serves itself; callers clear it once their provider call ends. A reader with neither a
+    /// writer nor a reading owner beside it claims the namespace now, retaining it exactly like a
+    /// writer's start would; a writer's later start releases it again
+    /// ([`Worker::release_reader_owners`]) and the next reader call claims it back after the
+    /// writer leaves. Fails `ProviderUnavailable` with a named stage when the claim is refused.
+    pub(super) async fn resolve_session_owner(
+        &mut self,
+        job: &mut Job,
+        authority: &AuthorityStamp,
+    ) -> Result<(), FailureCode> {
+        let binding = job.invocation.binding_ref().clone();
+        job.session_binding = self.session_owner_of(&binding);
+        let reader = self.grants.get(&binding).is_some_and(|receipt| {
+            receipt.role() == crate::workspace::authority::StartRole::Reader
+        });
+        if job.session_binding.is_some() || !reader {
+            return Ok(());
+        }
+        let launches = job.target.providers.clone();
+        self.retain_worktree_caches(&binding, authority, &launches, true)
+            .map_err(|code| {
+                let stage = match code {
+                    FailureCode::Conflict => "provider: cache namespace held by another session",
+                    FailureCode::Capacity => "provider: cache namespaces exhausted",
+                    _ => "provider: cache namespace unavailable",
+                };
+                job.set_stage_failure(&FailureCode::ProviderUnavailable, stage);
+                FailureCode::ProviderUnavailable
+            })
+    }
+
+    /// Reads what a session of the server in slot `index` would run against now.
+    fn session_basis(&self, index: usize, authority: &AuthorityStamp) -> SessionBasis {
+        let worktree = authority.worktree();
+        SessionBasis {
+            head: crate::workspace::git::head::HeadState::read(
+                worktree.worktree_path(),
+                worktree.git_common_dir(),
+            ),
+            inputs: project_inputs_stamp(
+                worktree.worktree_path(),
+                self.providers.slots[index].server.project_inputs(),
+            ),
+        }
+    }
+
+    /// Retires `owner`'s failed session of slot `index` when its project inputs changed or Git's
+    /// `HEAD` moved since it failed, so the call that follows starts a fresh one.
+    ///
+    /// A session that is not marked failed, and one whose basis is unchanged, is left alone: an
+    /// invalid project is never restarted on a timer or per call. The mark is dropped with the
+    /// session; a session that fails again is marked afresh against the new basis.
+    async fn retire_changed_session(
+        &mut self,
+        owner: &BindingRef,
+        index: usize,
+        authority: &AuthorityStamp,
+    ) {
+        let key = (owner.clone(), index);
+        let Some(basis) = self.providers.failed.get(&key) else {
+            return;
+        };
+        if *basis == self.session_basis(index, authority) {
+            return;
+        }
+        self.providers.failed.remove(&key);
+        if let Ok(mut backend) = self.providers.take_backend(index) {
+            backend.release_live(self, owner).await;
+            self.providers.put_backend(index, backend);
+        }
+    }
+
+    /// Settles the health of the session the finished job used, if any, from what its provider
+    /// calls observed ([`SessionHealth`]), not from the tool's final result: a failed provider
+    /// call marks the session failed against the basis it failed on even when the tool then
+    /// answered from a source outline, and a job whose provider calls all completed clears the mark.
+    pub(super) async fn settle_session_health(&mut self, job: &Job) {
+        self.providers.current = None;
+        let health = std::mem::take(&mut self.providers.health);
+        if health.is_empty() {
+            return;
+        }
+        let authority = self.authority(job.invocation.binding_ref()).await.ok();
+        for (key, health) in health {
+            match health {
+                SessionHealth::Healthy => {
+                    self.providers.failed.remove(&key);
+                }
+                SessionHealth::Failed => {
+                    if let Some(authority) = &authority {
+                        let basis = self.session_basis(key.1, authority);
+                        self.providers.failed.insert(key, basis);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Releases every reader-owned session and namespace of the worktree `writer` is about to
+    /// own, so the writer's retention never meets a second live owner.
+    ///
+    /// Each reader owner's live sessions are shut down and reaped, its non-session provider views
+    /// closed and its namespace quiesced, in that order, before this returns; the readers keep
+    /// working and borrow the writer's sessions from their next call on. `writer_was_reader` is
+    /// true when the incoming writer upgrades its own reader activation, which then releases its
+    /// own reader-owned state too; a retry after a failed upgrade is recognised by the recorded
+    /// debt, not by the role (the grant already says `Writer`), so the failed cleanup is attempted
+    /// again. Fails with the first cleanup failure; the namespace of a reader whose cleanup failed
+    /// stays non-quiescent, so the writer's start refuses instead of sharing it.
+    pub(super) async fn release_reader_owners(
+        &mut self,
+        writer: &BindingRef,
+        writer_was_reader: bool,
+        authority: &AuthorityStamp,
+    ) -> Result<(), FailureCode> {
+        use crate::workspace::authority::StartRole;
+        let upgrading = writer_was_reader || self.providers.pending_handover.contains(writer);
+        let owners: Vec<BindingRef> = self
+            .providers
+            .binding_caches
+            .keys()
+            .filter(|owner| {
+                if *owner == writer {
+                    return upgrading;
+                }
+                self.grants.get(*owner).is_some_and(|grant| {
+                    grant.role() == StartRole::Reader
+                        && grant.worktree().id() == authority.worktree().id()
+                })
+            })
+            .cloned()
+            .collect();
+        for owner in owners {
+            self.release_live(&owner).await;
+            if let Err(code) = self.close_provider(&owner).await {
+                if owner == *writer {
+                    self.providers.pending_handover.insert(writer.clone());
+                }
+                return Err(code);
+            }
+            self.quiesce_worktree_caches(&owner);
+        }
+        self.providers.pending_handover.remove(writer);
+        Ok(())
+    }
+
     /// Shuts down and reaps every live language session owned by one binding, in server order.
     pub(super) async fn release_live(&mut self, binding: &BindingRef) {
+        // A released session has nothing left to retire; its failed mark would only outlive it.
+        self.providers
+            .failed
+            .retain(|(owner, _), _| owner != binding);
         for index in 0..self.providers.slots.len() {
             let Ok(mut backend) = self.providers.take_backend(index) else {
                 continue;
@@ -551,6 +915,15 @@ impl Worker<'_> {
             }
         }
         failure.map_or(Ok(()), Err)
+    }
+
+    /// Remembers why a namespace lookup refused, for [`Providers::name_bare_failure`].
+    fn record_refusal(&self, cause: &'static str) {
+        *self
+            .providers
+            .refusal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cause);
     }
 
     /// Resolves the already-retained namespace for this exact durable worktree and provider.
@@ -620,6 +993,7 @@ impl Worker<'_> {
             .get(binding)
             .is_some_and(|keys| keys.iter().any(|existing| existing == key))
         {
+            self.record_refusal("cache namespace not owned by this session");
             return Err(FailureCode::ProviderUnavailable);
         }
         self.providers
@@ -628,7 +1002,10 @@ impl Worker<'_> {
             .and_then(CacheLifecycle::namespace_path)
             .and_then(|path| path.to_str())
             .map(str::to_owned)
-            .ok_or(FailureCode::ProviderUnavailable)
+            .ok_or_else(|| {
+                self.record_refusal("cache namespace unavailable");
+                FailureCode::ProviderUnavailable
+            })
     }
 }
 
@@ -647,6 +1024,118 @@ pub(super) struct CacheRequest {
     /// Whether this namespace is the one shared native namespace several concurrently active
     /// worktrees legitimately hold at once rather than a single-owner worktree namespace.
     pub(super) shared: bool,
+}
+
+/// Names the stage of a provider refusal that is a real "no language server for this file type"
+/// answer: `<tool>:provider_unavailable ext=<extension> (provider: no server for this file type)`.
+///
+/// The leading `ext=` shape is what the reply template renders as `no language server is
+/// configured for .<extension> files`; the trailing parenthesised stage keeps the journal line and
+/// the structured detail uniform with every other provider refusal. Only a path with no accepted
+/// server may use it; every other `ProviderUnavailable` carries its own parenthesised stage.
+fn set_no_server_stage(job: &mut Job) {
+    let shape = crate::assistance::facade::staged_detail(
+        job.tool,
+        &FailureCode::ProviderUnavailable,
+        &job.parameters,
+    );
+    job.failure_detail = Some(format!("{shape} (provider: no server for this file type)"));
+}
+
+/// Deepest directory level below the worktree root that [`project_inputs_stamp`] searches.
+const INPUT_SCAN_DEPTH: usize = 4;
+/// Most directory entries [`project_inputs_stamp`] reads in total; a larger tree is stamped from
+/// the entries read so far.
+const INPUT_SCAN_ENTRIES: usize = 5_000;
+/// Directories [`project_inputs_stamp`] never enters: VCS metadata and generated or vendored trees
+/// that hold copies of manifests the project does not own.
+const INPUT_SCAN_SKIP: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "dist",
+    "build",
+    "vendor",
+];
+
+/// Most bytes of one input file that [`project_inputs_stamp`] digests; a longer file is stamped
+/// by its length and this prefix.
+const INPUT_SCAN_FILE_BYTES: u64 = 256 * 1024;
+
+/// Digests the relative path, length, modification time and first [`INPUT_SCAN_FILE_BYTES`] bytes
+/// of every file named in `names` below `root`.
+///
+/// A file of up to that size is digested whole, so any edit of it changes the stamp. A longer file
+/// is covered by its length, its modification time and its prefix: an ordinary edit moves the
+/// modification time, but a same-length edit past the prefix that also restores the timestamp is
+/// not seen (a stated ceiling; the next `HEAD` move or session restart recovers it).
+///
+/// Coverage is bounded and honest: at most [`INPUT_SCAN_DEPTH`] levels below `root` and
+/// [`INPUT_SCAN_ENTRIES`] directory entries read in total (entries are streamed, never collected,
+/// so a huge directory costs at most the remaining budget); a manifest deeper than that or past the
+/// budget is not seen, and only a moved `HEAD` then revives a failed session. The per-file digests
+/// are summed, so the result does not depend on the order the filesystem lists entries. An
+/// unreadable directory or file contributes nothing; empty `names` digest to a constant. Only
+/// regular files are opened: a named pipe, socket, device or symlink named like an input is skipped
+/// (opening a pipe would block the worker), so a symlinked manifest is not stamped.
+fn project_inputs_stamp(root: &Path, names: &[&str]) -> [u8; 32] {
+    let mut sum = [0_u8; 32];
+    let mut budget = INPUT_SCAN_ENTRIES;
+    let mut pending = vec![(root.to_path_buf(), 0_usize)];
+    while let Some((directory, depth)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if budget == 0 {
+                return sum;
+            }
+            budget -= 1;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                if depth < INPUT_SCAN_DEPTH && !INPUT_SCAN_SKIP.contains(&name) {
+                    pending.push((entry.path(), depth + 1));
+                }
+            } else if kind.is_file()
+                && names.contains(&name)
+                && let Ok(file) = std::fs::File::open(entry.path())
+            {
+                use std::io::Read;
+                let relative = entry.path();
+                let relative = relative.strip_prefix(root).unwrap_or(&relative);
+                let mut content = Vec::new();
+                if file
+                    .take(INPUT_SCAN_FILE_BYTES)
+                    .read_to_end(&mut content)
+                    .is_err()
+                {
+                    continue;
+                }
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(relative.as_os_str().as_encoded_bytes());
+                let metadata = entry.metadata().ok();
+                let modified = metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |elapsed| elapsed.as_nanos());
+                hasher.update(&metadata.map_or(0, |metadata| metadata.len()).to_le_bytes());
+                hasher.update(&modified.to_le_bytes());
+                hasher.update(&content);
+                for (total, byte) in sum.iter_mut().zip(hasher.finalize().as_bytes()) {
+                    *total = total.wrapping_add(*byte);
+                }
+            }
+        }
+    }
+    sum
 }
 
 /// Parks `job` for a retry in 300 ms because its language server is still loading; the caller

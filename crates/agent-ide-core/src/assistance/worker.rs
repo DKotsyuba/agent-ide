@@ -109,9 +109,10 @@ struct Job {
     park_until: Option<tokio::time::Instant>,
     /// Retained in-memory continuation for work that cannot safely be repeated from its start.
     stage: Option<JobStage>,
-    /// The binding that owns this job's provider sessions: the writer's while this job's own
-    /// activation is a reader borrowing them, else absent (the invocation binding owns them).
-    /// Set only while a provider call runs; see [`Worker::borrow_writer_session`].
+    /// The binding that owns this job's provider sessions: the worktree's writer, else the reader
+    /// that owns the namespace, while this job's own activation is a reader borrowing them; absent
+    /// when the invocation binding owns them itself.
+    /// Set only while a provider call runs; see [`Worker::resolve_session_owner`].
     session_binding: Option<BindingRef>,
 }
 
@@ -457,9 +458,26 @@ pub(super) fn admission_controller() -> crate::execution::AdmissionController {
 #[cfg(test)]
 #[test]
 fn admission_reserves_a_server_slot_per_registered_language_and_one_free_slot() {
+    // Fix the registry before reading it twice: a parallel test installing between the two reads
+    // would otherwise change the expected size.
+    crate::lang::testing::install();
     let server_slots = crate::lang::registered().len().max(1);
     let limits = admission_controller().inspect();
     assert_eq!(limits.per_owner_running_limit, server_slots + 1);
+}
+
+/// The stage of a terminal job failure that no path named: the derived `<tool>:<reason>` default.
+///
+/// A `ProviderUnavailable` nobody named still gets a parenthesised stage —
+/// `<tool>:provider_unavailable (provider: cause not reported)` — and never the bare default that
+/// a reply would render as "no language server is configured". The real no-server refusal names
+/// itself (`set_no_server_stage` in `providers.rs`).
+fn terminal_stage(tool: AssistanceTool, code: &FailureCode) -> String {
+    if *code == FailureCode::ProviderUnavailable {
+        crate::telemetry::adapters::stage_with_failure(tool, code, "provider: cause not reported")
+    } else {
+        crate::telemetry::adapters::default_stage(tool, code)
+    }
 }
 
 /// Shared bounded transport-side bookkeeping; no lock survives an I/O await.
@@ -2732,6 +2750,7 @@ impl<'a> Worker<'a> {
     /// Rechecks queued liveness, executes only the selected owner operation, and fences every result.
     async fn perform(&mut self, job: &mut Job) {
         let binding = job.invocation.binding_ref().clone();
+        self.providers.begin_job();
         let was_parked = job.park_until.take().is_some();
         // Read/query jobs can restart from the top after readiness probes: observe records a fresh
         // source snapshot, and ensure_live_* reuses the same alive per-binding session.
@@ -2834,14 +2853,14 @@ impl<'a> Worker<'a> {
         if job.park_until.is_some() {
             return;
         }
+        self.settle_session_health(job).await;
         let (reply, authority, source) = match result {
             Ok(result) => result,
             Err(code) => {
                 // Every terminal failure names its stage: the failing path's own tag when it set
                 // one, else the derived `<tool>:<reason>` default — never a bare reason.
                 if job.failure_detail.is_none() {
-                    job.failure_detail =
-                        Some(crate::telemetry::adapters::default_stage(job.tool, &code));
+                    job.failure_detail = Some(terminal_stage(job.tool, &code));
                 }
                 (
                     PeerReply::Error {
@@ -3002,6 +3021,15 @@ impl<'a> Worker<'a> {
     /// Discovers and activates a worktree, settling fixed discovery commands before parsing.
     /// Repeats reuse durable authority and cache ownership. Validated environment choices are
     /// stored only after cache admission; cache refusals preserve an existing binding and choice.
+    ///
+    /// Provider namespace ownership: a reader retains nothing here — it claims the worktree's
+    /// namespace on its first semantic call (`Worker::resolve_session_owner`). A writer (a new
+    /// one, or a reader upgrading in place) first releases every reader owner of the worktree
+    /// (`Worker::release_reader_owners`: sessions, then non-session views, then quiescence) and
+    /// only then retains the namespace, so the namespace never has two live owners. A cleanup
+    /// failure of a reader owner refuses the writer's start (`start:reader_provider_handover`)
+    /// and leaves that reader as the namespace's sole owner; a retried start redoes the handover.
+    /// A writer downgrading to a reader releases its own sessions and namespace.
     ///
     /// The activation root (the model's `root` or the launcher candidate) and the discovered Git
     /// worktree root and common directory must all lie below a configured allowed root.
@@ -3313,13 +3341,28 @@ impl<'a> Worker<'a> {
             self.quiesce_worktree_caches(&binding);
         }
         let launches = job.target.providers.clone();
-        // A reader holds no provider namespace of its own: it borrows the writer's sessions for
-        // semantic reads (see `borrow_writer_session`), so the single-owner namespace stays with
-        // the writer. A second concurrent *writer* on the same physical worktree still cannot
-        // share one namespace: fail its activation with the finite reason and roll its own grant
-        // back, so the actor that already owns the cache keeps running and can hand off.
+        // A reader retains no namespace at start: it borrows the writer's sessions for semantic
+        // reads, or claims the namespace itself on its first semantic call when no writer is
+        // beside it (see `resolve_session_owner`). A writer takes the namespace over from any
+        // reader owner of the worktree first, so it never meets a second live owner. A second
+        // concurrent *writer* on the same physical worktree still cannot share one namespace:
+        // fail its activation with the finite reason and roll its own grant back, so the actor
+        // that already owns the cache keeps running and can hand off.
         if authority.role() == crate::workspace::authority::StartRole::Writer
-            && let Err(code) = self.retain_worktree_caches(&binding, &authority, &launches, true)
+            && let Err(code) = match self
+                .release_reader_owners(
+                    &binding,
+                    previous_role == Some(crate::workspace::authority::StartRole::Reader),
+                    &authority,
+                )
+                .await
+            {
+                Ok(()) => self.retain_worktree_caches(&binding, &authority, &launches, true),
+                Err(code) => {
+                    job.failure_detail = Some("start:reader_provider_handover".to_owned());
+                    Err(code)
+                }
+            }
         {
             if code == FailureCode::Conflict {
                 job.failure_detail = Some("start:provider_cache_namespace_conflict".to_owned());
@@ -3612,26 +3655,6 @@ impl<'a> Worker<'a> {
             }
             _ => "none".to_owned(),
         }
-    }
-
-    /// Points one read job of a reader activation at the writer's binding for provider sessions:
-    /// while a writer holds this worktree, its binding owns every live session and cache
-    /// namespace, so the reader borrows them instead of starting its own (E013 item 2). No-op
-    /// for a writer's or a writer-less reader's own jobs.
-    fn borrow_writer_session(&self, job: &mut Job) {
-        job.session_binding = self
-            .grants
-            .get(job.invocation.binding_ref())
-            .filter(|receipt| receipt.role() == crate::workspace::authority::StartRole::Reader)
-            .and_then(|receipt| {
-                self.grants
-                    .iter()
-                    .find(|(_, writer)| {
-                        writer.role() == crate::workspace::authority::StartRole::Writer
-                            && writer.worktree().id() == receipt.worktree().id()
-                    })
-                    .map(|(binding, _)| binding.clone())
-            });
     }
 
     /// Maps one durable holder record onto this daemon's live binding for it, when the worker
@@ -6928,6 +6951,15 @@ mod stop_retry_tests {
     /// Builds the fixture launcher with the worktree's temporary base as its allowed root and
     /// the requested details ceiling.
     fn production_launcher(root: &std::path::Path, details: usize) -> LauncherConfig {
+        production_launcher_with(root, details, serde_json::json!([]))
+    }
+
+    /// [`production_launcher`] with the given accepted provider declarations on its one target.
+    fn production_launcher_with(
+        root: &std::path::Path,
+        details: usize,
+        providers: Value,
+    ) -> LauncherConfig {
         let git = std::path::Path::new("/usr/bin/git");
         let executable = serde_json::json!({
             "path":git,
@@ -6942,10 +6974,131 @@ mod stop_retry_tests {
                 "attachment":"stop-retry",
                 "candidate":root,
                 "git":executable,
-                "providers":[]
+                "providers":providers
             }]
         });
         LauncherConfig::parse(config.to_string().as_bytes()).unwrap()
+    }
+
+    /// Returns the target of a launcher that accepts the recording fixture provider of the
+    /// `.epsilon` test language, so provider ownership runs through the production worker paths.
+    fn provider_target(root: &std::path::Path) -> LaunchTarget {
+        let git = std::path::Path::new("/usr/bin/git");
+        production_launcher_with(
+            root,
+            8,
+            serde_json::json!([{
+                "executable":{
+                    "path":git,
+                    "identity":"fixture-provider",
+                    "blake3":blake3::hash(&std::fs::read(git).unwrap()).to_hex().to_string()
+                },
+                "settings":"fixture_epsilon",
+                "toolchain":"fixture-toolchain",
+                "trust":"fixture-trust",
+                "cache_namespace":"fixture-epsilon-cache"
+            }]),
+        )
+        .target("stop-retry")
+        .unwrap()
+        .clone()
+    }
+
+    /// Runs the production `Worker::activate` with the fixture provider configured, for `root`
+    /// when given (a sibling worktree) and the fixture worktree otherwise, in the requested mode.
+    /// Returns the binding.
+    async fn provider_start(
+        worker: &mut Worker<'_>,
+        actor: &str,
+        id: &str,
+        read_only: bool,
+        root: Option<&std::path::Path>,
+    ) -> Result<BindingRef, FailureCode> {
+        crate::lang::testing::install();
+        let invocation = production_call(worker, actor, id);
+        let binding = invocation.binding_ref().clone();
+        let (_cancel_sender, cancel) = watch::channel(false);
+        let mut parameters = serde_json::json!({"activation_id":actor,"read_only":read_only});
+        if let Some(root) = root {
+            parameters["root"] = serde_json::json!(root);
+        }
+        let mut job = Job {
+            reference: format!("provider-{id}"),
+            invocation,
+            tool: AssistanceTool::Start,
+            parameters,
+            target: provider_target(&worker.runtime),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            cancel,
+            stop_reply: None,
+            native_epoch: 0,
+            failure_detail: None,
+            format_note: None,
+            check_scheduled: false,
+            park_until: None,
+            stage: None,
+            session_binding: None,
+        };
+        worker.activate(&mut job).await?;
+        Ok(binding)
+    }
+
+    /// Resolves `file` (a worktree-relative source) through the production
+    /// `Worker::live_session_for` as `actor`'s symbol call, returning how it answered and the
+    /// failure detail the job carried. The recording fixture provider answers `ProviderLoading`
+    /// once it holds the retained namespace.
+    async fn provider_symbol_call_detailed(
+        worker: &mut Worker<'_>,
+        actor: &str,
+        call: &str,
+        file: &std::path::Path,
+    ) -> (Result<(), FailureCode>, Option<String>) {
+        let invocation = production_call(worker, actor, call);
+        let binding = invocation.binding_ref().clone();
+        let (observed, _) = worker.observe(&binding, file.to_path_buf()).await.unwrap();
+        let (cancel_sender, cancel) = watch::channel(false);
+        let _keep = cancel_sender;
+        let mut job = Job {
+            reference: format!("provider-{call}"),
+            invocation,
+            tool: AssistanceTool::Symbol,
+            parameters: serde_json::json!({"symbol":format!("{}#a", file.display())}),
+            target: provider_target(&worker.runtime),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            cancel,
+            stop_reply: None,
+            native_epoch: 0,
+            failure_detail: None,
+            format_note: None,
+            check_scheduled: false,
+            park_until: None,
+            stage: None,
+            session_binding: None,
+        };
+        worker.providers.begin_job();
+        let outcome = worker
+            .live_session_for(&mut job, &observed)
+            .await
+            .map(|_| ());
+        assert!(
+            job.session_binding.is_none(),
+            "the borrowed owner is cleared after the provider call"
+        );
+        // What `perform` does when a job ends: settle the health of the session it used.
+        worker.settle_session_health(&job).await;
+        (outcome, job.failure_detail)
+    }
+
+    /// [`provider_symbol_call_detailed`] without the failure detail.
+    async fn provider_symbol_call(
+        worker: &mut Worker<'_>,
+        actor: &str,
+        call: &str,
+        file: &std::path::Path,
+    ) -> Result<(), FailureCode> {
+        provider_symbol_call_detailed(worker, actor, call, file)
+            .await
+            .0
     }
 
     /// Returns the target selected by the fixture's trusted launcher attachment.
@@ -7396,6 +7549,902 @@ mod stop_retry_tests {
             "the upgrade keeps the reader's activation operation"
         );
         assert!(worker.settle_revocation(&writer_binding).await.unwrap());
+    }
+
+    /// Writes the fixture worktree's `.epsilon` source that provider calls resolve and returns its
+    /// worktree-relative path, the form every tool call observes sources by. Registers the test
+    /// languages first: the registry is fixed by its first caller and sizes the worker's
+    /// admission ceiling, so a test must register before it builds its worker.
+    fn epsilon_source(fixture: &Fixture) -> std::path::PathBuf {
+        crate::lang::testing::install();
+        std::fs::write(fixture.root.join("a.epsilon"), "one\n").unwrap();
+        std::path::PathBuf::from("a.epsilon")
+    }
+
+    /// The `ensure:<binding>:<namespace>` lines of the recording fixture provider for `bindings`,
+    /// reduced to `ensure:<tag>` / `release:<tag>` plus the distinct namespaces they named.
+    fn provider_events(bindings: &[&BindingRef]) -> (Vec<String>, Vec<String>) {
+        let mut namespaces = Vec::new();
+        let events = crate::lang::testing::fixture_events(bindings)
+            .into_iter()
+            .map(|line| {
+                let mut parts = line.splitn(3, ':');
+                let (event, tag) = (parts.next().unwrap(), parts.next().unwrap());
+                if let Some(namespace) = parts.next()
+                    && !namespaces.iter().any(|seen| seen == namespace)
+                {
+                    namespaces.push(namespace.to_owned());
+                }
+                format!("{event}:{tag}")
+            })
+            .collect();
+        (events, namespaces)
+    }
+
+    /// QW-1: a read-only activation with no writer beside it owns the provider namespace, so its
+    /// semantic calls reach the provider (0.10.5 refused every one with a stage-less
+    /// `provider_unavailable` because only a writer retained the namespace). A second reader
+    /// borrows the first reader's session, and the owner's stop hands the namespace to the
+    /// survivor's next call.
+    #[tokio::test]
+    async fn writerless_reader_owns_the_provider_namespace_and_hands_it_to_a_surviving_reader() {
+        use crate::lang::testing::fixture_tag;
+        let fixture = Fixture::new();
+        let file = epsilon_source(&fixture);
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        let first = provider_start(&mut worker, "wl-first", "wl-first-start", true, None)
+            .await
+            .unwrap();
+        let second = provider_start(&mut worker, "wl-second", "wl-second-start", true, None)
+            .await
+            .unwrap();
+        assert!(
+            !worker.test_binding_owns_caches(&first),
+            "a reader retains nothing at start"
+        );
+
+        // The first reader's semantic call claims the namespace and reaches the provider.
+        assert_eq!(
+            provider_symbol_call(&mut worker, "wl-first", "wl-first-1", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+        assert!(worker.test_binding_owns_caches(&first));
+        // The second reader borrows the first reader's session instead of claiming a second one.
+        assert_eq!(
+            provider_symbol_call(&mut worker, "wl-second", "wl-second-1", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+        assert!(!worker.test_binding_owns_caches(&second));
+        let (events, namespaces) = provider_events(&[&first, &second]);
+        let (first_tag, second_tag) = (fixture_tag(&first), fixture_tag(&second));
+        assert_eq!(
+            events,
+            [format!("ensure:{first_tag}"), format!("ensure:{first_tag}")],
+            "both readers' calls were served by the first reader's session"
+        );
+        assert_eq!(namespaces.len(), 1, "{namespaces:?}");
+
+        // The owner stops: its session is released, and the survivor claims the same namespace.
+        assert!(worker.settle_revocation(&first).await.unwrap());
+        assert!(!worker.test_binding_owns_caches(&first));
+        assert_eq!(
+            provider_symbol_call(&mut worker, "wl-second", "wl-second-2", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+        assert!(worker.test_binding_owns_caches(&second));
+        let (events, namespaces) = provider_events(&[&first, &second]);
+        assert_eq!(
+            events[2..],
+            [
+                format!("release:{first_tag}"),
+                format!("ensure:{second_tag}")
+            ]
+        );
+        assert_eq!(
+            namespaces.len(),
+            1,
+            "the worktree's namespace is handed over: {namespaces:?}"
+        );
+    }
+
+    /// A writer that starts beside a reader-owned session takes the namespace over only after the
+    /// reader's session is released, the reader keeps answering through the writer, and the
+    /// reader claims the namespace back when the writer departs. A rejected second writer leaves
+    /// the first writer's ownership untouched.
+    #[tokio::test]
+    async fn writer_takes_the_namespace_from_a_reader_owner_and_returns_it_on_departure() {
+        use crate::lang::testing::fixture_tag;
+        let fixture = Fixture::new();
+        let file = epsilon_source(&fixture);
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        let reader = provider_start(&mut worker, "wa-reader", "wa-reader-start", true, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider_symbol_call(&mut worker, "wa-reader", "wa-reader-1", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+        assert!(worker.test_binding_owns_caches(&reader));
+
+        // Writer arrival: the reader's session is released before the writer retains.
+        let writer = provider_start(&mut worker, "wa-writer", "wa-writer-start", false, None)
+            .await
+            .unwrap();
+        assert!(!worker.test_binding_owns_caches(&reader));
+        assert!(worker.test_binding_owns_caches(&writer));
+        assert_eq!(
+            provider_symbol_call(&mut worker, "wa-reader", "wa-reader-2", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+        assert!(
+            !worker.test_binding_owns_caches(&reader),
+            "a reader beside a writer borrows and never owns"
+        );
+
+        // A second writer is refused and the first writer keeps the namespace and the reader.
+        let mut refused = start_job(
+            &worker,
+            "wa-third",
+            "wa-third-start",
+            serde_json::json!({"activation_id":"wa-third"}),
+        );
+        assert_eq!(
+            worker.activate(&mut refused.0).await,
+            Err(FailureCode::Conflict)
+        );
+        assert!(worker.test_binding_owns_caches(&writer));
+        assert_eq!(
+            provider_symbol_call(&mut worker, "wa-reader", "wa-reader-3", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+
+        // Writer departure: the reader's next call claims the namespace again.
+        assert!(worker.settle_revocation(&writer).await.unwrap());
+        assert!(!worker.test_binding_owns_caches(&writer));
+        assert_eq!(
+            provider_symbol_call(&mut worker, "wa-reader", "wa-reader-4", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+        assert!(worker.test_binding_owns_caches(&reader));
+
+        let (events, namespaces) = provider_events(&[&reader, &writer]);
+        let (reader_tag, writer_tag) = (fixture_tag(&reader), fixture_tag(&writer));
+        assert_eq!(
+            events,
+            [
+                format!("ensure:{reader_tag}"),
+                format!("release:{reader_tag}"),
+                format!("ensure:{writer_tag}"),
+                format!("ensure:{writer_tag}"),
+                format!("release:{writer_tag}"),
+                format!("ensure:{reader_tag}"),
+            ],
+            "reader session, handover, writer sessions, departure, reader session again"
+        );
+        assert_eq!(
+            namespaces.len(),
+            1,
+            "one namespace changes owners: {namespaces:?}"
+        );
+    }
+
+    /// A reader upgrading to a writer releases its own reader-owned session first; a writer
+    /// downgrading to a reader releases its session and lets its next call claim the namespace as
+    /// a reader again.
+    #[tokio::test]
+    async fn reader_upgrade_and_writer_downgrade_keep_one_owner_of_the_namespace() {
+        use crate::lang::testing::fixture_tag;
+        let fixture = Fixture::new();
+        let file = epsilon_source(&fixture);
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        let actor = provider_start(&mut worker, "ud-actor", "ud-start-reader", true, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider_symbol_call(&mut worker, "ud-actor", "ud-1", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+        assert!(worker.test_binding_owns_caches(&actor));
+
+        // Upgrade in place: the reader-owned session is released, the writer retains afresh.
+        provider_start(&mut worker, "ud-actor", "ud-start-writer", false, None)
+            .await
+            .unwrap();
+        assert!(worker.test_binding_owns_caches(&actor));
+        assert_eq!(
+            provider_symbol_call(&mut worker, "ud-actor", "ud-2", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+
+        // Downgrade in place: nothing is owned until the next call claims it as a reader.
+        provider_start(&mut worker, "ud-actor", "ud-start-reader-again", true, None)
+            .await
+            .unwrap();
+        assert!(!worker.test_binding_owns_caches(&actor));
+        assert_eq!(
+            provider_symbol_call(&mut worker, "ud-actor", "ud-3", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+        assert!(worker.test_binding_owns_caches(&actor));
+
+        let (events, namespaces) = provider_events(&[&actor]);
+        let tag = fixture_tag(&actor);
+        assert_eq!(
+            events,
+            [
+                format!("ensure:{tag}"),
+                format!("release:{tag}"),
+                format!("ensure:{tag}"),
+                format!("release:{tag}"),
+                format!("ensure:{tag}"),
+            ]
+        );
+        assert_eq!(namespaces.len(), 1, "{namespaces:?}");
+    }
+
+    /// A reader owner whose cleanup fails during a writer's handover leaves the writer's start
+    /// refused with no second owner: the writer holds nothing, the reader keeps the namespace and
+    /// its next call is still answered, and a retried writer start then takes the namespace over.
+    #[tokio::test]
+    async fn failed_reader_cleanup_refuses_the_writer_without_a_second_owner_and_retry_succeeds() {
+        use crate::lang::testing::{fixture_fail_next_close, fixture_tag};
+        let fixture = Fixture::new();
+        let file = epsilon_source(&fixture);
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        let reader = provider_start(&mut worker, "fc-reader", "fc-reader-start", true, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider_symbol_call(&mut worker, "fc-reader", "fc-reader-1", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+        fixture_fail_next_close(&reader);
+
+        let refused = provider_start(&mut worker, "fc-writer", "fc-writer-start-1", false, None)
+            .await
+            .err();
+        assert_eq!(refused, Some(FailureCode::Internal));
+        assert!(
+            worker.test_binding_owns_caches(&reader),
+            "the reader keeps the namespace its cleanup could not release"
+        );
+        assert_eq!(
+            provider_symbol_call(&mut worker, "fc-reader", "fc-reader-2", &file).await,
+            Err(FailureCode::ProviderLoading),
+            "the reader still answers; the refused writer holds nothing"
+        );
+
+        // Retry: the cleanup succeeds and the writer takes the namespace over.
+        let writer = provider_start(&mut worker, "fc-writer", "fc-writer-start-2", false, None)
+            .await
+            .unwrap();
+        assert!(!worker.test_binding_owns_caches(&reader));
+        assert!(worker.test_binding_owns_caches(&writer));
+        let (events, namespaces) = provider_events(&[&reader, &writer]);
+        let (reader_tag, writer_tag) = (fixture_tag(&reader), fixture_tag(&writer));
+        assert!(
+            events.windows(2).all(|pair| !(pair[0].starts_with("ensure")
+                && pair[1].starts_with("ensure")
+                && pair[0] != pair[1])),
+            "no writer session starts while the reader still owns: {events:?}"
+        );
+        assert!(
+            !events.contains(&format!("ensure:{writer_tag}")),
+            "{events:?}"
+        );
+        assert_eq!(events.first(), Some(&format!("ensure:{reader_tag}")));
+        assert_eq!(namespaces.len(), 1, "{namespaces:?}");
+    }
+
+    /// Every `provider_unavailable` a provider call raises carries a parenthesised stage: a
+    /// backend's bare refusal is named after its server and step, a namespace the session does
+    /// not own names that cause, a file type no server serves keeps the `ext=` no-server form, and
+    /// an unnamed terminal failure gets the generic provider stage.
+    #[tokio::test]
+    async fn every_provider_unavailable_names_its_stage() {
+        use crate::lang::testing::fixture_fail_next_ensure;
+        let fixture = Fixture::new();
+        let file = epsilon_source(&fixture);
+        std::fs::write(fixture.root.join("b.delta"), "two\n").unwrap();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let reader = provider_start(&mut worker, "st-reader", "st-reader-start", true, None)
+            .await
+            .unwrap();
+
+        fixture_fail_next_ensure(&reader, false);
+        let (outcome, detail) =
+            provider_symbol_call_detailed(&mut worker, "st-reader", "st-1", &file).await;
+        assert_eq!(outcome, Err(FailureCode::ProviderUnavailable));
+        assert_eq!(
+            detail.as_deref(),
+            Some(
+                "symbol:provider_unavailable (fixtureserver: session could not start; outline and read answer from source)"
+            ),
+            "a backend's bare refusal is named after its server"
+        );
+
+        fixture_fail_next_ensure(&reader, true);
+        let (outcome, detail) =
+            provider_symbol_call_detailed(&mut worker, "st-reader", "st-2", &file).await;
+        assert_eq!(outcome, Err(FailureCode::ProviderUnavailable));
+        assert_eq!(
+            detail.as_deref(),
+            Some(
+                "symbol:provider_unavailable (fixtureserver: cache namespace not owned by this session; outline and read answer from source)"
+            ),
+            "the namespace refusal names its own cause"
+        );
+
+        let (outcome, detail) = provider_symbol_call_detailed(
+            &mut worker,
+            "st-reader",
+            "st-3",
+            std::path::Path::new("b.delta"),
+        )
+        .await;
+        assert_eq!(outcome, Err(FailureCode::ProviderUnavailable));
+        assert_eq!(
+            detail.as_deref(),
+            Some("symbol:provider_unavailable ext=delta (provider: no server for this file type)"),
+            "a file type no server serves keeps the no-server form"
+        );
+
+        assert_eq!(
+            terminal_stage(AssistanceTool::Symbol, &FailureCode::ProviderUnavailable),
+            "symbol:provider_unavailable (provider: cause not reported)"
+        );
+        assert_eq!(
+            terminal_stage(AssistanceTool::Read, &FailureCode::Capacity),
+            "read:capacity"
+        );
+    }
+
+    /// A reader that upgrades in place and fails its own cleanup keeps the debt: the retry (the
+    /// grant already reads `Writer`) attempts the failed cleanup again instead of retaining the
+    /// still-owned namespace around it, and succeeds once the cleanup does.
+    #[tokio::test]
+    async fn failed_reader_upgrade_cleanup_is_attempted_again_on_retry() {
+        use crate::lang::testing::{fixture_fail_next_close, fixture_tag};
+        let fixture = Fixture::new();
+        let file = epsilon_source(&fixture);
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        let actor = provider_start(&mut worker, "fu-actor", "fu-start-reader", true, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider_symbol_call(&mut worker, "fu-actor", "fu-1", &file).await,
+            Err(FailureCode::ProviderLoading)
+        );
+
+        // First upgrade attempt: the reader-owned cleanup fails.
+        fixture_fail_next_close(&actor);
+        let first = provider_start(&mut worker, "fu-actor", "fu-start-writer-1", false, None)
+            .await
+            .err();
+        assert_eq!(first, Some(FailureCode::Internal));
+        // The retry must try the cleanup again: arm it to fail once more.
+        fixture_fail_next_close(&actor);
+        let second = provider_start(&mut worker, "fu-actor", "fu-start-writer-2", false, None)
+            .await
+            .err();
+        assert_eq!(
+            second,
+            Some(FailureCode::Internal),
+            "the retry attempted the failed cleanup again instead of skipping it"
+        );
+        // With the fault gone the upgrade completes and the actor owns the namespace as a writer.
+        provider_start(&mut worker, "fu-actor", "fu-start-writer-3", false, None)
+            .await
+            .unwrap();
+        assert!(worker.test_binding_owns_caches(&actor));
+        let (events, _) = provider_events(&[&actor]);
+        let tag = fixture_tag(&actor);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| **event == format!("close-failed:{tag}"))
+                .count(),
+            2,
+            "{events:?}"
+        );
+    }
+
+    /// A failed provider session is retired exactly when its project inputs change or Git's
+    /// `HEAD` moves: repeated calls against an unchanged invalid project keep the failed session
+    /// (no restart loop), and the first call after a changed input or a commit starts afresh.
+    #[tokio::test]
+    async fn failed_session_retires_only_on_changed_inputs_or_head_movement() {
+        use crate::lang::testing::{fixture_fail_next_ensure, fixture_tag};
+        let fixture = Fixture::new();
+        let file = epsilon_source(&fixture);
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let reader = provider_start(&mut worker, "rc-reader", "rc-start", true, None)
+            .await
+            .unwrap();
+        let tag = fixture_tag(&reader);
+        let (ensure, release) = (format!("ensure:{tag}"), format!("release:{tag}"));
+        let mut call = 0;
+        let mut next = async |worker: &mut Worker<'_>| {
+            call += 1;
+            provider_symbol_call(worker, "rc-reader", &format!("rc-{call}"), &file).await
+        };
+
+        assert_eq!(next(&mut worker).await, Err(FailureCode::ProviderLoading));
+        // The session fails a call: it is marked, but unchanged inputs never restart it.
+        fixture_fail_next_ensure(&reader, false);
+        assert_eq!(
+            next(&mut worker).await,
+            Err(FailureCode::ProviderUnavailable)
+        );
+        for _ in 0..3 {
+            assert_eq!(next(&mut worker).await, Err(FailureCode::ProviderLoading));
+        }
+        let (events, _) = provider_events(&[&reader]);
+        assert!(!events.contains(&release), "no restart loop: {events:?}");
+
+        // A changed project input retires the failed session before the next call.
+        std::fs::write(fixture.root.join("epsilon.cfg"), "fixed\n").unwrap();
+        assert_eq!(next(&mut worker).await, Err(FailureCode::ProviderLoading));
+        let (events, _) = provider_events(&[&reader]);
+        assert_eq!(
+            events.iter().filter(|event| **event == release).count(),
+            1,
+            "{events:?}"
+        );
+        assert_eq!(events.last(), Some(&ensure), "{events:?}");
+
+        // Fail again against the new basis: still no restart until something changes.
+        fixture_fail_next_ensure(&reader, false);
+        assert_eq!(
+            next(&mut worker).await,
+            Err(FailureCode::ProviderUnavailable)
+        );
+        assert_eq!(next(&mut worker).await, Err(FailureCode::ProviderLoading));
+        let (events, _) = provider_events(&[&reader]);
+        assert_eq!(
+            events.iter().filter(|event| **event == release).count(),
+            1,
+            "{events:?}"
+        );
+
+        // A moved HEAD retires it.
+        std::fs::write(fixture.root.join("moved.txt"), "commit\n").unwrap();
+        git_commit(&fixture.root, "move head");
+        assert_eq!(next(&mut worker).await, Err(FailureCode::ProviderLoading));
+        let (events, _) = provider_events(&[&reader]);
+        assert_eq!(
+            events.iter().filter(|event| **event == release).count(),
+            2,
+            "{events:?}"
+        );
+    }
+
+    /// A job's provider calls decide its session's health, not the tool's final result: a failure
+    /// noted by a provider call stays marked although the tool then answered (as the lexical
+    /// fallbacks do), and a stop or handover that releases the session drops the mark with it.
+    #[tokio::test]
+    async fn session_health_follows_provider_calls_and_dies_with_the_session() {
+        use crate::lang::testing::fixture_fail_next_ensure;
+        let fixture = Fixture::new();
+        let file = epsilon_source(&fixture);
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let reader = provider_start(&mut worker, "sh-reader", "sh-start", true, None)
+            .await
+            .unwrap();
+
+        // The provider call is fine (Loading), but a later exchange of the same job fails and the
+        // tool swallows it into a lexical answer: the job still ends with the session failed.
+        worker.providers.begin_job();
+        let invocation = production_call(&worker, "sh-reader", "sh-1");
+        let binding = invocation.binding_ref().clone();
+        let (observed, _) = worker.observe(&binding, file.clone()).await.unwrap();
+        let (_cancel_sender, cancel) = watch::channel(false);
+        let mut job = Job {
+            reference: "provider-sh-1".into(),
+            invocation,
+            tool: AssistanceTool::Symbol,
+            parameters: serde_json::json!({}),
+            target: provider_target(&worker.runtime),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            cancel,
+            stop_reply: None,
+            native_epoch: 0,
+            failure_detail: None,
+            format_note: None,
+            check_scheduled: false,
+            park_until: None,
+            stage: None,
+            session_binding: None,
+        };
+        let outcome = worker
+            .live_session_for(&mut job, &observed)
+            .await
+            .map(|_| ());
+        assert_eq!(outcome, Err(FailureCode::ProviderLoading));
+        worker.test_note_session_fault();
+        worker.settle_session_health(&job).await;
+        assert_eq!(
+            worker.test_failed_sessions(),
+            1,
+            "the swallowed failure is kept"
+        );
+
+        // A stop drops the mark with the session; nothing outlives the binding.
+        assert!(worker.settle_revocation(&reader).await.unwrap());
+        assert_eq!(
+            worker.test_failed_sessions(),
+            0,
+            "stop prunes the failed mark"
+        );
+
+        // A handover releases the reader owner's session and its mark too.
+        let reader = provider_start(&mut worker, "sh-reader-2", "sh-start-2", true, None)
+            .await
+            .unwrap();
+        fixture_fail_next_ensure(&reader, false);
+        assert_eq!(
+            provider_symbol_call(&mut worker, "sh-reader-2", "sh-2", &file).await,
+            Err(FailureCode::ProviderUnavailable)
+        );
+        assert_eq!(worker.test_failed_sessions(), 1);
+        provider_start(&mut worker, "sh-writer", "sh-start-3", false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            worker.test_failed_sessions(),
+            0,
+            "the writer's handover prunes the reader owner's mark"
+        );
+    }
+
+    /// Runs one `tool` job of `actor` against the scripted fixture session through the production
+    /// tool path, then settles the session's health as `perform` does. Returns the tool's outcome
+    /// and how many sessions are marked failed afterwards.
+    async fn scripted_tool(
+        worker: &mut Worker<'_>,
+        actor: &str,
+        call: &str,
+        tool: AssistanceTool,
+        parameters: Value,
+    ) -> (Result<(), FailureCode>, usize) {
+        let invocation = production_call(worker, actor, call);
+        let (cancel_sender, cancel) = watch::channel(false);
+        let _keep = cancel_sender;
+        let mut job = Job {
+            reference: format!("scripted-{call}"),
+            invocation,
+            tool,
+            parameters,
+            target: provider_target(&worker.runtime),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            cancel,
+            stop_reply: None,
+            native_epoch: 0,
+            failure_detail: None,
+            format_note: None,
+            check_scheduled: false,
+            park_until: None,
+            stage: None,
+            session_binding: None,
+        };
+        worker.providers.begin_job();
+        let outcome = match tool {
+            AssistanceTool::Graph => worker.graph(&mut job).await,
+            _ => worker.symbol(&mut job).await,
+        }
+        .map(|_| ());
+        assert!(job.park_until.is_none(), "{call} parked: {outcome:?}");
+        worker.settle_session_health(&job).await;
+        (outcome, worker.test_failed_sessions())
+    }
+
+    /// Every real exchange failure marks its session failed, whatever the tool then answers:
+    /// call-hierarchy requests of a symbol card and of a graph, and workspace symbols of a
+    /// bare-name search. A card whose exchanges all succeed marks nothing.
+    #[tokio::test]
+    async fn failed_exchanges_of_every_tool_mark_the_session() {
+        use crate::lang::testing::fixture_serve_session;
+        let fixture = Fixture::new();
+        epsilon_source(&fixture);
+        std::fs::write(fixture.root.join("a.epsilon"), "sym a\nend\n").unwrap();
+        git_commit(&fixture.root, "scripted source");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let reader = provider_start(&mut worker, "sx-reader", "sx-start", true, None)
+            .await
+            .unwrap();
+        fixture_serve_session(&reader, &[]);
+
+        let cases = [
+            (
+                "healthy card",
+                AssistanceTool::Symbol,
+                serde_json::json!({"symbol":"a.epsilon#a","callers":0}),
+                0,
+            ),
+            (
+                "card callers",
+                AssistanceTool::Symbol,
+                serde_json::json!({"symbol":"a.epsilon#a","callers":1}),
+                1,
+            ),
+            (
+                "card callees",
+                AssistanceTool::Symbol,
+                serde_json::json!({"symbol":"a.epsilon#a","usages":false,"callers":0,"callees":1}),
+                1,
+            ),
+            (
+                "graph callers",
+                AssistanceTool::Graph,
+                serde_json::json!({"symbol":"a.epsilon#a","direction":"callers","depth":2}),
+                1,
+            ),
+            (
+                "healthy bare name",
+                AssistanceTool::Symbol,
+                serde_json::json!({"symbol":"a","usages":false,"callers":0}),
+                0,
+            ),
+        ];
+        run_scripted_cases(&mut worker, &reader, "sx-reader", "sx", cases).await;
+
+        // Failing workspace-symbol, outline and reference exchanges mark the session as well,
+        // each isolated from the others (the rest of the scripted server answers).
+        fixture_serve_session(&reader, &["workspaceSymbol"]);
+        run_scripted_cases(
+            &mut worker,
+            &reader,
+            "sx-reader",
+            "sw",
+            [(
+                "bare-name workspace symbols",
+                AssistanceTool::Symbol,
+                serde_json::json!({"symbol":"a","usages":false,"callers":0}),
+                1,
+            )],
+        )
+        .await;
+        fixture_serve_session(&reader, &["references"]);
+        run_scripted_cases(
+            &mut worker,
+            &reader,
+            "sx-reader",
+            "sy",
+            [(
+                "card references",
+                AssistanceTool::Symbol,
+                serde_json::json!({"symbol":"a.epsilon#a","callers":0}),
+                1,
+            )],
+        )
+        .await;
+        // The outline exchange fails too, so the card answers from the source outline and the
+        // failing references exchange takes the degraded path.
+        fixture_serve_session(&reader, &["documentSymbol", "references"]);
+        run_scripted_cases(
+            &mut worker,
+            &reader,
+            "sx-reader",
+            "sv",
+            [(
+                "card references after an outline fallback",
+                AssistanceTool::Symbol,
+                serde_json::json!({"symbol":"a.epsilon#a","callers":0}),
+                1,
+            )],
+        )
+        .await;
+        fixture_serve_session(&reader, &["documentSymbol"]);
+        run_scripted_cases(
+            &mut worker,
+            &reader,
+            "sx-reader",
+            "sz",
+            [
+                (
+                    "card documentSymbols",
+                    AssistanceTool::Symbol,
+                    serde_json::json!({"symbol":"a.epsilon#a","callers":0}),
+                    1,
+                ),
+                (
+                    "bare-name documentSymbols",
+                    AssistanceTool::Symbol,
+                    serde_json::json!({"symbol":"a","usages":false,"callers":0}),
+                    1,
+                ),
+            ],
+        )
+        .await;
+    }
+
+    /// Runs each `(label, tool, parameters, expected failed marks)` case on a freshly released
+    /// session of `reader` and asserts the failed-session count the settled job leaves.
+    async fn run_scripted_cases<const N: usize>(
+        worker: &mut Worker<'_>,
+        reader: &BindingRef,
+        actor: &str,
+        prefix: &str,
+        cases: [(&str, AssistanceTool, Value, usize); N],
+    ) {
+        for (index, (label, tool, parameters, marks)) in cases.into_iter().enumerate() {
+            // A released session starts clean, with its failed mark dropped.
+            worker.release_live(reader).await;
+            assert_eq!(worker.test_failed_sessions(), 0, "{label}: clean start");
+            let (outcome, failed) = scripted_tool(
+                worker,
+                actor,
+                &format!("{prefix}-{index}"),
+                tool,
+                parameters,
+            )
+            .await;
+            assert_eq!(failed, marks, "{label}: {outcome:?}");
+        }
+    }
+
+    /// A failed session's mark dies with its owner: a call that failed on the provider marks the
+    /// session, and a stop, a writer's handover and a downgrade each leave no mark behind.
+    #[tokio::test]
+    async fn failed_marks_are_pruned_by_stop_handover_and_downgrade() {
+        use crate::lang::testing::fixture_fail_next_ensure;
+        let fixture = Fixture::new();
+        let file = epsilon_source(&fixture);
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        // Stop.
+        let stopped = provider_start(&mut worker, "fp-stopped", "fp-start-1", true, None)
+            .await
+            .unwrap();
+        fixture_fail_next_ensure(&stopped, false);
+        assert_eq!(
+            provider_symbol_call(&mut worker, "fp-stopped", "fp-1", &file).await,
+            Err(FailureCode::ProviderUnavailable)
+        );
+        assert_eq!(worker.test_failed_sessions(), 1);
+        assert!(worker.settle_revocation(&stopped).await.unwrap());
+        assert_eq!(worker.test_failed_sessions(), 0, "stop prunes the mark");
+
+        // Writer handover from a reader owner.
+        let reader = provider_start(&mut worker, "fp-reader", "fp-start-2", true, None)
+            .await
+            .unwrap();
+        fixture_fail_next_ensure(&reader, false);
+        assert_eq!(
+            provider_symbol_call(&mut worker, "fp-reader", "fp-2", &file).await,
+            Err(FailureCode::ProviderUnavailable)
+        );
+        assert_eq!(worker.test_failed_sessions(), 1);
+        let writer = provider_start(&mut worker, "fp-writer", "fp-start-3", false, None)
+            .await
+            .unwrap();
+        assert_eq!(worker.test_failed_sessions(), 0, "handover prunes the mark");
+
+        // Downgrade of the writer.
+        fixture_fail_next_ensure(&writer, false);
+        assert_eq!(
+            provider_symbol_call(&mut worker, "fp-writer", "fp-3", &file).await,
+            Err(FailureCode::ProviderUnavailable)
+        );
+        assert_eq!(worker.test_failed_sessions(), 1);
+        provider_start(&mut worker, "fp-writer", "fp-start-4", true, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            worker.test_failed_sessions(),
+            0,
+            "downgrade prunes the mark"
+        );
+    }
+
+    /// Epsilon opts into the source-outline fallback, so its source outline and its normalized
+    /// server outline must agree for the text the scripted session answers for.
+    #[test]
+    fn epsilon_source_and_server_outlines_agree() {
+        crate::lang::testing::install();
+        let file = std::path::Path::new("a.epsilon");
+        let source = "sym a\nend\n";
+        let support = crate::lang::testing::EPSILON.support();
+        let from_source = support
+            .outline_from_source(file, source)
+            .expect("source outline");
+        let from_server = support.normalize(
+            file,
+            source,
+            crate::lang::testing::fixture_document_symbols(),
+        );
+        assert_eq!(from_source, from_server);
+    }
+
+    /// Readers of sibling worktrees own independent namespaces: a writer arriving on one worktree
+    /// releases only that worktree's reader owner.
+    #[tokio::test]
+    async fn sibling_worktrees_keep_independent_reader_owned_namespaces() {
+        let fixture = Fixture::new();
+        let sibling = fixture.base.join("sibling-root");
+        std::fs::create_dir_all(&sibling).unwrap();
+        let file = epsilon_source(&fixture);
+        std::fs::write(sibling.join("b.epsilon"), "two\n").unwrap();
+        let sibling_file = std::path::PathBuf::from("b.epsilon");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+
+        let here = provider_start(&mut worker, "sw-here", "sw-here-start", true, None)
+            .await
+            .unwrap();
+        let there = provider_start(
+            &mut worker,
+            "sw-there",
+            "sw-there-start",
+            true,
+            Some(&sibling),
+        )
+        .await
+        .unwrap();
+        for (actor, call, path) in [
+            ("sw-here", "sw-here-1", &file),
+            ("sw-there", "sw-there-1", &sibling_file),
+        ] {
+            assert_eq!(
+                provider_symbol_call(&mut worker, actor, call, path).await,
+                Err(FailureCode::ProviderLoading),
+                "{actor}"
+            );
+        }
+        assert!(worker.test_binding_owns_caches(&here));
+        assert!(worker.test_binding_owns_caches(&there));
+        let (_, here_namespaces) = provider_events(&[&here]);
+        let (_, there_namespaces) = provider_events(&[&there]);
+        assert_ne!(here_namespaces, there_namespaces);
+
+        provider_start(&mut worker, "sw-writer", "sw-writer-start", false, None)
+            .await
+            .unwrap();
+        assert!(
+            !worker.test_binding_owns_caches(&here),
+            "released by the writer"
+        );
+        assert!(
+            worker.test_binding_owns_caches(&there),
+            "the sibling worktree's reader owner is untouched"
+        );
     }
 
     /// A second stop after authority release is a benign completion, not a workspace refusal.
@@ -10221,7 +11270,11 @@ mod stop_retry_tests {
             )
         };
         let limit = worker.admission().inspect().per_owner_running_limit;
-        assert_eq!(limit, 5, "one slot per server language plus one");
+        assert_eq!(
+            limit,
+            crate::lang::registered().len().max(1) + 1,
+            "one slot per registered language plus one"
+        );
         for index in 1..limit {
             let granted = server(&mut worker.admission(), format!("server-{index}"));
             assert!(matches!(granted, ProviderLeaseAdmission::Granted(_)));
@@ -10962,7 +12015,10 @@ mod stop_retry_tests {
             };
             let error = worker.symbol(&mut job).await.unwrap_err();
             assert_eq!(error, FailureCode::ProviderUnavailable);
-            assert_eq!(job.failure_detail.as_deref(), Some("symbol:anchor_missing"));
+            assert_eq!(
+                job.failure_detail.as_deref(),
+                Some("symbol:provider_unavailable (symbols: no language file found to search)")
+            );
         }
 
         // A context on a source over the read ceiling derives the default `<tool>:<reason>` stage.

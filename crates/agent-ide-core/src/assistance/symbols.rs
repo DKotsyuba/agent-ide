@@ -913,10 +913,13 @@ impl Worker<'_> {
                         .await
                     {
                         Ok(found) => references = Some(found),
+                        // This branch runs only after the outline's documentSymbols exchange
+                        // failed, which already marked the session failed.
                         Err(_) if exchange => {
                             degraded = Some("references request failed".to_owned());
                         }
                         Err(_) => {
+                            self.providers.note_session_fault();
                             // The ready session failed this exchange; the stage names the request
                             // so the refusal's reply can say what still answers and how to
                             // recover.
@@ -983,19 +986,24 @@ impl Worker<'_> {
                         server.name()
                     ));
                 } else {
+                    let mut faulted = false;
                     let calls = match self.live_session_for(job, &observed).await {
                         Ok(live) => match live
                             .session
                             .prepare_call_hierarchy(&observed, &bytes, byte_offset)
                             .await
                         {
-                            Err(_) => Err("prepare call hierarchy request failed"),
+                            Err(_) => {
+                                faulted = true;
+                                Err("prepare call hierarchy request failed")
+                            }
                             Ok(items) => match items.into_iter().next() {
-                                Some(item) => live
-                                    .session
-                                    .incoming_calls_for(item)
-                                    .await
-                                    .map_err(|_| "incoming calls request failed"),
+                                Some(item) => {
+                                    live.session.incoming_calls_for(item).await.map_err(|_| {
+                                        faulted = true;
+                                        "incoming calls request failed"
+                                    })
+                                }
                                 None => Ok(Vec::new()),
                             },
                         },
@@ -1007,6 +1015,9 @@ impl Worker<'_> {
                         }
                         Err(other) => return Err(other),
                     };
+                    if faulted {
+                        self.providers.note_session_fault();
+                    }
                     match calls {
                         Ok(calls) => {
                             for call in calls {
@@ -1057,6 +1068,7 @@ impl Worker<'_> {
                         }
                     }
                     Err(_) => {
+                        self.providers.note_session_fault();
                         card.callees_note =
                             Some("unavailable (call hierarchy request failed)".to_owned());
                     }
@@ -1314,6 +1326,7 @@ impl Worker<'_> {
             let source = observed_text(&source_observed, &source_bytes)?;
             let offset = name_offset(source, &symbol)?;
             let live = self.live_session_for(job, &source_observed).await?;
+            let mut faulted = false;
             let related_items = match edge_direction {
                 render::GraphDirection::Callers => live
                     .session
@@ -1326,7 +1339,13 @@ impl Worker<'_> {
                     .await
                     .map(|calls| calls.into_iter().map(|call| call.to).collect::<Vec<_>>()),
             }
-            .unwrap_or_default();
+            .unwrap_or_else(|_| {
+                faulted = true;
+                Vec::new()
+            });
+            if faulted {
+                self.providers.note_session_fault();
+            }
             for item in related_items {
                 let (node, item_file, item_symbol) =
                     match self.graph_node(job, &worktree_root, item.clone()).await {
@@ -1595,6 +1614,7 @@ impl Worker<'_> {
         let symbols = match live.session.document_symbols(observed, bytes).await {
             Ok(symbols) => symbols,
             Err(error) => {
+                self.providers.note_session_fault();
                 // The session passed readiness but this exchange failed (a server error reply
                 // while it reloads its workspace, or a dying transport): a language that
                 // outlines from its text answers at once, marked lexical with the cause in its
@@ -1664,7 +1684,10 @@ impl Worker<'_> {
         let root = authority.worktree().worktree_path().to_path_buf();
         let files = collect_language_files(&root);
         if files.is_empty() {
-            job.failure_detail = Some("symbol:anchor_missing".to_owned());
+            job.set_stage_failure(
+                &FailureCode::ProviderUnavailable,
+                "symbols: no language file found to search",
+            );
             return Err(FailureCode::ProviderUnavailable);
         }
         // (relative file, rendered candidate, is impl) in language and provider order.
@@ -1714,7 +1737,10 @@ impl Worker<'_> {
                             })
                             .collect()
                     }
-                    Err(_) => Vec::new(),
+                    Err(_) => {
+                        self.providers.note_session_fault();
+                        Vec::new()
+                    }
                 };
             if !workspace_hits.is_empty() {
                 matches.extend(workspace_hits.into_iter().map(|(path, container)| {
@@ -1756,7 +1782,11 @@ impl Worker<'_> {
                 let Ok(live) = self.live_session_for(job, &observed).await else {
                     continue;
                 };
-                if let Ok(symbols) = live.session.document_symbols(&observed, bytes).await {
+                let outcome = live.session.document_symbols(&observed, bytes).await;
+                if outcome.is_err() {
+                    self.providers.note_session_fault();
+                }
+                if let Ok(symbols) = outcome {
                     answered = true;
                     let source = String::from_utf8_lossy(bytes);
                     let outline = support.normalize(file, &source, symbols);
@@ -1771,7 +1801,10 @@ impl Worker<'_> {
         // Every language was searched: a name several languages share is ambiguous.
         deduplicate_symbol_candidates(&mut matches);
         if !answered {
-            job.failure_detail = Some("symbol:workspace_symbols".to_owned());
+            job.set_stage_failure(
+                &FailureCode::ProviderUnavailable,
+                "symbols: no language server answered the workspace search",
+            );
             return Err(FailureCode::ProviderUnavailable);
         }
         match matches.len() {

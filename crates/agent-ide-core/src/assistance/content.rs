@@ -293,12 +293,17 @@ fn environment_refusal(detail: &str) -> Option<(String, &str)> {
 }
 
 /// Extracts a producer's trailing detail payload without depending on prefix byte lengths.
+///
+/// For the no-server shape `<tool>:provider_unavailable ext=<ext>[ (provider: …)]` the payload is
+/// the bare extension: it ends at the first space, so the optional trailing parenthesised stage
+/// the journal carries never reaches the rendered sentence.
 fn resolution_message(detail: &str) -> &str {
     let Some((_, stage_detail)) = detail.split_once(':') else {
         return detail;
     };
     if let Some(extension) = stage_detail.strip_prefix("provider_unavailable ext=") {
-        return extension;
+        // The extension ends at the space before the trailing parenthesised stage, when present.
+        return extension.split(' ').next().unwrap_or(extension);
     }
     stage_detail
         .split_once(':')
@@ -1410,6 +1415,11 @@ mod tests {
                 FailureCode::ProviderUnavailable,
                 "outline:provider_unavailable ext=md",
                 "error: provider_unavailable (outline:no_server); no language server is configured for .md files in this project. Continue with native tools",
+            ),
+            (
+                FailureCode::ProviderUnavailable,
+                "symbol:provider_unavailable ext=md (provider: no server for this file type)",
+                "error: provider_unavailable (symbol:no_server); no language server is configured for .md files in this project. Continue with native tools",
             ),
             (
                 FailureCode::ProviderUnavailable,

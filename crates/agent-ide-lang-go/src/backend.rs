@@ -81,6 +81,11 @@ impl LanguageServer for GoplsServer {
         &["go"]
     }
 
+    /// The Go module and workspace files the server loads.
+    fn project_inputs(&self) -> &'static [&'static str] {
+        &["go.mod", "go.sum", "go.work"]
+    }
+
     /// Starts with no listeners and no views.
     fn new_backend(&self) -> Box<dyn ServerBackend> {
         Box::new(GoplsBackend::default())

@@ -5,7 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{CacheRequest, MAX_CACHE_NAMESPACES, retain_cache_plan};
+use super::{CacheRequest, MAX_CACHE_NAMESPACES, project_inputs_stamp, retain_cache_plan};
 use crate::app::cache::{CacheNamespaceId, CacheRoot};
 use crate::assistance::reply::FailureCode;
 use crate::intelligence::freshness::{CacheIdentity, CacheLifecycle};
@@ -298,4 +298,161 @@ fn a_failed_later_provider_leaves_no_unaccounted_namespace_or_directory_growth()
         "rollback must never remove pre-existing retained contents"
     );
     fs::remove_dir_all(root_path).unwrap();
+}
+
+/// The project input stamp follows exactly the named files inside its search ceiling: an edit of a
+/// named file changes it, an unrelated file or a skipped tree does not, a manifest deeper than the
+/// ceiling is not seen, and a directory far larger than the entry budget is still stamped.
+#[test]
+fn project_inputs_stamp_follows_named_files_within_its_ceiling() {
+    let root = temporary();
+    fs::create_dir_all(root.join("member/src")).unwrap();
+    fs::create_dir_all(root.join("target/debug")).unwrap();
+    fs::create_dir_all(root.join("a/b/c/d/e")).unwrap();
+    fs::write(root.join("Cargo.toml"), "one").unwrap();
+    fs::write(root.join("member/Cargo.toml"), "one").unwrap();
+    fs::write(root.join("target/debug/Cargo.toml"), "one").unwrap();
+    fs::write(root.join("a/b/c/d/e/Cargo.toml"), "one").unwrap();
+    let stamp = || project_inputs_stamp(&root, &["Cargo.toml"]);
+    let before = stamp();
+    assert_eq!(before, stamp(), "the stamp is deterministic");
+    fs::write(root.join("member/src/lib.rs"), "unrelated").unwrap();
+    assert_eq!(before, stamp(), "an unnamed file is not an input");
+    fs::write(
+        root.join("target/debug/Cargo.toml"),
+        "changed in a skipped tree",
+    )
+    .unwrap();
+    assert_eq!(before, stamp(), "a skipped tree is not searched");
+    fs::write(
+        root.join("a/b/c/d/e/Cargo.toml"),
+        "changed past the depth ceiling",
+    )
+    .unwrap();
+    assert_eq!(
+        before,
+        stamp(),
+        "a manifest past the depth ceiling is not seen"
+    );
+    fs::write(root.join("member/Cargo.toml"), "changed member manifest").unwrap();
+    assert_ne!(
+        before,
+        stamp(),
+        "a named file inside the ceiling is an input"
+    );
+    // A same-length edit that restores the modification time still changes the stamp.
+    let manifest = root.join("Cargo.toml");
+    let modified = fs::metadata(&manifest).unwrap().modified().unwrap();
+    let before_fix = stamp();
+    fs::write(&manifest, "two").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&manifest)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    assert_eq!(fs::read(&manifest).unwrap().len(), 3);
+    assert_ne!(
+        before_fix,
+        stamp(),
+        "a small file is digested whole, whatever its timestamp"
+    );
+    // A file past the prefix: an ordinary tail edit moves the modification time and is seen; a
+    // same-length tail edit that also restores it is the stated ceiling and is not.
+    let lock = root.join("member/Cargo.lock");
+    fs::write(
+        &lock,
+        vec![b'a'; super::INPUT_SCAN_FILE_BYTES as usize + 64],
+    )
+    .unwrap();
+    let stamp = || project_inputs_stamp(&root, &["Cargo.toml", "Cargo.lock"]);
+    let before_tail = stamp();
+    let mut edited = vec![b'a'; super::INPUT_SCAN_FILE_BYTES as usize + 64];
+    *edited.last_mut().unwrap() = b'b';
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::write(&lock, &edited).unwrap();
+    assert_ne!(
+        before_tail,
+        stamp(),
+        "an ordinary tail edit moves the mtime"
+    );
+    let after_tail = stamp();
+    let modified = fs::metadata(&lock).unwrap().modified().unwrap();
+    *edited.last_mut().unwrap() = b'c';
+    fs::write(&lock, &edited).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&lock)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    assert_eq!(
+        after_tail,
+        stamp(),
+        "a same-length tail edit past the prefix with a restored mtime is the stated ceiling"
+    );
+    assert_eq!(
+        project_inputs_stamp(&root, &[]),
+        [0; 32],
+        "no named inputs stamp to a constant"
+    );
+    // A directory far larger than the entry budget is read only up to the budget.
+    let many = root.join("many");
+    fs::create_dir_all(&many).unwrap();
+    for index in 0..(super::INPUT_SCAN_ENTRIES + 500) {
+        fs::write(many.join(format!("f{index}")), "").unwrap();
+    }
+    let _ = stamp();
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Session health is tracked per owner and server slot: a failure of one session never marks or
+/// clears another's, whatever order a job visits them in, and a failure is sticky for its session.
+#[test]
+fn session_health_is_kept_per_owner_and_slot() {
+    use super::{Providers, SessionHealth};
+    use crate::assistance::host_binding::BindingRef;
+    let (a, b) = (
+        (BindingRef::fixture("health-a", "health-channel", 1), 0),
+        (BindingRef::fixture("health-b", "health-channel", 1), 1),
+    );
+    let mut providers = Providers::new();
+    providers.begin_job();
+    providers.current = Some(a.clone());
+    providers.note_session_fault();
+    providers.current = Some(b.clone());
+    providers.note_session_healthy();
+    providers.current = Some(a.clone());
+    providers.note_session_healthy();
+    assert_eq!(providers.health.get(&a), Some(&SessionHealth::Failed));
+    assert_eq!(providers.health.get(&b), Some(&SessionHealth::Healthy));
+    providers.begin_job();
+    assert!(providers.health.is_empty());
+}
+
+/// A named pipe, or a symlink to one, carrying an input's name never blocks the stamp: only
+/// regular files are opened, so the scan returns at once (a blocking open would hang the worker).
+#[test]
+fn project_inputs_stamp_never_opens_special_files() {
+    let root = temporary();
+    fs::create_dir_all(&root).unwrap();
+    let pipe = root.join("Cargo.toml");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&pipe)
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo");
+    std::os::unix::fs::symlink(&pipe, root.join("pyproject.toml")).unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let scanned = root.clone();
+    std::thread::spawn(move || {
+        let _ = sender.send(project_inputs_stamp(
+            &scanned,
+            &["Cargo.toml", "pyproject.toml"],
+        ));
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the stamp must not block on a named pipe");
+    fs::remove_dir_all(root).unwrap();
 }

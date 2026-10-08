@@ -8347,6 +8347,82 @@ async fn configured_product_graph_traverses_live_calls_with_bounds() {
     daemon.wait().await.unwrap();
 }
 
+/// A read-only activation with no writer beside it owns the provider namespace, so its
+/// `ide.symbol` and `ide.graph` answer from the real rust-analyzer (QW-1: 0.10.5 refused them with
+/// a stage-less `provider_unavailable` because only a writer ever retained the namespace). A writer
+/// that starts later takes the namespace over, the reader keeps answering through the writer's
+/// session, and the reader claims the namespace back once the writer stops.
+#[tokio::test]
+async fn configured_product_writerless_reader_gets_symbol_and_graph_from_the_provider() {
+    let fixture = graph_test_fixture();
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    let mut writer_target = config["targets"][0].clone();
+    writer_target["attachment"] = json!("private-writer-channel");
+    config["targets"]
+        .as_array_mut()
+        .unwrap()
+        .push(writer_target);
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut reader = ProductActor::new(&fixture, "writerless-reader").await;
+    let mut writer = ProductActor::new_at(
+        &fixture,
+        "late-writer",
+        "private-writer-channel",
+        "agent_id",
+        fixture.state(),
+    )
+    .await;
+    let start = reader
+        .call(&fixture, "ide.start", json!({"read_only":true}))
+        .await;
+    assert_eq!(reader.settle(&fixture, start).await["kind"], "activation");
+
+    // Both semantic tools answer for a reader that has no writer beside it.
+    let semantic = async |reader: &mut ProductActor, stage: &str| {
+        let graph = reader
+            .call(
+                &fixture,
+                "ide.graph",
+                json!({"symbol":"src/lib.rs#c", "direction":"callers", "depth":3}),
+            )
+            .await;
+        let graph = reader.settle(&fixture, graph).await;
+        assert_eq!(graph["kind"], "graph", "{stage}: {graph}");
+        let text = graph["text"].as_str().unwrap();
+        assert!(text.contains("← src/lib.rs#b"), "{stage}: {text}");
+        let card = reader
+            .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#a"}))
+            .await;
+        let card = reader.settle(&fixture, card).await;
+        assert_eq!(card["kind"], "symbol", "{stage}: {card}");
+        assert!(
+            card["text"].as_str().unwrap().contains("usages:"),
+            "{stage}: {card}"
+        );
+    };
+    semantic(&mut reader, "reader alone").await;
+
+    // A writer arriving takes the namespace over; the reader borrows the writer's session.
+    let start = writer.call(&fixture, "ide.start", json!({})).await;
+    let start = writer.settle(&fixture, start).await;
+    assert_eq!(start["kind"], "activation", "{start}");
+    semantic(&mut reader, "writer arrived").await;
+    semantic(&mut writer, "writer itself").await;
+
+    // The writer leaving hands the namespace back to the reader's next semantic call.
+    let stop = writer.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(writer.settle(&fixture, stop).await["kind"], "stop");
+    semantic(&mut reader, "writer departed").await;
+
+    let stop = reader.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(reader.settle(&fixture, stop).await["kind"], "stop");
+    tokio::join!(reader.mcp.close(), writer.mcp.close());
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A source file whose inline `#[cfg(test)] mod tests` references `a` both from a helper and from
 /// a test: the card's src/tests split must classify those rows as tests, as callers already do.
 #[tokio::test]

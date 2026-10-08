@@ -894,8 +894,9 @@ pub fn kind_of(kind: lsp::SymbolKind) -> SymbolKind {
 /// They carry identity, ordering, extensions and a root-marker presence rule but no real
 /// language behaviour, so core tests never depend on a bundled language. `ALPHA`, `BETA` and
 /// `GAMMA` have project checks (present when `<id>.toml` exists at the worktree root) and tiny
-/// token-based name-fact providers; `GAMMA` also outlines from source (it has no server, like
-/// every test language); `DELTA` has neither. Their identifiers sort in that order.
+/// token-based name-fact providers; `GAMMA` also outlines from source; `DELTA` has neither. None
+/// of those four has a server. `EPSILON` alone has one, the recording [`FixtureServer`], for tests
+/// of provider ownership. Their identifiers sort alpha, beta, delta, epsilon, gamma.
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
@@ -909,7 +910,7 @@ pub(crate) mod testing {
         fn language(&self) -> Language {
             Language::by_id(self.0)
                 .or_else(|| {
-                    [ALPHA, BETA, GAMMA, DELTA]
+                    [ALPHA, BETA, GAMMA, DELTA, EPSILON]
                         .into_iter()
                         .find(|l| l.name() == self.0)
                 })
@@ -1027,18 +1028,45 @@ pub(crate) mod testing {
             })
         }
 
-        /// An outline with no symbols.
+        /// An outline with no symbols, except for epsilon: it keeps each top-level server symbol
+        /// the way epsilon's source outline reads a `sym <name>` … `end` block (kind `Other`,
+        /// signature `sym <name>`, the lines of its range), as the opt-in contract of
+        /// [`LanguageSupport::outline_while_loading`] requires.
         fn normalize(
             &self,
             file: &Path,
             source: &str,
-            _symbols: Vec<lsp::DocumentSymbol>,
+            symbols: Vec<lsp::DocumentSymbol>,
         ) -> Outline {
+            let symbols = if self.0 == "epsilon" {
+                symbols
+                    .into_iter()
+                    .map(|symbol| {
+                        let range =
+                            LineRange::new(symbol.range.start.line + 1, symbol.range.end.line + 1);
+                        Symbol {
+                            path: SymbolPath::new(
+                                Some(file.to_path_buf()),
+                                vec![symbol.name.clone()],
+                            ),
+                            kind: SymbolKind::Other,
+                            signature: format!("sym {}", symbol.name),
+                            name: symbol.name,
+                            range,
+                            body: range,
+                            doc: None,
+                            children: Vec::new(),
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             Outline {
                 file: file.to_path_buf(),
                 language: self.language(),
                 line_count: line_count(source),
-                symbols: Vec::new(),
+                symbols,
             }
         }
         /// No insertion points.
@@ -1080,10 +1108,14 @@ pub(crate) mod testing {
                 .strip_prefix("#!doc ")
                 .map(str::to_owned)
         }
-        /// Gamma alone outlines from its text: `sym <name>` opens a symbol, `end` closes the
+        /// Epsilon, whose server can fail, falls back to its source outline like a real language.
+        fn outline_while_loading(&self) -> bool {
+            self.0 == "epsilon"
+        }
+        /// Gamma and epsilon outline from their text: `sym <name>` opens a symbol, `end` closes the
         /// innermost open one.
         fn outline_from_source(&self, file: &Path, source: &str) -> Option<Outline> {
-            if self.0 != "gamma" {
+            if self.0 != "gamma" && self.0 != "epsilon" {
                 return None;
             }
             let mut open: Vec<Symbol> = Vec::new();
@@ -1315,6 +1347,436 @@ pub(crate) mod testing {
         names: None,
     };
 
+    /// Descriptor of the test language that alone has a language server: the fixture server below.
+    static EPSILON_DESCRIPTOR: LanguageDescriptor = LanguageDescriptor {
+        id: "epsilon",
+        display_name: "Epsilon",
+        extensions: &["epsilon"],
+        card_manifest: None,
+        home_tool_dirs: &[],
+        support: &Support("epsilon"),
+        checks: None,
+        server: Some(&FixtureServer),
+        names: None,
+    };
+
+    /// The events every fixture backend recorded, as `<event>:<binding tag>[:<detail>]` lines in
+    /// order. Tests filter by the binding tags of their own actors, so concurrent tests that use
+    /// distinct actor names never see each other's lines.
+    static FIXTURE_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Short stable tag of one binding in [`FIXTURE_LOG`] lines: its fingerprint's first four
+    /// bytes in hex.
+    pub(crate) fn fixture_tag(binding: &crate::assistance::host_binding::BindingRef) -> String {
+        binding.fingerprint()[..4]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// Returns the [`FIXTURE_LOG`] lines whose binding tag is one of `bindings`, in order.
+    pub(crate) fn fixture_events(
+        bindings: &[&crate::assistance::host_binding::BindingRef],
+    ) -> Vec<String> {
+        let tags: Vec<String> = bindings
+            .iter()
+            .map(|binding| fixture_tag(binding))
+            .collect();
+        FIXTURE_LOG
+            .lock()
+            .expect("fixture log")
+            .iter()
+            .filter(|line| tags.iter().any(|tag| line.split(':').nth(1) == Some(tag)))
+            .cloned()
+            .collect()
+    }
+
+    /// Binding tags whose next `close_binding` on the fixture server fails once, so a test can
+    /// make a reader owner's cleanup fail during a writer's handover.
+    static FIXTURE_CLOSE_FAILURES: std::sync::Mutex<Vec<String>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// Makes the next fixture-server `close_binding` of `binding` fail with `Internal`, once.
+    pub(crate) fn fixture_fail_next_close(binding: &crate::assistance::host_binding::BindingRef) {
+        FIXTURE_CLOSE_FAILURES
+            .lock()
+            .expect("fixture close failures")
+            .push(fixture_tag(binding));
+    }
+
+    /// Armed one-shot `ensure_live` faults of the fixture server: the binding tag and whether the
+    /// fault is a namespace lookup as a binding that owns none (`true`) or a bare refusal (`false`).
+    static FIXTURE_ENSURE_FAULTS: std::sync::Mutex<Vec<(String, bool)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// Makes the next fixture-server `ensure_live` of `binding` fail with a bare
+    /// `ProviderUnavailable` the way a real backend does, once: directly when `unowned` is false,
+    /// or by resolving the cache namespace of a binding that owns none when it is true.
+    pub(crate) fn fixture_fail_next_ensure(
+        binding: &crate::assistance::host_binding::BindingRef,
+        unowned: bool,
+    ) {
+        FIXTURE_ENSURE_FAULTS
+            .lock()
+            .expect("fixture ensure faults")
+            .push((fixture_tag(binding), unowned));
+    }
+
+    /// Tags of the bindings whose fixture `ensure_live` opens a scripted language-server session
+    /// (and so answers `Ok` instead of `ProviderLoading`).
+    static FIXTURE_SESSIONS: std::sync::Mutex<Vec<(String, &'static [&'static str])>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// Makes the fixture server open a scripted session for `binding` from now on: it answers
+    /// document symbols (one function, `a`), an empty reference list and an empty workspace-symbol
+    /// list, and fails every call-hierarchy request with an error reply, so tests can drive the
+    /// worker's real exchange-failure paths. `failing` additionally names requests
+    /// (`"documentSymbol"`, `"references"`, `"workspaceSymbol"`) that fail with an error reply.
+    ///
+    /// The latest call for a binding wins, but only for the next session opened for it: a session
+    /// that already exists keeps its script until it is released.
+    pub(crate) fn fixture_serve_session(
+        binding: &crate::assistance::host_binding::BindingRef,
+        failing: &'static [&'static str],
+    ) {
+        FIXTURE_SESSIONS
+            .lock()
+            .expect("fixture sessions")
+            .push((fixture_tag(binding), failing));
+    }
+
+    /// Profile of the scripted fixture session: accepts any server, opens `.epsilon` as `epsilon`.
+    #[derive(Debug)]
+    struct FixtureProfile;
+
+    impl crate::intelligence::session::SessionProfile for FixtureProfile {
+        /// An empty configuration object.
+        fn workspace_configuration(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        /// Any server identity is accepted.
+        fn accepts_server(&self, _info: Option<&async_lsp::lsp_types::ServerInfo>) -> bool {
+            true
+        }
+        /// Every file opens as `epsilon`.
+        fn language_id(&self, _path: &std::path::Path) -> &'static str {
+            "epsilon"
+        }
+    }
+
+    /// The document symbols the scripted session answers for the fixture source `sym a\nend\n`:
+    /// one symbol `a` over both lines, exactly what epsilon's source outline reads from that text.
+    #[allow(deprecated)]
+    pub(crate) fn fixture_document_symbols() -> Vec<async_lsp::lsp_types::DocumentSymbol> {
+        use async_lsp::lsp_types as lsp;
+        vec![lsp::DocumentSymbol {
+            name: "a".into(),
+            detail: None,
+            kind: lsp::SymbolKind::FUNCTION,
+            tags: None,
+            deprecated: None,
+            range: lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(1, 3)),
+            selection_range: lsp::Range::new(lsp::Position::new(0, 4), lsp::Position::new(0, 5)),
+            children: None,
+        }]
+    }
+
+    /// Opens a live session against a scripted in-process language server (see
+    /// [`fixture_serve_session`]).
+    ///
+    /// `source` supplies the worktree and authority epoch the session is opened for; `failing`
+    /// names the extra requests the script answers with an error reply. The in-process server runs
+    /// as a spawned task that ends with the connection, owned by the returned session. Errors are
+    /// those of opening the client and its initialize handshake.
+    async fn fixture_open_session(
+        source: &crate::workspace::observation::SourceObservation,
+        failing: &'static [&'static str],
+    ) -> std::io::Result<crate::intelligence::session::LiveSession> {
+        use async_lsp::{MainLoop, lsp_types as lsp, lsp_types::request, router::Router};
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+        let (client, peer) = tokio::io::duplex(65536);
+        let (input, output) = tokio::io::split(client);
+        let (peer_input, peer_output) = tokio::io::split(peer);
+        let (server, _) = MainLoop::new_server(|client| {
+            let mut router = Router::new(client);
+            router.request::<request::Initialize, _>(|_, _| async {
+                Ok(lsp::InitializeResult {
+                    capabilities: lsp::ServerCapabilities {
+                        text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
+                            lsp::TextDocumentSyncKind::FULL,
+                        )),
+                        document_symbol_provider: Some(lsp::OneOf::Left(true)),
+                        references_provider: Some(lsp::OneOf::Left(true)),
+                        hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
+                        call_hierarchy_provider: Some(lsp::CallHierarchyServerCapability::Simple(
+                            true,
+                        )),
+                        workspace_symbol_provider: Some(lsp::OneOf::Left(true)),
+                        ..Default::default()
+                    },
+                    server_info: None,
+                })
+            });
+            router.request::<request::DocumentSymbolRequest, _>(move |_, _| async move {
+                if failing.contains(&"documentSymbol") {
+                    return Err(async_lsp::ResponseError::new(
+                        async_lsp::ErrorCode::INTERNAL_ERROR,
+                        "scripted documentSymbol failure",
+                    ));
+                }
+                Ok(Some(lsp::DocumentSymbolResponse::Nested(
+                    fixture_document_symbols(),
+                )))
+            });
+            router.request::<request::References, _>(move |_, _| async move {
+                if failing.contains(&"references") {
+                    return Err(async_lsp::ResponseError::new(
+                        async_lsp::ErrorCode::INTERNAL_ERROR,
+                        "scripted references failure",
+                    ));
+                }
+                Ok(Some(Vec::new()))
+            });
+            router.request::<request::WorkspaceSymbolRequest, _>(move |_, _| async move {
+                if failing.contains(&"workspaceSymbol") {
+                    return Err(async_lsp::ResponseError::new(
+                        async_lsp::ErrorCode::INTERNAL_ERROR,
+                        "scripted workspaceSymbol failure",
+                    ));
+                }
+                Ok(Some(lsp::WorkspaceSymbolResponse::Flat(Vec::new())))
+            });
+            router.request::<request::Shutdown, _>(|_, _| async { Ok(()) });
+            router.notification::<lsp::notification::Exit>(|_, _| {
+                std::ops::ControlFlow::Break(Ok(()))
+            });
+            router.unhandled_notification(|_, _| std::ops::ControlFlow::Continue(()));
+            router
+        });
+        tokio::spawn(server.run_buffered(peer_input.compat(), peer_output.compat_write()));
+        crate::intelligence::session::LiveSession::open(
+            input,
+            output,
+            source.worktree().clone(),
+            source.authority_epoch(),
+            crate::intelligence::freshness::ViewGeneration::default(),
+            crate::intelligence::session::ProviderSettings::new(FixtureProfile),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+    }
+
+    /// Appends one line to [`FIXTURE_LOG`].
+    fn fixture_record(line: String) {
+        FIXTURE_LOG.lock().expect("fixture log").push(line);
+    }
+
+    /// Language server of [`EPSILON`]: it spawns nothing. Its backend resolves the retained cache
+    /// namespace exactly like the real backends do before they spawn, records which binding it did
+    /// so for, and then reports the server as still loading, so a unit test can observe namespace
+    /// ownership and release order through the production worker paths without a real server.
+    pub(crate) struct FixtureServer;
+
+    impl crate::intelligence::server::LanguageServer for FixtureServer {
+        /// The fixture language.
+        fn language(&self) -> Language {
+            EPSILON
+        }
+        /// Launcher `settings` identifier selecting the fixture server.
+        fn settings_key(&self) -> &'static str {
+            "fixture_epsilon"
+        }
+        /// Any declaration is acceptable.
+        fn validate_launch(&self, _launch: &crate::assistance::launcher::ProviderLaunch) -> bool {
+            true
+        }
+        /// Reply name of the fixture server.
+        fn name(&self) -> &'static str {
+            "fixtureserver"
+        }
+        /// Fixed cache settings identity.
+        fn cache_settings(&self) -> &'static str {
+            "epsilon-settings"
+        }
+        /// Fixed configuration identity.
+        fn effective_configuration(&self) -> &'static str {
+            "epsilon-configuration"
+        }
+        /// One private subdirectory.
+        fn cache_directories(&self) -> &'static [&'static str] {
+            &["epsilon-state"]
+        }
+        /// Context requests for `.epsilon` files.
+        fn context_extensions(&self) -> &'static [&'static str] {
+            &["epsilon"]
+        }
+        /// Symbol tools for `.epsilon` files use the fixture session.
+        fn session_extensions(&self) -> &'static [&'static str] {
+            &["epsilon"]
+        }
+        /// The one project input file of the fixture language, `epsilon.cfg`.
+        fn project_inputs(&self) -> &'static [&'static str] {
+            &["epsilon.cfg"]
+        }
+        /// A fresh recording backend.
+        fn new_backend(&self) -> Box<dyn crate::intelligence::server::ServerBackend> {
+            Box::new(FixtureBackend::default())
+        }
+    }
+
+    /// Per-worker state of [`FixtureServer`]: the bindings that currently hold a (pretend)
+    /// session.
+    #[derive(Default)]
+    struct FixtureBackend {
+        /// Bindings whose session `ensure_live` established and `release_live` has not yet ended.
+        live: std::collections::BTreeSet<crate::assistance::host_binding::BindingRef>,
+        /// Scripted sessions opened for bindings armed by [`fixture_serve_session`].
+        sessions: std::collections::BTreeMap<
+            crate::assistance::host_binding::BindingRef,
+            crate::intelligence::session::LiveSession,
+        >,
+    }
+
+    impl crate::intelligence::server::ServerBackend for FixtureBackend {
+        /// Ignores its inputs and always answers `ProviderUnavailable`: no test asks the fixture for
+        /// semantic context, only for sessions.
+        fn context<'a>(
+            &'a mut self,
+            _host: &'a mut dyn crate::intelligence::server::ProviderHost,
+            _job: &'a mut dyn crate::intelligence::server::ProviderJob,
+            _launch: &'a crate::assistance::launcher::ProviderLaunch,
+            _source: &'a crate::workspace::observation::SourceObservation,
+            _bytes: &'a [u8],
+            _query: crate::intelligence::context::ContextQuery,
+        ) -> crate::checks::BoxFuture<
+            'a,
+            Result<
+                crate::intelligence::server::ProviderContext,
+                crate::assistance::reply::FailureCode,
+            >,
+        > {
+            Box::pin(async { Err(crate::assistance::reply::FailureCode::ProviderUnavailable) })
+        }
+
+        /// Resolves the job binding's retained namespace like a real backend, records it, marks
+        /// the binding live, and answers `ProviderLoading` (the namespace was obtained; a real
+        /// server would now be starting). A binding without a retained namespace gets the real
+        /// backends' bare `ProviderUnavailable`, as does a binding armed by
+        /// [`fixture_fail_next_ensure`].
+        fn ensure_live<'a>(
+            &'a mut self,
+            host: &'a mut dyn crate::intelligence::server::ProviderHost,
+            job: &'a mut dyn crate::intelligence::server::ProviderJob,
+            launch: &'a crate::assistance::launcher::ProviderLaunch,
+            source: &'a crate::workspace::observation::SourceObservation,
+        ) -> crate::checks::BoxFuture<'a, Result<(), crate::assistance::reply::FailureCode>>
+        {
+            Box::pin(async move {
+                let binding = job.binding().clone();
+                let authority = host.authority(&binding).await?;
+                let fault = {
+                    let mut armed = FIXTURE_ENSURE_FAULTS.lock().expect("fixture ensure faults");
+                    let tag = fixture_tag(&binding);
+                    armed
+                        .iter()
+                        .position(|(armed, _)| *armed == tag)
+                        .map(|position| armed.remove(position).1)
+                };
+                let lookup = match fault {
+                    Some(false) => {
+                        return Err(crate::assistance::reply::FailureCode::ProviderUnavailable);
+                    }
+                    Some(true) => crate::assistance::host_binding::BindingRef::fixture(
+                        "fixture-unowned",
+                        "fixture-unowned-channel",
+                        1,
+                    ),
+                    None => binding.clone(),
+                };
+                let namespace = host.cache_namespace(
+                    &lookup,
+                    &authority,
+                    launch,
+                    &crate::intelligence::server::effective_trust(launch),
+                )?;
+                fixture_record(format!("ensure:{}:{namespace}", fixture_tag(&binding)));
+                let serving = FIXTURE_SESSIONS
+                    .lock()
+                    .expect("fixture sessions")
+                    .iter()
+                    .rev()
+                    .find(|(tag, _)| *tag == fixture_tag(&binding))
+                    .map(|(_, failing)| *failing);
+                self.live.insert(binding.clone());
+                let Some(failing) = serving else {
+                    return Err(crate::assistance::reply::FailureCode::ProviderLoading);
+                };
+                if let std::collections::btree_map::Entry::Vacant(slot) =
+                    self.sessions.entry(binding)
+                {
+                    let session = fixture_open_session(source, failing)
+                        .await
+                        .map_err(|_| crate::assistance::reply::FailureCode::ProviderUnavailable)?;
+                    slot.insert(session);
+                }
+                Ok(())
+            })
+        }
+
+        /// Ends the binding's pretend session and records it, and drops its scripted session (and
+        /// with it the in-process server connection) when one was opened.
+        fn release_live<'a>(
+            &'a mut self,
+            _host: &'a mut dyn crate::intelligence::server::ProviderHost,
+            binding: &'a crate::assistance::host_binding::BindingRef,
+        ) -> crate::checks::BoxFuture<'a, ()> {
+            self.sessions.remove(binding);
+            if self.live.remove(binding) {
+                fixture_record(format!("release:{}", fixture_tag(binding)));
+            }
+            Box::pin(async {})
+        }
+
+        /// Releases no resource, but fails once for a binding armed by [`fixture_fail_next_close`]
+        /// and records the failure.
+        fn close_binding<'a>(
+            &'a mut self,
+            _host: &'a mut dyn crate::intelligence::server::ProviderHost,
+            binding: &'a crate::assistance::host_binding::BindingRef,
+        ) -> crate::checks::BoxFuture<'a, Result<(), crate::assistance::reply::FailureCode>>
+        {
+            let tag = fixture_tag(binding);
+            let mut armed = FIXTURE_CLOSE_FAILURES
+                .lock()
+                .expect("fixture close failures");
+            let failing = armed.iter().position(|armed| *armed == tag);
+            if let Some(position) = failing {
+                armed.remove(position);
+                fixture_record(format!("close-failed:{tag}"));
+            }
+            Box::pin(async move {
+                if failing.is_some() {
+                    Err(crate::assistance::reply::FailureCode::Internal)
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        /// The scripted session of `binding`, when one was opened.
+        fn live_session(
+            &mut self,
+            binding: &crate::assistance::host_binding::BindingRef,
+        ) -> Option<&mut crate::intelligence::session::LiveSession> {
+            self.sessions.get_mut(binding)
+        }
+
+        /// The bindings holding a pretend session.
+        fn live_bindings(&self) -> Vec<crate::assistance::host_binding::BindingRef> {
+            self.live.iter().cloned().collect()
+        }
+    }
+
     /// First checked test language.
     pub(crate) const ALPHA: Language = Language::of(&ALPHA_DESCRIPTOR);
     /// Second checked test language.
@@ -1323,10 +1785,12 @@ pub(crate) mod testing {
     pub(crate) const GAMMA: Language = Language::of(&GAMMA_DESCRIPTOR);
     /// Unchecked test language.
     pub(crate) const DELTA: Language = Language::of(&DELTA_DESCRIPTOR);
+    /// Unchecked test language whose server is the recording [`FixtureServer`].
+    pub(crate) const EPSILON: Language = Language::of(&EPSILON_DESCRIPTOR);
 
     /// Registers the test languages (idempotent) for tests that look languages up by path or id.
     pub(crate) fn install() {
-        super::install(&[ALPHA, BETA, GAMMA, DELTA]);
+        super::install(&[ALPHA, BETA, GAMMA, DELTA, EPSILON]);
     }
 }
 
