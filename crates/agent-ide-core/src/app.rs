@@ -342,7 +342,12 @@ async fn run_daemon_inner(
     tokio::pin!(termination);
     if let Some(dispatcher) = &dispatcher {
         tokio::select! {
-            initialized = initialize_dispatcher(dispatcher, runtime_dir.path()) => initialized?,
+            initialized = initialize_dispatcher(dispatcher, runtime_dir.path()) => {
+                if let Err(error) = &initialized {
+                    record_daemon_failure("initialize", error);
+                }
+                initialized?
+            }
             _ = &mut termination => {
                 shutdown_dispatcher(dispatcher).await?;
                 return Ok(());
@@ -422,18 +427,29 @@ async fn run_daemon_inner(
     if let Some(retention) = retention {
         retention.abort();
     }
+    // The serving error (bind, accept, socket setup) wins over a later shutdown error, as in
+    // `finish_daemon`; the journal names which of the two ended the daemon.
+    let failed_serving = serving.is_err();
     let result = finish_daemon(serving, &mut connections, dispatcher.as_ref(), &lease).await;
-    crate::errorlog::record(
-        crate::errorlog::Method::Daemon,
-        if result.is_err() {
-            crate::errorlog::Outcome::Failed
-        } else if idle_exit {
-            crate::errorlog::Outcome::IdleExit
-        } else {
-            crate::errorlog::Outcome::Stopped
-        },
-        crate::errorlog::Fields::default(),
-    );
+    match &result {
+        Err(error) => record_daemon_failure(
+            if failed_serving {
+                "serving"
+            } else {
+                "shutdown"
+            },
+            error,
+        ),
+        Ok(()) => crate::errorlog::record(
+            crate::errorlog::Method::Daemon,
+            if idle_exit {
+                crate::errorlog::Outcome::IdleExit
+            } else {
+                crate::errorlog::Outcome::Stopped
+            },
+            crate::errorlog::Fields::default(),
+        ),
+    }
     if result.is_ok()
         && owned_socket.is_some()
         && let Some(identity) = runtime_identity
@@ -442,6 +458,29 @@ async fn run_daemon_inner(
     }
     drop((owned_socket, _lock));
     result
+}
+
+/// Journals that the daemon failed, with the stage that failed (`initialize`, `serving` or
+/// `shutdown`) and the closed class of the error as `detail` (QW-4): `stage:class`, where class is
+/// the [`AppError`] variant name or, for an operating-system failure, `io:` and the closed
+/// [`io::ErrorKind`] name. Never the error's text, which can carry paths.
+fn record_daemon_failure(stage: &str, error: &AppError) {
+    let class = match error {
+        AppError::UnsafeRuntimeDirectory => "unsafe_runtime_directory".to_owned(),
+        AppError::AlreadyRunning => "already_running".to_owned(),
+        AppError::SocketStateUnknown => "socket_state_unknown".to_owned(),
+        AppError::InvalidResponse => "invalid_response".to_owned(),
+        AppError::Io(error) => format!("io:{:?}", error.kind()),
+    };
+    crate::errorlog::record(
+        crate::errorlog::Method::Daemon,
+        crate::errorlog::Outcome::Failed,
+        crate::errorlog::Fields {
+            detail: Some(&format!("{stage}:{class}")),
+            version: Some(env!("CARGO_PKG_VERSION")),
+            ..Default::default()
+        },
+    );
 }
 
 /// Removes `path` only if it is still the exact directory identity captured when this daemon
@@ -1928,6 +1967,50 @@ mod tests {
         > {
             Box::pin(async { Err(AssistanceDispatchUnavailable) })
         }
+    }
+
+    /// QW-4: a failed daemon names the failing stage and the closed error class, never the
+    /// error's text.
+    #[test]
+    fn daemon_failure_is_journaled_with_its_stage_and_closed_class() {
+        crate::errorlog::capture_start();
+        for (stage, error) in [
+            ("initialize", AppError::InvalidResponse),
+            ("serving", AppError::AlreadyRunning),
+            ("serving", AppError::UnsafeRuntimeDirectory),
+            ("shutdown", AppError::SocketStateUnknown),
+            (
+                "serving",
+                AppError::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "/secret/path/in/the/message",
+                )),
+            ),
+        ] {
+            record_daemon_failure(stage, &error);
+        }
+        let events = crate::errorlog::capture_take();
+        let details = events
+            .iter()
+            .map(|event| {
+                assert_eq!(
+                    (event.method.as_str(), event.outcome.as_str()),
+                    ("daemon", "failed")
+                );
+                assert_eq!(event.level, "error");
+                event.detail.clone().unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            details,
+            [
+                "initialize:invalid_response",
+                "serving:already_running",
+                "serving:unsafe_runtime_directory",
+                "shutdown:socket_state_unknown",
+                "serving:io:PermissionDenied",
+            ]
+        );
     }
 
     /// Proves a rejected initialize still runs bounded shutdown and preserves the original failure.
