@@ -8,6 +8,8 @@
 //! that does not take leases exists. Installed releases (`standalone/releases/`) are removed when
 //! not current, not among the newest, old enough and not executed by any live process.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
@@ -38,6 +40,18 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(3_600);
 const SWEEP_SPACING: Duration = Duration::from_secs(55 * 60);
 /// Newest version whose processes do not take worktree leases.
 const LEGACY_BOUNDARY: (u64, u64, u64) = (0, 9, 1);
+/// Present in every executable built from this source, which takes worktree leases: a running
+/// `agent-ide` whose executable file contains it is a proven participating build. Never edit it
+/// without keeping older builds recognizable only by their release version.
+#[used]
+static LEASE_BUILD_PROOF: &[u8] = b"agent-ide/worktree-lease-protocol/proof-1";
+/// Present only in executables whose Claude hook key hint publishers take the directory lock a
+/// collection relies on (`hook_hints::PublishGuard`), which was introduced after
+/// [`LEASE_BUILD_PROOF`]: a lease-only build is no proof that hints are published under the lock.
+#[used]
+static HINT_LOCK_BUILD_PROOF: &[u8] = b"agent-ide/hint-publish-lock/proof-1";
+/// Largest executable scanned for a build proof; a larger one is unproven.
+const PROOF_SCAN_LIMIT: u64 = 1 << 30;
 /// Marker naming the worktree (checks) or launch directory (telemetry) of one cache directory.
 pub const MARKER_FILE_NAME: &str = "worktree.path";
 /// Directory of the stable, never-removed lease files below the state root.
@@ -212,6 +226,136 @@ fn try_exclusive(path: &Path) -> Option<File> {
     flock(&file, libc::LOCK_EX | libc::LOCK_NB).then_some(file)
 }
 
+/// Names `launch` in the marker of its telemetry store directory `store`, atomically, so a store
+/// the launch uses is never left marker-less (which keeps it behind the machine-wide `any` lease).
+///
+/// `store` must be exactly `<state_root>/telemetry/<full BLAKE3 hex of launch>`, with all three
+/// being private real directories. The shared lease of `launch` is taken first (a sweeper's claim,
+/// which locks that lease or `any`, then cannot run) and the chain and the store's identity are
+/// validated again under it, so a store a sweeper moved to trash or a directory replaced while
+/// waiting is refused. The marker is written to a fresh `0600` sibling, synced and renamed over
+/// any existing one, then read back. An existing marker that is a private regular file already
+/// naming `launch` is left untouched; one with other content (a torn write) or a non-private mode
+/// is replaced (so a historical `0644` marker is migrated to `0600`); a symlink, any other non-file or a marker writable by others is refused, never followed. A live telemetry
+/// writer is unaffected (the marker is no part of its SQLite state, and its lock is not taken).
+/// Publishing counts as a use of the store: it touches the directory's mtime, which delays its
+/// idle expiry by up to the idle age (the launch is a use anyway).
+pub fn adopt_marker(state_root: &Path, store: &Path, launch: &Path) -> std::io::Result<()> {
+    use std::io::{Error, Read as _, Write as _};
+    let refused = |message: &'static str| Error::new(ErrorKind::InvalidInput, message);
+    let digest = blake3::hash(launch.as_os_str().as_bytes()).to_hex();
+    let telemetry = state_root.join("telemetry");
+    if !launch.is_absolute()
+        || store.file_name().map(OsStr::as_bytes) != Some(digest.as_bytes())
+        || store.parent() != Some(telemetry.as_path())
+    {
+        return Err(refused("not the telemetry store of this launch directory"));
+    }
+    // The three directories are private real directories; returns the store's identity.
+    let chain = || -> std::io::Result<(u64, u64)> {
+        let private =
+            |dir: &Path| safe_dir(dir) && fs::metadata(dir).is_ok_and(|m| m.mode() & 0o077 == 0);
+        if ![state_root, telemetry.as_path(), store]
+            .into_iter()
+            .all(private)
+        {
+            return Err(refused("telemetry state is not private"));
+        }
+        let metadata = fs::symlink_metadata(store)?;
+        Ok((metadata.dev(), metadata.ino()))
+    };
+    let before = chain()?;
+    let _lease = Lease::acquire(state_root, launch)
+        .ok_or_else(|| Error::new(ErrorKind::PermissionDenied, "worktree lease unavailable"))?;
+    if chain()? != before {
+        return Err(refused(
+            "telemetry store changed while waiting for its lease",
+        ));
+    }
+    let marker = store.join(MARKER_FILE_NAME);
+    let wanted = launch.as_os_str().as_bytes();
+    // `Some(true)` when the marker is a private regular file of this user naming exactly
+    // `launch`, `Some(false)` when it is one with other content or a wider mode, `None` when
+    // missing; anything else is an error.
+    let current = || -> std::io::Result<Option<bool>> {
+        let metadata = match fs::symlink_metadata(&marker) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        // SAFETY: `geteuid` has no preconditions.
+        if !metadata.file_type().is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "marker is not a file of this user",
+            ));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&marker)?;
+        let opened = file.metadata()?;
+        if (opened.dev(), opened.ino()) != (metadata.dev(), metadata.ino()) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "marker was replaced while read",
+            ));
+        }
+        // Version 0.10.6 wrote markers with the process umask (`0644`): safe inside the private
+        // store, republished as `0600`. A marker others can write is refused.
+        if opened.mode() & 0o022 != 0 {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "marker is writable by others",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(wanted.len() as u64 + 1).read_to_end(&mut bytes)?;
+        Ok(Some(bytes == wanted && opened.mode() & 0o077 == 0))
+    };
+    if current()? == Some(true) {
+        return Ok(());
+    }
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = store.join(format!(
+        "{MARKER_FILE_NAME}.{}-{nanos}.tmp",
+        std::process::id()
+    ));
+    let published = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.write_all(wanted)?;
+            file.sync_all()
+        })
+        .and_then(|()| {
+            if chain()? != before {
+                return Err(refused(
+                    "telemetry store changed before its marker was published",
+                ));
+            }
+            fs::rename(&temporary, &marker)
+        });
+    if let Err(error) = published {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if current()? == Some(true) {
+        Ok(())
+    } else {
+        Err(Error::new(
+            ErrorKind::InvalidData,
+            "marker changed while it was published",
+        ))
+    }
+}
+
 /// One cache family the sweep manages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -334,6 +478,8 @@ pub struct Report {
     /// Live `agent-ide` processes that do not take leases, or `None` when the process snapshot
     /// failed; either non-empty or `None` pauses all check and telemetry removal.
     pub legacy: Option<Vec<Process>>,
+    /// Live development or test builds proven to take leases; they never pause removal.
+    pub builds: Vec<Process>,
     /// Check cache totals before the sweep.
     pub checks: Totals,
     /// Telemetry store totals before the sweep.
@@ -378,7 +524,8 @@ impl Report {
             ),
             Some(legacy) if !legacy.is_empty() => {
                 text.push_str(
-                    "eviction of checks/telemetry paused until these older agent-ide processes exit:\n",
+                    "eviction of checks/telemetry paused until these agent-ide processes exit \
+                     (releases up to 0.9.1, or executables not proven to take leases):\n",
                 );
                 for (pid, exe) in legacy {
                     let exe = exe.as_deref().map_or(
@@ -389,6 +536,15 @@ impl Report {
                 }
             }
             Some(_) => {}
+        }
+        if !self.builds.is_empty() {
+            text.push_str(
+                "these development or test builds take leases and do not pause eviction:\n",
+            );
+            for (pid, exe) in &self.builds {
+                let exe = exe.as_deref().map_or("?".into(), Path::to_string_lossy);
+                let _ = writeln!(text, "  pid {pid} {exe}");
+            }
         }
         if self.verdicts.is_empty() {
             text.push_str("nothing to remove\n");
@@ -558,8 +714,12 @@ fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
     parts.next().is_none().then_some(version)
 }
 
+/// An executable's identity (device, inode, length, mtime) and which proof was scanned for
+/// (`true`: the hint lock, `false`: the lease protocol).
+type ProofKey = (u64, u64, u64, SystemTime, bool);
+
 /// What a sweeping process knows about itself to classify other `agent-ide` processes.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Identity {
     /// Device and inode of the sweeping executable.
     own: Option<(u64, u64)>,
@@ -567,6 +727,20 @@ struct Identity {
     releases: PathBuf,
     /// Releases strictly newer than this take leases.
     floor: (u64, u64, u64),
+    /// When a process started, so a rebuilt file is not mistaken for the code it runs.
+    started: fn(i32) -> Option<SystemTime>,
+    /// Scan verdicts by executable identity (device, inode, length, mtime): one scan per build.
+    proofs: RefCell<BTreeMap<ProofKey, bool>>,
+}
+
+/// How the live `agent-ide` processes divide for one sweep.
+#[derive(Clone, Debug, Default)]
+pub struct Classified {
+    /// Processes not known to take leases; any of them pauses eviction.
+    pub legacy: Vec<Process>,
+    /// Participating development or test builds outside `standalone/releases`, proven by their
+    /// executable; they never pause eviction and are listed so the report can say so.
+    pub builds: Vec<Process>,
 }
 
 impl Identity {
@@ -579,26 +753,59 @@ impl Identity {
             // Every release after the boundary takes leases, older than this build or not: a
             // session started before an upgrade must not pause the upgraded sweeper.
             floor: LEGACY_BOUNDARY,
+            started: process_start,
+            proofs: RefCell::default(),
         }
     }
 
-    /// Returns the live `agent-ide` processes that are not known to take leases.
+    /// Splits the live `agent-ide` processes into those that pause eviction and the proven
+    /// development builds that do not.
     ///
-    /// A process participates only when its executable is this process's own file, or
-    /// `releases/X.Y.Z/agent-ide` with `X.Y.Z` strictly newer than [`Identity::floor`]; one
-    /// whose executable path is unreadable never does.
-    fn legacy(&self, processes: &[Process]) -> Vec<Process> {
+    /// A process participates when its executable is this process's own file, or
+    /// `releases/X.Y.Z/agent-ide` with `X.Y.Z` strictly newer than [`Identity::floor`], or when it
+    /// is a build proven to take leases ([`Identity::proven_build`]). One whose executable path is
+    /// unreadable never does.
+    fn classify(&self, processes: &[Process]) -> Classified {
+        let mut classified = Classified::default();
+        for process in processes.iter().filter(|(_, exe)| {
+            exe.as_ref().is_none_or(|exe| {
+                exe.file_name()
+                    .is_some_and(|name| name.as_bytes().starts_with(b"agent-ide"))
+            })
+        }) {
+            match &process.1 {
+                Some(exe) if self.participates(exe) => {}
+                Some(exe) if self.proven_build(process.0, exe) => {
+                    classified.builds.push(process.clone());
+                }
+                _ => classified.legacy.push(process.clone()),
+            }
+        }
+        classified
+    }
+
+    /// Returns the live `agent-ide` processes that may still publish hook key hints without the
+    /// directory lock a collection relies on: every one that is not this very executable or a
+    /// build proven to lock ([`HINT_LOCK_BUILD_PROOF`], embedded only together with that lock; a
+    /// lease-only build proves nothing here). An installed release is proven by its contents like
+    /// any other file, never by its version number, so every release before the lock keeps the
+    /// collection paused.
+    fn hint_unsafe(&self, processes: &[Process]) -> Vec<Process> {
         processes
             .iter()
-            .filter(|(_, exe)| {
-                exe.as_ref().is_none_or(|exe| {
-                    exe.file_name()
-                        .is_some_and(|name| name.as_bytes().starts_with(b"agent-ide"))
+            .filter(|(pid, exe)| {
+                !exe.as_deref().is_some_and(|exe| {
+                    (self.own.is_some() && file_id(exe) == self.own)
+                        || self.build_contains(*pid, exe, HINT_LOCK_BUILD_PROOF)
                 })
             })
-            .filter(|(_, exe)| !exe.as_deref().is_some_and(|exe| self.participates(exe)))
             .cloned()
             .collect()
+    }
+
+    /// Returns the live `agent-ide` processes that are not known to take leases.
+    fn legacy(&self, processes: &[Process]) -> Vec<Process> {
+        self.classify(processes).legacy
     }
 
     /// Whether one `agent-ide` executable is known to take leases.
@@ -612,6 +819,124 @@ impl Identity {
                 .filter(|dir| dir.parent() == Some(self.releases.as_path()))
                 .and_then(|dir| parse_version(dir.file_name()?.to_str()?))
                 .is_some_and(|version| version > self.floor)
+    }
+
+    /// Whether process `pid` runs a build of this source: its executable is a regular file not
+    /// modified since the process started (so it is the code that runs, not a later rebuild) and
+    /// contains [`LEASE_BUILD_PROOF`]. A path, name or location proves nothing.
+    ///
+    /// ponytail: an executable replaced by a file with an older mtime than the process start is
+    /// not noticed; the process list offers no inode to compare.
+    fn proven_build(&self, pid: i32, exe: &Path) -> bool {
+        self.build_contains(pid, exe, LEASE_BUILD_PROOF)
+    }
+
+    /// [`Self::proven_build`] for the build proof `needle`, which must be [`LEASE_BUILD_PROOF`] or
+    /// [`HINT_LOCK_BUILD_PROOF`]: the proof cache tells exactly those two kinds apart.
+    fn build_contains(&self, pid: i32, exe: &Path, needle: &'static [u8]) -> bool {
+        let Ok(file) = File::open(exe) else {
+            return false;
+        };
+        let Ok(metadata) = file.metadata() else {
+            return false;
+        };
+        let (Some(started), Ok(modified)) = ((self.started)(pid), metadata.modified()) else {
+            return false;
+        };
+        if !metadata.is_file() || metadata.len() > PROOF_SCAN_LIMIT || modified > started {
+            return false;
+        }
+        // The cache tells the two proofs apart: a lease-only build never answers for the lock.
+        let lock = needle == HINT_LOCK_BUILD_PROOF;
+        let key = (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            modified,
+            lock,
+        );
+        if let Some(proven) = self.proofs.borrow().get(&key) {
+            return *proven;
+        }
+        let proven = contains_proof(&file, needle);
+        // A rebuild during the scan changed the file or replaced the path: no verdict at all.
+        let unchanged = |now: fs::Metadata| {
+            (now.dev(), now.ino(), now.len(), now.modified().ok())
+                == (key.0, key.1, key.2, Some(key.3))
+        };
+        if !file.metadata().is_ok_and(unchanged) || !fs::metadata(exe).is_ok_and(unchanged) {
+            return false;
+        }
+        self.proofs.borrow_mut().insert(key, proven);
+        proven
+    }
+}
+
+/// Lists the live `agent-ide` processes that may publish Claude hook key hints without the
+/// directory lock, or `None` when the process list is unavailable; hint collection
+/// ([`crate::hook_hints::collect`]) must not apply while either is non-empty or `None`.
+pub fn hint_publishers_unsafe(snapshot: &dyn Fn() -> Option<Vec<Process>>) -> Option<Vec<Process>> {
+    hint_publishers_unsafe_as(&Identity::current(&state_root()?), snapshot)
+}
+
+/// Returns the question hook key hint collection asks right before every removal: `true` only while
+/// a fresh process snapshot shows every live `agent-ide` to be this executable or a proven build.
+/// One proof cache serves all questions of a pass.
+pub fn hint_publishers_safe() -> impl Fn() -> bool {
+    let identity = state_root().map(|root| Identity::current(&root));
+    move || {
+        identity.as_ref().is_some_and(|identity| {
+            hint_publishers_unsafe_as(identity, &process_snapshot)
+                .is_some_and(|unsafe_publishers| unsafe_publishers.is_empty())
+        })
+    }
+}
+
+/// [`hint_publishers_unsafe`] classifying processes as `identity` does.
+fn hint_publishers_unsafe_as(
+    identity: &Identity,
+    snapshot: &dyn Fn() -> Option<Vec<Process>>,
+) -> Option<Vec<Process>> {
+    Some(identity.hint_unsafe(&snapshot()?))
+}
+
+/// When process `pid` started, or `None` when it cannot be inspected.
+fn process_start(pid: i32) -> Option<SystemTime> {
+    // SAFETY: `proc_bsdinfo` is plain data that `proc_pidinfo` fills up to its size.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is writable for `size` bytes.
+    let filled =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    (filled == size).then(|| {
+        SystemTime::UNIX_EPOCH
+            + Duration::new(info.pbi_start_tvsec, (info.pbi_start_tvusec as u32) * 1_000)
+    })
+}
+
+/// Whether the stream contains the build proof `needle`; any read error means no.
+fn contains_proof(mut file: &File, needle: &[u8]) -> bool {
+    use std::io::Read as _;
+    let mut buffer = vec![0u8; (1 << 20) + needle.len()];
+    let mut kept = 0;
+    loop {
+        let Ok(read) = file.read(&mut buffer[kept..]) else {
+            return false;
+        };
+        if read == 0 {
+            return false;
+        }
+        let end = kept + read;
+        let haystack = &buffer[..end];
+        if haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+        {
+            return true;
+        }
+        // Keep a tail so a proof split across two reads is still found.
+        kept = (needle.len() - 1).min(end);
+        buffer.copy_within(end - kept..end, 0);
     }
 }
 
@@ -1143,6 +1468,23 @@ pub fn sweep_with(
     now: SystemTime,
     snapshot: &dyn Fn() -> Option<Vec<Process>>,
 ) -> Report {
+    sweep_as(
+        &Identity::current(state_root),
+        state_root,
+        apply,
+        now,
+        snapshot,
+    )
+}
+
+/// [`sweep_with`] classifying processes as `identity` does.
+fn sweep_as(
+    identity: &Identity,
+    state_root: &Path,
+    apply: bool,
+    now: SystemTime,
+    snapshot: &dyn Fn() -> Option<Vec<Process>>,
+) -> Report {
     let mut report = Report {
         checks: Totals {
             budget: CHECKS_BUDGET_BYTES,
@@ -1157,8 +1499,12 @@ pub fn sweep_with(
     if !safe_dir(state_root) {
         return report;
     }
-    let identity = Identity::current(state_root);
-    report.legacy = snapshot().map(|processes| identity.legacy(&processes));
+    let classified = snapshot().map(|processes| identity.classify(&processes));
+    report.builds = classified
+        .as_ref()
+        .map(|classified| classified.builds.clone())
+        .unwrap_or_default();
+    report.legacy = classified.map(|classified| classified.legacy);
     let paused = report.paused();
     let locks = state_root.join(LOCKS_DIR);
     let legacy_free = || snapshot().is_some_and(|processes| identity.legacy(&processes).is_empty());
@@ -1267,6 +1613,38 @@ pub async fn run_periodically() {
             };
             if let Some(_lock) = SweepLock::try_acquire(&root, Some(SWEEP_SPACING)) {
                 sweep(&root, true).record();
+                // The Claude hook key hints below the temporary root go with the same round, but
+                // only while no process that may publish one without the lock is alive.
+                use crate::errorlog::{Fields, Method, Outcome, record};
+                let (outcome, detail) = match hint_publishers_unsafe(&process_snapshot) {
+                    Some(unsafe_publishers) if unsafe_publishers.is_empty() => {
+                        let hints = crate::hook_hints::collect(
+                            Path::new(crate::hook_hints::TMP_ROOT),
+                            true,
+                            SystemTime::now(),
+                            &hint_publishers_safe(),
+                        );
+                        (
+                            Outcome::Completed,
+                            format!("hook_key_hints removed={}", hints.stale),
+                        )
+                    }
+                    Some(unsafe_publishers) => (
+                        Outcome::Skipped,
+                        format!("hook_key_hints paused={}", unsafe_publishers.len()),
+                    ),
+                    None => (Outcome::Skipped, "hook_key_hints paused=unknown".to_owned()),
+                };
+                if outcome == Outcome::Skipped || detail != "hook_key_hints removed=0" {
+                    record(
+                        Method::Retention,
+                        outcome,
+                        Fields {
+                            detail: Some(&detail),
+                            ..Default::default()
+                        },
+                    );
+                }
             }
         })
         .await;

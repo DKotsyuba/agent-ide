@@ -13,6 +13,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 #[cfg(test)]
@@ -27,8 +28,8 @@ use crate::app::config::StoreConfig;
 #[cfg(test)]
 use crate::app::store::UntrackedOutcome;
 use crate::app::store::{
-    DomainMigration, DomainName, MigrationAdmission, MigrationDigest, MigrationKey, Store,
-    StoreError, TrustedUpSql,
+    Checkpoint, DomainMigration, DomainName, MigrationAdmission, MigrationDigest, MigrationKey,
+    Store, StoreError, TrustedUpSql,
 };
 
 /// Converts existing Assistance, provider, and Execution facts into closed telemetry events.
@@ -383,6 +384,8 @@ pub struct TelemetryConfig {
     pub query_budget: usize,
     /// Maximum export bytes, from one through [`MAX_EXPORT_BYTES`].
     pub export_budget: usize,
+    /// Quiet time after the last write before the writer truncates the WAL (must be nonzero).
+    pub wal_idle: Duration,
 }
 
 impl Default for TelemetryConfig {
@@ -395,6 +398,7 @@ impl Default for TelemetryConfig {
             max_logical_bytes: MAX_LOGICAL_BYTES,
             query_budget: MAX_QUERY_ROWS,
             export_budget: MAX_EXPORT_BYTES,
+            wal_idle: Duration::from_secs(30),
         }
     }
 }
@@ -410,9 +414,10 @@ impl TelemetryConfig {
             && self.query_budget > 0
             && self.query_budget <= MAX_QUERY_ROWS
             && self.export_budget > 0
-            && self.export_budget <= MAX_EXPORT_BYTES)
-            .then_some(self)
-            .ok_or(TelemetryError::InvalidConfig)
+            && self.export_budget <= MAX_EXPORT_BYTES
+            && !self.wal_idle.is_zero())
+        .then_some(self)
+        .ok_or(TelemetryError::InvalidConfig)
     }
 }
 
@@ -701,7 +706,18 @@ impl Telemetry {
         let writer_ownership = ownership.clone();
         let writer = tokio::spawn(async move {
             let _ownership = writer_ownership;
+            // Whether committed frames may still sit in the WAL: set from the start because the
+            // migration (or an earlier owner's WAL) already wrote some, and left set by an idle
+            // or final checkpoint that was blocked so a later quiet period retries.
+            let mut dirty = true;
             loop {
+                let quiet = async {
+                    if dirty {
+                        tokio::time::sleep(writer_config.wal_idle).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                };
                 tokio::select! {
                     biased;
                     changed = shutdown_receiver.changed() => {
@@ -715,21 +731,32 @@ impl Telemetry {
                                     &mut retention,
                                     &writer_dropped,
                                 ).await;
+                                dirty = true;
                             }
                             break;
                         }
                     }
                     event = receiver.recv() => match event {
-                        Some(event) => write_event(
-                            &writer_store,
-                            writer_config,
-                            event,
-                            &mut retention,
-                            &writer_dropped,
-                        ).await,
+                        Some(event) => {
+                            write_event(
+                                &writer_store,
+                                writer_config,
+                                event,
+                                &mut retention,
+                                &writer_dropped,
+                            ).await;
+                            dirty = true;
+                        }
                         None => break,
+                    },
+                    () = quiet => {
+                        dirty = !checkpointed(&writer_store).await;
                     }
                 }
+            }
+            // The drain is complete: bound the WAL before the stable ownership is released.
+            if dirty {
+                checkpointed(&writer_store).await;
             }
         });
         Ok(Self {
@@ -938,6 +965,12 @@ async fn write_event(
             dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// Truncates the WAL on the store's owner connection; `true` when it ended empty. A busy or
+/// failed attempt is not an error: events stay durable in the WAL and the caller retries later.
+async fn checkpointed(store: &Store) -> bool {
+    matches!(store.checkpoint().await, Ok(Checkpoint::Truncated))
 }
 
 /// Persists one event and evicts only the oldest rows needed for both ceilings to hold.
@@ -1274,6 +1307,167 @@ mod tests {
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.dropped, None);
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Size of `database`'s write-ahead log file, `0` when it is absent.
+    fn wal_len(database: &Path) -> u64 {
+        fs::metadata(sqlite_companion(database, "-wal")).map_or(0, |metadata| metadata.len())
+    }
+
+    /// Counts the durable events through the owner's own query path.
+    async fn stored(telemetry: &Telemetry) -> usize {
+        let mut cursor = None;
+        let mut total = 0;
+        loop {
+            let page = telemetry.query(Filter::All, cursor, 1_000).await.unwrap();
+            total += page.rows.len();
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => return total,
+            }
+        }
+    }
+
+    /// Records `count` more events and waits until every one is durable.
+    async fn record_and_settle(telemetry: &Telemetry, count: usize) {
+        let target = stored(telemetry).await + count;
+        for _ in 0..count {
+            while telemetry.sender.as_ref().unwrap().capacity() == 0 {
+                tokio::task::yield_now().await;
+            }
+            telemetry.record(event());
+        }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while stored(telemetry).await < target {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every event becomes durable");
+    }
+
+    /// A grown WAL is truncated by the owner when the writer drains at shutdown, with every event
+    /// kept and the database still open (a connection close would hide a missing checkpoint).
+    #[tokio::test]
+    async fn shutdown_truncates_the_grown_wal_and_keeps_every_event() {
+        crate::lang::testing::install();
+        let path = private_database("agent-ide-telemetry-wal-drain");
+        let telemetry = Telemetry::open_database(&path, TelemetryConfig::default())
+            .await
+            .unwrap();
+        record_and_settle(&telemetry, 300).await;
+        assert!(wal_len(&path) > 0, "the committed events grew the WAL");
+        telemetry.shutdown().await;
+        assert_eq!(wal_len(&path), 0, "the drain truncated the WAL");
+        assert_eq!(stored(&telemetry).await, 300);
+        drop(telemetry);
+        remove_private_database(&path);
+    }
+
+    /// With no shutdown, a quiet writer truncates the WAL itself; new writes grow it again and
+    /// the next quiet period truncates it again.
+    #[tokio::test]
+    async fn an_idle_writer_truncates_the_wal_and_keeps_every_event() {
+        crate::lang::testing::install();
+        let path = private_database("agent-ide-telemetry-wal-idle");
+        let config = TelemetryConfig {
+            wal_idle: Duration::from_millis(400),
+            ..TelemetryConfig::default()
+        };
+        let telemetry = Telemetry::open_database(&path, config).await.unwrap();
+        for round in 1..=2 {
+            record_and_settle(&telemetry, 100).await;
+            assert!(
+                wal_len(&path) > 0,
+                "round {round}: the new events grew the WAL"
+            );
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while wal_len(&path) != 0 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the quiet writer truncates the WAL");
+            assert_eq!(stored(&telemetry).await, 100 * round);
+        }
+        telemetry.shutdown().await;
+        drop(telemetry);
+        remove_private_database(&path);
+    }
+
+    /// A writer that receives no event at all still truncates what opening (migration) or an
+    /// earlier owner left in the WAL, when quiet and at shutdown.
+    #[tokio::test]
+    async fn a_writer_without_ingress_truncates_the_opening_wal() {
+        let quiet_path = private_database("agent-ide-telemetry-wal-open-idle");
+        let config = TelemetryConfig {
+            wal_idle: Duration::from_millis(200),
+            ..TelemetryConfig::default()
+        };
+        let quiet = Telemetry::open_database(&quiet_path, config).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while wal_len(&quiet_path) != 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the idle writer truncates the WAL its migration wrote");
+        quiet.shutdown().await;
+        drop(quiet);
+        remove_private_database(&quiet_path);
+
+        let drained_path = private_database("agent-ide-telemetry-wal-open-drain");
+        let drained = Telemetry::open_database(&drained_path, TelemetryConfig::default())
+            .await
+            .unwrap();
+        assert!(wal_len(&drained_path) > 0, "opening wrote frames");
+        drained.shutdown().await;
+        assert_eq!(wal_len(&drained_path), 0, "the drain truncated them");
+        drop(drained);
+        remove_private_database(&drained_path);
+    }
+
+    /// Every writable owner bounds the WAL it keeps after a reset, and a checkpoint blocked by a
+    /// reader reports busy without losing anything, then succeeds once the reader is gone.
+    #[tokio::test]
+    async fn a_blocked_checkpoint_is_busy_not_lost_and_the_wal_residue_is_bounded() {
+        let path = private_database("agent-ide-telemetry-wal-busy");
+        let store = Store::open(&path, test_store_config()).unwrap();
+        let limit = store
+            .read_one(
+                "SELECT * FROM pragma_journal_size_limit",
+                Vec::new(),
+                |row| row.get::<_, i64>(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(limit, Some(1024 * 1024));
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM application_operation_receipts;")
+            .unwrap();
+        store
+            .execute_untracked_settled(|transaction| {
+                transaction.execute("CREATE TABLE note (value INTEGER)", [])?;
+                transaction.execute("INSERT INTO note VALUES (7)", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.checkpoint().await.unwrap(), Checkpoint::Busy);
+        assert!(wal_len(&path) > 0);
+        drop(reader);
+        assert_eq!(store.checkpoint().await.unwrap(), Checkpoint::Truncated);
+        assert_eq!(wal_len(&path), 0);
+        let value = store
+            .read_one("SELECT value FROM note", Vec::new(), |row| {
+                row.get::<_, i64>(0)
+            })
+            .await
+            .unwrap();
+        assert_eq!(value, Some(7));
+        drop(store);
+        remove_private_database(&path);
     }
 
     /// Keeps ownership through a contended background settlement so no second writer overlaps it.

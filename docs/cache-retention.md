@@ -37,6 +37,66 @@ and gone rules run first over every entry, then the budget rule over what is lef
 entry is never kept while a recent one is evicted. The budget bounds what can be reclaimed: bytes
 held by in-use caches are protected even when they alone exceed it (`cache status` reports them).
 
+## Telemetry write-ahead log
+
+Each telemetry store runs in SQLite WAL mode. Its owner connection sets
+`journal_size_limit` (1 MiB), so any WAL reset leaves at most that much allocated, and the
+telemetry writer runs `PRAGMA wal_checkpoint(TRUNCATE)` on that same owner connection, between
+transactions: after a graceful drain (`Telemetry::shutdown`, before the writer releases the store's
+lifetime lock) and whenever the writer has been quiet for 30 seconds with frames possibly pending
+(also right after opening, which covers a migration or a WAL an earlier owner left). A busy
+checkpoint (a reader holds an old snapshot) is not an error and loses nothing: the writer retries
+after the next quiet period. WAL and shared-memory files are never unlinked or edited by the
+product, and no routine `VACUUM` runs; a store that no process owns is only ever reduced by the
+SQLite connection of its next owner or removed whole by the rules above.
+
+## Telemetry marker adoption
+
+Every managed launch publishes the marker of its telemetry store before the daemon is started
+(`retention::adopt_marker`, called from `managed_telemetry_database_in`), so no new store waits
+behind the machine-wide `any` lease. The store must be exactly
+`<state root>/telemetry/<full BLAKE3 hex of the launch directory>`, and all three directories
+private; the launch directory's shared lease is held meanwhile (a sweeper's claim locks that lease,
+or `any` for a marker-less store, so it cannot run) and the chain and the store's identity are
+validated again under it. The marker is a fresh `0600` file synced and renamed over the old one, then
+read back: a marker already naming the launch is left alone, a torn one or a historical `0644`
+one (0.10.6 wrote them with the umask) is replaced, a symlink, other non-file or marker writable by
+others is refused. A live writer is unaffected (its lock is not taken and no SQLite state is
+touched). Publishing counts as a use of the store: it touches the directory's mtime, which delays
+its idle expiry. When the marker cannot be published the launch does not create a persistent
+store: the failed (empty) directory is removed, the daemon starts with its runtime-local telemetry
+database, and `errors` shows `daemon unavailable … telemetry_marker_unavailable:<io kind>`. Stores
+written before this version and never relaunched stay marker-less and keep the `any` rule above;
+nothing guesses their launch directory from the digest.
+
+## Claude hook key hints
+
+The managed Claude MCP leaves one hint directory `/private/tmp/ai-k-<16 hex of the worktree path
+digest>` per candidate (`key`, the cached rendezvous key; `candidate-attachment`). The candidate
+cannot be recovered from the truncated digest, so a hint is judged only by what it names
+(`hook_hints::collect`, run by the hourly sweep under the sweep lock and by `cache prune`;
+`cache status` counts what would go). It is removed only when **all** hold, each re-checked under
+its exclusive non-blocking directory `flock`, which a publisher (`write_claude_key_cache`,
+`write_claude_candidate_attachment`) holds shared while it writes:
+
+- a private (`0700`) real directory of this user, held open without following links and still the
+  directory at its path before it is judged and before it is removed, containing only regular
+  files of this user named `key`, `candidate-attachment` or a `key-*` temporary;
+- the directory and every file older than a day;
+- no `key` file (never published), or one whose path is unusable to a hook (not absolute and
+  normalized), or one naming a path that definitely does not exist (`NotFound`) **and** whose
+  runtime directory `ai-r-<16 hex of the key digest>` does not exist either, so no daemon a hook
+  could reach is keyed by it.
+
+A symlink, another owner or mode, an unexpected entry, an unreadable file, any lookup failing for a
+reason other than `NotFound` (the key path of a live repository exists), a busy lock or a hint
+younger than a day keeps the hint. A hint of a deleted worktree whose repository still exists is
+therefore kept: nothing guesses the worktree from the digest. Fronts older than this change publish
+without the lock, so the collection is **paused while any live `agent-ide` process is not this
+executable or a build proven to lock** (a second file proof, `HINT_LOCK_BUILD_PROOF`, embedded only together with the lock, so a build that merely takes leases does not count; version numbers are not trusted) or the
+process list is unreadable; `cache status` and `cache prune` name the blocking processes, and the
+sweep records `hook_key_hints paused=N`. Hooks only read hints and never lock.
+
 ## When
 
 Each long-lived daemon runs a background task: the first sweep 60 seconds after start (so a
@@ -89,13 +149,20 @@ daemons run, and a failed or skipped sweep is retried an hour later. Errors neve
    immediately before every A/B claim, the sweeper takes one snapshot of the effective user's
    live processes whose name starts with `agent-ide` (`proc_listallpids`, `proc_pidinfo`,
    `proc_pidpath`). Such a process *participates* only if its executable is the sweeper's own
-   file (same device and inode) or `standalone/releases/X.Y.Z/agent-ide` with `X.Y.Z` strictly
+   file (same device and inode), or `standalone/releases/X.Y.Z/agent-ide` with `X.Y.Z` strictly
    newer than 0.9.1 — older than the sweeper or not, so a session started before an upgrade
-   never pauses the upgraded sweeper. Any other — 0.9.1 or older, a dev build, a renamed
-   backup, one whose executable was deleted or cannot be read — is legacy, and
+   never pauses the upgraded sweeper — or is a **proven build**: a regular file that contains the
+   lease-protocol proof every build of this source embeds (`LEASE_BUILD_PROOF`) and was not
+   modified after the process started (a later rebuild is not the code that runs; the file is also
+   re-checked after the scan; a replacement file that keeps an older mtime than the process start
+   is the one case not noticed, because the process list offers no inode to compare). A gate or scratch `target/debug/agent-ide` is therefore recognized
+   by its contents, never by its path or name, and is listed by `cache status` as a build that
+   does not pause eviction. Any other — 0.9.1 or older, an older dev build without the proof, a
+   renamed backup, one whose executable was deleted, rebuilt since it started or cannot be read — is legacy, and
    while one is alive **no A or B entry is removed, gone ones and trash included**. The snapshot
    is unknown (and pauses everything the same way) when the process list cannot be read or is
-   truncated, or a process other than an exited one cannot be inspected. `cache status` names them. Eviction starts once old sessions end.
+   truncated, or a process other than an exited one cannot be inspected. `cache status` names
+   both groups. Eviction starts once old sessions end.
    Invariant this relies on: every published release after 0.9.1 keeps the lease protocol.
 4. **Releases.** Release evaluation — reading `current`, listing, recovery and removal, and the
    dry run too — holds `standalone/.install.lock` exclusively and non-blocking (an install in

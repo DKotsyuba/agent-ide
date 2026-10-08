@@ -362,6 +362,8 @@ fn only_this_binary_and_strictly_newer_releases_participate() {
         own: file_id(&own),
         releases: releases.clone(),
         floor: (0, 9, 1),
+        started: |_| None,
+        proofs: RefCell::default(),
     };
     let processes = vec![
         (1, Some(own.clone())),
@@ -388,6 +390,104 @@ fn only_this_binary_and_strictly_newer_releases_participate() {
         [3, 5, 6, 8, 9],
         "an unreadable executable is legacy"
     );
+}
+
+/// An identity whose processes all started at `started`.
+fn identity_started(home: &Path, started: fn(i32) -> Option<SystemTime>) -> Identity {
+    Identity {
+        started,
+        ..Identity::current(home)
+    }
+}
+
+/// Writes an executable named `agent-ide` below `dir` containing each of `proofs`.
+fn fake_build_with(dir: &Path, proofs: &[&[u8]]) -> PathBuf {
+    fs::create_dir_all(dir).unwrap();
+    let exe = dir.join("agent-ide");
+    let mut bytes = vec![0xCFu8; 3 << 20];
+    for (index, proof) in proofs.iter().enumerate() {
+        // The first straddles the first read boundary of the scanner, which reads
+        // `(1 << 20) + proof length` bytes at a time, as a proof in the middle of a real binary
+        // may; the rest sit a megabyte further on each.
+        let at = (1 << 20) + proof.len() - 7 + index * (1 << 20);
+        bytes[at..at + proof.len()].copy_from_slice(proof);
+    }
+    fs::write(&exe, bytes).unwrap();
+    exe
+}
+
+/// Writes an executable named `agent-ide` below `dir`; `proven` embeds both build proofs, as
+/// every build of this source does.
+fn fake_build(dir: &Path, proven: bool) -> PathBuf {
+    if proven {
+        fake_build_with(dir, &[LEASE_BUILD_PROOF, HINT_LOCK_BUILD_PROOF])
+    } else {
+        fake_build_with(dir, &[])
+    }
+}
+
+/// A development or test build proven to take leases does not pause eviction, an installed
+/// release up to the boundary still does, and the report names both groups.
+#[test]
+fn a_proven_test_build_does_not_pause_eviction_but_an_old_release_does() {
+    let home = scratch("test-build");
+    let dir = check_cache(&home, &home.join("deleted"));
+    let build = fake_build(&home.join("gate/target/debug"), true);
+    let identity = identity_started(&home, |_| Some(SystemTime::now() + DAY));
+    let with_build = || Some(vec![(41, Some(build.clone()))]);
+
+    let report = sweep_as(&identity, &home, false, SystemTime::now(), &with_build);
+    assert!(!report.paused(), "{report:?}");
+    assert_eq!(verdict(&report, &dir).fate, Fate::Removed);
+    let text = report.render(false);
+    assert!(
+        text.contains("take leases and do not pause eviction"),
+        "{text}"
+    );
+    assert!(text.contains("pid 41"), "{text}");
+
+    let old = home.join("standalone/releases/0.9.1/agent-ide");
+    let both = || Some(vec![(41, Some(build.clone())), (42, Some(old.clone()))]);
+    let report = sweep_as(&identity, &home, true, SystemTime::now(), &both);
+    assert!(report.paused());
+    assert_eq!(verdict(&report, &dir).fate, Fate::Paused);
+    assert!(dir.exists());
+    let text = report.render(true);
+    assert!(text.contains("pid 42") && text.contains("pid 41"), "{text}");
+}
+
+/// Only a proof inside a file that is no newer than the process proves a build: a lookalike
+/// without the proof, a rebuild after the process started, and an unreadable path stay legacy.
+#[test]
+fn an_unproven_or_rebuilt_dev_executable_stays_legacy() {
+    let home = scratch("unproven-build");
+    let unproven = fake_build(&home.join("a/target/debug"), false);
+    let proven = fake_build(&home.join("b/target/debug"), true);
+    let processes = vec![
+        (1, Some(unproven.clone())),
+        (2, Some(proven.clone())),
+        (3, Some(home.join("gone/target/debug/agent-ide"))),
+    ];
+    let later = identity_started(&home, |_| Some(SystemTime::now() + DAY));
+    let pids = |classified: Vec<Process>| classified.into_iter().map(|p| p.0).collect::<Vec<_>>();
+    let classified = later.classify(&processes);
+    assert_eq!(pids(classified.legacy), [1, 3]);
+    assert_eq!(pids(classified.builds), [2]);
+
+    // The same file, but the process started before it was written: it runs older code.
+    let earlier = identity_started(&home, |_| Some(SystemTime::UNIX_EPOCH));
+    assert_eq!(pids(earlier.classify(&processes).legacy), [1, 2, 3]);
+    // A process whose start cannot be read is unproven.
+    let unknown = identity_started(&home, |_| None);
+    assert_eq!(pids(unknown.classify(&processes).legacy), [1, 2, 3]);
+}
+
+/// The real start time of this process is readable and not in the future.
+#[test]
+fn process_start_reads_the_real_start_time() {
+    let started = process_start(std::process::id() as i32).expect("own start time");
+    assert!(started <= SystemTime::now());
+    assert!(started > SystemTime::now() - 30 * DAY);
 }
 
 /// The participation floor is the legacy boundary whatever this build's version: every release
@@ -635,4 +735,235 @@ fn sweeps_are_serialized_and_spaced() {
         SweepLock::try_acquire(&home, None).is_some(),
         "an explicit prune ignores the spacing"
     );
+}
+
+/// Creates `<home>/telemetry/<digest of launch>` as a private store with a small database file.
+fn marker_less_store(home: &Path, launch: &Path) -> PathBuf {
+    let store = home.join("telemetry").join(
+        blake3::hash(launch.as_os_str().as_bytes())
+            .to_hex()
+            .as_str(),
+    );
+    fs::create_dir_all(&store).unwrap();
+    for dir in [home.join("telemetry"), store.clone()] {
+        fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    }
+    fs::write(store.join("state.sqlite"), vec![1u8; 4096]).unwrap();
+    store
+}
+
+/// Adopting publishes a private marker naming the launch directory, leaves a correct one alone,
+/// migrates a historical `0644` one and repairs a torn one, never leaving a temporary file.
+#[test]
+fn adopting_a_marker_publishes_migrates_and_repairs_atomically() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let home = scratch("adopt");
+    let launch = home.join("project");
+    let store = marker_less_store(&home, &launch);
+    let marker = store.join(MARKER_FILE_NAME);
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let id = |path: &Path| fs::metadata(path).unwrap().ino();
+
+    adopt_marker(&home, &store, &launch).unwrap();
+    assert_eq!(fs::read(&marker).unwrap(), launch.as_os_str().as_bytes());
+    assert_eq!(mode(&marker), 0o600);
+
+    // A correct private marker is not rewritten.
+    let before = id(&marker);
+    adopt_marker(&home, &store, &launch).unwrap();
+    assert_eq!(id(&marker), before);
+
+    // A 0.10.6 marker (`fs::write` under umask 022) is safe and migrated to 0600.
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
+    adopt_marker(&home, &store, &launch).unwrap();
+    assert_eq!(mode(&marker), 0o600);
+    assert_ne!(id(&marker), before);
+
+    // A torn marker is replaced whole, and one writable by others is refused.
+    fs::write(&marker, b"/proj").unwrap();
+    adopt_marker(&home, &store, &launch).unwrap();
+    assert_eq!(fs::read(&marker).unwrap(), launch.as_os_str().as_bytes());
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(adopt_marker(&home, &store, &launch).is_err());
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let names: Vec<_> = fs::read_dir(&store)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        names.len(),
+        2,
+        "only the database and the marker remain: {names:?}"
+    );
+}
+
+/// A symlink or directory at the marker path, a store outside `<root>/telemetry`, one that is not
+/// named by the launch's digest, and a nonprivate store are all refused without touching anything.
+#[test]
+fn adopting_a_marker_refuses_unsafe_or_misplaced_state() {
+    let home = scratch("adopt-refused");
+    let launch = home.join("project");
+    let store = marker_less_store(&home, &launch);
+    let marker = store.join(MARKER_FILE_NAME);
+    let outside = home.join("outside");
+    fs::write(&outside, b"keep").unwrap();
+
+    std::os::unix::fs::symlink(&outside, &marker).unwrap();
+    assert!(adopt_marker(&home, &store, &launch).is_err());
+    assert_eq!(fs::read(&outside).unwrap(), b"keep");
+    fs::remove_file(&marker).unwrap();
+    fs::create_dir(&marker).unwrap();
+    assert!(adopt_marker(&home, &store, &launch).is_err());
+    fs::remove_dir(&marker).unwrap();
+
+    // Wrong root, wrong name, nonprivate store, replaced-by-symlink store.
+    let other_root = scratch("adopt-other-root");
+    assert!(adopt_marker(&other_root, &store, &launch).is_err());
+    assert!(adopt_marker(&home, &store, &home.join("another")).is_err());
+    let loose = marker_less_store(&home, &home.join("loose"));
+    fs::set_permissions(&loose, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    assert!(adopt_marker(&home, &loose, &home.join("loose")).is_err());
+    let moved = home.join("moved-away");
+    fs::rename(&store, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &store).unwrap();
+    assert!(adopt_marker(&home, &store, &launch).is_err());
+    assert!(!moved.join(MARKER_FILE_NAME).exists());
+}
+
+/// A live telemetry writer (its lifetime lock held) does not stop the marker from being
+/// published, and the lock stays held.
+#[test]
+fn adopting_a_marker_leaves_a_live_writer_alone() {
+    let home = scratch("adopt-writer");
+    let launch = home.join("project");
+    let store = marker_less_store(&home, &launch);
+    let writer = try_exclusive(&store.join(TELEMETRY_LOCK)).expect("writer lock");
+    adopt_marker(&home, &store, &launch).unwrap();
+    assert_eq!(
+        fs::read(store.join(MARKER_FILE_NAME)).unwrap(),
+        launch.as_os_str().as_bytes()
+    );
+    assert!(
+        try_exclusive(&store.join(TELEMETRY_LOCK)).is_none(),
+        "the writer still holds its lock"
+    );
+    drop(writer);
+}
+
+/// Adoption waits for a sweeper's exclusive claim, and refuses when the store it validated was
+/// moved to trash and replaced meanwhile instead of publishing into the stranger.
+#[test]
+fn adopting_a_marker_waits_for_a_claim_and_revalidates_the_store() {
+    let home = scratch("adopt-claim");
+    let launch = home.join("project");
+    let store = marker_less_store(&home, &launch);
+    let key = worktree_key(&launch);
+    let claim = try_exclusive(&home.join(LOCKS_DIR).join(format!("{key}.lock"))).expect("claim");
+
+    let adopting = {
+        let (home, store, launch) = (home.clone(), store.clone(), launch.clone());
+        std::thread::spawn(move || adopt_marker(&home, &store, &launch))
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !adopting.is_finished(),
+        "adoption waits behind the exclusive claim"
+    );
+    // The sweeper's rename: the validated directory is gone, another one takes its name.
+    fs::rename(&store, home.join("trashed")).unwrap();
+    let replacement = marker_less_store(&home, &launch);
+    drop(claim);
+    assert!(
+        adopting.join().unwrap().is_err(),
+        "the replaced store is refused"
+    );
+    assert!(!replacement.join(MARKER_FILE_NAME).exists());
+}
+
+/// The report's starvation case: a marker-less store is held by any unrelated lease, the adopted
+/// store (its launch directory gone) is claimable at once.
+#[test]
+fn an_adopted_store_is_no_longer_protected_by_an_unrelated_lease() {
+    let home = scratch("adopt-starvation");
+    let launch = home.join("deleted-project");
+    let store = marker_less_store(&home, &launch);
+    backdate(&store, 40 * DAY);
+    let unrelated = Lease::acquire(&home, &home.join("somewhere-else")).expect("lease");
+    let kept = sweep_with(&home, false, SystemTime::now(), &nobody);
+    assert_eq!(
+        verdict(&kept, &store).fate,
+        Fate::InUse,
+        "marker-less waits for any lease"
+    );
+
+    // Adoption takes the launch lease as well as the unrelated one held here.
+    adopt_marker(&home, &store, &launch).unwrap();
+    backdate(&store, 40 * DAY);
+    let freed = sweep_with(&home, false, SystemTime::now(), &nobody);
+    assert_eq!(verdict(&freed, &store).fate, Fate::Removed);
+    drop(unrelated);
+}
+
+/// Hook key hints are collected only while every live `agent-ide` process is this executable or a
+/// proven build: an installed release without the proof (whatever its version) may refresh a hint
+/// without the directory lock, as may an unreadable or unverifiable executable.
+#[test]
+fn hint_collection_pauses_for_any_publisher_not_proven_to_lock() {
+    let home = scratch("hint-publishers");
+    let proven = fake_build(&home.join("gate/target/debug"), true);
+    let unproven = fake_build(&home.join("old/releases/0.10.6"), false);
+    let later = identity_started(&home, |_| Some(SystemTime::now() + DAY));
+    let pids = |list: Option<Vec<Process>>| {
+        list.map(|list| list.into_iter().map(|(pid, _)| pid).collect::<Vec<_>>())
+    };
+    let snapshot = |processes: Vec<Process>| move || Some(processes.clone());
+
+    let calm = snapshot(vec![(1, Some(proven.clone()))]);
+    assert_eq!(pids(hint_publishers_unsafe_as(&later, &calm)), Some(vec![]));
+    let own = std::env::current_exe().unwrap();
+    let with_self = snapshot(vec![(1, Some(proven.clone())), (2, Some(own))]);
+    assert_eq!(
+        pids(hint_publishers_unsafe_as(&later, &with_self)),
+        Some(vec![])
+    );
+
+    let mixed = snapshot(vec![
+        (1, Some(proven.clone())),
+        (2, Some(unproven)),
+        (3, None),
+        (4, Some(home.join("gone/agent-ide"))),
+    ]);
+    assert_eq!(
+        pids(hint_publishers_unsafe_as(&later, &mixed)),
+        Some(vec![2, 3, 4])
+    );
+
+    // A rebuilt-after-start file or an unreadable start time proves nothing either.
+    let earlier = identity_started(&home, |_| Some(SystemTime::UNIX_EPOCH));
+    assert_eq!(
+        pids(hint_publishers_unsafe_as(&earlier, &calm)),
+        Some(vec![1])
+    );
+    assert_eq!(pids(hint_publishers_unsafe_as(&later, &|| None)), None);
+}
+
+/// A build that has the lease proof but predates the hint lock (a development build between the
+/// two changes) takes leases, yet may publish hints without the directory lock: it is a build for
+/// eviction and an unsafe publisher for hint collection, whichever is asked first.
+#[test]
+fn a_lease_only_build_is_not_a_hint_locking_publisher() {
+    let home = scratch("lease-only");
+    let lease_only = fake_build_with(&home.join("mid/target/debug"), &[LEASE_BUILD_PROOF]);
+    let hint_only = fake_build_with(&home.join("odd/target/debug"), &[HINT_LOCK_BUILD_PROOF]);
+    let later = identity_started(&home, |_| Some(SystemTime::now() + DAY));
+    let processes = vec![(1, Some(lease_only)), (2, Some(hint_only))];
+    let pids = |list: Vec<Process>| list.into_iter().map(|(pid, _)| pid).collect::<Vec<_>>();
+
+    // Either question first: the cache must keep the two proofs apart.
+    assert_eq!(pids(later.hint_unsafe(&processes)), [1]);
+    assert_eq!(pids(later.classify(&processes).builds), [1]);
+    let again = identity_started(&home, |_| Some(SystemTime::now() + DAY));
+    assert_eq!(pids(again.classify(&processes).builds), [1]);
+    assert_eq!(pids(again.hint_unsafe(&processes)), [1]);
 }

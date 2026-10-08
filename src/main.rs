@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use agent_ide::app::{
     AppError, DaemonStop, DoctorLockState, DoctorReport, DoctorStatus, RuntimeDir,
@@ -1305,13 +1305,13 @@ fn absolute_local_path(path: &Path) -> bool {
 }
 
 /// Fixed short namespace for deterministic shared per-repository Claude runtimes below `/private/tmp`.
-const CLAUDE_RUNTIME_PREFIX: &str = "ai-r-";
+const CLAUDE_RUNTIME_PREFIX: &str = agent_ide::hook_hints::RUNTIME_PREFIX;
 /// Bounded deadline for the local `git` rendezvous-key probe; a real repository answers instantly.
 const GIT_COMMON_DIR_TIMEOUT: Duration = Duration::from_secs(2);
 /// Fixed owner-only file carrying the full project identity and random transport attachment.
 const CLAUDE_ATTACHMENT_FILE: &str = agent_ide::app::CLAUDE_ATTACHMENT_FILE;
 /// Per-candidate attachment cache written only after the daemon registers that candidate.
-const CLAUDE_CANDIDATE_ATTACHMENT_FILE: &str = "candidate-attachment";
+const CLAUDE_CANDIDATE_ATTACHMENT_FILE: &str = agent_ide::hook_hints::ATTACHMENT_FILE;
 /// Exact record length: 64 digest bytes, one separator, 64 attachment bytes, and one newline.
 const CLAUDE_ATTACHMENT_BYTES: u64 = 130;
 
@@ -1347,9 +1347,7 @@ fn canonical_claude_project(value: Option<OsString>) -> std::io::Result<PathBuf>
 
 /// Returns the full BLAKE3 digest of one canonical rendezvous key's raw path bytes.
 fn claude_rendezvous_identity(key: &Path) -> String {
-    blake3::hash(key.as_os_str().as_bytes())
-        .to_hex()
-        .to_string()
+    agent_ide::hook_hints::rendezvous_identity(key)
 }
 
 /// Resolves the repository-wide rendezvous key shared by every worktree of one Claude candidate.
@@ -1417,9 +1415,9 @@ async fn git_common_dir(candidate: &Path) -> Option<PathBuf> {
 }
 
 /// Fixed short namespace for one candidate's non-authoritative cached rendezvous key.
-const CLAUDE_KEY_CACHE_PREFIX: &str = "ai-k-";
+const CLAUDE_KEY_CACHE_PREFIX: &str = agent_ide::hook_hints::KEY_CACHE_PREFIX;
 /// Fixed owner-only file name holding one candidate's cached rendezvous key bytes.
-const CLAUDE_KEY_CACHE_FILE: &str = "key";
+const CLAUDE_KEY_CACHE_FILE: &str = agent_ide::hook_hints::KEY_FILE;
 
 /// Derives the deterministic per-candidate path of [`claude_rendezvous_key`]'s hot-path cache.
 ///
@@ -1445,9 +1443,11 @@ fn write_claude_key_cache(candidate: &Path, key: &Path) {
     let Ok(cache) = claude_key_cache_path(candidate) else {
         return;
     };
-    if prepare_private_persistent_directory(&cache).is_err() {
+    // Shared with a hint collection's exclusive lock: a stale hint being collected is prepared
+    // again, and a hint being published is never collected.
+    let Some(_publishing) = lock_claude_key_cache(&cache) else {
         return;
-    }
+    };
     let Ok(nonce) = random_hex(8) else {
         return;
     };
@@ -1464,6 +1464,15 @@ fn write_claude_key_cache(candidate: &Path, key: &Path) {
     let _ = fs::remove_file(temporary);
 }
 
+/// Prepares one private key-cache directory and takes its shared publication lock, preparing it
+/// again when a collection removed or replaced it while waiting.
+fn lock_claude_key_cache(cache: &Path) -> Option<agent_ide::hook_hints::PublishGuard> {
+    (0..3).find_map(|_| {
+        prepare_private_persistent_directory(cache).ok()?;
+        agent_ide::hook_hints::PublishGuard::acquire(cache)
+    })
+}
+
 /// Caches the daemon-minted candidate attachment in the existing private key-cache directory.
 fn write_claude_candidate_attachment(candidate: &Path, attachment: &str) {
     if !valid_random_attachment(attachment) {
@@ -1473,6 +1482,9 @@ fn write_claude_candidate_attachment(candidate: &Path, attachment: &str) {
         return;
     }
     let Ok(cache) = claude_key_cache_path(candidate) else {
+        return;
+    };
+    let Some(_publishing) = agent_ide::hook_hints::PublishGuard::acquire(&cache) else {
         return;
     };
     let path = cache.join(CLAUDE_CANDIDATE_ATTACHMENT_FILE);
@@ -1587,11 +1599,20 @@ async fn run_cache(prune: bool) -> ExitCode {
         eprintln!("agent-ide: cannot resolve the user home");
         return ExitCode::from(2);
     };
+    let tmp = Path::new(agent_ide::hook_hints::TMP_ROOT);
     if !prune {
         print!(
             "{}",
             agent_ide::retention::sweep(&root, false).render(false)
         );
+        let hints = agent_ide::hook_hints::collect(tmp, false, SystemTime::now(), &|| true);
+        println!(
+            "hook key hints: {} in {}, {} stale and removable",
+            hints.hints,
+            tmp.display(),
+            hints.stale
+        );
+        print!("{}", hint_pause_note());
         return ExitCode::SUCCESS;
     }
     let Some(_lock) = agent_ide::retention::SweepLock::try_acquire(&root, None) else {
@@ -1608,32 +1629,121 @@ async fn run_cache(prune: bool) -> ExitCode {
     let report = agent_ide::retention::sweep(&root, true);
     report.record();
     print!("{}", report.render(true));
+    let pause = hint_pause_note();
+    if pause.is_empty() {
+        let hints = agent_ide::hook_hints::collect(
+            tmp,
+            true,
+            SystemTime::now(),
+            &agent_ide::retention::hint_publishers_safe(),
+        );
+        println!(
+            "hook key hints: {} in {}, {} stale removed",
+            hints.hints,
+            tmp.display(),
+            hints.stale
+        );
+    } else {
+        print!("hook key hints: collection paused\n{pause}");
+    }
     ExitCode::SUCCESS
+}
+
+/// Explains why hook key hints cannot be collected now, or is empty when they can: a live
+/// `agent-ide` process that is not a build proven to lock hint publication may still refresh a hint without
+/// taking the directory lock a collection relies on, so none is collected while one exists.
+fn hint_pause_note() -> String {
+    match agent_ide::retention::hint_publishers_unsafe(&agent_ide::retention::process_snapshot) {
+        Some(blocking) if blocking.is_empty() => String::new(),
+        Some(blocking) => {
+            let mut note = format!(
+                "hook key hints are not collected while {} agent-ide process(es) that may refresh a hint \
+                 without the hint lock run (only builds containing it are safe):\n",
+                blocking.len()
+            );
+            for (pid, exe) in blocking.iter().take(10) {
+                let exe = exe.as_deref().map_or("?".into(), Path::to_string_lossy);
+                note.push_str(&format!("  pid {pid} {exe}\n"));
+            }
+            if blocking.len() > 10 {
+                note.push_str(&format!("  … and {} more\n", blocking.len() - 10));
+            }
+            note
+        }
+        None => "hook key hints are not collected: the process list could not be read\n".to_owned(),
+    }
+}
+
+/// Why a candidate's persistent telemetry database path could not be derived.
+#[derive(Debug)]
+enum TelemetryStateError {
+    /// The private state directories are missing, unsafe or unavailable.
+    State,
+    /// The store directory exists but its retention marker could not be published.
+    Marker(std::io::Error),
 }
 
 /// Derives one candidate database below an explicitly supplied private Application state root.
 ///
-/// The application, telemetry, and digest directories are created or validated as `0700`. The
-/// returned database path is not opened here; unsafe or unavailable directory state returns I/O.
+/// The application, telemetry, and digest directories are created or validated as `0700`, and the
+/// digest directory gets its retention marker (the launch directory it belongs to) published
+/// atomically before the path is returned, so a store a launch uses is never marker-less. A marker
+/// failure removes the directory again when it is empty and returns [`TelemetryStateError::Marker`].
+/// The returned database path is not opened here.
 fn managed_telemetry_database_in(
     application_state: &Path,
     candidate: &Path,
-) -> std::io::Result<PathBuf> {
-    prepare_private_persistent_directory(application_state)?;
-    let telemetry = application_state.join("telemetry");
-    prepare_private_persistent_directory(&telemetry)?;
-    let candidate_state = telemetry.join(
-        blake3::hash(candidate.as_os_str().as_bytes())
-            .to_hex()
-            .as_str(),
-    );
-    prepare_private_persistent_directory(&candidate_state)?;
+) -> Result<PathBuf, TelemetryStateError> {
+    let prepare = || -> std::io::Result<PathBuf> {
+        prepare_private_persistent_directory(application_state)?;
+        let telemetry = application_state.join("telemetry");
+        prepare_private_persistent_directory(&telemetry)?;
+        let candidate_state = telemetry.join(
+            blake3::hash(candidate.as_os_str().as_bytes())
+                .to_hex()
+                .as_str(),
+        );
+        prepare_private_persistent_directory(&candidate_state)?;
+        Ok(candidate_state)
+    };
+    let candidate_state = prepare().map_err(|_| TelemetryStateError::State)?;
     // Names the launch directory so cache retention can tell when it is gone.
-    let marker = candidate_state.join(agent_ide::retention::MARKER_FILE_NAME);
-    if fs::symlink_metadata(&marker).is_err() {
-        let _ = fs::write(&marker, candidate.as_os_str().as_bytes());
+    if let Err(error) =
+        agent_ide::retention::adopt_marker(application_state, &candidate_state, candidate)
+    {
+        // Only an empty directory goes: a legacy store with data stays, as the sweeper left it.
+        let _ = fs::remove_dir(&candidate_state);
+        return Err(TelemetryStateError::Marker(error));
     }
     Ok(candidate_state.join("state.sqlite"))
+}
+
+/// Decides the persistent telemetry database a daemon for `candidate` is started with.
+///
+/// A marker that cannot be published keeps that daemon's telemetry runtime-local (the daemon's own
+/// default, `None`) rather than creating a persistent store retention could not attribute; the
+/// failure is journaled, never ignored. Unusable state directories refuse the start as before.
+fn telemetry_database_choice(
+    derived: Result<PathBuf, TelemetryStateError>,
+    candidate: &Path,
+) -> Result<Option<PathBuf>, StartDaemonError> {
+    match derived {
+        Ok(database) => Ok(Some(database)),
+        Err(TelemetryStateError::State) => Err(StartDaemonError::Other),
+        Err(TelemetryStateError::Marker(error)) => {
+            agent_ide::errorlog::record(
+                agent_ide::errorlog::Method::Daemon,
+                agent_ide::errorlog::Outcome::Unavailable,
+                agent_ide::errorlog::Fields {
+                    reason: Some(agent_ide::errorlog::ReasonCode::Internal),
+                    worktree: Some(candidate),
+                    detail: Some(&format!("telemetry_marker_unavailable:{:?}", error.kind())),
+                    ..Default::default()
+                },
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Derives the persistent telemetry-only Store path for one canonical managed worktree.
@@ -1642,24 +1752,17 @@ fn managed_telemetry_database_in(
 /// component is an opaque digest of the already-validated path, so fresh runtime generations reuse
 /// prior events while runtime cleanup cannot delete them. Unsafe or symlinked state is rejected,
 /// and Workspace/Changes authority remains in each daemon's private runtime.
-fn managed_telemetry_database(candidate: &Path) -> std::io::Result<PathBuf> {
-    let home = agent_ide::userhome::user_home()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "home is unavailable"))?;
+fn managed_telemetry_database(candidate: &Path) -> Result<PathBuf, TelemetryStateError> {
+    let home = agent_ide::userhome::user_home().ok_or(TelemetryStateError::State)?;
     if !absolute_local_path(&home) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "home is not absolute and normalized",
-        ));
+        return Err(TelemetryStateError::State);
     }
     // A relocated (`AGENT_IDE_HOME`) home may not exist yet; a real one always does.
     let _ = fs::create_dir_all(&home);
-    let home = fs::canonicalize(home)?;
-    let metadata = fs::symlink_metadata(&home)?;
+    let home = fs::canonicalize(home).map_err(|_| TelemetryStateError::State)?;
+    let metadata = fs::symlink_metadata(&home).map_err(|_| TelemetryStateError::State)?;
     if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "HOME is not owned by this user",
-        ));
+        return Err(TelemetryStateError::State);
     }
     managed_telemetry_database_in(&home.join(".agent-ide"), candidate)
 }
@@ -3150,7 +3253,7 @@ async fn start_managed_daemon(
     }
     let attachment = random_hex(32).map_err(|_| StartDaemonError::Other)?;
     let telemetry_database =
-        managed_telemetry_database(candidate).map_err(|_| StartDaemonError::Other)?;
+        telemetry_database_choice(managed_telemetry_database(candidate), candidate)?;
     let (launcher, bytes) =
         LauncherConfig::bind_one_candidate(launcher_template, &attachment, candidate)
             .map_err(|_| StartDaemonError::Other)?;
@@ -3182,16 +3285,19 @@ async fn start_managed_daemon(
         .args(["daemon", "--runtime-dir"])
         .arg(&runtime.path)
         .env("AGENT_IDE_LAUNCHER_CONFIG", launcher_path)
-        .env("AGENT_IDE_TELEMETRY_DATABASE", telemetry_database)
         .env(
             agent_ide::errorlog::LOG_KEY_ENV,
             &claude_rendezvous_identity(&log_key_source)[..16],
         )
         .env_remove("AGENT_IDE_STATE_DATABASE")
+        .env_remove("AGENT_IDE_TELEMETRY_DATABASE")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    if let Some(database) = &telemetry_database {
+        command.env("AGENT_IDE_TELEMETRY_DATABASE", database);
+    }
     match host {
         ManagedHost::Codex => {
             command.env("AGENT_IDE_MANAGED_CODEX_ATTACHMENT", &attachment);
@@ -3836,6 +3942,96 @@ mod tests {
         assert!(managed_telemetry_database_in(&state, &parent).is_err());
         fs::remove_file(&state).unwrap();
         fs::remove_dir(parent).unwrap();
+    }
+
+    /// Creates a private scratch application state root and returns it with its parent.
+    fn marker_fixture(name: &str) -> (PathBuf, PathBuf) {
+        let parent = std::env::temp_dir().join(format!(
+            "agent-ide-marker-{name}-{}-{}",
+            std::process::id(),
+            random_hex(4).unwrap()
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+        (parent.join("app"), parent)
+    }
+
+    /// The launch publishes its marker atomically, repairs a torn one and leaves no temporary.
+    #[test]
+    fn managed_telemetry_database_publishes_and_repairs_the_launch_marker() {
+        let (state, parent) = marker_fixture("publish");
+        let candidate = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let database = managed_telemetry_database_in(&state, &candidate).unwrap();
+        let marker = database
+            .parent()
+            .unwrap()
+            .join(agent_ide::retention::MARKER_FILE_NAME);
+        assert_eq!(fs::read(&marker).unwrap(), candidate.as_os_str().as_bytes());
+        assert_eq!(
+            fs::metadata(&marker).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // A torn marker (an interrupted non-atomic write) is replaced, not trusted.
+        fs::write(&marker, b"").unwrap();
+        managed_telemetry_database_in(&state, &candidate).unwrap();
+        assert_eq!(fs::read(&marker).unwrap(), candidate.as_os_str().as_bytes());
+        let leftovers = fs::read_dir(database.parent().unwrap())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    /// A marker that cannot be published is an error, never silently skipped, and the daemon is
+    /// then started without a persistent telemetry store while unusable state still refuses it.
+    #[test]
+    fn a_marker_that_cannot_be_published_is_reported_and_keeps_telemetry_runtime_local() {
+        let (state, parent) = marker_fixture("refused");
+        let candidate = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let database = managed_telemetry_database_in(&state, &candidate).unwrap();
+        let store = database.parent().unwrap().to_owned();
+        let marker = store.join(agent_ide::retention::MARKER_FILE_NAME);
+        fs::remove_file(&marker).unwrap();
+        // Something that is not a file sits where the marker belongs.
+        fs::create_dir(&marker).unwrap();
+        let derived = managed_telemetry_database_in(&state, &candidate);
+        assert!(
+            matches!(derived, Err(TelemetryStateError::Marker(_))),
+            "{derived:?}"
+        );
+        assert!(marker.is_dir(), "the foreign entry is left alone");
+        // A symlink there is refused too and never followed.
+        fs::remove_dir(&marker).unwrap();
+        let target = parent.join("elsewhere");
+        fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, &marker).unwrap();
+        assert!(matches!(
+            managed_telemetry_database_in(&state, &candidate),
+            Err(TelemetryStateError::Marker(_))
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"keep");
+
+        let marker_failure = Err(TelemetryStateError::Marker(std::io::Error::other("x")));
+        assert!(matches!(
+            telemetry_database_choice(marker_failure, &candidate),
+            Ok(None)
+        ));
+        assert!(matches!(
+            telemetry_database_choice(Err(TelemetryStateError::State), &candidate),
+            Err(StartDaemonError::Other)
+        ));
+        assert!(matches!(
+            telemetry_database_choice(Ok(database.clone()), &candidate),
+            Ok(Some(path)) if path == database
+        ));
+        fs::remove_dir_all(parent).unwrap();
     }
 
     /// Proves a telemetry query refuses a missing database without creating a SQLite file.
