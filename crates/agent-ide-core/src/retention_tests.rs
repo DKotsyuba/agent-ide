@@ -406,9 +406,10 @@ fn fake_build_with(dir: &Path, proofs: &[&[u8]]) -> PathBuf {
     let exe = dir.join("agent-ide");
     let mut bytes = vec![0xCFu8; 3 << 20];
     for (index, proof) in proofs.iter().enumerate() {
-        // The first straddles the first read boundary, as a proof in the middle of a real binary
-        // may; the rest sit further on.
-        let at = (1 << 20) - 7 + index * (1 << 20);
+        // The first straddles the first read boundary of the scanner, which reads
+        // `(1 << 20) + proof length` bytes at a time, as a proof in the middle of a real binary
+        // may; the rest sit a megabyte further on each.
+        let at = (1 << 20) + proof.len() - 7 + index * (1 << 20);
         bytes[at..at + proof.len()].copy_from_slice(proof);
     }
     fs::write(&exe, bytes).unwrap();
