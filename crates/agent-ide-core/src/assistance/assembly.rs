@@ -791,13 +791,33 @@ impl ProductDispatcher {
                     }
                     _ => {
                         // A hook that cannot correlate for a channel that never activated is
-                        // bookkeeping, not a failure; a channel that did activate keeps its warn.
-                        if self
+                        // bookkeeping, not a failure; a channel that did activate gets a per-call
+                        // warn (QW-4) naming the closed refusal, because the call it belongs to
+                        // is then refused with `missing_pre` and nothing else would say why.
+                        let bound = self
                             .bindings
                             .lock()
-                            .is_ok_and(|bindings| !bindings.channel_bound(&channel))
-                        {
-                            log_hook_inactive(&self.hook_noise, event.host());
+                            .ok()
+                            .map(|bindings| bindings.channel_bound(&channel));
+                        match bound {
+                            Some(false) => log_hook_inactive(&self.hook_noise, event.host()),
+                            Some(true) => errorlog::record(
+                                errorlog::Method::Hook,
+                                errorlog::Outcome::Unavailable,
+                                errorlog::Fields {
+                                    reason: Some(match status {
+                                        BindingStatus::Unavailable(reason) => reason.into(),
+                                        _ => errorlog::ReasonCode::Mismatch,
+                                    }),
+                                    host: Some(event.host()),
+                                    correlation: event.optional_call_id(),
+                                    detail: Some("hook_refused:active_channel"),
+                                    version: Some(env!("CARGO_PKG_VERSION")),
+                                    request: Some(hook.request_id()),
+                                    ..Default::default()
+                                },
+                            ),
+                            None => {}
                         }
                         Err(HostBindingCause::Mismatch)
                     }
@@ -1756,6 +1776,87 @@ async fn anonymous_reactivation_binds_only_its_own_attachments_named_call() {
             cause: Some(HostBindingCause::WorkerUnavailable),
         })
     );
+}
+
+/// QW-4: a hook the daemon refuses on a channel that already holds a binding leaves one warn per
+/// call with a closed reason and the call's opaque id, while the same refusal on a channel that
+/// never bound anything stays bookkeeping (no per-call warn).
+#[tokio::test]
+async fn refused_hook_of_an_active_channel_leaves_a_per_call_warn() {
+    use crate::app::transport::{HookSubmit, MethodDispatch, OpaqueJson};
+
+    let dispatcher = ProductDispatcher::default();
+    let hook = |phase: &str, call: &str, attachment: &str| {
+        AssistanceDispatch::HookSubmit(
+            HookSubmit::new(
+                "request-1",
+                call,
+                attachment,
+                OpaqueJson::from_value(
+                    &json!({"host":"claude","phase":phase,"actor_id":"session","call_id":call,"session_id":"session","agent_type":null}),
+                    64 * 1024,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+    };
+    // A channel that never bound anything: the unmatched post is bookkeeping.
+    errorlog::capture_start();
+    assert_eq!(
+        dispatcher
+            .handle(&hook("post", "ghost", "idle"), &mut None)
+            .await,
+        None
+    );
+    assert!(
+        errorlog::capture_take()
+            .iter()
+            .all(|event| event.detail.as_deref() != Some("hook_refused:active_channel"))
+    );
+
+    // Bind the channel: a pre, then the start it paired.
+    assert_eq!(
+        dispatcher
+            .handle(&hook("pre", "c1", "home"), &mut None)
+            .await,
+        Some(PeerReply::HookObserved {})
+    );
+    let start = AssistanceDispatch::MethodDispatch(
+        MethodDispatch::new(
+            "request-2",
+            "c1",
+            "home",
+            AssistanceMethod::Start,
+            OpaqueJson::from_value(
+                &json!({"parameters":{},"host_meta":{"claudecode/toolUseId":"c1"}}),
+                64 * 1024,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    );
+    dispatcher.handle(&start, &mut None).await;
+    // The same unmatched post on the now-bound channel is a per-call warn.
+    errorlog::capture_start();
+    assert_eq!(
+        dispatcher
+            .handle(&hook("post", "ghost", "home"), &mut None)
+            .await,
+        None
+    );
+    let events = errorlog::capture_take();
+    let warn = events
+        .iter()
+        .find(|event| event.detail.as_deref() == Some("hook_refused:active_channel"))
+        .unwrap_or_else(|| panic!("a per-call warn: {events:?}"));
+    assert_eq!(
+        (warn.method.as_str(), warn.level.as_str()),
+        ("hook", "warn")
+    );
+    assert_eq!(warn.correlation.as_deref(), Some("ghost"));
+    assert_eq!(warn.request.as_deref(), Some("request-1"));
+    assert!(warn.reason.is_some());
 }
 
 /// A correlated Claude request remains unavailable when this dispatcher has no configured worker.
