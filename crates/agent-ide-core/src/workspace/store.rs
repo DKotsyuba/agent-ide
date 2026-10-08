@@ -354,8 +354,8 @@ impl<'a> WorkspaceStore<'a> {
     /// The write is receipt-free: an observation is local append-only bookkeeping with no external
     /// effect, its operation id is unique per daemon and source sequence and is never replayed, and
     /// its own row carries that id, so an ambiguous commit is reconciled from the row itself. A
-    /// tracked receipt per read would exhaust the Application store's hard receipt cap (one per
-    /// observed file version), after which every durable write of the daemon is refused.
+    /// tracked receipt per read would add one row per observed file version to the Application
+    /// store's receipt ledger (retired behind the replay horizon, but never useful here).
     async fn record_with_previous(
         &self,
         draft: ObservationDraft,
