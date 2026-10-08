@@ -118,6 +118,8 @@ pub fn log_tool_reply(
             form: form.as_deref(),
             request: context.request,
             origin: context.origin,
+            delivered: context.delivered,
+            probe: context.probe,
             eligible: Some(context.parameters.is_some_and(|parameters| {
                 crate::assistance::facade::validate_call(tool, parameters.clone()).is_ok()
             })),
@@ -194,6 +196,12 @@ pub struct DispatchContext<'a> {
     pub origin: Option<&'a str>,
     /// The daemon marked this call's successful answer as built through a weaker path.
     pub degraded: bool,
+    /// For a call that retrieves a retained result by `detail_ref`: whether the inspection path
+    /// delivered it to the caller (typed evidence, not read from the failure text); `None` for a
+    /// call that retrieves nothing.
+    pub delivered: Option<bool>,
+    /// The trusted internal probe this call is (`whois`), not an agent's tool call.
+    pub probe: Option<&'static str>,
     /// The call's model parameters; `None` when the envelope carried none (refused as input).
     pub parameters: Option<&'a serde_json::Value>,
 }

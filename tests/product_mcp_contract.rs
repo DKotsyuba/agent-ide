@@ -7139,6 +7139,37 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
             .is_some_and(|text| text.contains("src/lib.rs")),
         "{outline}"
     );
+    // A lexical context answer is a degraded success that retains a result; inspecting that
+    // result after the call's own degraded mark was consumed reports it degraded again, names
+    // the call that queued it as `origin`, and is typed as delivered.
+    next += 1;
+    let context_call = next;
+    let lexical = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "context-session",
+        None,
+        "ide.context",
+        json!({"path":"src/lib.rs"}),
+    )
+    .await;
+    let detail_ref = lexical["detail_ref"]
+        .as_str()
+        .expect("a retained result")
+        .to_owned();
+    next += 1;
+    let inspected = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "context-session",
+        None,
+        "ide.inspect",
+        json!({"detail_ref": detail_ref}),
+    )
+    .await;
+    assert_ne!(inspected["state"], "unavailable", "{inspected}");
     // A request the front itself refuses never reaches the daemon; the front journals it.
     next += 1;
     let refused = mcp
@@ -7181,6 +7212,26 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
     assert_eq!(outline.outcome, "degraded", "{outline:?}");
     assert_eq!(outline.language.as_deref(), Some("rust"));
     assert_eq!(outline.form.as_deref(), Some("path"));
+    let lexical_context = events
+        .iter()
+        .find(|event| {
+            event.method == "context" && event.correlation.as_deref() == Some(detail_ref.as_str())
+        })
+        .unwrap_or_else(|| panic!("the lexical context line: {raw}"));
+    assert_eq!(lexical_context.outcome, "degraded", "{lexical_context:?}");
+    let inspection = events
+        .iter()
+        .find(|event| {
+            event.method == "inspect" && event.correlation.as_deref() == Some(detail_ref.as_str())
+        })
+        .unwrap_or_else(|| panic!("the inspection line: {raw}"));
+    assert_eq!(inspection.outcome, "degraded", "{inspection:?}");
+    assert_eq!(inspection.delivered, Some(true));
+    assert_eq!(
+        inspection.origin.as_deref(),
+        Some(format!("managed-claude-{context_call}").as_str())
+    );
+    assert_ne!(inspection.request, inspection.origin);
     let front = events
         .iter()
         .find(|event| event.detail.as_deref() == Some("front:invalid_parameters"))

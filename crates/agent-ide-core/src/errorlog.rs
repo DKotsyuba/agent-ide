@@ -738,6 +738,13 @@ pub struct Fields<'a> {
     /// Request id of the call that queued the job a line is about, on an inspection's line (QW-4);
     /// the inspection's own call id stays in `request`.
     pub origin: Option<&'a str>,
+    /// On an inspection's line: whether the inspection delivered a retained result to its caller,
+    /// as the inspection path itself reports (QW-4) — a delivered failed result is delivered, a
+    /// refused retrieval is not. Absent on a line that retrieves nothing.
+    pub delivered: Option<bool>,
+    /// A trusted internal probe the product sends itself (not an agent's tool call), for example
+    /// `whois`, the front's actor query (QW-4); the report keeps such lines out of its call counts.
+    pub probe: Option<&'static str>,
 }
 
 /// Records one event, best-effort: never blocks, never panics, never surfaces an error.
@@ -984,6 +991,15 @@ pub(crate) fn build_line(
             serde_json::Value::String(bounded_detail(origin).to_owned()),
         );
     }
+    if let Some(delivered) = fields.delivered {
+        object.insert("delivered".to_owned(), serde_json::Value::Bool(delivered));
+    }
+    if let Some(probe) = fields.probe {
+        object.insert(
+            "probe".to_owned(),
+            serde_json::Value::String(probe.to_owned()),
+        );
+    }
     if fields.dispatch {
         for (name, unknown) in [
             ("host", "unknown"),
@@ -1115,6 +1131,12 @@ pub struct LoggedEvent {
     /// Request id of the call that queued the inspected job, when the event carried one.
     #[serde(default)]
     pub origin: Option<String>,
+    /// Whether an inspection delivered a retained result, when the event carried the flag.
+    #[serde(default)]
+    pub delivered: Option<bool>,
+    /// The internal probe the event describes, when it is not an agent's call.
+    #[serde(default)]
+    pub probe: Option<String>,
 }
 
 impl Default for LoggedEvent {
@@ -1138,6 +1160,8 @@ impl Default for LoggedEvent {
             request: None,
             eligible: None,
             origin: None,
+            delivered: None,
+            probe: None,
         }
     }
 }

@@ -602,6 +602,11 @@ struct Shared {
     /// every successful inspection of that result is journaled as degraded too (QW-4). Bounded
     /// like [`Shared::requests`].
     degraded_references: Mutex<RequestIds>,
+    /// References whose retained result an inspection just delivered to its caller (typed
+    /// evidence from the inspection path itself, QW-4); the inspection's journal line takes it.
+    /// A refused retrieval (stale authority, expired or unknown reference, ...) never sets it.
+    /// Bounded like [`Shared::requests`].
+    delivered: Mutex<RequestIds>,
 }
 
 /// Most queued-job call ids [`Shared::requests`] and [`Shared::degraded`] keep; past it the oldest
@@ -655,6 +660,17 @@ impl Shared {
         {
             degraded.insert(request);
         }
+    }
+
+    /// Takes the evidence that an inspection delivered the result retained under `reference`.
+    fn take_delivery(&self, reference: &str) -> bool {
+        self.delivered.lock().is_ok_and(|mut delivered| {
+            let present = delivered.by_reference.remove(reference).is_some();
+            if present {
+                delivered.order.retain(|kept| kept != reference);
+            }
+            present
+        })
     }
 
     /// Whether the answer retained under `reference` was built through a weaker path; unlike
@@ -1164,6 +1180,7 @@ impl WorkerHandle {
                 requests: Mutex::default(),
                 degraded: Mutex::default(),
                 degraded_references: Mutex::default(),
+                delivered: Mutex::default(),
             }),
             inspect,
             receiver: Mutex::new(Some(receiver)),
@@ -1727,6 +1744,12 @@ impl WorkerHandle {
     /// once for a marked call, so exactly one terminal journal line reports it.
     pub fn take_degraded(&self, request: &str) -> bool {
         self.shared.take_degraded(request)
+    }
+
+    /// Takes the typed evidence that an inspection just delivered the retained result behind
+    /// `reference` to its caller (QW-4); `false` for a refused retrieval.
+    pub fn take_delivery(&self, reference: &str) -> bool {
+        self.shared.take_delivery(reference)
     }
 
     /// Whether the result behind `reference` was built through a weaker path (QW-4); retained, so
@@ -5649,6 +5672,15 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
         Ok::<_, InspectFailure>(reply)
     }
     .await;
+    // A retained job result reached the caller: the inspection path itself says so, whatever the
+    // result is (a cached failed read is delivered too), unlike a refused retrieval.
+    if result.is_ok()
+        && test_run_handle(&request.reference).is_none()
+        && poll_hint_run(&request.reference).is_none()
+        && let Ok(mut delivered) = shared.delivered.lock()
+    {
+        delivered.insert(request.reference.clone(), String::new());
+    }
     let reply = result.unwrap_or_else(|failure| PeerReply::Error {
         code: failure.code,
         detail: Some(failure.stage),
@@ -7945,6 +7977,7 @@ mod stop_retry_tests {
                 requests: Mutex::default(),
                 degraded: Mutex::default(),
                 degraded_references: Mutex::default(),
+                delivered: Mutex::default(),
             }),
             workspace,
             observations: WorkspaceStore::new(store),
@@ -9152,6 +9185,96 @@ mod stop_retry_tests {
             worker.shared.request_of("collected-ref").as_deref(),
             Some("req-for-collected-ref"),
             "a settled job keeps its call id for later inspections"
+        );
+    }
+
+    /// QW-4: the inspection path itself says whether it delivered a retained result: a settled
+    /// success and a cached *failed* result are delivered, a reference this daemon never minted or
+    /// no longer retains is not, and the evidence is taken once.
+    #[tokio::test]
+    async fn inspection_reports_typed_delivery_evidence() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, _) = production_start(&mut worker, "delivery-actor", "delivery-start").await;
+        let retained = |reply: PeerReply| Detail {
+            binding: binding.clone(),
+            reply,
+            selection: (AssistanceTool::Read, [0; 32]),
+            authority: None,
+            source: None,
+            native_epoch: 0,
+            line_movement: None,
+            diff_page: None,
+            diff_page_fresh: false,
+            context_page: None,
+            context_page_fresh: false,
+            diff_provenance: None,
+            extra_sources: Vec::new(),
+        };
+        {
+            let mut ledger = worker.shared.ledger.lock().unwrap();
+            ledger.details.insert(
+                "ok-ref".into(),
+                retained(PeerReply::Complete {
+                    kind: ResultKind::Outline,
+                    text: "fine".into(),
+                    detail_ref: None,
+                    truncated: false,
+                    continuation: false,
+                }),
+            );
+            ledger.details.insert(
+                "failed-ref".into(),
+                retained(PeerReply::Error {
+                    code: FailureCode::Capacity,
+                    detail: Some("store:busy".into()),
+                }),
+            );
+        }
+        let inspect = |reference: &str| {
+            let (reply, reply_rx) = oneshot::channel();
+            let request = Inspection {
+                binding: binding.clone(),
+                reference: reference.to_owned(),
+                expected: None,
+                reply,
+            };
+            let (workspace, shared) = (&worker.workspace, &worker.shared);
+            async move {
+                serve_inspection(workspace, shared, request).await;
+                reply_rx.await.unwrap()
+            }
+        };
+        assert!(matches!(
+            inspect("ok-ref").await,
+            PeerReply::Complete { .. }
+        ));
+        assert!(worker.shared.take_delivery("ok-ref"));
+        assert!(!worker.shared.take_delivery("ok-ref"), "taken once");
+        assert!(matches!(
+            inspect("failed-ref").await,
+            PeerReply::Error {
+                code: FailureCode::Capacity,
+                ..
+            }
+        ));
+        assert!(
+            worker.shared.take_delivery("failed-ref"),
+            "a cached failed result is delivered"
+        );
+        assert!(matches!(
+            inspect("never-minted-ref").await,
+            PeerReply::Error {
+                code: FailureCode::InvalidDetail,
+                ..
+            }
+        ));
+        assert!(
+            !worker.shared.take_delivery("never-minted-ref"),
+            "a refused retrieval delivers nothing"
         );
     }
 

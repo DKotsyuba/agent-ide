@@ -108,6 +108,7 @@ fn dispatch_lines_carry_closed_context_and_never_request_values() {
         None,
         &DispatchContext {
             request: Some("call-10"),
+            probe: Some("whois"),
             parameters: Some(&parameters),
             ..Default::default()
         },
@@ -122,6 +123,7 @@ fn dispatch_lines_carry_closed_context_and_never_request_values() {
         &DispatchContext {
             request: Some("call-11"),
             origin: Some("call-7"),
+            delivered: Some(true),
             parameters: Some(&parameters),
             ..Default::default()
         },
@@ -208,11 +210,17 @@ fn dispatch_lines_carry_closed_context_and_never_request_values() {
 
     assert_eq!(events[3].language.as_deref(), Some("unknown"));
     assert_eq!(events[3].host.as_deref(), Some("unknown"));
+    assert_eq!(events[3].probe.as_deref(), Some("whois"));
 
     assert_eq!(events[4].method, "inspect");
     assert_eq!(events[4].correlation.as_deref(), Some("ref-1"));
     assert_eq!(events[4].request.as_deref(), Some("call-11"));
     assert_eq!(events[4].origin.as_deref(), Some("call-7"));
+    assert_eq!(events[4].delivered, Some(true));
+    assert_eq!(
+        events[0].delivered, None,
+        "a call that retrieves nothing carries no delivery flag"
+    );
 
     // The completion records: a refusal and an unknown outcome are not successes; a success with
     // unknown diagnostics or a degraded answer is degraded; a plain answer is completed.

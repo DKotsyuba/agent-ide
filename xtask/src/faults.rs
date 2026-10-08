@@ -300,6 +300,8 @@ pub struct Report {
     keys: usize,
     /// Journal lines that were not valid JSON and were skipped (disclosed in the report).
     malformed: usize,
+    /// Internal probe lines (the front's actor query) kept out of the call counts.
+    probes: usize,
 }
 
 /// What became of the calls that answered `pending`.
@@ -343,6 +345,7 @@ impl Report {
             lifecycle: Lifecycle::default(),
             keys: 0,
             malformed: 0,
+            probes: 0,
         };
         let journals = journal_files(root)?;
         if journals.is_empty() {
@@ -399,6 +402,11 @@ impl Report {
             let correlation = record.get("correlation").and_then(Value::as_str);
             match line_kind(record) {
                 LineKind::Dispatch => {
+                    // The product's own probe (the front's actor query), not an agent's call.
+                    if record.get("probe").is_some() {
+                        self.probes += 1;
+                        continue;
+                    }
                     let day = text(record, "ts").get(..10).unwrap_or("").to_owned();
                     let outcome = text(record, "outcome");
                     if outcome == "pending" {
@@ -639,6 +647,13 @@ impl Report {
                 out,
                 "WARNING: {} journal lines were not valid JSON and were skipped; the counts are a lower bound",
                 self.malformed
+            );
+        }
+        if self.probes > 0 {
+            let _ = writeln!(
+                out,
+                "{} internal probe lines (the front's actor query) are not agent calls and are excluded",
+                self.probes
             );
         }
         out.push('\n');
@@ -937,19 +952,16 @@ fn line_kind(record: &Value) -> LineKind {
 /// Whether a non-pending dispatch line delivered the retained result of a pending job to its
 /// caller (an `ide.inspect` collection).
 ///
-/// A line of the older format is an inspection by its method. A current-format line is an
-/// inspection by its method *or* by naming the call that queued the result (`origin`: a settled
-/// edit retrieved through `ide.inspect` is journaled under `edit`), and a refusal of the retrieval
-/// itself (`inspect:*` stages: stale authority, expired or unknown reference, changed source; or a
-/// `store:*` cause) delivered nothing, so it collects nothing.
+/// A line of the older format is an inspection by its method. A current-format line carries the
+/// inspection path's own typed evidence, `delivered`: true when the retained result reached the
+/// caller whatever it was (a cached failed read is delivered), false for a refused retrieval
+/// (stale authority, expired or unknown reference, a call refused before the cache was reached),
+/// so no failure prose or method spelling decides it.
 fn delivers_result(record: &Value) -> bool {
     if record.get("version").is_none() {
         return text(record, "method") == "inspect";
     }
-    let detail = text(record, "detail");
-    (text(record, "method") == "inspect" || record.get("origin").is_some())
-        && !detail.starts_with("inspect:")
-        && !detail.starts_with("store:")
+    record.get("delivered").and_then(Value::as_bool) == Some(true)
 }
 
 /// A string field, or `""`.
@@ -1563,10 +1575,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Collection is delivery evidence, not a method spelling: a settled edit retrieved through
-    /// `ide.inspect` (journaled under `edit`, naming its `origin`) collects its pending job, while
-    /// a refused retrieval (`inspect:*` stage) delivers nothing and leaves the orphan counted; a
-    /// completion record that is a refusal is labeled by its outcome, not as a completion.
+    /// Collection is the inspection path's own typed delivery evidence, never a method spelling or
+    /// failure prose: a settled edit retrieved through `ide.inspect` (journaled under `edit`)
+    /// collects its pending job; a cached *failed* read (capacity, `store:busy`) is delivered and
+    /// collects it too (no double count with the job's failure line); a refused retrieval — stale
+    /// authority, or a host-binding refusal that still names an origin — delivers nothing and
+    /// leaves the orphan counted; a completion record that is a refusal is labeled by its outcome.
     #[test]
     fn collection_needs_delivery_evidence_and_completions_are_labeled_by_outcome() {
         let pending = |n: u32, method: &str| {
@@ -1578,14 +1592,26 @@ mod tests {
             pending(1, "edit"),
             pending(2, "read"),
             pending(3, "edit"),
-            // e-1: collected by an inspection journaled under `edit`, naming its origin.
-            r#"{"ts":"2026-10-01T10:00:10Z","method":"edit","outcome":"completed","correlation":"e-1","origin":"c-1","version":"1","request":"i-1","duration_ms":3}"#.to_owned(),
+            pending(4, "read"),
+            pending(5, "read"),
+            // e-1: collected by an inspection journaled under `edit`.
+            r#"{"ts":"2026-10-01T10:00:10Z","method":"edit","outcome":"completed","correlation":"e-1","origin":"c-1","delivered":true,"version":"1","request":"i-1","duration_ms":3}"#.to_owned(),
             // e-2: the inspection was refused (stale authority): nothing delivered; the job's own
             // failure line is the call's terminal row.
-            r#"{"ts":"2026-10-01T10:00:11Z","method":"inspect","outcome":"failed","reason":"workspace_authority","detail":"inspect:authority_stale","correlation":"e-2","version":"1","request":"i-2","origin":"c-2","duration_ms":3}"#.to_owned(),
+            r#"{"ts":"2026-10-01T10:00:11Z","method":"inspect","outcome":"failed","reason":"workspace_authority","detail":"inspect:authority_stale","correlation":"e-2","delivered":false,"version":"1","request":"i-2","origin":"c-2","duration_ms":3}"#.to_owned(),
             r#"{"ts":"2026-10-01T10:00:12Z","method":"read","outcome":"failed","reason":"internal","correlation":"e-2","request":"c-2","duration_ms":9}"#.to_owned(),
             // e-3: uncollected, and the completion record is a refusal, not a completion.
             r#"{"ts":"2026-10-01T10:00:13Z","method":"edit","outcome":"invalid","reason":"stale_source","detail":"pending_completion","correlation":"e-3","request":"c-3"}"#.to_owned(),
+            // e-4: a cached failed read delivered by the inspection (store:busy): collected; the
+            // job's failure line must not be counted again.
+            r#"{"ts":"2026-10-01T10:00:14Z","method":"inspect","outcome":"failed","reason":"capacity","detail":"store:busy","correlation":"e-4","delivered":true,"version":"1","request":"i-4","origin":"c-4","duration_ms":3}"#.to_owned(),
+            r#"{"ts":"2026-10-01T10:00:15Z","method":"read","outcome":"failed","reason":"capacity","detail":"store:busy","correlation":"e-4","request":"c-4","duration_ms":9}"#.to_owned(),
+            // e-5: an inspection refused by host binding (missing_pre) still names its origin but
+            // delivered nothing, so the orphan failure is still counted.
+            r#"{"ts":"2026-10-01T10:00:16Z","method":"inspect","outcome":"unavailable","detail":"missing_pre","correlation":"e-5","delivered":false,"version":"1","request":"i-5","origin":"c-5","duration_ms":3}"#.to_owned(),
+            r#"{"ts":"2026-10-01T10:00:17Z","method":"read","outcome":"failed","reason":"internal","correlation":"e-5","request":"c-5","duration_ms":9}"#.to_owned(),
+            // The front's private actor query is not an agent call.
+            r#"{"ts":"2026-10-01T10:00:18Z","method":"context","outcome":"unavailable","probe":"whois","version":"1","request":"w-1","duration_ms":1}"#.to_owned(),
         ];
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         let dir = journal("collect", "00000000000000b2", &refs);
@@ -1600,16 +1626,23 @@ mod tests {
                 s.uncollected_failed,
                 s.uncollected_unknown
             ),
-            (3, 1, 0, 1, 1, 0)
+            (5, 2, 0, 1, 2, 0)
         );
-        // Terminal rows: the collecting edit line, the refused inspection, the orphan job
-        // failure, the orphan refused completion — each once.
+        assert_eq!(report.probes, 1);
+        // Terminal rows, each once: the collecting edit line (e-1), the refused inspection and
+        // the orphan failure of e-2, the refused completion of e-3, the delivered failed read of
+        // e-4, the refused inspection and the orphan failure of e-5.
         let classes: Vec<&str> = report
             .calls
             .iter()
             .map(|call| call.class.as_str())
             .collect();
-        assert_eq!(report.calls.len(), 4, "{classes:?}");
+        assert_eq!(report.calls.len(), 7, "{classes:?}");
+        assert!(
+            report
+                .render(&dir, "2026-10-01", "2026-10-01", Scope::All)
+                .contains("1 internal probe lines")
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

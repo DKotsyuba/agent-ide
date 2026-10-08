@@ -123,6 +123,13 @@ request value):
   restarts per MCP front and is not used.)
 - `origin` — on an inspection's line, the `request` of the call that queued the inspected result,
   beside the inspection's own `request`; `correlation` stays the result's `detail_ref`.
+- `delivered` — on the line of a call that retrieves a retained result by `detail_ref`: `true`
+  when the inspection path itself delivered that result to the caller (a cached failed result is
+  delivered too), `false` for a refused retrieval (stale authority, expired or unknown reference, a
+  host-binding refusal). The report's notion of "collected" is this typed evidence, never failure
+  prose or the method spelling.
+- `probe` — `whois` on the line of the front's private actor query, which is the product's own
+  probe and not an agent's call; the report excludes it from its counts.
 - `eligible` — `true` when the request validated, `false` when it was refused as input.
 - `host` — `claude`, `codex` or `unknown`.
 

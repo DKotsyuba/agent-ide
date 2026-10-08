@@ -1499,6 +1499,15 @@ impl AssistanceDispatcher for ProductDispatcher {
                                     .as_deref()
                                     .is_some_and(|reference| worker.reference_degraded(reference))
                         });
+                    // The inspection path itself says whether it delivered a retained result.
+                    let delivered = requested
+                        .as_deref()
+                        .and_then(|reference| Some(self.worker.as_ref()?.take_delivery(reference)));
+                    // The front's actor query is the product's own probe, not an agent's call.
+                    let probe = envelope
+                        .as_ref()
+                        .and_then(|envelope| envelope.get("host_meta")?.get("claudecode/whois"))
+                        .map(|_| "whois");
                     adapters::log_tool_reply(
                         tool,
                         &result,
@@ -1510,6 +1519,8 @@ impl AssistanceDispatcher for ProductDispatcher {
                             request: Some(method.correlation_id()),
                             origin: origin.as_deref(),
                             degraded,
+                            delivered,
+                            probe,
                             parameters: parameters.as_ref(),
                         },
                     );
