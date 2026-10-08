@@ -132,6 +132,32 @@ fn terminate_shared_daemon(runtime: &Path) {
     }
 }
 
+/// Terminates the shared daemon at `runtime` and waits up to `budget` for it to remove its own
+/// runtime directory.
+///
+/// A managed Claude MCP watching its lease re-attaches the moment the daemon's generation ends
+/// (T15B transparent re-activation, `docs/assistance-host-binding.md`), recreating a fresh
+/// directory at the same path within milliseconds of the removal. Removal is therefore observed
+/// as the path being missing or naming a different directory (dev, inode) than before the signal;
+/// a crash-only exit keeps the same directory, so it never satisfies this wait.
+async fn terminate_shared_daemon_and_await_removal(runtime: &Path, budget: Duration) {
+    use std::os::unix::fs::MetadataExt as _;
+    let identity = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+    };
+    let before = identity(runtime).expect("the live daemon's runtime directory must exist");
+    terminate_shared_daemon(runtime);
+    tokio::time::timeout(budget, async {
+        while identity(runtime) == Some(before) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the terminated daemon must remove its own runtime directory");
+}
+
 /// Guarantees a shared daemon this test caused to be spawned is reaped, even if an assertion
 /// later in the same test panics, so a failing test cannot leak a long-lived orphan process.
 struct DaemonGuard(PathBuf);
@@ -725,22 +751,13 @@ async fn mcp_client_re_establishes_a_lost_shared_daemon_and_serves_the_next_call
     assert_reached_live_daemon(&call_ide_start(&mut mcp, 2, "before").await);
 
     // The test owns this daemon process and terminates it directly, standing in for a graceful
-    // idle shutdown, a crash, or a binary upgrade while the MCP process itself keeps running.
-    terminate_shared_daemon(&runtime);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if !runtime.exists() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the terminated daemon must remove its own runtime directory");
+    // idle shutdown, a crash, or a binary upgrade while the MCP process itself keeps running. The
+    // MCP's lease watcher may already re-attach a fresh daemon before the next call (T15B).
+    terminate_shared_daemon_and_await_removal(&runtime, Duration::from_secs(5)).await;
 
     // The very next call must reach a live daemon again, not repeat the stale unavailable error,
-    // and its own outcome must carry the T08B retry hint because it is the retried dispatch that
-    // re-established the daemon.
+    // and its own outcome must carry the T08B retry hint: whether the lease watcher or this
+    // dispatch re-established the daemon, this session's binding was replaced underneath it.
     assert_reached_live_daemon_after_reconnect(&call_ide_start(&mut mcp, 3, "after").await);
 
     wait_for_healthy_locked_daemon(&runtime).await;
@@ -784,23 +801,15 @@ async fn mcp_client_reopens_its_lease_after_re_establishing_a_lost_shared_daemon
     };
 
     // Stands in for idle shutdown, a crash, or a binary upgrade while the MCP process keeps running.
-    terminate_shared_daemon(&runtime);
-    // Orderly termination is quick (M-004 added no work to it); the margin only absorbs a loaded
-    // host, where a bare 5 seconds failed once at a load average of 60-86.
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            if !runtime.exists() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the terminated daemon must remove its own runtime directory");
+    // The MCP's lease watcher re-attaches a fresh daemon at the same path within milliseconds of
+    // the removal (T15B), which a bare existence poll misses; the helper compares directory
+    // identity instead. Orderly termination itself takes well under a second; the margin only
+    // absorbs a loaded host.
+    terminate_shared_daemon_and_await_removal(&runtime, Duration::from_secs(20)).await;
 
     // This is the first call made on this connection, and the daemon it was minted against is
-    // already gone, so this dispatch is itself the one that re-establishes it and must carry the
-    // T08B retry hint.
+    // gone. The lease watcher may already have re-established a fresh one (T15B); either way the
+    // session's binding was replaced underneath it, so this call must carry the T08B retry hint.
     assert_reached_live_daemon_after_reconnect(&call_ide_start(&mut mcp, 2, "reconnect").await);
 
     wait_for_healthy_locked_daemon(&runtime).await;
