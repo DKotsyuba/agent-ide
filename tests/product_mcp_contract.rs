@@ -6845,39 +6845,31 @@ async fn managed_claude_hook_pairs_through_project_dir_when_the_shell_cwd_left_t
     std::fs::create_dir(&outside).unwrap();
 
     let mut next = 1;
-    let mut reply = managed_claude_call_from(
+    let pending = managed_claude_call(
         &mut mcp,
         &fixture.root,
-        &outside,
         next,
         "cwd-session",
+        None,
         "ide.start",
         json!({"activation_id":"cwd-start"}),
     )
     .await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while reply["state"] == "pending" {
-        assert!(tokio::time::Instant::now() < deadline, "{reply}");
-        let detail_ref = reply["detail_ref"].clone();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        next += 1;
-        reply = managed_claude_call_from(
-            &mut mcp,
-            &fixture.root,
-            &outside,
-            next,
-            "cwd-session",
-            "ide.inspect",
-            json!({"detail_ref":detail_ref}),
-        )
-        .await;
-    }
-    assert_eq!(
-        reply["kind"], "activation",
-        "pre-hooks fired from outside the project must still pair: {reply}"
-    );
-    // The reproduced field session lost 11 of 11 calls while its cwd was outside the project.
-    for index in 0..11 {
+    let started = settle_managed_claude_start(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        "cwd-session",
+        None,
+        &pending,
+    )
+    .await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    // The reproduced field session lost 11 of 11 calls while its cwd was outside the project: the
+    // activation happened with the shell inside, then every later call fired its hook from
+    // outside. Counting (not asserting per call) reports the baseline's 11/11 in one failure.
+    let mut refused = 0;
+    for _ in 0..11 {
         next += 1;
         let paired = managed_claude_call_from(
             &mut mcp,
@@ -6889,8 +6881,14 @@ async fn managed_claude_hook_pairs_through_project_dir_when_the_shell_cwd_left_t
             json!({"kind":"problems"}),
         )
         .await;
-        assert_ne!(paired["state"], "unavailable", "call {index}: {paired}");
+        if paired["state"] == "unavailable" {
+            refused += 1;
+        }
     }
+    assert_eq!(
+        refused, 0,
+        "pre-hooks fired from outside the project must still pair; {refused} of 11 calls refused"
+    );
 
     let events = std::fs::read_to_string(journal.join("events.jsonl")).unwrap_or_default();
     assert!(
