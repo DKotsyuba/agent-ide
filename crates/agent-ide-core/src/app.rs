@@ -2079,4 +2079,23 @@ mod tests {
         assert!(matches!(error, AppError::InvalidResponse));
         assert!(probe.shutdown_called.load(Ordering::SeqCst));
     }
+
+    /// Descriptor or memory exhaustion and a handshake that died in the queue are transient accept
+    /// errors the daemon retries; a closed or invalid listener is not, and ends the daemon.
+    #[test]
+    fn transient_accept_errors_are_retried_and_listener_failures_are_not() {
+        for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert!(transient_accept_error(&io::Error::from_raw_os_error(code)), "{code}");
+        }
+        for kind in [
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::Interrupted,
+        ] {
+            assert!(transient_accept_error(&io::Error::from(kind)), "{kind:?}");
+        }
+        for code in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
+            assert!(!transient_accept_error(&io::Error::from_raw_os_error(code)), "{code}");
+        }
+    }
 }

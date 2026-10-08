@@ -603,3 +603,211 @@ async fn hook_and_method_keep_connect_write_within_the_configured_deadline() {
     }
     clock_guard.abort();
 }
+
+/// A dispatcher whose failure the test raises on demand, counting what it was asked to run.
+struct FailableDispatcher {
+    /// The failure flag; `true` once [`AssistanceDispatcher::is_failed`] must report it.
+    failed: tokio::sync::watch::Sender<bool>,
+    /// How many requests reached [`AssistanceDispatcher::dispatch`].
+    dispatched: AtomicUsize,
+}
+
+impl FailableDispatcher {
+    /// Builds a healthy dispatcher that has run nothing.
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            failed: tokio::sync::watch::Sender::new(false),
+            dispatched: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl AssistanceDispatcher for FailableDispatcher {
+    /// Answers like [`TestDispatcher`] and counts the request.
+    fn dispatch(
+        &self,
+        request: AssistanceDispatch,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = Result<AssistanceDispatchReply, AssistanceDispatchUnavailable>>
+                + Send
+                + '_,
+        >,
+    > {
+        self.dispatched.fetch_add(1, Ordering::SeqCst);
+        TestDispatcher.dispatch(request)
+    }
+
+    /// Reports the flag the test raised.
+    fn is_failed(&self) -> bool {
+        *self.failed.borrow()
+    }
+
+    /// Resolves once the test raised the flag.
+    fn failed(&self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let mut flag = self.failed.subscribe();
+        Box::pin(async move {
+            let _ = flag.wait_for(|failed| *failed).await;
+        })
+    }
+}
+
+/// Starts the in-process daemon over `dispatcher` and returns its task, whose result the caller
+/// inspects, once its private socket accepts connections.
+async fn start_failable_daemon(
+    runtime_dir: &Path,
+    dispatcher: Arc<FailableDispatcher>,
+) -> tokio::task::JoinHandle<Result<(), agent_ide::app::AppError>> {
+    let daemon_runtime = RuntimeDir::prepare_for_daemon(runtime_dir).unwrap();
+    let task = tokio::spawn(run_daemon_with_assistance(
+        daemon_runtime,
+        dispatcher,
+        EffectiveConfig::defaults(),
+        agent_ide::app::lease::DEFAULT_IDLE_TIMEOUT,
+    ));
+    let socket = runtime_dir.join("agent-ide.sock");
+    for _ in 0..200 {
+        if UnixStream::connect(&socket).await.is_ok() {
+            return task;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("Assistance daemon did not bind its private socket");
+}
+
+/// Sends one method call and returns the transport outcome.
+async fn one_context_call(runtime_dir: &Path, id: &str) -> MethodDispatchTransportResult {
+    dispatch_method_if_running(
+        runtime_dir,
+        MethodDispatch::new(
+            id,
+            id,
+            "attachment",
+            agent_ide::app::transport::AssistanceMethod::Context,
+            OpaqueJson::new("{}", 64).unwrap(),
+        )
+        .unwrap(),
+        transport_limits(),
+    )
+    .await
+}
+
+/// A failed dispatcher turns the daemon crash-only (stability QW-3): health answers `restarting`,
+/// a new call is refused as `restarting` without reaching the dispatcher, and the daemon then
+/// exits keeping its runtime directory with the store (`state.sqlite`) and receipts, retiring only
+/// the generation's launcher and attachment records.
+///
+/// Before the fix health answered `ok` for ever, the call was dispatched to the dead dispatcher, and
+/// an orderly exit deleted the whole runtime directory.
+#[tokio::test]
+async fn a_failed_dispatcher_answers_restarting_and_exits_keeping_the_runtime_store() {
+    let runtime_dir = runtime_dir();
+    let dispatcher = FailableDispatcher::new();
+    let task = start_failable_daemon(&runtime_dir, dispatcher.clone()).await;
+    fs::write(runtime_dir.join("state.sqlite"), b"receipts").unwrap();
+    fs::write(runtime_dir.join("launcher.json"), b"{}").unwrap();
+    fs::write(runtime_dir.join("attachment"), b"record").unwrap();
+    let healthy = exchange(
+        &runtime_dir,
+        json!({"version": 1, "request_id": "before", "method": "health"}),
+    )
+    .await;
+    assert_eq!(healthy["status"], "ok");
+    assert!(matches!(
+        one_context_call(&runtime_dir, "served").await,
+        MethodDispatchTransportResult::Dispatched { .. }
+    ));
+    let before = dispatcher.dispatched.load(Ordering::SeqCst);
+
+    dispatcher.failed.send_replace(true);
+    // The daemon keeps answering for a short drain, then exits; both answers must be seen in it.
+    let (mut health, mut call) = (false, false);
+    let until = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !(health && call) && tokio::time::Instant::now() < until && !task.is_finished() {
+        if let Ok(stream) = UnixStream::connect(runtime_dir.join("agent-ide.sock")).await {
+            drop(stream);
+            let reply = exchange(
+                &runtime_dir,
+                json!({"version": 1, "request_id": "during", "method": "health"}),
+            )
+            .await;
+            health |= reply["status"] == "restarting";
+        }
+        call |= one_context_call(&runtime_dir, "refused").await
+            == MethodDispatchTransportResult::Restarting;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(health, "health must answer restarting once the dispatcher failed");
+    assert!(call, "a call must be refused as restarting once the dispatcher failed");
+    assert_eq!(
+        dispatcher.dispatched.load(Ordering::SeqCst),
+        before,
+        "a refused call never reaches the failed dispatcher"
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("a failed daemon must exit")
+        .unwrap()
+        .unwrap();
+    assert_eq!(fs::read(runtime_dir.join("state.sqlite")).unwrap(), b"receipts");
+    assert!(
+        !runtime_dir.join("launcher.json").exists() && !runtime_dir.join("attachment").exists(),
+        "the generation's own records are retired so a replacement writes its own at once"
+    );
+    fs::remove_dir_all(runtime_dir).unwrap();
+}
+
+/// The failure flag, not the exit branch that wins, decides whether the runtime store survives: an
+/// exit that ends the daemon before the fault drain does (here the idle expiry; a termination
+/// signal is the same branch) must not take the orderly path that deletes the runtime directory.
+///
+/// The dispatcher is failed before the daemon starts and the idle timeout (50 ms) is far shorter
+/// than the 500 ms fault drain, so the idle branch wins; only the flag read at exit keeps the store.
+#[tokio::test]
+async fn a_failure_racing_an_idle_exit_still_keeps_the_runtime_store() {
+    let runtime_dir = runtime_dir();
+    fs::write(runtime_dir.join("state.sqlite"), b"receipts").unwrap();
+    let dispatcher = FailableDispatcher::new();
+    dispatcher.failed.send_replace(true);
+    let daemon_runtime = RuntimeDir::prepare_for_daemon(&runtime_dir).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_daemon_with_assistance(
+            daemon_runtime,
+            dispatcher,
+            EffectiveConfig::defaults(),
+            Duration::from_millis(50),
+        ),
+    )
+    .await
+    .expect("the daemon must exit")
+    .unwrap();
+    assert_eq!(
+        fs::read(runtime_dir.join("state.sqlite")).unwrap(),
+        b"receipts",
+        "a failed generation keeps the store whichever exit branch ends it"
+    );
+    fs::remove_dir_all(runtime_dir).unwrap();
+}
+
+/// Without a failure the same idle exit is orderly and removes the runtime directory, so the two
+/// tests above pin the difference to the failure flag alone.
+#[tokio::test]
+async fn an_unfailed_idle_exit_removes_the_runtime_directory() {
+    let runtime_dir = runtime_dir();
+    let daemon_runtime = RuntimeDir::prepare_for_daemon(&runtime_dir).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_daemon_with_assistance(
+            daemon_runtime,
+            FailableDispatcher::new(),
+            EffectiveConfig::defaults(),
+            Duration::from_millis(50),
+        ),
+    )
+    .await
+    .expect("the daemon must exit")
+    .unwrap();
+    assert!(!runtime_dir.exists(), "an orderly exit removes the runtime directory");
+}
