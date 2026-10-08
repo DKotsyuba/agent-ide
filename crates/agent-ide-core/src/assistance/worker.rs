@@ -598,6 +598,10 @@ struct Shared {
     /// outline fallback), set by the job and taken by whoever journals the call's terminal line
     /// (QW-4). Bounded by [`MAX_JOB_REQUESTS`].
     degraded: Mutex<BTreeSet<String>>,
+    /// Result references whose answer was built through a weaker path, retained (not consumed) so
+    /// every successful inspection of that result is journaled as degraded too (QW-4). Bounded
+    /// like [`Shared::requests`].
+    degraded_references: Mutex<RequestIds>,
 }
 
 /// Most queued-job call ids [`Shared::requests`] and [`Shared::degraded`] keep; past it the oldest
@@ -642,12 +646,23 @@ impl Shared {
     /// Marks the call that queued the job behind `reference` as answered through a weaker path
     /// (QW-4); a job nobody can attribute to a call (no id remembered) marks nothing.
     fn mark_degraded(&self, reference: &str) {
+        if let Ok(mut references) = self.degraded_references.lock() {
+            references.insert(reference.to_owned(), String::new());
+        }
         if let Some(request) = self.request_of(reference)
             && let Ok(mut degraded) = self.degraded.lock()
             && degraded.len() < MAX_JOB_REQUESTS
         {
             degraded.insert(request);
         }
+    }
+
+    /// Whether the answer retained under `reference` was built through a weaker path; unlike
+    /// [`Self::take_degraded`] it is not consumed, so every inspection of the result agrees.
+    fn reference_degraded(&self, reference: &str) -> bool {
+        self.degraded_references
+            .lock()
+            .is_ok_and(|references| references.by_reference.contains_key(reference))
     }
 
     /// Takes the degraded mark of the call `request`: `true` once per marked call.
@@ -1148,6 +1163,7 @@ impl WorkerHandle {
                 activated: Mutex::new(BTreeMap::new()),
                 requests: Mutex::default(),
                 degraded: Mutex::default(),
+                degraded_references: Mutex::default(),
             }),
             inspect,
             receiver: Mutex::new(Some(receiver)),
@@ -1711,6 +1727,12 @@ impl WorkerHandle {
     /// once for a marked call, so exactly one terminal journal line reports it.
     pub fn take_degraded(&self, request: &str) -> bool {
         self.shared.take_degraded(request)
+    }
+
+    /// Whether the result behind `reference` was built through a weaker path (QW-4); retained, so
+    /// a later successful inspection of a degraded result is journaled degraded as well.
+    pub fn reference_degraded(&self, reference: &str) -> bool {
+        self.shared.reference_degraded(reference)
     }
 
     /// The role (reader or writer) this binding's channel activated with, while it holds an
@@ -7922,6 +7944,7 @@ mod stop_retry_tests {
                 activated: Mutex::new(BTreeMap::new()),
                 requests: Mutex::default(),
                 degraded: Mutex::default(),
+                degraded_references: Mutex::default(),
             }),
             workspace,
             observations: WorkspaceStore::new(store),
@@ -9130,6 +9153,40 @@ mod stop_retry_tests {
             Some("req-for-collected-ref"),
             "a settled job keeps its call id for later inspections"
         );
+    }
+
+    /// QW-4: the degraded mark of a call is consumed once by the line that reports the call, while
+    /// the mark of its result stays, so a later successful inspection is degraded as well; a call
+    /// with no remembered id marks only its result.
+    #[tokio::test]
+    async fn degraded_provenance_is_taken_once_per_call_and_kept_for_the_result() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let worker = worker(&store, workspace, fixture.root.clone());
+        let shared = &worker.shared;
+        shared
+            .requests
+            .lock()
+            .unwrap()
+            .insert("ref-1".to_owned(), "call-1".to_owned());
+        assert!(!shared.reference_degraded("ref-1"));
+        shared.mark_degraded("ref-1");
+        assert!(
+            shared.take_degraded("call-1"),
+            "the call's own line takes the mark"
+        );
+        assert!(!shared.take_degraded("call-1"), "only once");
+        assert!(
+            shared.reference_degraded("ref-1"),
+            "the result stays degraded for later inspections"
+        );
+        assert!(
+            shared.reference_degraded("ref-1"),
+            "reading it consumes nothing"
+        );
+        shared.mark_degraded("ref-unattributed");
+        assert!(shared.reference_degraded("ref-unattributed"));
     }
 
     /// QW-6: a start whose worktree identity cannot be committed because the store is busy names

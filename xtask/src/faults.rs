@@ -309,8 +309,11 @@ struct Settlement {
     pending: usize,
     /// Pending replies a later `ide.inspect` collected.
     collected: usize,
-    /// Uncollected, and the job's completion record says it completed.
+    /// Uncollected, and the job's completion record says it succeeded (completed or degraded).
     uncollected_completed: usize,
+    /// Uncollected, and the job's completion record says it ended without success (a refused or
+    /// unknown edit, a cancelled call).
+    uncollected_refused: usize,
     /// Uncollected, and the job's failure line says it failed.
     uncollected_failed: usize,
     /// Uncollected with no completion or failure line (older journals, abandoned jobs).
@@ -404,7 +407,7 @@ impl Report {
                         pendings.extend(correlation);
                         continue;
                     }
-                    if text(record, "method") == "inspect" {
+                    if delivers_result(record) {
                         collected.extend(correlation);
                     }
                     let (class, kind) = match outcome {
@@ -451,12 +454,16 @@ impl Report {
             // in the current format (it carries the call id), so older journals keep their
             // published, dispatch-only count.
             if let Some(record) = completed.get(reference) {
-                self.settlement.uncollected_completed += 1;
                 let (class, kind) = match text(record, "outcome") {
                     "completed" => (String::new(), Kind::Ok),
                     "degraded" => (String::new(), Kind::Degraded),
                     _ => classify(text(record, "reason"), ""),
                 };
+                if matches!(kind, Kind::Ok | Kind::Degraded) {
+                    self.settlement.uncollected_completed += 1;
+                } else {
+                    self.settlement.uncollected_refused += 1;
+                }
                 let day = text(record, "ts").get(..10).unwrap_or("").to_owned();
                 self.push(key, record, day, class, kind);
             } else if let Some(record) = failed.get(reference) {
@@ -817,10 +824,12 @@ impl Report {
         let _ = writeln!(
             out,
             "\npending settlement: {} pending replies; {} collected by ide.inspect; uncollected: \
-             {} completed (completion record), {} failed (job line), {} unknown",
+             {} completed (completion record), {} refused or unknown (completion record), \
+             {} failed (job line), {} unknown",
             s.pending,
             s.collected,
             s.uncollected_completed,
+            s.uncollected_refused,
             s.uncollected_failed,
             s.uncollected_unknown
         );
@@ -923,6 +932,24 @@ fn line_kind(record: &Value) -> LineKind {
     } else {
         LineKind::Other
     }
+}
+
+/// Whether a non-pending dispatch line delivered the retained result of a pending job to its
+/// caller (an `ide.inspect` collection).
+///
+/// A line of the older format is an inspection by its method. A current-format line is an
+/// inspection by its method *or* by naming the call that queued the result (`origin`: a settled
+/// edit retrieved through `ide.inspect` is journaled under `edit`), and a refusal of the retrieval
+/// itself (`inspect:*` stages: stale authority, expired or unknown reference, changed source; or a
+/// `store:*` cause) delivered nothing, so it collects nothing.
+fn delivers_result(record: &Value) -> bool {
+    if record.get("version").is_none() {
+        return text(record, "method") == "inspect";
+    }
+    let detail = text(record, "detail");
+    (text(record, "method") == "inspect" || record.get("origin").is_some())
+        && !detail.starts_with("inspect:")
+        && !detail.starts_with("store:")
 }
 
 /// A string field, or `""`.
@@ -1533,6 +1560,56 @@ mod tests {
             report.calls.iter().map(|c| &c.class).collect::<Vec<_>>()
         );
         assert_eq!((counts[&Kind::Ok], counts[&Kind::Fault]), (2, 1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Collection is delivery evidence, not a method spelling: a settled edit retrieved through
+    /// `ide.inspect` (journaled under `edit`, naming its `origin`) collects its pending job, while
+    /// a refused retrieval (`inspect:*` stage) delivers nothing and leaves the orphan counted; a
+    /// completion record that is a refusal is labeled by its outcome, not as a completion.
+    #[test]
+    fn collection_needs_delivery_evidence_and_completions_are_labeled_by_outcome() {
+        let pending = |n: u32, method: &str| {
+            format!(
+                r#"{{"ts":"2026-10-01T10:00:0{n}Z","method":"{method}","outcome":"pending","correlation":"e-{n}","duration_ms":8000,"version":"1","request":"c-{n}"}}"#
+            )
+        };
+        let lines = [
+            pending(1, "edit"),
+            pending(2, "read"),
+            pending(3, "edit"),
+            // e-1: collected by an inspection journaled under `edit`, naming its origin.
+            r#"{"ts":"2026-10-01T10:00:10Z","method":"edit","outcome":"completed","correlation":"e-1","origin":"c-1","version":"1","request":"i-1","duration_ms":3}"#.to_owned(),
+            // e-2: the inspection was refused (stale authority): nothing delivered; the job's own
+            // failure line is the call's terminal row.
+            r#"{"ts":"2026-10-01T10:00:11Z","method":"inspect","outcome":"failed","reason":"workspace_authority","detail":"inspect:authority_stale","correlation":"e-2","version":"1","request":"i-2","origin":"c-2","duration_ms":3}"#.to_owned(),
+            r#"{"ts":"2026-10-01T10:00:12Z","method":"read","outcome":"failed","reason":"internal","correlation":"e-2","request":"c-2","duration_ms":9}"#.to_owned(),
+            // e-3: uncollected, and the completion record is a refusal, not a completion.
+            r#"{"ts":"2026-10-01T10:00:13Z","method":"edit","outcome":"invalid","reason":"stale_source","detail":"pending_completion","correlation":"e-3","request":"c-3"}"#.to_owned(),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let dir = journal("collect", "00000000000000b2", &refs);
+        let report = Report::build(&dir, "2026-10-01", "2026-10-01", Scope::All).unwrap();
+        let s = &report.settlement;
+        assert_eq!(
+            (
+                s.pending,
+                s.collected,
+                s.uncollected_completed,
+                s.uncollected_refused,
+                s.uncollected_failed,
+                s.uncollected_unknown
+            ),
+            (3, 1, 0, 1, 1, 0)
+        );
+        // Terminal rows: the collecting edit line, the refused inspection, the orphan job
+        // failure, the orphan refused completion — each once.
+        let classes: Vec<&str> = report
+            .calls
+            .iter()
+            .map(|call| call.class.as_str())
+            .collect();
+        assert_eq!(report.calls.len(), 4, "{classes:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -1493,10 +1493,12 @@ impl AssistanceDispatcher for ProductDispatcher {
                         .as_deref()
                         .and_then(|reference| self.worker.as_ref()?.request_of(reference));
                     let degraded = !matches!(result, PeerReply::Pending { .. })
-                        && self
-                            .worker
-                            .as_ref()
-                            .is_some_and(|worker| worker.take_degraded(method.correlation_id()));
+                        && self.worker.as_ref().is_some_and(|worker| {
+                            worker.take_degraded(method.correlation_id())
+                                || requested
+                                    .as_deref()
+                                    .is_some_and(|reference| worker.reference_degraded(reference))
+                        });
                     adapters::log_tool_reply(
                         tool,
                         &result,
