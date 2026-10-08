@@ -255,6 +255,21 @@ fn help_and_unknown_subcommands_print_usage() {
         );
         assert!(output.stdout.is_empty());
     }
+    for subcommand in ["cache", "daemon", "self-install"] {
+        for flag in ["--help", "-h"] {
+            let output = agent_ide().args([subcommand, flag]).output().unwrap();
+            assert_eq!(output.status.code(), Some(0), "{subcommand} {flag}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                stdout.starts_with("usage: agent-ide"),
+                "{subcommand}: {stdout}"
+            );
+            assert!(
+                stdout.contains("cache status|prune"),
+                "{subcommand}: {stdout}"
+            );
+        }
+    }
     let bad = agent_ide().arg("daemon").output().unwrap();
     assert_eq!(bad.status.code(), Some(1));
     assert!(
