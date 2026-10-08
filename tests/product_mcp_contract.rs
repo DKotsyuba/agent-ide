@@ -14142,6 +14142,65 @@ async fn configured_product_same_actor_start_on_another_root_hands_the_activatio
     daemon.wait().await.unwrap();
 }
 
+/// A real Codex reader start and repeated problems reads never create a check cache; a writer
+/// start on the same worktree creates one and the reader sees its completed diagnostics.
+#[tokio::test]
+async fn configured_product_reader_start_never_checks_and_reads_the_writers_problems() {
+    let fixture = ProductFixture::new(json!([]));
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    write_problems_count(&fixture.root, "2");
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut reader = ProductActor::new(&fixture, "m006-reader").await;
+    let started = reader
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"m006-reader","read_only":true}),
+        )
+        .await;
+    let started = reader.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let cache = home.join(".agent-ide/checks");
+    for _ in 0..5 {
+        let _ = eyes_codex_problems(&mut reader, &fixture).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !std::fs::read_dir(&cache).is_ok_and(|mut entries| entries.next().is_some()),
+        "reader scheduled a cold project check"
+    );
+    let mut writer = ProductActor::new(&fixture, "m006-writer").await;
+    let started = writer
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"m006-writer"}),
+        )
+        .await;
+    let started = writer.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    await_eyes_check_start(&home).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (problems, _) = eyes_codex_problems(&mut reader, &fixture).await;
+        if problems.starts_with("rust: ready; errors: 2") {
+            assert!(problems.contains("fake 1"), "{problems}");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "reader did not see writer problems: {problems}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = writer.call(&fixture, "ide.stop", json!({})).await;
+    let _ = reader.call(&fixture, "ide.stop", json!({})).await;
+    writer.mcp.close().await;
+    reader.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// The activation reply keeps its compact epoch line and appends the project card: one rendered
 /// block describing the fixture worktree (rust from Cargo.toml, typescript from package.json,
 /// plus the go module the shared fixture ships), with the layout, docs, and not-started server

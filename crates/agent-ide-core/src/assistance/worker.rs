@@ -8218,6 +8218,8 @@ mod stop_retry_tests {
         let (reader, _) = production_start_mode(&mut worker, "reader", "reader-start", true).await;
         let authority = worker.authority(&reader).await.unwrap();
         feed_activated(&feed, &reader, &authority);
+        assert!(!scheduler.is_busy(), "a reader start must queue no check");
+        assert_eq!(scheduler.generation(&fixture.root), 0);
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             checker.requests().is_empty(),
