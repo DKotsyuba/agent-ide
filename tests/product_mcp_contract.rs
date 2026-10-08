@@ -7122,6 +7122,23 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
     )
     .await;
     assert_ne!(context["state"], "unavailable", "{context}");
+    next += 1;
+    let outline = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        "context-session",
+        None,
+        "ide.outline",
+        json!({"path":"src/lib.rs"}),
+    )
+    .await;
+    assert!(
+        outline["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("src/lib.rs")),
+        "{outline}"
+    );
     // A request the front itself refuses never reaches the daemon; the front journals it.
     next += 1;
     let refused = mcp
@@ -7155,6 +7172,15 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
     assert_eq!(context.role.as_deref(), Some("writer"));
     assert_eq!(context.form.as_deref(), Some("kind"));
     assert_eq!(context.eligible, Some(true));
+    // With no language server configured, the outline answers from source: a degraded success
+    // marked by the daemon itself, not by the reply text.
+    let outline = events
+        .iter()
+        .find(|event| event.method == "outline" && event.request.is_some())
+        .unwrap_or_else(|| panic!("an outline dispatch line: {raw}"));
+    assert_eq!(outline.outcome, "degraded", "{outline:?}");
+    assert_eq!(outline.language.as_deref(), Some("rust"));
+    assert_eq!(outline.form.as_deref(), Some("path"));
     let front = events
         .iter()
         .find(|event| event.detail.as_deref() == Some("front:invalid_parameters"))

@@ -165,7 +165,7 @@ impl Worker<'_> {
             None => render::outline_text(&outline),
         };
         if let Some(why) = lexical.as_ref()
-            && let Some(note) = self.lexical_note(observed.path(), why)
+            && let Some(note) = self.lexical_note(job, observed.path(), why)
         {
             text.push_str(&note);
             text.push('\n');
@@ -243,7 +243,7 @@ impl Worker<'_> {
                     .ok_or_else(|| missing_symbol(job, from_text.clone()))?;
                 lexical = from_text
                     .as_ref()
-                    .and_then(|why| self.lexical_note(observed.path(), why));
+                    .and_then(|why| self.lexical_note(job, observed.path(), why));
                 (file, Some(found.range), symbol.to_string())
             }
             (None, None) => {
@@ -1631,7 +1631,8 @@ impl Worker<'_> {
     /// documentSymbols exchange failed, or it refused the file's project inputs): the outline
     /// is exact, so the call needs no repeat, but semantic facts (usages, callers) are not
     /// included. `None` when no server owns the file (nothing is loading, failed or refused).
-    fn lexical_note(&self, path: &Path, why: &Lexical) -> Option<String> {
+    /// A note makes the call a degraded success in the journal (QW-4): `job`'s call is marked.
+    fn lexical_note(&self, job: &Job, path: &Path, why: &Lexical) -> Option<String> {
         let server = self.session_server(path)?;
         let state = match why {
             Lexical::Loading => "still indexing".to_owned(),
@@ -1639,6 +1640,7 @@ impl Worker<'_> {
             Lexical::Exchange { cause } => format!("request failed: {cause}"),
             Lexical::Unverified { cause } => format!("project resolution unverified: {cause}"),
         };
+        self.shared.mark_degraded(&job.reference);
         Some(format!(
             "{}{} {state}; no need to repeat)",
             crate::telemetry::adapters::LEXICAL_OUTLINE_NOTE,
@@ -2446,7 +2448,7 @@ impl Worker<'_> {
                 let (outline, _, from_text) = self.outline_of(job, &observed, &bytes).await?;
                 let lexical = from_text
                     .as_ref()
-                    .and_then(|why| self.lexical_note(observed.path(), why));
+                    .and_then(|why| self.lexical_note(job, observed.path(), why));
                 let splice = match op.as_str() {
                     "insert" => {
                         let where_ = match job.parameters.get("where").and_then(Value::as_str) {
@@ -2769,7 +2771,7 @@ impl Worker<'_> {
             outline = Some(resolved);
             from_text
                 .as_ref()
-                .and_then(|why| self.lexical_note(observed.path(), why))
+                .and_then(|why| self.lexical_note(job, observed.path(), why))
         } else {
             None
         };

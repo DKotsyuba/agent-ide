@@ -3259,13 +3259,21 @@ impl StdioFacade {
     ) -> CallToolResult {
         let stage_parameters = parameters.clone();
         let call_started = std::time::Instant::now();
-        let request_id = context.id.to_string();
-        // The front's own journal lines (QW-4) share the daemon dispatch line's request id.
+        let host_kind = parse_host_kind(&context.meta).ok();
+        // The host's own call id: the front's journal lines (QW-4) share it with the daemon's
+        // dispatch line and the job the call queued.
+        let call_id = match host_kind {
+            Some(HostKind::Claude) => parse_claude_call_id(&context.meta).ok(),
+            Some(HostKind::Codex) => parse_candidate(&context.meta)
+                .ok()
+                .map(|candidate| candidate.call_id().to_owned()),
+            None => None,
+        };
         let front_context = crate::telemetry::adapters::DispatchContext {
-            host: parse_host_kind(&context.meta).ok(),
-            role: None,
-            request: Some(&request_id),
+            host: host_kind,
+            request: call_id.as_deref(),
             parameters: Some(&stage_parameters),
+            ..Default::default()
         };
         if let Err(error) = validate_call(tool, parameters.clone()) {
             crate::telemetry::adapters::log_front_outcome(

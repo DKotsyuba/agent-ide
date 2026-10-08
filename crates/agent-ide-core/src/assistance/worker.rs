@@ -590,15 +590,73 @@ struct Shared {
     /// native hints nothing can consume.
     /// Each entry also records the role the channel activated with (journal context only).
     activated: Mutex<BTreeMap<[u8; 32], crate::errorlog::Role>>,
-    /// Transport request id of the call that queued each live job, by result reference, so the
-    /// job's own journal lines carry the id of the front call that started it (QW-4). Bounded by
-    /// [`MAX_JOB_REQUESTS`]; an entry leaves when its job settles.
-    requests: Mutex<BTreeMap<String, String>>,
+    /// Call id of the call that queued each job, by result reference, so the job's own journal
+    /// lines and every later inspection of its result carry the id of the call that started it
+    /// (QW-4). Bounded by [`MAX_JOB_REQUESTS`]; the oldest entries are forgotten first.
+    requests: Mutex<RequestIds>,
+    /// Call ids whose successful answer was built through a weaker path (the lexical context or
+    /// outline fallback), set by the job and taken by whoever journals the call's terminal line
+    /// (QW-4). Bounded by [`MAX_JOB_REQUESTS`].
+    degraded: Mutex<BTreeSet<String>>,
 }
 
-/// Most queued-job request ids [`Shared::requests`] keeps; past it a job simply journals no id.
+/// Most queued-job call ids [`Shared::requests`] and [`Shared::degraded`] keep; past it the oldest
+/// request is forgotten and a degraded mark is simply not recorded.
 const MAX_JOB_REQUESTS: usize = 4096;
+
+/// Bounded first-in-first-out memory of which call queued which result reference.
+#[derive(Default)]
+struct RequestIds {
+    /// Call id by result reference.
+    by_reference: BTreeMap<String, String>,
+    /// References in insertion order, oldest first.
+    order: std::collections::VecDeque<String>,
+}
+
+impl RequestIds {
+    /// Remembers `request` for `reference`, forgetting the oldest entry past the bound.
+    fn insert(&mut self, reference: String, request: String) {
+        while self.order.len() >= MAX_JOB_REQUESTS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_reference.remove(&oldest);
+            }
+        }
+        if self
+            .by_reference
+            .insert(reference.clone(), request)
+            .is_none()
+        {
+            self.order.push_back(reference);
+        }
+    }
+}
 impl Shared {
+    /// The call id of the call that queued the job behind `reference`, while it is remembered.
+    fn request_of(&self, reference: &str) -> Option<String> {
+        self.requests
+            .lock()
+            .ok()
+            .and_then(|requests| requests.by_reference.get(reference).cloned())
+    }
+
+    /// Marks the call that queued the job behind `reference` as answered through a weaker path
+    /// (QW-4); a job nobody can attribute to a call (no id remembered) marks nothing.
+    fn mark_degraded(&self, reference: &str) {
+        if let Some(request) = self.request_of(reference)
+            && let Ok(mut degraded) = self.degraded.lock()
+            && degraded.len() < MAX_JOB_REQUESTS
+        {
+            degraded.insert(request);
+        }
+    }
+
+    /// Takes the degraded mark of the call `request`: `true` once per marked call.
+    fn take_degraded(&self, request: &str) -> bool {
+        self.degraded
+            .lock()
+            .is_ok_and(|mut degraded| degraded.remove(request))
+    }
+
     /// Refreshes file-resolved identities and invalidates checks for changed languages.
     fn refresh_environments(&self, worktree: &Path) {
         if let Ok(mut state) = self.environments.lock() {
@@ -1088,7 +1146,8 @@ impl WorkerHandle {
                 git_notices: Mutex::new(BTreeMap::new()),
                 environments: Mutex::default(),
                 activated: Mutex::new(BTreeMap::new()),
-                requests: Mutex::new(BTreeMap::new()),
+                requests: Mutex::default(),
+                degraded: Mutex::default(),
             }),
             inspect,
             receiver: Mutex::new(Some(receiver)),
@@ -1642,6 +1701,18 @@ impl WorkerHandle {
             .is_ok_and(|activated| activated.contains_key(&binding.fingerprint()))
     }
 
+    /// The call id of the call that queued the job behind result `reference`, while remembered
+    /// (QW-4): an inspection's journal line names it as the `origin` of the inspected result.
+    pub fn request_of(&self, reference: &str) -> Option<String> {
+        self.shared.request_of(reference)
+    }
+
+    /// Takes the mark that the call `request` was answered through a weaker path (QW-4): `true`
+    /// once for a marked call, so exactly one terminal journal line reports it.
+    pub fn take_degraded(&self, request: &str) -> bool {
+        self.shared.take_degraded(request)
+    }
+
     /// The role (reader or writer) this binding's channel activated with, while it holds an
     /// activation; `None` before the first start and after the stop. Journal context only.
     pub fn role_of(&self, binding: &BindingRef) -> Option<crate::errorlog::Role> {
@@ -1872,7 +1943,6 @@ impl WorkerHandle {
         }
         if let Some(request) = request
             && let Ok(mut requests) = self.shared.requests.lock()
-            && requests.len() < MAX_JOB_REQUESTS
         {
             requests.insert(reference.clone(), request.to_owned());
         }
@@ -2927,12 +2997,7 @@ impl<'a> Worker<'a> {
             },
             other => other,
         };
-        let request = self
-            .shared
-            .requests
-            .lock()
-            .ok()
-            .and_then(|mut requests| requests.remove(&job.reference));
+        let request = self.shared.request_of(&job.reference);
         if let PeerReply::Error { code, .. } = &reply {
             // T26B: a queued job's terminal failure must reach the error log with its closed
             // reason even when no caller view ever does — the dispatch path only logs the initial
@@ -3047,36 +3112,41 @@ impl<'a> Worker<'a> {
                     ..
                 }
             );
-            if sender.send(reply).is_ok() {
-                if let Some(mark_reply) = mark_reply {
-                    self.shared.mark_feedback_inline_delivered(
-                        &binding,
+            match sender.send(reply) {
+                Ok(()) => {
+                    if let Some(mark_reply) = mark_reply {
+                        self.shared.mark_feedback_inline_delivered(
+                            &binding,
+                            &job.reference,
+                            &mark_reply,
+                        );
+                    }
+                    if paged {
+                        // Page one just reached the caller through this settlement, so the first
+                        // `ide.inspect` of its `detail_ref` must serve page two, not repeat page
+                        // one (T16B) — for every paged kind, symbol cards and outlines included.
+                        // Only a lost receiver leaves the page undelivered and fresh.
+                        self.shared.mark_page_delivered(&job.reference);
+                    }
+                }
+                // The caller stopped waiting and was told `pending`; a result nobody collects
+                // would otherwise leave no trace at all (QW-4). The completion record classifies
+                // the job's own terminal reply like a dispatch line, its reference joins it to the
+                // pending dispatch line and to any later `ide.inspect`, and a failure already has
+                // its own line above.
+                Err(undelivered) if !failed => {
+                    let degraded = request
+                        .as_deref()
+                        .is_some_and(|request| self.shared.take_degraded(request));
+                    crate::telemetry::adapters::log_pending_completion(
+                        job.tool,
+                        &undelivered,
                         &job.reference,
-                        &mark_reply,
+                        request.as_deref(),
+                        degraded,
                     );
                 }
-                if paged {
-                    // Page one just reached the caller through this settlement, so the first
-                    // `ide.inspect` of its `detail_ref` must serve page two, not repeat page one
-                    // (T16B) — for every paged kind, symbol cards and outlines included. Only a
-                    // lost receiver leaves the page undelivered and fresh.
-                    self.shared.mark_page_delivered(&job.reference);
-                }
-            } else if !failed {
-                // The caller stopped waiting and was told `pending`; a result nobody collects
-                // would otherwise leave no trace at all (QW-4). The line is the job's completion
-                // record: its own reference as `correlation` joins it to the pending dispatch line
-                // and to any later `ide.inspect`, and a failure already has its own line above.
-                crate::errorlog::record(
-                    errorlog_method(job.tool),
-                    crate::errorlog::Outcome::Completed,
-                    crate::errorlog::Fields {
-                        correlation: Some(job.reference.as_str()),
-                        detail: Some("pending_completion"),
-                        request: request.as_deref(),
-                        ..Default::default()
-                    },
-                );
+                Err(_) => {}
             }
         }
     }
@@ -4041,11 +4111,15 @@ impl<'a> Worker<'a> {
         } else {
             self.semantic_context(job, &observed, &bytes, query).await
         };
+        let shared = self.shared.clone();
+        // A lexical answer is a success through a weaker path: the call is marked degraded (QW-4).
         let lexical = |job: &mut Job, reason: &'static str| {
-            lexical_context(&observed, &bytes, query, reason).map_err(|_| {
-                job.failure_detail = Some(format!("context:observation_failed:{path_detail}"));
-                FailureCode::SourceUnavailable
-            })
+            lexical_context(&observed, &bytes, query, reason)
+                .inspect(|_| shared.mark_degraded(&job.reference))
+                .map_err(|_| {
+                    job.failure_detail = Some(format!("context:observation_failed:{path_detail}"));
+                    FailureCode::SourceUnavailable
+                })
         };
         let (context, diagnostics) = match semantic {
             Ok(Some(result)) => (result.context, Some(result.diagnostics)),
@@ -4073,11 +4147,13 @@ impl<'a> Worker<'a> {
                     .clone()
                     .unwrap_or_else(|| "semantic project resolution is unverified".to_owned());
                 (
-                    lexical_context(&observed, &bytes, query, &reason).map_err(|_| {
-                        job.failure_detail =
-                            Some(format!("context:observation_failed:{path_detail}"));
-                        FailureCode::SourceUnavailable
-                    })?,
+                    lexical_context(&observed, &bytes, query, &reason)
+                        .inspect(|_| shared.mark_degraded(&job.reference))
+                        .map_err(|_| {
+                            job.failure_detail =
+                                Some(format!("context:observation_failed:{path_detail}"));
+                            FailureCode::SourceUnavailable
+                        })?,
                     None,
                 )
             }
@@ -7844,7 +7920,8 @@ mod stop_retry_tests {
                 git_notices: Mutex::new(BTreeMap::new()),
                 environments: Mutex::default(),
                 activated: Mutex::new(BTreeMap::new()),
-                requests: Mutex::new(BTreeMap::new()),
+                requests: Mutex::default(),
+                degraded: Mutex::default(),
             }),
             workspace,
             observations: WorkspaceStore::new(store),
@@ -9048,9 +9125,10 @@ mod stop_retry_tests {
         assert_eq!(records[0].outcome, "completed");
         assert_eq!(records[0].correlation.as_deref(), Some("abandoned-ref"));
         assert_eq!(records[0].request.as_deref(), Some("req-for-abandoned-ref"));
-        assert!(
-            worker.shared.requests.lock().unwrap().is_empty(),
-            "a settled job releases its request id"
+        assert_eq!(
+            worker.shared.request_of("collected-ref").as_deref(),
+            Some("req-for-collected-ref"),
+            "a settled job keeps its call id for later inspections"
         );
     }
 

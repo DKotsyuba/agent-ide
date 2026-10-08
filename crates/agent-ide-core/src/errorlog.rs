@@ -730,6 +730,14 @@ pub struct Fields<'a> {
     /// `false` when the request was refused as input (it never validated), `true` when it was a
     /// well-formed request; absent when the line does not describe a request (QW-4).
     pub eligible: Option<bool>,
+    /// `true` on a call's own dispatch or front line (QW-4): every context field the call could
+    /// not name is then written as an explicit closed value (`host` `unknown`, `role`, `language`,
+    /// `form` and `request` `none`; a file no registered language owns is `language` `unknown`),
+    /// so the field is present on every such line and an absent value is never a missing one.
+    pub dispatch: bool,
+    /// Request id of the call that queued the job a line is about, on an inspection's line (QW-4);
+    /// the inspection's own call id stays in `request`.
+    pub origin: Option<&'a str>,
 }
 
 /// Records one event, best-effort: never blocks, never panics, never surfaces an error.
@@ -970,6 +978,25 @@ pub(crate) fn build_line(
     if let Some(eligible) = fields.eligible {
         object.insert("eligible".to_owned(), serde_json::Value::Bool(eligible));
     }
+    if let Some(origin) = fields.origin {
+        object.insert(
+            "origin".to_owned(),
+            serde_json::Value::String(bounded_detail(origin).to_owned()),
+        );
+    }
+    if fields.dispatch {
+        for (name, unknown) in [
+            ("host", "unknown"),
+            ("role", "none"),
+            ("language", "none"),
+            ("form", "none"),
+            ("request", "none"),
+        ] {
+            object
+                .entry(name.to_owned())
+                .or_insert_with(|| serde_json::Value::String(unknown.to_owned()));
+        }
+    }
     if let Some(duration_ms) = fields.duration_ms {
         object.insert(
             "duration_ms".to_owned(),
@@ -1085,6 +1112,9 @@ pub struct LoggedEvent {
     /// Whether the request was well formed, when the event carried the flag.
     #[serde(default)]
     pub eligible: Option<bool>,
+    /// Request id of the call that queued the inspected job, when the event carried one.
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 impl Default for LoggedEvent {
@@ -1107,6 +1137,7 @@ impl Default for LoggedEvent {
             form: None,
             request: None,
             eligible: None,
+            origin: None,
         }
     }
 }
