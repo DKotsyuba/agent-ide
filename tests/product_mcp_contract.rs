@@ -3562,10 +3562,11 @@ fn managed_runtime_paths(fixture: &ProductFixture) -> std::collections::BTreeSet
 /// A managed Codex test that fails or panics ends its MCP with `SIGKILL`, which skips the MCP's own
 /// cleanup and orphans the daemon it owns (possibly `SIGSTOP`-ed or stalled in a seam). The guard
 /// finds the runtimes created since `before` whose launcher record targets exactly this fixture's
-/// repository, resumes then kills the pid the daemon recorded in its held lock, waits (at most five
-/// seconds) for the lock to be released and removes the runtime directory. On a passing test every
-/// daemon is already gone and the guard does nothing; it signals nothing it did not identify
-/// through the lock and never touches another fixture's runtime.
+/// repository, resumes then kills the pid the daemon recorded in its held lock, and waits (at most
+/// five seconds, by a monotonic deadline) for the lock to be released. It removes the runtime
+/// directory only once the lock is released, so a daemon that survives stays visible instead of
+/// losing its files. On a passing test every daemon is already gone and the guard does nothing; it
+/// signals nothing it did not identify through the lock and never touches another fixture's runtime.
 struct ManagedCodexCleanup {
     /// The fixture's repository root, as its runtimes' launcher records name it.
     roots: [PathBuf; 2],
@@ -3627,11 +3628,15 @@ impl Drop for ManagedCodexCleanup {
                     libc::kill(pid, libc::SIGCONT);
                     libc::kill(pid, libc::SIGKILL);
                 }
-                for _ in 0..100 {
-                    if !agent_ide_core::app::lock_is_held(&path) {
-                        break;
-                    }
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while agent_ide_core::app::lock_is_held(&path)
+                    && std::time::Instant::now() < deadline
+                {
                     std::thread::sleep(Duration::from_millis(50));
+                }
+                if agent_ide_core::app::lock_is_held(&path) {
+                    // The daemon survived: keep its runtime so the leftover stays visible.
+                    continue;
                 }
             }
             let _ = std::fs::remove_dir_all(&path);
