@@ -19,7 +19,7 @@
 //! copies. Std and `serde_json` only.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
@@ -297,8 +297,8 @@ impl Report {
             .filter_map(|record| record.get("request")?.as_str())
             .collect();
         let mut collected: HashSet<&str> = HashSet::new();
-        let mut completed: HashSet<&str> = HashSet::new();
-        let mut failed: HashSet<&str> = HashSet::new();
+        let mut completed: HashMap<&str, &Value> = HashMap::new();
+        let mut failed: HashMap<&str, &Value> = HashMap::new();
         let mut pendings: Vec<&str> = Vec::new();
         for record in &window {
             let correlation = record.get("correlation").and_then(Value::as_str);
@@ -341,9 +341,9 @@ impl Report {
                         && TOOLS.contains(&text(record, "method"))
                     {
                         if text(record, "detail") == "pending_completion" {
-                            completed.insert(correlation);
+                            completed.insert(correlation, record);
                         } else if text(record, "outcome") != "completed" {
-                            failed.insert(correlation);
+                            failed.insert(correlation, record);
                         }
                     }
                 }
@@ -352,10 +352,28 @@ impl Report {
         for reference in pendings {
             if collected.contains(reference) {
                 self.settlement.collected += 1;
-            } else if completed.contains(reference) {
+                continue;
+            }
+            // A result nobody collected still ends the call: its own terminal row is counted
+            // once. A completion record always identifies its call; a job-failure line does only
+            // in the current format (it carries the call id), so older journals keep their
+            // published, dispatch-only count.
+            if let Some(record) = completed.get(reference) {
                 self.settlement.uncollected_completed += 1;
-            } else if failed.contains(reference) {
+                let (class, kind) = match text(record, "outcome") {
+                    "completed" => (String::new(), Kind::Ok),
+                    "degraded" => (String::new(), Kind::Degraded),
+                    _ => classify(text(record, "reason"), ""),
+                };
+                let day = text(record, "ts").get(..10).unwrap_or("").to_owned();
+                self.push(key, record, day, class, kind);
+            } else if let Some(record) = failed.get(reference) {
                 self.settlement.uncollected_failed += 1;
+                if record.get("request").is_some() {
+                    let (class, kind) = classify(text(record, "reason"), text(record, "detail"));
+                    let day = text(record, "ts").get(..10).unwrap_or("").to_owned();
+                    self.push(key, record, day, class, kind);
+                }
             } else {
                 self.settlement.uncollected_unknown += 1;
             }
@@ -1356,10 +1374,13 @@ mod tests {
             pending(2),
             pending(3),
             pending(4),
-            // d-1 collected; d-2 completed uncollected; d-3 failed uncollected; d-4 unknown.
+            pending(5),
+            // d-1 collected; d-2 completed uncollected; d-3 failed uncollected (older format, no
+            // call id); d-4 unknown; d-5 failed uncollected (current format, carries the call id).
             r#"{"ts":"2026-10-01T10:00:09Z","method":"inspect","outcome":"completed","correlation":"d-1","duration_ms":3}"#.to_owned(),
             r#"{"ts":"2026-10-01T10:00:10Z","method":"diff","outcome":"completed","detail":"pending_completion","correlation":"d-2"}"#.to_owned(),
             r#"{"ts":"2026-10-01T10:00:11Z","method":"diff","outcome":"failed","reason":"deadline","correlation":"d-3","duration_ms":120000}"#.to_owned(),
+            r#"{"ts":"2026-10-01T10:00:12Z","method":"diff","outcome":"failed","reason":"internal","correlation":"d-5","request":"c-5","duration_ms":9}"#.to_owned(),
         ];
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         let dir = journal("settle", "00000000000000cd", &refs);
@@ -1373,14 +1394,20 @@ mod tests {
                 s.uncollected_failed,
                 s.uncollected_unknown
             ),
-            (4, 1, 1, 1, 1)
+            (5, 1, 1, 2, 1)
         );
-        assert_eq!(report.pending.values().sum::<usize>(), 4);
+        assert_eq!(report.pending.values().sum::<usize>(), 5);
+        // The inspection, the uncollected completion record and the uncollected current-format
+        // failure are terminal calls, each counted once; the older-format failure keeps the
+        // published dispatch-only count.
+        let counts = report.tally(|_| true);
         assert_eq!(
             report.calls.len(),
-            1,
-            "only the inspection is a terminal call"
+            3,
+            "{:?}",
+            report.calls.iter().map(|c| &c.class).collect::<Vec<_>>()
         );
+        assert_eq!((counts[&Kind::Ok], counts[&Kind::Fault]), (2, 1));
         let _ = fs::remove_dir_all(&dir);
     }
 
