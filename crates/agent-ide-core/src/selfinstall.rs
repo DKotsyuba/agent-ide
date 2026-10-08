@@ -345,6 +345,26 @@ fn install(options: &Options) -> Result<Summary, String> {
             ));
             fs::rename(&selected, &retired)
                 .map_err(|error| format!("{}: {error}", selected.display()))?;
+            // The earlier check can race a process that started afterwards. Once renamed, any
+            // process still running from the old copy reports the retired path, so look again
+            // and put the release back untouched rather than replace one in use.
+            let still_used = match release_user(&retired) {
+                Ok(None) => None,
+                Ok(Some(user)) => Some(user),
+                Err(reason) => Some(reason),
+            };
+            if let Some(user) = still_used {
+                fs::rename(&retired, &selected).map_err(|error| {
+                    format!(
+                        "{}: {user}; restoring it failed: {error}",
+                        selected.display()
+                    )
+                })?;
+                return Err(format!(
+                    "refusing to replace {}: {user}; stop it and retry",
+                    selected.display()
+                ));
+            }
             install_release(&options.release, &selected, &options.version)?;
         }
         Reinstall::Identical => {}
