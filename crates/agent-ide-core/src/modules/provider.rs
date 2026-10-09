@@ -989,7 +989,10 @@ impl<B: ProviderBuilder> ModuleServer for ProviderServer<B> {
                     io::ErrorKind::NotFound => Cause::ToolMissing,
                     io::ErrorKind::PermissionDenied => Cause::PolicyRefused,
                     _ if !alive => Cause::Exited,
-                    _ => Cause::Malformed,
+                    // A live provider that failed this one request (an error reply) keeps
+                    // serving, as an in-process session does: the request fails, the module
+                    // is not retired.
+                    _ => return Ok(Answer::error(ErrorCode::Failed, "provider request failed")),
                 };
                 Answer::unavailable(Stage::Provider, cause, "provider request failed")
             }

@@ -183,6 +183,9 @@ pub struct Supervisor<L: Launcher> {
     instance: u64,
     /// Stderr of the latest instance, kept after it is gone.
     stderr: Arc<Mutex<StderrTail>>,
+    /// Why an instance's cleanup could not be proven: its admission stays held and no
+    /// replacement starts; every later demand is refused `drain` with this cause.
+    unreaped: Option<Cause>,
 }
 
 /// Whether `cause` repeats until the accepted inputs change.
@@ -206,6 +209,7 @@ impl<L: Launcher> Supervisor<L> {
             blocked: None,
             instance: 0,
             stderr: Arc::default(),
+            unreaped: None,
         }
     }
 
@@ -258,8 +262,25 @@ impl<L: Launcher> Supervisor<L> {
         match live.channel.call(call, remaining, effects).await {
             Ok(reply) => Ok(reply),
             Err(failure) => {
-                self.retire(true).await;
+                self.retire(true).await?;
                 Err(failure)
+            }
+        }
+    }
+
+    /// Retires the live instance after a reply the core cannot use, counting it as a crash.
+    pub async fn retire_failed(&mut self) -> Result<(), ModuleUnavailable> {
+        self.retire(true).await
+    }
+
+    /// Reaps `process`; a cleanup that cannot be proven marks the slot unreaped and is returned
+    /// as its `drain` failure.
+    async fn reap(&mut self, process: L::Process) -> Result<(), ModuleUnavailable> {
+        match self.launcher.reap(process).await {
+            Ok(()) => Ok(()),
+            Err(cause) => {
+                self.unreaped = Some(cause);
+                Err(self.unavailable(Stage::Drain, cause, None))
             }
         }
     }
@@ -267,13 +288,16 @@ impl<L: Launcher> Supervisor<L> {
     /// Makes sure a live instance exists before `deadline`.
     async fn ready(&mut self, deadline: Instant) -> Result<(), ModuleUnavailable> {
         if let Some(process) = self.starting.take() {
-            let _ = self.launcher.reap(process).await;
+            self.reap(process).await?;
+        }
+        if let Some(cause) = self.unreaped {
+            return Err(self.unavailable(Stage::Drain, cause, None));
         }
         if let Some(live) = self.live.as_mut() {
             if live.channel.idle_fault().is_none() {
                 return Ok(());
             }
-            self.retire(true).await;
+            self.retire(true).await?;
         }
         if let Some((inputs, stage, cause)) = &self.blocked {
             if *inputs == self.launcher.inputs() {
@@ -336,7 +360,7 @@ impl<L: Launcher> Supervisor<L> {
                 Ok(())
             }
             Err(failure) => {
-                let _ = self.launcher.reap(process).await;
+                self.reap(process).await?;
                 if deterministic(failure.cause) {
                     self.blocked = Some((self.launcher.inputs(), failure.stage, failure.cause));
                 } else {
@@ -347,27 +371,33 @@ impl<L: Launcher> Supervisor<L> {
         }
     }
 
-    /// Takes the live instance out, reaps it and, for a failure, records a crash.
-    async fn retire(&mut self, failed: bool) {
+    /// Takes the live instance out, reaps it and, for a failure, records a crash; a cleanup
+    /// that cannot be proven is the `drain` failure.
+    async fn retire(&mut self, failed: bool) -> Result<(), ModuleUnavailable> {
         if let Some(live) = self.live.take() {
             drop(live.stderr);
-            let _ = self.launcher.reap(live.process).await;
             if failed {
                 self.budget.record(Instant::now());
             }
+            self.reap(live.process).await?;
         }
+        Ok(())
     }
 
-    /// Stops the live instance in order: `shutdown`, then the launcher's reap. Not a crash.
+    /// Stops the live instance in order: `shutdown`, then the launcher's reap. Not a crash. A
+    /// cleanup that cannot be proven, now or earlier, is returned (and every later stop and
+    /// demand keeps refusing with it).
     pub async fn stop(&mut self) -> Result<(), Cause> {
         if let Some(process) = self.starting.take() {
-            self.launcher.reap(process).await?;
+            self.reap(process).await.map_err(|failure| failure.cause)?;
         }
-        let Some(mut live) = self.live.take() else {
-            return Ok(());
-        };
-        live.channel.shutdown().await;
-        self.launcher.reap(live.process).await
+        if let Some(mut live) = self.live.take() {
+            live.channel.shutdown().await;
+            self.reap(live.process)
+                .await
+                .map_err(|failure| failure.cause)?;
+        }
+        self.unreaped.map_or(Ok(()), Err)
     }
 }
 
@@ -398,6 +428,8 @@ mod tests {
         reaps: u32,
         /// Started modules never answer `hello`.
         silent: bool,
+        /// Every reap fails to prove its cleanup.
+        unprovable: bool,
     }
 
     impl FakeLauncher {
@@ -410,6 +442,7 @@ mod tests {
                 launches: 0,
                 reaps: 0,
                 silent: false,
+                unprovable: false,
             }
         }
     }
@@ -454,6 +487,9 @@ mod tests {
         async fn reap(&mut self, process: Self::Process) -> Result<(), Cause> {
             self.reaps += 1;
             process.abort();
+            if self.unprovable {
+                return Err(Cause::ReapUnverified);
+            }
             Ok(())
         }
 
@@ -572,6 +608,68 @@ mod tests {
             supervisor.launcher.reaps, 2,
             "every failed instance was reaped"
         );
+    }
+
+    /// A failed instance whose cleanup cannot be proven settles the call `drain`
+    /// `reap_unverified`, and no replacement starts: every later demand is refused the same way.
+    #[tokio::test(start_paused = true)]
+    async fn an_unproven_reap_blocks_replacement() {
+        let mut launcher = FakeLauncher::new(vec![Ok(Some((Capability::Outline, Fault::Exit)))]);
+        launcher.unprovable = true;
+        let mut supervisor = slot(launcher);
+        let error = call(&mut supervisor, Capability::Outline)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (error.stage, error.cause),
+            (Stage::Drain, Cause::ReapUnverified)
+        );
+        tokio::time::sleep(RESTART_DELAYS[0] * 2).await;
+        let error = call(&mut supervisor, Capability::FileDoc)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (error.stage, error.cause),
+            (Stage::Drain, Cause::ReapUnverified)
+        );
+        assert_eq!(supervisor.launcher.launches, 1, "no replacement started");
+        assert_eq!(supervisor.stop().await, Err(Cause::ReapUnverified));
+
+        // A stop whose own reap cannot be proven keeps the slot unreaped as well.
+        let mut supervisor = slot(FakeLauncher::new(Vec::new()));
+        call(&mut supervisor, Capability::FileDoc).await.unwrap();
+        supervisor.launcher.unprovable = true;
+        assert_eq!(supervisor.stop().await, Err(Cause::ReapUnverified));
+        assert_eq!(supervisor.stop().await, Err(Cause::ReapUnverified));
+        let error = call(&mut supervisor, Capability::FileDoc)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (error.stage, error.cause),
+            (Stage::Drain, Cause::ReapUnverified)
+        );
+        assert_eq!(
+            supervisor.launcher.launches, 1,
+            "no replacement after the stop"
+        );
+    }
+
+    /// A reply the core cannot use retires the live instance as a counted crash; the next demand
+    /// starts a fresh one after the backoff.
+    #[tokio::test(start_paused = true)]
+    async fn an_unusable_reply_retires_the_instance() {
+        let mut supervisor = slot(FakeLauncher::new(Vec::new()));
+        call(&mut supervisor, Capability::FileDoc).await.unwrap();
+        supervisor.retire_failed().await.unwrap();
+        assert!(!supervisor.is_live());
+        assert_eq!(supervisor.launcher.reaps, 1);
+        let started = Instant::now();
+        call(&mut supervisor, Capability::FileDoc).await.unwrap();
+        assert!(
+            Instant::now() >= started + RESTART_DELAYS[0],
+            "counted as a crash"
+        );
+        assert_eq!(supervisor.instance, 2);
     }
 
     /// A crash loop exhausts the budget (`restart_exhausted` with a retry time, no further
