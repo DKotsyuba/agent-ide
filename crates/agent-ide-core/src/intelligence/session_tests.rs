@@ -1269,4 +1269,9 @@ async fn remote_context_checks_generation_and_diagnostic_binding() {
         !live.is_alive(),
         "a reply for another generation retires the session"
     );
+    assert_eq!(
+        live.remote_fault(),
+        Some("pilot module answered for another generation"),
+        "and is a module fault its owner turns into a typed refusal"
+    );
 }

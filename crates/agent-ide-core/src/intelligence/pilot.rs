@@ -209,8 +209,9 @@ impl Channel {
         }
     }
 
-    /// Records the first fault and returns it as an error.
-    fn poison(&mut self, fault: String) -> io::Error {
+    /// Records the first fault and returns it as an error; the owner also poisons the channel
+    /// for a well-framed reply it cannot accept (ill-typed, another generation).
+    pub fn poison(&mut self, fault: String) -> io::Error {
         let fault = self.fault.get_or_insert(fault).clone();
         io::Error::other(fault)
     }
