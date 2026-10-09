@@ -16,11 +16,11 @@ use std::{
 use serde::de::DeserializeOwned;
 
 use super::{
-    contract::Outcome,
     contract::{
         Capability, Cause, HelloOffer, Limits, ModuleConfig, ModuleId, ModuleUnavailable, PROTOCOL,
         Role, Stage, VERSION,
     },
+    contract::{Outcome, QUEUE_DEPTH},
     host::{Call, EffectRunner, NoEffects},
     launch::{ExecutionLauncher, MODULE_ENV, ModuleExecutable},
     mode::{LanguageModes, Mode},
@@ -57,8 +57,19 @@ pub fn budget_or(default: Duration) -> Duration {
         .map_or(default, |ms| Duration::from_millis(ms.clamp(100, 60_000)))
 }
 
+/// One supervised slot: its supervisor (one request in flight), the callers waiting for it and
+/// the stop signal that cancels them.
+struct SlotState {
+    /// The instance's supervisor; holding it is having the one in-flight request.
+    supervisor: tokio::sync::Mutex<Supervisor<ExecutionLauncher>>,
+    /// Callers waiting for the supervisor, bounded by [`QUEUE_DEPTH`].
+    waiting: std::sync::atomic::AtomicU32,
+    /// Cancelled when the slot stops: in-flight and waiting calls end at once.
+    stopping: tokio_util::sync::CancellationToken,
+}
+
 /// One supervised slot.
-type Slot = Arc<tokio::sync::Mutex<Supervisor<ExecutionLauncher>>>;
+type Slot = Arc<SlotState>;
 
 /// The daemon's module routing state.
 pub struct ModuleHost {
@@ -283,11 +294,11 @@ impl ModuleHost {
             requested_caps: Vec::new(),
             config,
         };
-        let slot = Arc::new(tokio::sync::Mutex::new(Supervisor::new(
-            launcher,
-            offer,
-            STARTUP_BUDGET,
-        )));
+        let slot = Arc::new(SlotState {
+            supervisor: tokio::sync::Mutex::new(Supervisor::new(launcher, offer, STARTUP_BUDGET)),
+            waiting: std::sync::atomic::AtomicU32::new(0),
+            stopping: tokio_util::sync::CancellationToken::new(),
+        });
         slots.insert(key, slot.clone());
         Ok(slot)
     }
@@ -332,9 +343,6 @@ impl ModuleHost {
         budget: Duration,
         effects: &mut dyn EffectRunner,
     ) -> Result<T, ModuleUnavailable> {
-        let slot = self.slot(language, worktree, role).await?;
-        let mut supervisor = slot.lock().await;
-        let reply = supervisor.call(call, budget, effects).await?;
         let failure = |cause| ModuleUnavailable {
             module_id: ModuleId::bundled(language.name()),
             module_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -343,6 +351,55 @@ impl ModuleHost {
             cause,
             instance: None,
             retry_after_ms: None,
+        };
+        // One deadline covers the wait for the instance and the call itself.
+        let deadline = tokio::time::Instant::now() + budget;
+        let slot = self.slot(language, worktree, role).await?;
+        let queued = slot
+            .waiting
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let waited = if queued >= QUEUE_DEPTH {
+            Err(Stage::Admission)
+        } else {
+            tokio::select! {
+                supervisor = tokio::time::timeout_at(deadline, slot.supervisor.lock()) => {
+                    supervisor.map_err(|_| Stage::Request)
+                }
+                _ = slot.stopping.cancelled() => Err(Stage::Request),
+            }
+        };
+        slot.waiting
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        let mut supervisor = match waited {
+            Ok(supervisor) => supervisor,
+            Err(Stage::Admission) => {
+                return Err(ModuleUnavailable {
+                    stage: Stage::Admission,
+                    ..failure(Cause::ResourceLimit)
+                });
+            }
+            Err(_) if slot.stopping.is_cancelled() => {
+                return Err(ModuleUnavailable {
+                    stage: Stage::Request,
+                    ..failure(Cause::Exited)
+                });
+            }
+            Err(stage) => {
+                return Err(ModuleUnavailable {
+                    stage,
+                    ..failure(Cause::Timeout)
+                });
+            }
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let reply = tokio::select! {
+            reply = supervisor.call(call, remaining, effects) => reply?,
+            _ = slot.stopping.cancelled() => {
+                return Err(ModuleUnavailable {
+                    stage: Stage::Request,
+                    ..failure(Cause::Exited)
+                });
+            }
         };
         match reply.outcome {
             Outcome::Result(value) => decode(value).map_err(|_| failure(Cause::Malformed)),
@@ -372,7 +429,9 @@ impl ModuleHost {
                 .collect()
         };
         for slot in stopping {
-            let _ = slot.lock().await.stop().await;
+            // Cancel the in-flight and waiting calls first, so the stop never queues behind them.
+            slot.stopping.cancel();
+            let _ = slot.supervisor.lock().await.stop().await;
         }
     }
 
@@ -386,7 +445,9 @@ impl ModuleHost {
             .map(|(_, slot)| slot)
             .collect();
         for slot in stopping {
-            let _ = slot.lock().await.stop().await;
+            // Cancel the in-flight and waiting calls first, so the stop never queues behind them.
+            slot.stopping.cancel();
+            let _ = slot.supervisor.lock().await.stop().await;
         }
     }
 }
