@@ -2943,17 +2943,35 @@ async fn cancel_owned(
             "owned process grace exceeds limit",
         )));
     }
-    if let Some(status) = process.child.try_wait()? {
-        return Ok(status);
-    }
-    let pid = process
-        .child
-        .id()
-        .ok_or_else(|| io::Error::other("owned child has no live PID"))?;
+    let Some(pid) = process.child.id() else {
+        // Already reaped by an earlier wait: its PID may be reused, so nothing is signalled.
+        return process
+            .child
+            .try_wait()?
+            .ok_or_else(|| ProcessError::Io(io::Error::other("owned child has no live PID")));
+    };
     let mut evidence = process.cancellation.unwrap_or(CancellationEvidence {
         term_requested: false,
         kill_requested: false,
     });
+    if leader_exited_unreaped(pid) {
+        // The leader already exited but stays unreaped, so its PID still pins the group id:
+        // tear down surviving group members before the reap that would release it.
+        evidence.term_requested |= signal_group(pid, libc::SIGTERM).is_ok();
+        process.cancellation = Some(evidence);
+        let deadline_at = Instant::now() + grace;
+        while group_alive(pid) && Instant::now() < deadline_at {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if group_alive(pid) {
+            evidence.kill_requested |= signal_group(pid, libc::SIGKILL).is_ok();
+            process.cancellation = Some(evidence);
+        }
+        return timeout(deadline, process.child.wait())
+            .await
+            .map_err(|_| ProcessError::ReapTimedOut)?
+            .map_err(ProcessError::Io);
+    }
     evidence.term_requested |= signal_group(pid, libc::SIGTERM).is_ok();
     process.cancellation = Some(evidence);
     match timeout(grace, process.child.wait()).await {
@@ -3108,6 +3126,47 @@ fn signal_group(pid: u32, signal: libc::c_int) -> io::Result<()> {
             io::ErrorKind::Unsupported,
             "process groups are unavailable on this platform",
         ))
+    }
+}
+
+/// Whether the direct child `pid` has exited but is not yet reaped, observed without reaping it
+/// (`WNOWAIT`), so its PID and process group id cannot have been reused.
+fn leader_exited_unreaped(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: an all-zero `siginfo_t` is a valid plain-data value for the kernel to fill.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is writable; WNOWAIT leaves the child waitable, WNOHANG never blocks,
+        // and `pid` is this process's own unreaped direct child.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        result == 0 && info.si_pid == pid as libc::pid_t
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Whether any member of the owned process group led by `pid` still exists.
+fn group_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 only checks existence and permission; nothing is delivered.
+        let result = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
+        result == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
     }
 }
 

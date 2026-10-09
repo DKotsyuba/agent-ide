@@ -663,6 +663,74 @@ async fn captured_streams_are_bounded_but_drained() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// A leader that already exited still has its group torn down: a TERM-resistant descendant left
+/// in the owned group is killed after the grace, before the leader's reap releases its PID.
+#[tokio::test]
+async fn cancellation_signals_the_group_after_the_leader_exited() {
+    let root = worktree();
+    let marker = root.join("descendant.pid");
+    let script = format!(
+        "(trap '' TERM; echo $$ > '{}'.tmp; mv '{}'.tmp '{}'; exec sleep 600) </dev/null >/dev/null 2>&1 & exit 0",
+        marker.display(),
+        marker.display(),
+        marker.display()
+    );
+    let request = request(&root, &script);
+    let mut admission = AdmissionController::new(AdmissionLimits {
+        total_running: 1,
+        per_owner_running: 1,
+        per_owner_queued: 1,
+        total_queued: 1,
+        interactive_burst: 1,
+    })
+    .unwrap();
+    let lease = match admission.submit(OwnerId::new("owner").unwrap(), AdmissionClass::Interactive)
+    {
+        Admission::Granted(lease) => lease,
+        outcome => panic!("unexpected admission: {outcome:?}"),
+    };
+    let child = execution::OwnedChild::spawn_captured(&request, lease, None, 64).unwrap();
+    let descendant = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(text) = fs::read_to_string(&marker) {
+                return text.trim().parse::<libc::pid_t>().unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the descendant started");
+    // Let the leader exit; it stays an unreaped zombie until the reap below.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // SAFETY: signal 0 only checks that the descendant exists.
+    assert_eq!(unsafe { libc::kill(descendant, 0) }, 0, "descendant alive");
+    let result = child
+        .cancel_and_reap(Duration::from_millis(200), Duration::from_secs(2))
+        .await
+        .unwrap();
+    let cancellation = result.evidence.cancellation().expect("group signalled");
+    assert!(cancellation.term_requested && cancellation.kill_requested);
+    assert!(
+        result.evidence.status().success(),
+        "the leader itself exited 0"
+    );
+    let gone = tokio::time::timeout(Duration::from_secs(5), async {
+        // SAFETY: signal 0 only checks existence of the former descendant.
+        while unsafe { libc::kill(descendant, 0) } == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(gone.is_ok(), "the TERM-resistant descendant was killed");
+    assert!(
+        admission
+            .release_reaped(result.settlement)
+            .unwrap()
+            .is_empty()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// Separates cancellation request acknowledgement from direct-child reaping evidence.
 #[tokio::test]
 async fn cancellation_reports_reap_without_claiming_descendants() {
