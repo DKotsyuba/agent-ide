@@ -1320,3 +1320,170 @@ async fn the_daemon_open_path_reaches_a_ready_rust_analyzer() {
     eprintln!("ready after {:?}", started.elapsed());
     let _ = child.kill().await;
 }
+
+/// A language server that completes the handshake as the accepted rust-analyzer, reports itself
+/// quiescent and fails every documentSymbols and references request (copied from the product
+/// suite's in-process control).
+const EXCHANGE_STUB_SERVER: &str = r#"
+const send = (message) => {
+  const text = JSON.stringify(message);
+  process.stdout.write(`Content-Length: ${Buffer.byteLength(text)}\r\n\r\n${text}`);
+};
+const reply = (id, result) => send({ jsonrpc: '2.0', id, result });
+const fail = (id) => send({ jsonrpc: '2.0', id, error: { code: -32603, message: 'fixture exchange failure' } });
+let buffer = Buffer.alloc(0);
+process.stdin.on('data', (chunk) => {
+  buffer = Buffer.concat([buffer, chunk]);
+  for (;;) {
+    const header = buffer.indexOf('\r\n\r\n');
+    if (header < 0) return;
+    const length = parseInt(buffer.slice(0, header).toString().match(/Content-Length: (\d+)/)?.[1] ?? '0', 10);
+    if (buffer.length < header + 4 + length) return;
+    const message = JSON.parse(buffer.slice(header + 4, header + 4 + length).toString());
+    buffer = buffer.slice(header + 4 + length);
+    switch (message.method) {
+      case 'initialize':
+        reply(message.id, {
+          capabilities: {
+            textDocumentSync: 1,
+            documentSymbolProvider: true,
+            hoverProvider: true,
+            referencesProvider: true,
+          },
+          serverInfo: { name: 'rust-analyzer', version: '1.98.1 (48a229ce 2026-09-01)' },
+        });
+        break;
+      case 'shutdown':
+        reply(message.id, null);
+        break;
+      case 'exit':
+        process.exit(0);
+      case 'textDocument/documentSymbol':
+      case 'textDocument/references':
+        fail(message.id);
+        break;
+      default:
+        if (message.id !== undefined) reply(message.id, null);
+    }
+  }
+});
+const report = () => {
+  send({ jsonrpc: '2.0', method: 'experimental/serverStatus', params: { health: 'ok', quiescent: true } });
+  setTimeout(report, 100);
+};
+report();
+"#;
+
+/// The module-mode twin of the in-process `configured_product_failed_exchange_rust_outline_
+/// answers_from_source` (pinned in process): a provider that is ready but fails documentSymbols
+/// and references. The outline and a symbol read answer from the exact source outline with the
+/// module's typed cause in the footer, a file the source scanner refuses keeps its refusal, and
+/// the symbol card's live sections name the typed `rust: module_unavailable (bundled.rust:…)`.
+#[tokio::test]
+#[ignore = "requires the accepted AGENT_IDE_NODE and AGENT_IDE_RUST_TOOLCHAIN_DIR inputs"]
+async fn a_failed_provider_exchange_answers_from_source_with_typed_attribution() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("exchange-stub-{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let stub = base.join("exchange-stub-server.mjs");
+    std::fs::write(&stub, EXCHANGE_STUB_SERVER).unwrap();
+    let wrapper = base.join("exchange-rust-provider");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec '{}' '{}'\n",
+            input("AGENT_IDE_NODE"),
+            stub.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = input("AGENT_IDE_RUST_TOOLCHAIN_DIR");
+    let fixture = Fixture::new(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"exchange\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "/// Answers broken.\npub fn value() -> i32 { 7 }\n\npub fn caller() -> i32 { value() }\n",
+            ),
+            (
+                "src/refused.rs",
+                "// attached to the item below\npub fn refused() {}\n",
+            ),
+        ],
+        json!([{
+            "executable":accepted(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
+            "settings":"rust_cache_priming_disabled_v1",
+            "toolchain":"1.98.1-aarch64-apple-darwin",
+            "cargo":accepted(&format!("{dir}/bin/cargo"),"cargo 1.98.1"),
+            "cargo_version":"cargo 1.98.1",
+            "rustc":accepted(&format!("{dir}/bin/rustc"),"rustc 1.98.1"),
+            "rustc_version":"rustc 1.98.1",
+            "trust":"fixture-disabled",
+            "cache_namespace":"module-rust-exchange"
+        }]),
+    );
+    let daemon = Daemon::start(&fixture, &[MODULE]).await;
+    let mut session = Session::start(&fixture).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let outline = loop {
+        let reply = session
+            .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+            .await;
+        if reply["kind"] == "outline"
+            && !reply["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("still indexing")
+        {
+            break reply;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the outline never settled: {reply}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let text = outline["text"].as_str().unwrap_or_default();
+    assert!(text.contains("pub fn value() -> i32"), "{outline}");
+    assert!(
+        text.contains("outline: from source, exact (")
+            && text.contains("module_unavailable (bundled.rust:"),
+        "the exchange-failed outline answers from source with the typed cause: {outline}"
+    );
+    let read = session
+        .call(&fixture, "ide.read", json!({"symbol":"src/lib.rs#value"}))
+        .await;
+    let read_text = read["text"].as_str().unwrap_or_default();
+    assert!(read_text.contains("pub fn value()"), "{read}");
+    assert!(
+        read_text.contains("outline: from source, exact ("),
+        "{read}"
+    );
+    let refused = session
+        .call(&fixture, "ide.outline", json!({"path":"src/refused.rs"}))
+        .await;
+    assert_eq!(refused["code"], "provider_unavailable", "{refused}");
+    let symbol = session
+        .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#value"}))
+        .await;
+    let card = symbol["text"].as_str().unwrap_or_default();
+    assert_eq!(symbol["kind"], "symbol", "{symbol}");
+    assert!(
+        card.contains("signature: pub fn value() -> i32"),
+        "{symbol}"
+    );
+    assert!(
+        card.contains("usages: unavailable (rust: module_unavailable (bundled.rust:"),
+        "the card's live sections name the typed module fault: {symbol}"
+    );
+    session.close(&fixture).await;
+    drop(daemon);
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -13726,7 +13726,18 @@ async fn configured_product_failed_exchange_rust_outline_answers_from_source() {
     fixture.git(&["add", "--", "src/lib.rs", "src/refused.rs"]);
     fixture.git(&["commit", "--quiet", "-m", "failed exchange fixture"]);
 
-    let mut daemon = fixture.daemon().await;
+    // In-process fallback coverage (pinned until the Rust in-process path is deleted): its stage
+    // wording is the in-process one; the module-mode twin with typed attribution is
+    // `a_failed_provider_exchange_answers_from_source_with_typed_attribution`.
+    let mut daemon = fixture
+        .spawn_configured_daemon_with_env(
+            None,
+            false,
+            Duration::from_secs(30),
+            None,
+            &[("AGENT_IDE_LANGUAGE_MODE", "rust=in_process")],
+        )
+        .await;
     let mut actor = ProductActor::new(&fixture, "exchange-lexical").await;
     let started = actor
         .call(
