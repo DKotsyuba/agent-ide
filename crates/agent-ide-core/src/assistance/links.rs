@@ -211,7 +211,7 @@ fn usage(shown: &ShownSite, key: Option<&NameKey>, is_test: bool) -> Usage {
 }
 
 /// The index-state and coverage lines a bridge reply ends with.
-fn notes(uncovered: &BTreeSet<Lang>, state: IndexState) -> Vec<String> {
+fn notes(uncovered: &BTreeSet<Lang>, state: IndexState, capped: usize) -> Vec<String> {
     let mut lines = Vec::new();
     if !uncovered.is_empty() {
         let ids: Vec<&str> = uncovered.iter().map(|language| language.name()).collect();
@@ -220,6 +220,13 @@ fn notes(uncovered: &BTreeSet<Lang>, state: IndexState) -> Vec<String> {
     if let IndexState::Partial { indexed, listed } = state {
         lines.push(format!(
             "links: partial (indexed {indexed} of {listed} files); counts are indexed, not live"
+        ));
+    }
+    if capped > 0 {
+        lines.push(format!(
+            "links: {} hit the per-file limit of {} facts; counts are lower bounds",
+            counted(capped, "file"),
+            crate::lang::names::MAX_FACTS_PER_FILE
         ));
     }
     lines
@@ -291,6 +298,8 @@ struct CardLinks {
     linked_total: usize,
     /// Present languages that cannot state the involved namespaces.
     uncovered: BTreeSet<Lang>,
+    /// Indexed files whose facts hit the per-file limit.
+    capped: usize,
 }
 
 /// What a name card shows for one key, gathered on the blocking pool.
@@ -308,6 +317,8 @@ struct NameLinks {
     uses: Proven,
     /// Present languages that cannot state the namespace.
     uncovered: BTreeSet<Lang>,
+    /// Indexed files whose facts hit the per-file limit.
+    capped: usize,
 }
 
 impl Worker<'_> {
@@ -441,6 +452,7 @@ impl Worker<'_> {
                     .into_iter()
                     .flat_map(|namespace| index.uncovered(namespace))
                     .collect(),
+                capped: index.capped_files(),
             }
         })
         .await?;
@@ -555,7 +567,8 @@ impl Worker<'_> {
                 ));
             }
         }
-        card.links.extend(notes(&gathered.uncovered, state));
+        card.links
+            .extend(notes(&gathered.uncovered, state, gathered.capped));
         Ok(())
     }
 
@@ -704,6 +717,7 @@ impl Worker<'_> {
                         defines_dropped: defines.dropped,
                         uses,
                         uncovered: index.uncovered(key.namespace).into_iter().collect(),
+                        capped: index.capped_files(),
                         key,
                     }
                 })
@@ -788,7 +802,7 @@ impl Worker<'_> {
                 usages_indexed: true,
                 usages_dropped: links.uses.dropped + links.defines_dropped,
                 report_empty_usages: true,
-                links: notes(&links.uncovered, state),
+                links: notes(&links.uncovered, state, links.capped),
                 ..Default::default()
             };
             if links.uses.more > 0 {
@@ -944,5 +958,26 @@ mod tests {
         assert_eq!(selector("<a class=\"{{ x }}\">"), "<a class=\"{{ x }}\">");
         assert_eq!(selector("--accent: #f60; /* brand */"), "--accent: #f60;");
         assert_eq!(selector(".btn { /* base */"), ".btn");
+    }
+
+    /// A reply ends with its coverage, partial-index and per-file-limit lines, in that order.
+    #[test]
+    fn notes_disclose_coverage_partial_index_and_the_fact_limit() {
+        assert!(notes(&BTreeSet::new(), IndexState::Ready, 0).is_empty());
+        let notes = notes(
+            &BTreeSet::new(),
+            IndexState::Partial {
+                indexed: 3,
+                listed: 9,
+            },
+            2,
+        );
+        assert_eq!(
+            notes,
+            [
+                "links: partial (indexed 3 of 9 files); counts are indexed, not live",
+                "links: 2 files hit the per-file limit of 5000 facts; counts are lower bounds",
+            ]
+        );
     }
 }
