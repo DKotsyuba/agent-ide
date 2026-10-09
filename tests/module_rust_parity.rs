@@ -154,7 +154,9 @@ fn semantic() -> Vec<(&'static str, Value)> {
 /// an edit (whose reply carries no text) by its structured reply. An edit's `status` plate is
 /// left out: it carries whatever check result happens to be due at that moment.
 fn record(fixture: &Fixture, tool: &str, arguments: &Value, reply: &Value) -> String {
-    let mut entry = parity::line_for(fixture, tool, arguments, reply);
+    let mut arguments = arguments.clone();
+    mask_refs(&mut arguments);
+    let mut entry = parity::line_for(fixture, tool, &arguments, reply);
     if tool == "ide.edit" {
         let mut body = reply.clone();
         if let Some(object) = body.as_object_mut() {
@@ -1151,6 +1153,12 @@ fn references_are_masked_and_nothing_else() {
     let mut reply = json!({"result":{"source_ref":"a".repeat(64) + "-2","outcome":"replaced",
         "digest":"b".repeat(64)},"detail_ref":null,"items":[{"detail_ref":"c-1"}]});
     mask_refs(&mut reply);
+    let mut arguments = json!({"op":"replace","source_ref":"d".repeat(64) + "-7","lines":"2-2"});
+    mask_refs(&mut arguments);
+    assert_eq!(
+        arguments,
+        json!({"op":"replace","source_ref":"<ref>","lines":"2-2"})
+    );
     assert_eq!(
         reply,
         json!({"result":{"source_ref":"<ref>","outcome":"replaced","digest":"b".repeat(64)},
