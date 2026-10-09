@@ -12,21 +12,41 @@ removing something a live process uses. The code is `crates/agent-ide-core/src/r
 | A | `checks/<repo16>/<worktree16>/` | the project-check build cache of one worktree (`<policy digest>/<language>/{target,tmp}` plus the `worktree.path` marker) | worktree lease |
 | B | `telemetry/<digest>/` | the telemetry store of one MCP launch directory (`state.sqlite*`, `worktree.path` marker from this version on) | the store's own writer lock `state.sqlite.lock` (held by its daemon for the daemon's whole life) and the leases of the launch directory and of every ancestor, all locked by a claim (so an activated worktree keeps the stores of its subdirectories); a store without a marker (written before this version) could belong to any worktree, so its claim needs the machine-wide `any` lease exclusively — it goes only while no lease is held anywhere |
 | C | `standalone/releases/<X.Y.Z>/` | one installed release | `current` symlink, live-process snapshot, install lock |
-| D | `/private/tmp/ai-r-*/cache` | provider cache namespaces of one daemon | **out of scope** |
+| D | `providers/<key>/` | the native cache namespace of one language-server launch (see below): `<key>` is the 64-hex BLAKE3 of the worktree state, accepted executable, settings, effective configuration, toolchain and trust; `worktree.path` marker | the leases of the marker's worktree; a namespace without a marker (the shared native namespace of gopls, or one whose marker is not yet published) needs the machine-wide `any` lease exclusively |
 
-D is excluded: 158 MiB measured, outside `~/.agent-ide`, exclusive to one daemon, cleared at
-reboot; a sweeper never traverses another daemon's runtime directory.
+Before this version the provider namespaces lived in `/private/tmp/ai-r-*/cache`, out of reach of
+every sweep (158 MiB measured) and lost at reboot. A daemon whose state root is unusable still
+keeps them there.
+
+## Provider caches
+
+Each retained language-server launch has one namespace `~/.agent-ide/providers/<key>` holding the
+subdirectories its server needs (rust-analyzer's build-script and proc-macro `target`, gopls' build
+and module caches, …). The key is stable across daemon restarts and reboots because it names the
+worktree by its directory — canonical path, inode and creation time, never the device number nor
+the per-database identity a new daemon mints afresh — and hashes every input that makes a native
+cache unsafe to reuse: the server and the language's own toolchain executables (compiler,
+interpreter) by path, identity and measured BLAKE3 digest — a selector such as `stable` or an
+unchanged label cannot hide a replaced binary — settings, effective initialization configuration,
+toolchain and effective trust. A restarted daemon whose launch declaration is
+unchanged therefore finds and adopts the existing namespace; a changed toolchain, setting,
+configuration, executable or trust derives another key and starts cold, and the old namespace ages
+out below. A worktree deleted and recreated at the same path has a new creation time and a new
+key. After the namespaces of a launch are retained, each per-worktree one gets its `worktree.path`
+marker (a fresh `0600` file renamed into place), which lets the rules below see the worktree and
+claim it through its lease; the shared native namespace has none. `cache status` lists them as
+`providers`.
 
 ## Policy and defaults
 
 No knobs: the defaults are constants in `retention.rs`. Sizes are allocated bytes
-(`st_blocks × 512`) of every entry below the cache directory, symlinks not followed. A cache
-cloned from a sibling with APFS copy-on-write shares extents with it, so "freed" is an upper bound
-of what the volume gets back.
+(`st_blocks × 512`) of every entry below the cache directory, symlinks not followed, and are
+charged once per family, not once per entry (see *Storage accounting*).
 
 | | Removed when | Default |
 |---|---|---|
-| A checks | 1. **gone**: the marker's worktree path no longer exists. 2. **idle**: last use older than the idle age. 3. **budget**: total of all A entries above the budget — least recently used first until the total fits | idle 7 days, budget 15 GiB |
+| A checks | 1. **gone**: the marker's worktree path no longer exists. 2. **idle**: last use older than the idle age. 3. **sessions** and **incremental** (partial, below). 4. **budget**: charged total of all A entries above the budget — least recently used first until the total fits | idle 7 days, incremental idle 2 days, budget 15 GiB |
+| D providers | same three rules; a namespace without a marker is only removed by idle or budget, and then only while no lease is held anywhere | idle 14 days, budget 8 GiB |
 | B telemetry | same three rules; a directory without a marker (written before this version) is only removed by idle or budget | idle 30 days, budget 1 GiB |
 | C releases | a completed release (`COMPLETE` present, directory named `X.Y.Z`) that is **not** the `current` target, **not** one of the 3 newest versions, **not** installed within the last 14 days, and **not** containing the executable of any live process | keep current + newest 3 + 14 days + live |
 
@@ -36,6 +56,55 @@ of what the volume gets back.
 and gone rules run first over every entry, then the budget rule over what is left, so a gone
 entry is never kept while a recent one is evicted. The budget bounds what can be reclaimed: bytes
 held by in-use caches are protected even when they alone exceed it (`cache status` reports them).
+
+## Storage accounting
+
+Sibling worktree caches are APFS copy-on-write clones of one another and a cargo target holds hard
+links, so summing allocation per entry charges the same extents again for every clone and link (36 GiB
+summed against at most 24 GiB of distinct streams on one machine). A family (A, B or D) is therefore
+measured as a whole and `cache status` shows three numbers for it:
+
+- **logical**: the sum of file lengths, every link and clone counted;
+- **charged**: allocation with each hard-linked inode and each perfect-clone stream (device and
+  APFS clone id, read with `getattrlist`; one inode where the volume reports none) counted once.
+  This is what the budget bounds. It is an upper bound of the physical footprint — partially shared
+  extents stay overcharged — and directories, symlinks and unshared files count as they are;
+- **private**: an estimate of what the volume gets back at once if everything went (APFS private
+  bytes summed once per inode, and only for inodes all of whose hard links are inside the family: a
+  link outside, for example a file also linked from a build outside the cache, keeps the data
+  allocated). It explains reclaim and is never charged: a family of perfect clones
+  has almost no private bytes yet still occupies the shared extents.
+
+Removing one entry frees only the streams no surviving entry still holds, so the charge is
+recomputed from the survivors after every removal (the verdict's bytes are that freed charge), never
+reduced by the removed entry's own size; the budget loop therefore stops as soon as the survivors
+fit. Where the attributes are unavailable (another filesystem) hard links are still recognized and
+every file is charged by its own inode.
+
+## Check cache tiers
+
+A worktree's check cache loses parts before it is evicted whole. Both steps run under the same
+exclusive claim of the worktree lease as a whole removal (busy means in use and nothing is touched,
+and no legacy process may be alive):
+
+1. **incremental**: a worktree idle for 2 days loses every rustc `incremental/` directory below
+   `<digest>/<language>/target` (renamed into the trash, deleted after the locks are released) and
+   keeps `deps/` and `build/` — incremental state was 69–91 % of a worktree's cache while sibling
+   dependencies are 88–99 % identical. The price is one slower first check after the break.
+2. **sessions**: in any other worktree, finalized sessions
+   `incremental/<crate>/s-<timestamp>-<random>-<svh>` older than the newest of their crate are
+   removed; rustc loads only the newest and collects the rest itself only when that crate is built
+   again. The newest is chosen by the base-36 `<timestamp>` rustc encodes, never by mtime. Each
+   session is removed only while its sibling `s-<timestamp>-<random>.lock` — the file rustc
+   locks while it reads, writes or collects the session (an `fcntl` lock on macOS, which the `flock`
+   taken here excludes) — is held exclusively and without waiting (a busy lock keeps the session), the lock file
+   goes last, still held. `-working` sessions and their locks are never touched. A crate directory
+   with a malformed `s-…` entry, an unreadable one, a finalized entry that is not a real directory,
+   or a tie at the newest timestamp is left entirely alone.
+
+Whole-worktree rules (gone, idle, budget) follow, so a budget eviction only reaches whole worktrees
+after every idle worktree's incremental state is already gone. A dry run probes the same locks,
+creates no lock file and reports "would remove: checks incremental|sessions".
 
 ## Telemetry write-ahead log
 

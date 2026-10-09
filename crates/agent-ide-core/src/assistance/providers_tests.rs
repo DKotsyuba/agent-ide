@@ -416,7 +416,7 @@ fn session_health_is_kept_per_owner_and_slot() {
         (BindingRef::fixture("health-a", "health-channel", 1), 0),
         (BindingRef::fixture("health-b", "health-channel", 1), 1),
     );
-    let mut providers = Providers::new();
+    let mut providers = Providers::new(temporary());
     providers.begin_job();
     providers.current = Some(a.clone());
     providers.note_session_fault();
@@ -455,4 +455,321 @@ fn project_inputs_stamp_never_opens_special_files() {
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the stamp must not block on a named pipe");
     fs::remove_dir_all(root).unwrap();
+}
+
+/// A fixture provider declaration; every argument is one input of the namespace key.
+fn launch(
+    identity: &str,
+    toolchain: &str,
+    trust: &str,
+    cache_namespace: &str,
+) -> super::ProviderLaunch {
+    crate::lang::testing::install();
+    serde_json::from_value(serde_json::json!({
+        "executable": {
+            "path": "/usr/bin/git",
+            "identity": identity,
+            "blake3": "0".repeat(64),
+        },
+        "settings": "fixture_epsilon",
+        "toolchain": toolchain,
+        "trust": trust,
+        "cache_namespace": cache_namespace,
+    }))
+    .unwrap()
+}
+
+/// The key a daemon derives for `launch` in `tree`.
+fn key_of(tree: &WorktreeRef, launch: &super::ProviderLaunch, configuration: &str) -> String {
+    super::provider_cache_key(
+        &super::cache_state(tree),
+        launch,
+        launch.server().cache_settings(),
+        configuration,
+        &launch.trust,
+    )
+}
+
+/// The same directory names the same state in every boot, whatever the boot-local identity says;
+/// a recreated directory or another path never reaches it.
+#[test]
+fn restart_state_follows_the_directory_not_the_boot() {
+    let path = temporary();
+    fs::create_dir_all(&path).unwrap();
+    let first_boot = worktree(&path);
+    let second_boot =
+        WorktreeRef::from_discovery(path.clone(), path.clone(), PathBuf::from(".git"), 9).unwrap();
+    assert_ne!(first_boot.id(), second_boot.id());
+    assert_eq!(
+        super::cache_state(&first_boot),
+        super::cache_state(&second_boot)
+    );
+
+    let elsewhere = temporary();
+    fs::create_dir_all(&elsewhere).unwrap();
+    assert_ne!(
+        super::cache_state(&first_boot),
+        super::cache_state(&worktree(&elsewhere))
+    );
+
+    // Deleted and recreated at the same path: a different directory, a different state.
+    let before = super::cache_state(&first_boot);
+    fs::remove_dir_all(&path).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::create_dir_all(&path).unwrap();
+    assert_ne!(before, super::cache_state(&first_boot));
+
+    // A tree that cannot be inspected keeps its boot-local identity, never shared with another boot.
+    let missing = temporary();
+    assert_ne!(
+        super::cache_state(&worktree(&missing)),
+        super::cache_state(
+            &WorktreeRef::from_discovery(
+                missing.clone(),
+                missing.clone(),
+                PathBuf::from(".git"),
+                9
+            )
+            .unwrap()
+        )
+    );
+}
+
+/// Every input that makes a native cache unsafe to reuse changes the namespace key.
+#[test]
+fn the_namespace_key_fences_executable_settings_configuration_toolchain_and_trust() {
+    let path = temporary();
+    fs::create_dir_all(&path).unwrap();
+    let tree = worktree(&path);
+    let base = launch("exe-1", "toolchain-1", "trust-1", "ns");
+    let key = key_of(&tree, &base, "configuration-1");
+    assert_eq!(
+        key,
+        key_of(
+            &tree,
+            &launch("exe-1", "toolchain-1", "trust-1", "ns"),
+            "configuration-1"
+        )
+    );
+    for (what, other) in [
+        (
+            "executable",
+            key_of(
+                &tree,
+                &launch("exe-2", "toolchain-1", "trust-1", "ns"),
+                "configuration-1",
+            ),
+        ),
+        (
+            "toolchain",
+            key_of(
+                &tree,
+                &launch("exe-1", "toolchain-2", "trust-1", "ns"),
+                "configuration-1",
+            ),
+        ),
+        (
+            "trust",
+            key_of(
+                &tree,
+                &launch("exe-1", "toolchain-1", "trust-2", "ns"),
+                "configuration-1",
+            ),
+        ),
+        (
+            "namespace",
+            key_of(
+                &tree,
+                &launch("exe-1", "toolchain-1", "trust-1", "ns2"),
+                "configuration-1",
+            ),
+        ),
+        ("configuration", key_of(&tree, &base, "configuration-2")),
+    ] {
+        assert_ne!(
+            key, other,
+            "a changed {what} must not adopt the old namespace"
+        );
+    }
+    let settings = super::provider_cache_key(
+        &super::cache_state(&tree),
+        &base,
+        "other-settings",
+        "configuration-1",
+        &base.trust,
+    );
+    assert_ne!(key, settings, "changed settings");
+}
+
+/// Namespaces live in the providers root: a second boot (new Store, new incarnation, empty map)
+/// adopts the first boot's directory and its content, a changed trust starts cold in another
+/// directory, `cache status` lists them, and a deleted worktree retires its namespace.
+#[test]
+fn a_restarted_daemon_adopts_the_namespace_and_retention_retires_it() {
+    let home = temporary();
+    let providers = crate::retention::providers_root(&home).expect("private providers root");
+    let root = CacheRoot::prepare(&providers).unwrap();
+    let path = temporary();
+    fs::create_dir_all(&path).unwrap();
+    let request = |tree: &WorktreeRef, trust: &str| {
+        let launch = launch("exe-1", "toolchain-1", trust, "ns");
+        vec![CacheRequest {
+            key: key_of(tree, &launch, "configuration-1"),
+            identity: CacheIdentity::new(
+                "exe-1",
+                "settings",
+                "configuration-1",
+                "toolchain-1",
+                trust,
+                super::cache_state(tree),
+            )
+            .unwrap(),
+            required: &["target"],
+            shared: false,
+        }]
+    };
+
+    let boot_one = worktree(&path);
+    let mut caches = BTreeMap::new();
+    let keys = retain_cache_plan(
+        &mut caches,
+        &BTreeMap::new(),
+        &root,
+        &boot_one,
+        &request(&boot_one, "trust-1"),
+    )
+    .unwrap();
+    let namespace = providers.join(&keys[0]);
+    fs::write(namespace.join("target/built"), b"native cache").unwrap();
+    assert_eq!(
+        fs::read(namespace.join(crate::retention::MARKER_FILE_NAME)).unwrap(),
+        fs::canonicalize(&path)
+            .unwrap()
+            .as_os_str()
+            .as_encoded_bytes()
+    );
+
+    let boot_two =
+        WorktreeRef::from_discovery(path.clone(), path.clone(), PathBuf::from(".git"), 7).unwrap();
+    let mut caches = BTreeMap::new();
+    let adopted = retain_cache_plan(
+        &mut caches,
+        &BTreeMap::new(),
+        &root,
+        &boot_two,
+        &request(&boot_two, "trust-1"),
+    )
+    .unwrap();
+    assert_eq!(
+        adopted, keys,
+        "the restarted daemon finds the same namespace"
+    );
+    assert_eq!(
+        fs::read(providers.join(&adopted[0]).join("target/built")).unwrap(),
+        b"native cache"
+    );
+
+    let mut caches = BTreeMap::new();
+    let changed = retain_cache_plan(
+        &mut caches,
+        &BTreeMap::new(),
+        &root,
+        &boot_two,
+        &request(&boot_two, "trust-2"),
+    )
+    .unwrap();
+    assert_ne!(changed, keys, "a changed trust never adopts it");
+    assert!(!providers.join(&changed[0]).join("target/built").exists());
+
+    let status = crate::retention::sweep_with(&home, false, std::time::SystemTime::now(), &|| {
+        Some(Vec::new())
+    })
+    .render(false);
+    assert!(status.contains("providers: 2 entries"), "{status}");
+
+    fs::remove_dir_all(&path).unwrap();
+    let report = crate::retention::sweep_with(&home, true, std::time::SystemTime::now(), &|| {
+        Some(Vec::new())
+    });
+    assert!(
+        report
+            .verdicts
+            .iter()
+            .all(|verdict| verdict.reason == crate::retention::Reason::Gone)
+    );
+    assert_eq!(report.verdicts.len(), 2, "{report:?}");
+    assert!(!namespace.exists());
+    fs::remove_dir_all(home).unwrap();
+}
+
+/// A declaration like [`launch`] with a chosen server digest and an optional companion program
+/// (the stand-in for a language's compiler or interpreter).
+fn launch_with_programs(
+    server_digest: &str,
+    companion: Option<(&str, &str, &str)>,
+) -> super::ProviderLaunch {
+    crate::lang::testing::install();
+    let mut declaration = serde_json::json!({
+        "executable": {
+            "path": "/usr/bin/git",
+            "identity": "exe-1",
+            "blake3": server_digest,
+        },
+        "settings": "fixture_epsilon",
+        "toolchain": "stable",
+        "trust": "trust-1",
+        "cache_namespace": "ns",
+    });
+    if let Some((path, identity, digest)) = companion {
+        declaration["companion"] =
+            serde_json::json!({"path": path, "identity": identity, "blake3": digest});
+    }
+    serde_json::from_value(declaration).unwrap()
+}
+
+/// The selector (`stable`), the identity labels and the namespace name stay put while a program
+/// the launch runs is replaced: a different measured server digest, or a different compiler path,
+/// identity or digest, still derives another namespace.
+#[test]
+fn the_namespace_key_fences_the_measured_programs_not_just_their_labels() {
+    let path = temporary();
+    fs::create_dir_all(&path).unwrap();
+    let tree = worktree(&path);
+    let zero = "0".repeat(64);
+    let one = "1".repeat(64);
+    let base = launch_with_programs(&zero, Some(("/usr/bin/true", "rustc 1.98.1", &zero)));
+    let key = key_of(&tree, &base, "configuration-1");
+    assert_eq!(
+        key,
+        key_of(
+            &tree,
+            &launch_with_programs(&zero, Some(("/usr/bin/true", "rustc 1.98.1", &zero))),
+            "configuration-1"
+        )
+    );
+    for (what, other) in [
+        (
+            "server digest",
+            launch_with_programs(&one, Some(("/usr/bin/true", "rustc 1.98.1", &zero))),
+        ),
+        (
+            "compiler digest",
+            launch_with_programs(&zero, Some(("/usr/bin/true", "rustc 1.98.1", &one))),
+        ),
+        (
+            "compiler identity",
+            launch_with_programs(&zero, Some(("/usr/bin/true", "rustc 1.99.0", &zero))),
+        ),
+        (
+            "compiler path",
+            launch_with_programs(&zero, Some(("/usr/bin/false", "rustc 1.98.1", &zero))),
+        ),
+        ("missing compiler", launch_with_programs(&zero, None)),
+    ] {
+        assert_ne!(
+            key,
+            key_of(&tree, &other, "configuration-1"),
+            "a changed {what}"
+        );
+    }
 }

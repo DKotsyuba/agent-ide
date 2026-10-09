@@ -1586,9 +1586,35 @@ pub(crate) mod testing {
         fn settings_key(&self) -> &'static str {
             "fixture_epsilon"
         }
+        /// The optional companion program a declaration may carry.
+        fn option_fields(&self) -> &'static [&'static str] {
+            &["companion"]
+        }
+        /// Decodes the optional companion program.
+        fn parse_options(
+            &self,
+            mut fields: serde_json::Map<String, serde_json::Value>,
+        ) -> Result<std::sync::Arc<dyn std::any::Any + Send + Sync>, serde_json::Error> {
+            let companion = fields
+                .remove("companion")
+                .map(serde_json::from_value::<crate::assistance::launcher::AcceptedExecutable>)
+                .transpose()?;
+            Ok(std::sync::Arc::new(companion))
+        }
         /// Any declaration is acceptable.
         fn validate_launch(&self, _launch: &crate::assistance::launcher::ProviderLaunch) -> bool {
             true
+        }
+        /// The declared companion program, as a language's toolchain executables would be.
+        fn launch_executables<'a>(
+            &self,
+            launch: &'a crate::assistance::launcher::ProviderLaunch,
+        ) -> Vec<&'a crate::assistance::launcher::AcceptedExecutable> {
+            launch
+                .options::<Option<crate::assistance::launcher::AcceptedExecutable>>()
+                .and_then(Option::as_ref)
+                .into_iter()
+                .collect()
         }
         /// Reply name of the fixture server.
         fn name(&self) -> &'static str {
