@@ -72,10 +72,12 @@ pub fn modes_line(languages: &[Language]) -> Option<String> {
     HOST.get()?.modes_line(languages)
 }
 
-/// The pinned module executable when `language` computes in its module (a backend then starts
-/// its provider inside that module); `None` keeps it in process.
-pub fn module_executable(language: Language) -> Option<Arc<super::launch::ModuleExecutable>> {
-    module(language)?.executable()
+/// Where a backend starts `language`'s provider: `None` in process; in module mode the pinned
+/// module executable, or the typed refusal when it cannot be pinned (never a silent fallback).
+pub fn module_executable(
+    language: Language,
+) -> Option<Routed<Arc<super::launch::ModuleExecutable>>> {
+    Some(module(language)?.executable(language))
 }
 
 /// Where `language` computes in this process.

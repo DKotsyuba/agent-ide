@@ -143,22 +143,14 @@ fn shipped_languages() -> BTreeSet<String> {
 }
 
 /// One `<language> <mode>` entry per language of `languages` whose module ships — `module`, or
-/// `in process (fallback)` when the switch sends it back or the executable cannot be pinned —
+/// `in process (fallback)` when the switch sends it back —
 /// joined with ` · `; `None` when none of them ships a module. `ignored` journal entries of the
 /// switch follow. This is what a process started with this environment would do (`agent-ide
 /// doctor`); a running daemon reports its own routing through [`ModuleHost::modes_line`].
 pub fn effective_modes(languages: &[Language]) -> Option<String> {
     let shipped = shipped_languages();
     let modes = LanguageModes::from_env();
-    let pinned = ModuleExecutable::current().is_some();
-    modes_line(languages, &shipped, |language| {
-        if pinned && modes.mode(language.name()) == Mode::Module {
-            Mode::Module
-        } else {
-            Mode::InProcess
-        }
-    })
-    .map(|line| {
+    modes_line(languages, &shipped, |language| modes.mode(language.name())).map(|line| {
         let ignored = modes.ignored_lines();
         if ignored.is_empty() {
             line
@@ -231,9 +223,21 @@ impl ModuleHost {
         self.modes.ignored_lines()
     }
 
-    /// The pinned module executable, when one could be measured.
-    pub fn executable(&self) -> Option<Arc<ModuleExecutable>> {
-        self.executable.clone()
+    /// The pinned module executable of `language`, or its typed refusal when the executable
+    /// could not be measured.
+    pub fn executable(
+        &self,
+        language: Language,
+    ) -> Result<Arc<ModuleExecutable>, ModuleUnavailable> {
+        self.executable.clone().ok_or_else(|| ModuleUnavailable {
+            module_id: ModuleId::bundled(language.name()),
+            module_version: env!("CARGO_PKG_VERSION").to_owned(),
+            role: Role::Analyzer,
+            stage: Stage::Spawn,
+            cause: Cause::Incompatible,
+            instance: None,
+            retry_after_ms: None,
+        })
     }
 
     /// This daemon's [`effective_modes`] line for `languages`.
@@ -243,8 +247,9 @@ impl ModuleHost {
 
     /// Where `language` computes in this daemon.
     pub fn mode(&self, language: Language) -> Mode {
-        if self.executable.is_some()
-            && self.shipped.contains(language.name())
+        // Only the shipped set and the explicit switch decide; a module that cannot be pinned or
+        // started stays in module mode and answers a typed `module_unavailable`.
+        if self.shipped.contains(language.name())
             && self.modes.mode(language.name()) == Mode::Module
         {
             Mode::Module
