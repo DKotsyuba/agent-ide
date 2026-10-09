@@ -142,6 +142,9 @@ pub struct ProjectCard {
     /// provider for that kind. Fields the block does not name stay `None` and fall back to the
     /// per-language merge as before.
     pub agent_commands: ProjectCommands,
+    /// Each detected language's resolved environments when the caller computed them (in
+    /// process or by the language's module); `None` resolves them in process while rendering.
+    pub environments: Option<Vec<(Language, Vec<crate::lang::environment::ResolvedEnv>)>>,
 }
 
 /// Mutable state threaded through the recursive walk in [`scan_dir`].
@@ -453,6 +456,7 @@ pub fn collect(
         problems,
         truncated: state.truncated,
         agent_commands,
+        environments: None,
     }
 }
 
@@ -751,7 +755,14 @@ fn render_environment(card: &ProjectCard) -> Option<String> {
     let mut facts = Vec::new();
     let mut lines = Vec::new();
     for summary in &card.languages {
-        let environments = summary.language.support().environments(&card.root);
+        let environments = match &card.environments {
+            Some(computed) => computed
+                .iter()
+                .find(|(language, _)| *language == summary.language)
+                .map(|(_, environments)| environments.clone())
+                .unwrap_or_default(),
+            None => summary.language.support().environments(&card.root),
+        };
         if environments.is_empty() {
             facts.extend(
                 summary
@@ -1115,6 +1126,7 @@ mod tests {
             problems: None,
             truncated: false,
             agent_commands: crate::lang::ProjectCommands::default(),
+            environments: None,
         };
         assert_eq!(
             render_servers(&card),

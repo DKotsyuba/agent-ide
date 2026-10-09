@@ -451,7 +451,7 @@ impl Outline {
 }
 
 /// Where new code goes relative to an anchor symbol.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum InsertWhere {
     /// Immediately before the anchor's header.
     Before,

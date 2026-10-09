@@ -125,7 +125,14 @@ fn field<T>(value: Field<T>, default: T) -> T {
 /// `LanguageSupport::detect`.
 pub async fn detect(language: Language, root: &Path) -> Routed<Option<LanguageProject>> {
     match module(language) {
-        None => Ok(language.support().detect(root)),
+        None => {
+            let root = root.to_path_buf();
+            Ok(
+                tokio::task::spawn_blocking(move || language.support().detect(&root))
+                    .await
+                    .unwrap_or(None),
+            )
+        }
         Some(host) => {
             host.request::<DetectAnswer>(
                 language,
@@ -147,7 +154,14 @@ pub async fn environments(
     worktree: &Path,
 ) -> Routed<Vec<environment::ResolvedEnv>> {
     match module(language) {
-        None => Ok(language.support().environments(worktree)),
+        None => {
+            let worktree = worktree.to_path_buf();
+            Ok(
+                tokio::task::spawn_blocking(move || language.support().environments(&worktree))
+                    .await
+                    .unwrap_or_default(),
+            )
+        }
         Some(host) => {
             host.request::<EnvironmentsAnswer>(
                 language,

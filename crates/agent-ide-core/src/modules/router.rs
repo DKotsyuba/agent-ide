@@ -33,7 +33,7 @@ use crate::{
     lang::Language,
 };
 
-/// Test seam naming languages whose module counts as shipped (`css,html`); honoured only in
+/// Test seam naming languages whose module counts as shipped (`alpha,beta`); honoured only in
 /// `test-seams` builds.
 pub const SHIPPED_SEAM: &str = "AGENT_IDE_TEST_MODULE_LANGUAGES";
 /// Spawn-to-`hello` ceiling of one instance.

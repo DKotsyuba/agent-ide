@@ -3976,11 +3976,32 @@ impl<'a> Worker<'a> {
         let names = self.names.get(authority.worktree());
         let card = {
             let root = authority.worktree().worktree_path().to_path_buf();
+            // Detection and environments are language computations (in process or in each
+            // language's module); the blocking walk only renders their answers. A module that
+            // cannot answer leaves its language off the card.
+            let mut languages: Vec<LanguageProject> = Vec::new();
+            let mut environments = Vec::new();
+            let detection = async {
+                for &language in crate::lang::registered() {
+                    if let Ok(Some(project)) = crate::modules::calls::detect(language, &root).await
+                    {
+                        if let Ok(resolved) =
+                            crate::modules::calls::environments(language, &root).await
+                        {
+                            environments.push((language, resolved));
+                        }
+                        languages.push(project);
+                    }
+                }
+            };
+            if tokio::time::timeout(PROJECT_CARD_BUDGET, detection)
+                .await
+                .is_err()
+            {
+                languages.clear();
+                environments.clear();
+            }
             let walk = tokio::task::spawn_blocking(move || {
-                let languages: Vec<LanguageProject> = crate::lang::registered()
-                    .iter()
-                    .filter_map(|language| language.support().detect(&root))
-                    .collect();
                 // The daemon does not probe language servers at start; every detected language's
                 // server state is the honest "not started" until a later tool observes otherwise,
                 // and it names what already works from source so a heavy user does not wait for
@@ -3995,7 +4016,8 @@ impl<'a> Worker<'a> {
                     })
                     .collect();
                 let links = project_card::links_line(&languages);
-                let project = project_card::collect(&root, languages, servers, None);
+                let mut project = project_card::collect(&root, languages, servers, None);
+                project.environments = Some(environments);
                 let clean_git = project.git.as_ref().and_then(|git| {
                     if git.clean {
                         git.last_commit
