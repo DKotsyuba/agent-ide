@@ -769,7 +769,7 @@ mod tests {
         );
         assert!(describe_checks(serde_json::json!({"nope": 1})).is_err());
         assert!(describe_provider(serde_json::json!({"executable": 1})).is_err());
-        let (layout, _, ..) = layout("presence");
+        let (layout, ..) = layout("presence");
         let worktree = layout.base.join("outer/ws");
         assert!(TypeScriptChecks.is_present(&worktree));
         assert!(!TypeScriptChecks.is_present(&layout.base));

@@ -8,6 +8,8 @@
 
 #[path = "support/parity.rs"]
 mod parity;
+#[path = "support/scrub.rs"]
+mod scrub;
 
 use parity::{Daemon, Fixture, LANGUAGE_MODE, Session, line};
 use serde_json::{Value, json};
@@ -92,22 +94,31 @@ async fn run(mode: &str) -> Vec<String> {
     let started = session
         .call(&fixture, "ide.start", json!({"activation_id":"links"}))
         .await;
-    replies.push(line("ide.start", &json!({}), &started));
+    replies.push(scrub::scrub(
+        &line("ide.start", &json!({}), &started),
+        &fixture.base,
+    ));
     for (tool, arguments) in calls() {
         let reply = session.call(&fixture, tool, arguments.clone()).await;
-        replies.push(line(tool, &arguments, &reply));
+        replies.push(scrub::scrub(&line(tool, &arguments, &reply), &fixture.base));
     }
     // A deletion and a native edit are visible to the very next query, in every mode.
     std::fs::remove_file(fixture.root.join("js/app.js")).unwrap();
     let card = json!({"symbol":"index.html#div#assets"});
     let after = session.call(&fixture, "ide.symbol", card.clone()).await;
-    replies.push(line("ide.symbol", &card, &after));
+    replies.push(scrub::scrub(
+        &line("ide.symbol", &card, &after),
+        &fixture.base,
+    ));
     let edited = std::fs::read_to_string(fixture.root.join("index.html"))
         .unwrap()
         .replace("<script src=\"js/app.js\"></script>", "");
     std::fs::write(fixture.root.join("index.html"), edited).unwrap();
     let after = session.call(&fixture, "ide.symbol", card.clone()).await;
-    replies.push(line("ide.symbol", &card, &after));
+    replies.push(scrub::scrub(
+        &line("ide.symbol", &card, &after),
+        &fixture.base,
+    ));
     session.close(&fixture).await;
     replies
 }
