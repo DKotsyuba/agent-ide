@@ -366,6 +366,14 @@ async fn act_fault(
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn();
+            // Exit only once the descendant ignores TERM (it records its pid after the trap).
+            let pid_file = format!("{flag}.pid");
+            for _ in 0..200 {
+                if std::fs::metadata(&pid_file).is_ok_and(|meta| meta.len() > 0) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
             return Err(ServeError::Protocol("orphaned by seam".into()));
         }
         "exit" => return Err(ServeError::Protocol("exited by seam".into())),

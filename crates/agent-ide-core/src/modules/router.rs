@@ -68,6 +68,10 @@ pub struct ModuleHost {
     admission: Arc<Mutex<AdmissionController>>,
     /// Live slots.
     slots: tokio::sync::Mutex<HashMap<(String, PathBuf, Role), Slot>>,
+    /// Extra variables every module receives (test seams).
+    extra_env: Vec<(String, String)>,
+    /// Budget of one ordinary request.
+    budget: Duration,
 }
 
 /// Languages whose module ships default-on in this release, declared once by the root.
@@ -98,12 +102,39 @@ impl ModuleHost {
                     .map(str::to_owned),
             );
         }
+        let extra_env = [super::serve::FAULT_SEAM]
+            .into_iter()
+            .filter_map(|seam| Some((seam.to_owned(), crate::test_seams::var(seam)?)))
+            .collect();
         Self {
             executable: ModuleExecutable::current().map(Arc::new),
             modes: LanguageModes::from_env(),
             shipped,
             admission,
             slots: tokio::sync::Mutex::default(),
+            extra_env,
+            budget: request_budget(),
+        }
+    }
+
+    /// Routing with every part explicit: the module `executable`, the `shipped` languages, extra
+    /// module environment and the request `budget` (conformance tests drive real modules this
+    /// way without a daemon). The fallback switch is not read.
+    pub fn with_parts(
+        executable: ModuleExecutable,
+        admission: Arc<Mutex<AdmissionController>>,
+        shipped: &[&str],
+        extra_env: Vec<(String, String)>,
+        budget: Duration,
+    ) -> Self {
+        Self {
+            executable: Some(Arc::new(executable)),
+            modes: LanguageModes::default(),
+            shipped: shipped.iter().map(|id| (*id).to_owned()).collect(),
+            admission,
+            slots: tokio::sync::Mutex::default(),
+            extra_env,
+            budget,
         }
     }
 
@@ -174,10 +205,8 @@ impl ModuleHost {
             worktree.to_path_buf(),
             encode(&config).to_string(),
         );
-        for seam in [super::serve::FAULT_SEAM] {
-            if let Some(value) = crate::test_seams::var(seam) {
-                launcher = launcher.with_env(seam, &value);
-            }
+        for (key, value) in &self.extra_env {
+            launcher = launcher.with_env(key, value);
         }
         let offer = HelloOffer {
             protocol: PROTOCOL.to_owned(),
@@ -220,9 +249,7 @@ impl ModuleHost {
             payload,
             attachments,
         };
-        let reply = supervisor
-            .call(call, request_budget(), &mut NoEffects)
-            .await?;
+        let reply = supervisor.call(call, self.budget, &mut NoEffects).await?;
         let failure = |cause| ModuleUnavailable {
             module_id: ModuleId::bundled(language.name()),
             module_version: env!("CARGO_PKG_VERSION").to_owned(),
