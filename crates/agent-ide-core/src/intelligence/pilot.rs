@@ -476,7 +476,8 @@ pub struct AnalyzerHello {
     pub worktree: WireWorktree,
     /// Authority epoch the session opens with.
     pub epoch: u64,
-    /// The core-minted generation fences, echoed by nothing and re-applied by the core.
+    /// The core-minted generation fences; the module echoes them in every context reply and the
+    /// core refuses a reply carrying any other generation.
     pub generation: [u64; 4],
     /// Per-request LSP deadline inside the module, milliseconds.
     pub request_timeout_ms: u64,
@@ -796,5 +797,41 @@ mod tests {
         assert!(abandoned.is_err());
         let error = channel.call("b", json!({}), budget).await.unwrap_err();
         assert_eq!(error.to_string(), "pilot module call abandoned mid-flight");
+    }
+
+    /// Measurement, not a contract: round trips of one framed call through real OS pipes to
+    /// `/bin/cat` (which echoes the request frame, a valid reply with the same id) for several
+    /// payload sizes; prints one JSON line per size with raw-sample percentiles in microseconds.
+    #[tokio::test]
+    #[ignore = "measurement of the pilot channel over OS pipes"]
+    async fn channel_round_trip_over_pipes() {
+        for size in [64usize, 4 * 1024, 64 * 1024, 1024 * 1024] {
+            let mut child = tokio::process::Command::new("/bin/cat")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let (input, output) = (child.stdout.take().unwrap(), child.stdin.take().unwrap());
+            let mut channel = Channel::spawn(input, output).0;
+            let payload = json!({"text": "x".repeat(size)});
+            let budget = Duration::from_secs(5);
+            for _ in 0..100 {
+                channel.call("echo", payload.clone(), budget).await.unwrap();
+            }
+            let mut micros = Vec::new();
+            for _ in 0..2000 {
+                let started = std::time::Instant::now();
+                channel.call("echo", payload.clone(), budget).await.unwrap();
+                micros.push(started.elapsed().as_secs_f64() * 1e6);
+            }
+            micros.sort_by(f64::total_cmp);
+            let at = |q: f64| micros[((micros.len() - 1) as f64 * q).round() as usize];
+            println!(
+                "{}",
+                json!({"payload_bytes": size, "n": micros.len(), "warmup": 100,
+                       "p50_us": at(0.5), "p95_us": at(0.95), "max_us": at(1.0)})
+            );
+        }
     }
 }
