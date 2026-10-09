@@ -147,11 +147,76 @@ fn semantic() -> Vec<(&'static str, Value)> {
             "new_name":"operate"}),
         ),
         ("ide.diff", json!({})),
-        ("ide.test", json!({"symbol":"src/lib.rs#user"})),
-        ("ide.test", json!({"path":"tests/service.rs"})),
-        ("ide.test", json!({"path":"tests/broken.rs"})),
-        ("ide.test", json!({"pattern":"added_test"})),
     ]
+}
+
+/// The `ide.test` selections: by referencing symbol, an integration binary, a failing test and a
+/// name pattern.
+fn test_runs() -> Vec<Value> {
+    vec![
+        json!({"symbol":"src/lib.rs#user"}),
+        json!({"path":"tests/service.rs"}),
+        json!({"path":"tests/broken.rs"}),
+        json!({"pattern":"added_test"}),
+    ]
+}
+
+/// One `ide.test` run: its start reply (the selected command) and, polled with `{"status": N}`
+/// until it is no longer running (180 s), its settled result.
+async fn test_run(session: &mut Session, fixture: &Fixture, arguments: Value) -> Vec<String> {
+    let started = session.call(fixture, "ide.test", arguments.clone()).await;
+    let text = started["text"].as_str().unwrap_or_default().to_owned();
+    let mut lines = vec![line("ide.test", &arguments, &started)];
+    let Some(id) = text
+        .strip_prefix("tests #")
+        .and_then(|rest| rest.split(':').next())
+        .and_then(|id| id.parse::<u64>().ok())
+    else {
+        return lines;
+    };
+    let status = json!({"status":id});
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let reply = session.call(fixture, "ide.test", status.clone()).await;
+        let text = reply["text"].as_str().unwrap_or_default();
+        if !text.contains(": running") && !text.contains(": started") {
+            lines.push(line("ide.test", &status, &reply));
+            return lines;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tests #{id} never finished: {reply}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// `text` with every whole-second duration (`3 s`) masked: test runs report their wall time.
+fn mask_seconds(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let starts_word = index == 0 || !bytes[index - 1].is_ascii_alphanumeric();
+        let digits = bytes[index..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        let end = index + digits;
+        let unit = bytes.get(end..end + 2) == Some(b" s")
+            && bytes
+                .get(end + 2)
+                .is_none_or(|byte| !byte.is_ascii_alphanumeric());
+        if starts_word && digits > 0 && unit {
+            out.push_str("<seconds>");
+            index = end;
+        } else {
+            let next = text[index..].chars().next().unwrap();
+            out.push(next);
+            index += next.len_utf8();
+        }
+    }
+    out
 }
 
 /// Polls `ide.context` on `src/lib.rs` until rust-analyzer answers semantically (60 s).
@@ -240,6 +305,9 @@ async fn run(fixture: &Fixture, env: &[(&str, &str)]) -> (Vec<String>, ProcessTr
         let reply = session.call(fixture, tool, arguments.clone()).await;
         replies.push(line(tool, &arguments, &reply));
     }
+    for arguments in test_runs() {
+        replies.extend(test_run(&mut session, fixture, arguments).await);
+    }
     replies.push(
         problems(&mut session, fixture, Duration::from_secs(120), |text| {
             text.starts_with("rust: ready")
@@ -288,18 +356,27 @@ async fn rust_module_and_in_process_transcripts_are_equal() {
             replies[0]
         );
         assert!(replies[2].contains("work"), "{}", replies[2]);
-        assert!(all.contains("mode: semantic"), "semantic context");
-        assert!(all.contains("operate"), "the rename applied");
-        assert!(
-            all.contains("pub fn added() -> bool"),
-            "rustfmt formatted the insert"
-        );
-        assert!(all.contains("expected failure"), "libtest failure parsed");
-        assert!(all.contains("rust: ready"), "the check landed");
-        assert!(all.contains("unused"), "the check reported the warning");
-        assert!(all.contains("not_analysed"), "module-graph noncoverage");
+        for (needle, row) in [
+            ("mode: semantic", "semantic context"),
+            ("operate", "the rename applied"),
+            ("pub fn added() -> bool", "rustfmt formatted the insert"),
+            ("cargo test", "cargo test selection"),
+            ("1 failed", "the failing test counted"),
+            ("expected failure", "libtest failure message parsed"),
+            ("rust: ready", "the check landed"),
+            ("unused", "the check reported the warning"),
+            ("not_analysed", "module-graph noncoverage"),
+        ] {
+            assert!(all.contains(needle), "{row}: {needle:?} missing in\n{all}");
+        }
     }
-    parity::assert_parity(&local, &moduled);
+    let masked = |replies: &[String]| {
+        replies
+            .iter()
+            .map(|reply| mask_seconds(reply))
+            .collect::<Vec<_>>()
+    };
+    parity::assert_parity(&masked(&local), &masked(&moduled));
     owned.extend(tree.all());
     drop(daemon);
     for id in owned {
@@ -794,11 +871,20 @@ async fn rust_analyzer_crash_loop_exhausts_the_restart_budget() {
     let mut session = Session::start(&fixture).await;
     let outline = json!({"path":"src/lib.rs"});
     let context = json!({"path":"src/lib.rs","byte_offset":WORK_OFFSET});
+    // Deaths are noticed through the backend's own path (context) and through the core's
+    // semantic paths (symbol, graph); each counts once against the same budget.
+    let demands = [
+        ("ide.context", context.clone()),
+        ("ide.symbol", json!({"symbol":"src/lib.rs#Service/work"})),
+        ("ide.graph", json!({"symbol":"src/lib.rs#user"})),
+        ("ide.symbol", json!({"symbol":"src/lib.rs#user"})),
+    ];
     for attempt in 0..4 {
         // A demand starts the module (the first after a death is settled with its fault).
+        let (tool, arguments) = &demands[attempt];
         let deadline = Instant::now() + Duration::from_secs(30);
         let module = loop {
-            let _ = session.call(&fixture, "ide.context", context.clone()).await;
+            let _ = session.call(&fixture, tool, arguments.clone()).await;
             if let Some((module, _)) = analyzer(&daemon.tree()) {
                 break module;
             }
@@ -835,4 +921,13 @@ async fn rust_analyzer_crash_loop_exhausts_the_restart_budget() {
     );
     assert_eq!(daemon.pid(), daemon_pid, "same daemon");
     session.close(&fixture).await;
+}
+
+/// Whole-second durations are masked wherever they stand; other numbers stay.
+#[test]
+fn seconds_are_masked_and_nothing_else() {
+    assert_eq!(
+        mask_seconds("tests #2: 1 passed, 1 failed, 3 s\nbudget 120 s; 12 sec, a1 s, 4 s."),
+        "tests #2: 1 passed, 1 failed, <seconds> s\nbudget <seconds> s; 12 sec, a1 s, <seconds> s."
+    );
 }

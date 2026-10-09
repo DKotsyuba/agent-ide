@@ -340,8 +340,9 @@ struct RustLive {
     view: RustView,
     /// Transport driver and synchronized document state.
     live: LiveSession,
-    /// The accepted inputs of a module-hosted session, against which its failures count.
-    module_inputs: Option<String>,
+    /// The accepted inputs of a module-hosted session and its worktree, against which its
+    /// failures count.
+    module_inputs: Option<(String, PathBuf)>,
 }
 
 /// Exclusive Rust generations and every binding's retained analyzer session.
@@ -379,17 +380,16 @@ impl RustBackend {
             // against the shared restart policy, and the demand that finds it dead is settled with
             // its typed fault (never silently answered by a restarted one); the next demand
             // restarts it within the policy.
-            if let Some(inputs) = &entry.module_inputs {
+            if entry.module_inputs.is_some() {
                 let failure = module_failure(entry.live.module_unavailable());
-                record_module_failure(worktree_path, inputs, Some(failure.clone()));
-                self.release(host, &binding).await;
+                self.release(host, &binding, true).await;
                 job.set_stage_failure(
                     &FailureCode::ProviderUnavailable,
                     &format!("rust: {failure}"),
                 );
                 return Err(FailureCode::ProviderUnavailable);
             }
-            self.release(host, &binding).await;
+            self.release(host, &binding, true).await;
         }
         // In module mode the Rust module is the process the core admits; it plans, verifies and
         // starts rust-analyzer from the granted files. An unpinnable module is a typed refusal,
@@ -535,7 +535,7 @@ impl RustBackend {
             None => Err(std::io::Error::other("protocol pipes already taken")),
         };
         let module_inputs = match start {
-            Start::Module { inputs, .. } => Some(inputs),
+            Start::Module { inputs, .. } => Some((inputs, worktree_path.to_path_buf())),
             Start::InProcess(_) => None,
         };
         match opened {
@@ -559,7 +559,7 @@ impl RustBackend {
                 match &module_inputs {
                     // The module's typed failure names the stage and cause and counts against the
                     // restart policy.
-                    Some(inputs) => {
+                    Some((inputs, _)) => {
                         let typed = error
                             .get_ref()
                             .and_then(|inner| {
@@ -665,24 +665,18 @@ impl RustBackend {
                 // A failed or cancelled exchange retires the session; the next request starts a
                 // fresh one. A module's typed fault names it (`module_unavailable (…)`) and
                 // counts against the restart policy.
-                let fault = match self.live.get(&binding) {
-                    Some(entry) if !job.cancelled() => entry.module_inputs.as_ref().map(|inputs| {
-                        record_module_failure(
-                            source.worktree().worktree_path(),
-                            inputs,
-                            entry.live.module_unavailable(),
-                        );
-                        entry.live.remote_fault().map(str::to_owned)
-                    }),
-                    _ => None,
-                };
-                self.release(host, &binding).await;
+                let fault = self
+                    .live
+                    .get(&binding)
+                    .filter(|entry| entry.module_inputs.is_some())
+                    .map(|entry| module_failure(entry.live.module_unavailable()).to_string());
+                self.release(host, &binding, !job.cancelled()).await;
                 if job.cancelled() {
                     Err(FailureCode::Cancelled)
                 } else {
                     job.set_stage_failure(
                         &FailureCode::ProviderUnavailable,
-                        &fault.flatten().map_or_else(
+                        &fault.map_or_else(
                             || "rust: request failed".to_owned(),
                             |fault| format!("rust: {fault}"),
                         ),
@@ -700,12 +694,23 @@ impl RustBackend {
         result
     }
 
-    /// Shuts down and reaps `binding`'s Rust session, if any.
-    async fn release(&mut self, host: &mut dyn ProviderHost, binding: &BindingRef) {
+    /// Shuts down and reaps `binding`'s Rust session, if any. A module session that died
+    /// (not a controlled stop or a cancellation, `count` false) counts once against the shared
+    /// restart policy, whichever path retires it.
+    async fn release(&mut self, host: &mut dyn ProviderHost, binding: &BindingRef, count: bool) {
         if let Some(RustLive {
-            child, view, live, ..
+            child,
+            view,
+            live,
+            module_inputs,
         }) = self.live.remove(binding)
         {
+            if count
+                && !live.is_alive()
+                && let Some((inputs, worktree)) = &module_inputs
+            {
+                record_module_failure(worktree, inputs, live.module_unavailable());
+            }
             let _ = live.shutdown().await;
             self.reap(host, binding, child, view).await;
         }
@@ -778,7 +783,7 @@ impl ServerBackend for RustBackend {
         host: &'a mut dyn ProviderHost,
         binding: &'a BindingRef,
     ) -> BoxFuture<'a, ()> {
-        Box::pin(self.release(host, binding))
+        Box::pin(self.release(host, binding, true))
     }
 
     /// Bindings with a retained analyzer session.
