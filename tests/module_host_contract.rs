@@ -28,8 +28,9 @@ fn module_process(language: &str, role: &str) -> tokio::process::Child {
 }
 
 /// Every bundled language's hidden mode answers `hello` for its own module id and role, serves its
-/// own support while provider capabilities (the normalized outline) answer a typed `unsupported`
-/// error until its module task adds its provider, and exits cleanly on `shutdown`.
+/// own support, answers a provider capability (the normalized outline) without a provider grant
+/// with a typed refusal (`unsupported` until its module task adds its provider; a provider-hosting
+/// module's typed `unavailable (provider: tool_missing)`), and exits cleanly on `shutdown`.
 #[tokio::test]
 async fn hidden_module_mode_serves_the_placeholder_contract() {
     agent_ide::languages::install();
@@ -58,10 +59,26 @@ async fn hidden_module_mode_serves_the_placeholder_contract() {
             )
             .await
             .unwrap();
-        assert!(
-            matches!(answer.outcome, Outcome::Error(ref error) if error.code == ErrorCode::Unsupported),
-            "{language}: {answer:?}"
-        );
+        // A module that hosts its provider (Python's Pyright) and was granted none answers the
+        // provider capability with its typed dependency failure, whatever tools the machine
+        // has; the others do not host one yet and answer `unsupported`.
+        match language {
+            "python" => assert!(
+                matches!(
+                    answer.outcome,
+                    Outcome::Error(ref error) if error.code == ErrorCode::Unavailable
+                        && error.unavailable.is_some_and(|unavailable| {
+                            unavailable.stage == Stage::Provider
+                                && unavailable.cause == Cause::ToolMissing
+                        })
+                ),
+                "{language}: {answer:?}"
+            ),
+            _ => assert!(
+                matches!(answer.outcome, Outcome::Error(ref error) if error.code == ErrorCode::Unsupported),
+                "{language}: {answer:?}"
+            ),
+        }
         channel.shutdown().await;
         let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
             .await
