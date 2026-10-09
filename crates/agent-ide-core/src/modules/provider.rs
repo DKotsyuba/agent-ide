@@ -429,6 +429,7 @@ impl<B: ProviderBuilder> ProviderServer<B> {
                             ContextMode::Lexical { reason } => Some(reason.clone()),
                         },
                         document_version: result.document_version,
+                        position_encoding: encoding.as_str().to_owned(),
                         definitions: convert(result.definitions.clone()),
                         references: convert(result.references.clone()),
                         truncated: result.truncated,
@@ -738,6 +739,11 @@ impl<B: ProviderBuilder> ProviderServer<B> {
         let uri = lsp::Url::from_file_path(self.root.join(&source.path)).ok();
         DiagnosticsEvidence {
             revision: bound.then(|| source.revision.clone()),
+            document_version: if bound {
+                snapshot.document_version
+            } else {
+                None
+            },
             readiness: match (bound, snapshot.readiness) {
                 (true, DiagnosticReadiness::Clean) => "clean",
                 (true, DiagnosticReadiness::Reported) => "reported",
