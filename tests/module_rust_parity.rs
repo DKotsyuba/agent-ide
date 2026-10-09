@@ -713,7 +713,7 @@ async fn timed(
 }
 
 /// A measurement, not a contract (design §3.2.4): for the in-process path and the module it
-/// records cold first outlines (a fresh session each), warm `ide.outline` and `ide.symbol`
+/// records the first outline of each of 15 files, warm `ide.outline` and `ide.symbol`
 /// latencies once rust-analyzer is ready, and the resident memory of the daemon's process tree,
 /// written as JSON to `AGENT_IDE_MODULE_MEASURE_OUT`. Without that variable it measures nothing.
 #[tokio::test]
@@ -724,8 +724,29 @@ async fn rust_module_measure() {
         eprintln!("rust_module_measure skipped: AGENT_IDE_MODULE_MEASURE_OUT is not set");
         return;
     };
-    let fixture = rust_fixture(PARITY_FILES, "module-rust-measure", 300);
     let (cold_runs, warmup, samples) = (15, 20, 200);
+    // One session per daemon (a second front would replay the first one's call ids): "cold"
+    // is the first outline of each of `cold_runs` files the session has not outlined yet.
+    let cold_files: Vec<(String, String)> = (0..cold_runs)
+        .map(|index| {
+            (
+                format!("src/cold_{index}.rs"),
+                format!(
+                    "/// Cold file {index}.\npub fn cold_{index}() -> u32 {{\n    {index}\n}}\n"
+                ),
+            )
+        })
+        .collect();
+    let files: Vec<(&str, &str)> = PARITY_FILES
+        .iter()
+        .copied()
+        .chain(
+            cold_files
+                .iter()
+                .map(|(path, text)| (path.as_str(), text.as_str())),
+        )
+        .collect();
+    let fixture = rust_fixture(&files, "module-rust-measure", 300);
     let mut report = serde_json::Map::new();
     for (mode, env) in [("in_process", IN_PROCESS), ("module", MODULE)] {
         let mut daemon = Daemon::start(&fixture, &[env]).await;
@@ -733,17 +754,13 @@ async fn rust_module_measure() {
         let symbol = json!({"symbol":"src/lib.rs#Service/work"});
         let mut cold = Vec::new();
         let mut session = Session::start(&fixture).await;
-        for run in 0..cold_runs {
-            if run > 0 {
-                session.close(&fixture).await;
-                session = Session::start(&fixture).await;
-            }
+        for (path, _) in &cold_files {
             cold.push(
                 timed(
                     &mut session,
                     &fixture,
                     "ide.outline",
-                    outline.clone(),
+                    json!({"path":path}),
                     "outline",
                 )
                 .await,
@@ -751,7 +768,7 @@ async fn rust_module_measure() {
         }
         ready(&mut session, &fixture).await;
         let mut measured = serde_json::Map::new();
-        measured.insert("cold_outline_ms".into(), json!(cold));
+        measured.insert("first_outline_per_file_ms".into(), json!(cold));
         for (name, tool, arguments, kind) in [
             ("warm_outline_ms", "ide.outline", outline.clone(), "outline"),
             ("warm_symbol_ms", "ide.symbol", symbol.clone(), "symbol"),
@@ -782,7 +799,7 @@ async fn rust_module_measure() {
     }
     report.insert(
         "method".into(),
-        json!({"cold_runs": cold_runs, "warmup": warmup, "calls": samples,
+        json!({"first_outline_files": cold_runs, "warmup": warmup, "calls": samples,
                "clock": "wall time of one settled MCP tools/call round trip measured in the test process"}),
     );
     std::fs::write(
@@ -1452,7 +1469,8 @@ report();
 /// answers_from_source` (pinned in process): a provider that is ready but fails documentSymbols
 /// and references. The outline and a symbol read answer from the exact source outline with the
 /// module's typed cause in the footer, a file the source scanner refuses keeps its refusal, and
-/// the symbol card's live sections name the typed `rust: module_unavailable (bundled.rust:…)`.
+/// the symbol card's live sections name the attributed `module_failed (bundled.rust:provider:…)`
+/// (the module stays live; its death would be `module_unavailable`).
 #[tokio::test]
 #[ignore = "requires the accepted AGENT_IDE_NODE and AGENT_IDE_RUST_TOOLCHAIN_DIR inputs"]
 async fn a_failed_provider_exchange_answers_from_source_with_typed_attribution() {
@@ -1528,7 +1546,7 @@ async fn a_failed_provider_exchange_answers_from_source_with_typed_attribution()
     assert!(text.contains("pub fn value() -> i32"), "{outline}");
     assert!(
         text.contains("outline: from source, exact (")
-            && text.contains("module_unavailable (bundled.rust:"),
+            && text.contains("module_failed (bundled.rust:provider:"),
         "the exchange-failed outline answers from source with the typed cause: {outline}"
     );
     let read = session
@@ -1554,7 +1572,9 @@ async fn a_failed_provider_exchange_answers_from_source_with_typed_attribution()
         "{symbol}"
     );
     assert!(
-        card.contains("usages: unavailable (rust: module_unavailable (bundled.rust:"),
+        card.contains(
+            "usages: unavailable (rust-analyzer references request failed: module_failed (bundled.rust:provider:"
+        ),
         "the card's live sections name the typed module fault: {symbol}"
     );
     session.close(&fixture).await;
