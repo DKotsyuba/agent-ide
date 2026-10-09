@@ -172,6 +172,30 @@ pub trait ProviderBuilder: Send + 'static {
     fn diagnostics(&self, snapshot: &mut crate::intelligence::session::DiagnosticSnapshot) {
         let _ = snapshot;
     }
+
+    /// Whether a context answer first waits (at most [`DIAGNOSTICS_WAIT`], within the request's
+    /// budget) for the provider's diagnostics of the synchronized text, as the language's
+    /// in-process backend does: by default every context does; a language that waits only for
+    /// the whole-file read (the post-edit diagnostic read) answers `whole_file`.
+    fn waits_for_diagnostics(&self, whole_file: bool) -> bool {
+        let _ = whole_file;
+        true
+    }
+}
+
+/// The longest a context answer waits for the provider's diagnostics, as in process.
+const DIAGNOSTICS_WAIT: Duration = Duration::from_secs(3);
+
+/// How long a context answer may still wait for diagnostics: `None` when the language does not
+/// wait, else [`DIAGNOSTICS_WAIT`] cut to the request's remaining budget less the answer margin,
+/// so a provider that never publishes cannot outlast the core's deadline.
+fn diagnostics_wait(waits: bool, budget_ms: u64, elapsed: Duration) -> Option<Duration> {
+    waits.then(|| {
+        DIAGNOSTICS_WAIT.min(
+            Duration::from_millis(budget_ms.saturating_sub(READINESS_MARGIN_MS))
+                .saturating_sub(elapsed),
+        )
+    })
 }
 
 /// A started provider.
@@ -408,6 +432,7 @@ impl<B: ProviderBuilder> ProviderServer<B> {
                     source,
                     byte_offset,
                 } => {
+                    let started = tokio::time::Instant::now();
                     let (observation, bytes) = self.observe(&source, request)?;
                     let query = match byte_offset {
                         Some(offset) => ContextQuery::Symbol {
@@ -415,9 +440,15 @@ impl<B: ProviderBuilder> ProviderServer<B> {
                         },
                         None => ContextQuery::File,
                     };
+                    let waits = self.builder.waits_for_diagnostics(byte_offset.is_none());
                     let session = self.session().await?;
                     let result = session.context(&observation, &bytes, query).await?;
-                    session.wait_for_matching_diagnostics().await;
+                    if let Some(wait) =
+                        diagnostics_wait(waits, request.budget_ms, started.elapsed())
+                    {
+                        let _ = tokio::time::timeout(wait, session.wait_for_matching_diagnostics())
+                            .await;
+                    }
                     let mut snapshot = session.diagnostics();
                     self.builder.diagnostics(&mut snapshot);
                     let encoding = result.position_encoding.clone();
@@ -969,6 +1000,20 @@ impl<B: ProviderBuilder> ModuleServer for ProviderServer<B> {
 #[cfg(test)]
 mod grant_tests {
     use super::*;
+
+    /// A context answer waits for diagnostics only when its language does, at most 3 s and never
+    /// past the request's remaining budget less the answer margin.
+    #[test]
+    fn the_diagnostics_wait_stays_inside_the_request_budget() {
+        let ms = Duration::from_millis;
+        assert_eq!(diagnostics_wait(false, 30_000, ms(0)), None);
+        assert_eq!(
+            diagnostics_wait(true, 30_000, ms(0)),
+            Some(DIAGNOSTICS_WAIT)
+        );
+        assert_eq!(diagnostics_wait(true, 2_000, ms(500)), Some(ms(1_000)));
+        assert_eq!(diagnostics_wait(true, 2_000, ms(1_800)), Some(ms(0)));
+    }
 
     /// A plan starts only from accepted, unchanged files, with every absolute path of its
     /// arguments and environment inside the worktree, a granted root or an accepted file's
