@@ -284,13 +284,29 @@ pub const XCODE_SELECT: EffectRecipe = EffectRecipe {
 };
 
 /// rustfmt formatting the candidate on stdin with the project's edition, the home tool the core
-/// finds on its formatter PATH exactly as for the in-process formatter.
+/// finds on its formatter PATH exactly as for the in-process formatter. The in-process formatter
+/// inherits the daemon's environment, so the variables a rustup proxy resolves its toolchain
+/// from ([`FORMATTER_ENV`]) travel the same way: the daemon's own values, when set.
 pub const RUSTFMT: EffectRecipe = EffectRecipe {
     id: "rustfmt",
     program: "rustfmt",
     args: &[Arg::Literal("--edition"), Arg::Param("edition")],
     env: &[
-        EnvRule::Home { name: "HOME" },
+        EnvRule::Param {
+            name: "HOME",
+            param: "HOME",
+            optional: true,
+        },
+        EnvRule::Param {
+            name: "RUSTUP_HOME",
+            param: "RUSTUP_HOME",
+            optional: true,
+        },
+        EnvRule::Param {
+            name: "RUSTUP_TOOLCHAIN",
+            param: "RUSTUP_TOOLCHAIN",
+            optional: true,
+        },
         EnvRule::Literal {
             name: "PATH",
             value: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
@@ -311,9 +327,18 @@ pub const RUSTFMT: EffectRecipe = EffectRecipe {
 /// Every effect recipe the Rust module may name; the root registers them with the descriptor.
 pub const RECIPES: &[EffectRecipe] = &[CARGO_CHECK, XCODE_SELECT, RUSTFMT];
 
-/// The daemon variables the Rust module receives (root composition data): the test toolchain
-/// and the developer-directory selection `xcode-select` honours.
-pub const MODULE_ENV: [&str; 2] = ["AGENT_IDE_RUST_TOOLCHAIN_DIR", "DEVELOPER_DIR"];
+/// The daemon variables a rustup-proxied formatter resolves its toolchain from.
+pub const FORMATTER_ENV: [&str; 3] = ["HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"];
+
+/// The daemon variables the Rust module receives (root composition data): the test toolchain,
+/// the developer-directory selection `xcode-select` honours and [`FORMATTER_ENV`].
+pub const MODULE_ENV: [&str; 5] = [
+    "AGENT_IDE_RUST_TOOLCHAIN_DIR",
+    "DEVELOPER_DIR",
+    "HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+];
 
 /// The recipe request of the in-process formatter's argument vector (`rustfmt --edition <e>`);
 /// `None` for any other shape, which the core then refuses.
@@ -324,15 +349,21 @@ pub fn interactive_effect(argv: &[String]) -> Option<EffectRequest> {
     if program != "rustfmt" || flag != "--edition" {
         return None;
     }
+    let mut params = std::collections::BTreeMap::from([
+        (
+            "rustfmt".to_owned(),
+            Param::Executable("rustfmt".to_owned()),
+        ),
+        ("edition".to_owned(), Param::Token(edition.clone())),
+    ]);
+    for name in FORMATTER_ENV {
+        if let Ok(value) = std::env::var(name) {
+            params.insert(name.to_owned(), Param::Token(value));
+        }
+    }
     Some(EffectRequest {
         recipe: RUSTFMT.id.to_owned(),
-        params: std::collections::BTreeMap::from([
-            (
-                "rustfmt".to_owned(),
-                Param::Executable("rustfmt".to_owned()),
-            ),
-            ("edition".to_owned(), Param::Token(edition.clone())),
-        ]),
+        params,
     })
 }
 
@@ -1044,6 +1075,18 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(spec.cwd, dir.0);
+        // The daemon's own rustup-resolving variables reach the run, as they reach the in-process
+        // formatter through the daemon's environment.
+        for name in FORMATTER_ENV {
+            assert_eq!(
+                spec.env
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.clone()),
+                std::env::var(name).ok(),
+                "{name}"
+            );
+        }
         let none: Option<EffectRequest> = ask(
             &mut channel,
             Capability::FormatPlan,

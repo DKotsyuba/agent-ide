@@ -191,32 +191,37 @@ async fn test_run(session: &mut Session, fixture: &Fixture, arguments: Value) ->
     }
 }
 
-/// `text` with every whole-second duration (`3 s`) masked: test runs report their wall time.
+/// `text` with the elapsed wall time of each `ide.test` result line masked (`tests #2: 1 passed,
+/// 1 failed, 3 s` -> `…, <seconds> s`); budgets and every other number stay byte-compared.
 fn mask_seconds(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        let starts_word = index == 0 || !bytes[index - 1].is_ascii_alphanumeric();
-        let digits = bytes[index..]
-            .iter()
-            .take_while(|byte| byte.is_ascii_digit())
-            .count();
-        let end = index + digits;
-        let unit = bytes.get(end..end + 2) == Some(b" s")
-            && bytes
-                .get(end + 2)
-                .is_none_or(|byte| !byte.is_ascii_alphanumeric());
-        if starts_word && digits > 0 && unit {
-            out.push_str("<seconds>");
-            index = end;
-        } else {
-            let next = text[index..].chars().next().unwrap();
-            out.push(next);
-            index += next.len_utf8();
-        }
-    }
-    out
+    text.split('\n')
+        .map(|line| {
+            if !line.starts_with("tests #") {
+                return line.to_owned();
+            }
+            let mut masked = String::with_capacity(line.len());
+            let mut rest = line;
+            while let Some(at) = rest.find(", ") {
+                masked.push_str(&rest[..at + 2]);
+                rest = &rest[at + 2..];
+                let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+                let after = &rest[digits..];
+                let elapsed = digits > 0
+                    && after.starts_with(" s")
+                    && after[2..]
+                        .chars()
+                        .next()
+                        .is_none_or(|next| !next.is_alphanumeric());
+                if elapsed {
+                    masked.push_str("<seconds>");
+                    rest = after;
+                }
+            }
+            masked.push_str(rest);
+            masked
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Polls `ide.context` on `src/lib.rs` until rust-analyzer answers semantically (60 s).
@@ -923,11 +928,23 @@ async fn rust_analyzer_crash_loop_exhausts_the_restart_budget() {
     session.close(&fixture).await;
 }
 
-/// Whole-second durations are masked wherever they stand; other numbers stay.
+/// Only the elapsed slot of test result lines is masked; budgets and other text stay.
 #[test]
 fn seconds_are_masked_and_nothing_else() {
     assert_eq!(
-        mask_seconds("tests #2: 1 passed, 1 failed, 3 s\nbudget 120 s; 12 sec, a1 s, 4 s."),
-        "tests #2: 1 passed, 1 failed, <seconds> s\nbudget <seconds> s; 12 sec, a1 s, <seconds> s."
+        mask_seconds("tests #2: 1 passed, 1 failed, 3 s\ntests #3: no summary parsed, 12 s"),
+        "tests #2: 1 passed, 1 failed, <seconds> s\ntests #3: no summary parsed, <seconds> s"
+    );
+    for kept in [
+        "tests #1: started — cargo test --lib (budget 120 s); poll: call ide.test",
+        "tests #1: stopped at budget 120 s — 1 passed, 0 failed so far",
+        "a line, 3 s that is not a test result",
+    ] {
+        assert_eq!(mask_seconds(kept), kept);
+    }
+    assert_ne!(
+        mask_seconds("tests #1: started — cargo test (budget 120 s)"),
+        mask_seconds("tests #1: started — cargo test (budget 60 s)"),
+        "two budgets stay different"
     );
 }
