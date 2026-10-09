@@ -161,6 +161,7 @@ fn scratch_dir(name: &str) -> Scratch {
     // Below one private per-call root: a cache root's parent holds the retention leases and must
     // not be group or world writable, whatever the system temporary directory is. The root is
     // the unit the guard removes, so the lease state beside the cache root goes with it.
+    /// Makes each call's root unique within this process.
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let base = std::env::temp_dir().join(format!(
         "agent-ide-scheduler-contract-{}-{}",

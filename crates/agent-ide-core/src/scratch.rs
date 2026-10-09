@@ -34,6 +34,7 @@ impl ScratchDir {
 }
 
 impl Deref for ScratchDir {
+    /// Derefs to the directory (or database) path.
     type Target = Path;
 
     /// The directory path.
@@ -85,6 +86,7 @@ impl ScratchDatabase {
 }
 
 impl Deref for ScratchDatabase {
+    /// Derefs to the directory (or database) path.
     type Target = Path;
 
     /// The reserved database path.
