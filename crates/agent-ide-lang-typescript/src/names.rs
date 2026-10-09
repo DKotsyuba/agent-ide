@@ -126,8 +126,7 @@ impl NameFacts for TsFacts {
         from: &Path,
         limit: usize,
     ) -> Vec<Resolution> {
-        let path = raw.split(['?', '#']).next().unwrap_or("");
-        if !relative_specifier(path) {
+        if !relative_specifier(raw.split(['?', '#']).next().unwrap_or("")) {
             return Vec::new();
         }
         resolve_file_ref(&FILE_PROBE, namespace, raw, from, limit)
@@ -1201,6 +1200,17 @@ mod tests {
         assert_eq!(names("./b.js")[..2], ["src/b.js", "src/b.ts"]);
         assert!(names("react").is_empty() && names("@/x").is_empty() && names("/x").is_empty());
         assert_eq!(TsFacts.resolve(ns::FILE_REF, "./b", from, 2).len(), 2);
+        // A query is file-name text first (CommonJS loads `plain.cjs?x`); dropping it is only an
+        // assumption, so the literal file never silently becomes a different one.
+        let queried = TsFacts.resolve(ns::FILE_REF, "./plain.cjs?x", Path::new("a.cjs"), 32);
+        assert_eq!(queried[0].name, "plain.cjs?x");
+        assert_eq!(queried[0].certainty, Certainty::Exact);
+        assert!(
+            queried
+                .iter()
+                .filter(|resolution| resolution.name == "plain.cjs")
+                .all(|resolution| resolution.certainty == Certainty::Heuristic("query dropped"))
+        );
     }
 
     /// Legacy certainty is untouched: a template without substitution is exact, one with a

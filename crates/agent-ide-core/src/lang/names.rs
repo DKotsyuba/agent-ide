@@ -379,7 +379,7 @@ pub fn relative_reference(from: &Path, reference: &str) -> Option<String> {
 }
 
 /// Static vocabulary with which a language's file references reach a file the reference does not
-/// spell exactly (`./button` for `button.tsx`). It is compiled descriptor data, not a language
+/// spell exactly (`./button` for `button.alpha`). It is compiled descriptor data, not a language
 /// computation: the core applies it to its own file listing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileProbe {
@@ -454,9 +454,10 @@ pub struct Resolution {
 /// Most candidates one [`NameFacts::resolve`] returns.
 pub const MAX_RESOLUTIONS: usize = 32;
 
-/// The default [`NameFacts::resolve`]: `raw` (a URL or specifier, query and fragment dropped)
-/// joined to `from`'s directory and expanded by `probe`; nothing outside `file-ref/v1`, for a URL
-/// or for a path leaving the worktree.
+/// The default [`NameFacts::resolve`]: `raw` (a URL or specifier) joined to `from`'s directory and
+/// expanded by `probe`; nothing outside `file-ref/v1`, for a URL or for a path leaving the
+/// worktree. A static query or fragment may be file-name text (CommonJS) or URL metadata, which `raw` alone does not say: the literal path comes first and, when `raw` has one,
+/// the path without it follows as a `query dropped` assumption.
 pub fn resolve_file_ref(
     probe: &FileProbe,
     namespace: Namespace,
@@ -467,21 +468,32 @@ pub fn resolve_file_ref(
     if namespace != ns::FILE_REF {
         return Vec::new();
     }
-    let path = raw.split(['?', '#']).next().unwrap_or("");
-    relative_reference(from, path)
-        .map(|key| {
-            probe
-                .candidates(&key)
-                .into_iter()
-                .take(limit.min(MAX_RESOLUTIONS))
-                .map(|(name, reason)| Resolution {
-                    domain: String::new(),
-                    name,
-                    certainty: reason.map_or(Certainty::Exact, Certainty::Heuristic),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    let stripped = raw.split(['?', '#']).next().unwrap_or("");
+    let mut found: Vec<Resolution> = Vec::new();
+    for (path, dropped) in [(raw, false), (stripped, stripped != raw)] {
+        if path != raw && !dropped {
+            continue;
+        }
+        let Some(key) = relative_reference(from, path) else {
+            continue;
+        };
+        for (name, reason) in probe.candidates(&key) {
+            if found.iter().any(|seen| seen.name == name) {
+                continue;
+            }
+            found.push(Resolution {
+                domain: String::new(),
+                name,
+                certainty: match (dropped, reason) {
+                    (true, _) => Certainty::Heuristic("query dropped"),
+                    (false, Some(reason)) => Certainty::Heuristic(reason),
+                    (false, None) => Certainty::Exact,
+                },
+            });
+        }
+    }
+    found.truncate(limit.min(MAX_RESOLUTIONS));
+    found
 }
 
 /// Cross-language name facts of one language. Stateless, synchronous and pure over its inputs.
@@ -541,25 +553,25 @@ mod tests {
     /// the worktree or name a URL, absolute path or empty target.
     #[test]
     fn relative_references_normalize_inside_the_worktree() {
-        let from = Path::new("src/ui/App.tsx");
+        let from = Path::new("src/ui/App.alpha");
         let key = |reference| relative_reference(from, reference);
         assert_eq!(key("./Button"), Some("src/ui/Button".into()));
         assert_eq!(key("../lib/util.js"), Some("src/lib/util.js".into()));
-        assert_eq!(key("a/./b/../c.css"), Some("src/ui/a/c.css".into()));
+        assert_eq!(key("a/./b/../c.beta"), Some("src/ui/a/c.beta".into()));
         assert_eq!(key("../../x.js"), Some("x.js".into()));
         assert_eq!(key("../../../x.js"), None);
         assert_eq!(key("/abs/x.js"), None);
         assert_eq!(key("https://cdn/x.js"), None);
-        assert_eq!(key("data:text/javascript,1"), None);
+        assert_eq!(key("data:text/plain,1"), None);
         assert_eq!(key("//cdn/x.js"), None);
         assert_eq!(key("a\\b.js"), None);
         assert_eq!(key(""), None);
         assert_eq!(key("."), Some("src/ui".into()));
         assert_eq!(
-            relative_reference(Path::new("index.html"), "app.js"),
-            Some("app.js".into())
+            relative_reference(Path::new("index.alpha"), "app.beta"),
+            Some("app.beta".into())
         );
-        assert_eq!(key("my file.css"), Some("src/ui/my file.css".into()));
+        assert_eq!(key("my file.beta"), Some("src/ui/my file.beta".into()));
     }
 
     /// An exact file wins; otherwise swaps, suffixes and index files are tried in that order and
@@ -608,9 +620,9 @@ mod tests {
                 }
             }
         }
-        let from = Path::new("src/a.tsx");
+        let from = Path::new("src/a.alpha");
         let rows: Vec<(String, Certainty)> = Probing
-            .resolve(ns::FILE_REF, "./b?x#y", from, 32)
+            .resolve(ns::FILE_REF, "./b", from, 32)
             .into_iter()
             .map(|r| (r.name, r.certainty))
             .collect();
@@ -624,6 +636,24 @@ mod tests {
                 ),
             ]
         );
+        // A query is file-name text first (CommonJS), URL metadata as an assumption.
+        let queried: Vec<(String, Certainty)> = Probing
+            .resolve(ns::FILE_REF, "./b?x", from, 32)
+            .into_iter()
+            .map(|r| (r.name, r.certainty))
+            .collect();
+        assert_eq!(
+            queried,
+            [
+                ("src/b?x".to_owned(), Certainty::Exact),
+                (
+                    "src/b?x.ts".to_owned(),
+                    Certainty::Heuristic("extension probe")
+                ),
+                ("src/b".to_owned(), Certainty::Heuristic("query dropped")),
+                ("src/b.ts".to_owned(), Certainty::Heuristic("query dropped")),
+            ]
+        );
         assert_eq!(Probing.resolve(ns::FILE_REF, "./b", from, 1).len(), 1);
         assert!(Probing.resolve(ns::CLASS, "./b", from, 32).is_empty());
         assert!(
@@ -631,7 +661,7 @@ mod tests {
                 .resolve(ns::FILE_REF, "../../b", from, 32)
                 .is_empty()
         );
-        // A bare path is relative by default (an HTML URL); script languages override this.
+        // A bare path is relative by default (a document URL); script languages override this.
         assert_eq!(Probing.resolve(ns::FILE_REF, "pkg", from, 32).len(), 2);
         assert!(
             Probing

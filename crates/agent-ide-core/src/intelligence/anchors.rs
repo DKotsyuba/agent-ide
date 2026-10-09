@@ -19,7 +19,10 @@ use crate::{
         Language,
         names::{Certainty, NameFact, NameKey, Role, ns},
     },
-    modules::payload::{AnchorBatch, AnchorCertainty, AnchorRole, FileVerdict},
+    modules::{
+        contract::ModuleUnavailable,
+        payload::{AnchorBatch, AnchorCertainty, AnchorRole, FileVerdict},
+    },
 };
 
 /// A module-side source of linkage anchors, installed once by the daemon.
@@ -29,15 +32,16 @@ pub trait AnchorSource: Send + Sync {
 
     /// The anchors of `text` as `path` in `worktree` from `language`'s module, validated against
     /// the module's declaration. Blocks the calling thread until the module answers or fails;
-    /// callers run on blocking-pool threads. `Err` is a module fault (unavailable, malformed,
-    /// refused): the index discloses it, it never substitutes an in-process answer.
+    /// callers run on blocking-pool threads. `Err` is the module's typed fault (unavailable,
+    /// malformed, refused): the index and the symbol cards disclose it, they never substitute an
+    /// in-process answer.
     fn anchors(
         &self,
         worktree: &Path,
         language: Language,
         path: &Path,
         text: &str,
-    ) -> Result<AnchorBatch, String>;
+    ) -> Result<AnchorBatch, ModuleUnavailable>;
 }
 
 /// The installed source.
@@ -219,9 +223,17 @@ pub(crate) mod stub {
             language: Language,
             path: &Path,
             text: &str,
-        ) -> Result<AnchorBatch, String> {
+        ) -> Result<AnchorBatch, ModuleUnavailable> {
             if self.down.load(Ordering::SeqCst) {
-                return Err("module down".into());
+                return Err(ModuleUnavailable {
+                    module_id: crate::modules::contract::ModuleId::bundled(language.name()),
+                    module_version: "test".into(),
+                    role: crate::modules::contract::Role::Analyzer,
+                    stage: crate::modules::contract::Stage::Request,
+                    cause: crate::modules::contract::Cause::Exited,
+                    instance: None,
+                    retry_after_ms: None,
+                });
             }
             Ok(served(language, path, text))
         }

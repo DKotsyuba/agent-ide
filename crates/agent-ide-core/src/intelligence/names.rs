@@ -160,7 +160,7 @@ pub enum ContentKey {
 }
 
 /// Key of one cached extraction: the language, its extractor revision, the worktree-relative path
-/// and the content. The path is part of the key because facts depend on it (a CSS module's class
+/// and the content. The path is part of the key because facts depend on it (a scoped module's class
 /// domain is its path, a file reference joins the path's directory): identical bytes at two paths
 /// are two extractions.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -903,7 +903,7 @@ impl NameIndex {
                 bytes,
             ) {
                 Extraction::NoProvider => return self.remove(path),
-                Extraction::Faulted => {
+                Extraction::Faulted(_) => {
                     // Not cached, so the next sweep asks the module again.
                     self.faulted.insert(language);
                     skipped(MODULE_UNAVAILABLE)
@@ -1029,7 +1029,7 @@ enum Extraction {
     /// The language states no names.
     NoProvider,
     /// The language's module did not answer.
-    Faulted,
+    Faulted(crate::modules::contract::ModuleUnavailable),
     /// The facts (possibly none).
     Done(Extracted),
 }
@@ -1060,7 +1060,7 @@ fn extract(
                 let converted = super::anchors::facts_from_anchors(text, &batch);
                 (converted.facts, converted.skipped, converted.capped)
             }
-            Err(_) => return Extraction::Faulted,
+            Err(fault) => return Extraction::Faulted(fault),
         },
         None => {
             let mut sink = FactSink::new();
@@ -1098,17 +1098,23 @@ fn extract(
 /// read the facts of the symbol they render from the bytes they observed): from the module or in
 /// process like the index's own extraction, sorted. Blocks while a module answers, so a routed
 /// language must be asked from a blocking-pool thread (see
-/// [`routed`](super::anchors::routed)). `None` without a provider or when the module fails.
+/// [`routed`](super::anchors::routed)). `Ok(None)` without a provider; a module that fails is the
+/// typed fault, never an empty answer.
+///
+/// # Errors
+///
+/// The module's [`ModuleUnavailable`](crate::modules::contract::ModuleUnavailable).
 pub fn facts_of(
     worktree: &Path,
     language: Language,
     path: &Path,
     bytes: &[u8],
-) -> Option<Vec<NameFact>> {
+) -> Result<Option<Vec<NameFact>>, crate::modules::contract::ModuleUnavailable> {
     let installed = super::anchors::installed();
     match extract(installed.as_deref(), worktree, language, path, bytes) {
-        Extraction::Done(extracted) => Some(extracted.facts.into_vec()),
-        Extraction::NoProvider | Extraction::Faulted => None,
+        Extraction::Done(extracted) => Ok(Some(extracted.facts.into_vec())),
+        Extraction::NoProvider => Ok(None),
+        Extraction::Faulted(fault) => Err(fault),
     }
 }
 
@@ -1972,7 +1978,7 @@ mod tests {
     }
 
     /// Identical bytes at different paths are different extractions: the cache key carries the
-    /// path (a CSS module's class domain, a file reference's directory depend on it).
+    /// path (a scoped module's class domain, a file reference's directory depend on it).
     #[test]
     fn cache_keys_carry_the_path() {
         testing::install();

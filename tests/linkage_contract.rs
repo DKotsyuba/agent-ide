@@ -24,7 +24,7 @@ use agent_ide::{
 use agent_ide_core::{
     modules::{
         adapter::SupportServer,
-        contract::Capability,
+        contract::{Capability, ModuleUnavailable},
         payload::{
             AnalyzeSource, AnchorBatch, Field, SourceAnalysis, SourceField, SourceRef, SourceText,
             decode, encode,
@@ -111,7 +111,7 @@ impl AnchorSource for Module {
         language: Language,
         path: &Path,
         text: &str,
-    ) -> Result<AnchorBatch, String> {
+    ) -> Result<AnchorBatch, ModuleUnavailable> {
         let incoming = Incoming {
             fence: Default::default(),
             capability: Capability::AnalyzeSource,
@@ -126,10 +126,10 @@ impl AnchorSource for Module {
             }),
             attachments: Vec::new(),
         };
-        let value = SupportServer::new(language, "1").answer(&incoming)?;
-        match decode::<SourceAnalysis>(value)?.anchors {
+        let value = SupportServer::new(language, "1").answer(&incoming).unwrap();
+        match decode::<SourceAnalysis>(value).unwrap().anchors {
             Field::Available(batch) => Ok(batch),
-            other => Err(format!("{other:?}")),
+            other => panic!("{other:?}"),
         }
     }
 }

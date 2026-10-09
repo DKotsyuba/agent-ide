@@ -2498,4 +2498,128 @@ ok 2 - subtracts
             Some("TS docs".into())
         );
     }
+
+    /// A Node backend (CommonJS entry, ESM conditional exports, `node --test`, no tsconfig) is a
+    /// project of this module like a front end: package manager, test runner and entry points
+    /// come from `package.json`, `.cjs`/`.mjs` files are scripts for every tool (tests, format,
+    /// syntax probe, source outline), and `node:test` runs by file or name pattern.
+    #[test]
+    fn node_backend_projects_get_the_same_tools() {
+        let root = scratch("node-backend");
+        put(
+            &root,
+            "package.json",
+            r#"{
+  "name": "server", "type": "module", "main": "./index.cjs",
+  "exports": { ".": { "import": "./esm/index.mjs", "require": "./index.cjs" } },
+  "scripts": { "test": "node --test", "start": "node index.cjs" },
+  "engines": { "node": ">=22" }
+}"#,
+        );
+        put(&root, "package-lock.json", "{}");
+        put(&root, "index.cjs", "module.exports = {};\n");
+        let project = TypeScript.detect(&root).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(project.manifests, [PathBuf::from("package.json")]);
+        assert_eq!(env_value(&project, "package_manager"), Some("npm"));
+        assert_eq!(env_value(&project, "node"), Some(">=22"));
+        assert_eq!(env_value(&project, "test_runner"), Some("node"));
+        assert_eq!(
+            project.entry_points,
+            [PathBuf::from("index.cjs"), PathBuf::from("esm/index.mjs")]
+        );
+        assert_eq!(
+            project
+                .commands
+                .test
+                .as_ref()
+                .map(|c| c.argv.join(" "))
+                .as_deref(),
+            Some("npm run test")
+        );
+
+        // Test files by convention for every Node script extension; others are not tests.
+        for file in [
+            "test/a.test.cjs",
+            "test/b.spec.mjs",
+            "__tests__/c.js",
+            "src/d.test.mts",
+        ] {
+            assert!(TypeScript.is_test_file(Path::new(file)), "{file}");
+        }
+        for file in ["src/server.cjs", "esm/index.mjs"] {
+            assert!(!TypeScript.is_test_file(Path::new(file)), "{file}");
+        }
+        let select = |target| {
+            TypeScript
+                .test_selection(&project, &target)
+                .unwrap()
+                .command
+        };
+        assert_eq!(
+            select(TestTarget::File(PathBuf::from("test/a.test.cjs"))),
+            argv(&["node", "--test", "test/a.test.cjs"])
+        );
+        assert_eq!(
+            select(TestTarget::Pattern("adds".into())),
+            argv(&["node", "--test", "--test-name-pattern=adds"])
+        );
+        assert!(matches!(
+            TypeScript.test_selection(&project, &TestTarget::File(PathBuf::from("src/server.cjs"))),
+            Err(LangError::Unsupported(_))
+        ));
+
+        // The spec reporter's summary and failures parse like the TAP form.
+        let report = TypeScript.parse_test_output(
+            "\u{2716} adds (0.8ms)\n  AssertionError: 1 !== 2\n    at /work/test/a.test.mjs:4:3\n\
+             \u{2139} tests 2\n\u{2139} pass 1\n\u{2139} fail 1\n\u{2139} skipped 0\n",
+            "",
+        );
+        assert_eq!(
+            (report.passed, report.failed, report.incomplete),
+            (1, 1, false)
+        );
+
+        // Source-only outline of a CommonJS module: column-0 declarations only (assigned
+        // `exports.x = …` members are not declarations).
+        let outline = TypeScript
+            .outline_from_source(
+                Path::new("lib/util.cjs"),
+                "'use strict';\nfunction add(a, b) { return a + b; }\nconst sub = (a, b) => a - b;\nmodule.exports = { add, sub };\nexports.mul = function mul(a, b) { return a * b; };\n",
+            )
+            .unwrap();
+        let names: Vec<&str> = outline
+            .symbols
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+        assert_eq!(names, ["add", "sub"]);
+
+        // The syntax probe and the stdin formatter serve .cjs/.mjs like any script.
+        let formatted = project_with_prettier();
+        for file in ["lib/util.cjs", "esm/index.mjs"] {
+            assert!(
+                TypeScript
+                    .format_stdin_command(&formatted, Path::new(file))
+                    .is_some(),
+                "{file}"
+            );
+        }
+        let probe_root = scratch("node-probe");
+        put(&probe_root, "node_modules/typescript/lib/typescript.js", "");
+        for file in ["lib/util.cjs", "esm/index.mjs"] {
+            assert!(
+                TypeScript
+                    .syntax_probe_command(&project, &probe_root, Path::new(file), None)
+                    .is_some(),
+                "{file}"
+            );
+        }
+        fs::remove_dir_all(&probe_root).unwrap();
+    }
+
+    /// A project that declares prettier.
+    fn project_with_prettier() -> LanguageProject {
+        project(&[("formatter", "prettier")])
+    }
 }

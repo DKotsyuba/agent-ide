@@ -18,7 +18,9 @@ use crate::lang::{
     names::{Certainty, NameKey, Namespace, Role, ns},
     render::{self, SymbolCard, Usage},
 };
+use crate::modules::contract::ModuleUnavailable;
 use crate::workspace::authority::WorktreeRef;
+use std::collections::HashMap;
 
 /// Longest one query sweeps before it parks its job.
 const NAMES_QUERY_WAIT: Duration = Duration::from_secs(1);
@@ -70,35 +72,47 @@ pub(super) fn bridged_files_present(root: &Path) -> bool {
     crate::lang::text::has_files_with(root, &extensions)
 }
 
-/// Facts `file`'s own language states on `range` of `bytes` (none without a provider or when its
-/// module fails). A language that computes in its module is asked on a blocking-pool thread,
-/// every other one inline.
+/// Facts `file`'s own language states on `range` of `bytes` (none without a provider). A
+/// language that computes in its module is asked on a blocking-pool thread, every other one
+/// inline.
+///
+/// # Errors
+///
+/// The module's typed fault when it cannot answer: a card never reads a faulted module as
+/// "no links".
 async fn local_facts(
     worktree: &Path,
     file: &Path,
     bytes: &[u8],
     range: LineRange,
-) -> Vec<crate::lang::names::NameFact> {
+) -> Result<Vec<crate::lang::names::NameFact>, ModuleUnavailable> {
     let Some(language) = Lang::for_path(file) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let (worktree, file, bytes) = (worktree.to_path_buf(), file.to_path_buf(), bytes.to_vec());
     let facts = move || crate::intelligence::names::facts_of(&worktree, language, &file, &bytes);
     let facts = if crate::intelligence::anchors::routed(language).is_some() {
-        tokio::task::spawn_blocking(facts).await.ok().flatten()
+        tokio::task::spawn_blocking(facts)
+            .await
+            .unwrap_or(Ok(None))?
     } else {
-        facts()
+        facts()?
     };
-    facts
+    Ok(facts
         .unwrap_or_default()
         .into_iter()
         .filter(|fact| range.start <= fact.line && fact.line <= range.end)
-        .collect()
+        .collect())
 }
 
 /// Whether `file`'s own language states a name fact on `range` of `bytes`.
-async fn has_facts_in(worktree: &Path, file: &Path, bytes: &[u8], range: LineRange) -> bool {
-    !local_facts(worktree, file, bytes, range).await.is_empty()
+async fn has_facts_in(
+    worktree: &Path,
+    file: &Path,
+    bytes: &[u8],
+    range: LineRange,
+) -> Result<bool, ModuleUnavailable> {
+    Ok(!local_facts(worktree, file, bytes, range).await?.is_empty())
 }
 
 /// Keys `found` defines itself (its children's definitions excluded), from `bytes`.
@@ -107,9 +121,9 @@ async fn owned_keys(
     file: &Path,
     bytes: &[u8],
     found: &Symbol,
-) -> BTreeSet<NameKey> {
-    local_facts(worktree, file, bytes, found.range)
-        .await
+) -> Result<BTreeSet<NameKey>, ModuleUnavailable> {
+    Ok(local_facts(worktree, file, bytes, found.range)
+        .await?
         .into_iter()
         .filter(|fact| fact.role == Role::Define)
         .filter(|fact| {
@@ -119,7 +133,7 @@ async fn owned_keys(
                 .any(|child| child.range.start <= fact.line && fact.line <= child.range.end)
         })
         .map(|fact| fact.key)
-        .collect()
+        .collect())
 }
 
 /// A name a graph node uses: its display (`.btn`), label and first indexed definition.
@@ -177,7 +191,8 @@ fn location(shown: &ShownSite) -> String {
 }
 
 /// The tagged usage row of a shown site; `key` is added to the tag when a card mixes keys.
-fn usage(shown: &ShownSite, key: Option<&NameKey>) -> Usage {
+/// `is_test` is the site's language's own test-file verdict for its file ([`test_flags`]).
+fn usage(shown: &ShownSite, key: Option<&NameKey>, is_test: bool) -> Usage {
     let mut tag = format!("[{}", shown.site.language);
     if let Certainty::Heuristic(reason) = shown.site.fact.certainty {
         tag.push_str(&format!(" ~{reason}"));
@@ -190,7 +205,7 @@ fn usage(shown: &ShownSite, key: Option<&NameKey>) -> Usage {
         file: shown.site.file.display().to_string(),
         line: shown.site.fact.line,
         text: shown.text.clone(),
-        is_test: shown.site.language.support().is_test_file(&shown.site.file),
+        is_test,
         tag: Some(tag),
     }
 }
@@ -210,17 +225,60 @@ fn notes(uncovered: &BTreeSet<Lang>, state: IndexState) -> Vec<String> {
     lines
 }
 
-/// The innermost outline symbol holding `line` of a file the index read, as `path (lines a–b)`,
-/// when its language outlines from source.
-fn address(index: &NameIndex, shown: &ShownSite) -> Option<(String, LineRange)> {
-    let source = index.source(&shown.site.file)?;
-    let outline = shown
-        .site
-        .language
-        .support()
-        .outline_from_source(&shown.site.file, &source)?;
-    super::symbols::innermost(&outline, shown.site.fact.line)
-        .map(|symbol| (symbol.path.to_string(), symbol.range))
+/// Whether each of `files` (with its language) is a test file by that language's own rule, asked
+/// through the module-aware facade (memoized per module build) and never on the blocking pool.
+///
+/// # Errors
+///
+/// The module's typed fault.
+async fn test_flags(
+    worktree: &Path,
+    files: Vec<(Lang, PathBuf)>,
+) -> Result<HashMap<PathBuf, bool>, ModuleUnavailable> {
+    let mut flags = HashMap::new();
+    for (language, file) in files {
+        if let std::collections::hash_map::Entry::Vacant(slot) = flags.entry(file) {
+            let facts = crate::modules::calls::test_facts(language, worktree, slot.key()).await?;
+            slot.insert(facts.is_test_file);
+        }
+    }
+    Ok(flags)
+}
+
+/// The language and file of each site among `shown`.
+fn site_files<'a>(shown: impl IntoIterator<Item = &'a ShownSite>) -> Vec<(Lang, PathBuf)> {
+    shown
+        .into_iter()
+        .map(|shown| (shown.site.language, shown.site.file.clone()))
+        .collect()
+}
+
+/// The innermost outline symbol holding `shown`'s line in `source` (the file's current text, read
+/// by the index), as `path (lines a–b)`, when its language outlines from source; the outline is
+/// computed through the module-aware facade.
+///
+/// # Errors
+///
+/// The module's typed fault.
+async fn address(
+    worktree: &Path,
+    shown: &ShownSite,
+    source: Option<&str>,
+) -> Result<Option<(String, LineRange)>, ModuleUnavailable> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let outline = crate::modules::calls::outline_from_source(
+        shown.site.language,
+        worktree,
+        &shown.site.file,
+        source,
+    )
+    .await?;
+    Ok(outline.and_then(|outline| {
+        super::symbols::innermost(&outline, shown.site.fact.line)
+            .map(|symbol| (symbol.path.to_string(), symbol.range))
+    }))
 }
 
 /// What a symbol card shows from the index, gathered on the blocking pool.
@@ -239,8 +297,11 @@ struct CardLinks {
 struct NameLinks {
     /// The key.
     key: NameKey,
-    /// Its definitions with outline addresses where the language has them.
+    /// Its definitions with outline addresses where the language has them (filled after the
+    /// gather, from [`NameLinks::sources`]).
     defines: Vec<(ShownSite, Option<(String, LineRange)>)>,
+    /// The current text of each definition's file, read by the index, in `defines` order.
+    sources: Vec<Option<String>>,
     /// Definitions dropped as unreadable.
     defines_dropped: usize,
     /// Its uses.
@@ -316,7 +377,10 @@ impl Worker<'_> {
     ) -> Result<(), FailureCode> {
         // The file's own facts decide first, from the observed bytes: a symbol without name facts
         // (most code) never touches the index, so its card costs nothing extra.
-        if !has_facts_in(worktree.worktree_path(), file, bytes, found.range).await {
+        if !has_facts_in(worktree.worktree_path(), file, bytes, found.range)
+            .await
+            .map_err(|failure| super::symbols::module_failure(job, &failure))?
+        {
             return Ok(());
         }
         let (index, state) = self.name_index(job, worktree).await?;
@@ -383,6 +447,12 @@ impl Worker<'_> {
         if gathered.defined.is_empty() && gathered.linked.is_empty() {
             return Ok(());
         }
+        let flags = test_flags(
+            worktree.worktree_path(),
+            site_files(gathered.defined.iter().flat_map(|(_, _, uses)| &uses.sites)),
+        )
+        .await
+        .map_err(|failure| super::symbols::module_failure(job, &failure))?;
         let own = |shown: &ShownSite| {
             shown.site.file == own_file
                 && range.start <= shown.site.fact.line
@@ -410,11 +480,12 @@ impl Worker<'_> {
                 }
             }
             card.defines.push(line);
-            rows.extend(
-                uses.sites
-                    .iter()
-                    .map(|shown| (shown, usage(shown, mixed.then_some(key)))),
-            );
+            rows.extend(uses.sites.iter().map(|shown| {
+                (
+                    shown,
+                    usage(shown, mixed.then_some(key), flags[&shown.site.file]),
+                )
+            }));
             card.usages_dropped += uses.dropped;
             not_listed += uses.more;
         }
@@ -502,7 +573,9 @@ impl Worker<'_> {
         bytes: &[u8],
         found: &Symbol,
     ) -> Result<Vec<(PathBuf, u32, Lang)>, FailureCode> {
-        let keys = owned_keys(worktree.worktree_path(), file, bytes, found).await;
+        let keys = owned_keys(worktree.worktree_path(), file, bytes, found)
+            .await
+            .map_err(|failure| super::symbols::module_failure(job, &failure))?;
         if keys.is_empty() {
             return Ok(Vec::new());
         }
@@ -540,6 +613,7 @@ impl Worker<'_> {
     ) -> Result<Vec<LinkTarget>, FailureCode> {
         let keys: BTreeSet<NameKey> = local_facts(worktree.worktree_path(), file, bytes, range)
             .await
+            .map_err(|failure| super::symbols::module_failure(job, &failure))?
             .into_iter()
             .filter(|fact| fact.role == Role::Use)
             .map(|fact| fact.key)
@@ -615,15 +689,18 @@ impl Worker<'_> {
                 .map(|key| {
                     let defines = index.proven_sites(&key, Some(Role::Define), MAX_LINK_ROWS);
                     let uses = index.proven_sites(&key, Some(Role::Use), MAX_LINK_ROWS);
+                    let sources = defines
+                        .sites
+                        .iter()
+                        .map(|shown| index.source(&shown.site.file))
+                        .collect();
                     NameLinks {
                         defines: defines
                             .sites
                             .into_iter()
-                            .map(|shown| {
-                                let address = address(index, &shown);
-                                (shown, address)
-                            })
+                            .map(|shown| (shown, None))
                             .collect(),
+                        sources,
                         defines_dropped: defines.dropped,
                         uses,
                         uncovered: index.uncovered(key.namespace).into_iter().collect(),
@@ -633,6 +710,21 @@ impl Worker<'_> {
                 .collect::<Vec<_>>()
         })
         .await?;
+        let mut gathered = gathered;
+        let worktree_path = authority.worktree().worktree_path();
+        for links in &mut gathered {
+            for ((shown, address_slot), source) in links.defines.iter_mut().zip(&links.sources) {
+                *address_slot = address(worktree_path, shown, source.as_deref())
+                    .await
+                    .map_err(|failure| super::symbols::module_failure(job, &failure))?;
+            }
+        }
+        let flags = test_flags(
+            worktree_path,
+            site_files(gathered.iter().flat_map(|links| &links.uses.sites)),
+        )
+        .await
+        .map_err(|failure| super::symbols::module_failure(job, &failure))?;
         self.shared.active(binding)?;
         let mut head = String::new();
         let mut tail = String::new();
@@ -691,7 +783,7 @@ impl Worker<'_> {
                     .uses
                     .sites
                     .iter()
-                    .map(|shown| usage(shown, None))
+                    .map(|shown| usage(shown, None, flags[&shown.site.file]))
                     .collect(),
                 usages_indexed: true,
                 usages_dropped: links.uses.dropped + links.defines_dropped,
@@ -741,7 +833,7 @@ impl Worker<'_> {
         let authority = self.authority(binding).await?;
         let (index, _) = self.name_index(job, authority.worktree()).await?;
         let name = name.to_owned();
-        with_names(index, move |index| {
+        let found = with_names(index, move |index| {
             let keys = index.keys_named(&name, Some(namespace));
             let key = keys
                 .iter()
@@ -750,19 +842,32 @@ impl Worker<'_> {
                 .key
                 .clone();
             let proven = index.proven_sites(&key, Some(Role::Define), 1);
-            let shown = proven.sites.first()?;
-            let line = shown.site.fact.line;
-            Some(match address(index, shown) {
+            let shown = proven.sites.into_iter().next()?;
+            let source = index.source(&shown.site.file);
+            Some((shown, source))
+        })
+        .await?;
+        let Some((shown, source)) = found else {
+            return Err(FailureCode::UnknownSymbol);
+        };
+        let line = shown.site.fact.line;
+        Ok(
+            match address(
+                authority.worktree().worktree_path(),
+                &shown,
+                source.as_deref(),
+            )
+            .await
+            .map_err(|failure| super::symbols::module_failure(job, &failure))?
+            {
                 Some((path, range)) => (shown.site.file.clone(), range, path),
                 None => (
                     shown.site.file.clone(),
                     LineRange::new(line, line),
-                    location(shown),
+                    location(&shown),
                 ),
-            })
-        })
-        .await?
-        .ok_or(FailureCode::UnknownSymbol)
+            },
+        )
     }
 }
 
