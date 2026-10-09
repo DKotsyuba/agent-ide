@@ -150,25 +150,28 @@ fn semantic() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// One transcript entry: the harness line with the fixture root written as `<root>`, followed for
-/// an edit (whose reply carries no text) by its structured reply. An edit's `status` plate is
-/// left out: it carries whatever check result happens to be due at that moment.
+/// One transcript entry: the harness line with the fixture root written as `<root>`
+/// ([`edit_entry`] adds an edit's structured fields).
 fn record(fixture: &Fixture, tool: &str, arguments: &Value, reply: &Value) -> String {
     let mut arguments = arguments.clone();
     mask_refs(&mut arguments);
-    let mut entry = parity::line_for(fixture, tool, &arguments, reply);
+    let entry = parity::line_for(fixture, tool, &arguments, reply);
+    edit_entry(entry, &fixture.root.display().to_string(), tool, reply)
+}
+
+/// `entry` followed, for an edit, by its structured reply without the text the harness line
+/// already carries (masked there) and without the `status` plate (whatever check result happens
+/// to be due at that moment); its reference values and the fixture `root` are masked.
+fn edit_entry(mut entry: String, root: &str, tool: &str, reply: &Value) -> String {
     if tool == "ide.edit" {
         let mut body = reply.clone();
         if let Some(object) = body.as_object_mut() {
             object.remove("status");
+            object.remove("text");
         }
         mask_refs(&mut body);
         entry.push('\n');
-        entry.push_str(
-            &body
-                .to_string()
-                .replace(&fixture.root.display().to_string(), "<root>"),
-        );
+        entry.push_str(&body.to_string().replace(root, "<root>"));
     }
     entry
 }
@@ -230,39 +233,6 @@ async fn test_run(session: &mut Session, fixture: &Fixture, arguments: Value) ->
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-}
-
-/// `text` with the elapsed wall time of each `ide.test` result line masked (`tests #2: 1 passed,
-/// 1 failed, 3 s` -> `…, <seconds> s`); budgets and every other number stay byte-compared.
-fn mask_seconds(text: &str) -> String {
-    text.split('\n')
-        .map(|line| {
-            if !line.starts_with("tests #") {
-                return line.to_owned();
-            }
-            let mut masked = String::with_capacity(line.len());
-            let mut rest = line;
-            while let Some(at) = rest.find(", ") {
-                masked.push_str(&rest[..at + 2]);
-                rest = &rest[at + 2..];
-                let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-                let after = &rest[digits..];
-                let elapsed = digits > 0
-                    && after.starts_with(" s")
-                    && after[2..]
-                        .chars()
-                        .next()
-                        .is_none_or(|next| !next.is_alphanumeric());
-                if elapsed {
-                    masked.push_str("<seconds>");
-                    rest = after;
-                }
-            }
-            masked.push_str(rest);
-            masked
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Polls `ide.context` on `src/lib.rs` until rust-analyzer answers semantically (60 s).
@@ -429,7 +399,7 @@ async fn rust_module_and_in_process_transcripts_are_equal() {
     let masked = |replies: &[String]| {
         replies
             .iter()
-            .map(|reply| mask_run_variance(&mask_text_refs(&mask_counters(&mask_seconds(reply)))))
+            .map(|reply| masked_entry(reply))
             .collect::<Vec<_>>()
     };
     let (local, moduled) = (masked(&local), masked(&moduled));
@@ -997,31 +967,20 @@ async fn rust_analyzer_crash_loop_exhausts_the_restart_budget() {
     session.close(&fixture).await;
 }
 
-/// `text` with each opaque reference a reply names in prose (`source_ref <64 hex>-<n>`, also
-/// `detail_ref …`, whatever punctuation follows) written as `<ref>`; other hex runs stay.
-fn mask_text_refs(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    loop {
-        let next = ["source_ref ", "detail_ref "]
-            .iter()
-            .filter_map(|marker| rest.find(marker).map(|at| (at, marker.len())))
-            .min();
-        let Some((at, marker)) = next else {
-            out.push_str(rest);
-            return out;
-        };
-        out.push_str(&rest[..at + marker]);
-        rest = &rest[at + marker..];
-        let hex = rest.bytes().take_while(u8::is_ascii_hexdigit).count();
-        if hex == 64 {
-            let suffix = rest[hex..].strip_prefix('-').map_or(0, |tail| {
-                1 + tail.bytes().take_while(u8::is_ascii_digit).count()
-            });
-            out.push_str("<ref>");
-            rest = &rest[hex + suffix..];
-        }
-    }
+/// One transcript entry with the Rust masks ([`mask_counters`], [`mask_run_variance`]) applied to
+/// its generated metadata rows only ([`parity::metadata_rows`]): the call line with its arguments
+/// and every returned source row stay byte-for-byte.
+fn masked_entry(entry: &str) -> String {
+    parity::metadata_rows(entry, entry.starts_with("ide.context "))
+        .enumerate()
+        .map(|(index, (row, metadata))| {
+            if index == 0 || !metadata {
+                row.to_owned()
+            } else {
+                mask_run_variance(&mask_counters(row))
+            }
+        })
+        .collect()
 }
 
 /// `text` with what legitimately varies between two runs written as a placeholder: the project
@@ -1071,27 +1030,6 @@ fn mask_counters(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Only the elapsed slot of test result lines is masked; budgets and other text stay.
-#[test]
-fn seconds_are_masked_and_nothing_else() {
-    assert_eq!(
-        mask_seconds("tests #2: 1 passed, 1 failed, 3 s\ntests #3: no summary parsed, 12 s"),
-        "tests #2: 1 passed, 1 failed, <seconds> s\ntests #3: no summary parsed, <seconds> s"
-    );
-    for kept in [
-        "tests #1: started — cargo test --lib (budget 120 s); poll: call ide.test",
-        "tests #1: stopped at budget 120 s — 1 passed, 0 failed so far",
-        "a line, 3 s that is not a test result",
-    ] {
-        assert_eq!(mask_seconds(kept), kept);
-    }
-    assert_ne!(
-        mask_seconds("tests #1: started — cargo test (budget 120 s)"),
-        mask_seconds("tests #1: started — cargo test (budget 60 s)"),
-        "two budgets stay different"
-    );
 }
 
 /// The shipping binary's `module rust analyzer` process, spawned like the daemon spawns it
@@ -1565,21 +1503,6 @@ async fn a_failed_provider_exchange_answers_from_source_with_typed_attribution()
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// References a reply names in prose are masked whatever follows them; other hashes stay.
-#[test]
-fn prose_references_are_masked_and_nothing_else() {
-    let reference = "8ab2ae26df5f5c8e532fbd83009bdff27a57bf8b598b90102c30db448fdc6c75";
-    let other = "b".repeat(64);
-    assert_eq!(
-        mask_text_refs(&format!(
-            "edit: unchanged; source_ref {reference}-5; Next: use ide.edit with source_ref {reference}-5\ndigest {other}"
-        )),
-        format!(
-            "edit: unchanged; source_ref <ref>; Next: use ide.edit with source_ref <ref>\ndigest {other}"
-        )
-    );
-}
-
 /// Only the check duration and the serving-path card line are masked; diagnostics and the rest
 /// of a reply stay.
 #[test]
@@ -1602,4 +1525,71 @@ fn run_variance_is_masked_and_nothing_else() {
         mask_run_variance("modules: rust module"),
         "only Rust's own line is the switch under test"
     );
+}
+
+/// Returned source is never masked: two context replies whose source bodies differ only in
+/// text that looks like a duration, a counter or a reference stay different, while the same
+/// text in their metadata rows is masked.
+#[test]
+fn returned_source_is_never_masked() {
+    let context = |body: &str, sequence: u32| {
+        format!(
+            "ide.context {{\"path\":\"src/lib.rs\"}} -> \"complete\" \"context\" null\nmode: semantic\nsource_sequence: {sequence}\n\n{body}"
+        )
+    };
+    let (a, b) = ("a".repeat(64), "b".repeat(64));
+    assert_eq!(
+        masked_entry(&context("pub fn f() {}\n", 3)),
+        masked_entry(&context("pub fn f() {}\n", 9)),
+        "a metadata counter is masked"
+    );
+    for (left, right) in [
+        (
+            format!("const T: &str = \"source_ref {a}-5\";\n"),
+            format!("const T: &str = \"source_ref {b}-5\";\n"),
+        ),
+        (
+            "source_sequence: 1\n".to_owned(),
+            "source_sequence: 2\n".to_owned(),
+        ),
+        (
+            "// project check 0.1s: done\n".to_owned(),
+            "// project check 0.2s: done\n".to_owned(),
+        ),
+    ] {
+        assert_ne!(
+            masked_entry(&context(&left, 1)),
+            masked_entry(&context(&right, 1)),
+            "source stays compared: {left}"
+        );
+    }
+    let read = |text: &str| format!("ide.read {{}} -> \"complete\" \"read\" null\n 1\t{text}\n");
+    assert_ne!(
+        masked_entry(&read("modules: rust module")),
+        masked_entry(&read("modules: rust in process (fallback)")),
+        "a numbered source row stays compared"
+    );
+}
+
+/// Two edit replies that differ only in their generated references (in fields and in prose)
+/// record equal entries; a different outcome does not.
+#[test]
+fn edit_entries_mask_generated_references_only() {
+    let edit = |reference: &str, outcome: &str| {
+        json!({"state":"edit","text":format!("edit: {outcome}; path src/lib.rs; source_ref {reference}-5"),
+            "status":"<agent-ide>\nrust: 0 errors\n</agent-ide>",
+            "result":{"operation_id":"p","outcome":outcome,"path":"src/lib.rs","source_ref":format!("{reference}-5")}})
+    };
+    let entry = |reply: &Value| {
+        let arguments = json!({"op":"replace"});
+        edit_entry(
+            parity::line("ide.edit", &arguments, reply),
+            "/root",
+            "ide.edit",
+            reply,
+        )
+    };
+    let (a, b) = ("a".repeat(64), "b".repeat(64));
+    assert_eq!(entry(&edit(&a, "replaced")), entry(&edit(&b, "replaced")));
+    assert_ne!(entry(&edit(&a, "replaced")), entry(&edit(&a, "unchanged")));
 }
