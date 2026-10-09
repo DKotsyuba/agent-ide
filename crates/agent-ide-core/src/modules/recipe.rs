@@ -284,6 +284,33 @@ impl Described {
     }
 }
 
+/// Effect recipes of each language's descriptor, declared by the root.
+static DECLARED: std::sync::RwLock<Vec<(&'static str, &'static [EffectRecipe])>> =
+    std::sync::RwLock::new(Vec::new());
+
+/// Declares languages' effect recipes (root composition data); a language already declared keeps
+/// its first declaration.
+pub fn declare(recipes: &'static [(&'static str, &'static [EffectRecipe])]) {
+    let mut declared = DECLARED
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (language, recipes) in recipes {
+        if !declared.iter().any(|(known, _)| known == language) {
+            declared.push((language, recipes));
+        }
+    }
+}
+
+/// The declared recipes of the language `id`; none when it declares none.
+pub fn declared(id: &str) -> &'static [EffectRecipe] {
+    DECLARED
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(language, _)| *language == id)
+        .map_or(&[], |(_, recipes)| recipes)
+}
+
 /// Expands `effect` with its recipe from `recipes` under `admission`.
 pub fn expand(
     recipes: &[EffectRecipe],

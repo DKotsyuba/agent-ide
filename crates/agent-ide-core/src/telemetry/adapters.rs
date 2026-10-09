@@ -103,6 +103,18 @@ pub fn log_tool_reply(
             .as_ref()
             .map(|reason| stage_default(tool, reason.as_str()))
     });
+    // Which path served the call: the failing module, else the request language's module when
+    // that language computes in its module; absent when it computes in process.
+    let served = language
+        .and_then(crate::lang::Language::by_id)
+        .filter(|language| {
+            crate::modules::calls::mode(*language) == crate::modules::mode::Mode::Module
+        })
+        .map(|language| format!("bundled.{}", language.name()));
+    let module = stage
+        .as_deref()
+        .and_then(failed_module)
+        .or(served.as_deref());
     crate::errorlog::record(
         errorlog_method(reply_method(tool, reply)),
         terminal_outcome(reply, context.degraded),
@@ -111,6 +123,8 @@ pub fn log_tool_reply(
             correlation: reply_correlation(reply).or(requested),
             duration_ms: elapsed.as_millis().try_into().ok(),
             detail: stage.as_deref(),
+            module,
+            module_version: module.map(|_| env!("CARGO_PKG_VERSION")),
             version: Some(env!("CARGO_PKG_VERSION")),
             host: context.host,
             role: context.role,
@@ -295,6 +309,14 @@ pub fn log_front_outcome(
             ..Default::default()
         },
     );
+}
+
+/// The bundled module a failure stage names: the `<module>` of the typed
+/// `module_unavailable (<module>:<stage>:<cause>)` text a module-routed failure carries.
+pub(crate) fn failed_module(stage: &str) -> Option<&str> {
+    let (_, rest) = stage.split_once("module_unavailable (")?;
+    let (module, _) = rest.split_once(':')?;
+    module.starts_with("bundled.").then_some(module)
 }
 
 /// Returns the stage tag an error or cause-tagged unavailable reply already carries, if any.
@@ -613,6 +635,40 @@ mod tests {
     use super::*;
     use crate::telemetry::{Filter, TelemetryConfig, ToolMethod};
     use std::time::Duration;
+
+    /// A call failed by a bundled module's typed `module_unavailable` names the module and its
+    /// version on its dispatch line; any other failure names none.
+    #[test]
+    fn module_failures_name_the_module_on_the_dispatch_line() {
+        let context = DispatchContext::default();
+        crate::errorlog::capture_start();
+        for detail in [
+            "ide.outline:module_unavailable (bundled.alpha:request:timeout)",
+            "ide.outline:provider_unavailable",
+        ] {
+            log_tool_reply(
+                AssistanceTool::Outline,
+                &PeerReply::Error {
+                    code: crate::assistance::reply::FailureCode::ProviderUnavailable,
+                    detail: Some(detail.to_owned()),
+                },
+                Duration::from_millis(3),
+                None,
+                &context,
+            );
+        }
+        let events = crate::errorlog::capture_take();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.module.as_deref(), event.module_version.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (Some("bundled.alpha"), Some(env!("CARGO_PKG_VERSION"))),
+                (None, None)
+            ]
+        );
+    }
 
     /// QW-4: every front outcome that never produced a typed reply leaves one closed `front:`
     /// line sharing the call's request id; a typed reply leaves none (the daemon wrote its line).

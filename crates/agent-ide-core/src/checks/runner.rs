@@ -95,6 +95,65 @@ impl ConfinedRunner for SeatbeltRunner {
     }
 }
 
+/// Production runner of a daemon: every run is an Execution-owned job of the daemon's single
+/// admission controller, owned per working directory; `confine` applies the Seatbelt profile of
+/// [`SeatbeltRunner`], otherwise the program runs as [`run_unconfined`] would.
+///
+/// [`run_unconfined`]: crate::execution::seatbelt::run_unconfined
+#[derive(Clone)]
+pub struct AdmittedRunner {
+    /// The daemon's admission controller.
+    admission: Arc<Mutex<crate::execution::AdmissionController>>,
+    /// Whether the Seatbelt profile applies.
+    confine: bool,
+}
+
+impl AdmittedRunner {
+    /// Runs as Execution-owned jobs of `admission`, under the Seatbelt profile when `confine`.
+    pub fn new(
+        admission: Arc<Mutex<crate::execution::AdmissionController>>,
+        confine: bool,
+    ) -> Self {
+        Self { admission, confine }
+    }
+}
+
+impl ConfinedRunner for AdmittedRunner {
+    fn run(&self, spec: RunSpec) -> BoxFuture<'_, io::Result<RunOutput>> {
+        Box::pin(async move {
+            let policy = SeatbeltPolicy {
+                read_roots: spec.read_roots,
+                write_roots: spec.write_roots,
+                read_denies: spec.read_denies,
+            };
+            let owner = crate::execution::OwnerId::new(format!(
+                "check:{}",
+                blake3::hash(spec.cwd.as_os_str().as_encoded_bytes()).to_hex()
+            ))
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+            let output = crate::execution::seatbelt::run_admitted(
+                &self.admission,
+                owner,
+                &spec.program,
+                &spec.args,
+                &spec.cwd,
+                &spec.env,
+                self.confine.then_some(&policy),
+                spec.timeout,
+                spec.max_output_bytes,
+            )
+            .await?;
+            Ok(RunOutput {
+                status: output.status,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                timed_out: output.timed_out,
+                truncated: output.truncated,
+            })
+        })
+    }
+}
+
 /// Whether this daemon has already seen the host refuse to apply our Seatbelt profile because
 /// the daemon itself is confined; remembered for the daemon's lifetime so no later check wastes
 /// a spawn on the doomed wrapper again.
@@ -133,12 +192,32 @@ fn nested_sandbox_refusal(output: &RunOutput) -> bool {
 pub struct NestedSandboxFallbackRunner {
     /// The profile-applying runner tried first on every check.
     inner: Arc<dyn ConfinedRunner>,
+    /// The runner of the unprofiled fallback; `None` runs it directly.
+    fallback: Option<Arc<dyn ConfinedRunner>>,
 }
 
 impl NestedSandboxFallbackRunner {
     /// Builds the production check runner around `inner` (normally [`SeatbeltRunner`]).
     pub fn new(inner: Arc<dyn ConfinedRunner>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            fallback: None,
+        }
+    }
+
+    /// The daemon's check runner: profiled and fallback runs are both Execution-owned jobs of
+    /// `admission` ([`AdmittedRunner`]).
+    pub fn admitted(admission: Arc<Mutex<crate::execution::AdmissionController>>) -> Self {
+        Self {
+            inner: Arc::new(AdmittedRunner {
+                admission: admission.clone(),
+                confine: true,
+            }),
+            fallback: Some(Arc::new(AdmittedRunner {
+                admission,
+                confine: false,
+            })),
+        }
     }
 }
 
@@ -157,6 +236,9 @@ impl ConfinedRunner for NestedSandboxFallbackRunner {
                     // of a nested-sandbox refusal.
                     Err(error) => return Err(error),
                 }
+            }
+            if let Some(fallback) = &self.fallback {
+                return fallback.run(spec).await;
             }
             let output = crate::execution::seatbelt::run_unconfined(
                 &spec.program,
@@ -620,5 +702,45 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&tmp_file);
+    }
+
+    /// The daemon's runner runs a check as an Execution-owned job — profiled, or through the
+    /// unprofiled fallback where the host refuses a nested profile — and releases its admission
+    /// slot after the reap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admitted_runs_are_execution_jobs_that_release_their_slot() {
+        let _state = isolated_fallback_state().await;
+        let admission = Arc::new(Mutex::new(
+            crate::execution::AdmissionController::new(crate::execution::AdmissionLimits {
+                total_running: 1,
+                per_owner_running: 1,
+                per_owner_queued: 1,
+                total_queued: 1,
+                interactive_burst: 1,
+            })
+            .unwrap(),
+        ));
+        let runner = NestedSandboxFallbackRunner::admitted(admission.clone());
+        let cwd = std::env::temp_dir().canonicalize().unwrap();
+        let spec = RunSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![OsString::from("-c"), OsString::from("echo checked")],
+            cwd: cwd.clone(),
+            env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+            read_roots: vec![cwd],
+            write_roots: Vec::new(),
+            read_denies: Vec::new(),
+            timeout: Duration::from_secs(30),
+            max_output_bytes: 1024,
+        };
+        for _ in 0..2 {
+            let output = runner.run(spec.clone()).await.unwrap();
+            assert_eq!(
+                (output.status, output.stdout.as_slice()),
+                (Some(0), &b"checked\n"[..]),
+                "{output:?}"
+            );
+            assert_eq!(admission.lock().unwrap().running_count(), 0);
+        }
     }
 }

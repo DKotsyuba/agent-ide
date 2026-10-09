@@ -93,9 +93,11 @@ pub struct Reply {
 /// Core side of one instance.
 pub struct HostChannel {
     /// To the module.
-    writer: Box<dyn AsyncWrite + Send + Unpin>,
+    writer: Box<dyn AsyncWrite + Send + Sync + Unpin>,
     /// Frames (or the terminal read error) from the reader task, in arrival order.
     frames: mpsc::Receiver<Result<Frame, WireError>>,
+    /// The reader task; it ends when the module's output ends.
+    reader: Option<tokio::task::JoinHandle<()>>,
     /// The accepted offer.
     offer: HelloOffer,
     /// Last request id sent.
@@ -137,10 +139,10 @@ impl HostChannel {
     ) -> Result<(Self, HelloReply), ModuleUnavailable>
     where
         R: AsyncRead + Send + Unpin + 'static,
-        W: AsyncWrite + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Sync + Unpin + 'static,
     {
         let (sender, frames) = mpsc::channel(16);
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             let mut input = input;
             loop {
                 let frame = read_frame(&mut input).await;
@@ -153,6 +155,7 @@ impl HostChannel {
         let mut channel = Self {
             writer: Box::new(output),
             frames,
+            reader: Some(reader),
             offer,
             last_request: 0,
             in_flight: false,
@@ -180,6 +183,11 @@ impl HostChannel {
         }
     }
 
+    /// Takes the reader task once: it finishes when the module's output ends (its liveness).
+    pub fn take_reader(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.reader.take()
+    }
+
     /// The accepted offer.
     pub fn offer(&self) -> &HelloOffer {
         &self.offer
@@ -188,6 +196,24 @@ impl HostChannel {
     /// The fault that poisoned this channel, if any.
     pub fn fault(&self) -> Option<(Stage, Cause)> {
         self.fault
+    }
+
+    /// Checks an idle channel without waiting: a closed stream (the module exited while idle) or
+    /// an unsolicited frame poisons it. Returns the fault, if any.
+    pub fn idle_fault(&mut self) -> Option<(Stage, Cause)> {
+        if self.fault.is_none() && !self.in_flight {
+            let cause = match self.frames.try_recv() {
+                Err(mpsc::error::TryRecvError::Empty) => None,
+                Err(mpsc::error::TryRecvError::Disconnected) => Some(Cause::Exited),
+                Ok(Err(error)) => Some(wire_cause(&error)),
+                Ok(Ok(_)) => Some(Cause::Malformed),
+            };
+            if let Some(cause) = cause {
+                self.poison(Stage::Request, cause);
+            }
+        }
+        self.fault
+            .or(self.in_flight.then_some((Stage::Request, Cause::Timeout)))
     }
 
     /// Records the first fault and returns its typed failure.

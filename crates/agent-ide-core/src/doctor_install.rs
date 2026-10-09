@@ -92,6 +92,7 @@ pub async fn report() -> Report {
     check_install(&mut findings, &effective);
     check_plugin(&mut findings, &effective);
     check_hosts(&mut findings, &effective);
+    check_language_modes(&mut findings);
     check_running_daemons(&mut findings).await;
     check_error_journal(&mut findings, &home);
     finish(findings, home)
@@ -126,6 +127,14 @@ fn push(
             component,
             detail,
         });
+    }
+}
+
+/// Reports where each language whose bundled module ships computes for a daemon started with this
+/// environment (`AGENT_IDE_LANGUAGE_MODE`), with any ignored switch entry.
+fn check_language_modes(findings: &mut Vec<Finding>) {
+    if let Some(line) = crate::modules::router::effective_modes(crate::lang::registered()) {
+        push(findings, "language_modes", "info", "modules", line);
     }
 }
 

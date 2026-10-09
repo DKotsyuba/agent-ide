@@ -903,7 +903,8 @@ impl LanguageChecks for RustChecks {
         &self,
         section: serde_json::Value,
     ) -> Result<Arc<dyn CheckConfig>, serde_json::Error> {
-        let config: ProjectRustChecksConfig = serde_json::from_value(section)?;
+        let mut config: ProjectRustChecksConfig = serde_json::from_value(section.clone())?;
+        config.section = section;
         Ok(Arc::new(config))
     }
 }
@@ -921,6 +922,9 @@ pub struct ProjectRustChecksConfig {
     /// `/usr/bin/xcode-select -p` with the fixed fallbacks (T05B, EYES-r2 §3).
     #[serde(default)]
     developer_dir: Option<PathBuf>,
+    /// The raw section, kept for the module that interprets it when Rust computes there.
+    #[serde(skip)]
+    section: serde_json::Value,
 }
 
 impl ProjectRustChecksConfig {
@@ -950,6 +954,14 @@ impl CheckConfig for ProjectRustChecksConfig {
 
     /// Builds the confined `cargo check` runner for this toolchain.
     fn checker(&self, runner: Arc<dyn ConfinedRunner>, timeout: Duration) -> Arc<dyn Checker> {
+        if let Some(checker) = agent_ide_core::modules::calls::checker(
+            crate::LANGUAGE,
+            &self.section,
+            runner.clone(),
+            timeout,
+        ) {
+            return checker;
+        }
         Arc::new(RustChecker::new(
             runner,
             self.toolchain_dir.clone(),

@@ -767,9 +767,10 @@ impl Shared {
     }
 
     /// Refreshes file-resolved identities and invalidates checks for changed languages.
-    fn refresh_environments(&self, worktree: &Path) {
+    async fn refresh_environments(&self, worktree: &Path) {
+        let observed = super::environment::observe(worktree).await;
         if let Ok(mut state) = self.environments.lock() {
-            let changed = state.refresh(worktree);
+            let changed = state.refresh(worktree, observed);
             if let Some(feed) = &self.project_feed {
                 for language in changed {
                     feed.environment_changed(worktree, language);
@@ -1269,11 +1270,11 @@ impl WorkerHandle {
                 nonce,
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 shutdown_failure: Mutex::new(None),
+                test_runs: TestRuns::new(admission.clone()),
                 admission,
                 telemetry,
                 problem_source: None,
                 project_feed: None,
-                test_runs: TestRuns::default(),
                 git_notices: Mutex::new(BTreeMap::new()),
                 environments: Mutex::default(),
                 activated: Mutex::new(BTreeMap::new()),
@@ -1333,7 +1334,7 @@ impl WorkerHandle {
     }
 
     /// Refreshes environment identities before plate rendering and returns due git/environment notices.
-    pub fn git_notice(&self, binding: &[u8; 32]) -> Option<String> {
+    pub async fn git_notice(&self, binding: &[u8; 32]) -> Option<String> {
         let mut lines = Vec::new();
         if let Some(root) = self
             .shared
@@ -1342,7 +1343,7 @@ impl WorkerHandle {
             .ok()
             .and_then(|state| state.root(binding))
         {
-            self.shared.refresh_environments(&root);
+            self.shared.refresh_environments(&root).await;
             if let Some(notice) = self.shared.environments.lock().ok()?.notice(&root, binding) {
                 lines.push(notice);
             }
@@ -1354,8 +1355,8 @@ impl WorkerHandle {
     }
 
     /// Consumes the exact delivered notice; a newer notice remains due for this binding.
-    pub fn consume_git_notice(&self, binding: &[u8; 32], line: &str) -> bool {
-        if self.git_notice(binding).as_deref() != Some(line) {
+    pub async fn consume_git_notice(&self, binding: &[u8; 32], line: &str) -> bool {
+        if self.git_notice(binding).await.as_deref() != Some(line) {
             return false;
         }
         if let Some(root) = self
@@ -2521,20 +2522,32 @@ impl<'a> Worker<'a> {
             let mut explicit_command = false;
             let mut command_cwd = root.clone();
             let mut command_env = Vec::new();
-            let (argv, language, selected_count) = if let Some(path) =
-                job.parameters.get("path").and_then(Value::as_str)
+            let (argv, language, selected_count) = if let Some(path) = job
+                .parameters
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
             {
+                let path = path.as_str();
                 // In a language whose tests live only in test files, a file the runner's naming
                 // convention does not count as a test file answers the same `no tests` hint the
                 // symbol path gives, instead of being handed to the runner as a target (which may
                 // import the module top-level or just fail). Directories keep selecting the test
                 // files inside them.
                 let target = PathBuf::from(path);
-                if !root.join(&target).is_dir()
-                    && let Some(language) = crate::lang::Language::for_path(&target)
-                    && language.support().tests_only_in_test_files()
-                    && !language.support().is_test_file(&target)
-                {
+                let not_a_test_file = match crate::lang::Language::for_path(&target) {
+                    Some(language)
+                        if !root.join(&target).is_dir()
+                            && language.support().tests_only_in_test_files() =>
+                    {
+                        !crate::modules::calls::test_facts(language, &root, &target)
+                            .await
+                            .map_err(|failure| symbols::module_failure(job, &failure))?
+                            .is_test_file
+                    }
+                    _ => false,
+                };
+                if not_a_test_file {
                     return Ok((
                         PeerReply::Complete {
                             kind: ResultKind::Test,
@@ -2547,7 +2560,10 @@ impl<'a> Worker<'a> {
                         None,
                     ));
                 }
-                match test_selection(&root, crate::lang::TestTarget::File(target)) {
+                match test_selection(&root, crate::lang::TestTarget::File(target))
+                    .await
+                    .map_err(|failure| symbols::module_failure(job, &failure))?
+                {
                     Ok(selection) => selection,
                     Err(crate::lang::LangError::Unsupported(message)) => return Ok((
                         PeerReply::InvalidParameters {
@@ -2563,7 +2579,10 @@ impl<'a> Worker<'a> {
                     Err(_) => return Err(FailureCode::ProviderUnavailable),
                 }
             } else if let Some(pattern) = job.parameters.get("pattern").and_then(Value::as_str) {
-                match test_selection(&root, crate::lang::TestTarget::Pattern(pattern.to_owned())) {
+                match test_selection(&root, crate::lang::TestTarget::Pattern(pattern.to_owned()))
+                    .await
+                    .map_err(|failure| symbols::module_failure(job, &failure))?
+                {
                     Ok(selection) => selection,
                     Err(crate::lang::LangError::Unsupported(message)) => return Ok((
                         PeerReply::InvalidParameters {
@@ -2579,6 +2598,11 @@ impl<'a> Worker<'a> {
                     Err(_) => return Err(FailureCode::ProviderUnavailable),
                 }
             } else if let Some(args) = job.parameters.get("command").and_then(Value::as_array) {
+                let argv: Vec<String> = args
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
                 if let Some(cwd) = job.parameters.get("cwd").and_then(Value::as_str) {
                     let root_path = root
                         .canonicalize()
@@ -2606,19 +2630,14 @@ impl<'a> Worker<'a> {
                     }));
                 }
                 let Some(language) = detect_test_language(&root)
+                    .await
+                    .map_err(|failure| symbols::module_failure(job, &failure))?
                     .or_else(|| crate::lang::registered().first().copied())
                 else {
                     return Err(FailureCode::ProviderUnavailable);
                 };
                 explicit_command = true;
-                (
-                    args.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect(),
-                    language,
-                    None,
-                )
+                (argv, language, None)
             } else if let Some(symbol) = job
                 .parameters
                 .get("symbol")
@@ -2688,11 +2707,16 @@ impl<'a> Worker<'a> {
                     path,
                     referencing_tests,
                 };
-                let support = language.support();
-                let project = support
-                    .detect(&root)
+                let project = crate::modules::calls::detect(language, &root)
+                    .await
+                    .map_err(|failure| symbols::module_failure(job, &failure))?
                     .ok_or(FailureCode::ProviderUnavailable)?;
-                let selection = match support.test_selection(&project, &target) {
+                let selection = match crate::modules::calls::test_selection(
+                    language, &root, &project, &target,
+                )
+                .await
+                .map_err(|failure| symbols::module_failure(job, &failure))?
+                {
                     Ok(selection) => selection,
                     Err(crate::lang::LangError::Unsupported(message)) => return Ok((
                         PeerReply::InvalidParameters {
@@ -2707,11 +2731,17 @@ impl<'a> Worker<'a> {
                     )),
                     Err(_) => return Err(FailureCode::ProviderUnavailable),
                 };
-                let bins: std::collections::BTreeSet<_> = selection
-                    .tests
-                    .iter()
-                    .filter_map(|test| support.test_binary(&test.file))
-                    .collect();
+                let mut bins = std::collections::BTreeSet::new();
+                for test in &selection.tests {
+                    if let Some(binary) =
+                        crate::modules::calls::test_facts(language, &root, &test.file)
+                            .await
+                            .map_err(|failure| symbols::module_failure(job, &failure))?
+                            .test_binary
+                    {
+                        bins.insert(binary);
+                    }
+                }
                 let count = Some(if bins.len() > 1 {
                     format!(
                         "{} tests in {} binaries; running the workspace filter",
@@ -2745,30 +2775,34 @@ impl<'a> Worker<'a> {
             };
             let mut started_id = None;
             if own_run.is_none() {
-                let start = if explicit_command {
-                    self.shared.test_runs.start_with_options(
-                        root.clone(),
-                        argv.clone(),
-                        &binding,
-                        super::tests::TestCommandOptions {
-                            cwd: command_cwd,
-                            env: command_env,
-                            language,
-                            command_language: None,
-                            budget,
-                            detail_ref: job.reference.clone(),
-                        },
-                    )
-                } else {
-                    self.shared.test_runs.start(
-                        root.clone(),
-                        argv.clone(),
+                // The command environment is the language's computation, resolved before the
+                // run starts (in process or by its module).
+                let resolution = super::tests::resolve_command(
+                    &root,
+                    if explicit_command {
+                        &command_cwd
+                    } else {
+                        &root
+                    },
+                    &argv,
+                    (!explicit_command).then_some(language),
+                )
+                .await
+                .map_err(|failure| symbols::module_failure(job, &failure))?;
+                let start = self.shared.test_runs.start_with_options(
+                    root.clone(),
+                    argv.clone(),
+                    &binding,
+                    super::tests::TestCommandOptions {
+                        cwd: command_cwd,
+                        env: command_env,
                         language,
+                        command_language: (!explicit_command).then_some(language),
                         budget,
-                        job.reference.clone(),
-                        &binding,
-                    )
-                };
+                        detail_ref: job.reference.clone(),
+                        resolution,
+                    },
+                );
                 match start {
                     StartResult::Started(id) => {
                         if explicit_command {
@@ -3406,6 +3440,13 @@ impl<'a> Worker<'a> {
                     detail: detail.as_deref(),
                     duration_ms: u32::try_from(started.elapsed().as_millis()).ok(),
                     request: request.as_deref(),
+                    module: detail
+                        .as_deref()
+                        .and_then(crate::telemetry::adapters::failed_module),
+                    module_version: detail
+                        .as_deref()
+                        .and_then(crate::telemetry::adapters::failed_module)
+                        .map(|_| env!("CARGO_PKG_VERSION")),
                     ..Default::default()
                 },
             );
@@ -3670,12 +3711,14 @@ impl<'a> Worker<'a> {
                 }
             }
         };
-        self.shared.refresh_environments(tree.worktree_path());
+        self.shared.refresh_environments(tree.worktree_path()).await;
         let choices = match validate_environment(
             job.parameters.get("environment"),
             tree.worktree_path(),
             self.shared.launcher.allowed_roots(),
-        ) {
+        )
+        .await
+        {
             Ok(choices) => choices,
             Err((code, detail)) => {
                 return Ok((
@@ -3932,7 +3975,8 @@ impl<'a> Worker<'a> {
                 })?;
         }
         self.shared
-            .refresh_environments(authority.worktree().worktree_path());
+            .refresh_environments(authority.worktree().worktree_path())
+            .await;
         // A plain directory has no Git state to capture, so no baseline run happens at all.
         let baseline = if plain_directory {
             None
@@ -3987,11 +4031,38 @@ impl<'a> Worker<'a> {
         let names = self.names.get(authority.worktree());
         let card = {
             let root = authority.worktree().worktree_path().to_path_buf();
-            let walk = tokio::task::spawn_blocking(move || {
-                let languages: Vec<LanguageProject> = crate::lang::registered()
+            // Detection and environments are language computations (in process or in each
+            // language's module); the blocking walk only renders their answers. A module that
+            // cannot answer leaves its language off the card.
+            let mut languages: Vec<LanguageProject> = Vec::new();
+            let mut environments = Vec::new();
+            let detection = async {
+                for &language in crate::lang::registered() {
+                    if let Ok(Some(project)) = crate::modules::calls::detect(language, &root).await
+                    {
+                        if let Ok(resolved) =
+                            crate::modules::calls::environments(language, &root).await
+                        {
+                            environments.push((language, resolved));
+                        }
+                        languages.push(project);
+                    }
+                }
+            };
+            if tokio::time::timeout(PROJECT_CARD_BUDGET, detection)
+                .await
+                .is_err()
+            {
+                languages.clear();
+                environments.clear();
+            }
+            let modes = crate::modules::calls::modes_line(
+                &languages
                     .iter()
-                    .filter_map(|language| language.support().detect(&root))
-                    .collect();
+                    .map(|project| project.language)
+                    .collect::<Vec<_>>(),
+            );
+            let walk = tokio::task::spawn_blocking(move || {
                 // The daemon does not probe language servers at start; every detected language's
                 // server state is the honest "not started" until a later tool observes otherwise,
                 // and it names what already works from source so a heavy user does not wait for
@@ -4006,7 +4077,9 @@ impl<'a> Worker<'a> {
                     })
                     .collect();
                 let links = project_card::links_line(&languages);
-                let project = project_card::collect(&root, languages, servers, None);
+                let mut project = project_card::collect(&root, languages, servers, None);
+                project.environments = environments;
+                project.modes = modes;
                 let clean_git = project.git.as_ref().and_then(|git| {
                     if git.clean {
                         git.last_commit
@@ -6803,7 +6876,7 @@ fn discovery_failure_detail(
 /// Validates choices before shared state changes. Every non-auto selector is admitted as a
 /// project-relative or absolute path; symlink and relative escapes retain the closed refusal.
 /// Project-root suffixes stay in the worktree, and language refusals preserve their reasons.
-fn validate_environment(
+async fn validate_environment(
     value: Option<&Value>,
     worktree: &Path,
     allowed_roots: &[PathBuf],
@@ -6861,9 +6934,9 @@ fn validate_environment(
                     ),
                 )
             })?;
-            language
-                .support()
-                .check_selection(worktree, &root, selector)
+            crate::modules::calls::check_selection(language, worktree, &root, selector)
+                .await
+                .map_err(|failure| (FailureCode::ProviderUnavailable, failure.to_string()))?
                 .map_err(|reason| invalid(format!("{key}: {reason}")))?;
         }
         result.push((
@@ -7235,18 +7308,30 @@ pub(super) fn fault_seam(_point: &str) -> bool {
 
 /// Projects detected at the worktree root in registration order, those with a root manifest
 /// first: a language present only by its files never shadows one the root declares.
-fn test_projects(root: &Path) -> Vec<(crate::lang::Language, LanguageProject)> {
-    let mut projects: Vec<_> = crate::lang::registered()
-        .iter()
-        .filter_map(|&language| Some((language, language.support().detect(root)?)))
-        .collect();
+async fn test_projects(
+    root: &Path,
+) -> Result<
+    Vec<(crate::lang::Language, LanguageProject)>,
+    crate::modules::contract::ModuleUnavailable,
+> {
+    let mut projects = Vec::new();
+    for &language in crate::lang::registered() {
+        if let Some(project) = crate::modules::calls::detect(language, root).await? {
+            projects.push((language, project));
+        }
+    }
     projects.sort_by_key(|(_, project)| project.manifests.is_empty());
-    projects
+    Ok(projects)
 }
 
 /// Chooses the first language of [`test_projects`].
-fn detect_test_language(root: &Path) -> Option<crate::lang::Language> {
-    test_projects(root).first().map(|(language, _)| *language)
+async fn detect_test_language(
+    root: &Path,
+) -> Result<Option<crate::lang::Language>, crate::modules::contract::ModuleUnavailable> {
+    Ok(test_projects(root)
+        .await?
+        .first()
+        .map(|(language, _)| *language))
 }
 
 /// Resolves a target through the detected runner, returning argv, language, and an optional
@@ -7254,12 +7339,17 @@ fn detect_test_language(root: &Path) -> Option<crate::lang::Language> {
 /// that names a file runs that file's language's runner — in a mixed worktree a `.py` test path
 /// selects pytest, never the first detected project's cargo — falling back to the first detected
 /// project for a bare pattern or an undetected language. Returns
-/// [`crate::lang::LangError::Unsupported`] when no runner supports the target.
-fn test_selection(
+/// [`crate::lang::LangError::Unsupported`] when no runner supports the target; a language module
+/// that cannot answer is the outer error.
+#[allow(clippy::type_complexity)]
+async fn test_selection(
     root: &Path,
     target: crate::lang::TestTarget,
-) -> Result<(Vec<String>, crate::lang::Language, Option<String>), crate::lang::LangError> {
-    let projects = test_projects(root);
+) -> Result<
+    Result<(Vec<String>, crate::lang::Language, Option<String>), crate::lang::LangError>,
+    crate::modules::contract::ModuleUnavailable,
+> {
+    let projects = test_projects(root).await?;
     let target_file = match &target {
         crate::lang::TestTarget::Symbol { path, .. } => path.file(),
         crate::lang::TestTarget::File(path) => Some(path.as_path()),
@@ -7270,14 +7360,18 @@ fn test_selection(
         .and_then(|language| projects.iter().find(|(detected, _)| *detected == language))
         .or_else(|| projects.first())
     else {
-        return Err(crate::lang::LangError::Unsupported(
+        return Ok(Err(crate::lang::LangError::Unsupported(
             "no supported test runner was detected".to_owned(),
-        ));
+        )));
     };
-    let selection = language.support().test_selection(project, &target)?;
+    let selection =
+        match crate::modules::calls::test_selection(*language, root, project, &target).await? {
+            Ok(selection) => selection,
+            Err(error) => return Ok(Err(error)),
+        };
     let count = (!selection.tests.is_empty())
         .then_some(format!("{} tests selected", selection.tests.len()));
-    Ok((selection.command, *language, count))
+    Ok(Ok((selection.command, *language, count)))
 }
 
 /// Formats an argv vector for the compact test status line without shell interpretation.
@@ -8073,8 +8167,8 @@ mod stop_retry_tests {
     }
 
     /// Relative escapes and symlink escapes are refused before language resolution; plain labels work.
-    #[test]
-    fn review_environment_selector_admission() {
+    #[tokio::test]
+    async fn review_environment_selector_admission() {
         crate::lang::testing::install();
         let fixture = Fixture::new();
         std::fs::create_dir_all(fixture.base.join("outside")).unwrap();
@@ -8092,6 +8186,7 @@ mod stop_retry_tests {
                 &fixture.root,
                 &allowed,
             )
+            .await
             .unwrap_err();
             assert_eq!(
                 error,
@@ -8107,6 +8202,7 @@ mod stop_retry_tests {
                 &fixture.root,
                 &[]
             )
+            .await
             .is_ok()
         );
         for key in ["alpha:../outside", "alpha:/absolute"] {
@@ -8116,6 +8212,7 @@ mod stop_retry_tests {
                     &fixture.root,
                     &allowed
                 )
+                .await
                 .unwrap_err()
                 .0,
                 FailureCode::InvalidDetail

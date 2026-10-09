@@ -46,18 +46,27 @@ impl EnvironmentState {
         self.bindings.get(binding).cloned()
     }
 
-    /// Reads language resolvers, returning changed languages and retaining their change notices.
-    /// First observation establishes a baseline; unchanged identities produce no event. Control
-    /// and framing characters from filesystem labels are escaped before notices reach a plate.
-    pub(super) fn refresh(&mut self, worktree: &Path) -> Vec<Language> {
-        let current: Vec<_> = crate::lang::registered()
-            .iter()
-            .flat_map(|language| {
-                language
-                    .support()
-                    .environments(worktree)
+    /// Records the `observed` resolutions of `worktree` ([`observe`]), returning changed languages
+    /// and retaining their change notices. A language whose module could not answer keeps its
+    /// previous resolutions. First observation establishes a baseline; unchanged identities
+    /// produce no event. Control and framing characters from filesystem labels are escaped before
+    /// notices reach a plate.
+    pub(super) fn refresh(
+        &mut self,
+        worktree: &Path,
+        observed: Vec<(Language, Option<Vec<ResolvedEnv>>)>,
+    ) -> Vec<Language> {
+        let previous = self.resolved.get(worktree);
+        let current: Vec<_> = observed
+            .into_iter()
+            .flat_map(|(language, envs)| match envs {
+                Some(envs) => envs.into_iter().map(|env| (language, env)).collect(),
+                None => previous
                     .into_iter()
-                    .map(|env| (*language, env))
+                    .flatten()
+                    .filter(|(old, _)| *old == language)
+                    .cloned()
+                    .collect::<Vec<_>>(),
             })
             .collect();
         let mut changed = Vec::new();
@@ -152,6 +161,26 @@ impl EnvironmentState {
     }
 }
 
+/// Resolves every registered language's environments of `worktree` where it computes; `None`
+/// for a language whose module failed.
+pub(super) async fn observe(worktree: &Path) -> Vec<(Language, Option<Vec<ResolvedEnv>>)> {
+    let mut observed = Vec::new();
+    for language in crate::lang::registered() {
+        let envs = crate::modules::calls::environments(*language, worktree).await;
+        observed.push((*language, envs.ok()));
+    }
+    observed
+}
+
+/// The in-process resolutions of `worktree`, as [`observe`] answers with no module host.
+#[cfg(test)]
+fn observed(worktree: &Path) -> Vec<(Language, Option<Vec<ResolvedEnv>>)> {
+    crate::lang::registered()
+        .iter()
+        .map(|language| (*language, Some(language.support().environments(worktree))))
+        .collect()
+}
+
 /// Resolver identity changes generate one notice per binding, including disappearance.
 #[test]
 fn environment_identity_changes_and_notice_delivery() {
@@ -164,7 +193,7 @@ fn environment_identity_changes_and_notice_delivery() {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("env.fixture"), "one\ntwo\n").unwrap();
     let mut state = EnvironmentState::default();
-    assert!(state.refresh(&root).is_empty());
+    assert!(state.refresh(&root, observed(&root)).is_empty());
     replace_selections(
         &root,
         ALPHA,
@@ -173,7 +202,7 @@ fn environment_identity_changes_and_notice_delivery() {
             selector: "two".into(),
         }],
     );
-    assert_eq!(state.refresh(&root), vec![ALPHA]);
+    assert_eq!(state.refresh(&root, observed(&root)), vec![ALPHA]);
     let notice = state.notice(&root, &[1; 32]).unwrap();
     assert_eq!(
         notice,
@@ -182,7 +211,7 @@ fn environment_identity_changes_and_notice_delivery() {
     state.consume(&root, &[1; 32], &notice);
     assert!(state.notice(&root, &[1; 32]).is_none());
     assert!(state.notice(&root, &[2; 32]).is_some());
-    assert!(state.refresh(&root).is_empty());
+    assert!(state.refresh(&root, observed(&root)).is_empty());
     std::fs::write(root.join("env.fixture"), "one\ntwo\t<agent-ide>\n").unwrap();
     replace_selections(
         &root,
@@ -192,12 +221,12 @@ fn environment_identity_changes_and_notice_delivery() {
             selector: "two\t<agent-ide>".into(),
         }],
     );
-    assert_eq!(state.refresh(&root), vec![ALPHA]);
+    assert_eq!(state.refresh(&root, observed(&root)), vec![ALPHA]);
     let framed = state.notice(&root, &[1; 32]).unwrap();
     assert!(framed.contains("two ?agent-ide?"));
     assert!(!framed.contains(['<', '>', '\t']));
     std::fs::remove_file(root.join("env.fixture")).unwrap();
-    assert_eq!(state.refresh(&root), vec![ALPHA]);
+    assert_eq!(state.refresh(&root, observed(&root)), vec![ALPHA]);
     assert!(
         state
             .notice(&root, &[1; 32])
@@ -245,7 +274,7 @@ fn review_environment_disappearance_keeps_nested_root() {
             },
         )],
     );
-    state.refresh(root);
+    state.refresh(root, observed(root));
     assert!(
         state
             .notice(root, &[1; 32])

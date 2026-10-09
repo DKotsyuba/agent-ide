@@ -635,24 +635,46 @@ fn auto_managed_candidate(
 /// host shuts it down. One arm per bundled module: each language's module task replaces its
 /// placeholder (every capability declared unsupported) with its own crate's server.
 async fn serve_bundled_module(language: &str, role: &str) -> ExitCode {
-    use agent_ide_core::modules::{
-        contract::{ModuleId, Role},
-        serve::{Unimplemented, serve_stdio},
-    };
-    let Some(role) = Role::parse(role) else {
+    use agent_ide_core::modules::{adapter::SupportServer, contract::Role, serve::serve_stdio};
+    let (Some(role), Some(registered)) = (
+        Role::parse(role),
+        agent_ide::lang::Language::by_id(language),
+    ) else {
         return ExitCode::from(2);
     };
-    let placeholder =
-        |language| Unimplemented::new(ModuleId::bundled(language), env!("CARGO_PKG_VERSION"));
+    // Conformance fixture (test-seams builds only): the contract's fake module under the
+    // language's identity, so host tests drive checks and effects through a real process.
+    if agent_ide_core::test_seams::var(agent_ide_core::modules::serve::FIXTURE_SEAM).is_some() {
+        let fixture = agent_ide_core::modules::fake::FakeModule::new(
+            agent_ide_core::modules::contract::ModuleId::bundled(language),
+            env!("CARGO_PKG_VERSION"),
+        );
+        return match serve_stdio(fixture, role).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
+    // The language's own support served through the module transport; a language's module
+    // task wraps it with its provider and checks.
+    let support = SupportServer::new(registered, env!("CARGO_PKG_VERSION"));
     let served = match language {
-        "python" => serve_stdio(placeholder("python"), role).await,
+        "python" => serve_stdio(support, role).await,
         "rust" => {
-            agent_ide::languages::install();
-            serve_stdio(agent_ide_lang_rust::module::RustModule::new(role), role).await
+            use agent_ide_lang_rust::module::{RustBuilder, RustModule};
+            match role {
+                Role::Analyzer => {
+                    let provider = agent_ide_core::modules::provider::ProviderServer::new(
+                        support,
+                        RustBuilder,
+                    );
+                    serve_stdio(RustModule::new(role, provider), role).await
+                }
+                Role::Checker => serve_stdio(RustModule::new(role, support), role).await,
+            }
         }
-        "typescript" => serve_stdio(placeholder("typescript"), role).await,
-        "html" => serve_stdio(placeholder("html"), role).await,
-        "css" => serve_stdio(placeholder("css"), role).await,
+        "typescript" => serve_stdio(support, role).await,
+        "html" => serve_stdio(support, role).await,
+        "css" => serve_stdio(support, role).await,
         _ => return ExitCode::from(2),
     };
     match served {

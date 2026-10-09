@@ -315,8 +315,8 @@ impl FakeModule {
                     .run(check_effect(&query.config))
                     .await
                     .map_err(|error| error.to_string())?;
-                let EffectOutcome::Completed { .. } = outcome else {
-                    return Err("check effect refused".into());
+                let EffectOutcome::Completed { truncated, .. } = outcome else {
+                    return Err(format!("check effect refused: {outcome:?}"));
                 };
                 let language = self.language().ok_or("language not registered")?;
                 let bytes = output
@@ -330,7 +330,10 @@ impl FakeModule {
                     query.request.input_generation,
                     0,
                 );
-                snapshot.detail = Some(format!("{bytes} output bytes"));
+                snapshot.detail = Some(format!(
+                    "{bytes} output bytes{}",
+                    if truncated { ", truncated" } else { "" }
+                ));
                 encode(&snapshot)
             }
             Capability::CheckParse => {
@@ -361,12 +364,15 @@ impl FakeModule {
                     }))
                 }
                 DescribeQuery::VerifyProvider { .. } => encode(&Ok::<(), String>(())),
-                DescribeQuery::Checks { .. } => {
+                DescribeQuery::Checks { section } => {
                     encode(&Ok::<ChecksDescription, String>(ChecksDescription {
                         valid: true,
-                        programs: Vec::new(),
-                        launcher_roots: Vec::new(),
-                        developer_dirs: Vec::new(),
+                        programs: serde_json::from_value(section["programs"].clone())
+                            .unwrap_or_default(),
+                        launcher_roots: serde_json::from_value(section["launcher_roots"].clone())
+                            .unwrap_or_default(),
+                        developer_dirs: serde_json::from_value(section["developer_dirs"].clone())
+                            .unwrap_or_default(),
                     }))
                 }
                 DescribeQuery::Presence { .. } => json!(true),
@@ -432,9 +438,16 @@ impl ModuleServer for FakeModule {
     }
 }
 
-/// The fake's check recipe: with `{"roots": n}` in its configuration, `n` ancestor files.
+/// The fake's check recipe: with `{"roots": n}` in its configuration, `n` ancestor files; the
+/// configuration's `params` object adds typed parameters (and its `programs`, the named programs
+/// `describe` reports), so a test can drive any declared recipe.
 fn check_effect(config: &Value) -> EffectRequest {
     let mut effect = sample_effect("check");
+    if let Ok(params) = serde_json::from_value::<std::collections::BTreeMap<String, Param>>(
+        config["params"].clone(),
+    ) {
+        effect.params.extend(params);
+    }
     if let Some(count) = config["roots"].as_u64() {
         let roots = (0..count)
             .map(|n| PathBuf::from(format!("/deep/{n:05}/Cargo.toml")))

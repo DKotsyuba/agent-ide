@@ -160,6 +160,65 @@ impl LanguageServer for RustServer {
     }
 }
 
+/// Opens the analyzer session on the started child's pipes: directly on rust-analyzer, or, in
+/// module mode, on the Rust module that hosts it (`hello` grants only the declaration's accepted
+/// files and the provider settings).
+#[allow(clippy::too_many_arguments)]
+async fn open_live(
+    module: Option<&agent_ide_core::modules::launch::ModuleExecutable>,
+    launch: &ProviderLaunch,
+    cache_namespace: &str,
+    stdout: tokio::process::ChildStdout,
+    stdin: tokio::process::ChildStdin,
+    source: &SourceObservation,
+    generation: ViewGeneration,
+    profile: RustProfile,
+) -> std::io::Result<LiveSession> {
+    let settings = ProviderSettings::new(profile);
+    let Some(executable) = module else {
+        return LiveSession::open(
+            stdout,
+            stdin,
+            source.worktree().clone(),
+            source.authority_epoch(),
+            generation,
+            settings,
+            Duration::from_secs(30),
+        )
+        .await;
+    };
+    let declared = crate::module::RustProviderSettings::from_launch(launch, cache_namespace)
+        .ok_or_else(|| std::io::Error::other("rust provider declaration"))?;
+    let options = launch
+        .options::<RustLaunchOptions>()
+        .ok_or_else(|| std::io::Error::other("rust provider declaration"))?;
+    let accepted = std::iter::once(&launch.executable)
+        .chain(options.cargo.iter())
+        .chain(options.rustc.iter())
+        .map(|file| (file.path.clone(), file.blake3.clone()))
+        .collect();
+    let offer = agent_ide_core::modules::analyzer::analyzer_offer(
+        executable,
+        crate::DESCRIPTOR.id,
+        generation.view,
+        source.worktree(),
+        accepted,
+        Duration::from_secs(30),
+        serde_json::to_value(declared).map_err(std::io::Error::other)?,
+    );
+    agent_ide_core::modules::analyzer::open_session(
+        stdout,
+        stdin,
+        offer,
+        source.worktree().clone(),
+        source.authority_epoch(),
+        generation,
+        settings,
+        Duration::from_secs(30),
+    )
+    .await
+}
+
 /// Names the failed initialize stage on the job's failure reply: a handshake that exhausted its
 /// 30-second bound reports the timeout; any other initialize failure (a server that exited or
 /// answered invalidly before readiness) reports the failed initialize. Closed stage words only.
@@ -249,17 +308,38 @@ impl RustBackend {
             configuration: RustServer.effective_configuration().into(),
             trust: launch.trust.clone(),
             transport: "stdio-v1".into(),
-            cache_namespace,
+            cache_namespace: cache_namespace.clone(),
         })
         .map_err(|_| FailureCode::ExecutionProfile)?;
         let scoped = server::execution_authority(&authority)?;
         let worktree = RustWorktree::new(authority.worktree().clone(), scoped)
             .map_err(|_| FailureCode::WorkspaceAuthority)?;
-        let command = profile
-            .command(&worktree)
-            .map_err(|_| FailureCode::ExecutionProfile)?;
+        // In module mode the analyzer is started by the Rust module, which is the process the
+        // core admits; the module plans and verifies the analyzer launch from the granted files.
+        let module = agent_ide_core::modules::calls::module_executable(crate::LANGUAGE);
+        let (command, program) = match &module {
+            Some(executable) => (
+                agent_ide_core::modules::analyzer::analyzer_command(
+                    executable,
+                    crate::DESCRIPTOR.id,
+                    authority.worktree(),
+                )
+                .ok_or(FailureCode::ExecutionProfile)?,
+                AcceptedExecutable {
+                    path: executable.path.clone(),
+                    identity: "agent-ide-module".to_owned(),
+                    blake3: executable.digest.to_hex().to_string(),
+                },
+            ),
+            None => (
+                profile
+                    .command(&worktree)
+                    .map_err(|_| FailureCode::ExecutionProfile)?,
+                launch.executable.clone(),
+            ),
+        };
         let request = host
-            .execution_request(&*job, &authority, command, &launch.executable)
+            .execution_request(&*job, &authority, command, &program)
             .await?;
         let active = host.active(&binding)?;
         // The shared controller guard is confined to this block: it is a `std` mutex, so it must
@@ -315,14 +395,15 @@ impl RustBackend {
         };
         let opened = match child.take_pipes() {
             Some((stdin, stdout)) => {
-                let open = LiveSession::open(
+                let open = open_live(
+                    module.as_deref(),
+                    launch,
+                    &cache_namespace,
                     stdout,
                     stdin,
-                    source.worktree().clone(),
-                    source.authority_epoch(),
+                    source,
                     generation,
-                    ProviderSettings::new(profile),
-                    Duration::from_secs(30),
+                    profile,
                 );
                 tokio::pin!(open);
                 // Stop or shutdown must be able to interrupt a handshake the server never answers.

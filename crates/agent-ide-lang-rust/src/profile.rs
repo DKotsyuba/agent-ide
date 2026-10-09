@@ -259,6 +259,19 @@ impl RustProfile {
         ])
     }
 
+    /// The analyzer's complete cleared environment as text, for a launch the module plans itself.
+    pub(crate) fn launch_environment(&self) -> std::collections::BTreeMap<String, String> {
+        self.environment()
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect()
+    }
+
     /// Produces the exclusive backend identity, including the canonical worktree incarnation.
     pub fn compatibility_key(&self, worktree: &RustWorktree) -> RustCompatibilityKey {
         let mut identity = String::new();

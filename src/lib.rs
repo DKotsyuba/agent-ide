@@ -76,6 +76,7 @@ pub mod languages {
     pub fn install() {
         crate::lang::install(&ALL);
         crate::assistance::launcher::install_retired_settings(&RETIRED_SETTINGS);
+        agent_ide_core::modules::recipe::declare(&[("rust", agent_ide_lang_rust::module::RECIPES)]);
     }
 }
 

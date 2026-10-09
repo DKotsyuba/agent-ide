@@ -2674,7 +2674,7 @@ impl OwnedProtocolChild {
         if let Err(error) = request.consume_spawn_use(active_use) {
             return Err(settlement.error(ProcessError::Request(error)));
         }
-        Self::spawn_parts(request, settlement, output_cap)
+        Self::spawn_parts(&request.command, settlement, output_cap)
     }
 
     /// Starts one forwarder using its distinct process slot and exact registry-view authority.
@@ -2702,20 +2702,45 @@ impl OwnedProtocolChild {
         if let Err(error) = request.consume_spawn_use(active_use) {
             return Err(settlement.error(ProcessError::Request(error)));
         }
-        Self::spawn_parts(request, settlement, output_cap)
+        Self::spawn_parts(&request.command, settlement, output_cap)
+    }
+
+    /// Starts one sealed bundled-module process on the daemon's own authority, admitted by a
+    /// direct reservation: the daemon's own executable in hidden module mode, never a program a
+    /// peer named, so no host invocation is involved. `command` must be a job whose program
+    /// digest, measured at construction, equals `pinned`, the digest measured at daemon start.
+    pub fn spawn_module(
+        command: &ControlledCommand,
+        lease: AdmissionLease,
+        pinned: &blake3::Hash,
+        output_cap: usize,
+    ) -> Result<Self, ProcessError> {
+        let settlement = SpawnNeverStarted::ordinary(lease);
+        if command.kind != CommandKind::Job || !command.has_program_digest(pinned) {
+            return Err(settlement.error(ProcessError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "module executable is not the pinned daemon executable",
+            ))));
+        }
+        Self::spawn_parts(command, settlement, output_cap)
+    }
+
+    /// Whether the direct child already exited, observed without reaping it, so its process
+    /// group can still be torn down safely.
+    pub fn exited(&self) -> bool {
+        self.process.child.id().is_none_or(leader_exited_unreaped)
     }
 
     /// Launches one typed or direct reservation while retaining its target and exact child identity.
     fn spawn_parts(
-        request: &ValidatedExecutionRequest,
+        command: &ControlledCommand,
         settlement: SpawnNeverStarted,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
-        let (mut child, identity) =
-            match launch_child(&request.command, &settlement, output_cap, true) {
-                Ok(child) => child,
-                Err(error) => return Err(settlement.error(error)),
-            };
+        let (mut child, identity) = match launch_child(command, &settlement, output_cap, true) {
+            Ok(child) => child,
+            Err(error) => return Err(settlement.error(error)),
+        };
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = tokio::spawn(drain(
@@ -2904,7 +2929,14 @@ fn launch_child(
         )
         .into());
     }
-    validate_output_cap(output_cap)?;
+    validate_output_cap(
+        output_cap,
+        if command.kind == CommandKind::Job && !protocol {
+            job::MAX_JOB_CAPTURE_BYTES
+        } else {
+            MAX_CAPTURED_PROCESS_BYTES
+        },
+    )?;
     if executable_identity(&command.program).map_err(ProcessError::Request)?
         != command.program_identity
     {
@@ -2916,6 +2948,8 @@ fn launch_child(
         process.stdin(Stdio::from(file.try_clone()?));
     } else if protocol {
         process.stdin(Stdio::piped());
+    } else if command.kind == CommandKind::Job {
+        process.stdin(Stdio::null());
     }
     configure_process_group(&mut process);
     let generation = launch_generation()?;
@@ -2943,31 +2977,34 @@ async fn cancel_owned(
             "owned process grace exceeds limit",
         )));
     }
-    if let Some(status) = process.child.try_wait()? {
-        return Ok(status);
-    }
-    let pid = process
-        .child
-        .id()
-        .ok_or_else(|| io::Error::other("owned child has no live PID"))?;
+    let Some(pid) = process.child.id() else {
+        // Already reaped by an earlier wait: its PID may be reused, so nothing is signalled.
+        return process
+            .child
+            .try_wait()?
+            .ok_or_else(|| ProcessError::Io(io::Error::other("owned child has no live PID")));
+    };
     let mut evidence = process.cancellation.unwrap_or(CancellationEvidence {
         term_requested: false,
         kill_requested: false,
     });
+    // The leader stays unreaped until the group teardown decision, whether it was alive at entry
+    // or exits on TERM: its PID pins the group id, so the group may still be signalled safely.
     evidence.term_requested |= signal_group(pid, libc::SIGTERM).is_ok();
     process.cancellation = Some(evidence);
-    match timeout(grace, process.child.wait()).await {
-        Ok(status) => status.map_err(ProcessError::Io),
-        Err(_) => {
-            evidence.kill_requested |= signal_group(pid, libc::SIGKILL).is_ok();
-            process.cancellation = Some(evidence);
-            process.child.start_kill()?;
-            timeout(deadline, process.child.wait())
-                .await
-                .map_err(|_| ProcessError::ReapTimedOut)?
-                .map_err(ProcessError::Io)
-        }
+    let grace_end = Instant::now() + grace;
+    while group_running(pid) && Instant::now() < grace_end {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    if group_running(pid) {
+        evidence.kill_requested |= signal_group(pid, libc::SIGKILL).is_ok();
+        process.cancellation = Some(evidence);
+        let _ = process.child.start_kill();
+    }
+    timeout(deadline, process.child.wait())
+        .await
+        .map_err(|_| ProcessError::ReapTimedOut)?
+        .map_err(ProcessError::Io)
 }
 
 /// Reads a private random launch generation before an OS child can exist.
@@ -2979,8 +3016,8 @@ fn launch_generation() -> Result<[u8; 32], ProcessError> {
 }
 
 /// Refuses over-limit capture policy before an OS child can be created; zero retains no bytes.
-fn validate_output_cap(cap: usize) -> Result<(), ProcessError> {
-    if cap > MAX_CAPTURED_PROCESS_BYTES {
+fn validate_output_cap(cap: usize, limit: usize) -> Result<(), ProcessError> {
+    if cap > limit {
         Err(ProcessError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
             "process capture cap exceeds limit",
@@ -3108,6 +3145,78 @@ fn signal_group(pid: u32, signal: libc::c_int) -> io::Result<()> {
             io::ErrorKind::Unsupported,
             "process groups are unavailable on this platform",
         ))
+    }
+}
+
+/// Whether the direct child `pid` has exited but is not yet reaped, observed without reaping it
+/// (`WNOWAIT`), so its PID and process group id cannot have been reused.
+fn leader_exited_unreaped(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: an all-zero `siginfo_t` is a valid plain-data value for the kernel to fill.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is writable; WNOWAIT leaves the child waitable, WNOHANG never blocks,
+        // and `pid` is this process's own unreaped direct child.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        result == 0 && info.si_pid == pid as libc::pid_t
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Whether any member of the owned process group led by `pid` is still running; an exited but
+/// unreaped member (the leader included) does not count.
+fn group_running(pid: u32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let mut pids = vec![0 as libc::pid_t; 4096];
+        let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+        // SAFETY: `pids` is writable for `bytes` bytes; the call only lists kernel PIDs.
+        let listed =
+            unsafe { libc::proc_listpgrppids(pid as libc::pid_t, pids.as_mut_ptr().cast(), bytes) };
+        if listed < 0 {
+            return false;
+        }
+        pids.iter()
+            .take(listed as usize)
+            .filter(|member| **member > 0)
+            .any(|member| {
+                // SAFETY: an all-zero `proc_bsdinfo` is a valid plain-data value to fill.
+                let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+                let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+                // SAFETY: `info` is writable for `size` bytes; the call only reads process data.
+                let written = unsafe {
+                    libc::proc_pidinfo(
+                        *member,
+                        libc::PROC_PIDTBSDINFO,
+                        0,
+                        (&mut info as *mut libc::proc_bsdinfo).cast(),
+                        size,
+                    )
+                };
+                written == size && info.pbi_status != libc::SZOMB
+            })
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // SAFETY: signal 0 only checks existence and permission; nothing is delivered.
+        let result = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
+        result == 0 && !leader_exited_unreaped(pid)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
     }
 }
 
@@ -3412,6 +3521,7 @@ pub async fn run_inherited_child(
     }
 }
 
+pub mod job;
 pub mod seatbelt;
 
 #[cfg(test)]
