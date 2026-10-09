@@ -17488,21 +17488,29 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
 /// A real background Context job that finishes while its own caller only ever saw `Pending`
 /// leaves a genuinely undelivered new fact: the first eligible native-edit hook must deliver it
 /// once, and a second must not resurrect it. This drives the actual product Worker/dispatcher
-/// entry path end to end (real daemon, real rust-analyzer, real hook binary) — `ide.inspect` is never
+/// entry path end to end (real daemon, real Pyright, real hook binary) — `ide.inspect` is never
 /// called for this detail, so nothing but the job's own completion and the hook can be the source
 /// of delivery.
 #[tokio::test]
-#[ignore = "requires accepted AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment"]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
 async fn configured_product_pending_context_job_completes_and_native_hook_delivers_its_feedback_once()
  {
     use std::os::unix::fs::PermissionsExt;
-    let analyzer = std::env::var("AGENT_IDE_RUST_ANALYZER").unwrap();
-    let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN").unwrap();
+    let node = std::env::var("AGENT_IDE_NODE").unwrap();
+    let pyright = std::env::var("AGENT_IDE_PYRIGHT").unwrap();
     let fixture = ProductFixture::new(json!([]));
-    // rust-analyzer cannot start until this test releases the gate, so the very first `ide.context`
-    // must observe the job still queued (`Pending`) rather than racing a fast real provider.
+    std::fs::write(
+        fixture.root.join("app.py"),
+        "def value() -> int:\n    return 7\n\ndef caller() -> int:\n    return value()\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "app.py"]);
+    fixture.git(&["commit", "--quiet", "-m", "python fixture"]);
+    // The Node host of Pyright cannot start until this test releases the gate, so the very first
+    // `ide.context` must observe the job still queued (`Pending`) rather than racing a fast real
+    // provider.
     let gate = fixture.base.join("release-provider");
-    let wrapper = fixture.base.join("rust-gated-provider");
+    let wrapper = fixture.base.join("node-gated-provider");
     fixture.guard_gate(&gate);
     std::fs::write(
         &wrapper,
@@ -17510,19 +17518,20 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
             "#!/bin/sh\nwhile [ ! -f '{}' ]; do [ -d '{}' ] || exit 1; sleep 0.02; done\nexec '{}' \"$@\"\n",
             gate.display(),
             fixture.base.display(),
-            analyzer.replace('\'', "'\\''")
+            node.replace('\'', "'\\''")
         ),
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let providers = json!([{
-        "executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
-        "settings":"rust_cache_priming_disabled_v1",
-        "toolchain":toolchain,
-        "cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),
-        "cargo_version":"cargo 1.98.1",
-        "rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),
-        "rustc_version":"rustc 1.98.1",
+        "executable":accepted_program(&pyright,"pyright 1.1.413"),
+        "settings":"pyright_defaults_v1",
+        "toolchain":"node-fixture",
+        "node":accepted_program(wrapper.to_str().unwrap(),"node-fixture"),
+        "cargo":null,
+        "cargo_version":null,
+        "rustc":null,
+        "rustc_version":null,
         "trust":"fixture-disabled",
         "cache_namespace":"fixture-pending-feedback-cache"
     }]);
@@ -17540,11 +17549,11 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
     assert_eq!(start["kind"], "activation", "{start}");
 
     std::fs::write(
-        fixture.root.join("src/lib.rs"),
-        "pub fn value() -> i32 { 7 }\npub fn caller() -> i32 { value() }\nmod missing_module;\n",
+        fixture.root.join("app.py"),
+        "def value() -> int:\n    return \"bad\"\n\ndef caller() -> int:\n    return value()\n",
     )
     .unwrap();
-    let offset = std::fs::read_to_string(fixture.root.join("src/lib.rs"))
+    let offset = std::fs::read_to_string(fixture.root.join("app.py"))
         .unwrap()
         .find("value")
         .unwrap();
@@ -17552,12 +17561,12 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
         .call(
             &fixture,
             "ide.context",
-            json!({"path":"src/lib.rs","byte_offset":offset}),
+            json!({"path":"app.py","byte_offset":offset}),
         )
         .await;
     assert_eq!(
         response["state"], "pending",
-        "rust-analyzer is gated and must not have answered synchronously: {response}"
+        "Pyright is gated and must not have answered synchronously: {response}"
     );
 
     // Release the gate: the job now finishes for real inside the daemon's own worker loop. This
@@ -19447,24 +19456,19 @@ async fn claude_later_binding_diffs_path_edited_under_earlier_grant() {
 /// Cross-production identity replacement is covered by the worker's bounded ledger regression;
 /// this test owns the real Claude host surfaces.
 #[tokio::test]
-#[ignore = "requires accepted AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment"]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
 async fn configured_product_claude_returns_context_diff_and_feedback() {
-    let rust_analyzer = std::env::var("AGENT_IDE_RUST_ANALYZER").unwrap();
-    let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN").unwrap();
-    let providers = json!([
-        {
-            "executable":accepted_program(&rust_analyzer,"1.98.1 (48a229ce 2026-09-01)"),
-            "settings":"rust_cache_priming_disabled_v1",
-            "toolchain":toolchain,
-            "cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),
-            "cargo_version":"cargo 1.98.1",
-            "rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),
-            "rustc_version":"rustc 1.98.1",
-            "trust":"fixture-disabled",
-            "cache_namespace":"fixture-claude-rust-cache"
-        }
-    ]);
+    let providers = json!([accepted_pyright_provider(
+        "fixture-claude-context-pyright-cache"
+    )]);
     let fixture = ProductFixture::new(providers);
+    std::fs::write(
+        fixture.root.join("app.py"),
+        "def value() -> int:\n    return 7\n\ndef caller() -> int:\n    return value()\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "app.py"]);
+    fixture.git(&["commit", "--quiet", "-m", "python fixture"]);
     let mut daemon = fixture
         .daemon_with_home(Some(&provider_home(&fixture)))
         .await;
@@ -19485,15 +19489,15 @@ async fn configured_product_claude_returns_context_diff_and_feedback() {
     assert!(feedback.is_empty());
 
     std::fs::write(
-        fixture.root.join("src/lib.rs"),
-        "pub fn value() -> i32 { 7 }\npub fn caller() -> i32 { value() }\nmod missing_module;\n",
+        fixture.root.join("app.py"),
+        "def value() -> int:\n    return \"bad\"\n\ndef caller() -> int:\n    return value()\n",
     )
     .unwrap();
-    let offset = std::fs::read_to_string(fixture.root.join("src/lib.rs"))
+    let offset = std::fs::read_to_string(fixture.root.join("app.py"))
         .unwrap()
         .find("value")
         .unwrap();
-    let arguments = json!({"path":"src/lib.rs","byte_offset":offset});
+    let arguments = json!({"path":"app.py","byte_offset":offset});
     let pending = actor
         .call_claude(&fixture, "ide.context", arguments.clone())
         .await;
@@ -19503,7 +19507,7 @@ async fn configured_product_claude_returns_context_diff_and_feedback() {
     assert_eq!(context["kind"], "context", "{context}");
     let context_text = context["text"].as_str().unwrap();
     assert!(context_text.contains("mode: semantic"), "{context_text}");
-    assert!(context_text.contains("missing_module"), "{context_text}");
+    assert!(context_text.contains("return \"bad\""), "{context_text}");
     assert!(
         context_text.contains("diagnostic_count: 1"),
         "{context_text}"
@@ -19548,17 +19552,17 @@ async fn configured_product_claude_returns_context_diff_and_feedback() {
         "{diff_text}"
     );
     assert!(
-        diff_text.contains("tracked_path: \"src/lib.rs\""),
+        diff_text.contains("tracked_path: \"app.py\""),
         "{diff_text}"
     );
-    assert!(diff_text.contains("missing_module"), "{diff_text}");
+    assert!(diff_text.contains("return \"bad\""), "{diff_text}");
 
     let mut retained = std::fs::read_dir(provider_cache(&fixture))
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect::<Vec<_>>();
     retained.sort();
-    // The daemon-owned provider uses the same layout as on the Codex route: one rust-analyzer
+    // The daemon-owned provider uses the same layout as on the Codex route: one Pyright
     // namespace.
     assert_eq!(retained.len(), 1, "{retained:?}");
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
