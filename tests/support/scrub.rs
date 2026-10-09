@@ -22,15 +22,16 @@ pub fn line(tool: &str, arguments: &Value, reply: &Value, root: &Path, base: &Pa
             *value = json!("<ref>");
         }
     }
-    let text = super::parity::line(tool, &arguments, reply)
-        .replace(root.to_string_lossy().as_ref(), "<root>")
-        .replace(base.to_string_lossy().as_ref(), "<fixture>");
-    if tool == "ide.start" {
-        let text = mask_after(&text, "git ", 7, 12);
-        mask_after(&text, "activation ", 8, 64)
-    } else {
-        text
+    let mut reply = reply.clone();
+    if tool == "ide.start"
+        && let Some(card) = reply["text"].as_str()
+    {
+        let card = mask_after(card, "git ", 7, 12);
+        reply["text"] = json!(mask_after(&card, "activation ", 8, 64));
     }
+    super::parity::line(tool, &arguments, &reply)
+        .replace(root.to_string_lossy().as_ref(), "<root>")
+        .replace(base.to_string_lossy().as_ref(), "<fixture>")
 }
 
 /// Masks the hexadecimal run that directly follows each `marker` when it is `min..=max` long.
@@ -97,6 +98,8 @@ mod tests {
         let read = |text: &str| at("ide.read", json!({"symbol":"a"}), text, "p");
         assert_ne!(read("git abcdef1"), read("git abcdef2"));
         assert_ne!(read("activation deadbeef"), read("activation cafebabe"));
+        let start = |id: &str| at("ide.start", json!({"activation_id":id}), "x", "p");
+        assert_ne!(start("activation deadbeef"), start("activation cafebabe"));
         assert_ne!(
             read("{\"source_ref\":\"alpha\"}"),
             read("{\"source_ref\":\"beta\"}")
