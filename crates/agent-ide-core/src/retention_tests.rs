@@ -1451,7 +1451,8 @@ fn the_private_estimate_excludes_inodes_with_a_link_outside_the_family() {
     let cache = sharing_cache(&home, "p", 4096);
     big_file(&cache.join("digest/lang/target/pinned"), 256 << 10);
     big_file(&cache.join("digest/lang/target/free"), 256 << 10);
-    let outside = scratch("private-outside-elsewhere").join("keeper");
+    let outside_root = scratch("private-outside-elsewhere");
+    let outside = outside_root.join("keeper");
     fs::hard_link(cache.join("digest/lang/target/pinned"), &outside).unwrap();
     let entries = scanned(&home);
     let sharing = Sharing::new(entries.iter().map(|entry| &entry.usage));

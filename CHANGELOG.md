@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Experimental, opt-in and read-only: with `AGENT_IDE_PILOT_MODULE=python` in the daemon's environment, Python analysis and the Python project check run in an external module process (the installed `agent-ide` binary in a hidden mode) instead of inside the daemon. Answers are the same as in-process; `rename` is refused in this mode; a killed, stalled or malformed module gives a typed refusal and is restarted while the daemon keeps serving; every confined check run the module asks for must match exactly what the core itself would run. Without the variable nothing changes. This is a learning pilot: its wire format is not public and may change or go away.
+
 ### Changed
 
 - Language-server native cache namespaces (rust-analyzer's build-script and proc-macro target, gopls' build and module caches, …) live in `~/.agent-ide/providers/<namespace>` instead of the daemon runtime in `/private/tmp`, so they survive a daemon restart and a reboot. The namespace key is now derived from the worktree directory (canonical path, inode and creation time) instead of the boot-local database identity, and hashes the accepted server and toolchain executables (path, identity, measured digest), settings, effective configuration, toolchain and trust: a restarted daemon adopts the namespace only when all of them are unchanged, a changed one starts cold in another directory and the old one ages out. Each namespace carries a `worktree.path` marker; `agent-ide cache status` lists them as `providers`, and the checks rules retire them (worktree gone, 14 days idle, 8 GiB budget least recently used first). When the state root is unusable the namespaces stay in the runtime directory as before.

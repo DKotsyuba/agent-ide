@@ -3,28 +3,12 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{CacheRequest, MAX_CACHE_NAMESPACES, project_inputs_stamp, retain_cache_plan};
 use crate::app::cache::{CacheNamespaceId, CacheRoot};
 use crate::assistance::reply::FailureCode;
 use crate::intelligence::freshness::{CacheIdentity, CacheLifecycle};
 use crate::workspace::authority::WorktreeRef;
-
-/// Separates the disposable cache roots created by tests in this process.
-static NEXT: AtomicUsize = AtomicUsize::new(0);
-
-/// Returns an uncreated unique temporary directory owned solely by one check.
-///
-/// Uses `/private/tmp` directly so Darwin's `/tmp` symlink alias cannot make the private-directory
-/// validation reject a path this test just created.
-fn temporary() -> PathBuf {
-    PathBuf::from(format!(
-        "/private/tmp/agent-ide-provider-caches-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ))
-}
 
 /// Builds one canonical worktree reference without discovering host Git state.
 ///
@@ -79,9 +63,10 @@ fn plan() -> Vec<CacheRequest> {
 /// deleted by the failure itself.
 #[test]
 fn a_late_provider_failure_leaves_earlier_lifecycles_reusable_and_retries_cleanly() {
-    let root_path = temporary();
+    let scratch = crate::scratch::ScratchDir::new("provider-caches");
+    let root_path = scratch.join("cache");
     let root = CacheRoot::prepare(&root_path).unwrap();
-    let tree = worktree(&temporary());
+    let tree = worktree(&scratch.join("tree"));
     let mut caches: BTreeMap<String, CacheLifecycle> = BTreeMap::new();
     let shared_refs: BTreeMap<String, usize> = BTreeMap::new();
     let plan = plan();
@@ -133,9 +118,10 @@ fn a_late_provider_failure_leaves_earlier_lifecycles_reusable_and_retries_cleanl
 /// A second live owner of the same namespace is refused as a finite conflict and may hand off later.
 #[test]
 fn a_live_namespace_owner_is_reported_as_a_conflict_until_it_quiesces() {
-    let root_path = temporary();
+    let scratch = crate::scratch::ScratchDir::new("provider-caches");
+    let root_path = scratch.join("cache");
     let root = CacheRoot::prepare(&root_path).unwrap();
-    let tree = worktree(&temporary());
+    let tree = worktree(&scratch.join("tree"));
     let mut caches: BTreeMap<String, CacheLifecycle> = BTreeMap::new();
     let shared_refs: BTreeMap<String, usize> = BTreeMap::new();
     let plan = plan();
@@ -177,9 +163,10 @@ fn a_live_namespace_owner_is_reported_as_a_conflict_until_it_quiesces() {
 /// A full lifecycle map fails closed with a typed capacity error and evicts no retained namespace.
 #[test]
 fn bounded_lifecycle_ownership_fails_closed_instead_of_evicting_retained_state() {
-    let root_path = temporary();
+    let scratch = crate::scratch::ScratchDir::new("provider-caches");
+    let root_path = scratch.join("cache");
     let root = CacheRoot::prepare(&root_path).unwrap();
-    let tree = worktree(&temporary());
+    let tree = worktree(&scratch.join("tree"));
     let mut caches: BTreeMap<String, CacheLifecycle> = BTreeMap::new();
     let shared_refs: BTreeMap<String, usize> = BTreeMap::new();
     for index in 0..MAX_CACHE_NAMESPACES {
@@ -223,9 +210,10 @@ fn bounded_lifecycle_ownership_fails_closed_instead_of_evicting_retained_state()
 /// keeps both its directory and its contents.
 #[test]
 fn a_failed_later_provider_leaves_no_unaccounted_namespace_or_directory_growth() {
-    let root_path = temporary();
+    let scratch = crate::scratch::ScratchDir::new("provider-caches");
+    let root_path = scratch.join("cache");
     let root = CacheRoot::prepare(&root_path).unwrap();
-    let tree = worktree(&temporary());
+    let tree = worktree(&scratch.join("tree"));
     let mut caches: BTreeMap<String, CacheLifecycle> = BTreeMap::new();
     let shared_refs: BTreeMap<String, usize> = BTreeMap::new();
 
@@ -305,7 +293,8 @@ fn a_failed_later_provider_leaves_no_unaccounted_namespace_or_directory_growth()
 /// ceiling is not seen, and a directory far larger than the entry budget is still stamped.
 #[test]
 fn project_inputs_stamp_follows_named_files_within_its_ceiling() {
-    let root = temporary();
+    let scratch = crate::scratch::ScratchDir::new("provider-inputs");
+    let root = scratch.join("tree");
     fs::create_dir_all(root.join("member/src")).unwrap();
     fs::create_dir_all(root.join("target/debug")).unwrap();
     fs::create_dir_all(root.join("a/b/c/d/e")).unwrap();
@@ -416,7 +405,8 @@ fn session_health_is_kept_per_owner_and_slot() {
         (BindingRef::fixture("health-a", "health-channel", 1), 0),
         (BindingRef::fixture("health-b", "health-channel", 1), 1),
     );
-    let mut providers = Providers::new(temporary());
+    let scratch = crate::scratch::ScratchDir::new("provider-health");
+    let mut providers = Providers::new(scratch.join("cache"));
     providers.begin_job();
     providers.current = Some(a.clone());
     providers.note_session_fault();
@@ -434,7 +424,8 @@ fn session_health_is_kept_per_owner_and_slot() {
 /// regular files are opened, so the scan returns at once (a blocking open would hang the worker).
 #[test]
 fn project_inputs_stamp_never_opens_special_files() {
-    let root = temporary();
+    let scratch = crate::scratch::ScratchDir::new("provider-inputs");
+    let root = scratch.join("tree");
     fs::create_dir_all(&root).unwrap();
     let pipe = root.join("Cargo.toml");
     let made = std::process::Command::new("mkfifo")
@@ -494,7 +485,8 @@ fn key_of(tree: &WorktreeRef, launch: &super::ProviderLaunch, configuration: &st
 /// a recreated directory or another path never reaches it.
 #[test]
 fn restart_state_follows_the_directory_not_the_boot() {
-    let path = temporary();
+    let scratch = crate::scratch::ScratchDir::new("provider-state");
+    let path = scratch.join("tree");
     fs::create_dir_all(&path).unwrap();
     let first_boot = worktree(&path);
     let second_boot =
@@ -505,7 +497,7 @@ fn restart_state_follows_the_directory_not_the_boot() {
         super::cache_state(&second_boot)
     );
 
-    let elsewhere = temporary();
+    let elsewhere = scratch.join("elsewhere");
     fs::create_dir_all(&elsewhere).unwrap();
     assert_ne!(
         super::cache_state(&first_boot),
@@ -520,7 +512,7 @@ fn restart_state_follows_the_directory_not_the_boot() {
     assert_ne!(before, super::cache_state(&first_boot));
 
     // A tree that cannot be inspected keeps its boot-local identity, never shared with another boot.
-    let missing = temporary();
+    let missing = scratch.join("missing");
     assert_ne!(
         super::cache_state(&worktree(&missing)),
         super::cache_state(
@@ -538,7 +530,8 @@ fn restart_state_follows_the_directory_not_the_boot() {
 /// Every input that makes a native cache unsafe to reuse changes the namespace key.
 #[test]
 fn the_namespace_key_fences_executable_settings_configuration_toolchain_and_trust() {
-    let path = temporary();
+    let scratch = crate::scratch::ScratchDir::new("provider-state");
+    let path = scratch.join("tree");
     fs::create_dir_all(&path).unwrap();
     let tree = worktree(&path);
     let base = launch("exe-1", "toolchain-1", "trust-1", "ns");
@@ -606,10 +599,11 @@ fn the_namespace_key_fences_executable_settings_configuration_toolchain_and_trus
 /// directory, `cache status` lists them, and a deleted worktree retires its namespace.
 #[test]
 fn a_restarted_daemon_adopts_the_namespace_and_retention_retires_it() {
-    let home = temporary();
+    let scratch = crate::scratch::ScratchDir::new("provider-retention");
+    let home = scratch.join("home");
     let providers = crate::retention::providers_root(&home).expect("private providers root");
     let root = CacheRoot::prepare(&providers).unwrap();
-    let path = temporary();
+    let path = scratch.join("tree");
     fs::create_dir_all(&path).unwrap();
     let request = |tree: &WorktreeRef, trust: &str| {
         let launch = launch("exe-1", "toolchain-1", trust, "ns");
@@ -732,7 +726,8 @@ fn launch_with_programs(
 /// identity or digest, still derives another namespace.
 #[test]
 fn the_namespace_key_fences_the_measured_programs_not_just_their_labels() {
-    let path = temporary();
+    let scratch = crate::scratch::ScratchDir::new("provider-state");
+    let path = scratch.join("tree");
     fs::create_dir_all(&path).unwrap();
     let tree = worktree(&path);
     let zero = "0".repeat(64);

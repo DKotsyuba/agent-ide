@@ -449,13 +449,26 @@ mod tests {
 
     use super::*;
 
+    /// Removes a pilot fixture and all files it created when the test exits.
+    struct TestScratch(PathBuf);
+
+    impl Drop for TestScratch {
+        /// Deletes the fixture directory, including during assertion unwinding.
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// The core permits exactly the in-process spec of each resolved root and refuses a module
     /// spec that differs in any field, including a write root that escapes the cache lexically.
     #[test]
     fn only_the_core_built_spec_is_permitted() {
-        let root =
-            std::env::temp_dir().join(format!("agent-ide-pilot-policy-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = TestScratch(
+            std::env::temp_dir().join(format!("agent-ide-pilot-policy-{}", std::process::id())),
+        );
+        let _ = fs::remove_dir_all(&scratch.0);
+        fs::create_dir_all(&scratch.0).unwrap();
+        let root = scratch.0.join("tree");
         fs::create_dir_all(root.join(".venv/bin")).unwrap();
         fs::write(root.join(".venv/bin/python"), "").unwrap();
         fs::write(root.join("pyproject.toml"), "").unwrap();
@@ -482,6 +495,5 @@ mod tests {
         let mut other = permitted[0].clone();
         other.args.push(OsString::from("--watch"));
         assert!(!permitted.contains(&other));
-        fs::remove_dir_all(&root).unwrap();
     }
 }
