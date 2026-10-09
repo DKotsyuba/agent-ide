@@ -1388,10 +1388,28 @@ fn cache_state(worktree: &crate::workspace::authority::WorktreeRef) -> String {
     format!("tree-{}", hash.finalize().to_hex())
 }
 
+/// Fingerprints every program a launch runs: the server executable and the language's own
+/// toolchain executables (compilers, interpreters), each by path, identity and measured BLAKE3.
+/// A selector such as `stable` or an unchanged identity label cannot hide a replaced binary.
+fn programs(launch: &ProviderLaunch) -> String {
+    std::iter::once(&launch.executable)
+        .chain(launch.server().launch_executables(launch))
+        .map(|program| {
+            format!(
+                "{}\0{}\0{}",
+                program.path.display(),
+                program.identity,
+                program.blake3
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\u{1}")
+}
+
 /// Derives one opaque namespace component from durable worktree and accepted provider identities.
 ///
 /// Every input that makes an existing native cache unsafe to reuse is hashed: the accepted
-/// executable, settings, effective initialization configuration, toolchain and effective trust.
+/// executables (server and toolchain: path, identity and measured digest), settings, effective initialization configuration, toolchain and effective trust.
 /// A restarted daemon whose launch declaration changed in any of them computes a different key,
 /// finds no namespace and starts cold; the old one ages out under the retention rules.
 fn provider_cache_key(
@@ -1406,7 +1424,7 @@ fn provider_cache_key(
             "{}\0{}\0{}\0{}\0{}\0{}\0{}",
             worktree_state,
             launch.cache_namespace,
-            launch.executable.identity,
+            programs(launch),
             settings,
             configuration,
             launch.toolchain,
