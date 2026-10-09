@@ -5,9 +5,11 @@
 //! Without an installed host (unit tests, tools that never start a daemon) every language computes
 //! in process, exactly as before. A module failure is the typed [`ModuleUnavailable`] the caller
 //! maps onto its existing refusal; it never falls back in process silently. A complete
-//! `analyze_source` answer is cached by language, worktree, path, exact source revision and
-//! requested fields for the daemon's one pinned module build; a warming or unsupported field is
-//! never cached as a fact.
+//! `analyze_source` answer of text- and path-only fields (outline from source, file doc, structural
+//! syntax verdict, test facts) is cached by language, worktree, path, exact source revision and
+//! requested fields for the daemon's one pinned module build: those fields depend on nothing else
+//! (no configuration, environment or provider readiness). Anchors, whose coverage the live
+//! instance declares, and any warming or unsupported field are never cached.
 //!
 //! [`LanguageSupport`]: crate::lang::LanguageSupport
 
@@ -126,15 +128,16 @@ fn analyses() -> &'static Mutex<HashMap<AnalysisKey, SourceAnalysis>> {
     CACHE.get_or_init(Mutex::default)
 }
 
-/// Whether `analysis` computed every requested field: only such an answer is a cacheable fact (a
-/// warming field may compute later, an unsupported one is not this source's fact).
+/// Whether `analysis` is a cacheable fact: every requested field computed (a warming field may
+/// compute later, an unsupported one is not this source's fact) and none of them anchors (their
+/// coverage is the live instance's declaration, validated per call, never a fact of the text).
 fn complete(analysis: &SourceAnalysis, fields: &[SourceField]) -> bool {
     fields.iter().all(|field| match field {
         SourceField::Outline => matches!(analysis.outline, Field::Available(_)),
         SourceField::FileDoc => matches!(analysis.file_doc, Field::Available(_)),
         SourceField::Syntax => matches!(analysis.syntax, Field::Available(_)),
         SourceField::Tests => matches!(analysis.tests, Field::Available(_)),
-        SourceField::Anchors => matches!(analysis.anchors, Field::Available(_)),
+        SourceField::Anchors => false,
     })
 }
 
@@ -786,7 +789,8 @@ mod tests {
     use super::*;
 
     /// Only an answer that computed every requested field is a cacheable fact: a warming or
-    /// unsupported field (whose in-process default the caller substitutes) never is.
+    /// unsupported field (whose in-process default the caller substitutes) never is, nor is an
+    /// anchor batch, however complete.
     #[test]
     fn only_complete_analyses_are_cached() {
         let analysis = |tests: Field<TestFacts>| SourceAnalysis {
@@ -811,5 +815,16 @@ mod tests {
             })),
             &[SourceField::Tests, SourceField::Syntax]
         ));
+        let anchors = SourceAnalysis {
+            anchors: Field::Available(AnchorBatch {
+                verdict: FileVerdict::Indexed,
+                capped: false,
+                rejected: 0,
+                coverage: Vec::new(),
+                anchors: Vec::new(),
+            }),
+            ..analysis(Field::NotRequested)
+        };
+        assert!(!complete(&anchors, &[SourceField::Anchors]));
     }
 }
