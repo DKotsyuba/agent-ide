@@ -268,6 +268,11 @@ impl<L: Launcher> Supervisor<L> {
         }
     }
 
+    /// Retires the live instance after a reply the core cannot use, counting it as a crash.
+    pub async fn retire_failed(&mut self) -> Result<(), ModuleUnavailable> {
+        self.retire(true).await
+    }
+
     /// Reaps `process`; a cleanup that cannot be proven marks the slot unreaped and is returned
     /// as its `drain` failure.
     async fn reap(&mut self, process: L::Process) -> Result<(), ModuleUnavailable> {
@@ -647,6 +652,24 @@ mod tests {
             supervisor.launcher.launches, 1,
             "no replacement after the stop"
         );
+    }
+
+    /// A reply the core cannot use retires the live instance as a counted crash; the next demand
+    /// starts a fresh one after the backoff.
+    #[tokio::test(start_paused = true)]
+    async fn an_unusable_reply_retires_the_instance() {
+        let mut supervisor = slot(FakeLauncher::new(Vec::new()));
+        call(&mut supervisor, Capability::FileDoc).await.unwrap();
+        supervisor.retire_failed().await.unwrap();
+        assert!(!supervisor.is_live());
+        assert_eq!(supervisor.launcher.reaps, 1);
+        let started = Instant::now();
+        call(&mut supervisor, Capability::FileDoc).await.unwrap();
+        assert!(
+            Instant::now() >= started + RESTART_DELAYS[0],
+            "counted as a crash"
+        );
+        assert_eq!(supervisor.instance, 2);
     }
 
     /// A crash loop exhausts the budget (`restart_exhausted` with a retry time, no further

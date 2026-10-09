@@ -107,6 +107,9 @@ pub struct ModuleHost {
     admission: Arc<Mutex<AdmissionController>>,
     /// Live slots.
     slots: tokio::sync::Mutex<HashMap<(String, PathBuf, Role), Slot>>,
+    /// Slots whose stop could not prove its cleanup, with why: their admission stays held and
+    /// no fresh slot replaces them.
+    unreaped: std::sync::Mutex<HashMap<(String, PathBuf, Role), Cause>>,
     /// Extra variables every module receives (test seams).
     extra_env: Vec<(String, String)>,
     /// Budget of one ordinary request.
@@ -192,6 +195,7 @@ impl ModuleHost {
             shipped,
             admission,
             slots: tokio::sync::Mutex::default(),
+            unreaped: std::sync::Mutex::default(),
             extra_env,
             budget: request_budget(),
         }
@@ -213,6 +217,7 @@ impl ModuleHost {
             shipped: shipped.iter().map(|id| (*id).to_owned()).collect(),
             admission,
             slots: tokio::sync::Mutex::default(),
+            unreaped: std::sync::Mutex::default(),
             extra_env,
             budget,
         }
@@ -267,6 +272,23 @@ impl ModuleHost {
     ) -> Result<Slot, ModuleUnavailable> {
         let module_id = ModuleId::bundled(language.name());
         let version = env!("CARGO_PKG_VERSION");
+        let key = (language.name().to_owned(), worktree.to_path_buf(), role);
+        if let Some(cause) = self
+            .unreaped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+        {
+            return Err(ModuleUnavailable {
+                module_id,
+                module_version: version.to_owned(),
+                role,
+                stage: Stage::Drain,
+                cause: *cause,
+                instance: None,
+                retry_after_ms: None,
+            });
+        }
         let Some(executable) = self.executable.clone() else {
             return Err(ModuleUnavailable {
                 module_id,
@@ -278,7 +300,6 @@ impl ModuleHost {
                 retry_after_ms: None,
             });
         };
-        let key = (language.name().to_owned(), worktree.to_path_buf(), role);
         let mut slots = self.slots.lock().await;
         if let Some(slot) = slots.get(&key) {
             return Ok(slot.clone());
@@ -425,16 +446,22 @@ impl ModuleHost {
             }
         };
         match reply.outcome {
-            Outcome::Result(value) => decode(value).map_err(|_| failure(Cause::Malformed)),
-            Outcome::Error(error) => Err(ModuleUnavailable {
-                stage: Stage::Request,
-                ..failure(match error.code {
-                    super::contract::ErrorCode::ToolMissing => Cause::ToolMissing,
-                    super::contract::ErrorCode::InvalidRequest => Cause::Malformed,
-                    super::contract::ErrorCode::Busy => Cause::ResourceLimit,
-                    _ => Cause::PolicyRefused,
+            Outcome::Result(value) => match decode(value) {
+                Ok(value) => Ok(value),
+                // A well-framed but ill-typed result is the instance's fault: it is retired and
+                // counted like a crash, as a module session's is.
+                Err(_) => {
+                    supervisor.retire_failed().await?;
+                    Err(failure(Cause::Malformed))
+                }
+            },
+            Outcome::Error(error) => {
+                let (stage, cause) = refusal(&error);
+                Err(ModuleUnavailable {
+                    stage,
+                    ..failure(cause)
                 })
-            }),
+            }
         }
     }
 
@@ -457,7 +484,7 @@ impl ModuleHost {
 
     /// Stops every slot of `worktree` (view release, binding stop) in order.
     pub async fn stop_worktree(&self, worktree: &Path) {
-        let stopping: Vec<Slot> = {
+        let stopping: Vec<_> = {
             let mut slots = self.slots.lock().await;
             let keys: Vec<_> = slots
                 .keys()
@@ -465,30 +492,44 @@ impl ModuleHost {
                 .cloned()
                 .collect();
             keys.into_iter()
-                .filter_map(|key| slots.remove(&key))
+                .filter_map(|key| slots.remove(&key).map(|slot| (key, slot)))
                 .collect()
         };
-        for slot in stopping {
-            // Cancel the in-flight and waiting calls first, so the stop never queues behind them.
+        self.stop_slots(stopping).await;
+    }
+
+    /// Stops `slots` in order, each after cancelling its in-flight and waiting calls (so the
+    /// stop never queues behind them); a stop that cannot prove its cleanup quarantines its key.
+    async fn stop_slots(&self, slots: Vec<((String, PathBuf, Role), Slot)>) {
+        for (key, slot) in slots {
             slot.stopping.cancel();
-            let _ = slot.supervisor.lock().await.stop().await;
+            if let Err(cause) = slot.supervisor.lock().await.stop().await {
+                self.unreaped
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(key, cause);
+            }
         }
     }
 
     /// Stops every slot (daemon shutdown).
     pub async fn stop_all(&self) {
-        let stopping: Vec<Slot> = self
-            .slots
-            .lock()
-            .await
-            .drain()
-            .map(|(_, slot)| slot)
-            .collect();
-        for slot in stopping {
-            // Cancel the in-flight and waiting calls first, so the stop never queues behind them.
-            slot.stopping.cancel();
-            let _ = slot.supervisor.lock().await.stop().await;
-        }
+        let stopping: Vec<_> = self.slots.lock().await.drain().collect();
+        self.stop_slots(stopping).await;
+    }
+}
+
+/// The stage and cause of a module's typed refusal: a dependency failure keeps its own, every
+/// other code its closest cause (never a policy refusal for an unsupported or busy request).
+fn refusal(error: &super::contract::ModuleError) -> (Stage, Cause) {
+    use super::contract::ErrorCode;
+    match (error.code, error.unavailable) {
+        (ErrorCode::Unavailable, Some(unavailable)) => (unavailable.stage, unavailable.cause),
+        (ErrorCode::ToolMissing, _) => (Stage::Request, Cause::ToolMissing),
+        (ErrorCode::InvalidRequest, _) => (Stage::Request, Cause::Malformed),
+        (ErrorCode::Busy, _) => (Stage::Request, Cause::ResourceLimit),
+        (ErrorCode::Unsupported, _) => (Stage::Request, Cause::Incompatible),
+        _ => (Stage::Request, Cause::PolicyRefused),
     }
 }
 
@@ -496,6 +537,76 @@ impl ModuleHost {
 mod tests {
     use super::*;
     use crate::lang::testing::{ALPHA, BETA};
+
+    /// A slot whose stop could not prove its cleanup stays quarantined at its key: a later
+    /// demand is refused `drain` with that cause instead of starting a fresh slot.
+    #[tokio::test]
+    async fn an_unreaped_slot_is_never_replaced() {
+        crate::lang::testing::install();
+        let admission = Arc::new(Mutex::new(
+            crate::execution::AdmissionController::new(crate::execution::AdmissionLimits {
+                total_running: 2,
+                per_owner_running: 2,
+                per_owner_queued: 1,
+                total_queued: 1,
+                interactive_burst: 1,
+            })
+            .unwrap(),
+        ));
+        let host = ModuleHost::new(admission);
+        let worktree = Path::new("/quarantine");
+        host.unreaped.lock().unwrap().insert(
+            (
+                ALPHA.name().to_owned(),
+                worktree.to_path_buf(),
+                Role::Analyzer,
+            ),
+            Cause::ReapUnverified,
+        );
+        let refused = host
+            .slot(ALPHA, worktree, Role::Analyzer)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            (refused.stage, refused.cause),
+            (Stage::Drain, Cause::ReapUnverified)
+        );
+        assert!(host.slots.lock().await.is_empty(), "no fresh slot");
+    }
+
+    /// A typed dependency failure keeps its stage and cause; unsupported and busy requests are
+    /// not policy refusals.
+    #[test]
+    fn module_refusals_keep_their_typed_cause() {
+        use crate::modules::{
+            contract::{ErrorCode, ModuleError, Unavailable},
+            serve::Answer,
+        };
+        let Outcome::Error(provider) =
+            Answer::unavailable(Stage::Provider, Cause::Timeout, "provider").outcome
+        else {
+            panic!("an unavailable answer is an error");
+        };
+        assert_eq!(refusal(&provider), (Stage::Provider, Cause::Timeout));
+        let error = |code| ModuleError {
+            code,
+            message: String::new(),
+            unavailable: None::<Unavailable>,
+        };
+        assert_eq!(
+            refusal(&error(ErrorCode::Unsupported)),
+            (Stage::Request, Cause::Incompatible)
+        );
+        assert_eq!(
+            refusal(&error(ErrorCode::Busy)),
+            (Stage::Request, Cause::ResourceLimit)
+        );
+        assert_eq!(
+            refusal(&error(ErrorCode::ToolMissing)),
+            (Stage::Request, Cause::ToolMissing)
+        );
+    }
 
     /// Only languages whose module ships are named, each with where it computes; with none
     /// shipped there is no line.
