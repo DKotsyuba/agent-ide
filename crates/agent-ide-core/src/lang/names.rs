@@ -21,6 +21,9 @@ pub struct NamespaceDescriptor {
     pub define_word: &'static str,
     /// Prefix that addresses a bare name in this namespace (`.btn`, `##main`, `--brand`), if any.
     pub sigil: Option<&'static str>,
+    /// Names are worktree-relative file paths (spaces allowed, up to [`MAX_PATH_KEY_BYTES`])
+    /// instead of identifiers (no whitespace, up to [`MAX_NAME_BYTES`]).
+    pub path_keys: bool,
 }
 
 /// A namespace handle: a cheap copyable reference to a core-owned [`NamespaceDescriptor`].
@@ -54,6 +57,11 @@ impl Namespace {
     /// Bare-name prefix, if the namespace has one.
     pub const fn sigil(self) -> Option<&'static str> {
         self.0.sigil
+    }
+
+    /// Whether names are file paths (see [`NamespaceDescriptor::path_keys`]).
+    pub const fn path_keys(self) -> bool {
+        self.0.path_keys
     }
 }
 
@@ -105,6 +113,7 @@ pub mod ns {
         label: "class name",
         define_word: "rule",
         sigil: Some("."),
+        path_keys: false,
     };
     /// Descriptor of [`ELEMENT_ID`].
     static ELEMENT_ID_DESCRIPTOR: NamespaceDescriptor = NamespaceDescriptor {
@@ -112,6 +121,7 @@ pub mod ns {
         label: "element id",
         define_word: "element",
         sigil: Some("##"),
+        path_keys: false,
     };
     /// Descriptor of [`STYLE_VARIABLE`].
     static STYLE_VARIABLE_DESCRIPTOR: NamespaceDescriptor = NamespaceDescriptor {
@@ -119,6 +129,15 @@ pub mod ns {
         label: "style variable",
         define_word: "declaration",
         sigil: Some("--"),
+        path_keys: false,
+    };
+    /// Descriptor of [`FILE_REF`].
+    static FILE_REF_DESCRIPTOR: NamespaceDescriptor = NamespaceDescriptor {
+        id: "file-ref/v1",
+        label: "file reference",
+        define_word: "file",
+        sigil: None,
+        path_keys: true,
     };
 
     /// Class names: defined by style rule selectors, used by markup and code class attributes.
@@ -127,8 +146,13 @@ pub mod ns {
     pub const ELEMENT_ID: Namespace = Namespace::of(&ELEMENT_ID_DESCRIPTOR);
     /// Custom style properties: defined by `--x:` declarations, used by `var(--x)`.
     pub const STYLE_VARIABLE: Namespace = Namespace::of(&STYLE_VARIABLE_DESCRIPTOR);
+    /// File references: used by `<script src>`, `<link href>`, imports and `require` of a local
+    /// file; a name is the worktree-relative path the reference spells (lexically normalized),
+    /// and the file itself is the definition, known to the core's file listing rather than to
+    /// any extractor.
+    pub const FILE_REF: Namespace = Namespace::of(&FILE_REF_DESCRIPTOR);
     /// Every core namespace, in id order.
-    pub const ALL: [Namespace; 3] = [CLASS, ELEMENT_ID, STYLE_VARIABLE];
+    pub const ALL: [Namespace; 4] = [CLASS, FILE_REF, ELEMENT_ID, STYLE_VARIABLE];
 }
 
 /// The join key: facts meet only when namespace, domain and name are all byte-equal.
@@ -213,14 +237,17 @@ pub enum FileVerdict {
 
 /// Longest accepted name or domain, in bytes.
 pub const MAX_NAME_BYTES: usize = 256;
+/// Longest accepted name of a path-keyed namespace, in bytes.
+pub const MAX_PATH_KEY_BYTES: usize = 4096;
 /// Facts one file may contribute; the sink refuses more and marks itself capped.
 pub const MAX_FACTS_PER_FILE: usize = 5_000;
 
 /// Core-owned collector for one file's facts.
 ///
 /// Validates every fact (name of 1..=[`MAX_NAME_BYTES`] bytes without control characters or
-/// whitespace, domain empty or valid by the same rule, 1-based position) and enforces the per-file
-/// cap. Invalid facts are dropped and counted.
+/// whitespace — a path-keyed namespace takes 1..=[`MAX_PATH_KEY_BYTES`] bytes with spaces but no
+/// control characters and no domain — domain empty or valid by the same rule, 1-based position)
+/// and enforces the per-file cap. Invalid facts are dropped and counted.
 #[derive(Debug)]
 pub struct FactSink {
     /// Accepted facts in push order.
@@ -267,8 +294,15 @@ impl FactSink {
             text.len() <= MAX_NAME_BYTES
                 && !text.chars().any(|ch| ch.is_control() || ch.is_whitespace())
         };
+        let name_valid = if fact.key.namespace.path_keys() {
+            fact.key.name.len() <= MAX_PATH_KEY_BYTES
+                && !fact.key.name.chars().any(char::is_control)
+                && fact.key.domain.is_empty()
+        } else {
+            valid(&fact.key.name)
+        };
         if fact.key.name.is_empty()
-            || !valid(&fact.key.name)
+            || !name_valid
             || !valid(&fact.key.domain)
             || fact.line == 0
             || fact.column == 0
@@ -306,6 +340,44 @@ impl FactSink {
     }
 }
 
+/// The worktree-relative path `reference` spells when written in `from` (a worktree-relative
+/// file): joined to `from`'s directory and normalized lexically (`.` dropped, `..` resolved).
+/// `None` when the reference is not a plain relative path (empty, absolute, a URL scheme, a
+/// network path) or climbs above the worktree root. No file is consulted: the caller decides
+/// whether the target exists. Components are joined with `/`.
+pub fn relative_reference(from: &Path, reference: &str) -> Option<String> {
+    let first = reference.split('/').next().unwrap_or("");
+    if reference.is_empty()
+        || reference.starts_with(['/', '\\'])
+        || reference.contains(['\\', '\0'])
+        || first.contains(':')
+    {
+        return None;
+    }
+    let mut parts: Vec<&str> = from
+        .parent()
+        .map(|parent| {
+            parent
+                .components()
+                .filter_map(|component| match component {
+                    std::path::Component::Normal(part) => part.to_str(),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for part in reference.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(part),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 /// Cross-language name facts of one language. Stateless, synchronous and pure over its inputs.
 pub trait NameFacts: Send + Sync {
     /// The namespaces this language may define and/or use names in.
@@ -333,8 +405,67 @@ mod tests {
     fn namespaces_compare_by_id() {
         assert_eq!(ns::CLASS, ns::CLASS);
         assert_ne!(ns::CLASS, ns::ELEMENT_ID);
-        assert!(ns::CLASS < ns::STYLE_VARIABLE);
+        assert!(ns::CLASS < ns::FILE_REF && ns::FILE_REF < ns::STYLE_VARIABLE);
         assert_eq!(ns::ELEMENT_ID.sigil(), Some("##"));
+        assert!(ns::FILE_REF.path_keys() && !ns::CLASS.path_keys());
         assert_eq!(format!("{:?}", ns::STYLE_VARIABLE), "style-variable/v1");
+    }
+
+    /// References join to the referencing file's directory, normalize lexically and never leave
+    /// the worktree or name a URL, absolute path or empty target.
+    #[test]
+    fn relative_references_normalize_inside_the_worktree() {
+        let from = Path::new("src/ui/App.tsx");
+        let key = |reference| relative_reference(from, reference);
+        assert_eq!(key("./Button"), Some("src/ui/Button".into()));
+        assert_eq!(key("../lib/util.js"), Some("src/lib/util.js".into()));
+        assert_eq!(key("a/./b/../c.css"), Some("src/ui/a/c.css".into()));
+        assert_eq!(key("../../x.js"), Some("x.js".into()));
+        assert_eq!(key("../../../x.js"), None);
+        assert_eq!(key("/abs/x.js"), None);
+        assert_eq!(key("https://cdn/x.js"), None);
+        assert_eq!(key("data:text/javascript,1"), None);
+        assert_eq!(key("//cdn/x.js"), None);
+        assert_eq!(key("a\\b.js"), None);
+        assert_eq!(key(""), None);
+        assert_eq!(key("."), Some("src/ui".into()));
+        assert_eq!(
+            relative_reference(Path::new("index.html"), "app.js"),
+            Some("app.js".into())
+        );
+        assert_eq!(key("my file.css"), Some("src/ui/my file.css".into()));
+    }
+
+    /// A fact of `name` in `namespace` at line 1, column 1.
+    fn fact(namespace: Namespace, domain: &str, name: &str) -> NameFact {
+        NameFact {
+            key: NameKey {
+                namespace,
+                domain: domain.into(),
+                name: name.into(),
+            },
+            role: Role::Use,
+            line: 1,
+            column: 1,
+            certainty: Certainty::Exact,
+        }
+    }
+
+    /// Identifier namespaces refuse whitespace; a path-keyed namespace takes spaces and long
+    /// paths but neither control characters, an empty path, a domain nor more than 4 KiB.
+    #[test]
+    fn the_sink_validates_per_namespace() {
+        let mut sink = FactSink::new();
+        assert!(sink.push(fact(ns::CLASS, "", "a b")));
+        assert!(sink.push(fact(ns::FILE_REF, "", "src/my file.ts")));
+        assert!(sink.push(fact(ns::FILE_REF, "", &"d/".repeat(1000))));
+        assert!(sink.push(fact(ns::FILE_REF, "", "a\u{7}b")));
+        assert!(sink.push(fact(ns::FILE_REF, "dom", "a.ts")));
+        assert!(sink.push(fact(ns::FILE_REF, "", &"d".repeat(MAX_PATH_KEY_BYTES + 1))));
+        assert!(sink.push(fact(ns::CLASS, "", &"c".repeat(MAX_NAME_BYTES + 1))));
+        assert_eq!(sink.rejected(), 5);
+        let names: Vec<&str> = sink.facts().iter().map(|fact| &*fact.key.name).collect();
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[1].len(), 2000);
     }
 }
