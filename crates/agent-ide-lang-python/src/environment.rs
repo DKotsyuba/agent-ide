@@ -470,6 +470,26 @@ pub(crate) fn for_path(worktree: &Path, path: &Path) -> Option<Resolution> {
         .or_else(|| governing(worktree))
 }
 
+/// The roots a run of `worktree`'s accepted environments reads: each chosen environment directory
+/// and its interpreter's canonical installation prefix (a base interpreter outside every static
+/// prefix, such as a user-home installation, included), exactly as the in-process check grants.
+pub fn accepted_roots(worktree: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for env in environments(worktree, &[]) {
+        let Some(interpreter) = interpreter(&env) else {
+            continue;
+        };
+        let canonical = fs::canonicalize(&interpreter).unwrap_or_else(|_| interpreter.clone());
+        for path in [&interpreter, &canonical] {
+            let prefix = path.parent().and_then(Path::parent).unwrap_or(path);
+            if !roots.iter().any(|root| root == prefix) {
+                roots.push(prefix.to_path_buf());
+            }
+        }
+    }
+    roots
+}
+
 /// The session's interpreter and the identity a live session is compared against.
 pub(crate) fn session(worktree: &Path) -> (Option<PathBuf>, String) {
     governing(worktree).map_or_else(
@@ -1064,6 +1084,28 @@ mod tests {
         );
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir_all(&outside).unwrap();
+    }
+
+    /// The accepted roots are the chosen environment and its interpreter's canonical installation
+    /// prefix, reached through the `bin/python` link even when it lies outside every static
+    /// prefix; a project without an environment accepts nothing.
+    #[test]
+    fn accepted_roots_follow_the_interpreter_link() {
+        let root = scratch("accepted-roots");
+        let base = scratch("accepted-roots-base");
+        put(&base, "bin/python3.14", "");
+        put(&root, "pyproject.toml", "");
+        fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        std::os::unix::fs::symlink(base.join("bin/python3.14"), root.join(".venv/bin/python"))
+            .unwrap();
+        assert_eq!(
+            accepted_roots(&root),
+            vec![root.join(".venv"), fs::canonicalize(&base).unwrap()]
+        );
+        fs::remove_dir_all(root.join(".venv")).unwrap();
+        assert!(accepted_roots(&root).is_empty());
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&base).unwrap();
     }
 
     /// Explicit commands run activated in the environment of the deepest root holding `cwd`,
