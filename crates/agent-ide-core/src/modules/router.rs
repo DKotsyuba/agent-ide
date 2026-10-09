@@ -16,13 +16,13 @@ use std::{
 use serde::de::DeserializeOwned;
 
 use super::{
-    contract::Outcome,
     contract::{
         Capability, Cause, HelloOffer, Limits, ModuleConfig, ModuleId, ModuleUnavailable, PROTOCOL,
         Role, Stage, VERSION,
     },
+    contract::{Outcome, QUEUE_DEPTH},
     host::{Call, EffectRunner, NoEffects},
-    launch::{ExecutionLauncher, MODULE_ENV, ModuleExecutable},
+    launch::{ExecutionLauncher, ModuleExecutable, module_env},
     mode::{LanguageModes, Mode},
     payload::{decode, encode},
     runtime::Supervisor,
@@ -57,8 +57,43 @@ pub fn budget_or(default: Duration) -> Duration {
         .map_or(default, |ms| Duration::from_millis(ms.clamp(100, 60_000)))
 }
 
+/// One supervised slot: its supervisor (one request in flight), the callers waiting for it and
+/// the stop signal that cancels them.
+struct SlotState {
+    /// The instance's supervisor; holding it is having the one in-flight request.
+    supervisor: tokio::sync::Mutex<Supervisor<ExecutionLauncher>>,
+    /// Callers waiting for the supervisor, bounded by [`QUEUE_DEPTH`].
+    waiting: std::sync::atomic::AtomicU32,
+    /// Cancelled when the slot stops: in-flight and waiting calls end at once.
+    stopping: tokio_util::sync::CancellationToken,
+}
+
 /// One supervised slot.
-type Slot = Arc<tokio::sync::Mutex<Supervisor<ExecutionLauncher>>>;
+type Slot = Arc<SlotState>;
+
+/// One caller counted as waiting for a slot until dropped, so a cancelled caller never leaks its
+/// place in the bounded queue.
+struct Waiter<'a> {
+    /// The slot's waiter count.
+    count: &'a std::sync::atomic::AtomicU32,
+    /// Callers already waiting when this one entered.
+    ahead: u32,
+}
+
+impl<'a> Waiter<'a> {
+    /// Counts one more waiter on `count`.
+    fn enter(count: &'a std::sync::atomic::AtomicU32) -> Self {
+        let ahead = count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self { count, ahead }
+    }
+}
+
+impl Drop for Waiter<'_> {
+    /// Gives the place back.
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 
 /// The daemon's module routing state.
 pub struct ModuleHost {
@@ -108,22 +143,14 @@ fn shipped_languages() -> BTreeSet<String> {
 }
 
 /// One `<language> <mode>` entry per language of `languages` whose module ships — `module`, or
-/// `in process (fallback)` when the switch sends it back or the executable cannot be pinned —
+/// `in process (fallback)` when the switch sends it back —
 /// joined with ` · `; `None` when none of them ships a module. `ignored` journal entries of the
 /// switch follow. This is what a process started with this environment would do (`agent-ide
 /// doctor`); a running daemon reports its own routing through [`ModuleHost::modes_line`].
 pub fn effective_modes(languages: &[Language]) -> Option<String> {
     let shipped = shipped_languages();
     let modes = LanguageModes::from_env();
-    let pinned = ModuleExecutable::current().is_some();
-    modes_line(languages, &shipped, |language| {
-        if pinned && modes.mode(language.name()) == Mode::Module {
-            Mode::Module
-        } else {
-            Mode::InProcess
-        }
-    })
-    .map(|line| {
+    modes_line(languages, &shipped, |language| modes.mode(language.name())).map(|line| {
         let ignored = modes.ignored_lines();
         if ignored.is_empty() {
             line
@@ -196,9 +223,21 @@ impl ModuleHost {
         self.modes.ignored_lines()
     }
 
-    /// The pinned module executable, when one could be measured.
-    pub fn executable(&self) -> Option<Arc<ModuleExecutable>> {
-        self.executable.clone()
+    /// The pinned module executable of `language`, or its typed refusal when the executable
+    /// could not be measured.
+    pub fn executable(
+        &self,
+        language: Language,
+    ) -> Result<Arc<ModuleExecutable>, ModuleUnavailable> {
+        self.executable.clone().ok_or_else(|| ModuleUnavailable {
+            module_id: ModuleId::bundled(language.name()),
+            module_version: env!("CARGO_PKG_VERSION").to_owned(),
+            role: Role::Analyzer,
+            stage: Stage::Spawn,
+            cause: Cause::Incompatible,
+            instance: None,
+            retry_after_ms: None,
+        })
     }
 
     /// This daemon's [`effective_modes`] line for `languages`.
@@ -208,8 +247,9 @@ impl ModuleHost {
 
     /// Where `language` computes in this daemon.
     pub fn mode(&self, language: Language) -> Mode {
-        if self.executable.is_some()
-            && self.shipped.contains(language.name())
+        // Only the shipped set and the explicit switch decide; a module that cannot be pinned or
+        // started stays in module mode and answers a typed `module_unavailable`.
+        if self.shipped.contains(language.name())
             && self.modes.mode(language.name()) == Mode::Module
         {
             Mode::Module
@@ -247,10 +287,7 @@ impl ModuleHost {
             worktree: Some(worktree.to_path_buf()),
             provider: None,
             checks: None,
-            env: MODULE_ENV
-                .iter()
-                .filter_map(|name| Some(((*name).to_owned(), std::env::var(name).ok()?)))
-                .collect(),
+            env: module_env(language.name()),
             home: crate::userhome::user_home(),
         };
         let owner = OwnerId::new(format!(
@@ -283,11 +320,11 @@ impl ModuleHost {
             requested_caps: Vec::new(),
             config,
         };
-        let slot = Arc::new(tokio::sync::Mutex::new(Supervisor::new(
-            launcher,
-            offer,
-            STARTUP_BUDGET,
-        )));
+        let slot = Arc::new(SlotState {
+            supervisor: tokio::sync::Mutex::new(Supervisor::new(launcher, offer, STARTUP_BUDGET)),
+            waiting: std::sync::atomic::AtomicU32::new(0),
+            stopping: tokio_util::sync::CancellationToken::new(),
+        });
         slots.insert(key, slot.clone());
         Ok(slot)
     }
@@ -332,9 +369,6 @@ impl ModuleHost {
         budget: Duration,
         effects: &mut dyn EffectRunner,
     ) -> Result<T, ModuleUnavailable> {
-        let slot = self.slot(language, worktree, role).await?;
-        let mut supervisor = slot.lock().await;
-        let reply = supervisor.call(call, budget, effects).await?;
         let failure = |cause| ModuleUnavailable {
             module_id: ModuleId::bundled(language.name()),
             module_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -343,6 +377,52 @@ impl ModuleHost {
             cause,
             instance: None,
             retry_after_ms: None,
+        };
+        // One deadline covers the wait for the instance and the call itself.
+        let deadline = tokio::time::Instant::now() + budget;
+        let slot = self.slot(language, worktree, role).await?;
+        let waiter = Waiter::enter(&slot.waiting);
+        let waited = if waiter.ahead >= QUEUE_DEPTH {
+            Err(Stage::Admission)
+        } else {
+            tokio::select! {
+                supervisor = tokio::time::timeout_at(deadline, slot.supervisor.lock()) => {
+                    supervisor.map_err(|_| Stage::Request)
+                }
+                _ = slot.stopping.cancelled() => Err(Stage::Request),
+            }
+        };
+        drop(waiter);
+        let mut supervisor = match waited {
+            Ok(supervisor) => supervisor,
+            Err(Stage::Admission) => {
+                return Err(ModuleUnavailable {
+                    stage: Stage::Admission,
+                    ..failure(Cause::ResourceLimit)
+                });
+            }
+            Err(_) if slot.stopping.is_cancelled() => {
+                return Err(ModuleUnavailable {
+                    stage: Stage::Request,
+                    ..failure(Cause::Exited)
+                });
+            }
+            Err(stage) => {
+                return Err(ModuleUnavailable {
+                    stage,
+                    ..failure(Cause::Timeout)
+                });
+            }
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let reply = tokio::select! {
+            reply = supervisor.call(call, remaining, effects) => reply?,
+            _ = slot.stopping.cancelled() => {
+                return Err(ModuleUnavailable {
+                    stage: Stage::Request,
+                    ..failure(Cause::Exited)
+                });
+            }
         };
         match reply.outcome {
             Outcome::Result(value) => decode(value).map_err(|_| failure(Cause::Malformed)),
@@ -356,6 +436,23 @@ impl ModuleHost {
                 })
             }),
         }
+    }
+
+    /// The linkage coverage the live analyzer instance of `language` in `worktree` declared in
+    /// its `hello`; `None` while none is live.
+    pub async fn linkage(
+        &self,
+        language: Language,
+        worktree: &Path,
+    ) -> Option<Vec<super::payload::LinkageCoverage>> {
+        let key = (
+            language.name().to_owned(),
+            worktree.to_path_buf(),
+            Role::Analyzer,
+        );
+        let slot = self.slots.lock().await.get(&key)?.clone();
+        let supervisor = slot.supervisor.lock().await;
+        supervisor.linkage().map(<[_]>::to_vec)
     }
 
     /// Stops every slot of `worktree` (view release, binding stop) in order.
@@ -372,7 +469,9 @@ impl ModuleHost {
                 .collect()
         };
         for slot in stopping {
-            let _ = slot.lock().await.stop().await;
+            // Cancel the in-flight and waiting calls first, so the stop never queues behind them.
+            slot.stopping.cancel();
+            let _ = slot.supervisor.lock().await.stop().await;
         }
     }
 
@@ -386,7 +485,9 @@ impl ModuleHost {
             .map(|(_, slot)| slot)
             .collect();
         for slot in stopping {
-            let _ = slot.lock().await.stop().await;
+            // Cancel the in-flight and waiting calls first, so the stop never queues behind them.
+            slot.stopping.cancel();
+            let _ = slot.supervisor.lock().await.stop().await;
         }
     }
 }

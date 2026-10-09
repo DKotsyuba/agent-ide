@@ -248,28 +248,112 @@ pub const CARGO_CHECK: EffectRecipe = EffectRecipe {
     capture_bytes: 64 << 20,
 };
 
-/// The platform developer-directory selection (`xcode-select -p`), the one finite probe the
-/// project check needs; the module starts no process itself, so the core runs it.
+/// The platform's selected developer directory (`/usr/bin/xcode-select -p`), the one finite probe
+/// the project check needs: the module starts no process itself, so the core runs it. The
+/// daemon's `DEVELOPER_DIR`, which `xcode-select` honours, travels as the module environment.
 pub const XCODE_SELECT: EffectRecipe = EffectRecipe {
     id: "xcode_select",
     program: "tool",
     args: &[Arg::Literal("-p")],
-    env: &[],
-    paths: &[PathRule {
-        param: "tool",
-        roles: &[PathRole::Fixed(&["/usr/bin/xcode-select"])],
-        existing_only: false,
-        read_root: false,
+    env: &[EnvRule::Param {
+        name: "DEVELOPER_DIR",
+        param: "developer_dir",
+        optional: true,
     }],
+    paths: &[
+        PathRule {
+            param: "tool",
+            roles: &[PathRole::Fixed(&["/usr/bin/xcode-select"])],
+            existing_only: false,
+            read_root: false,
+        },
+        PathRule {
+            param: "developer_dir",
+            roles: &[PathRole::DeveloperDir],
+            existing_only: false,
+            read_root: true,
+        },
+    ],
     executables: &[],
     stdin: Stdin::Null,
-    class: RunClass::Interactive,
+    class: RunClass::Background,
     timeout_ceiling_ms: 10_000,
     capture_bytes: 4096,
 };
 
+/// rustfmt formatting the candidate on stdin with the project's edition, the home tool the core
+/// finds on its formatter PATH exactly as for the in-process formatter.
+pub const RUSTFMT: EffectRecipe = EffectRecipe {
+    id: "rustfmt",
+    program: "rustfmt",
+    args: &[Arg::Literal("--edition"), Arg::Param("edition")],
+    env: &[
+        EnvRule::Home { name: "HOME" },
+        EnvRule::Literal {
+            name: "PATH",
+            value: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+        },
+    ],
+    paths: &[],
+    executables: &[ExecutableSlot {
+        name: "rustfmt",
+        source: SlotSource::HomeTool("rustfmt"),
+    }],
+    stdin: Stdin::Candidate,
+    class: RunClass::Interactive,
+    timeout_ceiling_ms: 10_000,
+    capture_bytes: 64 << 20,
+};
+
 /// Every effect recipe the Rust module may name; the root registers them with the descriptor.
-pub const RECIPES: &[EffectRecipe] = &[CARGO_CHECK, XCODE_SELECT];
+pub const RECIPES: &[EffectRecipe] = &[CARGO_CHECK, XCODE_SELECT, RUSTFMT];
+
+/// The daemon variables the Rust module receives (root composition data): the test toolchain
+/// and the developer-directory selection `xcode-select` honours.
+pub const MODULE_ENV: [&str; 2] = ["AGENT_IDE_RUST_TOOLCHAIN_DIR", "DEVELOPER_DIR"];
+
+/// The recipe request of the in-process formatter's argument vector (`rustfmt --edition <e>`);
+/// `None` for any other shape, which the core then refuses.
+pub fn interactive_effect(argv: &[String]) -> Option<EffectRequest> {
+    let [program, flag, edition] = argv else {
+        return None;
+    };
+    if program != "rustfmt" || flag != "--edition" {
+        return None;
+    }
+    Some(EffectRequest {
+        recipe: RUSTFMT.id.to_owned(),
+        params: std::collections::BTreeMap::from([
+            (
+                "rustfmt".to_owned(),
+                Param::Executable("rustfmt".to_owned()),
+            ),
+            ("edition".to_owned(), Param::Token(edition.clone())),
+        ]),
+    })
+}
+
+/// Serves `agent-ide module rust <role>` over this process's stdin and stdout until the core
+/// closes it: the analyzer hosts rust-analyzer beside the language's own support, the checker
+/// plans and interprets `cargo check`.
+pub async fn serve(role: Role) -> Result<(), ServeError> {
+    use agent_ide_core::modules::serve::serve_stdio;
+    match role {
+        Role::Analyzer => serve_stdio(RustModule::new(role, provider_server()), role).await,
+        Role::Checker => serve_stdio(RustModule::new(role, support_server()), role).await,
+    }
+}
+
+/// Rust's own support served through the module, its formatter plans as [`RUSTFMT`] requests.
+fn support_server() -> agent_ide_core::modules::adapter::SupportServer {
+    agent_ide_core::modules::adapter::SupportServer::new(crate::LANGUAGE, env!("CARGO_PKG_VERSION"))
+        .with_effect_plans(interactive_effect)
+}
+
+/// The analyzer's server: the support beside the rust-analyzer session the core grants.
+fn provider_server() -> agent_ide_core::modules::provider::ProviderServer<RustBuilder> {
+    agent_ide_core::modules::provider::ProviderServer::new(support_server(), RustBuilder)
+}
 
 /// The module's identity.
 pub fn module_id() -> ModuleId {
@@ -477,12 +561,16 @@ async fn developer_dir(
     if let Some(dir) = config.developer_dir().filter(|dir| dir.is_dir()) {
         return Ok(Some(dir.to_path_buf()));
     }
+    let mut params = std::collections::BTreeMap::from([(
+        "tool".to_owned(),
+        Param::Path(PathBuf::from("/usr/bin/xcode-select")),
+    )]);
+    if let Some(dir) = std::env::var_os("DEVELOPER_DIR") {
+        params.insert("developer_dir".to_owned(), Param::Path(dir.into()));
+    }
     let probe = EffectRequest {
         recipe: XCODE_SELECT.id.to_owned(),
-        params: std::collections::BTreeMap::from([(
-            "tool".to_owned(),
-            Param::Path(PathBuf::from("/usr/bin/xcode-select")),
-        )]),
+        params,
     };
     let (outcome, attachments) = effects.run(probe).await?;
     let selected = match outcome {
@@ -739,16 +827,14 @@ mod tests {
         checks::CheckState,
         lang::LanguageSupport,
         modules::{
-            adapter::{SupportServer, effect_argv},
-            contract::Outcome,
+            contract::{Fence, Outcome},
             fake::{FakeEffects, in_memory, offer},
-            host::{Call, HostChannel, NoEffects},
+            host::{Call, EffectRunner, HostChannel, NoEffects},
             payload::{
                 AnalyzeSource, Field, FormatPlanRequest, SourceAnalysis, SourceField, SourceRef,
                 SourceText, TestFacts, decode,
             },
-            provider::ProviderServer,
-            recipe::{Described, expand},
+            recipe::{Admission, Described, expand},
         },
     };
     use serde_json::json;
@@ -785,16 +871,12 @@ mod tests {
     /// The Rust module of `role` as the root assembles it, over the in-memory fake transport.
     async fn serve(role: Role) -> (HostChannel, agent_ide_core::modules::contract::HelloReply) {
         install();
-        let support = SupportServer::new(crate::LANGUAGE, env!("CARGO_PKG_VERSION"));
         let offer = offer(module_id(), env!("CARGO_PKG_VERSION"), role, 1);
         match role {
-            Role::Analyzer => in_memory(
-                RustModule::new(role, ProviderServer::new(support, RustBuilder)),
-                offer,
-            )
-            .await
-            .unwrap(),
-            Role::Checker => in_memory(RustModule::new(role, support), offer)
+            Role::Analyzer => in_memory(RustModule::new(role, provider_server()), offer)
+                .await
+                .unwrap(),
+            Role::Checker => in_memory(RustModule::new(role, support_server()), offer)
                 .await
                 .unwrap(),
         }
@@ -926,10 +1008,39 @@ mod tests {
         )
         .await;
         let plan = plan.expect("rustfmt applies to a Cargo project");
+        assert_eq!(plan.recipe, "rustfmt");
+        // The core's expansion runs exactly the in-process argument vector: the home tool it
+        // resolves for `rustfmt`, then the same arguments, the candidate on stdin.
+        let argv = RustSupport
+            .format_stdin_command(&project, Path::new("src/lib.rs"))
+            .unwrap();
+        let tool = dir.0.join("bin/rustfmt");
+        let programs = [("rustfmt".to_owned(), tool.clone())];
+        let spec = expand(
+            RECIPES,
+            &plan,
+            &Admission {
+                worktree: &dir.0,
+                cache_dir: &dir.0.join("cache"),
+                read_denies: &[],
+                home: Some(&dir.0),
+                launcher_roots: &[],
+                developer_dirs: &[],
+                programs: &programs,
+                timeout: Duration::from_secs(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(argv[0], "rustfmt");
+        assert_eq!(spec.program, tool);
         assert_eq!(
-            effect_argv(&plan),
-            Some(vec!["rustfmt".into(), "--edition".into(), "2024".into()])
+            spec.args,
+            argv[1..]
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
         );
+        assert_eq!(spec.cwd, dir.0);
         let none: Option<EffectRequest> = ask(
             &mut channel,
             Capability::FormatPlan,
@@ -1061,8 +1172,179 @@ mod tests {
         let snapshot: ProblemSnapshot = decode(value).unwrap();
         assert_eq!(snapshot.state, CheckState::Ready);
         assert_eq!(snapshot.input_generation, 9);
-        assert_eq!(effects.runs, 2, "the developer-directory probe, then the check");
+        assert_eq!(
+            effects.runs, 2,
+            "the developer-directory probe, then the check"
+        );
         assert_eq!(effects.last.unwrap().recipe, "cargo_check");
+    }
+
+    /// Answers the developer-directory probe with `selected` and exit `status`, every other
+    /// effect with a clean build, and records each request.
+    struct Platform {
+        /// The probe's stdout.
+        selected: Vec<u8>,
+        /// The probe's exit status.
+        status: i32,
+        /// Every effect requested, in order.
+        seen: Vec<EffectRequest>,
+    }
+
+    impl EffectRunner for Platform {
+        fn run<'a>(
+            &'a mut self,
+            _fence: &'a Fence,
+            effect: EffectRequest,
+        ) -> BoxFuture<'a, (EffectOutcome, Vec<Attachment>)> {
+            let (status, stdout) = if effect.recipe == XCODE_SELECT.id {
+                (self.status, self.selected.clone())
+            } else {
+                (0, br#"{"reason":"build-finished","success":true}"#.to_vec())
+            };
+            self.seen.push(effect);
+            Box::pin(async move {
+                (
+                    EffectOutcome::Completed {
+                        effect_id: "e".into(),
+                        status: Some(status),
+                        timed_out: false,
+                        truncated: false,
+                        stdout_bytes: stdout.len() as u64,
+                        stderr_bytes: 0,
+                    },
+                    vec![Attachment::octets(1, stdout)],
+                )
+            })
+        }
+    }
+
+    /// The developer directory the check is planned around is the in-process checker's choice:
+    /// the section's existing override without any probe; else the platform selection the core
+    /// probes (`xcode-select -p`), even a non-standard Xcode; else the standard locations.
+    #[tokio::test]
+    async fn the_check_follows_the_selected_developer_directory() {
+        install();
+        let base = Scratch::new("platform");
+        let worktree = base.0.join("ws");
+        let toolchain = base.0.join("toolchains/stable-aarch64-apple-darwin");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(toolchain.join("bin")).unwrap();
+        std::fs::write(toolchain.join("bin/cargo"), "").unwrap();
+        let overridden = developer(&base.0.join("override"));
+        let selected = developer(&base.0.join("Xcode-beta.app/Contents"));
+        let request = CheckRequest {
+            worktree,
+            cache_dir: base.0.join("cache"),
+            input_generation: 4,
+            read_denies: Vec::new(),
+        };
+        let cases = [
+            (Some(&overridden), 0, Some(overridden.clone()), 1),
+            (None, 0, Some(selected.clone()), 2),
+            (None, 1, crate::checks::standard_developer_dir(), 2),
+        ];
+        for (override_dir, status, expected, runs) in cases {
+            let config = json!({"toolchain_dir": toolchain, "developer_dir": override_dir});
+            let (mut channel, _) = serve(Role::Checker).await;
+            let mut platform = Platform {
+                selected: format!("{}\n", selected.display()).into_bytes(),
+                status,
+                seen: Vec::new(),
+            };
+            let reply = channel
+                .call(
+                    Call {
+                        capability: Capability::CheckPlan,
+                        scope_key: "scope".into(),
+                        revision_key: "revision".into(),
+                        payload: payload::encode(&CheckPlanRequest {
+                            request: request.clone(),
+                            config: config.clone(),
+                            timeout_ms: 60_000,
+                        }),
+                        attachments: Vec::new(),
+                    },
+                    Duration::from_secs(10),
+                    &mut platform,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(reply.outcome, Outcome::Result(_)), "{reply:?}");
+            assert_eq!(platform.seen.len(), runs, "{expected:?}");
+            if runs == 2 {
+                assert_eq!(platform.seen[0].recipe, "xcode_select");
+            }
+            let section: ProjectRustChecksConfig = serde_json::from_value(config).unwrap();
+            let in_process = checker_for(&section, Duration::from_secs(60), expected.clone());
+            assert_eq!(
+                platform.seen.last(),
+                Some(&in_process.cargo_check_plan(&request).to_effect(&request)),
+                "{expected:?}"
+            );
+            if let Some(expected) = expected {
+                assert!(
+                    matches!(&platform.seen.last().unwrap().params["developer"],
+                        Param::Paths(dirs) if dirs.contains(&expected)),
+                    "the selected developer directory is a read root"
+                );
+            }
+        }
+    }
+
+    /// The core expands the probe to exactly `/usr/bin/xcode-select -p` with no environment, or
+    /// with the daemon's `DEVELOPER_DIR` when it lies in an admitted developer directory; any
+    /// other program or directory is refused.
+    #[test]
+    fn the_probe_expands_to_xcode_select_only() {
+        let base = Scratch::new("probe");
+        let developer = developer(&base.0);
+        let developer_dirs = [developer.clone()];
+        let admission = Admission {
+            worktree: &base.0,
+            cache_dir: &base.0.join("cache"),
+            read_denies: &[],
+            home: None,
+            launcher_roots: &[],
+            developer_dirs: &developer_dirs,
+            programs: &[],
+            timeout: Duration::from_secs(60),
+        };
+        let probe = |extra: Option<(&str, &Path)>| EffectRequest {
+            recipe: "xcode_select".into(),
+            params: [("tool", Path::new("/usr/bin/xcode-select"))]
+                .into_iter()
+                .chain(extra)
+                .map(|(name, path)| (name.to_owned(), Param::Path(path.to_path_buf())))
+                .collect(),
+        };
+        let spec = expand(RECIPES, &probe(None), &admission).unwrap();
+        assert_eq!(spec.program, PathBuf::from("/usr/bin/xcode-select"));
+        assert_eq!(spec.args, ["-p"]);
+        assert!(spec.env.iter().all(|(name, _)| name != "DEVELOPER_DIR"));
+        assert!(spec.timeout <= Duration::from_secs(10));
+        let spec = expand(
+            RECIPES,
+            &probe(Some(("developer_dir", &developer))),
+            &admission,
+        )
+        .unwrap();
+        assert!(
+            spec.env
+                .contains(&("DEVELOPER_DIR".to_owned(), developer.display().to_string()))
+        );
+        assert!(
+            expand(
+                RECIPES,
+                &probe(Some(("developer_dir", &base.0))),
+                &admission
+            )
+            .is_err()
+        );
+        let mut other = probe(None);
+        other
+            .params
+            .insert("tool".into(), Param::Path(PathBuf::from("/bin/sh")));
+        assert!(expand(RECIPES, &other, &admission).is_err());
     }
 
     /// Output streams are found by attachment id, not by position: a lone stderr or a reversed

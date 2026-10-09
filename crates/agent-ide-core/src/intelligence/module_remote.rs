@@ -39,6 +39,10 @@ pub struct ModuleRemote {
     channel: HostChannel,
     /// Whether the module declared call hierarchy support.
     calls: bool,
+    /// The typed `module_unavailable` that failed this session, once one did.
+    pub(super) fault: Option<String>,
+    /// The module's typed dependency (provider) failure, once one failed this session.
+    unavailable: Option<crate::modules::contract::ModuleUnavailable>,
 }
 
 impl ModuleRemote {
@@ -93,6 +97,17 @@ fn position(text: &str, offset: u64) -> lsp::Position {
         line,
         character: (offset - start) as u32,
     }
+}
+
+/// The request's own source, against which a module's ranges are checked.
+#[derive(Clone, Copy)]
+struct Own<'a> {
+    /// Its scope-relative path.
+    path: &'a Path,
+    /// The revision the request carried.
+    revision: &'a str,
+    /// Its exact text.
+    text: &'a str,
 }
 
 /// The closed LSP kind of a product symbol kind.
@@ -173,8 +188,12 @@ impl LiveSession {
             deadline: tokio::time::Instant::now() + Duration::from_secs(60 * 60 * 24 * 3650),
             sequence: 0,
             version: 0,
-            remote: None,
-            module: Some(Box::new(ModuleRemote { channel, calls })),
+            module: Some(Box::new(ModuleRemote {
+                channel,
+                calls,
+                fault: None,
+                unavailable: None,
+            })),
         };
         Ok(Self { session, driver })
     }
@@ -189,7 +208,9 @@ impl Session {
     /// The fault that retired this session's module channel, if any.
     pub fn module_fault(&self) -> Option<crate::modules::contract::ModuleUnavailable> {
         let remote = self.module.as_ref()?;
-        let (stage, cause) = remote.channel.fault()?;
+        let Some((stage, cause)) = remote.channel.fault() else {
+            return remote.unavailable.clone();
+        };
         let offer = remote.channel.offer();
         Some(crate::modules::contract::ModuleUnavailable {
             module_id: offer.module_id.clone(),
@@ -257,6 +278,7 @@ impl Session {
             Ok(reply) => reply,
             Err(failure) => {
                 self.state.lock().expect("session lock").invalidate();
+                remote.fault = Some(failure.to_string());
                 return Err(io::Error::other(failure.to_string()));
             }
         };
@@ -266,39 +288,72 @@ impl Session {
                 io::Error::new(io::ErrorKind::InvalidData, "module reply ill-typed")
             }),
             Outcome::Error(error) => Err(io::Error::other(match error.unavailable {
-                Some(unavailable) => format!(
-                    "module_unavailable ({}:{}:{})",
-                    remote.channel.offer().module_id,
-                    unavailable.stage,
-                    unavailable.cause
-                ),
+                Some(unavailable) => {
+                    // The module's provider failed: a typed fault that retires this generation.
+                    let offer = remote.channel.offer();
+                    let typed = crate::modules::contract::ModuleUnavailable {
+                        module_id: offer.module_id.clone(),
+                        module_version: offer.package_version.clone(),
+                        role: offer.role,
+                        stage: unavailable.stage,
+                        cause: unavailable.cause,
+                        instance: Some(offer.instance),
+                        retry_after_ms: None,
+                    };
+                    let fault = typed.to_string();
+                    remote.fault = Some(fault.clone());
+                    remote.unavailable = Some(typed);
+                    self.state.lock().expect("session lock").invalidate();
+                    fault
+                }
                 None => format!("module refused: {:?}", error.code),
             })),
         }
     }
 
-    /// A file's exact current text for location conversion: the request's own text for its file,
-    /// otherwise the file read now inside the worktree.
-    fn module_text(&self, path: &Path, own: Option<(&Path, &str)>) -> Option<String> {
-        if let Some((own_path, text)) = own
-            && own_path == path
+    /// A file's exact text for location conversion: the request's own text for its file, else a
+    /// file the core reads now only when its path is relative and normal and it resolves inside
+    /// the worktree (no `..`, no symlink out).
+    fn module_text(&self, path: &Path, own: Option<Own<'_>>) -> Option<String> {
+        if let Some(own) = own
+            && own.path == path
         {
-            return Some(text.to_owned());
+            return Some(own.text.to_owned());
         }
-        let root = self.worktree.worktree_path();
-        let full = root.join(path);
-        full.starts_with(root)
+        let normal = !path.as_os_str().is_empty()
+            && path
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)));
+        if !normal {
+            return None;
+        }
+        let root = self.worktree.worktree_path().canonicalize().ok()?;
+        let full = root.join(path).canonicalize().ok()?;
+        full.starts_with(&root)
             .then(|| std::fs::read_to_string(full).ok())
             .flatten()
     }
 
-    /// Converts one product location into a provider location with UTF-8 positions.
-    fn module_location(
-        &self,
-        location: &Location,
-        own: Option<(&Path, &str)>,
-    ) -> Option<lsp::Location> {
+    /// Converts one product location into a provider location with UTF-8 positions. A range
+    /// in the request's own file must carry that request's revision, a range elsewhere none (the
+    /// core reads that file itself); either must lie inside the text on UTF-8 boundaries, or the
+    /// location is dropped rather than clamped.
+    fn module_location(&self, location: &Location, own: Option<Own<'_>>) -> Option<lsp::Location> {
+        let in_own = own.is_some_and(|own| own.path == location.path);
+        match (&location.revision, own) {
+            (Some(revision), Some(own)) if in_own && revision == own.revision => {}
+            (None, _) if !in_own => {}
+            _ => return None,
+        }
         let text = self.module_text(&location.path, own)?;
+        let (start, end) = (location.start_byte as usize, location.end_byte as usize);
+        if start > end
+            || end > text.len()
+            || !text.is_char_boundary(start)
+            || !text.is_char_boundary(end)
+        {
+            return None;
+        }
         let uri =
             lsp::Url::from_file_path(self.worktree.worktree_path().join(&location.path)).ok()?;
         Some(lsp::Location {
@@ -373,7 +428,11 @@ impl Session {
         let found: Option<Vec<Location>> = self
             .module_call(Capability::Semantic, encode(&query), attachments)
             .await?;
-        let own = Some((observation.path(), text.as_str()));
+        let own = Some(Own {
+            path: observation.path(),
+            revision: observation.source_revision().as_str(),
+            text: text.as_str(),
+        });
         Ok(found
             .unwrap_or_default()
             .iter()
@@ -434,7 +493,11 @@ impl Session {
                 attachments,
             )
             .await?;
-        let own = Some((observation.path(), text.as_str()));
+        let own = Some(Own {
+            path: observation.path(),
+            revision: observation.source_revision().as_str(),
+            text: text.as_str(),
+        });
         Ok(items
             .unwrap_or_default()
             .iter()
@@ -446,7 +509,7 @@ impl Session {
     fn module_call_item(
         &self,
         item: &CallItem,
-        own: Option<(&Path, &str)>,
+        own: Option<Own<'_>>,
     ) -> Option<lsp::CallHierarchyItem> {
         let location = self.module_location(&item.location, own)?;
         let selection = self.module_location(&item.selection, own)?;
@@ -641,7 +704,11 @@ impl Session {
                 attachments,
             )
             .await;
-        let own = Some((observation.path(), text.as_str()));
+        let own = Some(Own {
+            path: observation.path(),
+            revision: observation.source_revision().as_str(),
+            text: text.as_str(),
+        });
         match reply {
             Ok(evidence) => {
                 let convert = |locations: &Option<Vec<Location>>| {

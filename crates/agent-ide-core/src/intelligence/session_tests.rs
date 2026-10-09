@@ -268,7 +268,6 @@ async fn unversioned_diagnostics_require_unchanged_initial_open() {
         deadline: Instant::now() + Duration::from_secs(1),
         sequence: 1,
         version: 2,
-        remote: None,
         module: None,
     };
     assert_eq!(
@@ -1099,188 +1098,6 @@ async fn live_session_outlives_requests_and_waits_for_readiness_per_request() {
     let _ = tokio::time::timeout(Duration::from_secs(2), peer_task).await;
 }
 
-/// Opens an M-011 pilot (remote) session against an in-memory module that answers `hello`, then
-/// answers every later request with `reply` and records its method.
-async fn remote_session(reply: serde_json::Value) -> (LiveSession, Arc<Mutex<Vec<String>>>) {
-    use super::super::pilot::{read_frame, write_frame};
-    let (core_out, mut module_in) = tokio::io::duplex(1 << 16);
-    let (mut module_out, core_in) = tokio::io::duplex(1 << 16);
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let seen = log.clone();
-    tokio::spawn(async move {
-        let hello = read_frame(&mut module_in).await.unwrap();
-        let capabilities =
-            json!({"advertised": {}, "position_encoding": "utf-16", "server_info": null});
-        write_frame(
-            &mut module_out,
-            &json!({"id": hello["id"], "result": capabilities}),
-        )
-        .await
-        .unwrap();
-        while let Ok(request) = read_frame(&mut module_in).await {
-            seen.lock()
-                .unwrap()
-                .push(request["method"].as_str().unwrap().to_owned());
-            write_frame(
-                &mut module_out,
-                &json!({"id": request["id"], "result": reply}),
-            )
-            .await
-            .unwrap();
-        }
-    });
-    let generation = ViewGeneration {
-        backend: 1,
-        configuration: 1,
-        toolchain: 1,
-        view: 1,
-    };
-    let live = LiveSession::open_remote(
-        core_in,
-        core_out,
-        tree(),
-        1,
-        generation,
-        plain_settings(),
-        Duration::from_secs(5),
-        json!({}),
-    )
-    .await
-    .unwrap();
-    (live, log)
-}
-
-/// A remote session applies the local source fences before any byte reaches the module: another
-/// worktree, another epoch, bytes that do not match the observation and a stale sequence are
-/// refused, and only the one valid request is forwarded.
-#[tokio::test]
-async fn remote_session_fences_source_before_forwarding() {
-    let (mut live, log) = remote_session(json!([])).await;
-    let other_tree =
-        WorktreeRef::from_discovery("/tmp/other".into(), "/tmp/other".into(), ".git".into(), 1)
-            .unwrap();
-    let foreign = |worktree: WorktreeRef, epoch: u64| {
-        SourceObservation::new(
-            worktree,
-            epoch,
-            5,
-            ObservationRef::new("source-5").unwrap(),
-            "main.txt".into(),
-            Some(SourceBytes::from_bytes(b"a")),
-            SourceRevision::new("revision-5").unwrap(),
-            SourceCoverage::Complete,
-            ObservedState::Present,
-        )
-        .unwrap()
-    };
-    let session = &mut live.session;
-    let error = session
-        .document_symbols(&foreign(other_tree, 1), b"a")
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-    let error = session
-        .document_symbols(&foreign(tree(), 2), b"a")
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-    assert!(
-        session
-            .document_symbols(&observation("a", 2), b"b")
-            .await
-            .is_err()
-    );
-    assert!(
-        session
-            .document_symbols(&observation("a", 3), b"a")
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let error = session
-        .document_symbols(&observation("a", 2), b"a")
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-    assert!(
-        session
-            .rename(&observation("a", 4), b"a", 0, "b")
-            .await
-            .is_err()
-    );
-    assert_eq!(*log.lock().unwrap(), ["document_symbols"]);
-}
-
-/// The module's context evidence counts only for the core's own generation, and its
-/// diagnostics bind to the core's observation only when the module saw the same sequence.
-#[tokio::test]
-async fn remote_context_checks_generation_and_diagnostic_binding() {
-    let diagnostic = json!({"range": {"start": {"line": 0, "character": 0},
-        "end": {"line": 0, "character": 1}}, "message": "m"});
-    let reply = |generation: u64, sequence: u64| {
-        let generation = (generation > 0).then_some([generation, 1, 1, generation]);
-        json!({
-            "context": {"generation": generation, "document_version": 1,
-                "position_encoding": "utf-16", "lexical": null, "definitions": [],
-                "references": [], "truncated": false},
-            "diagnostics": {"source_sequence": sequence, "document_version": 1,
-                "readiness": "reported", "freshness": "provisional",
-                "diagnostics": [diagnostic], "truncated": false},
-        })
-    };
-    let query = ContextQuery::Symbol { byte_offset: 0 };
-
-    let (mut live, _) = remote_session(reply(1, 2)).await;
-    let result = live
-        .session
-        .context(&observation("a", 2), b"a", query)
-        .await
-        .unwrap();
-    assert_eq!(result.mode, ContextMode::Semantic);
-    assert_eq!(
-        result.source,
-        SourceBinding::from_observation(&observation("a", 2))
-    );
-    let diagnostics = live.session.diagnostics();
-    assert_eq!(diagnostics.readiness, DiagnosticReadiness::Reported);
-    assert_eq!(diagnostics.diagnostics.len(), 1);
-
-    let (mut live, _) = remote_session(reply(1, 9)).await;
-    live.session
-        .context(&observation("a", 2), b"a", query)
-        .await
-        .unwrap();
-    let diagnostics = live.session.diagnostics();
-    assert_eq!(diagnostics.readiness, DiagnosticReadiness::Unknown);
-    assert!(diagnostics.source.is_none() && diagnostics.diagnostics.is_empty());
-
-    // Another generation, and semantic evidence without any generation (0 = null here).
-    for generation in [7, 0] {
-        let (mut live, _) = remote_session(reply(generation, 2)).await;
-        let result = live
-            .session
-            .context(&observation("a", 2), b"a", query)
-            .await
-            .unwrap();
-        assert_eq!(
-            result.mode,
-            ContextMode::Lexical {
-                reason: "pilot module answered for another generation".into()
-            }
-        );
-        assert!(result.generation.is_none() && result.definitions.is_none());
-        assert!(
-            !live.is_alive(),
-            "a reply for another generation retires the session"
-        );
-        assert_eq!(
-            live.remote_fault(),
-            Some("pilot module answered for another generation"),
-            "and is a module fault its owner turns into a typed refusal"
-        );
-    }
-}
-
 /// A module-hosted session sends the core's exact source with its revision and turns the module's
 /// product answers back into provider types with UTF-8 positions over the exact text; context is
 /// built over the core's own observation and binds diagnostics only for the same revision; a
@@ -1367,4 +1184,101 @@ async fn module_session_converts_product_answers() {
     );
     assert!(!failing.is_alive(), "a module fault retires the generation");
     assert!(failing.session.module_fault().is_some());
+}
+
+/// Replaces the pilot session fence and fault tests: a module-hosted session applies the local
+/// source fences before any byte reaches the module (another worktree, another epoch, bytes that
+/// do not match the observation, a stale sequence are refused; the valid request answers), and a
+/// module's typed dependency failure retires the session as a fault its owner turns into a typed
+/// refusal naming the module.
+#[tokio::test]
+async fn module_session_fences_sources_and_reports_its_fault() {
+    use crate::modules::{
+        contract::{Capability, ModuleId, Role},
+        fake::{FakeModule, Fault, in_memory, offer},
+    };
+    crate::lang::testing::install();
+    let generation = ViewGeneration {
+        backend: 1,
+        configuration: 2,
+        toolchain: 3,
+        view: 4,
+    };
+    let open = |module: FakeModule| async move {
+        let (channel, _) = in_memory(
+            module,
+            offer(ModuleId::bundled("alpha"), "1.0", Role::Analyzer, 1),
+        )
+        .await
+        .unwrap();
+        LiveSession::open_module(
+            channel,
+            true,
+            tree(),
+            1,
+            generation,
+            plain_settings(),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    };
+    let mut live = open(FakeModule::new(ModuleId::bundled("alpha"), "1.0")).await;
+    let other_tree =
+        WorktreeRef::from_discovery("/tmp/other".into(), "/tmp/other".into(), ".git".into(), 1)
+            .unwrap();
+    let foreign = |worktree: WorktreeRef, epoch: u64| {
+        SourceObservation::new(
+            worktree,
+            epoch,
+            5,
+            ObservationRef::new("source-5").unwrap(),
+            "main.txt".into(),
+            Some(SourceBytes::from_bytes(b"a")),
+            SourceRevision::new("revision-5").unwrap(),
+            SourceCoverage::Complete,
+            ObservedState::Present,
+        )
+        .unwrap()
+    };
+    let session = &mut live.session;
+    for observation in [foreign(other_tree, 1), foreign(tree(), 2)] {
+        let error = session.hover(&observation, b"a", 0).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+    assert!(session.hover(&observation("a", 2), b"b", 0).await.is_err());
+    assert!(session.hover(&observation("a", 3), b"a", 0).await.is_ok());
+    let error = session
+        .hover(&observation("a", 2), b"a", 0)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "stale sequence");
+    assert!(live.remote_fault().is_none());
+
+    let mut live = open(
+        FakeModule::new(ModuleId::bundled("alpha"), "1.0")
+            .with_fault(Capability::Semantic, Fault::ProviderExit),
+    )
+    .await;
+    assert!(
+        live.session
+            .hover(&observation("a", 2), b"a", 0)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        live.remote_fault(),
+        Some("module_unavailable (bundled.alpha:provider:exited)")
+    );
+    let typed = live.session.module_fault().expect("a typed provider fault");
+    assert_eq!(
+        (typed.stage, typed.cause),
+        (
+            crate::modules::contract::Stage::Provider,
+            crate::modules::contract::Cause::Exited
+        )
+    );
+    assert!(
+        !live.is_alive(),
+        "the provider fault retires the generation"
+    );
 }

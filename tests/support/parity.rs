@@ -52,7 +52,7 @@ pub struct ProcessIdentity {
 
 impl ProcessIdentity {
     /// The identity, parent and run state of `pid`, or `None` once it is gone.
-    fn of(pid: libc::pid_t) -> Option<(Self, libc::pid_t, u32)> {
+    pub fn of(pid: libc::pid_t) -> Option<(Self, libc::pid_t, u32)> {
         // SAFETY: an all-zero `proc_bsdinfo` is a valid plain-data value for the kernel to fill.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;

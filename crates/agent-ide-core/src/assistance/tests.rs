@@ -916,12 +916,13 @@ async fn run_child(
     let combined = Arc::new(tokio::sync::Mutex::new(VecDeque::with_capacity(MAX_OUTPUT)));
     let mut out_task = tokio::spawn(read_into_tail(Some(stdout), combined.clone()));
     let mut err_task = tokio::spawn(read_into_tail(Some(stderr), combined.clone()));
-    let status = match job.as_mut() {
+    let exited = match job.as_mut() {
         Some(running) => running.wait(budget).await,
-        None => None,
+        None => false,
     };
     // Past its budget the whole group is torn down and reaped before the pipes are drained.
-    let mut stopped = status.is_none();
+    let mut stopped = !exited;
+    let mut status = None;
     if stopped && let Some(running) = job.take() {
         let _ = running.finish().await;
     }
@@ -939,9 +940,10 @@ async fn run_child(
         out_task.abort();
         err_task.abort();
     }
-    // A finished run's group is swept, so no descendant outlives it, and its slot released.
+    // A finished run's group is torn down before its leader is reaped, so no descendant outlives
+    // it, and its slot is released; the leader's status comes from that reap.
     if let Some(finished) = job.take() {
-        let _ = finished.finish().await;
+        status = finished.finish().await.ok();
     }
     let bytes = combined.lock().await.iter().copied().collect::<Vec<_>>();
     let output = String::from_utf8_lossy(&bytes).into_owned();

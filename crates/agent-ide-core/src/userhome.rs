@@ -18,7 +18,19 @@ pub const HOME_OVERRIDE_ENV: &str = "AGENT_IDE_HOME";
 ///
 /// `$HOME` is deliberately ignored.
 pub fn user_home() -> Option<PathBuf> {
+    if let Some(home) = MODULE_HOME.get() {
+        return Some(home.clone());
+    }
     home_from(std::env::var_os(HOME_OVERRIDE_ENV))
+}
+
+/// The home a bundled module process was given by its daemon (`hello.config.home`).
+static MODULE_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Makes `home` this process's user home: a bundled module's cleared environment carries none,
+/// so the daemon's own resolution travels in `hello.config.home`. The first call wins.
+pub fn set_module_home(home: PathBuf) {
+    let _ = MODULE_HOME.set(home);
 }
 
 /// Applies the override rule to one already-read override value.

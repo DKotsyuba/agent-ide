@@ -213,7 +213,7 @@ pub(crate) fn venv_directories(root: &Path) -> Vec<PathBuf> {
 /// `-c` program of the syntax probe: parses stdin with `ast` and prints `<lineno>: <msg>` on a
 /// syntax error, the exact line `SyntaxVerdict::from_probe` maps (any other nonzero output
 /// means no checker was proven).
-const PY_AST_PROBE: &str = "import ast,sys\ntry:\n    ast.parse(sys.stdin.read())\nexcept SyntaxError as e:\n    print(f\"{e.lineno}: {e.msg}\")\n    sys.exit(1)";
+pub(crate) const PY_AST_PROBE: &str = "import ast,sys\ntry:\n    ast.parse(sys.stdin.read())\nexcept SyntaxError as e:\n    print(f\"{e.lineno}: {e.msg}\")\n    sys.exit(1)";
 
 impl LanguageSupport for Python {
     /// Always the Python [`LANGUAGE`].

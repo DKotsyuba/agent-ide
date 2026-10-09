@@ -158,6 +158,8 @@ struct Live<P> {
     process: P,
     /// Its captured stderr.
     stderr: Arc<Mutex<StderrTail>>,
+    /// The linkage coverage its `hello` declared.
+    linkage: Vec<crate::modules::payload::LinkageCoverage>,
 }
 
 /// Supervises one `(module, scope, role)` slot.
@@ -170,6 +172,9 @@ pub struct Supervisor<L: Launcher> {
     startup_budget: Duration,
     /// The live instance.
     live: Option<Live<L::Process>>,
+    /// A launched process whose `hello` has not completed: kept here across the await so a
+    /// cancelled start still reaps it (and releases its admission) on the next demand or stop.
+    starting: Option<L::Process>,
     /// Crash history.
     budget: RestartBudget,
     /// A deterministic refusal and the inputs it was observed with.
@@ -181,7 +186,7 @@ pub struct Supervisor<L: Launcher> {
 }
 
 /// Whether `cause` repeats until the accepted inputs change.
-fn deterministic(cause: Cause) -> bool {
+pub(crate) fn deterministic(cause: Cause) -> bool {
     matches!(
         cause,
         Cause::Incompatible | Cause::ToolMissing | Cause::PolicyRefused
@@ -196,6 +201,7 @@ impl<L: Launcher> Supervisor<L> {
             offer,
             startup_budget,
             live: None,
+            starting: None,
             budget: RestartBudget::default(),
             blocked: None,
             instance: 0,
@@ -222,6 +228,11 @@ impl<L: Launcher> Supervisor<L> {
         self.live
             .as_mut()
             .is_some_and(|live| live.channel.idle_fault().is_none())
+    }
+
+    /// The linkage coverage the live instance declared in its `hello`.
+    pub fn linkage(&self) -> Option<&[crate::modules::payload::LinkageCoverage]> {
+        self.live.as_ref().map(|live| live.linkage.as_slice())
     }
 
     /// Stderr of the latest instance (private diagnostics).
@@ -255,6 +266,9 @@ impl<L: Launcher> Supervisor<L> {
 
     /// Makes sure a live instance exists before `deadline`.
     async fn ready(&mut self, deadline: Instant) -> Result<(), ModuleUnavailable> {
+        if let Some(process) = self.starting.take() {
+            let _ = self.launcher.reap(process).await;
+        }
         if let Some(live) = self.live.as_mut() {
             if live.channel.idle_fault().is_none() {
                 return Ok(());
@@ -308,17 +322,21 @@ impl<L: Launcher> Supervisor<L> {
         let mut offer = self.offer.clone();
         offer.instance = self.instance;
         let hello_budget = start_by.saturating_duration_since(Instant::now());
-        match HostChannel::open(spawned.stdout, spawned.stdin, offer, hello_budget).await {
-            Ok((channel, _)) => {
+        self.starting = Some(spawned.process);
+        let opened = HostChannel::open(spawned.stdout, spawned.stdin, offer, hello_budget).await;
+        let process = self.starting.take().expect("kept across the hello");
+        match opened {
+            Ok((channel, reply)) => {
                 self.live = Some(Live {
                     channel,
-                    process: spawned.process,
+                    process,
                     stderr: self.stderr.clone(),
+                    linkage: reply.linkage_kinds,
                 });
                 Ok(())
             }
             Err(failure) => {
-                let _ = self.launcher.reap(spawned.process).await;
+                let _ = self.launcher.reap(process).await;
                 if deterministic(failure.cause) {
                     self.blocked = Some((self.launcher.inputs(), failure.stage, failure.cause));
                 } else {
@@ -342,6 +360,9 @@ impl<L: Launcher> Supervisor<L> {
 
     /// Stops the live instance in order: `shutdown`, then the launcher's reap. Not a crash.
     pub async fn stop(&mut self) -> Result<(), Cause> {
+        if let Some(process) = self.starting.take() {
+            self.launcher.reap(process).await?;
+        }
         let Some(mut live) = self.live.take() else {
             return Ok(());
         };
@@ -375,6 +396,8 @@ mod tests {
         launches: u32,
         /// Reaps performed.
         reaps: u32,
+        /// Started modules never answer `hello`.
+        silent: bool,
     }
 
     impl FakeLauncher {
@@ -386,6 +409,7 @@ mod tests {
                 inputs: "inputs-1".into(),
                 launches: 0,
                 reaps: 0,
+                silent: false,
             }
         }
     }
@@ -407,8 +431,13 @@ mod tests {
             if let Some((capability, fault)) = fault {
                 module = module.with_fault(capability, fault);
             }
+            let silent = self.silent;
             let process = tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt;
+                if silent {
+                    let _keep = (&module_in, &module_out);
+                    std::future::pending::<()>().await;
+                }
                 let mut stderr_out = stderr_out;
                 let _ = stderr_out.write_all(&vec![b'e'; 100 * 1024]).await;
                 let _ = serve(module, Role::Analyzer, module_in, module_out).await;
@@ -456,6 +485,33 @@ mod tests {
                 &mut NoEffects,
             )
             .await
+    }
+
+    /// A start cancelled during `hello` keeps its process for the next demand or stop, which reaps
+    /// it (releasing its admission) without counting a crash.
+    #[tokio::test]
+    async fn a_start_cancelled_during_hello_is_reaped_by_the_stop() {
+        let mut launcher = FakeLauncher::new(vec![Ok(None)]);
+        launcher.silent = true;
+        let mut supervisor = slot(launcher);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                call(&mut supervisor, Capability::FileDoc)
+            )
+            .await
+            .is_err(),
+            "the caller gave up during hello"
+        );
+        assert!(supervisor.starting.is_some());
+        assert_eq!(supervisor.stop().await, Ok(()));
+        assert_eq!(supervisor.launcher.reaps, 1);
+        assert!(supervisor.starting.is_none());
+        assert_eq!(
+            supervisor.budget.permit(Instant::now()),
+            Permit::Now,
+            "not a crash"
+        );
     }
 
     /// The budget permits the initial start and three delayed restarts, then reports exhaustion
