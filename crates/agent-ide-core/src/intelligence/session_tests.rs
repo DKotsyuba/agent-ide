@@ -1282,3 +1282,50 @@ async fn module_session_fences_sources_and_reports_its_fault() {
         "the provider fault retires the generation"
     );
 }
+
+/// A module-hosted session keeps its profile's status barrier across the boundary: readiness is
+/// asked of the module (which answers its provider's barrier), and a module that cannot answer
+/// is a gone transport.
+#[tokio::test]
+async fn module_session_asks_the_module_for_readiness() {
+    use crate::modules::{
+        contract::{Capability, ModuleId, Role},
+        fake::{FakeModule, Fault, in_memory, offer},
+    };
+    crate::lang::testing::install();
+    let generation = ViewGeneration {
+        backend: 1,
+        configuration: 2,
+        toolchain: 3,
+        view: 4,
+    };
+    let open = |module: FakeModule| async move {
+        let (channel, _) = in_memory(
+            module,
+            offer(ModuleId::bundled("alpha"), "1.0", Role::Analyzer, 1),
+        )
+        .await
+        .unwrap();
+        LiveSession::open_module(
+            channel,
+            true,
+            tree(),
+            1,
+            generation,
+            status_settings(),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    };
+    let mut live = open(FakeModule::new(ModuleId::bundled("alpha"), "1.0")).await;
+    assert_eq!(live.wait_ready(Duration::from_secs(2)).await, Ok(()));
+    let mut live = open(
+        FakeModule::new(ModuleId::bundled("alpha"), "1.0")
+            .with_fault(Capability::Semantic, Fault::Stall),
+    )
+    .await;
+    assert_eq!(
+        live.wait_ready(Duration::from_millis(200)).await,
+        Err(ReadinessError::Gone)
+    );
+}
