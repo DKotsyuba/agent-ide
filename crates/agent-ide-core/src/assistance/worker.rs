@@ -4951,8 +4951,26 @@ impl<'a> Worker<'a> {
         } else {
             ""
         };
+        // The cross-language names of the file, or of the line at the requested position.
+        let related = {
+            let newlines = |end: usize| {
+                bytes[..end.min(bytes.len())]
+                    .iter()
+                    .filter(|b| **b == b'\n')
+                    .count() as u32
+            };
+            let lines = byte_offset.map_or_else(
+                || crate::lang::LineRange::new(1, 1 + newlines(bytes.len())),
+                |at| {
+                    let line = 1 + newlines(at as usize);
+                    crate::lang::LineRange::new(line, line)
+                },
+            );
+            self.related_links(job, authority.worktree(), Path::new(&path), &bytes, lines)
+                .await
+        };
         let text = format!(
-            "{hint}mode: {mode}\npath: {path}\nsource_state: {:?}\nsource_sequence: {}\nauthority_epoch: {}\ncoverage: complete registered path\nposition_encoding: {:?}\nprovider_generation: {:?}\ndocument_version: {:?}\n{diagnostic_text}\ndefinitions: {}\nreferences: {}\nlexical_matches: {}\n\n{}",
+            "{hint}mode: {mode}\npath: {path}\nsource_state: {:?}\nsource_sequence: {}\nauthority_epoch: {}\ncoverage: complete registered path\nposition_encoding: {:?}\nprovider_generation: {:?}\ndocument_version: {:?}\n{diagnostic_text}\ndefinitions: {}\nreferences: {}\nlexical_matches: {}\n{related}\n{}",
             observed.state(),
             observed.sequence(),
             authority.epoch(),
