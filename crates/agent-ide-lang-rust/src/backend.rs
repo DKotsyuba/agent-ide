@@ -371,7 +371,7 @@ impl RustBackend {
             if entry.live.is_alive() {
                 // A demand on a module analyzer that has not loaded yet waits for it.
                 if entry.module_inputs.is_some() {
-                    entry.waited = entry.live.wait_ready(Duration::ZERO).await.is_err();
+                    entry.waited = !entry.live.session.provider_readiness().is_ready();
                 }
                 return Ok(());
             }
