@@ -83,6 +83,13 @@ pub mod languages {
     /// `hello.config.env`) receives from the daemon.
     pub static MODULE_ENV: [(&str, &[&str]); 1] = [("rust", &["AGENT_IDE_RUST_TOOLCHAIN_DIR"])];
 
+    /// Each language's static install roots its interactive recipes may name (Python's standard
+    /// interpreter prefixes).
+    pub static INSTALL_ROOTS: [(&str, &[&str]); 1] = [(
+        "python",
+        &agent_ide_lang_python::module::INTERPRETER_PREFIXES,
+    )];
+
     /// Registers every bundled language for this process. Idempotent; call it before parsing a
     /// launcher configuration or mapping any path to a language.
     pub fn install() {
@@ -91,6 +98,7 @@ pub mod languages {
         agent_ide_core::modules::router::ship(&SHIPPED_MODULES);
         agent_ide_core::modules::recipe::declare(&RECIPES);
         agent_ide_core::modules::launch::declare_env(&MODULE_ENV);
+        agent_ide_core::modules::recipe::declare_roots(&INSTALL_ROOTS);
     }
 }
 

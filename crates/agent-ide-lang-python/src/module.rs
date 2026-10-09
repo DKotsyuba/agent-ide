@@ -127,7 +127,8 @@ impl ProviderBuilder for Pyright {
 /// Serves `agent-ide module python <role>` over this process's stdin and stdout until the core
 /// closes it.
 pub async fn serve(role: Role) -> Result<(), ServeError> {
-    let support = SupportServer::new(crate::LANGUAGE, env!("CARGO_PKG_VERSION"));
+    let support = SupportServer::new(crate::LANGUAGE, env!("CARGO_PKG_VERSION"))
+        .with_effect_plans(interactive_effect);
     match role {
         Role::Analyzer => serve_stdio(ProviderServer::new(support, Pyright::default()), role).await,
         Role::Checker => serve_stdio(CheckerServer { support }, role).await,
@@ -138,7 +139,7 @@ pub async fn serve(role: Role) -> Result<(), ServeError> {
 /// (Homebrew, MacPorts and conda under `/opt`, `/usr/local`, the system and python.org
 /// frameworks, developer tools): the roots the Pyright recipe admits an interpreter and its
 /// installation prefix from. An interpreter anywhere else is refused, never granted.
-const INTERPRETER_PREFIXES: [&str; 6] = [
+pub const INTERPRETER_PREFIXES: [&str; 6] = [
     "/opt",
     "/usr/local",
     "/usr",
@@ -155,8 +156,203 @@ const INTERPRETER_ROLES: &[PathRole] = &[
     PathRole::DeveloperDir,
 ];
 
-/// The effect recipes of the Python module, declared by the root.
-pub const RECIPES: &[EffectRecipe] = &[EffectRecipe {
+/// The effect recipes of the Python module, declared by the root: the Pyright check, and the
+/// formatter (black or ruff, through the project interpreter, `uv run` or a home tool) and the
+/// syntax probe that read the candidate on stdin.
+pub const RECIPES: &[EffectRecipe] = &[
+    PYRIGHT,
+    interactive(
+        "black-module",
+        "interpreter",
+        &[
+            Arg::Literal("-m"),
+            Arg::Literal("black"),
+            Arg::Literal("-q"),
+            Arg::Literal("-"),
+        ],
+    ),
+    interactive(
+        "ruff-module",
+        "interpreter",
+        &[
+            Arg::Literal("-m"),
+            Arg::Literal("ruff"),
+            Arg::Literal("format"),
+            Arg::Literal("--stdin-filename"),
+            Arg::Param("file"),
+            Arg::Literal("-"),
+        ],
+    ),
+    interactive(
+        "black-uv",
+        "uv",
+        &[
+            Arg::Literal("run"),
+            Arg::Literal("black"),
+            Arg::Literal("-q"),
+            Arg::Literal("-"),
+        ],
+    ),
+    interactive(
+        "ruff-uv",
+        "uv",
+        &[
+            Arg::Literal("run"),
+            Arg::Literal("ruff"),
+            Arg::Literal("format"),
+            Arg::Literal("--stdin-filename"),
+            Arg::Param("file"),
+            Arg::Literal("-"),
+        ],
+    ),
+    interactive(
+        "black-tool",
+        "black",
+        &[Arg::Literal("-q"), Arg::Literal("-")],
+    ),
+    interactive(
+        "ruff-tool",
+        "ruff",
+        &[
+            Arg::Literal("format"),
+            Arg::Literal("--stdin-filename"),
+            Arg::Param("file"),
+            Arg::Literal("-"),
+        ],
+    ),
+    interactive(
+        "ast-probe",
+        "interpreter",
+        &[
+            Arg::Literal("-c"),
+            Arg::Literal(crate::support::PY_AST_PROBE),
+        ],
+    ),
+    interactive(
+        "ast-probe-tool",
+        "python3",
+        &[
+            Arg::Literal("-c"),
+            Arg::Literal(crate::support::PY_AST_PROBE),
+        ],
+    ),
+];
+
+/// Home tools an interactive recipe may run, looked up by the core on its formatter PATH.
+const HOME_TOOLS: &[ExecutableSlot] = &[
+    ExecutableSlot {
+        name: "uv",
+        source: SlotSource::HomeTool("uv"),
+    },
+    ExecutableSlot {
+        name: "black",
+        source: SlotSource::HomeTool("black"),
+    },
+    ExecutableSlot {
+        name: "ruff",
+        source: SlotSource::HomeTool("ruff"),
+    },
+    ExecutableSlot {
+        name: "python3",
+        source: SlotSource::HomeTool("python3"),
+    },
+];
+
+/// A recipe reading the candidate on stdin: `program` is the `interpreter` path parameter
+/// (admitted under [`INTERPRETER_ROLES`]) or a home tool slot of the same name.
+const fn interactive(
+    id: &'static str,
+    program: &'static str,
+    args: &'static [Arg],
+) -> EffectRecipe {
+    EffectRecipe {
+        id,
+        program,
+        args,
+        env: &[
+            EnvRule::Home { name: "HOME" },
+            EnvRule::Literal {
+                name: "PATH",
+                value: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+            },
+        ],
+        paths: &[PathRule {
+            param: "interpreter",
+            roles: INTERPRETER_ROLES,
+            existing_only: false,
+            read_root: false,
+        }],
+        executables: HOME_TOOLS,
+        stdin: Stdin::Candidate,
+        class: RunClass::Interactive,
+        timeout_ceiling_ms: 10_000,
+        capture_bytes: 64 << 20,
+    }
+}
+
+/// The recipe request of a formatter or probe argument vector the in-process support builds
+/// ([`crate::support`]); `None` for any other shape, which the core then refuses.
+pub fn interactive_effect(argv: &[String]) -> Option<EffectRequest> {
+    let words: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let path = |value: &str| Param::Path(PathBuf::from(value));
+    let tool = |name: &str| Param::Executable(name.to_owned());
+    let (recipe, params): (&str, Vec<(&str, Param)>) = match words.as_slice() {
+        [interpreter, "-m", "black", "-q", "-"] if interpreter.starts_with('/') => {
+            ("black-module", vec![("interpreter", path(interpreter))])
+        }
+        [
+            interpreter,
+            "-m",
+            "ruff",
+            "format",
+            "--stdin-filename",
+            file,
+            "-",
+        ] if interpreter.starts_with('/') => (
+            "ruff-module",
+            vec![
+                ("interpreter", path(interpreter)),
+                ("file", Param::Token((*file).to_owned())),
+            ],
+        ),
+        ["uv", "run", "black", "-q", "-"] => ("black-uv", vec![("uv", tool("uv"))]),
+        ["uv", "run", "ruff", "format", "--stdin-filename", file, "-"] => (
+            "ruff-uv",
+            vec![
+                ("uv", tool("uv")),
+                ("file", Param::Token((*file).to_owned())),
+            ],
+        ),
+        ["black", "-q", "-"] => ("black-tool", vec![("black", tool("black"))]),
+        ["ruff", "format", "--stdin-filename", file, "-"] => (
+            "ruff-tool",
+            vec![
+                ("ruff", tool("ruff")),
+                ("file", Param::Token((*file).to_owned())),
+            ],
+        ),
+        [interpreter, "-c", probe] if *probe == crate::support::PY_AST_PROBE => {
+            if interpreter.starts_with('/') {
+                ("ast-probe", vec![("interpreter", path(interpreter))])
+            } else if *interpreter == "python3" {
+                ("ast-probe-tool", vec![("python3", tool("python3"))])
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    Some(EffectRequest {
+        recipe: recipe.to_owned(),
+        params: params
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect(),
+    })
+}
+
+/// The Pyright check: Node runs the Pyright CLI over one project root.
+const PYRIGHT: EffectRecipe = EffectRecipe {
     id: "pyright",
     program: "node",
     args: &[
@@ -262,7 +458,7 @@ pub const RECIPES: &[EffectRecipe] = &[EffectRecipe {
     class: RunClass::Background,
     timeout_ceiling_ms: 900_000,
     capture_bytes: 64 << 20,
-}];
+};
 
 /// The `pyright` recipe request that reproduces `spec`, a run [`PythonChecker`] built for
 /// `request` ([`PythonChecker::pyright_spec_for_root`]): the module names its inputs, the core
@@ -652,6 +848,96 @@ mod tests {
         assert!(matches!(
             expand(RECIPES, &program, &admission),
             Err(Refusal::UnknownSlot(_))
+        ));
+    }
+
+    /// Every formatter and probe argument vector the in-process support builds becomes a
+    /// request of a declared recipe that the core expands to exactly that program and those
+    /// arguments (a home tool resolved by the core); any other shape has no request, and an
+    /// interpreter outside every interpreter root is refused.
+    #[test]
+    fn formatter_and_probe_plans_are_recipes() {
+        let (layout, request, _, interpreter) = layout("interactive");
+        let home = layout.base.join("home");
+        let tools: Vec<(String, PathBuf)> = ["uv", "black", "ruff", "python3"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_owned(),
+                    PathBuf::from(format!("/opt/homebrew/bin/{name}")),
+                )
+            })
+            .collect();
+        let roots: Vec<PathBuf> = INTERPRETER_PREFIXES.iter().map(PathBuf::from).collect();
+        let admission = agent_ide_core::modules::recipe::Admission {
+            worktree: &request.worktree,
+            cache_dir: &request.cache_dir,
+            read_denies: &[],
+            home: Some(&home),
+            launcher_roots: &roots,
+            developer_dirs: &[],
+            programs: &tools,
+            timeout: Duration::from_secs(10),
+        };
+        let python = interpreter.display().to_string();
+        let probe = crate::support::PY_AST_PROBE;
+        for argv in [
+            vec![python.as_str(), "-m", "black", "-q", "-"],
+            vec![
+                python.as_str(),
+                "-m",
+                "ruff",
+                "format",
+                "--stdin-filename",
+                "a.py",
+                "-",
+            ],
+            vec!["uv", "run", "black", "-q", "-"],
+            vec![
+                "uv",
+                "run",
+                "ruff",
+                "format",
+                "--stdin-filename",
+                "a.py",
+                "-",
+            ],
+            vec!["black", "-q", "-"],
+            vec!["ruff", "format", "--stdin-filename", "a.py", "-"],
+            vec![python.as_str(), "-c", probe],
+            vec!["python3", "-c", probe],
+        ] {
+            let argv: Vec<String> = argv.into_iter().map(str::to_owned).collect();
+            let effect = interactive_effect(&argv).expect("a recipe request");
+            let spec = expand(RECIPES, &effect, &admission).unwrap();
+            let program = if argv[0].starts_with('/') {
+                PathBuf::from(&argv[0])
+            } else {
+                PathBuf::from(format!("/opt/homebrew/bin/{}", argv[0]))
+            };
+            assert_eq!(spec.program, program, "{argv:?}");
+            assert_eq!(
+                spec.args,
+                argv[1..]
+                    .iter()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>(),
+                "{argv:?}"
+            );
+            assert_eq!(spec.cwd, request.worktree);
+        }
+        assert!(interactive_effect(&["sh".into(), "-c".into(), "x".into()]).is_none());
+        let outside = interactive_effect(&[
+            "/private/var/root/python".into(),
+            "-m".into(),
+            "black".into(),
+            "-q".into(),
+            "-".into(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            expand(RECIPES, &outside, &admission),
+            Err(Refusal::OutOfRule(name, _)) if name == "interpreter"
         ));
     }
 }
