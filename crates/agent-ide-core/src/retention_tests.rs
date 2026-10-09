@@ -8,15 +8,10 @@ const DAY: Duration = Duration::from_secs(86_400);
 /// Repository-level directory name used for every fixture check cache.
 const REPO: &str = "0123456789abcdef";
 
-/// Creates a fresh canonical scratch directory unique to this process and `name`.
-fn scratch(name: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("agent-ide-retention-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    // A state root must not be group or world writable, whatever the umask.
-    fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
-    fs::canonicalize(dir).unwrap()
+/// Creates a fresh canonical scratch directory that removes itself, and everything the test put in
+/// it, when dropped. `name` only labels it.
+fn scratch(name: &str) -> crate::scratch::ScratchDir {
+    crate::scratch::ScratchDir::new(&format!("retention-{name}"))
 }
 
 /// Builds `checks/<REPO>/<worktree key>` for `worktree` with a small target file and marker.
@@ -890,7 +885,7 @@ fn adopting_a_marker_waits_for_a_claim_and_revalidates_the_store() {
     let claim = try_exclusive(&home.join(LOCKS_DIR).join(format!("{key}.lock"))).expect("claim");
 
     let adopting = {
-        let (home, store, launch) = (home.clone(), store.clone(), launch.clone());
+        let (home, store, launch) = (home.to_path_buf(), store.clone(), launch.clone());
         std::thread::spawn(move || adopt_marker(&home, &store, &launch))
     };
     std::thread::sleep(Duration::from_millis(300));

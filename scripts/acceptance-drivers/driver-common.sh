@@ -105,6 +105,31 @@ require_transcript_text() {
     [ "$matched" -ge 1 ] || { note "$3" "expected text $2 in $(basename -- "$1")"; return 1; }
 }
 
+# Requires one literal in the result of a call to one named tool in a stream-json transcript.
+#
+# Unlike require_transcript_text this is correlated: only a `tool_result` whose `tool_use_id`
+# belongs to an assistant `tool_use` of the named tool counts, so narration that mentions the
+# literal, or another tool's result carrying it, can never stand in for the call that was
+# skipped. The arguments are the transcript, the tool name, the literal and the closed code.
+require_tool_result_text() {
+    matched=$(jq -s --arg name "$2" --arg needle "$3" '
+        [.[] | select(.type == "assistant") | .message.content[]?
+            | select(.type == "tool_use" and .name == $name) | .id] as $ids
+        | [.[] | select(.type == "user") | .message.content[]?
+            | select(.type == "tool_result" and ((.tool_use_id as $id | $ids | index($id)) != null))
+            | (.content // "") | if type == "array" then map(.text? // "") | join("\n") else tostring end
+            | select(contains($needle))] | length' "$1" 2>>"$DIAG_LOG")
+    [ "${matched:-0}" -ge 1 ] || { note "$4" "expected $3 in a $2 result in $(basename -- "$1")"; return 1; }
+}
+
+# Requires the L2 stale probe: the model really called ide.edit (step 7 can be skipped) and that
+# call's own result carries the `stale_source` refusal. The oracle literal is unchanged; only
+# its source is pinned to the stale ide.edit result.
+require_stale_edit_result() {
+    require_tool_use "$1" mcp__agent-ide__ide_edit A_L2_STEP7_SKIPPED || return 1
+    require_tool_result_text "$1" mcp__agent-ide__ide_edit "stale_source" A_L2_STALE_OUTCOME
+}
+
 # Requires one literal to be absent from a captured stream-json transcript.
 forbid_transcript_text() {
     matched=$(jq -sr --arg needle "$2" '

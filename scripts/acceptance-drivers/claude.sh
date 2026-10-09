@@ -299,7 +299,9 @@ verify_l2() {
     t=$DIAG_DIR/transcript-l2.jsonl
     require_claude_native_edit "$t" A_L2_NATIVE_EDIT || return 1
     require_transcript_text "$t" "LEFT_FALLBACK_OK" A_L2_FINAL || return 1
-    require_transcript_text "$t" "stale_source" A_L2_STALE_OUTCOME || return 1
+    # Step 7 can be skipped by the model; the oracle is the refusal that the stale ide.edit call
+    # itself returned, never a mention of it in narration or in another tool's result.
+    require_stale_edit_result "$t" || return 1
     left_py=$LEFT/acceptance-fixture/fixture.py
     [ "$(sed -n '1p' "$left_py")" = "# native acceptance marker" ] || return 1
     grep -qF "return 0" "$left_py" || return 1

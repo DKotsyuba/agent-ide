@@ -92,24 +92,55 @@ type SelectionMap = HashMap<(PathBuf, Language), Vec<EnvSelection>>;
 static SELECTIONS: LazyLock<Mutex<SelectionMap>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// The selections in force for one language in one worktree, in no particular order.
+///
+/// The map is a cache of the durable store, so a lock poisoned by a panicking holder is recovered
+/// (poisoned-lock policy, `docs/architecture.md`): the lookup answers what was last written
+/// instead of panicking every later reader.
 pub fn selections(worktree: &Path, language: Language) -> Vec<EnvSelection> {
     SELECTIONS
         .lock()
-        .expect("environment selections mutex is not poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&(worktree.to_path_buf(), language))
         .cloned()
         .unwrap_or_default()
 }
 
 /// Replaces every selection of one language in one worktree; an empty list clears them.
+///
+/// Recovers a poisoned lock like [`selections`]: the next load from the durable store rewrites the
+/// worktree's rows whole.
 pub fn replace_selections(worktree: &Path, language: Language, selections: Vec<EnvSelection>) {
     let mut map = SELECTIONS
         .lock()
-        .expect("environment selections mutex is not poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let key = (worktree.to_path_buf(), language);
     if selections.is_empty() {
         map.remove(&key);
     } else {
         map.insert(key, selections);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A holder that panicked with the process-wide selection map locked does not make every later
+    /// read or write of the (rebuildable) cache panic.
+    #[test]
+    fn poisoned_selection_cache_is_recovered_not_propagated() {
+        crate::lang::testing::install();
+        let poisoned = std::thread::spawn(|| {
+            let _map = SELECTIONS.lock().unwrap();
+            panic!("poison the selection cache");
+        })
+        .join();
+        assert!(poisoned.is_err() && SELECTIONS.is_poisoned());
+
+        let worktree = Path::new("/nonexistent/poisoned-cache");
+        let language = crate::lang::testing::ALPHA;
+        assert!(selections(worktree, language).is_empty());
+        replace_selections(worktree, language, Vec::new());
+        assert!(selections(worktree, language).is_empty());
     }
 }

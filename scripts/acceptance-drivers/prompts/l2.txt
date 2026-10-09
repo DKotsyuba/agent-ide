@@ -14,8 +14,10 @@ spelling variant (ide.start or ide_start); they are the same tools.
 
 1. Call ide.start with {"activation_id":"acceptance-left-2"}. Apply R1 to that reply.
 2. Call ide.context with {"path":"acceptance-fixture/fixture.py"}. Apply R1 to
-   that reply. The structured context result has a detail_ref field; remember
-   that exact value as OLD_REF.
+   that reply. The reply ends with "use ide.edit with source_ref X when
+   available" (a structured detail_ref field, if your host shows one, holds the
+   same value); remember that exact whole value X as OLD_REF. It is not a
+   digest and not invented.
 3. Call ide.stop with {}.
 4. With your native file-editing ability only (apply_patch, the shell, or the
    Edit tool after its required Read), edit acceptance-fixture/fixture.py by
@@ -24,7 +26,8 @@ spelling variant (ide.start or ide_start); they are the same tools.
 5. Call ide.start with {"activation_id":"acceptance-left-2b"}. Apply R1 to that reply.
 6. Call ide.context with {"path":"acceptance-fixture/fixture.py"}. Apply R1 to that reply.
 7. Call ide.edit with {"operation_id":"stale-probe","path":"acceptance-fixture/fixture.py","source_ref":"OLD_REF","content":"def value() -> int:\n    return 7\n"},
-   using the OLD_REF detail_ref value remembered from step 2.
+   using the OLD_REF value remembered from step 2. Step 7 is mandatory and its
+   refusal is the expected result: never skip it.
 8. Whatever step 7 replies, do not retry or fix anything; apply R1 only.
 9. Call ide.stop with {}.
 Then reply with exactly: LEFT_FALLBACK_OK

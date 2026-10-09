@@ -8,6 +8,11 @@
 - Check-cache eviction is tiered. A worktree idle for 2 days loses its rustc `incremental/` state first and keeps `deps/` and `build/`; whole worktrees go only by the existing gone, idle (7 days) and budget rules. Independently, finalized rustc incremental sessions older than the newest of their crate are swept (newest by rustc's base-36 session timestamp, never mtime), each only while its sibling rustc session lock `s-<timestamp>-<random>.lock` is held exclusively, never `-working` sessions, and only under the worktree's exclusive claim; a malformed `s-…` name or a tie at the newest timestamp leaves the crate alone.
 - Retention budgets charge what is actually allocated once: hard-linked inodes and perfect APFS clones (sibling worktree caches are copy-on-write clones of each other) are counted once per family, and removing an entry frees only what no surviving entry still holds. `agent-ide cache status` shows logical (file lengths), charged (budgeted) and private (APFS private bytes, a reclaim estimate that is never charged) bytes per family.
 
+### Fixed
+
+- A panic in an accepted-connection task is journaled (`daemon failed internal`, detail `connection_task_panic`) on both the live accept loop and the shutdown drain; cancellation by the drain stays silent.
+- The daemon's poisoned-lock policy is stated and tested (`docs/architecture.md`, "Poisoned locks"): the lease idle clock, the shutdown hooks and the environment selection cache recover a poisoned lock instead of panicking; authority state keeps failing closed.
+
 ## 0.10.7 — 2026-10-08
 
 ### Fixed

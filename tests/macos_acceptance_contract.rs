@@ -231,3 +231,110 @@ fn toolchain_checks_return_explicitly_inside_guarded_routes() {
         "{checks:?}"
     );
 }
+
+/// Owns one scratch directory of the L2 oracle test and removes it on every exit path.
+struct OracleScratch(std::path::PathBuf);
+
+impl Drop for OracleScratch {
+    /// Removes the directory even when an assertion failed.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Runs the driver's real `require_stale_edit_result` over stream-json `events` and reports
+/// whether it accepted the transcript.
+fn l2_stale_probe_accepts(scratch: &OracleScratch, name: &str, events: &[Value]) -> bool {
+    let transcript = scratch.0.join(format!("{name}.jsonl"));
+    let lines = events.iter().map(Value::to_string).collect::<Vec<_>>();
+    std::fs::write(&transcript, lines.join("\n")).unwrap();
+    let common = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/scripts/acceptance-drivers/driver-common.sh"
+    );
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(". \"$1\"; require_stale_edit_result \"$2\"")
+        .args(["sh", common])
+        .arg(&transcript)
+        .env("AGENT_IDE_ACCEPTANCE_DIAG_LOG", scratch.0.join("diag.log"))
+        .status()
+        .expect("sh runs the driver function")
+        .success()
+}
+
+/// One assistant message with `content` blocks, as in `claude -p --output-format stream-json`.
+fn assistant(content: Value) -> Value {
+    serde_json::json!({"type":"assistant","message":{"content":content}})
+}
+
+/// One user message carrying the `result` text of tool call `id`.
+fn tool_result(id: &str, text: &str) -> Value {
+    serde_json::json!({"type":"user","message":{"content":[
+        {"type":"tool_result","tool_use_id":id,"content":[{"type":"text","text":text}]}]}})
+}
+
+/// The L2 oracle keeps the literal `stale_source` but takes it only from the result of a real
+/// `ide.edit` call: a skipped step 7 fails even when the model narrates the literal, and another
+/// tool's result carrying it does not stand in for the skipped call.
+///
+/// Before the fix `verify_l2` scanned every event for the literal, so a transcript with no
+/// `ide.edit` at all passed on narration alone.
+#[test]
+fn l2_stale_oracle_requires_the_stale_edit_result_not_narration() {
+    let scratch = OracleScratch(
+        std::env::temp_dir().join(format!("agent-ide-l2-oracle-{}", std::process::id())),
+    );
+    std::fs::create_dir_all(&scratch.0).unwrap();
+    let edit = "mcp__agent-ide__ide_edit";
+    let stale = "edit: stale_source; path acceptance-fixture/fixture.py. No write occurred";
+    let narration = assistant(serde_json::json!([
+        {"type":"text","text":"Step 7 skipped; a stale_source refusal would have followed. LEFT_FALLBACK_OK"}]));
+    let call = |id: &str, name: &str| {
+        assistant(serde_json::json!([{"type":"tool_use","id":id,"name":name,"input":{}}]))
+    };
+
+    assert!(l2_stale_probe_accepts(
+        &scratch,
+        "real",
+        &[
+            call("e1", edit),
+            tool_result("e1", stale),
+            narration.clone()
+        ]
+    ));
+    assert!(
+        !l2_stale_probe_accepts(&scratch, "skipped", std::slice::from_ref(&narration)),
+        "narration alone must not pass"
+    );
+    assert!(
+        !l2_stale_probe_accepts(
+            &scratch,
+            "other-tool",
+            &[
+                call("c1", "mcp__agent-ide__ide_context"),
+                tool_result("c1", stale),
+                narration.clone()
+            ]
+        ),
+        "another tool's result carrying the literal must not pass"
+    );
+    assert!(
+        !l2_stale_probe_accepts(
+            &scratch,
+            "wrong-result",
+            &[
+                call("e1", edit),
+                tool_result("e1", "edit: applied"),
+                call("c1", "mcp__agent-ide__ide_context"),
+                tool_result("c1", stale),
+                narration
+            ]
+        ),
+        "an ide.edit that was not refused as stale must not pass"
+    );
+
+    let claude = include_str!("../scripts/acceptance-drivers/claude.sh");
+    assert!(claude.contains("require_stale_edit_result \"$t\""));
+    assert!(!claude.contains("require_transcript_text \"$t\" \"stale_source\""));
+}
