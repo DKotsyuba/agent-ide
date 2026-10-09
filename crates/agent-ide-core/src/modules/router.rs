@@ -83,25 +83,74 @@ pub fn ship(languages: &'static [&'static str]) {
     let _ = SHIPPED.set(languages);
 }
 
+/// The languages whose module ships ([`ship`]), plus the test seam's.
+fn shipped_languages() -> BTreeSet<String> {
+    let mut shipped: BTreeSet<String> = SHIPPED
+        .get()
+        .copied()
+        .unwrap_or_default()
+        .iter()
+        .map(|id| (*id).to_owned())
+        .collect();
+    if let Some(seam) = crate::test_seams::var(SHIPPED_SEAM) {
+        shipped.extend(
+            seam.split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned),
+        );
+    }
+    shipped
+}
+
+/// One `<language> <mode>` entry per language of `languages` whose module ships — `module`, or
+/// `in process (fallback)` when the switch sends it back or the executable cannot be pinned —
+/// joined with ` · `; `None` when none of them ships a module. `ignored` journal entries of the
+/// switch follow. This is what a process started with this environment would do (`agent-ide
+/// doctor`); a running daemon reports its own routing through [`ModuleHost::modes_line`].
+pub fn effective_modes(languages: &[Language]) -> Option<String> {
+    let shipped = shipped_languages();
+    let modes = LanguageModes::from_env();
+    let pinned = ModuleExecutable::current().is_some();
+    modes_line(languages, &shipped, |language| {
+        if pinned && modes.mode(language.name()) == Mode::Module {
+            Mode::Module
+        } else {
+            Mode::InProcess
+        }
+    })
+    .map(|line| {
+        let ignored = modes.ignored_lines();
+        if ignored.is_empty() {
+            line
+        } else {
+            format!("{line} ({})", ignored.join(", "))
+        }
+    })
+}
+
+/// The modes line of `languages` that ship in `shipped`, with `mode` deciding each.
+fn modes_line(
+    languages: &[Language],
+    shipped: &BTreeSet<String>,
+    mode: impl Fn(Language) -> Mode,
+) -> Option<String> {
+    let entries: Vec<String> = languages
+        .iter()
+        .filter(|language| shipped.contains(language.name()))
+        .map(|language| match mode(*language) {
+            Mode::Module => format!("{language} module"),
+            Mode::InProcess => format!("{language} in process (fallback)"),
+        })
+        .collect();
+    (!entries.is_empty()).then(|| entries.join(" · "))
+}
+
 impl ModuleHost {
     /// Routing for the shipped languages ([`ship`]) with the daemon's `admission`, pinning the
     /// running executable and reading the fallback switch once.
     pub fn new(admission: Arc<Mutex<AdmissionController>>) -> Self {
-        let mut shipped: BTreeSet<String> = SHIPPED
-            .get()
-            .copied()
-            .unwrap_or_default()
-            .iter()
-            .map(|id| (*id).to_owned())
-            .collect();
-        if let Some(seam) = crate::test_seams::var(SHIPPED_SEAM) {
-            shipped.extend(
-                seam.split(',')
-                    .map(str::trim)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_owned),
-            );
-        }
+        let shipped = shipped_languages();
         let extra_env = [super::serve::FAULT_SEAM, super::serve::FIXTURE_SEAM]
             .into_iter()
             .filter_map(|seam| Some((seam.to_owned(), crate::test_seams::var(seam)?)))
@@ -141,6 +190,11 @@ impl ModuleHost {
     /// The journal lines of ignored switch entries (`language_mode_ignored:<id>`).
     pub fn ignored_lines(&self) -> Vec<String> {
         self.modes.ignored_lines()
+    }
+
+    /// This daemon's [`effective_modes`] line for `languages`.
+    pub fn modes_line(&self, languages: &[Language]) -> Option<String> {
+        modes_line(languages, &self.shipped, |language| self.mode(language))
     }
 
     /// Where `language` computes in this daemon.
@@ -325,5 +379,28 @@ impl ModuleHost {
         for slot in stopping {
             let _ = slot.lock().await.stop().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lang::testing::{ALPHA, BETA};
+
+    /// Only languages whose module ships are named, each with where it computes; with none
+    /// shipped there is no line.
+    #[test]
+    fn modes_name_shipped_languages_only() {
+        crate::lang::testing::install();
+        let shipped: BTreeSet<String> = ["alpha".to_owned()].into();
+        assert_eq!(
+            modes_line(&[ALPHA, BETA], &shipped, |_| Mode::Module).as_deref(),
+            Some("alpha module")
+        );
+        assert_eq!(
+            modes_line(&[ALPHA, BETA], &shipped, |_| Mode::InProcess).as_deref(),
+            Some("alpha in process (fallback)")
+        );
+        assert_eq!(modes_line(&[BETA], &shipped, |_| Mode::Module), None);
     }
 }

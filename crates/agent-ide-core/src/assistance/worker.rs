@@ -3429,6 +3429,13 @@ impl<'a> Worker<'a> {
                     detail: detail.as_deref(),
                     duration_ms: u32::try_from(started.elapsed().as_millis()).ok(),
                     request: request.as_deref(),
+                    module: detail
+                        .as_deref()
+                        .and_then(crate::telemetry::adapters::failed_module),
+                    module_version: detail
+                        .as_deref()
+                        .and_then(crate::telemetry::adapters::failed_module)
+                        .map(|_| env!("CARGO_PKG_VERSION")),
                     ..Default::default()
                 },
             );
@@ -4038,6 +4045,12 @@ impl<'a> Worker<'a> {
                 languages.clear();
                 environments.clear();
             }
+            let modes = crate::modules::calls::modes_line(
+                &languages
+                    .iter()
+                    .map(|project| project.language)
+                    .collect::<Vec<_>>(),
+            );
             let walk = tokio::task::spawn_blocking(move || {
                 // The daemon does not probe language servers at start; every detected language's
                 // server state is the honest "not started" until a later tool observes otherwise,
@@ -4055,6 +4068,7 @@ impl<'a> Worker<'a> {
                 let links = project_card::links_line(&languages);
                 let mut project = project_card::collect(&root, languages, servers, None);
                 project.environments = environments;
+                project.modes = modes;
                 let clean_git = project.git.as_ref().and_then(|git| {
                     if git.clean {
                         git.last_commit

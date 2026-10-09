@@ -66,6 +66,12 @@ pub fn checker(
     )))
 }
 
+/// The daemon's modes line for `languages` ([`ModuleHost::modes_line`]); `None` without a host
+/// or when none of them ships a module.
+pub fn modes_line(languages: &[Language]) -> Option<String> {
+    HOST.get()?.modes_line(languages)
+}
+
 /// Where `language` computes in this process.
 pub fn mode(language: Language) -> Mode {
     module(language).map_or(Mode::InProcess, |_| Mode::Module)

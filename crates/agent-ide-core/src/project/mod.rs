@@ -145,6 +145,9 @@ pub struct ProjectCard {
     /// Each detected language's resolved environments, computed by the caller where the language
     /// computes (in process or by its module); a language absent here renders its generic facts.
     pub environments: Vec<(Language, Vec<crate::lang::environment::ResolvedEnv>)>,
+    /// Where each detected language whose module ships computes (`<id> module`, or `in
+    /// process (fallback)`), when any ships; set by the daemon that serves the card.
+    pub modes: Option<String>,
 }
 
 /// Mutable state threaded through the recursive walk in [`scan_dir`].
@@ -457,6 +460,7 @@ pub fn collect(
         truncated: state.truncated,
         agent_commands,
         environments: Vec::new(),
+        modes: None,
     }
 }
 
@@ -625,6 +629,9 @@ fn render_at(card: &ProjectCard, show_layout_children: bool, docs_shown: usize) 
     }
     if !card.servers.is_empty() {
         lines.push(render_servers(card));
+        if let Some(modes) = &card.modes {
+            lines.push(format!("modules: {modes}"));
+        }
     }
     if let Some(problems) = &card.problems {
         lines.push(format!("problems: {problems}"));
@@ -1125,6 +1132,7 @@ mod tests {
             truncated: false,
             agent_commands: crate::lang::ProjectCommands::default(),
             environments: Vec::new(),
+            modes: None,
         };
         assert_eq!(
             render_servers(&card),
