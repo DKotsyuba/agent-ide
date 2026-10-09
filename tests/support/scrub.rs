@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 /// The transcript line of one call with only the generated identities normalized: the values of
 /// the request's own `source_ref`/`detail_ref` (a proof echoed from an earlier reply), the exact
 /// worktree and fixture prefixes (relative suffixes stay), and, for the activation card alone,
-/// the short commit hash and the activation identifier. Reply text of every other call, source
-/// literals included, stays byte for byte.
+/// the short commit hash (the `last <hash>` slot of the project card) and the activation
+/// identifier. Reply text of every other call, source literals included, stays byte for byte.
 pub fn line(tool: &str, arguments: &Value, reply: &Value, root: &Path, base: &Path) -> String {
     let mut arguments = arguments.clone();
     for key in ["source_ref", "detail_ref"] {
@@ -26,7 +26,7 @@ pub fn line(tool: &str, arguments: &Value, reply: &Value, root: &Path, base: &Pa
     if tool == "ide.start"
         && let Some(card) = reply["text"].as_str()
     {
-        let card = mask_after(card, "git ", 7, 12);
+        let card = mask_after(card, "last ", 7, 12);
         reply["text"] = json!(mask_after(&card, "activation ", 8, 64));
     }
     super::parity::line(tool, &arguments, &reply)
@@ -74,7 +74,9 @@ mod tests {
     /// The four generated identities normalize; relative suffixes and everything else stay.
     #[test]
     fn identities_normalize() {
-        let card = |hash: &str, id: &str| format!("git {hash} @/a.css activation {id}");
+        let card = |hash: &str, id: &str| {
+            format!("(git: master, clean, last {hash} fixture) @/a.css activation {id}")
+        };
         assert_eq!(
             at("ide.start", json!({}), &card("5d7fd78", "25d98761ab"), "p1"),
             at("ide.start", json!({}), &card("9f00aa1", "ffe01234ab"), "p2"),
@@ -96,7 +98,7 @@ mod tests {
     #[test]
     fn real_differences_survive() {
         let read = |text: &str| at("ide.read", json!({"symbol":"a"}), text, "p");
-        assert_ne!(read("git abcdef1"), read("git abcdef2"));
+        assert_ne!(read("last abcdef1"), read("last abcdef2"));
         assert_ne!(read("activation deadbeef"), read("activation cafebabe"));
         let start = |id: &str| at("ide.start", json!({"activation_id":id}), "x", "p");
         assert_ne!(start("activation deadbeef"), start("activation cafebabe"));
