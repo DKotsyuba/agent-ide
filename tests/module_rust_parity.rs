@@ -93,6 +93,11 @@ const PARITY_FILES: &[(&str, &str)] = &[
     ("style.css", ".button {\n  color: red;\n}\n"),
 ];
 
+/// Byte offset of `work` in the parity crate's `src/lib.rs` (its definition).
+const WORK_OFFSET: usize = 96;
+/// Byte offset of the `helper` call inside `Service::work`.
+const HELPER_CALL_OFFSET: usize = 132;
+
 /// Calls answered from source while rust-analyzer still loads: outline (with its marker), the
 /// quadratic-syntax refusal, a symbol read and a symbol edit.
 fn before_ready() -> Vec<(&'static str, Value)> {
@@ -127,7 +132,7 @@ fn semantic() -> Vec<(&'static str, Value)> {
         ),
         (
             "ide.context",
-            json!({"path":"src/lib.rs","byte_offset":120}),
+            json!({"path":"src/lib.rs","byte_offset":HELPER_CALL_OFFSET}),
         ),
         edit(
             json!({"operation_id":"p-container","op":"insert","symbol":"src/lib.rs#tests",
@@ -154,7 +159,11 @@ async fn ready(session: &mut Session, fixture: &Fixture) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let reply = session
-            .call(fixture, "ide.context", json!({"path":"src/lib.rs"}))
+            .call(
+                fixture,
+                "ide.context",
+                json!({"path":"src/lib.rs","byte_offset":WORK_OFFSET}),
+            )
             .await;
         if reply["text"]
             .as_str()
@@ -385,9 +394,16 @@ async fn killing_the_module_while_rust_analyzer_indexes_is_typed_and_leaves_no_o
         (fixture, reply)
     };
     let text = outcome["text"].as_str().unwrap_or_default();
-    assert_eq!(outcome["code"], "provider_unavailable", "{outcome}");
+    // The symbol card keeps its definition and names why usages are missing; either way the
+    // original reply carries the module's typed fault.
     assert!(
-        text.contains("module_unavailable (bundled.rust:"),
+        outcome["code"] == "provider_unavailable" || text.contains("usages: unavailable"),
+        "the original call fails its semantic part: {outcome}"
+    );
+    assert!(
+        outcome
+            .to_string()
+            .contains("module_unavailable (bundled.rust:"),
         "the original call names the module fault: {outcome}"
     );
     assert_eq!(daemon.pid(), daemon_pid, "the daemon is the same process");
@@ -506,4 +522,15 @@ async fn a_stalled_cargo_check_times_out_and_leaves_no_orphan() {
     for id in owned {
         assert!(id.gone().await, "{id:?} survived the daemon");
     }
+}
+
+/// The fixed offsets the transcript asks about point at the names they mean.
+#[test]
+fn offsets_point_at_their_names() {
+    let (_, lib) = PARITY_FILES
+        .iter()
+        .find(|(path, _)| *path == "src/lib.rs")
+        .unwrap();
+    assert!(lib[WORK_OFFSET..].starts_with("work(&self)"));
+    assert!(lib[HELPER_CALL_OFFSET..].starts_with("helper()\n"));
 }
