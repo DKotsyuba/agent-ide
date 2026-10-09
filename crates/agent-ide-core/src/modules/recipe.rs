@@ -290,6 +290,19 @@ pub fn expand(
     effect: &EffectRequest,
     admission: &Admission<'_>,
 ) -> Result<RunSpec, Refusal> {
+    expand_staged(recipes, effect, admission).map(|(spec, _)| spec)
+}
+
+/// A run's assets with the admitted cache paths they are staged at.
+pub type Staged = Vec<(PathBuf, &'static [u8])>;
+
+/// [`expand`] plus the recipe's assets with their admitted cache paths, to [`stage`] before the
+/// spawn; an asset whose parameter is not a cache-only path rule with one admitted value refuses.
+pub fn expand_staged(
+    recipes: &[EffectRecipe],
+    effect: &EffectRequest,
+    admission: &Admission<'_>,
+) -> Result<(RunSpec, Staged), Refusal> {
     let recipe = recipes
         .iter()
         .find(|recipe| recipe.id == effect.recipe)
@@ -307,7 +320,10 @@ pub fn expand(
             | EnvRule::Joined { param, .. }
             | EnvRule::Pattern { param, .. }
             | EnvRule::SearchPath { param, .. } => declared.push(param),
-            EnvRule::Literal { .. } | EnvRule::Home { .. } => {}
+            EnvRule::Literal { .. }
+            | EnvRule::Home { .. }
+            | EnvRule::ReadRootsJson { .. }
+            | EnvRule::ReadDeniesJson { .. } => {}
         }
     }
     declared.extend(recipe.paths.iter().map(|rule| rule.param));
@@ -458,26 +474,82 @@ pub fn expand(
                     .ok_or_else(|| Refusal::Missing("home".to_owned()))?;
                 env.push(((*name).to_owned(), home.display().to_string()));
             }
+            EnvRule::ReadRootsJson { name } => env.push((
+                (*name).to_owned(),
+                serde_json::to_string(&read_roots).unwrap_or_default(),
+            )),
+            EnvRule::ReadDeniesJson { name } => env.push((
+                (*name).to_owned(),
+                serde_json::to_string(admission.read_denies).unwrap_or_default(),
+            )),
         }
     }
-    Ok(RunSpec {
-        program,
-        args,
-        cwd: admission.worktree.to_path_buf(),
-        env,
-        read_roots,
-        write_roots: vec![admission.cache_dir.to_path_buf()],
-        read_denies: admission.read_denies.to_vec(),
-        timeout: admission
-            .timeout
-            .min(Duration::from_millis(recipe.timeout_ceiling_ms)),
-        max_output_bytes: recipe.capture_bytes as usize,
-    })
+    let mut staged = Vec::with_capacity(recipe.assets.len());
+    for asset in recipe.assets {
+        let cache_only = recipe
+            .paths
+            .iter()
+            .any(|rule| rule.param == asset.param && rule.roles == [PathRole::Cache]);
+        match paths.get(asset.param).map(Vec::as_slice) {
+            Some([path]) if cache_only => staged.push((path.clone(), asset.bytes)),
+            _ => return Err(Refusal::Missing(asset.param.to_owned())),
+        }
+    }
+    Ok((
+        RunSpec {
+            program,
+            args,
+            cwd: admission.worktree.to_path_buf(),
+            env,
+            read_roots,
+            write_roots: vec![admission.cache_dir.to_path_buf()],
+            read_denies: admission.read_denies.to_vec(),
+            timeout: admission
+                .timeout
+                .min(Duration::from_millis(recipe.timeout_ceiling_ms)),
+            max_output_bytes: recipe.capture_bytes as usize,
+        },
+        staged,
+    ))
+}
+
+/// Stages a run's assets ([`expand_staged`]): each one written to a fresh private temporary file
+/// beside its target and renamed into place, so a symlink at the target is replaced, never
+/// followed.
+pub fn stage(assets: &[(PathBuf, &[u8])]) -> std::io::Result<()> {
+    use std::io::Write;
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for (target, bytes) in assets {
+        let dir = target
+            .parent()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "asset path"))?;
+        std::fs::create_dir_all(dir)?;
+        let temporary = dir.join(format!(
+            ".asset-{}-{}.tmp",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let written = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(bytes)?;
+            drop(file);
+            std::fs::rename(&temporary, target)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        written?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::payload::RecipeAsset;
     use crate::modules::payload::{ExecutableSlot, RunClass, Stdin};
 
     /// Ancestor files a nested project check reads.
@@ -678,6 +750,7 @@ mod tests {
         class: RunClass::Background,
         timeout_ceiling_ms: 900_000,
         capture_bytes: 64 << 20,
+        assets: &[],
     };
 
     /// A scratch layout: an outer project holding the worktree, a home with a toolchain and a git
@@ -1094,6 +1167,7 @@ mod tests {
             class: RunClass::Background,
             timeout_ceiling_ms: 900_000,
             capture_bytes: 64 << 20,
+            assets: &[],
         };
         for (depth, expected) in [(48usize, 144usize), (403, 1209)] {
             let worktree: PathBuf = std::iter::once("/".to_owned())
@@ -1127,5 +1201,103 @@ mod tests {
             assert_eq!(spec.read_roots, roots, "{depth} levels");
             assert!(spec.read_roots.len() > 128);
         }
+    }
+
+    /// A recipe's asset is staged at the admitted cache path of its parameter (replacing a
+    /// symlink there, never following it), and the read-roots and read-denies JSON variables
+    /// carry the run's final read roots and the host denies; an asset on a parameter that is not
+    /// a cache-only path refuses.
+    #[test]
+    fn assets_stage_at_admitted_cache_paths_and_json_env_mirrors_the_run() {
+        const ADAPTER: RecipeAsset = RecipeAsset {
+            param: "adapter",
+            bytes: b"module.exports = 1;\n",
+        };
+        const TS: EffectRecipe = EffectRecipe {
+            id: "ts",
+            program: "node",
+            args: &[Arg::Param("adapter")],
+            env: &[
+                EnvRule::ReadRootsJson {
+                    name: "CHECK_READ_ROOTS",
+                },
+                EnvRule::ReadDeniesJson {
+                    name: "CHECK_READ_DENIES",
+                },
+            ],
+            paths: &[
+                PathRule {
+                    param: "worktree",
+                    roles: &[PathRole::WorktreeRoot],
+                    existing_only: false,
+                    read_root: true,
+                },
+                PathRule {
+                    param: "adapter",
+                    roles: &[PathRole::Cache],
+                    existing_only: false,
+                    read_root: false,
+                },
+            ],
+            executables: &[ExecutableSlot {
+                name: "node",
+                source: SlotSource::Launcher("node"),
+            }],
+            stdin: Stdin::Null,
+            class: RunClass::Background,
+            timeout_ceiling_ms: 900_000,
+            capture_bytes: 64 << 20,
+            assets: &[ADAPTER],
+        };
+        let layout = Layout::new("assets");
+        let programs = [("node".to_owned(), layout.toolchain.join("bin/node"))];
+        let denies = [ReadDeny::Path(layout.base.join("secret"))];
+        let admission = Admission {
+            read_denies: &denies,
+            ..layout.admission(&programs, &[], &[])
+        };
+        let target = layout.cache.join("adapter-check.js");
+        let effect = EffectRequest {
+            recipe: "ts".into(),
+            params: BTreeMap::from([
+                ("node".into(), Param::Executable("node".into())),
+                ("worktree".into(), Param::Path(layout.worktree.clone())),
+                ("adapter".into(), Param::Path(target.clone())),
+            ]),
+        };
+        let (spec, staged) = expand_staged(&[TS], &effect, &admission).unwrap();
+        assert_eq!(staged, [(target.clone(), ADAPTER.bytes)]);
+        let env: BTreeMap<_, _> = spec.env.iter().cloned().collect();
+        assert_eq!(
+            env["CHECK_READ_ROOTS"],
+            serde_json::to_string(&spec.read_roots).unwrap()
+        );
+        assert_eq!(
+            env["CHECK_READ_DENIES"],
+            serde_json::to_string(&denies).unwrap()
+        );
+        std::fs::create_dir_all(&layout.cache).unwrap();
+        let elsewhere = layout.base.join("elsewhere.js");
+        std::fs::write(&elsewhere, "keep").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &target).unwrap();
+        stage(&staged).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), ADAPTER.bytes);
+        assert!(!std::fs::symlink_metadata(&target).unwrap().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere).unwrap(),
+            "keep",
+            "not followed"
+        );
+        const WRONG: EffectRecipe = EffectRecipe {
+            assets: &[RecipeAsset {
+                param: "worktree",
+                bytes: b"x",
+            }],
+            ..TS
+        };
+        assert!(matches!(
+            expand_staged(&[WRONG], &effect, &admission),
+            Err(Refusal::Missing(name)) if name == "worktree"
+        ));
     }
 }
