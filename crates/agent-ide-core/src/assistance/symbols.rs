@@ -924,7 +924,7 @@ impl Worker<'_> {
                         // This branch runs only after the outline's documentSymbols exchange
                         // failed, which already marked the session failed.
                         Err(error) if exchange => {
-                            degraded = Some(request_failed("references", &error));
+                            degraded = Some(request_failed("references", &error, outline.language));
                         }
                         Err(error) => {
                             self.providers.note_session_fault();
@@ -936,7 +936,7 @@ impl Worker<'_> {
                                     &FailureCode::ProviderUnavailable,
                                     &format!(
                                         "{name}: {}{}",
-                                        request_failed("references", &error),
+                                        request_failed("references", &error, outline.language),
                                         super::providers::session_fallback_clause(
                                             outline.language.support().outline_while_loading()
                                         )
@@ -2404,32 +2404,46 @@ fn module_failures_name_their_stage() {
     );
 }
 
-/// `<request> request failed`, naming a module's attributed request failure
-/// (`module_failed (…)`) when a module-hosted provider failed it; an in-process failure keeps
-/// the bare wording.
-fn request_failed(request: &str, error: &std::io::Error) -> String {
-    let error = error.to_string();
-    if error.starts_with("module_failed (") {
-        format!("{request} request failed: {error}")
+/// `<request> request failed`, naming the attributed request failure of `language`'s own
+/// module (exactly the core's closed `module_failed (bundled.<language>:provider:failed)`) when
+/// its module-hosted provider failed it; any other error, an in-process provider's message
+/// included, keeps the bare wording.
+fn request_failed(request: &str, error: &std::io::Error, language: Language) -> String {
+    let attributed = crate::intelligence::session::module_remote::module_failed(
+        &crate::modules::contract::ModuleId::bundled(language.name()),
+    );
+    if error.to_string() == attributed {
+        format!("{request} request failed: {attributed}")
     } else {
         format!("{request} request failed")
     }
 }
 
-/// A module's attributed request failure is named on the card; an in-process one is not.
+/// A module's attributed request failure is named on the card; an in-process one, or a provider
+/// message that merely starts like one, is not.
 #[test]
 fn module_request_failures_are_named() {
+    crate::lang::testing::install();
+    let alpha = crate::lang::testing::ALPHA;
     let module = std::io::Error::other(crate::intelligence::session::module_remote::module_failed(
-        &crate::modules::contract::ModuleId::bundled("rust"),
+        &crate::modules::contract::ModuleId::bundled(alpha.name()),
     ));
     assert_eq!(
-        request_failed("references", &module),
-        "references request failed: module_failed (bundled.rust:provider:failed)"
+        request_failed("references", &module, alpha),
+        "references request failed: module_failed (bundled.alpha:provider:failed)"
     );
-    assert_eq!(
-        request_failed("references", &std::io::Error::other("content modified")),
-        "references request failed"
-    );
+    for other in [
+        "content modified",
+        "module_failed (bundled.alpha:provider:failed) /etc/passwd",
+        "module_failed (bundled.alpha:provider:\x1b[31mx)",
+        "module_failed (bundled.beta:provider:failed)",
+    ] {
+        assert_eq!(
+            request_failed("references", &std::io::Error::other(other), alpha),
+            "references request failed",
+            "{other}"
+        );
+    }
 }
 
 /// The bounded first line of a failed documentSymbols exchange, for the outline footer.
