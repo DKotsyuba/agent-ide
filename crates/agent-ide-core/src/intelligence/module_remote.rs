@@ -277,6 +277,9 @@ impl Session {
                 Vec::new(),
             )
             .await;
+        if let Ok(readiness) = &answer {
+            self.record_module_readiness(*readiness);
+        }
         match answer {
             Ok(crate::modules::contract::Readiness::Ready) => Ok(()),
             Ok(crate::modules::contract::Readiness::Warming) => Err(ReadinessError::Loading),
@@ -322,11 +325,46 @@ impl Session {
                 return Err(io::Error::other(failure.to_string()));
             }
         };
+        // Every reply carries the hosted provider's readiness: it is this session's barrier.
+        self.record_module_readiness(reply.readiness);
+        // A semantic answer the module marks as covering only part of the workspace (its
+        // provider still loading) is never taken as a complete answer.
+        if matches!(
+            capability,
+            Capability::Semantic | Capability::Calls | Capability::Rename
+        ) && reply.coverage != crate::modules::contract::Coverage::Complete
+            && matches!(reply.outcome, Outcome::Result(_))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "provider answered for part of the workspace only",
+            ));
+        }
+        let remote = self.module.as_mut().expect("a module session");
         match reply.outcome {
-            Outcome::Result(value) => decode(value).map_err(|_| {
-                self.state.lock().expect("session lock").invalidate();
-                io::Error::new(io::ErrorKind::InvalidData, "module reply ill-typed")
-            }),
+            Outcome::Result(value) => match decode(value) {
+                Ok(value) => Ok(value),
+                Err(_) => {
+                    // A well-framed but ill-typed result is the module's typed fault.
+                    let offer = remote.channel.offer();
+                    let typed = crate::modules::contract::ModuleUnavailable {
+                        module_id: offer.module_id.clone(),
+                        module_version: offer.package_version.clone(),
+                        role: offer.role,
+                        stage: crate::modules::contract::Stage::Decode,
+                        cause: crate::modules::contract::Cause::Malformed,
+                        instance: Some(offer.instance),
+                        retry_after_ms: None,
+                    };
+                    remote.fault = Some(typed.to_string());
+                    remote.unavailable = Some(typed);
+                    self.state.lock().expect("session lock").invalidate();
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "module reply ill-typed",
+                    ))
+                }
+            },
             Outcome::Error(error) => Err(io::Error::other(match error.unavailable {
                 Some(unavailable) => {
                     // The module's provider failed: a typed fault that retires this generation.

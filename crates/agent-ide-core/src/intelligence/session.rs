@@ -823,6 +823,45 @@ impl Session {
         *self.state.lock().expect("session lock").readiness.borrow()
     }
 
+    /// Whether this session's profile has a provider status barrier.
+    pub fn has_status_barrier(&self) -> bool {
+        self.settings.profile().status_method().is_some()
+    }
+
+    /// The module form of the readiness barrier: the readiness a bundled module reported for its
+    /// hosted provider becomes this session's barrier state (ready, workspace error, or unknown
+    /// while it warms).
+    pub(crate) fn record_module_readiness(&self, readiness: crate::modules::contract::Readiness) {
+        use crate::modules::contract::Readiness;
+        let state = match readiness {
+            Readiness::Ready => ProviderReadiness(ReadinessState::Ready),
+            Readiness::Degraded => ProviderReadiness(ReadinessState::WorkspaceError),
+            Readiness::Warming | Readiness::Unavailable => UNKNOWN_READINESS,
+        };
+        self.state
+            .lock()
+            .expect("session lock")
+            .readiness
+            .send_replace(state);
+    }
+
+    /// The readiness of this provider for a module reply: its status barrier's state, or ready
+    /// when its profile has none.
+    pub fn module_readiness_of(&self) -> crate::modules::contract::Readiness {
+        use crate::modules::contract::Readiness;
+        if !self.has_status_barrier() {
+            return Readiness::Ready;
+        }
+        let readiness = self.provider_readiness();
+        if readiness.is_ready() {
+            Readiness::Ready
+        } else if readiness.is_workspace_error() {
+            Readiness::Degraded
+        } else {
+            Readiness::Warming
+        }
+    }
+
     /// Returns only capabilities observed during this connection's successful handshake.
     pub fn capabilities(&self) -> &ProviderCapabilities {
         self.capabilities.as_ref().expect("initialized session")

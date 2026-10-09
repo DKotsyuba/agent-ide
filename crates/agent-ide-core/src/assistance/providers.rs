@@ -698,22 +698,31 @@ impl Worker<'_> {
             Err(ReadinessError::Gone) => {
                 let cancelled = *job.cancel.borrow();
                 let mut backend = self.providers.take_backend(index)?;
-                backend.release_live(self, &binding).await;
+                // A module-hosted session keeps its typed fault: named here, and left dead for the
+                // backend's next ensure, which counts the failed instance once against the shared
+                // restart policy and releases it; any other gone session is released now.
+                let module_fault = backend
+                    .live_session(&binding)
+                    .and_then(|live| live.module_unavailable());
+                if module_fault.is_none() {
+                    backend.release_live(self, &binding).await;
+                }
                 self.providers.put_backend(index, backend);
                 if cancelled {
                     return Err(FailureCode::Cancelled);
                 }
                 self.providers.note_session_fault();
-                job.set_stage_failure(
-                    &FailureCode::ProviderUnavailable,
-                    &format!(
+                let stage = match module_fault {
+                    Some(fault) => format!("{}: {fault}", server.language()),
+                    None => format!(
                         "{}: transport gone{}",
                         server.name(),
                         session_fallback_clause(
                             server.language().support().outline_while_loading()
                         )
                     ),
-                );
+                };
+                job.set_stage_failure(&FailureCode::ProviderUnavailable, &stage);
                 return Err(FailureCode::ProviderUnavailable);
             }
         }

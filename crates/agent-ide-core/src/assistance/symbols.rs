@@ -866,23 +866,18 @@ impl Worker<'_> {
             // section a live session would answer says why it is missing instead of failing the
             // whole call — outline and read answer from source in exactly this state. A
             // language with name facts shows index-backed usages instead (below).
+            // A language module's typed failure is named as such; a real workspace-load failure
+            // keeps its phrase.
+            let why = module_stage(job)
+                .unwrap_or_else(|| format!("{} workspace failed to load", server.name()));
             if want_usages && outline.language.names().is_none() {
-                card.usages_note = Some(format!(
-                    "unavailable ({} workspace failed to load)",
-                    server.name()
-                ));
+                card.usages_note = Some(format!("unavailable ({why})"));
             }
             if callers_depth > 0 {
-                card.callers_note = Some(format!(
-                    "unavailable ({} workspace failed to load)",
-                    server.name()
-                ));
+                card.callers_note = Some(format!("unavailable ({why})"));
             }
             if callees_depth > 0 {
-                card.callees_note = Some(format!(
-                    "unavailable ({} workspace failed to load)",
-                    server.name()
-                ));
+                card.callees_note = Some(format!("unavailable ({why})"));
             }
         } else {
             let byte_offset = name_offset(source, &found)?;
@@ -901,9 +896,9 @@ impl Worker<'_> {
                 Err(FailureCode::ProviderUnavailable) if exchange => None,
                 Err(code) => return Err(code),
             };
-            let mut degraded = live
-                .is_none()
-                .then(|| "workspace failed to load".to_owned());
+            let mut degraded = live.is_none().then(|| {
+                module_stage(job).unwrap_or_else(|| "workspace failed to load".to_owned())
+            });
             let mut references: Option<Vec<async_lsp::lsp_types::Location>> = None;
             if let Some(live) = live {
                 if let Ok(Some(hover)) = live.session.hover(&observed, &bytes, byte_offset).await {
@@ -2348,6 +2343,37 @@ pub(super) fn module_failure(
 ) -> FailureCode {
     job.set_stage_failure(&FailureCode::ProviderUnavailable, &failure.to_string());
     FailureCode::ProviderUnavailable
+}
+
+/// The typed language-module failure a job's stage names (`<language>: module_unavailable (…)`,
+/// as a backend records it), if its failure was one.
+fn module_stage(job: &Job) -> Option<String> {
+    module_stage_of(job.failure_detail.as_deref()?)
+}
+
+/// [`module_stage`] of one failure detail (`<default stage> (<stage>)`).
+fn module_stage_of(detail: &str) -> Option<String> {
+    let (_, stage) = detail.split_once(" (")?;
+    let stage = stage.strip_suffix(')')?;
+    stage
+        .contains("module_unavailable (")
+        .then(|| stage.to_owned())
+}
+
+/// A module's typed failure is named from the job's stage; any other stage names none.
+#[test]
+fn module_failures_name_their_stage() {
+    assert_eq!(
+        module_stage_of(
+            "ide.symbol:provider_unavailable (alpha: module_unavailable (bundled.alpha:request:exited))"
+        )
+        .as_deref(),
+        Some("alpha: module_unavailable (bundled.alpha:request:exited)")
+    );
+    assert_eq!(
+        module_stage_of("ide.symbol:provider_unavailable (alpha-server: workspace load failed)"),
+        None
+    );
 }
 
 /// The bounded first line of a failed documentSymbols exchange, for the outline footer.
