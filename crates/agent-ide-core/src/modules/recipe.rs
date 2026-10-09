@@ -312,14 +312,17 @@ pub fn declared(id: &str) -> &'static [EffectRecipe] {
 }
 
 /// The platform developer directories the core resolves itself for [`PathRole::DeveloperDir`]:
-/// the selected developer directory (the target of `/private/var/db/xcode_select_link`, what
-/// `xcode-select -p` reports, and the link itself), the Command Line Tools and the default Xcode
+/// the daemon's `DEVELOPER_DIR` (which `xcode-select` honours), the selected developer directory
+/// (the target of `/private/var/db/xcode_select_link`, what `xcode-select -p` reports, and the
+/// link itself), the Command Line Tools and the default Xcode
 /// developer directory — each only when it exists.
 pub fn platform_developer_dirs() -> Vec<PathBuf> {
     let link = Path::new("/private/var/db/xcode_select_link");
-    let mut dirs: Vec<PathBuf> = std::fs::canonicalize(link)
-        .ok()
+    let mut dirs: Vec<PathBuf> = std::env::var_os("DEVELOPER_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
         .into_iter()
+        .chain(std::fs::canonicalize(link).ok())
         .chain([
             link.to_path_buf(),
             PathBuf::from("/Library/Developer/CommandLineTools"),
