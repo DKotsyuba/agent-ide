@@ -429,7 +429,7 @@ async fn rust_module_and_in_process_transcripts_are_equal() {
     let masked = |replies: &[String]| {
         replies
             .iter()
-            .map(|reply| mask_text_refs(&mask_counters(&mask_seconds(reply))))
+            .map(|reply| mask_run_variance(&mask_text_refs(&mask_counters(&mask_seconds(reply)))))
             .collect::<Vec<_>>()
     };
     let (local, moduled) = (masked(&local), masked(&moduled));
@@ -1024,6 +1024,37 @@ fn mask_text_refs(text: &str) -> String {
     }
 }
 
+/// `text` with what legitimately varies between two runs written as a placeholder: the project
+/// check's duration in an edit reply (`project check 0.1s:`) and the card line naming where Rust
+/// computes (`modules: rust module` / `rust in process (fallback)`, the switch under test).
+/// Everything else, diagnostics included, stays byte-compared.
+fn mask_run_variance(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        if line == "modules: rust module" || line == "modules: rust in process (fallback)" {
+            out.push("modules: rust <mode>".to_owned());
+            continue;
+        }
+        let mut masked = String::with_capacity(line.len());
+        let mut rest = line;
+        while let Some(at) = rest.find("project check ") {
+            masked.push_str(&rest[..at + 14]);
+            rest = &rest[at + 14..];
+            let seconds = rest
+                .bytes()
+                .take_while(|byte| byte.is_ascii_digit() || *byte == b'.')
+                .count();
+            if seconds > 0 && rest[seconds..].starts_with("s:") {
+                masked.push_str("<seconds>");
+                rest = &rest[seconds..];
+            }
+        }
+        masked.push_str(rest);
+        out.push(masked);
+    }
+    out.join("\n")
+}
+
 /// `text` with the per-daemon observation counters of a context reply masked (`source_sequence:`
 /// and `document_version:`): they count every observation of the run, and the readiness wait
 /// polls a variable number of times. Everything else stays byte-compared.
@@ -1543,5 +1574,29 @@ fn prose_references_are_masked_and_nothing_else() {
         format!(
             "edit: unchanged; source_ref <ref>; Next: use ide.edit with source_ref <ref>\ndigest {other}"
         )
+    );
+}
+
+/// Only the check duration and the serving-path card line are masked; diagnostics and the rest
+/// of a reply stay.
+#[test]
+fn run_variance_is_masked_and_nothing_else() {
+    let module = "edit: inserted; diagnostics: current_reported (project check 0.1s: 0 new errors)\nmodules: rust module\nfeedback_delta: none";
+    let local = "edit: inserted; diagnostics: current_reported (project check 0.0s: 0 new errors)\nmodules: rust in process (fallback)\nfeedback_delta: none";
+    assert_eq!(mask_run_variance(module), mask_run_variance(local));
+    assert_ne!(
+        mask_run_variance("diagnostics_freshness: Provisional\ndiagnostic_count: 0"),
+        mask_run_variance("diagnostics_freshness: unknown\ndiagnostic_count: unknown"),
+        "diagnostic knowledge stays compared"
+    );
+    assert_ne!(
+        mask_run_variance("project check 0.1s: 1 new errors"),
+        mask_run_variance("project check 0.1s: 0 new errors"),
+        "counts stay"
+    );
+    assert_ne!(
+        mask_run_variance("modules: python module"),
+        mask_run_variance("modules: rust module"),
+        "only Rust's own line is the switch under test"
     );
 }

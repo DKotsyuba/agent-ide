@@ -726,6 +726,13 @@ impl ProviderBuilder for RustBuilder {
         };
         Ok((ProviderSettings::new(profile), plan))
     }
+
+    /// Only the whole-file read (the post-edit diagnostic read) waits for rust-analyzer's
+    /// diagnostics, exactly as the in-process backend's context exchange does; a symbol context
+    /// answers at once with whatever the provider has published.
+    fn waits_for_diagnostics(&self, whole_file: bool) -> bool {
+        whole_file
+    }
 }
 
 /// The Rust module: a language server (analyzer) or checker wrapped around the host's
@@ -946,6 +953,13 @@ mod tests {
             Outcome::Result(value) => decode(value).unwrap(),
             Outcome::Error(error) => panic!("{capability:?}: {error:?}"),
         }
+    }
+
+    /// Like the in-process context exchange, only the whole-file read waits for diagnostics.
+    #[test]
+    fn only_the_whole_file_context_waits_for_diagnostics() {
+        assert!(RustBuilder.waits_for_diagnostics(true));
+        assert!(!RustBuilder.waits_for_diagnostics(false));
     }
 
     /// The role decides what is supported; everything else is declared unsupported.
