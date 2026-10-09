@@ -7,6 +7,10 @@
 //! * A class or id-list value holding template placeholders (`{{ }}`, `{% %}`, `<%= %>`, `${ }`)
 //!   makes its other tokens heuristic (`template`); a token touching a placeholder, and a
 //!   single-id value holding one, yield no fact.
+//! * `<script src>` and `<link href>` use the local file they spell (`file-ref/v1`): a relative
+//!   URL, query and fragment dropped, percent escapes decoded, joined to the document's directory.
+//!   Absolute and network URLs, templated values and every reference of a document with a
+//!   `<base href>` name nothing.
 //! * Minified documents (`*.min.*`, or an average line over 2 000 bytes) are skipped.
 
 use std::{ops::Range, path::Path};
@@ -39,12 +43,22 @@ const COVERAGE: &[NamespaceCoverage] = &[
         defines: true,
         uses: true,
     },
+    NamespaceCoverage {
+        namespace: ns::FILE_REF,
+        defines: false,
+        uses: true,
+    },
 ];
 
 impl NameFacts for HtmlFacts {
-    /// Classes (use) and element ids (define and use).
+    /// Classes (use), element ids (define and use) and file references (use).
     fn coverage(&self) -> &'static [NamespaceCoverage] {
         COVERAGE
+    }
+
+    /// `2`: `<script src>` and `<link href>` file references.
+    fn revision(&self) -> &'static str {
+        "2"
     }
 
     /// Facts of one document (see the module docs).
@@ -60,9 +74,11 @@ impl NameFacts for HtmlFacts {
         }
         let document = Document::parse(source);
         let mut facts = Facts {
+            file,
             document: &document,
             sink,
             full: false,
+            references: !has_base(&document.elements),
         };
         facts.elements(&document.elements);
         FileVerdict::Indexed
@@ -71,18 +87,27 @@ impl NameFacts for HtmlFacts {
 
 /// One extraction pass.
 struct Facts<'a, 's> {
+    /// The worktree-relative document path.
+    file: &'a Path,
     /// The parsed document.
     document: &'a Document<'s>,
     /// Where facts go.
     sink: &'a mut FactSink,
     /// The sink refused a fact; stop emitting.
     full: bool,
+    /// File references may be read (no `<base href>` rebases the document's URLs).
+    references: bool,
 }
 
 impl Facts<'_, '_> {
     /// Facts of `elements` and their descendants, in document order.
     fn elements(&mut self, elements: &[Element]) {
         for element in elements {
+            match element.tag.as_str() {
+                "script" if self.references => self.file_ref(element.attribute("src")),
+                "link" if self.references => self.file_ref(element.attribute("href")),
+                _ => {}
+            }
             for attribute in &element.attributes {
                 let Some(value) = &attribute.value else {
                     continue;
@@ -142,6 +167,25 @@ impl Facts<'_, '_> {
         self.emit(ns::ELEMENT_ID, &decode(name), at, role, Certainty::Exact);
     }
 
+    /// A use of the local file a `src`/`href` value spells, positioned at the value.
+    fn file_ref(&mut self, value: Option<&Range<usize>>) {
+        let Some(value) = value else { return };
+        let raw = &self.document.text[value.clone()];
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || !placeholders(trimmed).is_empty() {
+            return;
+        }
+        let decoded = decode(trimmed);
+        let url = decoded.split(['?', '#']).next().unwrap_or("");
+        let Some(path) = percent_decoded(url)
+            .and_then(|path| agent_ide_core::lang::names::relative_reference(self.file, &path))
+        else {
+            return;
+        };
+        let at = value.start + (raw.len() - raw.trim_start().len());
+        self.emit(ns::FILE_REF, &path, at, Role::Use, Certainty::Exact);
+    }
+
     /// Pushes one global fact positioned at byte `at`, until the sink is full.
     fn emit(
         &mut self,
@@ -163,6 +207,37 @@ impl Facts<'_, '_> {
             certainty,
         });
     }
+}
+
+/// Whether any element is a `<base href>`, which rebases every relative URL of the document.
+fn has_base(elements: &[Element]) -> bool {
+    elements.iter().any(|element| {
+        (element.tag == "base" && element.attribute("href").is_some())
+            || has_base(&element.children)
+    })
+}
+
+/// `url` with its percent escapes decoded; `None` for a malformed or non-UTF-8 escape sequence
+/// and for an escaped path separator (`%2F`, `%5C`), which does not separate path segments.
+fn percent_decoded(url: &str) -> Option<String> {
+    let bytes = url.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%' {
+            let hex = url.get(at + 1..at + 3)?;
+            let byte = u8::from_str_radix(hex, 16).ok()?;
+            if matches!(byte, b'/' | b'\\') {
+                return None;
+            }
+            out.push(byte);
+            at += 3;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Byte spans of template placeholders in `raw`; an unclosed one runs to the end.
@@ -315,5 +390,39 @@ mod tests {
             facts("a.html", &"<p class=a>".repeat(300)).0,
             FileVerdict::Skipped("minified")
         );
+    }
+
+    /// `<script src>` and `<link href>` use the local file they spell: query and fragment drop,
+    /// escapes decode and the path joins the document's directory; absolute, network, data,
+    /// templated, escaping and escaped-separator URLs name nothing, and neither do anchors.
+    #[test]
+    fn local_scripts_and_styles_are_file_references() {
+        let (_, rows) = facts(
+            "web/pages/index.html",
+            "<link rel=stylesheet href=\"../css/site.css?v=2#top\">\n\
+             <script src='./app%20main.js'></script>\n\
+             <script src=\"https://cdn.example/x.js\"></script><script src=\"/root.js\"></script>\n\
+             <script src=\"data:text/javascript,1\"></script><script src=\"{{ asset }}\"></script>\n\
+             <script src=\"../../../outside.js\"></script><script src=\"a%2Fb.js\"></script>\n\
+             <link rel=icon href=\"#frag\"><script>var src;</script><script src=\"\"></script>\n",
+        );
+        assert_eq!(
+            rows,
+            [
+                row("file-ref/v1", "web/css/site.css", Role::Use, 1, 28),
+                row("file-ref/v1", "web/pages/app main.js", Role::Use, 2, 14),
+                row("id/v1", "frag", Role::Use, 6, 22),
+            ]
+        );
+    }
+
+    /// A `<base href>` rebases every relative URL, so no file reference is named.
+    #[test]
+    fn a_base_element_voids_file_references() {
+        let (_, rows) = facts(
+            "index.html",
+            "<head><base href=\"/sub/\"><script src=\"a.js\"></script></head>",
+        );
+        assert!(rows.is_empty());
     }
 }

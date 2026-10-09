@@ -1902,7 +1902,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedInput<R> {
 
 /// Sessions whose provider is hosted by a bundled module.
 #[path = "module_remote.rs"]
-mod module_remote;
+pub(crate) mod module_remote;
 
 #[cfg(test)]
 #[path = "session_tests.rs"]

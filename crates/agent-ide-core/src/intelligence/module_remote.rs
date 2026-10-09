@@ -205,6 +205,13 @@ impl LiveSession {
     }
 }
 
+/// The error text of a request a module's live provider failed (`ErrorCode::Failed`):
+/// `module_failed (<module>:provider:failed)`. A closed code, never the module's own message, and
+/// never a `module_unavailable`: the module is not retired.
+pub(crate) fn module_failed(module_id: &crate::modules::contract::ModuleId) -> String {
+    format!("module_failed ({module_id}:provider:failed)")
+}
+
 impl Session {
     /// Whether this session's provider is hosted by a bundled module.
     pub fn is_module(&self) -> bool {
@@ -380,26 +387,8 @@ impl Session {
         match reply.outcome {
             Outcome::Result(value) => match decode(value) {
                 Ok(value) => Ok(value),
-                Err(_) => {
-                    // A well-framed but ill-typed result is the module's typed fault.
-                    let offer = remote.channel.offer();
-                    let typed = crate::modules::contract::ModuleUnavailable {
-                        module_id: offer.module_id.clone(),
-                        module_version: offer.package_version.clone(),
-                        role: offer.role,
-                        stage: crate::modules::contract::Stage::Decode,
-                        cause: crate::modules::contract::Cause::Malformed,
-                        instance: Some(offer.instance),
-                        retry_after_ms: None,
-                    };
-                    remote.fault = Some(typed.to_string());
-                    remote.unavailable = Some(typed);
-                    self.state.lock().expect("session lock").invalidate();
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "module reply ill-typed",
-                    ))
-                }
+                // A well-framed but ill-typed result is the module's typed fault.
+                Err(_) => Err(self.retire_malformed("module reply ill-typed")),
             },
             Outcome::Error(error) => Err(io::Error::other(match error.unavailable {
                 Some(unavailable) => {
@@ -420,9 +409,34 @@ impl Session {
                     self.state.lock().expect("session lock").invalidate();
                     fault
                 }
+                // A live provider failed this one request: attributed to the module, which keeps
+                // serving (no fault recorded, the generation stays live).
+                None if error.code == crate::modules::contract::ErrorCode::Failed => {
+                    module_failed(&remote.channel.offer().module_id)
+                }
                 None => format!("module refused: {:?}", error.code),
             })),
         }
+    }
+
+    /// Retires this session's module with the typed `decode`/`malformed` fault for a well-framed
+    /// answer the core cannot use, and returns the request's error naming `what`.
+    fn retire_malformed(&mut self, what: &str) -> io::Error {
+        let remote = self.module.as_mut().expect("a module session");
+        let offer = remote.channel.offer();
+        let typed = crate::modules::contract::ModuleUnavailable {
+            module_id: offer.module_id.clone(),
+            module_version: offer.package_version.clone(),
+            role: offer.role,
+            stage: crate::modules::contract::Stage::Decode,
+            cause: crate::modules::contract::Cause::Malformed,
+            instance: Some(offer.instance),
+            retry_after_ms: None,
+        };
+        remote.fault = Some(typed.to_string());
+        remote.unavailable = Some(typed);
+        self.state.lock().expect("session lock").invalidate();
+        io::Error::new(io::ErrorKind::InvalidData, what.to_owned())
     }
 
     /// A file's exact text for location conversion: the request's own text for its file, else a
@@ -809,8 +823,8 @@ impl Session {
             ContextQuery::Symbol { byte_offset } => Some(byte_offset as u64),
             ContextQuery::File => None,
         };
-        let reply: io::Result<ContextEvidence> = self
-            .module_call(
+        let reply: io::Result<ContextEvidence> = match self
+            .module_call::<ContextEvidence>(
                 Capability::Semantic,
                 encode(&SemanticQuery::Context {
                     source,
@@ -819,16 +833,21 @@ impl Session {
                 attachments,
             )
             .await
-            .and_then(|evidence: ContextEvidence| {
-                let encoding = encoding_of(&evidence.position_encoding).ok_or_else(|| {
-                    context::invalid("module reported an unsupported position encoding")
-                })?;
-                // Every later conversion, of this reply first, uses the provider's encoding.
-                if let Some(capabilities) = &mut self.capabilities {
-                    capabilities.position_encoding = encoding;
+        {
+            Ok(evidence) => match encoding_of(&evidence.position_encoding) {
+                Some(encoding) => {
+                    // Every later conversion, of this reply first, uses the provider's encoding.
+                    if let Some(capabilities) = &mut self.capabilities {
+                        capabilities.position_encoding = encoding;
+                    }
+                    Ok(evidence)
                 }
-                Ok(evidence)
-            });
+                // An encoding the core cannot convert in is an ill-typed answer: the module's
+                // typed fault, never a silent lexical reply from a live module.
+                None => Err(self.retire_malformed("module reported an unknown position encoding")),
+            },
+            Err(error) => Err(error),
+        };
         let own = Some(Own {
             path: observation.path(),
             revision: observation.source_revision().as_str(),

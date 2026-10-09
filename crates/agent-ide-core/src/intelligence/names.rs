@@ -57,6 +57,9 @@ pub const MAX_CACHED_ENTRIES: usize = 2 * MAX_INDEXED_FILES;
 /// Facts the daemon-level fact cache keeps. Live indexes share the cached facts, so this bounds
 /// the memory of every worktree index together (about 12 MB per 500 000 facts).
 pub const MAX_CACHED_FACTS: usize = 2 * MAX_FACTS_PER_WORKTREE;
+/// Files of any language the index remembers from a listing, the targets file references can
+/// reach; references into a listing cut at this bound reach nothing.
+pub const MAX_KNOWN_FILES: usize = 200_000;
 /// Directories the fallback walk visits at most.
 const WALK_MAX_DIRECTORIES: usize = 10_000;
 /// Skip reason of a file whose facts would pass [`MAX_FACTS_PER_WORKTREE`].
@@ -102,6 +105,15 @@ pub struct Site {
     pub fact: NameFact,
 }
 
+/// The file a `file-ref/v1` fact reaches, with the assumption that reached it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileTarget {
+    /// Worktree-relative file.
+    pub file: PathBuf,
+    /// Exact when the reference spells the file; the probe's assumption otherwise.
+    pub certainty: crate::lang::names::Certainty,
+}
+
 /// A site with the text of its line, read and verified for display.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShownSite {
@@ -145,23 +157,29 @@ pub enum ContentKey {
     Digest([u8; 32]),
 }
 
-/// Key of one cached extraction: the language, its extractor revision and the content.
+/// Key of one cached extraction: the language, its extractor revision, the worktree-relative path
+/// and the content. The path is part of the key because facts depend on it (a CSS module's class
+/// domain is its path, a file reference joins the path's directory): identical bytes at two paths
+/// are two extractions.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CacheKey {
     /// Language identifier.
     language: &'static str,
     /// [`NameFacts::revision`](crate::lang::names::NameFacts::revision) of its provider.
     revision: &'static str,
+    /// The worktree-relative path the facts were extracted as.
+    path: PathBuf,
     /// The content.
     content: ContentKey,
 }
 
 impl CacheKey {
-    /// The key of `content` in `language`'s current extractor.
-    fn of(language: Language, content: ContentKey) -> Option<Self> {
+    /// The key of `content` at `path` in `language`'s current extractor.
+    fn of(language: Language, path: &Path, content: ContentKey) -> Option<Self> {
         Some(Self {
             language: language.name(),
             revision: language.names()?.revision(),
+            path: path.to_path_buf(),
             content,
         })
     }
@@ -327,6 +345,8 @@ pub struct NameIndex {
     facts: usize,
     /// Registered languages seen by the last listing, with or without a provider.
     present: BTreeSet<Language>,
+    /// Every file of the last listing (any language), the targets of file references.
+    known: HashSet<PathBuf>,
     /// The unfinished sweep, if any.
     sweep: Option<Sweep>,
     /// Files the last refresh read (0 when nothing changed or everything came from the cache).
@@ -354,6 +374,7 @@ impl NameIndex {
             postings: BTreeMap::new(),
             facts: 0,
             present: BTreeSet::new(),
+            known: HashSet::new(),
             sweep: None,
             reread: 0,
             reused: 0,
@@ -443,13 +464,79 @@ impl NameIndex {
             .collect()
     }
 
+    /// The file the `file-ref/v1` reference `key` (written in a file of `language`) reaches in
+    /// the last listing: the file it spells, else the first file `language`'s probe reaches. A
+    /// reference into a directory, a missing file or a listing cut at [`MAX_KNOWN_FILES`] reaches
+    /// nothing.
+    pub fn file_target(&self, language: Language, key: &NameKey) -> Option<FileTarget> {
+        if !key.namespace.path_keys() {
+            return None;
+        }
+        let probe = language
+            .names()
+            .map_or(&crate::lang::names::FileProbe::EXACT, |names| {
+                names.file_probe()
+            });
+        let (name, reason) = probe.reach(&key.name, |path| self.known.contains(Path::new(path)))?;
+        Some(FileTarget {
+            file: PathBuf::from(name),
+            certainty: reason.map_or(
+                crate::lang::names::Certainty::Exact,
+                crate::lang::names::Certainty::Heuristic,
+            ),
+        })
+    }
+
+    /// Definitions of `key` proven against current bytes, for display: the sites that define it,
+    /// or, for a file reference written in `language`, the file it reaches (first line shown; a
+    /// target that can no longer be read is dropped). At most `limit`.
+    pub fn proven_definitions(
+        &mut self,
+        language: Language,
+        key: &NameKey,
+        limit: usize,
+    ) -> Proven {
+        if !key.namespace.path_keys() {
+            return self.proven_sites(key, Some(Role::Define), limit);
+        }
+        let mut proven = Proven::default();
+        let Some(target) = self.file_target(language, key) else {
+            return proven;
+        };
+        match self.read(&target.file) {
+            Some(bytes) if limit > 0 => {
+                let text = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]).into_owned();
+                proven.sites.push(ShownSite {
+                    text: crate::lang::render::line_text(&text, 1),
+                    site: Site {
+                        language: Language::for_path(&target.file).unwrap_or(language),
+                        fact: NameFact {
+                            key: key.clone(),
+                            role: Role::Define,
+                            line: 1,
+                            column: 1,
+                            certainty: target.certainty,
+                        },
+                        file: target.file,
+                    },
+                });
+            }
+            Some(_) => proven.more = 1,
+            None => proven.dropped = 1,
+        }
+        proven
+    }
+
     /// Indexed keys spelled `name` in every domain, optionally in one namespace, in key order.
     ///
     /// ponytail: scans every distinct key; a name-to-keys map when key counts make this slow.
     pub fn keys_named(&self, name: &str, only: Option<Namespace>) -> Vec<KeySummary> {
         self.postings
             .iter()
-            .filter(|(key, _)| &*key.name == name && only.is_none_or(|ns| key.namespace == ns))
+            .filter(|(key, _)| {
+                &*key.name == name
+                    && only.map_or(!key.namespace.path_keys(), |ns| key.namespace == ns)
+            })
             .map(|(key, files)| {
                 let (mut defines, mut uses) = (0, 0);
                 for fact in files
@@ -655,8 +742,12 @@ impl NameIndex {
         let listed = git_candidates(root)
             .unwrap_or_else(|| walk(root).into_iter().map(|path| (path, None)).collect());
         self.present.clear();
+        self.known.clear();
         let mut candidates = Vec::new();
         for (path, blob) in listed {
+            if self.known.len() < MAX_KNOWN_FILES {
+                self.known.insert(path.clone());
+            }
             let Some(language) = Language::for_path(&path) else {
                 continue;
             };
@@ -693,7 +784,7 @@ impl NameIndex {
             {
                 return;
             }
-            let key = CacheKey::of(language, content.clone());
+            let key = CacheKey::of(language, path, content.clone());
             let cached = key.and_then(|key| self.cache.lock().ok()?.get(&key));
             if let Some(extracted) = cached {
                 self.reused += 1;
@@ -719,7 +810,7 @@ impl NameIndex {
             // worktrees skip it without a stat.
             let extracted = skipped("large");
             if let Some(content) = &content
-                && let Some(key) = CacheKey::of(language, content.clone())
+                && let Some(key) = CacheKey::of(language, path, content.clone())
                 && let Ok(mut cache) = self.cache.lock()
             {
                 cache.insert(key, extracted.clone());
@@ -759,7 +850,7 @@ impl NameIndex {
             entry.stamp = stamp;
             if let Some(content) = content {
                 // Same bytes, newly known by their blob: other worktrees may reuse them.
-                if let Some(key) = CacheKey::of(language, content.clone())
+                if let Some(key) = CacheKey::of(language, path, content.clone())
                     && let Ok(mut cache) = self.cache.lock()
                 {
                     cache.insert(key, entry.extracted.clone());
@@ -769,7 +860,7 @@ impl NameIndex {
             return;
         }
         let content = content.unwrap_or(ContentKey::Digest(digest));
-        let Some(key) = CacheKey::of(language, content.clone()) else {
+        let Some(key) = CacheKey::of(language, path, content.clone()) else {
             return self.remove(path);
         };
         let cached = self.cache.lock().ok().and_then(|mut cache| cache.get(&key));
@@ -1461,7 +1552,7 @@ mod tests {
     fn fact_cache_keys_by_revision_and_evicts_unreferenced_first() {
         testing::install();
         let content = ContentKey::GitBlob("abc".into());
-        let key = CacheKey::of(ALPHA, content.clone()).unwrap();
+        let key = CacheKey::of(ALPHA, Path::new("a.alpha"), content.clone()).unwrap();
         assert_eq!(key.revision, "1");
         let mut cache = FactCache {
             max_entries: 2,
@@ -1701,5 +1792,109 @@ mod tests {
         assert!(cold < Duration::from_secs(5), "cold build {cold:?}");
         assert!(warm <= WARM_REFRESH_TARGET, "warm refresh {warm:?}");
         assert_eq!(index.keys_named("shared", None)[0].files, 10_000);
+    }
+
+    /// A file reference reaches the file it spells, else the first file its language's probe
+    /// reaches (labelled), and nothing for a directory, a miss or an exact-only language; an
+    /// edit or deletion of the target changes or removes the edge on the next query.
+    #[test]
+    fn file_references_reach_files_through_the_probe() {
+        let root = scratch("file-refs");
+        write(
+            &root,
+            &[
+                (
+                    "src/b.beta",
+                    "ref:src/target ref:src/dir ref:src/old.a ref:src/exact.alpha ref:src/gone ref:src/dir.alpha\n",
+                ),
+                ("src/target.alpha", "@target\n"),
+                ("src/dir/index.alpha", "@dir\n"),
+                ("src/old.alpha", "@old\n"),
+                ("src/exact.alpha", "@exact\n"),
+                ("src/dir.alpha", "@dirfile\n"),
+                ("src/data.txt", "not a language\n"),
+            ],
+        );
+        let mut index = built(&root);
+        let key = |name: &str| NameKey::global(ns::FILE_REF, name);
+        let reach = |index: &NameIndex, name: &str| {
+            index
+                .file_target(BETA, &key(name))
+                .map(|target| (target.file.display().to_string(), target.certainty))
+        };
+        let probed = |reason| Certainty::Heuristic(reason);
+        assert_eq!(
+            reach(&index, "src/target"),
+            Some(("src/target.alpha".into(), probed("extension probe")))
+        );
+        assert_eq!(
+            reach(&index, "src/dir"),
+            Some(("src/dir.alpha".into(), probed("extension probe")))
+        );
+        assert_eq!(
+            reach(&index, "src/old.a"),
+            Some(("src/old.alpha".into(), probed("extension swap")))
+        );
+        assert_eq!(
+            reach(&index, "src/exact.alpha"),
+            Some(("src/exact.alpha".into(), Certainty::Exact))
+        );
+        assert_eq!(reach(&index, "src/gone"), None);
+        assert_eq!(reach(&index, "src/data.txt"), None);
+        // An exact-only language never probes, and a class key is no file reference.
+        assert_eq!(index.file_target(ALPHA, &key("src/target")), None);
+        assert_eq!(
+            index.file_target(BETA, &NameKey::global(ns::CLASS, "src/target")),
+            None
+        );
+
+        // The displayed definition is the target's first line, read now.
+        let shown = index.proven_definitions(BETA, &key("src/target"), 2);
+        assert_eq!(shown.sites.len(), 1);
+        assert_eq!(shown.sites[0].text, "@target");
+        assert_eq!(shown.sites[0].site.language, ALPHA);
+
+        // Invalidation: an edit changes the shown line, a deletion removes the edge.
+        write(&root, &[("src/target.alpha", "@renamed\n")]);
+        assert_eq!(
+            index.proven_definitions(BETA, &key("src/target"), 2).sites[0].text,
+            "@renamed"
+        );
+        std::fs::remove_file(root.join("src/target.alpha")).unwrap();
+        assert_eq!(index.refresh(far()), IndexState::Ready);
+        assert_eq!(reach(&index, "src/target"), None);
+        assert!(
+            index
+                .proven_definitions(BETA, &key("src/target"), 2)
+                .sites
+                .is_empty()
+        );
+    }
+
+    /// File-reference keys never answer a bare-name lookup (a path is not a symbol name) unless
+    /// the lookup names the namespace.
+    #[test]
+    fn file_reference_keys_stay_out_of_bare_name_lookups() {
+        let root = scratch("file-ref-names");
+        write(&root, &[("b.beta", "ref:thing use:thing\n")]);
+        let index = built(&root);
+        let named = index.keys_named("thing", None);
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].key.namespace, ns::CLASS);
+        assert_eq!(index.keys_named("thing", Some(ns::FILE_REF)).len(), 1);
+    }
+
+    /// Identical bytes at different paths are different extractions: the cache key carries the
+    /// path (a CSS module's class domain, a file reference's directory depend on it).
+    #[test]
+    fn cache_keys_carry_the_path() {
+        testing::install();
+        let content = ContentKey::GitBlob("same".into());
+        let one = CacheKey::of(ALPHA, Path::new("a/x.alpha"), content.clone()).unwrap();
+        let two = CacheKey::of(ALPHA, Path::new("b/x.alpha"), content).unwrap();
+        assert_ne!(one, two);
+        let mut cache = FactCache::default();
+        cache.insert(one.clone(), skipped("one"));
+        assert!(cache.get(&one).is_some() && cache.get(&two).is_none());
     }
 }

@@ -20,9 +20,9 @@ use super::{
     payload::{
         AnalysisScopeRequest, AnalyzeSource, Anchor, AnchorBatch, AnchorCertainty, AnchorRole,
         EffectRequest, Field, FileDocRequest, FileVerdict, FormatPlanRequest, InsertSiteRequest,
-        LinkageCoverage, LinkageQuery, Location, Param, ProjectQuery, SourceAnalysis, SourceField,
-        SourceRef, SourceText, SyntaxQuery, TestFacts, TestParseRequest, TestPlanQuery, decode,
-        encode,
+        LinkageCoverage, LinkageQuery, Location, MAX_RESOLVE_CANDIDATES, Param, ProjectQuery,
+        ResolveAnswer, ResolveCandidate, SourceAnalysis, SourceField, SourceRef, SourceText,
+        SyntaxQuery, TestFacts, TestParseRequest, TestPlanQuery, decode, encode,
     },
     serve::{Answer, Effects, Incoming, ModuleServer, ServeError},
 };
@@ -323,7 +323,39 @@ impl SupportServer {
                     let text = Self::text(&source, request)?;
                     encode(&self.anchors(&source, &text).ok_or("no linkage")?)
                 }
-                LinkageQuery::Resolve(_) => return Err("resolve is not supported".into()),
+                LinkageQuery::Resolve(query) => {
+                    let names = self.language.names().ok_or("no linkage")?;
+                    let namespace = crate::lang::names::ns::ALL
+                        .into_iter()
+                        .find(|namespace| namespace.id() == query.namespace)
+                        .ok_or_else(|| format!("unknown namespace {}", query.namespace))?;
+                    let limit = (query.candidate_limit as usize).min(MAX_RESOLVE_CANDIDATES);
+                    // One more than the limit tells whether the limit cut the list.
+                    // ponytail: at the 32-candidate maximum the language itself stops, so a
+                    // longer list is not reported capped.
+                    let mut candidates =
+                        names.resolve(namespace, &query.raw_key, &query.from_path, limit + 1);
+                    let capped = candidates.len() > limit;
+                    candidates.truncate(limit);
+                    encode(&ResolveAnswer {
+                        capped,
+                        candidates: candidates
+                            .into_iter()
+                            .map(|resolution| ResolveCandidate {
+                                domain: resolution.domain,
+                                normalized_key: resolution.name,
+                                certainty: match resolution.certainty {
+                                    Certainty::Exact => AnchorCertainty::Exact,
+                                    Certainty::Heuristic(_) => AnchorCertainty::Heuristic,
+                                },
+                                evidence: match resolution.certainty {
+                                    Certainty::Exact => "exact".to_owned(),
+                                    Certainty::Heuristic(reason) => reason.to_owned(),
+                                },
+                            })
+                            .collect(),
+                    })
+                }
             },
             other => return Err(format!("{other:?} is not served by the support adapter")),
         })
@@ -471,5 +503,79 @@ mod tests {
         assert!(
             matches!(semantic.outcome, Outcome::Error(error) if error.code == ErrorCode::Unsupported)
         );
+    }
+
+    /// Linkage `resolve` answers the language's own `NameFacts::resolve` in probe order with its
+    /// certainty and evidence; a limit below the candidate count caps the list at exactly the
+    /// limit; an unknown namespace is refused.
+    #[tokio::test]
+    async fn linkage_resolve_answers_the_language_probe() {
+        use crate::modules::payload::ResolveRequest;
+        crate::lang::testing::install();
+        let (mut channel, _) = in_memory(
+            SupportServer::new(crate::lang::testing::BETA, "1.0"),
+            offer(ModuleId::bundled("beta"), "1.0", Role::Analyzer, 1),
+        )
+        .await
+        .unwrap();
+        let mut resolve = async |namespace: &str, candidate_limit| {
+            let call = Call {
+                capability: Capability::Linkage,
+                scope_key: "s".into(),
+                revision_key: "r".into(),
+                payload: encode(&LinkageQuery::Resolve(ResolveRequest {
+                    namespace: namespace.into(),
+                    raw_key: "./lib".into(),
+                    from_path: "src/a.ts".into(),
+                    source_revision: "r1".into(),
+                    config_revision: "c1".into(),
+                    candidate_limit,
+                })),
+                attachments: Vec::new(),
+            };
+            channel
+                .call(call, Duration::from_secs(5), &mut NoEffects)
+                .await
+                .unwrap()
+                .outcome
+        };
+        let Outcome::Result(value) = resolve("file-ref/v1", 32).await else {
+            panic!("resolve answers");
+        };
+        let answer: ResolveAnswer = decode(value).unwrap();
+        let rows: Vec<(&str, AnchorCertainty, &str)> = answer
+            .candidates
+            .iter()
+            .map(|c| (c.normalized_key.as_str(), c.certainty, c.evidence.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("src/lib", AnchorCertainty::Exact, "exact"),
+                (
+                    "src/lib.alpha",
+                    AnchorCertainty::Heuristic,
+                    "extension probe"
+                ),
+                (
+                    "src/lib.beta",
+                    AnchorCertainty::Heuristic,
+                    "extension probe"
+                ),
+                (
+                    "src/lib/index.alpha",
+                    AnchorCertainty::Heuristic,
+                    "index probe"
+                ),
+            ]
+        );
+        assert!(!answer.capped);
+        let Outcome::Result(value) = resolve("file-ref/v1", 2).await else {
+            panic!("resolve answers");
+        };
+        let answer: ResolveAnswer = decode(value).unwrap();
+        assert!(answer.capped);
+        assert_eq!(answer.candidates.len(), 2);
+        assert!(matches!(resolve("nope/v1", 32).await, Outcome::Error(_)));
     }
 }
