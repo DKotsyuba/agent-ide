@@ -2889,10 +2889,21 @@ impl StdioFacade {
         context: &RequestContext<RoleServer>,
         expected: Option<&str>,
     ) -> (FacadeOutcome, Resume, Option<String>) {
+        // The pair as it stood when the call arrived: when a re-establishment in flight replaces it
+        // while the call waits, the call is the first one on the replacement and says so.
+        let arrived = match &self.reconnect {
+            Some(reconnect) => Some(reconnect.current().await),
+            None => None,
+        };
         let Some((runtime_dir, attachment)) = self.current_connection().await else {
             return (FacadeOutcome::MissingHostMetadata, Resume::Fresh, None);
         };
-        let mut resume = Resume::Fresh;
+        let mut resume =
+            if arrived.is_some_and(|pair| pair != (runtime_dir.clone(), attachment.clone())) {
+                Resume::Restarted
+            } else {
+                Resume::Fresh
+            };
         // T15B restart recovery (0.10.2 single slot, kept for activations an older daemon or a
         // Codex host answered without an actor tag): after a daemon replacement, the first call
         // whose pre-hook already reached the healed daemon transparently re-runs the remembered
