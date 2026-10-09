@@ -76,6 +76,10 @@ fn synthetic(name: &str, bytes: u64, age_days: u64) -> Entry {
         worktree: None,
         lease_keys: Vec::new(),
         bytes,
+        usage: Usage {
+            own: bytes,
+            ..Usage::default()
+        },
         last_used: SystemTime::UNIX_EPOCH + DAY * 100 - DAY * age_days as u32,
         gone: false,
         complete: true,
@@ -96,10 +100,17 @@ fn select_removes_gone_and_idle_first_then_least_recently_used_until_under_budge
         gone,
     ];
     let mut claimed = Vec::new();
-    let verdicts = select(entries, DAY * 7, Some(70), now, &mut |entry| {
-        claimed.push(entry.path.clone());
-        (Fate::Removed, entry.bytes)
-    });
+    let verdicts = select(
+        entries,
+        DAY * 7,
+        Some(70),
+        now,
+        &mut |entry, freed| {
+            claimed.push(entry.path.clone());
+            (Fate::Removed, freed)
+        },
+        None,
+    );
     let decided: Vec<_> = verdicts
         .iter()
         .map(|v| (v.path.file_name().unwrap().to_str().unwrap(), v.reason))
@@ -126,13 +137,20 @@ fn select_skips_in_use_entries_and_evicts_the_next_oldest_instead() {
         synthetic("next", 50, 2),
         synthetic("newest", 50, 1),
     ];
-    let verdicts = select(entries, DAY * 7, Some(100), now, &mut |entry| {
-        if entry.path.ends_with("busy") {
-            (Fate::InUse, entry.bytes)
-        } else {
-            (Fate::Removed, entry.bytes)
-        }
-    });
+    let verdicts = select(
+        entries,
+        DAY * 7,
+        Some(100),
+        now,
+        &mut |entry, freed| {
+            if entry.path.ends_with("busy") {
+                (Fate::InUse, freed)
+            } else {
+                (Fate::Removed, freed)
+            }
+        },
+        None,
+    );
     let fates: Vec<_> = verdicts.iter().map(|v| v.fate).collect();
     assert_eq!(fates, [Fate::InUse, Fate::Removed]);
     assert!(verdicts[1].path.ends_with("next"));
@@ -147,9 +165,14 @@ fn a_paused_budget_selection_stops_once_the_would_remove_total_fits() {
         synthetic("middle", 50, 2),
         synthetic("newest", 50, 1),
     ];
-    let verdicts = select(entries, DAY * 7, Some(100), now, &mut |entry| {
-        (Fate::Paused, entry.bytes)
-    });
+    let verdicts = select(
+        entries,
+        DAY * 7,
+        Some(100),
+        now,
+        &mut |_, freed| (Fate::Paused, freed),
+        None,
+    );
     assert_eq!(verdicts.len(), 1, "{verdicts:?}");
     assert!(verdicts[0].path.ends_with("oldest"));
     assert_eq!(
@@ -164,9 +187,14 @@ fn select_never_claims_an_unreadable_entry() {
     let now = SystemTime::UNIX_EPOCH + DAY * 100;
     let mut unreadable = synthetic("unreadable", 10, 30);
     unreadable.complete = false;
-    let verdicts = select(vec![unreadable], DAY * 7, Some(0), now, &mut |_| {
-        panic!("an unreadable entry must not be claimed")
-    });
+    let verdicts = select(
+        vec![unreadable],
+        DAY * 7,
+        Some(0),
+        now,
+        &mut |_, _| panic!("an unreadable entry must not be claimed"),
+        None,
+    );
     assert_eq!(verdicts[0].fate, Fate::Unreadable);
 }
 
@@ -560,7 +588,7 @@ fn an_activation_after_the_scan_still_keeps_a_telemetry_store() {
     let locks = home.join(LOCKS_DIR);
     let (entries, _) = scan_telemetry(&home.join("telemetry"), &locks);
     let activation = Lease::acquire(&home, &worktree).expect("worktree lease");
-    let (fate, _) = claim_entry(&entries[0], &locks, SystemTime::now(), true, &|| true);
+    let (fate, _) = claim_entry(&entries[0], 0, &locks, SystemTime::now(), true, &|| true);
     assert_eq!(fate, Fate::InUse);
     assert!(store.exists());
     drop(activation);
@@ -966,4 +994,393 @@ fn a_lease_only_build_is_not_a_hint_locking_publisher() {
     let again = identity_started(&home, |_| Some(SystemTime::now() + DAY));
     assert_eq!(pids(again.classify(&processes).builds), [1]);
     assert_eq!(pids(again.hint_unsafe(&processes)), [1]);
+}
+
+/// Writes `len` bytes of non-sparse data to `path`, creating parents.
+fn big_file(path: &Path, len: usize) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, vec![0x5au8; len]).unwrap();
+}
+
+/// A check cache named by `name` holding one `unique` file of its own.
+fn sharing_cache(home: &Path, name: &str, unique: usize) -> PathBuf {
+    let worktree = home.join(format!("wt-{name}"));
+    fs::create_dir_all(&worktree).unwrap();
+    let dir = home.join("checks").join(REPO).join(worktree_key(&worktree));
+    big_file(&dir.join("digest/lang/target/unique"), unique);
+    fs::write(dir.join(MARKER_FILE_NAME), worktree.as_os_str().as_bytes()).unwrap();
+    backdate(&dir, DAY);
+    dir
+}
+
+/// Entries of the fixture family, oldest first.
+fn scanned(home: &Path) -> Vec<Entry> {
+    let (mut entries, complete) = scan_checks(&home.join("checks"), &home.join(LOCKS_DIR));
+    assert!(complete);
+    entries.sort_by_key(|entry| entry.last_used);
+    entries
+}
+
+/// Three caches, two of which hold hard links to one large file. The budget counts the file once,
+/// removing the first sharer frees only what no survivor holds, and the last sharer then frees the
+/// file with it.
+#[test]
+fn hard_links_are_charged_once_and_a_removal_frees_only_what_no_survivor_holds() {
+    let home = scratch("hard-links");
+    let first = sharing_cache(&home, "a", 64 << 10);
+    let second = sharing_cache(&home, "b", 64 << 10);
+    let third = sharing_cache(&home, "c", 64 << 10);
+    big_file(&first.join("digest/lang/target/shared"), 256 << 10);
+    fs::hard_link(
+        first.join("digest/lang/target/shared"),
+        second.join("digest/lang/target/shared"),
+    )
+    .unwrap();
+    // The shared inode takes the last mtime set: the older cache goes last.
+    backdate(&second, DAY * 2);
+    backdate(&first, DAY * 3);
+    let entries = scanned(&home);
+    let shared = fs::metadata(first.join("digest/lang/target/shared"))
+        .unwrap()
+        .blocks()
+        * 512;
+    let alone: u64 = entries.iter().map(|entry| entry.bytes).sum();
+
+    let sharing = Sharing::new(entries.iter().map(|entry| &entry.usage));
+    assert_eq!(
+        sharing.charged(),
+        alone - shared,
+        "the link is charged once"
+    );
+    assert!(sharing.logical() >= (3 * 64 + 2 * 256) << 10);
+    let now = SystemTime::now();
+    let mut freed_by = Vec::new();
+    // Exactly the deduplicated total fits: a per-entry sum would have evicted the first sharer.
+    let fits = select(
+        entries.clone(),
+        DAY * 30,
+        Some(sharing.charged()),
+        now,
+        &mut |_, freed| {
+            freed_by.push(freed);
+            (Fate::Removed, freed)
+        },
+        None,
+    );
+    assert!(fits.is_empty(), "{fits:?}");
+
+    // One byte over: the oldest sharer goes and frees its own file but not the link.
+    let verdicts = select(
+        entries.clone(),
+        DAY * 30,
+        Some(sharing.charged() - 1),
+        now,
+        &mut |_, freed| (Fate::Removed, freed),
+        None,
+    );
+    assert_eq!(verdicts.len(), 1, "{verdicts:?}");
+    assert!(verdicts[0].path.starts_with(&first));
+    assert_eq!(verdicts[0].bytes, entries[0].bytes - shared);
+
+    // Down to nothing: the second sharer now frees the file as well.
+    let verdicts = select(
+        entries.clone(),
+        DAY * 30,
+        Some(0),
+        now,
+        &mut |_, freed| (Fate::Removed, freed),
+        None,
+    );
+    let freed: Vec<_> = verdicts.iter().map(|verdict| verdict.bytes).collect();
+    assert_eq!(
+        freed,
+        [
+            entries[0].bytes - shared,
+            entries[1].bytes,
+            entries[2].bytes
+        ]
+    );
+    assert!(verdicts[1].path.starts_with(&second));
+    drop(third);
+}
+
+/// A perfect APFS clone is charged once; private bytes are what the volume gets back and never
+/// exceed the charge.
+#[cfg(target_os = "macos")]
+#[test]
+fn perfect_clones_are_charged_once_and_private_bytes_are_an_estimate() {
+    let home = scratch("clones");
+    let origin = sharing_cache(&home, "origin", 32 << 10);
+    let sibling = sharing_cache(&home, "sibling", 32 << 10);
+    big_file(&origin.join("digest/lang/target/dep"), 1 << 20);
+    let clone = std::process::Command::new("/bin/cp")
+        .arg("-c")
+        .arg(origin.join("digest/lang/target/dep"))
+        .arg(sibling.join("digest/lang/target/dep"))
+        .status()
+        .unwrap();
+    assert!(clone.success());
+    let entries = scanned(&home);
+    let alone: u64 = entries.iter().map(|entry| entry.bytes).sum();
+    let sharing = Sharing::new(entries.iter().map(|entry| &entry.usage));
+    let dep = fs::metadata(origin.join("digest/lang/target/dep"))
+        .unwrap()
+        .blocks()
+        * 512;
+
+    assert_eq!(
+        sharing.charged(),
+        alone - dep,
+        "the clone stream is charged once"
+    );
+    assert!(
+        sharing.private() < sharing.charged(),
+        "shared extents are not private"
+    );
+    assert!(sharing.logical() >= (2 << 20));
+
+    let report = sweep_with(&home, false, SystemTime::now(), &nobody);
+    assert_eq!(report.checks.bytes, sharing.charged());
+    assert_eq!(report.checks.logical, sharing.logical());
+    assert_eq!(report.checks.private, sharing.private());
+    let text = report.render(false);
+    assert!(text.contains("charged ("), "{text}");
+    assert!(
+        text.contains("logical") && text.contains("private reclaim estimate"),
+        "{text}"
+    );
+}
+
+/// One rustc crate directory: finalized sessions named `finalized` (oldest to newest naming is the
+/// caller's), plus a working session, each with its lock file.
+fn rustc_cache(home: &Path, name: &str, finalized: &[&str]) -> PathBuf {
+    let dir = sharing_cache(home, name, 8 << 10);
+    let target = dir.join("digest/rust/target/debug");
+    big_file(&target.join("deps/libdep.rlib"), 16 << 10);
+    let krate = target.join("incremental/krate-1abc");
+    for session in finalized.iter().chain(&["s-zz-w1-working"]) {
+        big_file(&krate.join(session).join("work-products.bin"), 16 << 10);
+        let stem = session.rsplit_once('-').unwrap().0;
+        fs::write(krate.join(format!("{stem}.lock")), b"").unwrap();
+    }
+    dir
+}
+
+/// Names of the session directories left in the fixture crate directory.
+fn sessions_left(cache: &Path) -> Vec<String> {
+    let mut names: Vec<_> =
+        fs::read_dir(cache.join("digest/rust/target/debug/incremental/krate-1abc"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.ends_with(".lock"))
+            .collect();
+    names.sort();
+    names
+}
+
+/// A recent worktree keeps the newest finalized session per crate by decoded timestamp (not text
+/// order, not mtime) and its `-working` session; older finalized sessions and their locks go.
+#[test]
+fn older_finalized_sessions_are_swept_keeping_the_newest_and_working() {
+    let home = scratch("sessions");
+    // Numerically: z (35) < 10 (36) < 1a (46); text order would keep `z`.
+    let cache = rustc_cache(&home, "s", &["s-z-a1-h1", "s-10-b2-h2", "s-1a-c3-h3"]);
+    // The newest session has the oldest mtime: mtime must not decide.
+    backdate(
+        &cache.join("digest/rust/target/debug/incremental/krate-1abc/s-1a-c3-h3"),
+        DAY * 5,
+    );
+
+    let report = sweep_with(&home, true, SystemTime::now(), &nobody);
+
+    let swept = verdict(&report, &cache);
+    assert_eq!(
+        (swept.reason, swept.fate),
+        (Reason::Sessions, Fate::Removed)
+    );
+    assert!(swept.bytes >= 32 << 10, "{swept:?}");
+    assert_eq!(sessions_left(&cache), ["s-1a-c3-h3", "s-zz-w1-working"]);
+    let krate = cache.join("digest/rust/target/debug/incremental/krate-1abc");
+    assert!(!krate.join("s-z-a1.lock").exists() && !krate.join("s-10-b2.lock").exists());
+    assert!(krate.join("s-1a-c3.lock").exists() && krate.join("s-zz-w1.lock").exists());
+    assert!(
+        cache
+            .join("digest/rust/target/debug/deps/libdep.rlib")
+            .exists()
+    );
+}
+
+/// rustc's own session lock protects a session: one held (by a compiler reading or collecting it)
+/// is kept, and it goes once the lock is released.
+#[test]
+fn a_session_whose_rustc_lock_is_held_is_kept() {
+    let home = scratch("session-lock");
+    let cache = rustc_cache(&home, "l", &["s-a-a1-h1", "s-b-b2-h2", "s-c-c3-h3"]);
+    let krate = cache.join("digest/rust/target/debug/incremental/krate-1abc");
+    let held = File::open(krate.join("s-a-a1.lock")).unwrap();
+    assert!(flock(&held, libc::LOCK_SH | libc::LOCK_NB));
+
+    sweep_with(&home, true, SystemTime::now(), &nobody);
+    assert_eq!(
+        sessions_left(&cache),
+        ["s-a-a1-h1", "s-c-c3-h3", "s-zz-w1-working"]
+    );
+
+    drop(held);
+    for _ in 0..300 {
+        sweep_with(&home, true, SystemTime::now(), &nobody);
+        if sessions_left(&cache).len() == 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(sessions_left(&cache), ["s-c-c3-h3", "s-zz-w1-working"]);
+}
+
+/// Anything not provably rustc's is left alone: a malformed `s-` entry makes the whole crate
+/// uncertain, a tie at the newest timestamp keeps both, a lone session is never removed.
+#[test]
+fn uncertain_crates_and_ties_are_left_alone() {
+    let home = scratch("session-uncertain");
+    let malformed = rustc_cache(&home, "m", &["s-a-a1-h1", "s-b-b2-h2"]);
+    big_file(
+        &malformed.join("digest/rust/target/debug/incremental/krate-1abc/s-Not_A_Session/x"),
+        10,
+    );
+    let tied = rustc_cache(&home, "t", &["s-a-a1-h1", "s-b-b2-h2", "s-b-c3-h3"]);
+    let lone = rustc_cache(&home, "o", &["s-a-a1-h1"]);
+
+    let report = sweep_with(&home, true, SystemTime::now(), &nobody);
+
+    assert!(report.verdicts.is_empty(), "{report:?}");
+    assert_eq!(sessions_left(&malformed).len(), 4);
+    assert_eq!(sessions_left(&tied).len(), 4);
+    assert_eq!(sessions_left(&lone).len(), 2);
+}
+
+/// A dry run reports the sweep without removing anything or creating a lock file.
+#[test]
+fn a_dry_run_reports_session_sweeps_without_touching_them() {
+    let home = scratch("session-dry");
+    let cache = rustc_cache(&home, "d", &["s-a-a1-h1", "s-b-b2-h2"]);
+    let krate = cache.join("digest/rust/target/debug/incremental/krate-1abc");
+    fs::remove_file(krate.join("s-a-a1.lock")).unwrap();
+
+    let report = sweep_with(&home, false, SystemTime::now(), &nobody);
+
+    assert!(
+        report
+            .render(false)
+            .contains("would remove: checks sessions")
+    );
+    assert_eq!(sessions_left(&cache).len(), 3);
+    assert!(!krate.join("s-a-a1.lock").exists());
+}
+
+/// A leased worktree keeps every session.
+#[test]
+fn a_leased_worktree_keeps_its_sessions() {
+    let home = scratch("session-leased");
+    let cache = rustc_cache(&home, "x", &["s-a-a1-h1", "s-b-b2-h2"]);
+    let worktree = home.join("wt-x");
+    let lease = Lease::acquire(&home, &worktree).expect("lease");
+
+    let report = sweep_with(&home, true, SystemTime::now(), &nobody);
+
+    assert_eq!(verdict(&report, &cache).fate, Fate::InUse);
+    assert_eq!(sessions_left(&cache).len(), 3);
+    drop(lease);
+}
+
+/// A worktree idle past [`INCREMENTAL_IDLE`] loses its whole `incremental` tier but keeps its
+/// dependencies and stays; one idle past the idle age goes whole, without a tier verdict first.
+#[test]
+fn an_idle_worktree_loses_incremental_state_before_the_worktree() {
+    let home = scratch("incremental-tier");
+    let idle = rustc_cache(&home, "i", &["s-a-a1-h1", "s-b-b2-h2"]);
+    let expired = rustc_cache(&home, "e", &["s-a-a1-h1", "s-b-b2-h2"]);
+    backdate(&idle, INCREMENTAL_IDLE + DAY);
+    backdate(&expired, CHECKS_IDLE + DAY);
+
+    let report = sweep_with(&home, true, SystemTime::now(), &nobody);
+
+    let tier = verdict(&report, &idle);
+    assert_eq!(
+        (tier.reason, tier.fate),
+        (Reason::Incremental, Fate::Removed)
+    );
+    assert!(!idle.join("digest/rust/target/debug/incremental").exists());
+    assert!(
+        idle.join("digest/rust/target/debug/deps/libdep.rlib")
+            .exists()
+    );
+    assert!(
+        fs::read_dir(home.join("checks/.trash"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    let whole = verdict(&report, &expired);
+    assert_eq!((whole.reason, whole.fate), (Reason::Idle, Fate::Removed));
+    assert!(!expired.exists());
+    assert_eq!(report.verdicts.len(), 2, "{report:?}");
+}
+
+/// Over the budget, every idle worktree's incremental tier is trimmed before any whole
+/// worktree is evicted.
+#[test]
+fn the_incremental_tier_goes_before_any_whole_worktree_is_evicted() {
+    let now = SystemTime::UNIX_EPOCH + DAY * 100;
+    let entries = vec![
+        synthetic("old", 100, 5),
+        synthetic("older", 100, 6),
+        synthetic("fresh", 100, 1),
+    ];
+    let mut order = Vec::new();
+    let mut trim = |entry: &Entry, tier: Tier| {
+        order.push(format!(
+            "trim {tier:?} {}",
+            entry.path.file_name().unwrap().to_string_lossy()
+        ));
+        (tier == Tier::Incremental).then(|| Trimmed {
+            fate: Fate::Removed,
+            freed: 60,
+            usage: Some(Usage {
+                own: 40,
+                ..Usage::default()
+            }),
+        })
+    };
+    let verdicts = select(
+        entries,
+        DAY * 30,
+        Some(150),
+        now,
+        &mut |_, freed| (Fate::Removed, freed),
+        Some(&mut trim),
+    );
+    let reasons: Vec<_> = verdicts
+        .iter()
+        .map(|verdict| {
+            (
+                verdict
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+                verdict.reason,
+            )
+        })
+        .collect();
+    // 300 → trimming the two idle ones leaves 40+40+100 = 180 → still over: the LRU one goes.
+    assert_eq!(
+        reasons,
+        [
+            ("older".to_owned(), Reason::Incremental),
+            ("old".to_owned(), Reason::Incremental),
+            ("older".to_owned(), Reason::Budget),
+        ]
+    );
 }
