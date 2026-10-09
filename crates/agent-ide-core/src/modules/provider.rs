@@ -880,7 +880,13 @@ impl<B: ProviderBuilder> ModuleServer for ProviderServer<B> {
             return self.support.call(request, effects).await;
         }
         Ok(match self.provider_answer(&request).await {
-            Ok(value) => Answer::result(value),
+            // The answer carries the hosted provider's own readiness, never a blanket ready.
+            Ok(value) => Answer {
+                readiness: self.hosted.as_ref().map_or(Readiness::Ready, |hosted| {
+                    hosted.live.session.module_readiness_of()
+                }),
+                ..Answer::result(value)
+            },
             Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
                 Answer::error(ErrorCode::InvalidRequest, error.to_string())
             }

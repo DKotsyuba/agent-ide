@@ -590,8 +590,9 @@ pub fn expand_staged(
     ))
 }
 
-/// Stages a run's assets ([`expand_staged`]) inside the private `cache_dir`: the cache root is
-/// opened component by component without following any symlink, every directory below it is
+/// Stages a run's assets ([`expand_staged`]) inside the private `cache_dir`: the admitted cache
+/// path is opened component by component from `/` without following any symlink (a cache path
+/// through a symlink, or a cache entry replaced by one, refuses), every directory below it is
 /// created or opened through those handles (a symlinked component refuses), and each asset is
 /// written to a fresh temporary file in its final directory and renamed into place there (a
 /// symlink at the target is replaced, never followed). A target outside `cache_dir` refuses.
@@ -610,7 +611,9 @@ pub fn stage(cache_dir: &Path, assets: &[(PathBuf, &[u8])]) -> std::io::Result<(
         return Ok(());
     }
     std::fs::create_dir_all(cache_dir)?;
-    let root = std::fs::canonicalize(cache_dir)?;
+    // The admitted cache path itself is walked without following any symlink: a cache entry
+    // replaced by a link (or a path through one) refuses instead of being resolved elsewhere.
+    let root = cache_dir;
     for (target, bytes) in assets {
         let relative = target
             .strip_prefix(cache_dir)
@@ -625,7 +628,7 @@ pub fn stage(cache_dir: &Path, assets: &[(PathBuf, &[u8])]) -> std::io::Result<(
         let Some((leaf, dirs)) = parts.split_last() else {
             return Err(refused("asset path"));
         };
-        let mut directory = crate::workspace::observation::open_root_directory(&root)
+        let mut directory = crate::workspace::observation::open_root_directory(root)
             .map_err(|_| refused("cache root"))?;
         for dir in dirs {
             let name = CString::new(dir.as_bytes()).map_err(|_| refused("asset path"))?;
@@ -1441,6 +1444,16 @@ mod tests {
         assert!(
             !outside.join("adapter.js").exists(),
             "nothing written outside the cache"
+        );
+        std::fs::remove_dir_all(&layout.cache).unwrap();
+        std::os::unix::fs::symlink(&outside, &layout.cache).unwrap();
+        assert!(
+            stage(&layout.cache, &staged).is_err(),
+            "a cache entry replaced by a symlink refuses"
+        );
+        assert!(
+            !outside.join("adapter-check.js").exists(),
+            "nothing written through the replaced cache entry"
         );
         const WRONG: EffectRecipe = EffectRecipe {
             assets: &[RecipeAsset {
