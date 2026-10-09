@@ -281,14 +281,14 @@ fn is_problems_context(method: AssistanceMethod, parameters: &Value) -> bool {
 /// context (EYES-r2 §5/§6). Hosts whose [`super::host_binding::FeedDelivery`] is
 /// [`super::host_binding::FeedDelivery::Replies`] never take
 /// this path; their plates ride terminal `ide.*` replies instead (`attach_reply_plate`).
-fn due_plate(
+async fn due_plate(
     feed: Option<&Arc<ProjectProblemFeed>>,
     worker: Option<&WorkerHandle>,
     fingerprint: &[u8; 32],
     feedback: Option<&str>,
 ) -> Option<String> {
     if let Some(worker) = worker {
-        let _ = worker.git_notice(fingerprint);
+        let _ = worker.git_notice(fingerprint).await;
     }
     let reserved = feedback.map_or(0, |text| text.len() + 1);
     if reserved + crate::feed::MAX_BLOCK_BYTES > super::reply::MAX_FEEDBACK_BYTES {
@@ -308,20 +308,20 @@ fn due_plate(
 /// Leads `plate` with due one-shot git and environment notices when the
 /// merged plate still `fits`; the line is consumed only when delivered, otherwise it stays due
 /// and `plate` is returned unchanged. A due line with no other plate becomes a plate of its own.
-fn with_git_notice(
+async fn with_git_notice(
     worker: &WorkerHandle,
     fingerprint: &[u8; 32],
     plate: Option<String>,
     fits: impl FnOnce(&str) -> bool,
 ) -> Option<String> {
-    let Some(notice) = worker.git_notice(fingerprint) else {
+    let Some(notice) = worker.git_notice(fingerprint).await else {
         return plate;
     };
     let merged = match &plate {
         Some(plate) => plate.replacen("<agent-ide>\n", &format!("<agent-ide>\n{notice}\n"), 1),
         None => format!("<agent-ide>\n{notice}\n</agent-ide>"),
     };
-    if fits(&merged) && worker.consume_git_notice(fingerprint, &notice) {
+    if fits(&merged) && worker.consume_git_notice(fingerprint, &notice).await {
         Some(merged)
     } else {
         plate
@@ -448,6 +448,22 @@ impl ProductDispatcher {
     /// telemetry owner has started; otherwise the worker is unchanged from v0.2.
     pub fn with_launcher(launcher: LauncherConfig) -> Self {
         let mut dispatcher = Self::default();
+        // Language computations route in process or to each shipped module through one host
+        // sharing the daemon's admission; ignored fallback-switch entries are journaled once.
+        let modules = Arc::new(crate::modules::router::ModuleHost::new(
+            dispatcher.admission.clone(),
+        ));
+        for line in modules.ignored_lines() {
+            errorlog::record(
+                errorlog::Method::Daemon,
+                errorlog::Outcome::Refused,
+                errorlog::Fields {
+                    detail: Some(&line),
+                    ..Default::default()
+                },
+            );
+        }
+        crate::modules::calls::install(modules);
         if let Some(scope) = dispatcher.scope {
             let worker = WorkerHandle::new(
                 dispatcher.bindings.clone(),
@@ -458,6 +474,7 @@ impl ProductDispatcher {
             let telemetry = worker.telemetry_slot();
             let feed = ProjectProblemFeed::from_launcher(
                 &launcher,
+                dispatcher.admission.clone(),
                 Arc::new(move |snapshot: &crate::checks::ProblemSnapshot| {
                     adapters::log_project_check(snapshot);
                     if let Some(telemetry) = telemetry.lock().ok().and_then(|slot| slot.clone()) {
@@ -715,9 +732,11 @@ impl ProductDispatcher {
                             Some(worker),
                             &binding.binding_ref().fingerprint(),
                             None,
-                        ),
+                        )
+                        .await,
                         |plate| plate.len() <= super::reply::MAX_FEEDBACK_BYTES,
                     )
+                    .await
                 {
                     return Ok(PeerReply::Feedback { text: block });
                 }
@@ -763,9 +782,10 @@ impl ProductDispatcher {
                     let block = with_git_notice(
                         worker,
                         &fingerprint,
-                        due_plate(feed, Some(worker), &fingerprint, feedback.as_deref()),
+                        due_plate(feed, Some(worker), &fingerprint, feedback.as_deref()).await,
                         |plate| reserved + plate.len() <= super::reply::MAX_FEEDBACK_BYTES,
-                    );
+                    )
+                    .await;
                     let text = match (block, feedback) {
                         (Some(block), Some(feedback)) => Some(format!("{block}\n{feedback}")),
                         (block, feedback) => block.or(feedback),
@@ -1331,7 +1351,7 @@ impl ProductDispatcher {
                     && method.method() != AssistanceMethod::Stop
                     && !stopped
                 {
-                    let _ = worker.git_notice(&fingerprint);
+                    let _ = worker.git_notice(&fingerprint).await;
                     let test_status = test_status_snapshot(&reply);
                     if let Some(feed) = worker.project_feed() {
                         feed.changed(&fingerprint);
@@ -1359,7 +1379,8 @@ impl ProductDispatcher {
                                     plate,
                                     super::content::Envelope::WithStructured,
                                 )
-                        });
+                        })
+                        .await;
                     }
                 }
                 Ok(reply)

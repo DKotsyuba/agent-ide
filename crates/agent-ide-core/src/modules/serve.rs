@@ -279,6 +279,115 @@ pub trait ModuleServer: Send {
     ) -> impl Future<Output = Result<Answer, ServeError>> + Send + 'a;
 }
 
+/// Test seam `<kind>:<target>:<flag file>`: the module misbehaves once on `target` (a capability's
+/// wire name, or `hello`) when it can remove the flag file. Kinds: `exit`, `stall`, `late`
+/// (answers after 3 s), `malformed`, `oversize`, `wrong-fence`, `truncate` (declares 4 attachment
+/// bytes, sends 2, exits), `stderr-flood` (1 MiB on stderr, then answers normally) and `orphan`
+/// (leaves a TERM-resistant descendant in its group, its pid in `<flag file>.pid`, then exits); any
+/// kind on `hello` exits before answering. Honoured only in `test-seams` builds.
+pub const FAULT_SEAM: &str = "AGENT_IDE_TEST_MODULE_FAULT";
+/// Test seam serving the contract's fake module under a language's identity
+/// ([`FakeModule`](super::fake::FakeModule)) from the bundled binary; honoured only in
+/// `test-seams` builds.
+pub const FIXTURE_SEAM: &str = "AGENT_IDE_TEST_MODULE_FIXTURE";
+
+/// The one-time fault the seam selects for `target` (a capability's wire name, or `hello`),
+/// consumed when its flag file is removed; returns the kind and the flag path.
+fn fault_seam(target: &str) -> Option<(String, String)> {
+    let value = crate::test_seams::var(FAULT_SEAM)?;
+    let mut parts = value.splitn(3, ':');
+    let (kind, wanted, flag) = (parts.next()?, parts.next()?, parts.next()?);
+    (wanted == target && std::fs::remove_file(flag).is_ok())
+        .then(|| (kind.to_owned(), flag.to_owned()))
+}
+
+/// The seam fault for `capability`.
+fn capability_fault(capability: Capability) -> Option<(String, String)> {
+    let name = serde_json::to_value(capability).ok()?;
+    fault_seam(name.as_str()?)
+}
+
+/// Acts out a seam-selected fault for the request `fence`; `Ok(true)` when the request is still
+/// answered normally afterwards (`stderr-flood`).
+async fn act_fault(
+    kind: &str,
+    flag: &str,
+    io: &mut ModuleIo,
+    fence: &Fence,
+) -> Result<bool, ServeError> {
+    use tokio::io::AsyncWriteExt;
+    match kind {
+        "malformed" => {
+            let _ = io.output.write_all(b"\0\0\0\x06\0{not}").await;
+        }
+        "oversize" => {
+            let _ = io.output.write_all(&u32::MAX.to_be_bytes()).await;
+        }
+        "wrong-fence" | "late" | "truncate" => {
+            if kind == "late" {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+            let mut fence = fence.clone();
+            if kind == "wrong-fence" {
+                fence.request_id += 1;
+            }
+            let declared = if kind == "truncate" {
+                vec![AttachmentDecl {
+                    id: 1,
+                    length: 4,
+                    content_type: "application/octet-stream".into(),
+                }]
+            } else {
+                Vec::new()
+            };
+            let response = Control::Response(Response {
+                fence: fence.clone(),
+                outcome: Outcome::Result(Value::Null),
+                body_attachment: None,
+                readiness: Readiness::Ready,
+                coverage: Coverage::Complete,
+                attachments: declared,
+            });
+            write_control(&mut io.output, &response).await?;
+            if kind == "truncate" {
+                write_attachment(&mut io.output, fence.request_id, 1, b"ab").await?;
+                return Err(ServeError::Protocol("truncated by seam".into()));
+            }
+            return Ok(false);
+        }
+        "stderr-flood" => {
+            let mut stderr = tokio::io::stderr();
+            let _ = stderr.write_all(&vec![b'x'; 1 << 20]).await;
+            return Ok(true);
+        }
+        "orphan" => {
+            let _ = std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &format!("trap '' TERM; echo $$ > '{flag}.pid'; exec sleep 600"),
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            // Exit only once the descendant ignores TERM (it records its pid after the trap).
+            let pid_file = format!("{flag}.pid");
+            for _ in 0..200 {
+                if std::fs::metadata(&pid_file).is_ok_and(|meta| meta.len() > 0) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            return Err(ServeError::Protocol("orphaned by seam".into()));
+        }
+        "exit" => return Err(ServeError::Protocol("exited by seam".into())),
+        _ => {}
+    }
+    let _ = io.output.flush().await;
+    std::future::pending::<()>().await;
+    Ok(false)
+}
+
 /// Serves one instance of `server` in `role` on `input`/`output` until the core shuts it down or
 /// closes the stream (`Ok`), or a fault ends it (`Err`).
 pub async fn serve<S: ModuleServer>(
@@ -296,6 +405,9 @@ pub async fn serve<S: ModuleServer>(
         (Control::Hello(offer), _) => offer,
         _ => return Err(ServeError::Protocol("expected hello".into())),
     };
+    if fault_seam("hello").is_some() {
+        return Err(ServeError::Protocol("exited at hello by seam".into()));
+    }
     let declaration = server.declaration();
     let accepted = if offer.role == role {
         match declaration.answer(&offer) {
@@ -349,6 +461,11 @@ pub async fn serve<S: ModuleServer>(
         }
         last_request = request.fence.request_id;
         let fence = request.fence.clone();
+        if let Some((kind, flag)) = capability_fault(request.capability)
+            && !act_fault(&kind, &flag, &mut io, &fence).await?
+        {
+            continue;
+        }
         let answer = if request.capability_version != 0 {
             Answer::error(ErrorCode::InvalidRequest, "unknown capability version")
         } else if supported.get(&request.capability) != Some(&Support::Supported) {

@@ -107,7 +107,10 @@ impl Worker<'_> {
                 && test.kind == crate::lang::SymbolKind::Test
             {
                 let outline_path = test.path.segments().join("::");
-                let name = language.support().test_id(&relative, &outline_path);
+                let name =
+                    crate::modules::calls::test_id(language, &root, &relative, &outline_path)
+                        .await
+                        .map_err(|failure| module_failure(job, &failure))?;
                 tests.insert((relative.clone(), name));
             }
         }
@@ -141,8 +144,19 @@ impl Worker<'_> {
             let relative = directory
                 .strip_prefix(&root)
                 .map_err(|_| FailureCode::OutsideAllowedRoots)?;
-            let text = render::directory_outline(&root, relative)
-                .map_err(|_| FailureCode::SourceUnavailable)?;
+            let text = match render::directory_outline(&root, relative).await {
+                Ok(text) => text,
+                Err(error) => {
+                    return Err(
+                        match error.get_ref().and_then(|inner| {
+                            inner.downcast_ref::<crate::modules::contract::ModuleUnavailable>()
+                        }) {
+                            Some(failure) => module_failure(job, failure),
+                            None => FailureCode::SourceUnavailable,
+                        },
+                    );
+                }
+            };
             let (reply, page) =
                 ContextPageState::new(text, 0, false, ResultKind::Outline).next(&job.reference)?;
             self.shared.set_context_page(&job.reference, page);
@@ -1520,7 +1534,10 @@ impl Worker<'_> {
         let Some(server) = self.session_server(observed.path()) else {
             // No registered server owns the file: a language that outlines from its text still
             // answers; any other keeps the provider-unavailable refusal.
-            return match support.outline_from_source(observed.path(), &source) {
+            return match self
+                .source_outline(job, language, &worktree_root, observed.path(), &source)
+                .await?
+            {
                 Some(outline) => Ok((outline, worktree_root, None)),
                 None => {
                     job.set_stage_failure(
@@ -1542,7 +1559,10 @@ impl Worker<'_> {
                 // `live_session_for` set is lifted) and the caller's reply marks it lexical; a
                 // file that does not scan cleanly keeps the park, exactly as before.
                 let parked = job.park_until.take();
-                return match support.outline_from_source(observed.path(), &source) {
+                return match self
+                    .source_outline(job, language, &worktree_root, observed.path(), &source)
+                    .await?
+                {
                     Some(outline) => Ok((outline, worktree_root, Some(Lexical::Loading))),
                     None => {
                         job.park_until = parked;
@@ -1557,7 +1577,10 @@ impl Worker<'_> {
                 // wins. A file that does not scan cleanly keeps the refusal, exactly as before,
                 // with the stage `live_session_for` already named. The lexical answer succeeds,
                 // so its failure detail must not leak into a later refusal of this job.
-                return match support.outline_from_source(observed.path(), &source) {
+                return match self
+                    .source_outline(job, language, &worktree_root, observed.path(), &source)
+                    .await?
+                {
                     Some(outline) => {
                         job.failure_detail = None;
                         Ok((outline, worktree_root, Some(Lexical::Unavailable)))
@@ -1601,7 +1624,10 @@ impl Worker<'_> {
                     .failure_detail
                     .clone()
                     .unwrap_or_else(|| "semantic project resolution is unverified".to_owned());
-                return match support.outline_from_source(observed.path(), &source) {
+                return match self
+                    .source_outline(job, language, &worktree_root, observed.path(), &source)
+                    .await?
+                {
                     Some(outline) => {
                         job.failure_detail = None;
                         Ok((outline, worktree_root, Some(Lexical::Unverified { cause })))
@@ -1611,6 +1637,20 @@ impl Worker<'_> {
             }
             Err(other) => return Err(other),
         };
+        if live.session.is_module() {
+            // The module normalizes its provider's symbols with the language's own rules.
+            return match live.session.module_outline(observed, bytes).await {
+                Ok(outline) => Ok((outline, worktree_root, None)),
+                Err(error) => {
+                    self.providers.note_session_fault();
+                    job.set_stage_failure(
+                        &FailureCode::ProviderUnavailable,
+                        &format!("{}: {}", server.name(), exchange_cause(&error)),
+                    );
+                    Err(FailureCode::ProviderUnavailable)
+                }
+            };
+        }
         let symbols = match live.session.document_symbols(observed, bytes).await {
             Ok(symbols) => symbols,
             Err(error) => {
@@ -1621,7 +1661,9 @@ impl Worker<'_> {
                 // footer, exactly as the unavailable branch. A file its lexer refuses keeps the
                 // refusal, now with the stage naming the failed request.
                 if support.outline_while_loading()
-                    && let Some(outline) = support.outline_from_source(observed.path(), &source)
+                    && let Some(outline) = self
+                        .source_outline(job, language, &worktree_root, observed.path(), &source)
+                        .await?
                 {
                     let cause = exchange_cause(&error);
                     return Ok((outline, worktree_root, Some(Lexical::Exchange { cause })));
@@ -1644,6 +1686,21 @@ impl Worker<'_> {
             worktree_root,
             None,
         ))
+    }
+
+    /// The language's source outline of `source`, in process or from its module; a module
+    /// failure is the typed provider refusal naming the module, stage and cause.
+    async fn source_outline(
+        &mut self,
+        job: &mut Job,
+        language: Lang,
+        worktree: &Path,
+        path: &Path,
+        source: &str,
+    ) -> Result<Option<Outline>, FailureCode> {
+        crate::modules::calls::outline_from_source(language, worktree, path, source)
+            .await
+            .map_err(|failure| module_failure(job, &failure))
     }
 
     /// One compact line marking a reply that was built from the lexical outline because the
@@ -1785,14 +1842,21 @@ impl Worker<'_> {
                 let Ok(live) = self.live_session_for(job, &observed).await else {
                     continue;
                 };
-                let outcome = live.session.document_symbols(&observed, bytes).await;
+                let outcome = if live.session.is_module() {
+                    live.session.module_outline(&observed, bytes).await
+                } else {
+                    live.session
+                        .document_symbols(&observed, bytes)
+                        .await
+                        .map(|symbols| {
+                            support.normalize(file, &String::from_utf8_lossy(bytes), symbols)
+                        })
+                };
                 if outcome.is_err() {
                     self.providers.note_session_fault();
                 }
-                if let Ok(symbols) = outcome {
+                if let Ok(outline) = outcome {
                     answered = true;
-                    let source = String::from_utf8_lossy(bytes);
-                    let outline = support.normalize(file, &source, symbols);
                     for candidate in outline.named(name) {
                         let path = format!("{}#{}", file.display(), candidate.path);
                         let implementation = candidate.kind == crate::lang::SymbolKind::Impl;
@@ -1851,10 +1915,16 @@ impl Worker<'_> {
             Ok((outline, _, lexical)) => Some((outline, lexical.is_none())),
             // The server could not outline it (its project config lives below the worktree
             // root): the language's text outline still names the enclosing declaration.
-            Err(_) => Lang::for_path(file)?
-                .support()
-                .outline_from_source(file, observed_text(&observed, read.contents()).ok()?)
-                .map(|outline| (outline, false)),
+            Err(_) => crate::modules::calls::outline_from_source(
+                Lang::for_path(file)?,
+                authority.worktree().worktree_path(),
+                file,
+                observed_text(&observed, read.contents()).ok()?,
+            )
+            .await
+            .ok()
+            .flatten()
+            .map(|outline| (outline, false)),
         }
     }
 
@@ -1939,8 +2009,16 @@ impl Worker<'_> {
                     text
                 }
             };
-            let mut is_test = Lang::for_path(&relative)
-                .is_some_and(|language| language.support().is_test_file(&relative));
+            let mut is_test = match Lang::for_path(&relative) {
+                Some(language) => {
+                    // A module that cannot classify the file leaves it unmarked: the usage is
+                    // still listed, only its test marker is not claimed.
+                    crate::modules::calls::test_facts(language, worktree_root, &relative)
+                        .await
+                        .is_ok_and(|facts| facts.is_test_file)
+                }
+                None => false,
+            };
             if !is_test
                 && authority.is_some()
                 && !outlines.contains_key(&relative)
@@ -2262,6 +2340,15 @@ pub(super) enum Lexical {
 /// one compact line, so a longer error is cut at this byte ceiling.
 const EXCHANGE_CAUSE_LIMIT: usize = 120;
 
+/// Names a module failure as the call's provider refusal: `module_unavailable (<module>:<stage>:<cause>)`.
+pub(super) fn module_failure(
+    job: &mut Job,
+    failure: &crate::modules::contract::ModuleUnavailable,
+) -> FailureCode {
+    job.set_stage_failure(&FailureCode::ProviderUnavailable, &failure.to_string());
+    FailureCode::ProviderUnavailable
+}
+
 /// The bounded first line of a failed documentSymbols exchange, for the outline footer.
 fn exchange_cause(error: &std::io::Error) -> String {
     crate::intelligence::context::prefix(
@@ -2465,69 +2552,75 @@ impl Worker<'_> {
         // Resolve the file and the line span the operation touches. The symbol form carries the
         // observation it resolved on out of the branch: its line span is only meaningful for those
         // exact bytes.
-        let (file, splice, lexical, resolved) = match job
-            .parameters
-            .get("symbol")
-            .and_then(Value::as_str)
-        {
-            Some(symbol) => {
-                let symbol = SymbolPath::parse(symbol).map_err(|_| FailureCode::UnknownSymbol)?;
-                let file = symbol
-                    .file()
-                    .ok_or(FailureCode::UnknownSymbol)?
-                    .to_path_buf();
-                let (observed, bytes) = self.observe(&binding, file.clone()).await?;
-                let source = observed_text(&observed, &bytes)?.to_owned();
-                let (outline, _, from_text) = self.outline_of(job, &observed, &bytes).await?;
-                let lexical = from_text
-                    .as_ref()
-                    .and_then(|why| self.lexical_note(job, observed.path(), why));
-                let splice = match op.as_str() {
-                    "insert" => {
-                        let where_ = match job.parameters.get("where").and_then(Value::as_str) {
-                            Some("before") => lang::InsertWhere::Before,
-                            Some("after") => lang::InsertWhere::After,
-                            Some("first") => lang::InsertWhere::First,
-                            Some("last") => lang::InsertWhere::Last,
-                            _ => return Err(FailureCode::Internal),
-                        };
-                        let support = outline.language.support();
-                        let site = support
-                            .insert_site(&source, &outline, &symbol, where_)
+        let (file, splice, lexical, resolved) =
+            match job.parameters.get("symbol").and_then(Value::as_str) {
+                Some(symbol) => {
+                    let symbol =
+                        SymbolPath::parse(symbol).map_err(|_| FailureCode::UnknownSymbol)?;
+                    let file = symbol
+                        .file()
+                        .ok_or(FailureCode::UnknownSymbol)?
+                        .to_path_buf();
+                    let (observed, bytes) = self.observe(&binding, file.clone()).await?;
+                    let source = observed_text(&observed, &bytes)?.to_owned();
+                    let (outline, _, from_text) = self.outline_of(job, &observed, &bytes).await?;
+                    let lexical = from_text
+                        .as_ref()
+                        .and_then(|why| self.lexical_note(job, observed.path(), why));
+                    let splice = match op.as_str() {
+                        "insert" => {
+                            let where_ = match job.parameters.get("where").and_then(Value::as_str) {
+                                Some("before") => lang::InsertWhere::Before,
+                                Some("after") => lang::InsertWhere::After,
+                                Some("first") => lang::InsertWhere::First,
+                                Some("last") => lang::InsertWhere::Last,
+                                _ => return Err(FailureCode::Internal),
+                            };
+                            let site = crate::modules::calls::insert_site(
+                                outline.language,
+                                observed.worktree().worktree_path(),
+                                observed.path(),
+                                &source,
+                                &outline,
+                                &symbol,
+                                where_,
+                            )
+                            .await
+                            .map_err(|failure| module_failure(job, &failure))?
                             .map_err(|error| match error {
                                 lang::LangError::UnknownSymbol(_) => missing_symbol(job, from_text),
                                 _ => FailureCode::Internal,
                             })?;
-                        Splice::Insert(site)
-                    }
-                    _ => {
-                        let found = outline
-                            .find(&symbol)
-                            .ok_or_else(|| missing_symbol(job, from_text))?;
-                        Splice::Replace(found.range)
-                    }
-                };
-                (file, splice, lexical, Some((observed, bytes)))
-            }
-            None => {
-                let path = job.parameters["path"]
-                    .as_str()
-                    .ok_or(FailureCode::Internal)?
-                    .to_owned();
-                let range = job
-                    .parameters
-                    .get("lines")
-                    .and_then(Value::as_str)
-                    .and_then(crate::assistance::facade::parse_line_range)
-                    .ok_or(FailureCode::Internal)?;
-                (
-                    std::path::PathBuf::from(path),
-                    Splice::Replace(range),
-                    None,
-                    None,
-                )
-            }
-        };
+                            Splice::Insert(site)
+                        }
+                        _ => {
+                            let found = outline
+                                .find(&symbol)
+                                .ok_or_else(|| missing_symbol(job, from_text))?;
+                            Splice::Replace(found.range)
+                        }
+                    };
+                    (file, splice, lexical, Some((observed, bytes)))
+                }
+                None => {
+                    let path = job.parameters["path"]
+                        .as_str()
+                        .ok_or(FailureCode::Internal)?
+                        .to_owned();
+                    let range = job
+                        .parameters
+                        .get("lines")
+                        .and_then(Value::as_str)
+                        .and_then(crate::assistance::facade::parse_line_range)
+                        .ok_or(FailureCode::Internal)?;
+                    (
+                        std::path::PathBuf::from(path),
+                        Splice::Replace(range),
+                        None,
+                        None,
+                    )
+                }
+            };
         // The line-range form observes right before splicing so the base is the exact text being
         // replaced; the symbol form splices on — and bases the write on — the observation it
         // resolved the symbol on, so a file that changed since that read is refused stale_source
@@ -2818,10 +2911,45 @@ impl Worker<'_> {
             ));
             FailureCode::EditRefused
         };
-        let changes = match resolve_changes(&source, outline.as_ref(), &path, &requests) {
-            Ok(changes) => changes,
-            Err(refusal) => return Err(refused(job, refusal)),
+        // Insertion sites are the language's computation: ask for each one first (in process or
+        // from its module), then resolve every change synchronously against the answers.
+        let mut sites = std::collections::HashMap::new();
+        if let Some(outline) = outline.as_ref() {
+            for request in &requests {
+                if let ChangeRequest::Symbol {
+                    path: symbol,
+                    op: "insert",
+                    where_,
+                    ..
+                } = request
+                    && let Some(placement) = insert_where(where_.as_deref())
+                {
+                    let site = crate::modules::calls::insert_site(
+                        outline.language,
+                        observed.worktree().worktree_path(),
+                        observed.path(),
+                        &source,
+                        outline,
+                        symbol,
+                        placement,
+                    )
+                    .await
+                    .map_err(|failure| module_failure(job, &failure))?;
+                    sites.insert((symbol.clone(), placement), site);
+                }
+            }
+        }
+        let site_of = |_: &Outline, symbol: &SymbolPath, placement: lang::InsertWhere| {
+            sites
+                .get(&(symbol.clone(), placement))
+                .cloned()
+                .unwrap_or_else(|| Err(lang::LangError::UnknownSymbol(symbol.clone())))
         };
+        let changes =
+            match resolve_changes_with(&source, outline.as_ref(), &path, &requests, &site_of) {
+                Ok(changes) => changes,
+                Err(refusal) => return Err(refused(job, refusal)),
+            };
         let (spliced, landings) = match apply_changes(&source, &path, &changes) {
             Ok(applied) => applied,
             Err(refusal) => {
@@ -3022,16 +3150,27 @@ impl Worker<'_> {
         let Some(language) = Lang::for_path(file) else {
             return candidate;
         };
-        let support = language.support();
         let root = observed.worktree().worktree_path().to_path_buf();
-        let Some(project) = support.detect(&root) else {
+        // A module that cannot plan the formatter leaves the candidate unformatted, exactly as a
+        // formatter that fails.
+        let Ok(Some(project)) = crate::modules::calls::detect(language, &root).await else {
             return candidate;
         };
-        let Some(argv) = support.format_stdin_command(&project, file) else {
+        let Ok(Some(argv)) =
+            crate::modules::calls::format_stdin_command(language, &root, &project, file).await
+        else {
             return candidate;
         };
-        match run_stdin(&argv, &root, &candidate, Duration::from_secs(10)).await {
-            Some(output) if output.status.success() && !output.stdout.is_empty() => {
+        match run_stdin(
+            &self.admission,
+            &argv,
+            &root,
+            &candidate,
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            Some(output) if output.status == Some(0) && !output.stdout.is_empty() => {
                 String::from_utf8(output.stdout).unwrap_or(candidate)
             }
             _ => candidate,
@@ -3068,20 +3207,34 @@ impl Worker<'_> {
                 Some("no language owns the file"),
             );
         };
-        let support = language.support();
-        let verdict = support.syntax_verdict(file, source);
+        let root = observed.worktree().worktree_path().to_path_buf();
+        let Ok(verdict) =
+            crate::modules::calls::syntax_verdict(language, &root, file, source).await
+        else {
+            return (
+                lang::SyntaxVerdict::Unchecked,
+                Some("the language module is unavailable"),
+            );
+        };
         if verdict != lang::SyntaxVerdict::Unchecked {
             return (verdict, None);
         }
-        let root = observed.worktree().worktree_path().to_path_buf();
-        let Some(project) = support.detect(&root) else {
+        let Ok(Some(project)) = crate::modules::calls::detect(language, &root).await else {
             return (
                 lang::SyntaxVerdict::Unchecked,
                 Some("no project detected for the language"),
             );
         };
         let configured = self.configured_probe_programs(job, language);
-        let Some(argv) = support.syntax_probe_command(&project, &root, file, configured.as_ref())
+        let Ok(Some(argv)) = crate::modules::calls::syntax_probe_command(
+            language,
+            &root,
+            &project,
+            &root,
+            file,
+            configured.as_ref(),
+        )
+        .await
         else {
             let why = if configured.is_none() {
                 "no configured probe and no project-local checker"
@@ -3090,7 +3243,15 @@ impl Worker<'_> {
             };
             return (lang::SyntaxVerdict::Unchecked, Some(why));
         };
-        let Some(output) = run_stdin(&argv, &root, source, Duration::from_secs(10)).await else {
+        let Some(output) = run_stdin(
+            &self.admission,
+            &argv,
+            &root,
+            source,
+            Duration::from_secs(10),
+        )
+        .await
+        else {
             return (
                 lang::SyntaxVerdict::Unchecked,
                 Some("the probe did not start or finish in time"),
@@ -3103,7 +3264,7 @@ impl Worker<'_> {
             .unwrap_or_default()
             .to_owned();
         (
-            lang::SyntaxVerdict::from_probe(output.status.success(), &first),
+            lang::SyntaxVerdict::from_probe(output.status == Some(0), &first),
             None,
         )
     }
@@ -3489,39 +3650,73 @@ fn push_block(out: &mut String, content: &str) {
     }
 }
 
-/// Runs one bounded stdin probe — the project's formatter or a language's syntax checker —
-/// writing `input` to its stdin and waiting at most `timeout`; `None` when it cannot start or
-/// does not finish in time (a late child is killed on drop). Runs from `root` with the daemon's
-/// formatter PATH; stderr is kept so a checker's own error line can be read as the probe's head.
+/// Runs `argv` from `root` with `input` on stdin as an Execution-owned interactive job of the
+/// worktree — admitted, measured, its group torn down and reaped — with the daemon's environment
+/// and formatter `PATH`. `None` when it cannot start, is refused as busy, overflows the capture
+/// ceiling or does not finish within `timeout`.
 async fn run_stdin(
+    admission: &std::sync::Arc<std::sync::Mutex<crate::execution::AdmissionController>>,
     argv: &[String],
     root: &Path,
     input: &str,
     timeout: Duration,
-) -> Option<std::process::Output> {
+) -> Option<crate::execution::job::JobOutput> {
+    use std::ffi::OsString;
     let (program, args) = argv.split_first()?;
-    let mut command = tokio::process::Command::new(program);
-    command
-        .args(args)
-        .current_dir(root)
-        .env("PATH", formatter_path())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let Ok(mut child) = command.spawn() else {
-        return None;
+    let path = formatter_path();
+    let program = crate::execution::job::executable_on(program, root, &path)?;
+    let mut env: std::collections::BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+    env.insert("PATH".into(), path.into());
+    let command = crate::execution::ControlledCommand::from_validated_peer(
+        crate::execution::CommandKind::Job,
+        program,
+        args.iter().map(OsString::from).collect(),
+        root.to_path_buf(),
+        env,
+    )
+    .ok()?
+    .with_private_stdin(private_input(input).ok()?);
+    let owner = crate::execution::OwnerId::new(format!(
+        "edit:{}",
+        blake3::hash(root.as_os_str().as_encoded_bytes()).to_hex()
+    ))
+    .ok()?;
+    let output = crate::execution::job::run_job(
+        admission,
+        owner,
+        crate::execution::AdmissionClass::Interactive,
+        &command,
+        crate::execution::job::MAX_JOB_CAPTURE_BYTES,
+        timeout,
+    )
+    .await
+    .ok()?;
+    (!output.timed_out && !output.truncated).then_some(output)
+}
+
+/// A private, already-unlinked file holding `input`, positioned at its start.
+fn private_input(input: &str) -> std::io::Result<std::fs::File> {
+    use std::{
+        io::{Seek, Write},
+        os::unix::fs::OpenOptionsExt,
+        sync::atomic::{AtomicU64, Ordering},
     };
-    let mut stdin = child.stdin.take()?;
-    let input = input.as_bytes().to_vec();
-    let writer = tokio::spawn(async move {
-        use tokio::io::AsyncWriteExt;
-        let _ = stdin.write_all(&input).await;
-        let _ = stdin.shutdown().await;
-    });
-    let output = tokio::time::timeout(timeout, child.wait_with_output()).await;
-    writer.abort();
-    output.ok()?.ok()
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        ".agent-ide-stdin-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    let _ = std::fs::remove_file(&path);
+    file.write_all(input.as_bytes())?;
+    file.rewind()?;
+    Ok(file)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3868,12 +4063,52 @@ fn find_old(source: &str, old: &str, scope: Option<LineRange>) -> OldMatch {
 /// Resolves every change against the base bytes and the base outline: a symbol an earlier change
 /// would create is simply not in the base outline, so a later change cannot address it. All
 /// refusals are collected so one reply names every failed change. `outline` is `None` only when
-/// no request addresses a symbol, so no arm below ever consults it then.
+/// no request addresses a symbol, so no arm below ever consults it then. Insertion sites come from
+/// the language in process.
+#[cfg(test)]
 fn resolve_changes(
     source: &str,
     outline: Option<&Outline>,
     path: &str,
     requests: &[ChangeRequest],
+) -> Result<Vec<ResolvedChange>, Refusal> {
+    resolve_changes_with(
+        source,
+        outline,
+        path,
+        requests,
+        &|outline, symbol, where_| {
+            outline
+                .language
+                .support()
+                .insert_site(source, outline, symbol, where_)
+        },
+    )
+}
+
+/// An insertion site lookup: the anchor's outline, the anchor and the placement.
+type SiteOf<'a> = dyn Fn(&Outline, &SymbolPath, lang::InsertWhere) -> Result<lang::InsertSite, lang::LangError>
+    + 'a;
+
+/// The placement an insert request names, if valid.
+fn insert_where(where_: Option<&str>) -> Option<lang::InsertWhere> {
+    match where_ {
+        Some("before") => Some(lang::InsertWhere::Before),
+        Some("after") => Some(lang::InsertWhere::After),
+        Some("first") => Some(lang::InsertWhere::First),
+        Some("last") => Some(lang::InsertWhere::Last),
+        _ => None,
+    }
+}
+
+/// [`resolve_changes`] with insertion sites from `site_of` (precomputed by the caller, in process
+/// or from the language's module).
+fn resolve_changes_with(
+    source: &str,
+    outline: Option<&Outline>,
+    path: &str,
+    requests: &[ChangeRequest],
+    site_of: &SiteOf<'_>,
 ) -> Result<Vec<ResolvedChange>, Refusal> {
     let spans = line_byte_spans(source);
     let line_of = |byte: usize| line_of_byte(&spans, byte);
@@ -3916,21 +4151,14 @@ fn resolve_changes(
                 }
                 if *op == "insert" {
                     let outline = outline.expect("an insert entry resolves against the outline");
-                    let support = outline.language.support();
-                    let where_ = match where_.as_deref() {
-                        Some("before") => lang::InsertWhere::Before,
-                        Some("after") => lang::InsertWhere::After,
-                        Some("first") => lang::InsertWhere::First,
-                        Some("last") => lang::InsertWhere::Last,
-                        _ => {
-                            refusal.push(
-                                number,
-                                format!("change {number}: {requested} needs \"where\""),
-                            );
-                            continue;
-                        }
+                    let Some(where_) = insert_where(where_.as_deref()) else {
+                        refusal.push(
+                            number,
+                            format!("change {number}: {requested} needs \"where\""),
+                        );
+                        continue;
                     };
-                    match support.insert_site(source, outline, symbol, where_) {
+                    match site_of(outline, symbol, where_) {
                         Ok(site) => {
                             let anchor = symbol
                                 .segments()

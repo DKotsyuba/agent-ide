@@ -745,6 +745,10 @@ pub struct Fields<'a> {
     /// A trusted internal probe the product sends itself (not an agent's tool call), for example
     /// `whois`, the front's actor query (QW-4); the report keeps such lines out of its call counts.
     pub probe: Option<&'static str>,
+    /// The bundled module (`bundled.<language>`) whose typed `module_unavailable` failed the call.
+    pub module: Option<&'a str>,
+    /// That module's version (the sealed binary's own).
+    pub module_version: Option<&'static str>,
 }
 
 /// Records one event, best-effort: never blocks, never panics, never surfaces an error.
@@ -1000,6 +1004,18 @@ pub(crate) fn build_line(
             serde_json::Value::String(probe.to_owned()),
         );
     }
+    if let Some(module) = fields.module {
+        object.insert(
+            "module".to_owned(),
+            serde_json::Value::String(bounded_detail(module).to_owned()),
+        );
+    }
+    if let Some(module_version) = fields.module_version {
+        object.insert(
+            "module_version".to_owned(),
+            serde_json::Value::String(module_version.to_owned()),
+        );
+    }
     if fields.dispatch {
         for (name, unknown) in [
             ("host", "unknown"),
@@ -1137,6 +1153,12 @@ pub struct LoggedEvent {
     /// The internal probe the event describes, when it is not an agent's call.
     #[serde(default)]
     pub probe: Option<String>,
+    /// The bundled module whose failure the event records, when one failed.
+    #[serde(default)]
+    pub module: Option<String>,
+    /// That module's version, when one failed.
+    #[serde(default)]
+    pub module_version: Option<String>,
 }
 
 impl Default for LoggedEvent {
@@ -1162,6 +1184,8 @@ impl Default for LoggedEvent {
             origin: None,
             delivered: None,
             probe: None,
+            module: None,
+            module_version: None,
         }
     }
 }

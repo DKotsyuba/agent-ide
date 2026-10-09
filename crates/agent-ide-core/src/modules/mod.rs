@@ -13,6 +13,13 @@
 //! - [`fake`](crate::modules::fake): a fake module and fake host for conformance tests.
 //! - [`mode`](crate::modules::mode): the `AGENT_IDE_LANGUAGE_MODE` fallback switch.
 //! - [`recipe`](crate::modules::recipe): core expansion of effect recipes into run specifications.
+//! - [`runtime`](crate::modules::runtime): supervision of one instance slot.
+//! - [`launch`](crate::modules::launch): the Execution-admitted launcher of the pinned executable.
+//! - [`adapter`](crate::modules::adapter): the module-side server of a language's own support.
+//! - [`router`](crate::modules::router): daemon-side routing in process or to a module.
+//! - [`provider`](crate::modules::provider): the module-side host of a language's provider.
+//! - [`analyzer`](crate::modules::analyzer): the core-side start of a module-hosted provider.
+//! - [`calls`](crate::modules::calls): the async facade every core call site uses.
 //!
 //! # Growth beyond version 0: linters and debugging
 //!
@@ -33,11 +40,19 @@
 //!   stream that cannot be one); launching or attaching to a debuggee is a core-admitted effect
 //!   recipe, never a module spawn, and the debug adapter runs under a provider grant.
 
+pub mod adapter;
+pub mod analyzer;
+pub mod calls;
+pub mod checker;
 pub mod contract;
 pub mod fake;
 pub mod host;
+pub mod launch;
 pub mod mode;
 pub mod payload;
+pub mod provider;
 pub mod recipe;
+pub mod router;
+pub mod runtime;
 pub mod serve;
 pub mod wire;
