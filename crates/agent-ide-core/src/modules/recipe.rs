@@ -393,6 +393,35 @@ pub fn stage_assets(cache_dir: &Path, assets: &[CacheAsset]) -> std::io::Result<
     Ok(())
 }
 
+/// Install roots each language's interactive recipes may name as launcher roots (static
+/// descriptor data, for example the standard interpreter prefixes), declared by the root.
+static ROOTS: std::sync::RwLock<Vec<(&'static str, &'static [&'static str])>> =
+    std::sync::RwLock::new(Vec::new());
+
+/// Declares languages' static install roots; a language already declared keeps its first
+/// declaration.
+pub fn declare_roots(roots: &'static [(&'static str, &'static [&'static str])]) {
+    let mut declared = ROOTS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (language, roots) in roots {
+        if !declared.iter().any(|(known, _)| known == language) {
+            declared.push((language, roots));
+        }
+    }
+}
+
+/// The declared static install roots of the language `id`.
+pub fn declared_roots(id: &str) -> Vec<PathBuf> {
+    ROOTS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(language, _)| *language == id)
+        .flat_map(|(_, roots)| roots.iter().map(PathBuf::from))
+        .collect()
+}
+
 /// Expands `effect` with its recipe from `recipes` under `admission`.
 pub fn expand(
     recipes: &[EffectRecipe],
