@@ -17,6 +17,8 @@
 //! - [`launch`](crate::modules::launch): the Execution-admitted launcher of the pinned executable.
 //! - [`adapter`](crate::modules::adapter): the module-side server of a language's own support.
 //! - [`router`](crate::modules::router): daemon-side routing in process or to a module.
+//! - [`provider`](crate::modules::provider): the module-side host of a language's provider.
+//! - [`analyzer`](crate::modules::analyzer): the core-side start of a module-hosted provider.
 //!
 //! # Growth beyond version 0: linters and debugging
 //!
@@ -38,6 +40,7 @@
 //!   recipe, never a module spawn, and the debug adapter runs under a provider grant.
 
 pub mod adapter;
+pub mod analyzer;
 pub mod contract;
 pub mod fake;
 pub mod host;
