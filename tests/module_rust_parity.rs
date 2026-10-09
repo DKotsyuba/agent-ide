@@ -260,10 +260,17 @@ async fn ready(session: &mut Session, fixture: &Fixture) {
         {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "rust-analyzer never ready: {reply}"
-        );
+        if Instant::now() >= deadline {
+            // The symbol card names a typed module failure the lexical context answer does not.
+            let card = session
+                .call(
+                    fixture,
+                    "ide.symbol",
+                    json!({"symbol":"src/lib.rs#Service/work"}),
+                )
+                .await;
+            panic!("rust-analyzer never ready: {reply}\nsymbol card: {card}");
+        }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }

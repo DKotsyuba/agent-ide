@@ -1529,3 +1529,139 @@ mod tests {
         assert!(present);
     }
 }
+
+/// The analyzer module with the real pinned rust-analyzer, over an in-memory transport: the
+/// granted provider starts within `hello` and answers a semantic outline once ready.
+#[cfg(test)]
+mod real_provider_tests {
+    use super::*;
+    use agent_ide_core::modules::{
+        contract::{Outcome, Readiness},
+        fake::offer,
+        host::{Call, HostChannel, NoEffects},
+        payload::{OutlineRequest, SemanticQuery, SourceRef, SourceText, decode},
+        provider::ProviderGrant,
+    };
+    use serde_json::json;
+
+    /// BLAKE3 of the file at `path`, hex.
+    fn digest(path: &Path) -> String {
+        blake3::hash(&std::fs::read(path).unwrap())
+            .to_hex()
+            .to_string()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the accepted AGENT_IDE_RUST_TOOLCHAIN_DIR, AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN inputs"]
+    async fn the_analyzer_module_starts_rust_analyzer_within_hello() {
+        agent_ide_core::lang::install(&[crate::LANGUAGE]);
+        let input = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name}"));
+        let toolchain = PathBuf::from(input("AGENT_IDE_RUST_TOOLCHAIN_DIR"));
+        let analyzer = PathBuf::from(input("AGENT_IDE_RUST_ANALYZER"));
+        let worktree = std::env::current_dir().unwrap();
+        let namespace = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("rust-module-real-{}", std::process::id()));
+        for dir in ["cargo", "target", "tmp"] {
+            std::fs::create_dir_all(namespace.join(dir)).unwrap();
+        }
+        let settings = RustProviderSettings {
+            binary: analyzer.clone(),
+            version: "rust-analyzer 1.98.1 (48a229ce 2026-09-01)".into(),
+            cargo: toolchain.join("bin/cargo"),
+            cargo_home: None,
+            cargo_version: "cargo 1.98.1".into(),
+            rustc: toolchain.join("bin/rustc"),
+            rustc_version: "rustc 1.98.1".into(),
+            toolchain: input("AGENT_IDE_RUST_TOOLCHAIN"),
+            trust: "fixture-disabled".into(),
+            cache_namespace: namespace.display().to_string(),
+        };
+        let mut offer = offer(module_id(), env!("CARGO_PKG_VERSION"), Role::Analyzer, 1);
+        offer.config.worktree = Some(worktree.clone());
+        offer.config.home = agent_ide_core::userhome::user_home();
+        offer.config.provider = Some(json!({
+            "grant": ProviderGrant {
+                accepted: [&settings.binary, &settings.cargo, &settings.rustc]
+                    .into_iter()
+                    .map(|path| (path.clone(), digest(path)))
+                    .collect(),
+                request_timeout_ms: 30_000,
+                roots: crate::backend::provider_roots(&settings),
+            },
+            "settings": settings,
+        }));
+        let (core_out, module_in) = tokio::io::duplex(1 << 16);
+        let (module_out, core_in) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            let _ = agent_ide_core::modules::serve::serve(
+                RustModule::new(Role::Analyzer, provider_server()),
+                Role::Analyzer,
+                module_in,
+                module_out,
+            )
+            .await;
+        });
+        let started = std::time::Instant::now();
+        let (mut channel, _) =
+            HostChannel::open(core_in, core_out, offer, Duration::from_secs(120))
+                .await
+                .unwrap();
+        eprintln!("hello answered after {:?}", started.elapsed());
+        let call = |capability, payload| Call {
+            capability,
+            scope_key: "scope".into(),
+            revision_key: "revision".into(),
+            payload,
+            attachments: Vec::new(),
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let reply = channel
+                .call(
+                    call(
+                        Capability::Semantic,
+                        payload::encode(&SemanticQuery::Readiness {}),
+                    ),
+                    Duration::from_secs(5),
+                    &mut NoEffects,
+                )
+                .await
+                .unwrap();
+            let readiness: Readiness = match reply.outcome {
+                Outcome::Result(value) => decode(value).unwrap(),
+                Outcome::Error(error) => panic!("readiness: {error:?}"),
+            };
+            if readiness == Readiness::Ready {
+                break;
+            }
+            assert_ne!(
+                readiness,
+                Readiness::Degraded,
+                "the workspace failed to load"
+            );
+            assert!(std::time::Instant::now() < deadline, "never ready");
+        }
+        let text = std::fs::read_to_string(worktree.join("src/home.rs")).unwrap();
+        let reply = channel
+            .call(
+                call(
+                    Capability::Outline,
+                    payload::encode(&OutlineRequest {
+                        source: SourceRef {
+                            path: "src/home.rs".into(),
+                            revision: "r1".into(),
+                            text: SourceText::Inline(text),
+                        },
+                    }),
+                ),
+                Duration::from_secs(30),
+                &mut NoEffects,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(reply.outcome, Outcome::Result(_)), "{reply:?}");
+        let _ = std::fs::remove_dir_all(&namespace);
+    }
+}

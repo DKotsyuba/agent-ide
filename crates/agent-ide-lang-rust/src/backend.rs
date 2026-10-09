@@ -218,7 +218,7 @@ fn profile_of(launch: &ProviderLaunch, cache_namespace: &str) -> Result<RustProf
 /// Roots the core admits for the paths of the module-started analyzer's environment beside the
 /// worktree and the accepted files' directories: the private namespace, the declared Cargo home,
 /// the user home (its `.cargo`) and the system tool directories.
-fn provider_roots(settings: &crate::module::RustProviderSettings) -> Vec<PathBuf> {
+pub(crate) fn provider_roots(settings: &crate::module::RustProviderSettings) -> Vec<PathBuf> {
     let mut roots = vec![PathBuf::from(&settings.cache_namespace)];
     roots.extend(settings.cargo_home.clone());
     roots.extend(agent_ide_core::userhome::user_home());
@@ -239,6 +239,25 @@ fn record_module_failure(
         inputs,
         &module_failure(failure),
     );
+}
+
+/// The typed failure of a module session that could not open: the module's own when it gave
+/// one, else a `hello` failure (`timeout` when the exchange ran out of time, `exited` otherwise).
+fn hello_failure(error: &std::io::Error) -> agent_ide_core::modules::contract::ModuleUnavailable {
+    use agent_ide_core::modules::contract::{Cause, ModuleUnavailable, Stage};
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ModuleUnavailable>())
+        .cloned()
+        .unwrap_or_else(|| ModuleUnavailable {
+            stage: Stage::Hello,
+            cause: if error.kind() == std::io::ErrorKind::TimedOut {
+                Cause::Timeout
+            } else {
+                Cause::Exited
+            },
+            ..module_failure(None)
+        })
 }
 
 /// The Rust analyzer module's typed failure, `request`/`exited` when none was observed.
@@ -560,20 +579,12 @@ impl RustBackend {
                     // The module's typed failure names the stage and cause and counts against the
                     // restart policy.
                     Some((inputs, _)) => {
-                        let typed = error
-                            .get_ref()
-                            .and_then(|inner| {
-                                inner.downcast_ref::<agent_ide_core::modules::contract::ModuleUnavailable>()
-                            })
-                            .cloned();
-                        record_module_failure(worktree_path, inputs, typed.clone());
-                        match typed {
-                            Some(failure) => job.set_stage_failure(
-                                &FailureCode::ProviderUnavailable,
-                                &format!("rust: {failure}"),
-                            ),
-                            None => initialize_stage(job, &error),
-                        }
+                        let failure = hello_failure(&error);
+                        record_module_failure(worktree_path, inputs, Some(failure.clone()));
+                        job.set_stage_failure(
+                            &FailureCode::ProviderUnavailable,
+                            &format!("rust: {failure}"),
+                        );
                     }
                     None => initialize_stage(job, &error),
                 }
