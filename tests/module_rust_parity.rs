@@ -1187,7 +1187,8 @@ async fn the_module_process_starts_rust_analyzer_within_hello() {
         assert!(Instant::now() < deadline, "never ready");
     }
     // A symbol context answers like the in-process exchange: no wait for diagnostics a
-    // byte-offset query never asked for, well inside the core's module call budget.
+    // byte-offset query never asked for (that wait ran into the 30 s module call budget); a
+    // cold first query may still take seconds.
     let (_, lib) = PARITY_FILES
         .iter()
         .find(|(path, _)| *path == "src/lib.rs")
@@ -1219,7 +1220,7 @@ async fn the_module_process_starts_rust_analyzer_within_hello() {
     eprintln!("symbol context after {:?}", asked.elapsed());
     assert!(matches!(reply.outcome, Outcome::Result(_)), "{reply:?}");
     assert!(
-        asked.elapsed() < Duration::from_secs(5),
+        asked.elapsed() < Duration::from_secs(15),
         "a symbol context waited {:?}",
         asked.elapsed()
     );
