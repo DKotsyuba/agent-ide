@@ -248,8 +248,28 @@ pub const CARGO_CHECK: EffectRecipe = EffectRecipe {
     capture_bytes: 64 << 20,
 };
 
+/// The platform developer-directory selection (`xcode-select -p`), the one finite probe the
+/// project check needs; the module starts no process itself, so the core runs it.
+pub const XCODE_SELECT: EffectRecipe = EffectRecipe {
+    id: "xcode_select",
+    program: "tool",
+    args: &[Arg::Literal("-p")],
+    env: &[],
+    paths: &[PathRule {
+        param: "tool",
+        roles: &[PathRole::Fixed(&["/usr/bin/xcode-select"])],
+        existing_only: false,
+        read_root: false,
+    }],
+    executables: &[],
+    stdin: Stdin::Null,
+    class: RunClass::Interactive,
+    timeout_ceiling_ms: 10_000,
+    capture_bytes: 4096,
+};
+
 /// Every effect recipe the Rust module may name; the root registers them with the descriptor.
-pub const RECIPES: &[EffectRecipe] = &[CARGO_CHECK];
+pub const RECIPES: &[EffectRecipe] = &[CARGO_CHECK, XCODE_SELECT];
 
 /// The module's identity.
 pub fn module_id() -> ModuleId {
@@ -447,14 +467,49 @@ fn reply(value: &impl Serialize) -> Answer {
     Answer::result(payload::encode(value))
 }
 
-/// The checker for `config`, planning and parsing only.
-fn checker_for(config: &ProjectRustChecksConfig, timeout: Duration) -> RustChecker {
+/// The primary Apple developer directory, selected as the in-process checker does: the section's
+/// override when it exists, else the platform selection (`xcode-select -p`, run by the core as a
+/// finite probe effect), else the standard install locations.
+async fn developer_dir(
+    config: &ProjectRustChecksConfig,
+    effects: &mut Effects<'_>,
+) -> Result<Option<PathBuf>, ServeError> {
+    if let Some(dir) = config.developer_dir().filter(|dir| dir.is_dir()) {
+        return Ok(Some(dir.to_path_buf()));
+    }
+    let probe = EffectRequest {
+        recipe: XCODE_SELECT.id.to_owned(),
+        params: std::collections::BTreeMap::from([(
+            "tool".to_owned(),
+            Param::Path(PathBuf::from("/usr/bin/xcode-select")),
+        )]),
+    };
+    let (outcome, attachments) = effects.run(probe).await?;
+    let selected = match outcome {
+        EffectOutcome::Completed {
+            status: Some(0), ..
+        } => String::from_utf8(stream(&attachments, 1))
+            .ok()
+            .map(|text| PathBuf::from(text.trim()))
+            .filter(|path| path.is_dir()),
+        _ => None,
+    };
+    Ok(selected.or_else(crate::checks::standard_developer_dir))
+}
+
+/// The checker for `config`, planning and parsing only, around the resolved `primary` developer
+/// directory.
+fn checker_for(
+    config: &ProjectRustChecksConfig,
+    timeout: Duration,
+    primary: Option<PathBuf>,
+) -> RustChecker {
     RustChecker::for_planning(
         std::sync::Arc::new(NoProcess),
         config.toolchain_dir().to_path_buf(),
         config.cargo_home().map(Path::to_path_buf),
         timeout,
-        config.developer_dir().map(Path::to_path_buf),
+        primary,
     )
 }
 
@@ -572,15 +627,17 @@ async fn check_plan(incoming: &Incoming, effects: &mut Effects<'_>) -> Result<An
             return Ok(Answer::error(ErrorCode::InvalidRequest, error.to_string()));
         }
     };
-    let checker = checker_for(&config, Duration::from_millis(query.timeout_ms));
     let started = std::time::Instant::now();
-    if checker.cargo_missing(&query.request) {
+    // The missing-cargo answer depends on the toolchain alone, so it needs no probe.
+    if checker_for(&config, Duration::ZERO, None).cargo_missing(&query.request) {
         return Ok(reply(&ProblemSnapshot::unavailable(
             crate::LANGUAGE,
             UnavailableReason::ToolMissing,
             query.request.input_generation,
         )));
     }
+    let primary = developer_dir(&config, effects).await?;
+    let checker = checker_for(&config, Duration::from_millis(query.timeout_ms), primary);
     let effect = checker
         .cargo_check_plan(&query.request)
         .to_effect(&query.request);
@@ -917,7 +974,7 @@ mod tests {
                 "developer_dir": developer,
             });
             let section: ProjectRustChecksConfig = serde_json::from_value(config.clone()).unwrap();
-            let checker = checker_for(&section, Duration::from_secs(300));
+            let checker = checker_for(&section, Duration::from_secs(300), Some(developer.clone()));
             let request = CheckRequest {
                 worktree: worktree.clone(),
                 cache_dir: cache.clone(),
@@ -1004,7 +1061,7 @@ mod tests {
         let snapshot: ProblemSnapshot = decode(value).unwrap();
         assert_eq!(snapshot.state, CheckState::Ready);
         assert_eq!(snapshot.input_generation, 9);
-        assert_eq!(effects.runs, 1);
+        assert_eq!(effects.runs, 2, "the developer-directory probe, then the check");
         assert_eq!(effects.last.unwrap().recipe, "cargo_check");
     }
 

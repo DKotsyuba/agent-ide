@@ -90,20 +90,23 @@ impl RustChecker {
         )
     }
 
-    /// A checker for planning and parsing only: the primary developer directory is the section's
-    /// override or a fixed standard location, never the answer of a process, because a module
-    /// starts no process of its own (the core runs every effect).
+    /// A checker for planning and parsing only, around an already resolved primary developer
+    /// directory: a module starts no process of its own, so the platform selection comes from a
+    /// probe the core ran for it ([`standard_developer_dir`] when that failed).
     pub(crate) fn for_planning(
         runner: Arc<dyn ConfinedRunner>,
         toolchain_dir: PathBuf,
         cargo_home: Option<PathBuf>,
         timeout: Duration,
-        developer_dir: Option<PathBuf>,
+        primary_developer_dir: Option<PathBuf>,
     ) -> Self {
-        let primary = developer_dir
-            .filter(|dir| dir.is_dir())
-            .or_else(standard_developer_dir);
-        Self::with_primary_developer_dir(runner, toolchain_dir, cargo_home, timeout, primary)
+        Self::with_primary_developer_dir(
+            runner,
+            toolchain_dir,
+            cargo_home,
+            timeout,
+            primary_developer_dir,
+        )
     }
 
     /// Builds the checker around an already resolved primary developer directory.
@@ -513,7 +516,7 @@ fn xcode_select_developer_dir() -> Option<PathBuf> {
 }
 
 /// The first standard Apple developer directory that exists, without asking any process.
-fn standard_developer_dir() -> Option<PathBuf> {
+pub(crate) fn standard_developer_dir() -> Option<PathBuf> {
     existing_dir("/Applications/Xcode.app/Contents/Developer")
         .or_else(|| existing_dir("/Library/Developer/CommandLineTools"))
 }
