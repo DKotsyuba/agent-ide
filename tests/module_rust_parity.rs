@@ -534,3 +534,110 @@ fn offsets_point_at_their_names() {
     assert!(lib[WORK_OFFSET..].starts_with("work(&self)"));
     assert!(lib[HELPER_CALL_OFFSET..].starts_with("helper()\n"));
 }
+
+/// The resident memory of `id` in KiB, 0 once it is gone.
+fn rss_kib(id: ProcessIdentity) -> u64 {
+    let listing = std::process::Command::new("/bin/ps")
+        .args(["-o", "rss=", "-p", &id.pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&listing.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// Milliseconds of one settled call that must answer `kind`.
+async fn timed(
+    session: &mut Session,
+    fixture: &Fixture,
+    tool: &str,
+    arguments: Value,
+    kind: &str,
+) -> f64 {
+    let started = Instant::now();
+    let reply = session.call(fixture, tool, arguments).await;
+    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(reply["kind"], kind, "{reply}");
+    elapsed
+}
+
+/// A measurement, not a contract (design §3.2.4): for the in-process path and the module it
+/// records cold first outlines (a fresh session each), warm `ide.outline` and `ide.symbol`
+/// latencies once rust-analyzer is ready, and the resident memory of the daemon's process tree,
+/// written as JSON to `AGENT_IDE_MODULE_MEASURE_OUT`. Without that variable it measures nothing.
+#[tokio::test]
+#[ignore = "measurement; requires the accepted Rust inputs and AGENT_IDE_MODULE_MEASURE_OUT"]
+async fn rust_module_measure() {
+    let Some(out) = std::env::var_os("AGENT_IDE_MODULE_MEASURE_OUT").map(std::path::PathBuf::from)
+    else {
+        eprintln!("rust_module_measure skipped: AGENT_IDE_MODULE_MEASURE_OUT is not set");
+        return;
+    };
+    let fixture = rust_fixture(PARITY_FILES, "module-rust-measure", 300);
+    let (cold_runs, warmup, samples) = (15, 20, 200);
+    let mut report = serde_json::Map::new();
+    for (mode, env) in [("in_process", IN_PROCESS), ("module", MODULE)] {
+        let mut daemon = Daemon::start(&fixture, &[env]).await;
+        let outline = json!({"path":"src/lib.rs"});
+        let symbol = json!({"symbol":"src/lib.rs#Service/work"});
+        let mut cold = Vec::new();
+        let mut session = Session::start(&fixture).await;
+        for run in 0..cold_runs {
+            if run > 0 {
+                session.close(&fixture).await;
+                session = Session::start(&fixture).await;
+            }
+            cold.push(
+                timed(
+                    &mut session,
+                    &fixture,
+                    "ide.outline",
+                    outline.clone(),
+                    "outline",
+                )
+                .await,
+            );
+        }
+        ready(&mut session, &fixture).await;
+        let mut measured = serde_json::Map::new();
+        measured.insert("cold_outline_ms".into(), json!(cold));
+        for (name, tool, arguments, kind) in [
+            ("warm_outline_ms", "ide.outline", outline.clone(), "outline"),
+            ("warm_symbol_ms", "ide.symbol", symbol.clone(), "symbol"),
+        ] {
+            for _ in 0..warmup {
+                timed(&mut session, &fixture, tool, arguments.clone(), kind).await;
+            }
+            let mut values = Vec::new();
+            for _ in 0..samples {
+                values.push(timed(&mut session, &fixture, tool, arguments.clone(), kind).await);
+            }
+            measured.insert(name.into(), json!(values));
+        }
+        let tree = daemon.tree();
+        let mut memory = vec![
+            json!({"process":"daemon","rss_kib":rss_kib(ProcessIdentity::of(daemon.pid()).unwrap().0)}),
+        ];
+        for node in &tree.children {
+            memory.push(json!({"process":node.command,"rss_kib":rss_kib(node.id)}));
+            for (id, command) in &node.children {
+                memory.push(json!({"process":format!("  {command}"),"rss_kib":rss_kib(*id)}));
+            }
+        }
+        measured.insert("rss".into(), json!(memory));
+        report.insert(mode.into(), Value::Object(measured));
+        session.close(&fixture).await;
+        drop(daemon);
+    }
+    report.insert(
+        "method".into(),
+        json!({"cold_runs": cold_runs, "warmup": warmup, "calls": samples,
+               "clock": "wall time of one settled MCP tools/call round trip measured in the test process"}),
+    );
+    std::fs::write(
+        &out,
+        serde_json::to_vec_pretty(&Value::Object(report)).unwrap(),
+    )
+    .unwrap();
+}
