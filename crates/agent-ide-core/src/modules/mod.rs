@@ -19,6 +19,7 @@
 //! - [`router`](crate::modules::router): daemon-side routing in process or to a module.
 //! - [`provider`](crate::modules::provider): the module-side host of a language's provider.
 //! - [`analyzer`](crate::modules::analyzer): the core-side start of a module-hosted provider.
+//! - [`calls`](crate::modules::calls): the async facade every core call site uses.
 //!
 //! # Growth beyond version 0: linters and debugging
 //!
@@ -41,6 +42,7 @@
 
 pub mod adapter;
 pub mod analyzer;
+pub mod calls;
 pub mod contract;
 pub mod fake;
 pub mod host;
