@@ -1384,3 +1384,30 @@ fn the_incremental_tier_goes_before_any_whole_worktree_is_evicted() {
         ]
     );
 }
+
+/// A `target` that is a symlink to a caller-owned directory is never searched: neither tier
+/// reaches the `incremental` state behind it, and a symlinked `incremental` or session is left too.
+#[test]
+fn symlinked_target_incremental_and_session_directories_are_never_followed() {
+    let home = scratch("session-symlinks");
+    let cache = rustc_cache(&home, "y", &["s-a-a1-h1", "s-b-b2-h2"]);
+    let callers = home.join("callers-target");
+    fs::rename(cache.join("digest/lang/target"), &callers).unwrap();
+    std::os::unix::fs::symlink(&callers, cache.join("digest/lang/target")).unwrap();
+    backdate(&cache, INCREMENTAL_IDLE + DAY);
+    let incremental = callers.join("debug/incremental");
+
+    let recent = sweep_with(&home, true, SystemTime::now(), &nobody);
+    assert!(recent.verdicts.is_empty(), "{recent:?}");
+    assert!(incremental.join("krate-1abc/s-a-a1-h1").exists());
+
+    // The same holds for a symlinked `incremental` directory and symlinked session directories.
+    fs::remove_file(cache.join("digest/lang/target")).unwrap();
+    let target = cache.join("digest/lang/target");
+    fs::create_dir_all(target.join("debug")).unwrap();
+    std::os::unix::fs::symlink(&incremental, target.join("debug/incremental")).unwrap();
+    let report = sweep_with(&home, true, SystemTime::now(), &nobody);
+    assert!(report.verdicts.is_empty(), "{report:?}");
+    assert!(incremental.join("krate-1abc/s-a-a1-h1").exists());
+    assert!(incremental.join("krate-1abc/s-b-b2-h2").exists());
+}
