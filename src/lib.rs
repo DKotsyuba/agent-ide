@@ -79,6 +79,10 @@ pub mod languages {
     pub static RECIPES: [(&str, &[agent_ide_core::modules::payload::EffectRecipe]); 1] =
         [("python", agent_ide_lang_python::module::RECIPES)];
 
+    /// Each language's module environment: the only variables its cleared module process (and
+    /// `hello.config.env`) receives from the daemon.
+    pub static MODULE_ENV: [(&str, &[&str]); 1] = [("rust", &["AGENT_IDE_RUST_TOOLCHAIN_DIR"])];
+
     /// Registers every bundled language for this process. Idempotent; call it before parsing a
     /// launcher configuration or mapping any path to a language.
     pub fn install() {
@@ -86,6 +90,7 @@ pub mod languages {
         crate::assistance::launcher::install_retired_settings(&RETIRED_SETTINGS);
         agent_ide_core::modules::router::ship(&SHIPPED_MODULES);
         agent_ide_core::modules::recipe::declare(&RECIPES);
+        agent_ide_core::modules::launch::declare_env(&MODULE_ENV);
     }
 }
 

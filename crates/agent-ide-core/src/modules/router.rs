@@ -22,7 +22,7 @@ use super::{
     },
     contract::{Outcome, QUEUE_DEPTH},
     host::{Call, EffectRunner, NoEffects},
-    launch::{ExecutionLauncher, MODULE_ENV, ModuleExecutable},
+    launch::{ExecutionLauncher, ModuleExecutable, module_env},
     mode::{LanguageModes, Mode},
     payload::{decode, encode},
     runtime::Supervisor,
@@ -287,10 +287,7 @@ impl ModuleHost {
             worktree: Some(worktree.to_path_buf()),
             provider: None,
             checks: None,
-            env: MODULE_ENV
-                .iter()
-                .filter_map(|name| Some(((*name).to_owned(), std::env::var(name).ok()?)))
-                .collect(),
+            env: module_env(language.name()),
             home: crate::userhome::user_home(),
         };
         let owner = OwnerId::new(format!(

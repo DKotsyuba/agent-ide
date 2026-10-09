@@ -14,7 +14,7 @@ use super::{
         Capability, HelloOffer, Limits, ModuleConfig, ModuleId, PROTOCOL, Role, Support, VERSION,
     },
     host::HostChannel,
-    launch::{MODULE_ENV, ModuleExecutable},
+    launch::{ModuleExecutable, module_env},
     provider::ProviderGrant,
 };
 use crate::{
@@ -37,9 +37,9 @@ pub fn analyzer_command(
     language: &str,
     worktree: &WorktreeRef,
 ) -> Option<ControlledCommand> {
-    let mut env: BTreeMap<OsString, OsString> = MODULE_ENV
-        .iter()
-        .filter_map(|key| Some((OsString::from(key), std::env::var_os(key)?)))
+    let mut env: BTreeMap<OsString, OsString> = module_env(language)
+        .into_iter()
+        .map(|(key, value)| (OsString::from(key), OsString::from(value)))
         .collect();
     if let Some(seam) = crate::test_seams::var(super::serve::FAULT_SEAM) {
         env.insert(super::serve::FAULT_SEAM.into(), seam.into());
@@ -92,10 +92,7 @@ pub fn analyzer_offer(
                 "settings": settings,
             })),
             checks: None,
-            env: MODULE_ENV
-                .iter()
-                .filter_map(|name| Some(((*name).to_owned(), std::env::var(name).ok()?)))
-                .collect(),
+            env: module_env(language),
             home: crate::userhome::user_home(),
         },
     }

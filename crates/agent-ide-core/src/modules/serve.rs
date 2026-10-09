@@ -411,7 +411,12 @@ pub async fn serve<S: ModuleServer>(
     let declaration = server.declaration();
     let accepted = if offer.role == role {
         match declaration.answer(&offer) {
-            Ok(reply) => server.hello(&offer).await.map(|()| reply),
+            Ok(reply) => {
+                if let Some(home) = &offer.config.home {
+                    crate::userhome::set_module_home(home.clone());
+                }
+                server.hello(&offer).await.map(|()| reply)
+            }
             Err(reason) => Err(reason),
         }
     } else {

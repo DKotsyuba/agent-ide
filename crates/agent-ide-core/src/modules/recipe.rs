@@ -362,7 +362,8 @@ pub fn asset_path(cache_dir: &Path, asset: &CacheAsset) -> PathBuf {
         .join(asset.name)
 }
 
-/// Stages every asset into `cache_dir` unless its exact bytes are already there: written to a
+/// Stages every asset into `cache_dir` unless a regular file with its exact bytes and mode is
+/// already there: written to a
 /// private temporary file beside the target, given its mode, then renamed into place.
 pub fn stage_assets(cache_dir: &Path, assets: &[CacheAsset]) -> std::io::Result<()> {
     use std::{io::Write, os::unix::fs::PermissionsExt};
@@ -374,7 +375,10 @@ pub fn stage_assets(cache_dir: &Path, assets: &[CacheAsset]) -> std::io::Result<
             ));
         }
         let target = asset_path(cache_dir, asset);
-        if std::fs::read(&target).is_ok_and(|bytes| bytes == asset.bytes) {
+        let current = std::fs::symlink_metadata(&target).is_ok_and(|metadata| {
+            metadata.is_file() && metadata.permissions().mode() & 0o7777 == asset.mode
+        }) && std::fs::read(&target).is_ok_and(|bytes| bytes == asset.bytes);
+        if current {
             continue;
         }
         let dir = target.parent().expect("an asset directory");
@@ -1256,6 +1260,16 @@ mod tests {
         std::fs::write(&path, "tampered").unwrap();
         stage_assets(&layout.cache, &[ASSET]).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), ASSET.bytes);
+        let executable = CacheAsset {
+            mode: 0o755,
+            ..ASSET
+        };
+        stage_assets(&layout.cache, &[executable]).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "same bytes, new mode: restaged with the declared mode"
+        );
         let bad = CacheAsset {
             name: "../x",
             ..ASSET
