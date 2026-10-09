@@ -246,6 +246,7 @@ pub const CARGO_CHECK: EffectRecipe = EffectRecipe {
     class: RunClass::Background,
     timeout_ceiling_ms: 900_000,
     capture_bytes: 64 << 20,
+    assets: &[],
 };
 
 /// The platform's selected developer directory (`/usr/bin/xcode-select -p`), the one finite probe
@@ -279,6 +280,7 @@ pub const XCODE_SELECT: EffectRecipe = EffectRecipe {
     class: RunClass::Background,
     timeout_ceiling_ms: 10_000,
     capture_bytes: 4096,
+    assets: &[],
 };
 
 /// rustfmt formatting the candidate on stdin with the project's edition, the home tool the core
@@ -303,6 +305,7 @@ pub const RUSTFMT: EffectRecipe = EffectRecipe {
     class: RunClass::Interactive,
     timeout_ceiling_ms: 10_000,
     capture_bytes: 64 << 20,
+    assets: &[],
 };
 
 /// Every effect recipe the Rust module may name; the root registers them with the descriptor.

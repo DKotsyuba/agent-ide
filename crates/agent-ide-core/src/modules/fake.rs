@@ -247,6 +247,7 @@ impl FakeModule {
                     encode(&Some(vec![located(&source, 0, 1)]))
                 }
                 SemanticQuery::WorkspaceSymbols { .. } => json!([]),
+                SemanticQuery::Readiness {} => encode(&super::contract::Readiness::Ready),
                 SemanticQuery::Diagnostics { source } => encode(&DiagnosticsEvidence {
                     revision: Some(source.revision),
                     readiness: "clean".into(),
@@ -1169,6 +1170,31 @@ mod tests {
             unavailable: None,
         };
         assert!(!untyped.well_formed());
+    }
+
+    /// The readiness query answers the hosted provider's status barrier as a typed readiness.
+    #[tokio::test]
+    async fn the_readiness_query_answers_the_provider_barrier() {
+        let id = alpha();
+        let (mut channel, _) = in_memory(
+            FakeModule::new(id.clone(), "1.0"),
+            offer(id, "1.0", Role::Analyzer, 1),
+        )
+        .await
+        .unwrap();
+        let mut call = sample_call(Capability::Semantic);
+        call.payload = encode(&SemanticQuery::Readiness {});
+        let reply = channel
+            .call(call, Duration::from_secs(5), &mut NoEffects)
+            .await
+            .unwrap();
+        let super::super::contract::Outcome::Result(value) = reply.outcome else {
+            panic!("a readiness answer");
+        };
+        assert_eq!(
+            decode::<super::super::contract::Readiness>(value).unwrap(),
+            super::super::contract::Readiness::Ready
+        );
     }
 
     /// A late reply after an abandoned call can never settle the next request: the abandoned

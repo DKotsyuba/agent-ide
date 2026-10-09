@@ -311,86 +311,25 @@ pub fn declared(id: &str) -> &'static [EffectRecipe] {
         .map_or(&[], |(_, recipes)| recipes)
 }
 
-/// A static file a language's recipes need in the private cache (an embedded adapter script),
-/// compiled into its descriptor. The core stages it before any of the language's effects run;
-/// the module names the staged path ([`asset_path`]) as a [`Param::Path`] under
-/// [`PathRole::Cache`].
-#[derive(Clone, Copy, Debug)]
-pub struct CacheAsset {
-    /// File name (a plain name, no separators).
-    pub name: &'static str,
-    /// Exact bytes.
-    pub bytes: &'static [u8],
-    /// Unix permission bits of the staged file.
-    pub mode: u32,
-}
-
-/// Cache assets of each language, declared by the root.
-static ASSETS: std::sync::RwLock<Vec<(&'static str, &'static [CacheAsset])>> =
-    std::sync::RwLock::new(Vec::new());
-
-/// Declares languages' cache assets (root composition data); a language already declared keeps
-/// its first declaration.
-pub fn declare_assets(assets: &'static [(&'static str, &'static [CacheAsset])]) {
-    let mut declared = ASSETS
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for (language, assets) in assets {
-        if !declared.iter().any(|(known, _)| known == language) {
-            declared.push((language, assets));
-        }
-    }
-}
-
-/// The declared cache assets of the language `id`.
-pub fn declared_assets(id: &str) -> &'static [CacheAsset] {
-    ASSETS
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .find(|(language, _)| *language == id)
-        .map_or(&[], |(_, assets)| assets)
-}
-
-/// Where `asset` is staged below the private `cache_dir`: content-addressed, so a changed asset
-/// never reuses a stale file (`<cache>/assets/<blake3 prefix>/<name>`).
-pub fn asset_path(cache_dir: &Path, asset: &CacheAsset) -> PathBuf {
-    let digest = blake3::hash(asset.bytes).to_hex();
-    cache_dir
-        .join("assets")
-        .join(&digest.as_str()[..32])
-        .join(asset.name)
-}
-
-/// Stages every asset into `cache_dir` unless a regular file with its exact bytes and mode is
-/// already there: written to a
-/// private temporary file beside the target, given its mode, then renamed into place.
-pub fn stage_assets(cache_dir: &Path, assets: &[CacheAsset]) -> std::io::Result<()> {
-    use std::{io::Write, os::unix::fs::PermissionsExt};
-    for asset in assets {
-        if asset.name.is_empty() || asset.name.contains('/') || asset.name.starts_with('.') {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "asset name",
-            ));
-        }
-        let target = asset_path(cache_dir, asset);
-        let current = std::fs::symlink_metadata(&target).is_ok_and(|metadata| {
-            metadata.is_file() && metadata.permissions().mode() & 0o7777 == asset.mode
-        }) && std::fs::read(&target).is_ok_and(|bytes| bytes == asset.bytes);
-        if current {
-            continue;
-        }
-        let dir = target.parent().expect("an asset directory");
-        std::fs::create_dir_all(dir)?;
-        let temporary = dir.join(format!(".{}.{}.tmp", asset.name, std::process::id()));
-        let mut file = std::fs::File::create(&temporary)?;
-        file.write_all(asset.bytes)?;
-        file.set_permissions(std::fs::Permissions::from_mode(asset.mode))?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, &target)?;
-    }
-    Ok(())
+/// The platform developer directories the core resolves itself for [`PathRole::DeveloperDir`]:
+/// the selected developer directory (the target of `/private/var/db/xcode_select_link`, what
+/// `xcode-select -p` reports, and the link itself), the Command Line Tools and the default Xcode
+/// developer directory — each only when it exists.
+pub fn platform_developer_dirs() -> Vec<PathBuf> {
+    let link = Path::new("/private/var/db/xcode_select_link");
+    let mut dirs: Vec<PathBuf> = std::fs::canonicalize(link)
+        .ok()
+        .into_iter()
+        .chain([
+            link.to_path_buf(),
+            PathBuf::from("/Library/Developer/CommandLineTools"),
+            PathBuf::from("/Applications/Xcode.app/Contents/Developer"),
+        ])
+        .filter(|dir| dir.exists())
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    dirs.retain(|dir| seen.insert(dir.clone()));
+    dirs
 }
 
 /// Install roots each language's interactive recipes may name as launcher roots (static
@@ -428,6 +367,19 @@ pub fn expand(
     effect: &EffectRequest,
     admission: &Admission<'_>,
 ) -> Result<RunSpec, Refusal> {
+    expand_staged(recipes, effect, admission).map(|(spec, _)| spec)
+}
+
+/// A run's assets with the admitted cache paths they are staged at.
+pub type Staged = Vec<(PathBuf, &'static [u8])>;
+
+/// [`expand`] plus the recipe's assets with their admitted cache paths, to [`stage`] (in the
+/// admission's cache) before the spawn; an asset whose parameter is not a cache-only path rule with one admitted value refuses.
+pub fn expand_staged(
+    recipes: &[EffectRecipe],
+    effect: &EffectRequest,
+    admission: &Admission<'_>,
+) -> Result<(RunSpec, Staged), Refusal> {
     let recipe = recipes
         .iter()
         .find(|recipe| recipe.id == effect.recipe)
@@ -445,7 +397,10 @@ pub fn expand(
             | EnvRule::Joined { param, .. }
             | EnvRule::Pattern { param, .. }
             | EnvRule::SearchPath { param, .. } => declared.push(param),
-            EnvRule::Literal { .. } | EnvRule::Home { .. } => {}
+            EnvRule::Literal { .. }
+            | EnvRule::Home { .. }
+            | EnvRule::ReadRootsJson { .. }
+            | EnvRule::ReadDeniesJson { .. } => {}
         }
     }
     declared.extend(recipe.paths.iter().map(|rule| rule.param));
@@ -596,26 +551,147 @@ pub fn expand(
                     .ok_or_else(|| Refusal::Missing("home".to_owned()))?;
                 env.push(((*name).to_owned(), home.display().to_string()));
             }
+            EnvRule::ReadRootsJson { name } => env.push((
+                (*name).to_owned(),
+                serde_json::to_string(&read_roots).unwrap_or_default(),
+            )),
+            EnvRule::ReadDeniesJson { name } => env.push((
+                (*name).to_owned(),
+                serde_json::to_string(admission.read_denies).unwrap_or_default(),
+            )),
         }
     }
-    Ok(RunSpec {
-        program,
-        args,
-        cwd: admission.worktree.to_path_buf(),
-        env,
-        read_roots,
-        write_roots: vec![admission.cache_dir.to_path_buf()],
-        read_denies: admission.read_denies.to_vec(),
-        timeout: admission
-            .timeout
-            .min(Duration::from_millis(recipe.timeout_ceiling_ms)),
-        max_output_bytes: recipe.capture_bytes as usize,
-    })
+    let mut staged = Vec::with_capacity(recipe.assets.len());
+    for asset in recipe.assets {
+        let cache_only = recipe
+            .paths
+            .iter()
+            .any(|rule| rule.param == asset.param && rule.roles == [PathRole::Cache]);
+        match paths.get(asset.param).map(Vec::as_slice) {
+            Some([path]) if cache_only => staged.push((path.clone(), asset.bytes)),
+            _ => return Err(Refusal::Missing(asset.param.to_owned())),
+        }
+    }
+    Ok((
+        RunSpec {
+            program,
+            args,
+            cwd: admission.worktree.to_path_buf(),
+            env,
+            read_roots,
+            write_roots: vec![admission.cache_dir.to_path_buf()],
+            read_denies: admission.read_denies.to_vec(),
+            timeout: admission
+                .timeout
+                .min(Duration::from_millis(recipe.timeout_ceiling_ms)),
+            max_output_bytes: recipe.capture_bytes as usize,
+        },
+        staged,
+    ))
+}
+
+/// Stages a run's assets ([`expand_staged`]) inside the private `cache_dir`: the cache root is
+/// opened component by component without following any symlink, every directory below it is
+/// created or opened through those handles (a symlinked component refuses), and each asset is
+/// written to a fresh temporary file in its final directory and renamed into place there (a
+/// symlink at the target is replaced, never followed). A target outside `cache_dir` refuses.
+pub fn stage(cache_dir: &Path, assets: &[(PathBuf, &[u8])]) -> std::io::Result<()> {
+    use std::{
+        ffi::{CString, OsStr},
+        fs::File,
+        io::Write,
+        os::unix::ffi::OsStrExt,
+        os::unix::io::{AsRawFd, FromRawFd},
+    };
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let refused =
+        |what: &str| std::io::Error::new(std::io::ErrorKind::PermissionDenied, what.to_owned());
+    if assets.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(cache_dir)?;
+    let root = std::fs::canonicalize(cache_dir)?;
+    for (target, bytes) in assets {
+        let relative = target
+            .strip_prefix(cache_dir)
+            .map_err(|_| refused("asset outside the cache"))?;
+        let parts: Vec<&OsStr> = relative
+            .components()
+            .map(|part| match part {
+                Component::Normal(name) => Ok(name),
+                _ => Err(refused("asset path")),
+            })
+            .collect::<Result<_, _>>()?;
+        let Some((leaf, dirs)) = parts.split_last() else {
+            return Err(refused("asset path"));
+        };
+        let mut directory = crate::workspace::observation::open_root_directory(&root)
+            .map_err(|_| refused("cache root"))?;
+        for dir in dirs {
+            let name = CString::new(dir.as_bytes()).map_err(|_| refused("asset path"))?;
+            // SAFETY: `name` is NUL terminated and `directory` is an open directory descriptor.
+            let made = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
+            if made != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(error);
+                }
+            }
+            let next = crate::workspace::observation::open_directory(directory.as_raw_fd(), dir)
+                .map_err(|_| refused("symlinked or missing cache directory"))?;
+            // SAFETY: `open_directory` returned a new descriptor owned solely by this `File`.
+            directory = unsafe { File::from_raw_fd(next) };
+        }
+        let temporary = CString::new(format!(
+            ".asset-{}-{}.tmp",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+        .expect("no NUL");
+        let leaf = CString::new(leaf.as_bytes()).map_err(|_| refused("asset path"))?;
+        // SAFETY: both names are NUL terminated; a successful descriptor is owned below.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                temporary.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o644 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the successful open returned one new owned descriptor.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let written = file.write_all(bytes).and_then(|()| {
+            // SAFETY: both names are NUL terminated and resolved relative to `directory`.
+            let renamed = unsafe {
+                libc::renameat(
+                    directory.as_raw_fd(),
+                    temporary.as_ptr(),
+                    directory.as_raw_fd(),
+                    leaf.as_ptr(),
+                )
+            };
+            if renamed == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+        if written.is_err() {
+            // SAFETY: removes the private temporary inside the anchored directory.
+            unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) };
+        }
+        written?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::payload::RecipeAsset;
     use crate::modules::payload::{ExecutableSlot, RunClass, Stdin};
 
     /// Ancestor files a nested project check reads.
@@ -816,6 +892,7 @@ mod tests {
         class: RunClass::Background,
         timeout_ceiling_ms: 900_000,
         capture_bytes: 64 << 20,
+        assets: &[],
     };
 
     /// A scratch layout: an outer project holding the worktree, a home with a toolchain and a git
@@ -1232,6 +1309,7 @@ mod tests {
             class: RunClass::Background,
             timeout_ceiling_ms: 900_000,
             capture_bytes: 64 << 20,
+            assets: &[],
         };
         for (depth, expected) in [(48usize, 144usize), (403, 1209)] {
             let worktree: PathBuf = std::iter::once("/".to_owned())
@@ -1267,42 +1345,113 @@ mod tests {
         }
     }
 
-    /// Assets are staged content-addressed with their exact bytes and mode, restaged when the
-    /// staged copy differs, and a name with a separator is refused.
+    /// A recipe's asset is staged at the admitted cache path of its parameter (replacing a
+    /// symlink there, never following it), and the read-roots and read-denies JSON variables
+    /// carry the run's final read roots and the host denies; an asset on a parameter that is not
+    /// a cache-only path refuses.
     #[test]
-    fn staged_assets_are_content_addressed_and_exact() {
-        use std::os::unix::fs::PermissionsExt;
-        let layout = Layout::new("assets");
-        const ASSET: CacheAsset = CacheAsset {
-            name: "adapter.js",
+    fn assets_stage_at_admitted_cache_paths_and_json_env_mirrors_the_run() {
+        const ADAPTER: RecipeAsset = RecipeAsset {
+            param: "adapter",
             bytes: b"module.exports = 1;\n",
-            mode: 0o644,
         };
-        stage_assets(&layout.cache, &[ASSET]).unwrap();
-        let path = asset_path(&layout.cache, &ASSET);
-        assert!(path.starts_with(layout.cache.join("assets")));
-        assert_eq!(std::fs::read(&path).unwrap(), ASSET.bytes);
+        const TS: EffectRecipe = EffectRecipe {
+            id: "ts",
+            program: "node",
+            args: &[Arg::Param("adapter")],
+            env: &[
+                EnvRule::ReadRootsJson {
+                    name: "CHECK_READ_ROOTS",
+                },
+                EnvRule::ReadDeniesJson {
+                    name: "CHECK_READ_DENIES",
+                },
+            ],
+            paths: &[
+                PathRule {
+                    param: "worktree",
+                    roles: &[PathRole::WorktreeRoot],
+                    existing_only: false,
+                    read_root: true,
+                },
+                PathRule {
+                    param: "adapter",
+                    roles: &[PathRole::Cache],
+                    existing_only: false,
+                    read_root: false,
+                },
+            ],
+            executables: &[ExecutableSlot {
+                name: "node",
+                source: SlotSource::Launcher("node"),
+            }],
+            stdin: Stdin::Null,
+            class: RunClass::Background,
+            timeout_ceiling_ms: 900_000,
+            capture_bytes: 64 << 20,
+            assets: &[ADAPTER],
+        };
+        let layout = Layout::new("assets");
+        let programs = [("node".to_owned(), layout.toolchain.join("bin/node"))];
+        let denies = [ReadDeny::Path(layout.base.join("secret"))];
+        let admission = Admission {
+            read_denies: &denies,
+            ..layout.admission(&programs, &[], &[])
+        };
+        let target = layout.cache.join("adapter-check.js");
+        let effect = EffectRequest {
+            recipe: "ts".into(),
+            params: BTreeMap::from([
+                ("node".into(), Param::Executable("node".into())),
+                ("worktree".into(), Param::Path(layout.worktree.clone())),
+                ("adapter".into(), Param::Path(target.clone())),
+            ]),
+        };
+        let (spec, staged) = expand_staged(&[TS], &effect, &admission).unwrap();
+        assert_eq!(staged, [(target.clone(), ADAPTER.bytes)]);
+        let env: BTreeMap<_, _> = spec.env.iter().cloned().collect();
         assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o644
+            env["CHECK_READ_ROOTS"],
+            serde_json::to_string(&spec.read_roots).unwrap()
         );
-        std::fs::write(&path, "tampered").unwrap();
-        stage_assets(&layout.cache, &[ASSET]).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), ASSET.bytes);
-        let executable = CacheAsset {
-            mode: 0o755,
-            ..ASSET
-        };
-        stage_assets(&layout.cache, &[executable]).unwrap();
         assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o755,
-            "same bytes, new mode: restaged with the declared mode"
+            env["CHECK_READ_DENIES"],
+            serde_json::to_string(&denies).unwrap()
         );
-        let bad = CacheAsset {
-            name: "../x",
-            ..ASSET
+        std::fs::create_dir_all(&layout.cache).unwrap();
+        let elsewhere = layout.base.join("elsewhere.js");
+        std::fs::write(&elsewhere, "keep").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &target).unwrap();
+        stage(&layout.cache, &staged).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), ADAPTER.bytes);
+        assert!(!std::fs::symlink_metadata(&target).unwrap().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere).unwrap(),
+            "keep",
+            "not followed"
+        );
+        let outside = layout.base.join("outside-dir");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, layout.cache.join("parent")).unwrap();
+        let nested = layout.cache.join("parent/adapter.js");
+        assert!(
+            stage(&layout.cache, &[(nested, ADAPTER.bytes)]).is_err(),
+            "a symlinked directory below the cache refuses"
+        );
+        assert!(
+            !outside.join("adapter.js").exists(),
+            "nothing written outside the cache"
+        );
+        const WRONG: EffectRecipe = EffectRecipe {
+            assets: &[RecipeAsset {
+                param: "worktree",
+                bytes: b"x",
+            }],
+            ..TS
         };
-        assert!(stage_assets(&layout.cache, &[bad]).is_err());
+        assert!(matches!(
+            expand_staged(&[WRONG], &effect, &admission),
+            Err(Refusal::Missing(name)) if name == "worktree"
+        ));
     }
 }

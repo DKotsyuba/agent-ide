@@ -287,6 +287,7 @@ const fn interactive(
         class: RunClass::Interactive,
         timeout_ceiling_ms: 10_000,
         capture_bytes: 64 << 20,
+        assets: &[],
     }
 }
 
@@ -458,6 +459,7 @@ const PYRIGHT: EffectRecipe = EffectRecipe {
     class: RunClass::Background,
     timeout_ceiling_ms: 900_000,
     capture_bytes: 64 << 20,
+    assets: &[],
 };
 
 /// The `pyright` recipe request that reproduces `spec`, a run [`PythonChecker`] built for

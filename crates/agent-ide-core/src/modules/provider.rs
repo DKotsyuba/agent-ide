@@ -28,7 +28,8 @@ use serde_json::Value;
 use super::{
     adapter::SupportServer,
     contract::{
-        Capability, CapabilityDecl, Cause, Declaration, ErrorCode, HelloOffer, Stage, Support,
+        Capability, CapabilityDecl, Cause, Declaration, ErrorCode, HelloOffer, Readiness, Stage,
+        Support,
     },
     payload::{
         Call, CallItem, CallsQuery, ContextEvidence, Diagnostic, DiagnosticsEvidence, EditProposal,
@@ -42,7 +43,7 @@ use crate::{
     intelligence::{
         context::{ContextMode, ContextQuery},
         freshness::{DiagnosticReadiness, Freshness, ViewGeneration},
-        session::{LiveSession, ProviderSettings, Session},
+        session::{LiveSession, ProviderSettings, ReadinessError, Session},
     },
     lang::{edits::byte_offset, kind_of},
     workspace::{
@@ -493,6 +494,23 @@ impl<B: ProviderBuilder> ProviderServer<B> {
                             })
                             .collect::<Vec<_>>(),
                     )))
+                }
+                SemanticQuery::Readiness {} => {
+                    self.session().await?;
+                    let budget = Duration::from_millis(request.budget_ms.saturating_sub(200));
+                    let hosted = self.hosted.as_mut().expect("started above");
+                    let readiness = match hosted.live.wait_ready(budget).await {
+                        Ok(()) => Readiness::Ready,
+                        Err(ReadinessError::Loading) => Readiness::Warming,
+                        Err(ReadinessError::WorkspaceError) => Readiness::Degraded,
+                        Err(ReadinessError::Gone) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "provider exited",
+                            ));
+                        }
+                    };
+                    Ok(encode(&readiness))
                 }
                 SemanticQuery::Diagnostics { source } => {
                     let (observation, bytes) = self.observe(&source, request)?;

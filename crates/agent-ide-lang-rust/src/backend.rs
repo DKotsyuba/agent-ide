@@ -233,8 +233,20 @@ fn record_module_failure(
     inputs: &str,
     failure: Option<agent_ide_core::modules::contract::ModuleUnavailable>,
 ) {
+    agent_ide_core::modules::analyzer::record_failure(
+        crate::DESCRIPTOR.id,
+        worktree,
+        inputs,
+        &module_failure(failure),
+    );
+}
+
+/// The Rust analyzer module's typed failure, `request`/`exited` when none was observed.
+fn module_failure(
+    failure: Option<agent_ide_core::modules::contract::ModuleUnavailable>,
+) -> agent_ide_core::modules::contract::ModuleUnavailable {
     use agent_ide_core::modules::contract::{Cause, ModuleId, ModuleUnavailable, Role, Stage};
-    let failure = failure.unwrap_or(ModuleUnavailable {
+    failure.unwrap_or(ModuleUnavailable {
         module_id: ModuleId::bundled(crate::DESCRIPTOR.id),
         module_version: env!("CARGO_PKG_VERSION").to_owned(),
         role: Role::Analyzer,
@@ -242,13 +254,7 @@ fn record_module_failure(
         cause: Cause::Exited,
         instance: None,
         retry_after_ms: None,
-    });
-    agent_ide_core::modules::analyzer::record_failure(
-        crate::DESCRIPTOR.id,
-        worktree,
-        inputs,
-        &failure,
-    );
+    })
 }
 
 /// Opens the analyzer session on the started child's pipes: directly on rust-analyzer, or on the
@@ -336,8 +342,6 @@ struct RustLive {
     live: LiveSession,
     /// The accepted inputs of a module-hosted session, against which its failures count.
     module_inputs: Option<String>,
-    /// A call parked waiting for this session to load.
-    waited: bool,
 }
 
 /// Exclusive Rust generations and every binding's retained analyzer session.
@@ -367,31 +371,23 @@ impl RustBackend {
     ) -> Result<(), FailureCode> {
         let binding = job.binding().clone();
         let worktree_path = source.worktree().worktree_path();
-        if let Some(entry) = self.live.get_mut(&binding) {
+        if let Some(entry) = self.live.get(&binding) {
             if entry.live.is_alive() {
-                // A demand on a module analyzer that has not loaded yet waits for it.
-                if entry.module_inputs.is_some() {
-                    entry.waited = !entry.live.session.provider_readiness().is_ready();
-                }
                 return Ok(());
             }
-            // A module session that died counts against the shared restart policy. A call that
-            // was waiting for its analyzer to load is settled with the module's typed fault,
-            // never silently answered by a restarted one; a death while idle restarts on demand.
+            // A module that died — while a call waited for its analyzer to load, or idle — counts
+            // against the shared restart policy, and the demand that finds it dead is settled with
+            // its typed fault (never silently answered by a restarted one); the next demand
+            // restarts it within the policy.
             if let Some(inputs) = &entry.module_inputs {
-                let failure = entry.live.module_unavailable();
-                record_module_failure(worktree_path, inputs, failure.clone());
-                if entry.waited {
-                    self.release(host, &binding).await;
-                    job.set_stage_failure(
-                        &FailureCode::ProviderUnavailable,
-                        &failure.map_or_else(
-                            || "rust: request failed".to_owned(),
-                            |failure| format!("rust: {failure}"),
-                        ),
-                    );
-                    return Err(FailureCode::ProviderUnavailable);
-                }
+                let failure = module_failure(entry.live.module_unavailable());
+                record_module_failure(worktree_path, inputs, Some(failure.clone()));
+                self.release(host, &binding).await;
+                job.set_stage_failure(
+                    &FailureCode::ProviderUnavailable,
+                    &format!("rust: {failure}"),
+                );
+                return Err(FailureCode::ProviderUnavailable);
             }
             self.release(host, &binding).await;
         }
@@ -544,8 +540,6 @@ impl RustBackend {
         };
         match opened {
             Ok(live) => {
-                // A freshly started module analyzer loads before it answers.
-                let waited = module_inputs.is_some();
                 self.live.insert(
                     binding,
                     RustLive {
@@ -553,7 +547,6 @@ impl RustBackend {
                         view,
                         live,
                         module_inputs,
-                        waited,
                     },
                 );
                 Ok(())
@@ -625,7 +618,6 @@ impl RustBackend {
             };
             match readiness {
                 Ok(()) => {
-                    entry.waited = false;
                     // A whole-file query is the post-edit diagnostic read: give the analyzer a
                     // few seconds to publish diagnostics for the synchronized version before
                     // snapshotting, so an edit reply can report `current_clean`/`current_reported`
@@ -653,7 +645,6 @@ impl RustBackend {
                             .saturating_duration_since(tokio::time::Instant::now())
                             > Duration::from_secs(1)
                     {
-                        entry.waited = true;
                         job.park_until(tokio::time::Instant::now() + Duration::from_millis(300));
                     }
                     return Err(FailureCode::ProviderLoading);

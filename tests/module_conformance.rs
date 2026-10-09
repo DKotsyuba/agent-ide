@@ -294,6 +294,7 @@ const RECIPES: &[EffectRecipe] = &[EffectRecipe {
     class: RunClass::Background,
     timeout_ceiling_ms: 900_000,
     capture_bytes: 64 << 20,
+    assets: &[],
 }];
 
 /// Check output of 3 MiB, 9 MiB and exactly the 64 MiB ceiling lands through a real checker

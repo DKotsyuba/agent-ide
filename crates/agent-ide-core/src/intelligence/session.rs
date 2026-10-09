@@ -594,6 +594,10 @@ impl LiveSession {
         if self.session.settings.profile().status_method().is_none() {
             return Ok(());
         }
+        // A module hosts the provider: its status barrier is asked across the boundary.
+        if self.session.module.is_some() {
+            return self.session.module_readiness(budget).await;
+        }
         let mut ready = self
             .session
             .state
