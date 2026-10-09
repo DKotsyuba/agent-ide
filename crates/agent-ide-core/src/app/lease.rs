@@ -451,4 +451,3 @@ mod tests {
         assert!(ran.load(Ordering::SeqCst), "the registered hook still ran");
     }
 }
-

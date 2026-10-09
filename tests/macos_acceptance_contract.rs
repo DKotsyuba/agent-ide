@@ -282,10 +282,9 @@ fn tool_result(id: &str, text: &str) -> Value {
 /// `ide.edit` at all passed on narration alone.
 #[test]
 fn l2_stale_oracle_requires_the_stale_edit_result_not_narration() {
-    let scratch = OracleScratch(std::env::temp_dir().join(format!(
-        "agent-ide-l2-oracle-{}",
-        std::process::id()
-    )));
+    let scratch = OracleScratch(
+        std::env::temp_dir().join(format!("agent-ide-l2-oracle-{}", std::process::id())),
+    );
     std::fs::create_dir_all(&scratch.0).unwrap();
     let edit = "mcp__agent-ide__ide_edit";
     let stale = "edit: stale_source; path acceptance-fixture/fixture.py. No write occurred";
@@ -298,10 +297,14 @@ fn l2_stale_oracle_requires_the_stale_edit_result_not_narration() {
     assert!(l2_stale_probe_accepts(
         &scratch,
         "real",
-        &[call("e1", edit), tool_result("e1", stale), narration.clone()]
+        &[
+            call("e1", edit),
+            tool_result("e1", stale),
+            narration.clone()
+        ]
     ));
     assert!(
-        !l2_stale_probe_accepts(&scratch, "skipped", &[narration.clone()]),
+        !l2_stale_probe_accepts(&scratch, "skipped", std::slice::from_ref(&narration)),
         "narration alone must not pass"
     );
     assert!(

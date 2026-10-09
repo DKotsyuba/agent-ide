@@ -25,13 +25,19 @@ impl Scratch {
     }
 
     /// Owns the existing `root` tree and presents its child `dir` to the test.
-    #[allow(dead_code, reason = "only the contracts with sibling state beside a root use it")]
+    #[allow(
+        dead_code,
+        reason = "only the contracts with sibling state beside a root use it"
+    )]
     pub fn own_tree(root: PathBuf, dir: PathBuf) -> Self {
         Self { root, dir }
     }
 
     /// Returns the presented directory as an owned path.
-    #[allow(dead_code, reason = "only the contracts that hand out owned roots use it")]
+    #[allow(
+        dead_code,
+        reason = "only the contracts that hand out owned roots use it"
+    )]
     pub fn path(&self) -> PathBuf {
         self.dir.clone()
     }

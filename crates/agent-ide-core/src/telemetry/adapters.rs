@@ -833,7 +833,8 @@ mod tests {
     /// Proves a tool adapter persists only its closed result facts and never the reply's text.
     #[tokio::test]
     async fn tool_adapter_omits_completed_reply_text() {
-        let (_database, telemetry) = super::super::open_test_telemetry(TelemetryConfig::default()).await;
+        let (_database, telemetry) =
+            super::super::open_test_telemetry(TelemetryConfig::default()).await;
         tool_reply(
             &telemetry,
             AssistanceTool::Context,
@@ -873,7 +874,8 @@ mod tests {
     /// Persists an edit's closed method/outcome/diagnostic classes without its private fields.
     #[tokio::test]
     async fn edit_adapter_omits_path_reference_and_diagnostic_message() {
-        let (_database, telemetry) = super::super::open_test_telemetry(TelemetryConfig::default()).await;
+        let (_database, telemetry) =
+            super::super::open_test_telemetry(TelemetryConfig::default()).await;
         let reply = PeerReply::Edit {
             result: crate::changes::edit::EditResult::new(
                 "private-operation".into(),

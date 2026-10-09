@@ -2482,8 +2482,11 @@ mod tests {
         events
             .iter()
             .filter(|event| {
-                (event.method.as_str(), event.outcome.as_str(), event.reason.as_deref())
-                    == ("daemon", "failed", Some("internal"))
+                (
+                    event.method.as_str(),
+                    event.outcome.as_str(),
+                    event.reason.as_deref(),
+                ) == ("daemon", "failed", Some("internal"))
                     && event.detail.as_deref() == Some("connection_task_panic")
             })
             .count()
@@ -2525,10 +2528,9 @@ mod tests {
     #[tokio::test]
     async fn a_panicking_connection_task_is_journaled_while_the_daemon_serves() {
         crate::errorlog::capture_start();
-        let scratch = ScratchRuntime(std::env::temp_dir().join(format!(
-            "agent-ide-panic-live-{}",
-            std::process::id()
-        )));
+        let scratch = ScratchRuntime(
+            std::env::temp_dir().join(format!("agent-ide-panic-live-{}", std::process::id())),
+        );
         let runtime = RuntimeDir::prepare_for_daemon(&scratch.0).unwrap();
         let daemon = tokio::spawn(run_daemon_with_assistance(
             runtime,
@@ -2537,7 +2539,10 @@ mod tests {
             Duration::from_millis(1500),
         ));
         for _ in 0..200 {
-            if UnixStream::connect(scratch.0.join(SOCKET_NAME)).await.is_ok() {
+            if UnixStream::connect(scratch.0.join(SOCKET_NAME))
+                .await
+                .is_ok()
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

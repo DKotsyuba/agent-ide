@@ -2677,9 +2677,11 @@ async fn run_managed_claude_mcp(
 /// next tool call re-runs the remembered activation itself. A failed heal retries at a bounded
 /// cadence; nothing here can block or fail the MCP's serving loop.
 async fn watch_claude_lease(lease: Arc<Mutex<Option<UnixStream>>>, facade: StdioFacade) {
-    follow_lease(lease, || facade.current_pair(), |observed| {
-        facade.recover_lost_daemon(observed)
-    })
+    follow_lease(
+        lease,
+        || facade.current_pair(),
+        |observed| facade.recover_lost_daemon(observed),
+    )
     .await;
 }
 
