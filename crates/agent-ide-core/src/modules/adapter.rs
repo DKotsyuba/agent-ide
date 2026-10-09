@@ -73,8 +73,11 @@ pub struct SupportServer {
     /// Turns the language's formatter or syntax-probe argument vector into a request of one of
     /// its declared recipes; without it (or when it answers `None`) the plan is the generic
     /// `argv` request, which the core refuses to run.
-    plans: Option<fn(&[String]) -> Option<EffectRequest>>,
+    plans: Option<EffectPlans>,
 }
+
+/// Turns a formatter or probe argument vector into a request of the language's recipes.
+pub type EffectPlans = fn(&[String]) -> Option<EffectRequest>;
 
 impl SupportServer {
     /// The adapter for `language` at `version`.
@@ -88,7 +91,7 @@ impl SupportServer {
 
     /// The adapter whose formatter and syntax-probe plans become requests of the language's
     /// declared recipes through `plans`.
-    pub fn with_effect_plans(mut self, plans: fn(&[String]) -> Option<EffectRequest>) -> Self {
+    pub fn with_effect_plans(mut self, plans: EffectPlans) -> Self {
         self.plans = Some(plans);
         self
     }
