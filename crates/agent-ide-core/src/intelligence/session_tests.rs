@@ -1217,8 +1217,9 @@ async fn remote_context_checks_generation_and_diagnostic_binding() {
     let diagnostic = json!({"range": {"start": {"line": 0, "character": 0},
         "end": {"line": 0, "character": 1}}, "message": "m"});
     let reply = |generation: u64, sequence: u64| {
+        let generation = (generation > 0).then_some([generation, 1, 1, generation]);
         json!({
-            "context": {"generation": [generation, 1, 1, generation], "document_version": 1,
+            "context": {"generation": generation, "document_version": 1,
                 "position_encoding": "utf-16", "lexical": null, "definitions": [],
                 "references": [], "truncated": false},
             "diagnostics": {"source_sequence": sequence, "document_version": 1,
@@ -1252,26 +1253,29 @@ async fn remote_context_checks_generation_and_diagnostic_binding() {
     assert_eq!(diagnostics.readiness, DiagnosticReadiness::Unknown);
     assert!(diagnostics.source.is_none() && diagnostics.diagnostics.is_empty());
 
-    let (mut live, _) = remote_session(reply(7, 2)).await;
-    let result = live
-        .session
-        .context(&observation("a", 2), b"a", query)
-        .await
-        .unwrap();
-    assert_eq!(
-        result.mode,
-        ContextMode::Lexical {
-            reason: "pilot module answered for another generation".into()
-        }
-    );
-    assert!(result.generation.is_none() && result.definitions.is_none());
-    assert!(
-        !live.is_alive(),
-        "a reply for another generation retires the session"
-    );
-    assert_eq!(
-        live.remote_fault(),
-        Some("pilot module answered for another generation"),
-        "and is a module fault its owner turns into a typed refusal"
-    );
+    // Another generation, and semantic evidence without any generation (0 = null here).
+    for generation in [7, 0] {
+        let (mut live, _) = remote_session(reply(generation, 2)).await;
+        let result = live
+            .session
+            .context(&observation("a", 2), b"a", query)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.mode,
+            ContextMode::Lexical {
+                reason: "pilot module answered for another generation".into()
+            }
+        );
+        assert!(result.generation.is_none() && result.definitions.is_none());
+        assert!(
+            !live.is_alive(),
+            "a reply for another generation retires the session"
+        );
+        assert_eq!(
+            live.remote_fault(),
+            Some("pilot module answered for another generation"),
+            "and is a module fault its owner turns into a typed refusal"
+        );
+    }
 }
