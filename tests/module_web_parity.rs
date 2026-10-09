@@ -37,6 +37,18 @@ fn fixture() -> Fixture {
             ),
             ("polyfill.js", "export {};\n"),
             ("box.module.css", ".panel { color: red; }\n"),
+            (
+                "page.htm",
+                "<main id=\"m\" class=\"btn\"><a href=\"#m\">x</a></main>\n",
+            ),
+            (
+                "tone.sass",
+                ".tone\n  color: red\n  &-dark\n    color: black\n",
+            ),
+            (
+                "tone.less",
+                "@c: red;\n.tone { color: @c; .inner { margin: 0; } }\n",
+            ),
         ],
         json!([]),
     )
@@ -49,6 +61,11 @@ fn calls() -> Vec<(&'static str, Value)> {
         ("ide.outline", json!({"path":"styles.css"})),
         ("ide.outline", json!({"path":"theme.scss"})),
         ("ide.outline", json!({"path":"box.module.css"})),
+        ("ide.outline", json!({"path":"page.htm"})),
+        ("ide.outline", json!({"path":"tone.sass"})),
+        ("ide.outline", json!({"path":"tone.less"})),
+        ("ide.read", json!({"symbol":"page.htm#main#m"})),
+        ("ide.read", json!({"path":"tone.sass","lines":"1-2"})),
         ("ide.read", json!({"symbol":"styles.css#.btn"})),
         ("ide.read", json!({"symbol":"index.html#main#main"})),
         ("ide.read", json!({"path":"index.html","lines":"1-6"})),
@@ -129,7 +146,7 @@ async fn web_edits_match_in_process_results() {
         json!({"operation_id":"html-insert","op":"insert","symbol":"index.html#main#main","where":"after","content":"<footer></footer>"}),
         json!({"operation_id":"html-delete","op":"delete","symbol":"index.html#main#main"}),
     ];
-    let mut outcomes: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+    let mut outcomes: Vec<(Vec<String>, Vec<String>, Vec<Value>)> = Vec::new();
     for env in [&[IN_PROCESS][..], &[][..]] {
         let fixture = fixture();
         let _daemon = Daemon::start(&fixture, env).await;
@@ -140,10 +157,11 @@ async fn web_edits_match_in_process_results() {
                 .call(&fixture, "ide.outline", json!({"path":path}))
                 .await;
         }
-        let mut replies = Vec::new();
+        let (mut replies, mut raw) = (Vec::new(), Vec::new());
         for edit in &edits {
             let reply = session.call(&fixture, "ide.edit", edit.clone()).await;
             replies.push(line("ide.edit", edit, &reply));
+            raw.push(reply);
         }
         // A line edit proves its source with the reference of a fresh read.
         let read = session
@@ -157,20 +175,44 @@ async fn web_edits_match_in_process_results() {
             "source_ref":read["detail_ref"],"content":"<!DOCTYPE html>"});
         let reply = session.call(&fixture, "ide.edit", edit.clone()).await;
         replies.push(line("ide.edit", &edit, &reply));
+        raw.push(reply);
         let files = ["index.html", "styles.css"]
             .iter()
             .map(|name| std::fs::read_to_string(fixture.root.join(name)).unwrap())
             .collect();
         session.close(&fixture).await;
-        outcomes.push((replies, files));
+        outcomes.push((replies, files, raw));
     }
     parity::assert_parity(&outcomes[0].0, &outcomes[1].0);
     assert_eq!(outcomes[0].1, outcomes[1].1, "the edited files differ");
-    assert!(
-        outcomes[0].0[2].contains("unsupported") || outcomes[0].0[2].contains("insert"),
-        "HTML insertion stays refused: {}",
-        outcomes[0].0[2]
-    );
+    for (_, files, raw) in &outcomes {
+        // CSS insertion, replacement and the HTML deletion and line edit are real edits ...
+        for at in [0, 1, 3, 4] {
+            assert_eq!(raw[at]["state"], "edit", "edit {at}: {}", raw[at]);
+        }
+        // ... HTML insertion is refused: no edit state and the document gained no footer.
+        assert_ne!(
+            raw[2]["state"], "edit",
+            "HTML insertion stays unsupported: {}",
+            raw[2]
+        );
+        assert!(!files[0].contains("<footer>"), "{}", files[0]);
+        // The CSS file really holds the inserted rule after `.btn` and the replaced rule.
+        let css = &files[1];
+        let added = css
+            .find(".added { color: red; }")
+            .expect("the inserted rule");
+        let btn = css.find(".btn {").expect("the .btn rule");
+        assert!(btn < added, "inserted after .btn:\n{css}");
+        assert!(css.contains(".layout .btn { margin: 1px; }"), "{css}");
+        assert!(
+            !css.contains(".layout .btn {\n"),
+            "the old body is gone:\n{css}"
+        );
+        // The HTML file lost its <main> and starts with the new first line.
+        assert!(files[0].starts_with("<!DOCTYPE html>"), "{}", files[0]);
+        assert!(!files[0].contains("<main"), "{}", files[0]);
+    }
 }
 
 /// `kill -9` of the idle HTML module: the style sheets' facts keep answering at once, the next
