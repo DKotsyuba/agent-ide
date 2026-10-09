@@ -167,8 +167,24 @@ struct PyrightLive {
     live: LiveSession,
     /// Interpreter the session was started with, `None` when no environment resolved.
     interpreter: Option<PathBuf>,
+    /// Pyright runs in the analyzer module, which resolved the interpreter and summarized a
+    /// missing environment's import flood itself.
+    in_module: bool,
     /// Shared-resolver identity of that environment; a different identity at use restarts.
     environment: String,
+}
+
+/// The identity of the module's environment resolutions of `worktree` (every project root's),
+/// computed in the module; `unavailable` when the module could not answer.
+async fn module_environment(worktree: &std::path::Path) -> String {
+    match agent_ide_core::modules::calls::environments(crate::LANGUAGE, worktree).await {
+        Ok(environments) => environments
+            .iter()
+            .map(|environment| environment.identity.as_str())
+            .collect::<Vec<_>>()
+            .join(";"),
+        Err(_) => "unavailable".to_owned(),
+    }
 }
 
 /// Whether a live session started for `started` may keep serving a worktree whose environment
@@ -204,8 +220,14 @@ impl PyrightBackend {
         source: &SourceObservation,
     ) -> Result<(), FailureCode> {
         let binding = job.binding().clone();
-        let (interpreter, environment) =
-            crate::environment::session(source.worktree().worktree_path());
+        let worktree_path = source.worktree().worktree_path();
+        // In module mode the module resolves the interpreter and import roots itself; the
+        // session restarts when any of the module's environment resolutions changes identity.
+        let module = agent_ide_core::modules::calls::module_executable(crate::LANGUAGE);
+        let (interpreter, environment) = match &module {
+            Some(_) => (None, module_environment(worktree_path).await),
+            None => crate::environment::session(worktree_path),
+        };
         if self.live.get(&binding).is_some_and(|entry| {
             keeps_session(entry.live.is_alive(), &entry.environment, &environment)
         }) {
@@ -218,9 +240,12 @@ impl PyrightBackend {
             .options::<PyrightLaunchOptions>()
             .and_then(|options| options.node.as_ref())
             .ok_or(FailureCode::ExecutionProfile)?;
-        let extra_paths = crate::support::import_roots(source.worktree().worktree_path());
-        // M-011 pilot: the same accepted identities, handed to the external analyzer module.
-        let pilot = crate::pilot::enabled().then(|| crate::pilot::ProviderParams {
+        let extra_paths = match &module {
+            Some(_) => Vec::new(),
+            None => crate::support::import_roots(worktree_path),
+        };
+        // The same accepted identities, handed to the analyzer module that starts Pyright.
+        let settings = crate::module::AnalyzerSettings {
             binary: launch.executable.path.clone(),
             script_digest: launch.executable.blake3.clone(),
             version: launch.executable.identity.clone(),
@@ -229,9 +254,11 @@ impl PyrightBackend {
             node_identity: node.identity.clone(),
             trust: launch.trust.clone(),
             cache_namespace: cache_namespace.clone(),
-            interpreter: interpreter.clone(),
-            environment: environment.clone(),
-            extra_paths: extra_paths.clone(),
+        };
+        let module_program = module.as_ref().map(|executable| AcceptedExecutable {
+            path: executable.path.clone(),
+            identity: "agent-ide-module".to_owned(),
+            blake3: executable.digest.to_hex().to_string(),
         });
         let profile = PyrightProfile::new(PyrightProfileIdentity {
             binary: launch.executable.path.clone(),
@@ -253,16 +280,17 @@ impl PyrightBackend {
             server::execution_authority(&authority)?,
         )
         .map_err(|_| FailureCode::WorkspaceAuthority)?;
-        let (command, program) = match &pilot {
-            Some(params) => {
-                let module =
-                    crate::pilot::module_executable().ok_or(FailureCode::ExecutionProfile)?;
-                let command =
-                    crate::pilot::analyzer_command(module, &worktree, &params.cache_namespace)
-                        .ok_or(FailureCode::ExecutionProfile)?;
-                (command, module)
-            }
-            None => (
+        let (command, program) = match (&module, &module_program) {
+            (Some(executable), Some(program)) => (
+                agent_ide_core::modules::analyzer::analyzer_command(
+                    executable,
+                    crate::DESCRIPTOR.id,
+                    worktree.worktree(),
+                )
+                .ok_or(FailureCode::ExecutionProfile)?,
+                program,
+            ),
+            _ => (
                 profile
                     .command(&worktree)
                     .map_err(|_| FailureCode::ExecutionProfile)?,
@@ -341,17 +369,29 @@ impl PyrightBackend {
                     view: generation,
                 };
                 let open = async {
-                    match pilot {
-                        Some(params) => {
-                            LiveSession::open_remote(
+                    match &module {
+                        Some(executable) => {
+                            let offer = agent_ide_core::modules::analyzer::analyzer_offer(
+                                executable,
+                                crate::DESCRIPTOR.id,
+                                generation.backend,
+                                source.worktree(),
+                                vec![
+                                    (settings.node.clone(), settings.node_digest.clone()),
+                                    (settings.binary.clone(), settings.script_digest.clone()),
+                                ],
+                                Duration::from_secs(30),
+                                serde_json::json!(settings),
+                            );
+                            agent_ide_core::modules::analyzer::open_session(
                                 stdout,
                                 stdin,
+                                offer,
                                 source.worktree().clone(),
                                 source.authority_epoch(),
                                 generation,
                                 ProviderSettings::new(profile),
-                                Duration::from_secs(30),
-                                serde_json::json!(params),
+                                agent_ide_core::modules::router::budget_or(Duration::from_secs(30)),
                             )
                             .await
                         }
@@ -383,6 +423,7 @@ impl PyrightBackend {
                         view,
                         live,
                         interpreter,
+                        in_module: module.is_some(),
                         environment,
                     },
                 );
@@ -427,8 +468,8 @@ impl PyrightBackend {
             let entry = self.live.get_mut(&binding).ok_or(FailureCode::Internal)?;
             let (result, diagnostics) =
                 server::exchange_context(&mut entry.live, job, source, bytes, query, true).await;
-            // M-011 pilot: a module fault is a typed refusal naming it, never a quiet lexical
-            // answer; the next call starts a fresh module.
+            // A module fault is a typed refusal naming it, never a quiet lexical answer; the
+            // next call starts a fresh module.
             if let Some(fault) = entry.live.remote_fault().map(str::to_owned) {
                 self.release(host, &binding).await;
                 job.set_stage_failure(
@@ -437,7 +478,11 @@ impl PyrightBackend {
                 );
                 return Err(FailureCode::ProviderUnavailable);
             }
-            (result, diagnostics, entry.interpreter.is_none())
+            (
+                result,
+                diagnostics,
+                entry.interpreter.is_none() && !entry.in_module,
+            )
         };
         let context = match result {
             Ok(context) => context,
@@ -571,7 +616,7 @@ const IMPORT_RESOLUTION_RULES: [&str; 2] = ["reportMissingImports", "reportMissi
 /// [`MISSING_ENVIRONMENT_IMPORTS`] line; the caller has already established that the worktree
 /// has no Python environment. Diagnostics of every other rule survive untouched, and the line is
 /// appended after them, so an edit reply says why its imports were not checked exactly once.
-fn summarize_missing_environment(
+pub(crate) fn summarize_missing_environment(
     diagnostics: &mut agent_ide_core::intelligence::session::DiagnosticSnapshot,
 ) {
     if !diagnostics.diagnostics.iter().any(is_import_resolution) {

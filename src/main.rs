@@ -40,16 +40,6 @@ use tokio::sync::Mutex;
 async fn main() -> ExitCode {
     agent_ide::languages::install();
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    // M-011 phase-2b pilot: the hidden external-module mode (stdout is its framed protocol); it
-    // is never listed and runs only when the daemon's opt-in flag spawns it.
-    if let [mode, role] = arguments.as_slice()
-        && mode == "module-pilot"
-    {
-        return match agent_ide_lang_python::pilot::run_module(&role.to_string_lossy()).await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(_) => ExitCode::FAILURE,
-        };
-    }
     // Bundled language modules (internal `bundled-module/0`): hidden, never listed, started only
     // by the daemon's module host; stdout is the framed protocol.
     if let [mode, language, role] = arguments.as_slice()
@@ -658,7 +648,7 @@ async fn serve_bundled_module(language: &str, role: &str) -> ExitCode {
     // task wraps it with its provider and checks.
     let support = SupportServer::new(registered, env!("CARGO_PKG_VERSION"));
     let served = match language {
-        "python" => serve_stdio(support, role).await,
+        "python" => agent_ide_lang_python::module::serve(role).await,
         "rust" => serve_stdio(support, role).await,
         "typescript" => serve_stdio(support, role).await,
         "html" => serve_stdio(support, role).await,

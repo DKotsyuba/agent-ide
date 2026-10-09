@@ -71,11 +71,21 @@ pub mod languages {
         notice: "Go support was removed in 0.10.8; the gopls provider entry is ignored",
     }];
 
+    /// Languages whose bundled module ships default-on in this release; the others compute in
+    /// process. `AGENT_IDE_LANGUAGE_MODE=<id>=in_process` sends a shipped one back.
+    pub const SHIPPED_MODULES: [&str; 1] = ["python"];
+
+    /// Each language's effect recipes: the only processes its module may ask the core to run.
+    pub static RECIPES: [(&str, &[agent_ide_core::modules::payload::EffectRecipe]); 1] =
+        [("python", agent_ide_lang_python::module::RECIPES)];
+
     /// Registers every bundled language for this process. Idempotent; call it before parsing a
     /// launcher configuration or mapping any path to a language.
     pub fn install() {
         crate::lang::install(&ALL);
         crate::assistance::launcher::install_retired_settings(&RETIRED_SETTINGS);
+        agent_ide_core::modules::router::ship(&SHIPPED_MODULES);
+        agent_ide_core::modules::recipe::declare(&RECIPES);
     }
 }
 

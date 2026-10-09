@@ -39,6 +39,8 @@ pub struct ModuleRemote {
     channel: HostChannel,
     /// Whether the module declared call hierarchy support.
     calls: bool,
+    /// The typed `module_unavailable` that failed this session, once one did.
+    pub(super) fault: Option<String>,
 }
 
 impl ModuleRemote {
@@ -173,8 +175,11 @@ impl LiveSession {
             deadline: tokio::time::Instant::now() + Duration::from_secs(60 * 60 * 24 * 3650),
             sequence: 0,
             version: 0,
-            remote: None,
-            module: Some(Box::new(ModuleRemote { channel, calls })),
+            module: Some(Box::new(ModuleRemote {
+                channel,
+                calls,
+                fault: None,
+            })),
         };
         Ok(Self { session, driver })
     }
@@ -257,6 +262,7 @@ impl Session {
             Ok(reply) => reply,
             Err(failure) => {
                 self.state.lock().expect("session lock").invalidate();
+                remote.fault = Some(failure.to_string());
                 return Err(io::Error::other(failure.to_string()));
             }
         };
@@ -266,12 +272,16 @@ impl Session {
                 io::Error::new(io::ErrorKind::InvalidData, "module reply ill-typed")
             }),
             Outcome::Error(error) => Err(io::Error::other(match error.unavailable {
-                Some(unavailable) => format!(
-                    "module_unavailable ({}:{}:{})",
-                    remote.channel.offer().module_id,
-                    unavailable.stage,
-                    unavailable.cause
-                ),
+                Some(unavailable) => {
+                    let fault = format!(
+                        "module_unavailable ({}:{}:{})",
+                        remote.channel.offer().module_id,
+                        unavailable.stage,
+                        unavailable.cause
+                    );
+                    remote.fault = Some(fault.clone());
+                    fault
+                }
                 None => format!("module refused: {:?}", error.code),
             })),
         }
