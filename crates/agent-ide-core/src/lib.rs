@@ -29,6 +29,9 @@ pub mod intelligence;
 /// Language identity, registration and the support contract for the symbol-addressed tools.
 pub mod lang;
 
+/// The internal bundled-module contract: wire, payloads, module serve loop, host channel, fakes.
+pub mod modules;
+
 /// Builds and renders the language-independent project card `ide.start` shows.
 pub mod project;
 

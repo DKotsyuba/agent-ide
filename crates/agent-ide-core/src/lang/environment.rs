@@ -16,7 +16,8 @@ use std::{
 use super::Language;
 
 /// One stored environment choice for one project root of a worktree.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvSelection {
     /// The project root, relative to the worktree; empty for the worktree itself.
     pub root: PathBuf,
@@ -25,7 +26,8 @@ pub struct EnvSelection {
 }
 
 /// One environment a language found for a project root.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvCandidate {
     /// What the card shows and an agent may pass back as a selector: `.venv-py314`.
     pub label: String,
@@ -38,7 +40,8 @@ pub struct EnvCandidate {
 }
 
 /// Why a project root uses its chosen environment.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum EnvSource {
     /// An agent chose it through `ide.start environment`.
     Selected,
@@ -52,7 +55,8 @@ pub enum EnvSource {
 
 /// The single answer of one language's resolver for one project root; every consumer (card,
 /// project check, language server session, test and format commands) uses the same answer.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResolvedEnv {
     /// The project root, relative to the worktree; empty for the worktree itself.
     pub root: PathBuf,
@@ -72,7 +76,8 @@ pub struct ResolvedEnv {
 }
 
 /// How one command (a test or formatter run) must start inside a resolved environment.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandEnv {
     /// Replaces the command's program with an interpreter/module or pinned executable. The
     /// command's remaining arguments follow unchanged.

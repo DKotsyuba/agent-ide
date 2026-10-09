@@ -10,7 +10,10 @@ use std::{
 };
 
 /// Parsed symbol address; `file` is relative to the project root.
-#[derive(Clone, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(deny_unknown_fields)]
 pub struct SymbolPath {
     file: Option<PathBuf>,
     segments: Vec<String>,

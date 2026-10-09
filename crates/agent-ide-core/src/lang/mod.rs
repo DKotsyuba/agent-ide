@@ -236,7 +236,7 @@ impl<'de> serde::Deserialize<'de> for Language {
 }
 
 /// Closed symbol kinds shared by every language; language-specific kinds map onto the nearest one.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SymbolKind {
     Module,
     Namespace,
@@ -326,7 +326,10 @@ impl SymbolKind {
 }
 
 /// Inclusive 1-based line range, the unit every reply prints and every edit replaces.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(deny_unknown_fields)]
 pub struct LineRange {
     pub start: u32,
     pub end: u32,
@@ -367,7 +370,8 @@ impl fmt::Display for LineRange {
 /// `range` starts at the symbol's header (doc comments, attributes, decorators, JSDoc) so that
 /// reading, replacing and deleting the symbol always moves its documentation with it. `body`
 /// is the range the language server reported for the declaration itself; `range.start <= body.start`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Symbol {
     pub path: SymbolPath,
     pub kind: SymbolKind,
@@ -392,7 +396,8 @@ impl Symbol {
 }
 
 /// Skeleton of one file: every normalized symbol with its members, no bodies.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Outline {
     pub file: PathBuf,
     pub language: Language,
@@ -446,7 +451,7 @@ impl Outline {
 }
 
 /// Where new code goes relative to an anchor symbol.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum InsertWhere {
     /// Immediately before the anchor's header.
     Before,
@@ -459,7 +464,8 @@ pub enum InsertWhere {
 }
 
 /// Exact insertion point computed by the language module.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InsertSite {
     /// New code is inserted before this 1-based line (`line_count + 1` appends).
     pub line: u32,
@@ -472,7 +478,8 @@ pub struct InsertSite {
 }
 
 /// What `ide.test` was asked to run.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TestTarget {
     /// Tests that reference this symbol (the caller resolves references; the language module maps
     /// them onto test identifiers and a command).
@@ -487,7 +494,8 @@ pub enum TestTarget {
 }
 
 /// One test the runner can address by name.
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestId {
     pub file: PathBuf,
     /// Runner-specific identifier: `assistance::worker::tests::stop_cancels_queue`,
@@ -496,7 +504,8 @@ pub struct TestId {
 }
 
 /// Command that runs a selection, plus the identifiers it is expected to cover.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestSelection {
     pub tests: Vec<TestId>,
     /// argv, program first; run from the project root.
@@ -504,7 +513,8 @@ pub struct TestSelection {
 }
 
 /// One failed test as the runner reported it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestFailure {
     pub name: String,
     /// `file:line` when the runner names one.
@@ -515,7 +525,8 @@ pub struct TestFailure {
 }
 
 /// Parsed runner output; counts are what the runner printed, never inferred from silence.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestReport {
     pub passed: u32,
     pub failed: u32,
@@ -526,7 +537,8 @@ pub struct TestReport {
 }
 
 /// Structural verdict for a candidate file text, used to refuse a broken edit before any write.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum SyntaxVerdict {
     /// The text parses structurally.
     Clean,
@@ -537,7 +549,7 @@ pub enum SyntaxVerdict {
 }
 
 /// Where a project command came from; replies print it so the agent knows how far to trust it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CommandSource {
     /// A `key: command` line inside the ` ```agent-ide ` fenced block in `AGENTS.md`.
     Agents,
@@ -566,14 +578,16 @@ impl CommandSource {
 }
 
 /// One project command with its provenance.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectCommand {
     pub argv: Vec<String>,
     pub source: CommandSource,
 }
 
 /// The commands a language module knows for a project; `None` means the project has none.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectCommands {
     pub build: Option<ProjectCommand>,
     pub check: Option<ProjectCommand>,
@@ -584,7 +598,8 @@ pub struct ProjectCommands {
 }
 
 /// One language's view of a project root.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LanguageProject {
     pub language: Language,
     /// Manifest files that established the project, relative to the root.
@@ -602,7 +617,8 @@ pub struct LanguageProject {
 /// program and the absolute module it runs, resolved by the worker from the effective launcher
 /// configuration for that language's server. Both are opaque paths here; the owning language
 /// decides how its probe uses them (see [`LanguageSupport::syntax_probe_command`]).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProbePrograms {
     /// Absolute program that runs the module.
     pub program: PathBuf,
@@ -611,7 +627,7 @@ pub struct ProbePrograms {
 }
 
 /// Failures a language module reports; the reply layer maps them onto closed failure codes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LangError {
     /// The anchor or target symbol is not in the outline.
     UnknownSymbol(SymbolPath),
