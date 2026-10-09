@@ -13,6 +13,7 @@
 //! - [`fake`](crate::modules::fake): a fake module and fake host for conformance tests.
 //! - [`mode`](crate::modules::mode): the `AGENT_IDE_LANGUAGE_MODE` fallback switch.
 //! - [`recipe`](crate::modules::recipe): core expansion of effect recipes into run specifications.
+//! - [`runtime`](crate::modules::runtime): supervision of one instance slot.
 //!
 //! # Growth beyond version 0: linters and debugging
 //!
@@ -39,5 +40,6 @@ pub mod host;
 pub mod mode;
 pub mod payload;
 pub mod recipe;
+pub mod runtime;
 pub mod serve;
 pub mod wire;

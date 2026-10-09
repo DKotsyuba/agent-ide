@@ -190,6 +190,24 @@ impl HostChannel {
         self.fault
     }
 
+    /// Checks an idle channel without waiting: a closed stream (the module exited while idle) or
+    /// an unsolicited frame poisons it. Returns the fault, if any.
+    pub fn idle_fault(&mut self) -> Option<(Stage, Cause)> {
+        if self.fault.is_none() && !self.in_flight {
+            let cause = match self.frames.try_recv() {
+                Err(mpsc::error::TryRecvError::Empty) => None,
+                Err(mpsc::error::TryRecvError::Disconnected) => Some(Cause::Exited),
+                Ok(Err(error)) => Some(wire_cause(&error)),
+                Ok(Ok(_)) => Some(Cause::Malformed),
+            };
+            if let Some(cause) = cause {
+                self.poison(Stage::Request, cause);
+            }
+        }
+        self.fault
+            .or(self.in_flight.then_some((Stage::Request, Cause::Timeout)))
+    }
+
     /// Records the first fault and returns its typed failure.
     pub fn poison(&mut self, stage: Stage, cause: Cause) -> ModuleUnavailable {
         let (stage, cause) = *self.fault.get_or_insert((stage, cause));
