@@ -268,6 +268,7 @@ async fn unversioned_diagnostics_require_unchanged_initial_open() {
         deadline: Instant::now() + Duration::from_secs(1),
         sequence: 1,
         version: 2,
+        remote: None,
     };
     assert_eq!(
         session

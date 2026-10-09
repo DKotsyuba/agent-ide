@@ -15,8 +15,9 @@ use std::time::Duration;
 use super::BoxFuture;
 use crate::execution::seatbelt::{ReadDeny, SeatbeltPolicy, run_confined};
 
-/// One confined process invocation requested by a checker.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One confined process invocation requested by a checker. Serializable only so the M-011
+/// pilot's external checker can hand it back to the core for execution.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct RunSpec {
     /// Absolute executable path.
     pub program: PathBuf,
@@ -39,7 +40,7 @@ pub struct RunSpec {
 }
 
 /// Captured result of one confined run.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct RunOutput {
     /// Exit status code; `None` when the process was killed by a signal or the timeout.
     pub status: Option<i32>,
