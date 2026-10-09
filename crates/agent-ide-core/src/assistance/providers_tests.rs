@@ -701,3 +701,75 @@ fn a_restarted_daemon_adopts_the_namespace_and_retention_retires_it() {
     assert!(!namespace.exists());
     fs::remove_dir_all(home).unwrap();
 }
+
+/// A declaration like [`launch`] with a chosen server digest and an optional companion program
+/// (the stand-in for a language's compiler or interpreter).
+fn launch_with_programs(
+    server_digest: &str,
+    companion: Option<(&str, &str, &str)>,
+) -> super::ProviderLaunch {
+    crate::lang::testing::install();
+    let mut declaration = serde_json::json!({
+        "executable": {
+            "path": "/usr/bin/git",
+            "identity": "exe-1",
+            "blake3": server_digest,
+        },
+        "settings": "fixture_epsilon",
+        "toolchain": "stable",
+        "trust": "trust-1",
+        "cache_namespace": "ns",
+    });
+    if let Some((path, identity, digest)) = companion {
+        declaration["companion"] =
+            serde_json::json!({"path": path, "identity": identity, "blake3": digest});
+    }
+    serde_json::from_value(declaration).unwrap()
+}
+
+/// The selector (`stable`), the identity labels and the namespace name stay put while a program
+/// the launch runs is replaced: a different measured server digest, or a different compiler path,
+/// identity or digest, still derives another namespace.
+#[test]
+fn the_namespace_key_fences_the_measured_programs_not_just_their_labels() {
+    let path = temporary();
+    fs::create_dir_all(&path).unwrap();
+    let tree = worktree(&path);
+    let zero = "0".repeat(64);
+    let one = "1".repeat(64);
+    let base = launch_with_programs(&zero, Some(("/usr/bin/true", "rustc 1.98.1", &zero)));
+    let key = key_of(&tree, &base, "configuration-1");
+    assert_eq!(
+        key,
+        key_of(
+            &tree,
+            &launch_with_programs(&zero, Some(("/usr/bin/true", "rustc 1.98.1", &zero))),
+            "configuration-1"
+        )
+    );
+    for (what, other) in [
+        (
+            "server digest",
+            launch_with_programs(&one, Some(("/usr/bin/true", "rustc 1.98.1", &zero))),
+        ),
+        (
+            "compiler digest",
+            launch_with_programs(&zero, Some(("/usr/bin/true", "rustc 1.98.1", &one))),
+        ),
+        (
+            "compiler identity",
+            launch_with_programs(&zero, Some(("/usr/bin/true", "rustc 1.99.0", &zero))),
+        ),
+        (
+            "compiler path",
+            launch_with_programs(&zero, Some(("/usr/bin/false", "rustc 1.98.1", &zero))),
+        ),
+        ("missing compiler", launch_with_programs(&zero, None)),
+    ] {
+        assert_ne!(
+            key,
+            key_of(&tree, &other, "configuration-1"),
+            "a changed {what}"
+        );
+    }
+}
