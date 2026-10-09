@@ -1279,9 +1279,28 @@ mod tests {
             }
             let section: ProjectRustChecksConfig = serde_json::from_value(config).unwrap();
             let in_process = checker_for(&section, Duration::from_secs(60), expected.clone());
+            // Only what the developer directory decides (home-derived values are another
+            // test's, which may move `AGENT_IDE_HOME` concurrently).
+            let developer_params = |effect: &EffectRequest| {
+                let mut params = effect.params.clone();
+                params.retain(|name, _| {
+                    [
+                        "developer",
+                        "cc",
+                        "cxx",
+                        "ar",
+                        "ranlib",
+                        "sdkroot",
+                        "linker",
+                    ]
+                    .contains(&name.as_str())
+                        || name == "linker_flag"
+                });
+                (effect.recipe.clone(), params)
+            };
             assert_eq!(
-                platform.seen.last(),
-                Some(&in_process.cargo_check_plan(&request).to_effect(&request)),
+                developer_params(platform.seen.last().unwrap()),
+                developer_params(&in_process.cargo_check_plan(&request).to_effect(&request)),
                 "{expected:?}"
             );
             if let Some(expected) = expected {
