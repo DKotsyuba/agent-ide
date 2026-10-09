@@ -52,9 +52,33 @@ impl ModuleRemote {
     }
 }
 
+/// The opaque revision a module receives for `observation`: its source revision plus a digest of
+/// the core observation (sequence and reference) that read it. Each new core observation is a new
+/// revision even for unchanged bytes, so the module's provider re-synchronizes the document and
+/// drops its held diagnostics exactly as an in-process session does on every new
+/// [`SourceBinding`](super::super::freshness::SourceBinding).
+pub(super) fn wire_revision(observation: &SourceObservation) -> String {
+    let revision = observation.source_revision().as_str();
+    let seen = blake3::hash(
+        format!(
+            "{}\0{}",
+            observation.sequence(),
+            observation.reference().as_str()
+        )
+        .as_bytes(),
+    );
+    // The wire allows 128 bytes; a revision too long for the suffix is named by its digest.
+    let revision = if revision.len() > 128 - 17 {
+        blake3::hash(revision.as_bytes()).to_hex().to_string()
+    } else {
+        revision.to_owned()
+    };
+    format!("{revision}@{}", &seen.to_hex()[..16])
+}
+
 /// One source as the module receives it.
 fn source_ref(observation: &SourceObservation, text: &str) -> (SourceRef, Vec<Attachment>) {
-    let revision = observation.source_revision().as_str().to_owned();
+    let revision = wire_revision(observation);
     if text.len() <= crate::modules::payload::MAX_INLINE_SOURCE {
         let text = if observation.bytes().is_some() {
             SourceText::Inline(text.to_owned())
@@ -556,9 +580,10 @@ impl Session {
         let found: Option<Vec<Location>> = self
             .module_call(Capability::Semantic, encode(&query), attachments)
             .await?;
+        let revision = wire_revision(observation);
         let own = Some(Own {
             path: observation.path(),
-            revision: observation.source_revision().as_str(),
+            revision: &revision,
             text: text.as_str(),
         });
         Ok(found
@@ -621,9 +646,10 @@ impl Session {
                 attachments,
             )
             .await?;
+        let revision = wire_revision(observation);
         let own = Some(Own {
             path: observation.path(),
-            revision: observation.source_revision().as_str(),
+            revision: &revision,
             text: text.as_str(),
         });
         Ok(items
@@ -848,9 +874,10 @@ impl Session {
             },
             Err(error) => Err(error),
         };
+        let revision = wire_revision(observation);
         let own = Some(Own {
             path: observation.path(),
-            revision: observation.source_revision().as_str(),
+            revision: &revision,
             text: text.as_str(),
         });
         match reply {
@@ -913,7 +940,7 @@ impl Session {
         observation: &SourceObservation,
         text: &str,
     ) {
-        let bound = evidence.revision.as_deref() == Some(observation.source_revision().as_str());
+        let bound = evidence.revision.as_deref() == Some(wire_revision(observation).as_str());
         let encoding = self.module_encoding();
         let diagnostics: Vec<lsp::Diagnostic> = if bound {
             evidence
