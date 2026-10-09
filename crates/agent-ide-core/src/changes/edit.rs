@@ -587,18 +587,9 @@ mod tests {
     use crate::app::{config::StoreConfig, store::MigrationAdmission};
     use std::{fs, time::Duration};
 
-    /// Creates one isolated SQLite path beneath the process temporary directory.
-    fn database(tag: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "agent-ide-changes-edit-{tag}-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        let _ = fs::remove_file(&path);
-        path
+    /// Creates one isolated SQLite path whose whole scratch directory is removed on drop.
+    fn database(tag: &str) -> crate::scratch::ScratchDatabase {
+        crate::scratch::ScratchDatabase::new(&format!("changes-edit-{tag}"))
     }
 
     /// Returns finite Store settings suitable for receipt and restart tests.

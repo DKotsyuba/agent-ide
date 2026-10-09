@@ -9,12 +9,16 @@ use agent_ide::checks::{
 };
 use agent_ide::execution::seatbelt::ReadDeny;
 use agent_ide::retention::{Fate, Reason, Report, sweep_with};
+use support::Scratch;
 use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+#[path = "support/scratch.rs"]
+mod support;
 
 /// Scripted [`Checker`] that records every request, tracks live concurrency through an RAII
 /// guard held across its (optional) delay, and echoes the request's `input_generation` into the
@@ -153,26 +157,28 @@ impl Checker for RecordingChecker {
 /// Creates a fresh empty scratch directory under the system temporary directory, suitable for
 /// use both as a scheduler cache root and as a fake worktree path (it only needs to exist so
 /// `std::fs::canonicalize` succeeds).
-fn scratch_dir(name: &str) -> PathBuf {
-    // Below one private per-process directory: a cache root's parent holds the retention leases
-    // and must not be group or world writable, whatever the system temporary directory is.
+fn scratch_dir(name: &str) -> Scratch {
+    // Below one private per-call root: a cache root's parent holds the retention leases and must
+    // not be group or world writable, whatever the system temporary directory is. The root is
+    // the unit the guard removes, so the lease state beside the cache root goes with it.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let base = std::env::temp_dir().join(format!(
-        "agent-ide-scheduler-contract-{}",
-        std::process::id()
+        "agent-ide-scheduler-contract-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&base).unwrap();
     std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let dir = base.join(format!("{name}-{}", name.len()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = base.join(name);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    dir
+    Scratch::own_tree(base, dir)
 }
 
 /// Builds a scratch worktree that is present for `language` (T10B), so tests exercising the
 /// scheduler through `RecordingChecker` are not short-circuited by the presence gate meant for
 /// real per-language checkers.
-fn scratch_worktree(name: &str, language: Language) -> PathBuf {
+fn scratch_worktree(name: &str, language: Language) -> Scratch {
     let dir = scratch_dir(name);
     if language == agent_ide::languages::RUST {
         std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
@@ -185,7 +191,7 @@ fn scratch_worktree(name: &str, language: Language) -> PathBuf {
 }
 
 /// Builds a scratch worktree present for both languages (T10B).
-fn scratch_worktree_both_languages(name: &str) -> PathBuf {
+fn scratch_worktree_both_languages(name: &str) -> Scratch {
     let dir = scratch_dir(name);
     std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
     std::fs::write(dir.join("pyproject.toml"), "").unwrap();
@@ -262,7 +268,7 @@ async fn scheduler_burst_of_triggers_debounces_to_one_check() {
         vec![Arc::new(checker.clone())],
         Duration::from_millis(50),
         2,
-        cache_root,
+        cache_root.path(),
     );
 
     for _ in 0..10 {
@@ -294,7 +300,7 @@ async fn scheduler_trigger_during_running_check_causes_one_extra_run_with_newest
         vec![Arc::new(checker.clone())],
         Duration::from_millis(50),
         2,
-        cache_root,
+        cache_root.path(),
     );
 
     scheduler.trigger("repo", &worktree);
@@ -341,7 +347,7 @@ async fn scheduler_dirty_rerun_with_unchanged_fingerprint_is_skipped() {
         vec![Arc::new(checker.clone())],
         Duration::from_millis(50),
         2,
-        cache_root,
+        cache_root.path(),
     )
     .with_fingerprint(constant_fingerprint(Some(7)));
 
@@ -385,7 +391,7 @@ async fn scheduler_dirty_rerun_with_changed_fingerprint_runs() {
         vec![Arc::new(checker.clone())],
         Duration::from_millis(50),
         2,
-        cache_root,
+        cache_root.path(),
     )
     .with_fingerprint(shared_fingerprint(Arc::clone(&cell)));
 
@@ -437,10 +443,10 @@ async fn scheduler_never_runs_more_than_max_concurrent_checks_across_worktrees_a
         ],
         Duration::from_millis(10),
         2,
-        cache_root,
+        cache_root.path(),
     );
 
-    let worktrees: Vec<PathBuf> = (0..5)
+    let worktrees: Vec<Scratch> = (0..5)
         .map(|i| scratch_worktree_both_languages(&format!("fanout-wt-{i}")))
         .collect();
     for worktree in &worktrees {
@@ -477,7 +483,7 @@ async fn scheduler_latest_reflects_previous_snapshot_while_a_newer_check_runs() 
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
         2,
-        cache_root,
+        cache_root.path(),
     );
 
     // Settle just past the expected completion (debounce 10ms + 200ms delay), with only a
@@ -526,7 +532,7 @@ async fn scheduler_shutdown_cancels_a_long_running_check_promptly() {
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
         2,
-        cache_root,
+        cache_root.path(),
     );
 
     scheduler.trigger("repo", &worktree);
@@ -567,7 +573,7 @@ async fn scheduler_clones_rust_target_from_sibling_worktree_of_the_same_reposito
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
         2,
-        cache_root,
+        cache_root.path(),
     );
 
     scheduler.trigger("shared-repo", &worktree_a);
@@ -627,7 +633,7 @@ async fn scheduler_skips_the_sibling_clone_when_the_source_lease_is_unavailable(
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
         2,
-        cache_root.clone(),
+        cache_root.path(),
     );
     scheduler.trigger("no-lease-repo", &worktree_a);
     advance(Duration::from_millis(30)).await;
@@ -674,7 +680,7 @@ async fn scheduler_partitions_caches_and_clones_by_policy() {
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
         2,
-        cache_root,
+        cache_root.path(),
     );
     scheduler.add_read_denies(
         &worktree_a,
@@ -739,7 +745,7 @@ async fn scheduler_fatal_or_timeout_completion_never_replaces_a_ready_snapshot()
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
         2,
-        cache_root,
+        cache_root.path(),
     );
 
     scheduler.trigger("repo", &worktree);
@@ -795,7 +801,8 @@ async fn scheduler_check_lease_keeps_retention_off_a_running_check_until_it_comp
     agent_ide::languages::install();
     let checker =
         RecordingChecker::with_delay(agent_ide::languages::PYTHON, Duration::from_secs(5));
-    let home = std::fs::canonicalize(scratch_dir("retention-home")).unwrap();
+    let home_dir = scratch_dir("retention-home");
+    let home = std::fs::canonicalize(&home_dir).unwrap();
     let worktree = scratch_worktree("retention-worktree", agent_ide::languages::PYTHON);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
@@ -831,7 +838,8 @@ async fn scheduler_cancelled_check_keeps_its_lease_for_the_process_lifetime() {
     agent_ide::languages::install();
     let checker =
         RecordingChecker::with_delay(agent_ide::languages::PYTHON, Duration::from_secs(3600));
-    let home = std::fs::canonicalize(scratch_dir("retention-cancel-home")).unwrap();
+    let home_dir = scratch_dir("retention-cancel-home");
+    let home = std::fs::canonicalize(&home_dir).unwrap();
     let worktree = scratch_worktree("retention-cancel-worktree", agent_ide::languages::PYTHON);
     let scheduler = Scheduler::new(
         vec![Arc::new(checker.clone())],
@@ -864,7 +872,7 @@ async fn scheduler_enforces_a_cooldown_of_max_debounce_and_previous_duration() {
     let checker = RecordingChecker::with_delay(agent_ide::languages::PYTHON, run_duration);
     let cache_root = scratch_dir("cooldown-cache");
     let worktree = scratch_worktree("cooldown-worktree", agent_ide::languages::PYTHON);
-    let scheduler = Scheduler::new(vec![Arc::new(checker.clone())], debounce, 2, cache_root);
+    let scheduler = Scheduler::new(vec![Arc::new(checker.clone())], debounce, 2, cache_root.path());
 
     // Settle just past the expected completion (debounce + 150ms delay), with only a small
     // margin, for the same reason as above: the cooldown budget this test exercises is measured
@@ -907,7 +915,7 @@ async fn scheduler_rust_only_worktree_checks_rust_and_reports_python_disabled() 
         ],
         Duration::from_millis(10),
         2,
-        cache_root.clone(),
+        cache_root.path(),
     );
 
     scheduler.trigger("repo", &worktree);
@@ -976,7 +984,7 @@ async fn scheduler_python_only_worktree_checks_python_and_reports_rust_disabled(
         ],
         Duration::from_millis(10),
         2,
-        cache_root,
+        cache_root.path(),
     );
 
     scheduler.trigger("repo", &worktree);
@@ -1019,7 +1027,7 @@ async fn scheduler_worktree_with_both_manifests_checks_both_languages() {
         ],
         Duration::from_millis(10),
         2,
-        cache_root,
+        cache_root.path(),
     );
 
     scheduler.trigger("repo", &worktree);
@@ -1042,6 +1050,7 @@ async fn scheduler_typescript_presence_requires_root_config() {
     let rust_checker = RecordingChecker::new(agent_ide::languages::RUST);
     let python_checker = RecordingChecker::new(agent_ide::languages::PYTHON);
     let typescript_checker = RecordingChecker::new(agent_ide::languages::TYPESCRIPT);
+    let cache_root = scratch_dir("presence-typescript-cache");
     let scheduler = Scheduler::new(
         vec![
             Arc::new(rust_checker.clone()),
@@ -1050,7 +1059,7 @@ async fn scheduler_typescript_presence_requires_root_config() {
         ],
         Duration::from_millis(10),
         2,
-        scratch_dir("presence-typescript-cache"),
+        cache_root.path(),
     );
     let configured = scratch_worktree(
         "presence-typescript-configured",
@@ -1102,7 +1111,7 @@ async fn scheduler_empty_worktree_checks_neither_language() {
         ],
         Duration::from_millis(10),
         2,
-        cache_root,
+        cache_root.path(),
     );
 
     scheduler.trigger("repo", &worktree);
@@ -1131,7 +1140,7 @@ async fn scheduler_worktree_gaining_cargo_toml_is_checked_on_the_next_trigger() 
         vec![Arc::new(rust_checker.clone())],
         Duration::from_millis(10),
         2,
-        cache_root,
+        cache_root.path(),
     );
 
     scheduler.trigger("repo", &worktree);
@@ -1170,7 +1179,7 @@ async fn scheduler_trigger_with_unchanged_fingerprint_after_a_ready_result_skips
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
         2,
-        cache_root,
+        cache_root.path(),
     )
     .with_fingerprint(constant_fingerprint(Some(7)));
 
@@ -1216,7 +1225,7 @@ async fn scheduler_trigger_with_a_changed_fingerprint_reruns_the_check() {
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
         2,
-        cache_root,
+        cache_root.path(),
     )
     .with_fingerprint(shared_fingerprint(Arc::clone(&cell)));
 
@@ -1246,7 +1255,7 @@ async fn scheduler_activate_with_unchanged_fingerprint_still_runs() {
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
         2,
-        cache_root,
+        cache_root.path(),
     )
     .with_fingerprint(constant_fingerprint(Some(7)));
 
@@ -1282,7 +1291,7 @@ async fn scheduler_unknown_fingerprint_always_runs() {
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
         2,
-        cache_root,
+        cache_root.path(),
     )
     .with_fingerprint(constant_fingerprint(None));
 
@@ -1318,7 +1327,7 @@ async fn scheduler_trigger_after_a_fatal_completion_reruns_despite_unchanged_fin
         vec![Arc::new(checker.clone())],
         Duration::from_millis(10),
         2,
-        cache_root,
+        cache_root.path(),
     )
     .with_fingerprint(constant_fingerprint(Some(7)));
 
@@ -1350,4 +1359,29 @@ async fn scheduler_trigger_after_a_fatal_completion_reruns_despite_unchanged_fin
         2,
         "only a Ready completion arms the skip"
     );
+}
+
+/// A scratch root owns the lease state the scheduler keeps beside its cache root, after a pass
+/// and after a failing assertion alike, so nothing is left in the system temporary directory.
+#[test]
+fn scratch_roots_remove_their_lease_state_after_pass_and_failure() {
+    let seen = Mutex::new(Vec::new());
+    let body = |fail: bool| {
+        let cache_root = scratch_dir("lease-state");
+        let root = cache_root.parent().unwrap().to_path_buf();
+        // Where the scheduler's retention leases live: `<cache root parent>/locks`.
+        std::fs::create_dir_all(root.join("locks")).unwrap();
+        std::fs::write(root.join("locks/lease"), b"held").unwrap();
+        seen.lock().unwrap().push(root);
+        if fail {
+            panic!("failing test body");
+        }
+    };
+    body(false);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(true))).is_err());
+    let roots = seen.lock().unwrap().clone();
+    assert_eq!(roots.len(), 2);
+    for root in roots {
+        assert!(!root.exists(), "{root:?} survived");
+    }
 }
