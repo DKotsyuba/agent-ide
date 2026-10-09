@@ -23812,3 +23812,137 @@ async fn pilot_python_checker_faults_are_typed_and_restart() {
         drop(daemon);
     }
 }
+
+/// Resident set size of `id` in KiB, `0` once it is gone.
+fn pilot_rss_kib(id: ProcessIdentity) -> u64 {
+    let listing = std::process::Command::new("/bin/ps")
+        .args(["-o", "rss=", "-p", &id.pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&listing.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// Milliseconds of one settled call that must answer `kind`.
+async fn pilot_timed(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    tool: &str,
+    arguments: Value,
+    kind: &str,
+) -> f64 {
+    let started = std::time::Instant::now();
+    let reply = pilot_call(actor, fixture, tool, arguments).await;
+    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+    assert!(
+        reply.contains(&format!("\"complete\" \"{kind}\"")),
+        "{reply}"
+    );
+    elapsed
+}
+
+/// M-011 measurement harness, not a pass/fail contract: for the in-process path and the pilot
+/// module it records raw samples of cold session start (stop/start then the first outline),
+/// warm per-call latency of `ide.outline` (documentSymbols) and `ide.symbol` (hover plus
+/// references), and the resident memory of the daemon and its provider process tree, and
+/// writes them as JSON to `AGENT_IDE_PILOT_MEASURE_OUT`. Run it on a release build.
+#[tokio::test]
+#[ignore = "measurement; requires AGENT_IDE_PYRIGHT, AGENT_IDE_NODE, AGENT_IDE_PYTHON and AGENT_IDE_PILOT_MEASURE_OUT"]
+async fn pilot_python_measure() {
+    let out = PathBuf::from(std::env::var("AGENT_IDE_PILOT_MEASURE_OUT").unwrap());
+    let fixture = pilot_fixture("pilot-measure-cache");
+    let mut reaper = PilotReaper::default();
+    let (cold_runs, warmup, calls) = (15, 20, 200);
+    let mut report = serde_json::Map::new();
+    for mode in ["off", "python"] {
+        let (daemon, mut actor) =
+            pilot_session(&fixture, &[("AGENT_IDE_PILOT_MODULE", mode)]).await;
+        let outline = json!({"path":"main.py"});
+        let symbol = json!({"symbol":"helper.py#double"});
+        // Cold starts: the first outline after a stop starts the provider (and module).
+        let mut cold = Vec::new();
+        for run in 0..cold_runs {
+            if run > 0 {
+                let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+                actor.settle(&fixture, stopped).await;
+                let start = actor
+                    .call(
+                        &fixture,
+                        "ide.start",
+                        json!({"activation_id":"pilot-start"}),
+                    )
+                    .await;
+                actor.settle(&fixture, start).await;
+            }
+            cold.push(
+                pilot_timed(
+                    &mut actor,
+                    &fixture,
+                    "ide.outline",
+                    outline.clone(),
+                    "outline",
+                )
+                .await,
+            );
+        }
+        // Full usages prove the workspace is indexed before warm sampling.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !pilot_call(&mut actor, &fixture, "ide.symbol", symbol.clone())
+            .await
+            .contains("usages: 2 in 1 files")
+        {
+            assert!(std::time::Instant::now() < deadline, "workspace indexed");
+        }
+        let mut samples = serde_json::Map::new();
+        samples.insert("cold_outline_ms".into(), json!(cold));
+        for (name, tool, arguments, kind) in [
+            ("warm_outline_ms", "ide.outline", outline.clone(), "outline"),
+            ("warm_symbol_ms", "ide.symbol", symbol.clone(), "symbol"),
+        ] {
+            for _ in 0..warmup {
+                pilot_timed(&mut actor, &fixture, tool, arguments.clone(), kind).await;
+            }
+            let mut values = Vec::new();
+            for _ in 0..calls {
+                values.push(pilot_timed(&mut actor, &fixture, tool, arguments.clone(), kind).await);
+            }
+            samples.insert(name.into(), json!(values));
+        }
+        let problems = pilot_problems(&mut actor, &fixture).await;
+        assert!(problems.contains("python: ready"), "{problems}");
+        let daemon_pid = daemon.id().unwrap() as libc::pid_t;
+        let daemon_id = ProcessIdentity::of(daemon_pid).unwrap().0;
+        let mut tree = vec![("daemon".to_owned(), daemon_id)];
+        for child in ProcessIdentity::children_of(daemon_pid) {
+            let command = pilot_command(child);
+            reaper.0.push(child);
+            for grandchild in pilot_children(child) {
+                reaper.0.push(grandchild);
+                tree.push((format!("  {}", pilot_command(grandchild)), grandchild));
+            }
+            tree.push((command, child));
+        }
+        let memory: Vec<Value> = tree
+            .iter()
+            .map(|(command, id)| json!({"process": command, "rss_kib": pilot_rss_kib(*id)}))
+            .collect();
+        samples.insert("rss".into(), json!(memory));
+        report.insert(mode.into(), Value::Object(samples));
+        let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+        actor.settle(&fixture, stopped).await;
+        actor.mcp.close().await;
+        drop(daemon);
+    }
+    report.insert(
+        "method".into(),
+        json!({"cold_runs": cold_runs, "warmup": warmup, "calls": calls,
+               "clock": "wall time of one settled MCP tools/call round trip measured in the test process"}),
+    );
+    std::fs::write(
+        &out,
+        serde_json::to_vec_pretty(&Value::Object(report)).unwrap(),
+    )
+    .unwrap();
+}
