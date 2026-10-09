@@ -28,8 +28,8 @@ use serde_json::Value;
 use super::{
     adapter::SupportServer,
     contract::{
-        Capability, CapabilityDecl, Cause, Declaration, ErrorCode, HelloOffer, Readiness, Stage,
-        Support,
+        Capability, CapabilityDecl, Cause, Coverage, Declaration, ErrorCode, HelloOffer, Readiness,
+        Stage, Support,
     },
     payload::{
         Call, CallItem, CallsQuery, ContextEvidence, Diagnostic, DiagnosticsEvidence, EditProposal,
@@ -881,12 +881,22 @@ impl<B: ProviderBuilder> ModuleServer for ProviderServer<B> {
         }
         Ok(match self.provider_answer(&request).await {
             // The answer carries the hosted provider's own readiness, never a blanket ready.
-            Ok(value) => Answer {
-                readiness: self.hosted.as_ref().map_or(Readiness::Ready, |hosted| {
+            Ok(value) => {
+                let readiness = self.hosted.as_ref().map_or(Readiness::Ready, |hosted| {
                     hosted.live.session.module_readiness_of()
-                }),
-                ..Answer::result(value)
-            },
+                });
+                Answer {
+                    readiness,
+                    // A provider that is still loading or failed to load its workspace may have
+                    // considered only part of it: never a complete answer.
+                    coverage: if readiness == Readiness::Ready {
+                        Coverage::Complete
+                    } else {
+                        Coverage::Partial
+                    },
+                    ..Answer::result(value)
+                }
+            }
             Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
                 Answer::error(ErrorCode::InvalidRequest, error.to_string())
             }

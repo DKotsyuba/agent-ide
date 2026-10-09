@@ -1396,3 +1396,70 @@ async fn an_ill_typed_module_result_is_a_typed_fault() {
     );
     assert!(!live.is_alive());
 }
+
+/// A semantic answer the module marks partial (its provider warming or degraded) is never taken
+/// as complete, and its readiness becomes the session's barrier state; a later ready answer is
+/// taken whole and makes the barrier ready.
+#[tokio::test]
+async fn partial_module_answers_are_not_complete() {
+    use crate::modules::{
+        contract::{Coverage, Declaration, ModuleId, Readiness, Role},
+        fake::{FakeModule, in_memory, offer},
+        serve::{Answer, Effects, Incoming, ModuleServer, ServeError},
+    };
+    /// Answers like the fake, first warming and partial, then ready.
+    struct Warming(FakeModule, bool);
+    impl ModuleServer for Warming {
+        fn declaration(&self) -> Declaration {
+            self.0.declaration()
+        }
+        async fn call<'a>(
+            &'a mut self,
+            request: Incoming,
+            effects: Effects<'a>,
+        ) -> Result<Answer, ServeError> {
+            let mut answer = self.0.call(request, effects).await?;
+            if std::mem::replace(&mut self.1, false) {
+                answer.readiness = Readiness::Warming;
+                answer.coverage = Coverage::Partial;
+            }
+            Ok(answer)
+        }
+    }
+    crate::lang::testing::install();
+    let (channel, _) = in_memory(
+        Warming(FakeModule::new(ModuleId::bundled("alpha"), "1.0"), true),
+        offer(ModuleId::bundled("alpha"), "1.0", Role::Analyzer, 1),
+    )
+    .await
+    .unwrap();
+    let mut live = LiveSession::open_module(
+        channel,
+        true,
+        tree(),
+        1,
+        ViewGeneration {
+            backend: 1,
+            configuration: 1,
+            toolchain: 1,
+            view: 1,
+        },
+        status_settings(),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let partial = live
+        .session
+        .references(&observation("a", 2), b"a", 0)
+        .await
+        .unwrap_err();
+    assert_eq!(partial.kind(), io::ErrorKind::WouldBlock);
+    assert!(live.session.provider_readiness().is_unknown());
+    assert!(
+        live.session
+            .references(&observation("a", 3), b"a", 0)
+            .await
+            .is_ok()
+    );
+    assert!(live.session.provider_readiness().is_ready());
+}
