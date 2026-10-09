@@ -67,6 +67,7 @@ pub fn analyzer_offer(
     executable: &ModuleExecutable,
     language: &str,
     instance: u64,
+    worktree: &WorktreeRef,
     accepted: Vec<(PathBuf, String)>,
     request_timeout: Duration,
     settings: Value,
@@ -82,6 +83,7 @@ pub fn analyzer_offer(
         limits: Limits::default(),
         requested_caps: vec![Capability::Semantic, Capability::Outline],
         config: ModuleConfig {
+            worktree: Some(worktree.worktree_path().to_path_buf()),
             provider: Some(json!({
                 "grant": ProviderGrant {
                     accepted,

@@ -123,6 +123,7 @@ impl ModuleHost {
             return Ok(slot.clone());
         }
         let config = ModuleConfig {
+            worktree: Some(worktree.to_path_buf()),
             provider: None,
             checks: None,
             env: MODULE_ENV
