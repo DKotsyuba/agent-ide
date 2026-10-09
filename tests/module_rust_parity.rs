@@ -213,12 +213,16 @@ fn descendants(pid: libc::pid_t) -> Vec<(ProcessIdentity, String)> {
 
 /// The analyzer module that hosts rust-analyzer, with that child.
 fn analyzer(tree: &ProcessTree) -> Option<(parity::Node, ProcessIdentity)> {
-    let module = tree.module("rust", "analyzer")?;
-    let server = module
-        .children
+    tree.children
         .iter()
-        .find(|(_, command)| command.contains("rust-analyzer"))?;
-    Some((module.clone(), server.0))
+        .filter(|node| node.command.ends_with("module rust analyzer"))
+        .find_map(|module| {
+            let server = module
+                .children
+                .iter()
+                .find(|(_, command)| command.contains("rust-analyzer"))?;
+            Some((module.clone(), server.0))
+        })
 }
 
 /// The transcript of one daemon run with `env`: source-first answers, the semantic and editing
@@ -352,7 +356,8 @@ async fn a_check_report_over_two_mib_lands_equally() {
 #[tokio::test]
 #[ignore = "requires the accepted AGENT_IDE_RUST_TOOLCHAIN_DIR, AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN inputs"]
 async fn killing_the_module_while_rust_analyzer_indexes_is_typed_and_leaves_no_orphan() {
-    let fixture = rust_fixture(PARITY_FILES, "module-rust-kill", 300);
+    // No project check: the only typed fault in the reply is the analyzer's own.
+    let fixture = Fixture::new(PARITY_FILES, providers("module-rust-kill"));
     let mut daemon = Daemon::start(&fixture, &[MODULE]).await;
     let daemon_pid = daemon.pid();
     let mut session = Session::start(&fixture).await;
@@ -394,16 +399,14 @@ async fn killing_the_module_while_rust_analyzer_indexes_is_typed_and_leaves_no_o
         (fixture, reply)
     };
     let text = outcome["text"].as_str().unwrap_or_default();
-    // The symbol card keeps its definition and names why usages are missing; either way the
-    // original reply carries the module's typed fault.
+    // The symbol card keeps its definition and names why usages are missing, or the call fails
+    // whole; either way its own text names the analyzer module's typed fault.
     assert!(
         outcome["code"] == "provider_unavailable" || text.contains("usages: unavailable"),
         "the original call fails its semantic part: {outcome}"
     );
     assert!(
-        outcome
-            .to_string()
-            .contains("module_unavailable (bundled.rust:"),
+        text.contains("module_unavailable (bundled.rust:"),
         "the original call names the module fault: {outcome}"
     );
     assert_eq!(daemon.pid(), daemon_pid, "the daemon is the same process");
