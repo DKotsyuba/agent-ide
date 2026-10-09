@@ -23,11 +23,20 @@ const READER_DRAIN_GRACE: Duration = Duration::from_millis(500);
 const COMPLETED_PER_WORKTREE: usize = 4;
 
 /// One daemon's monotonically numbered test jobs, independent of host binding lifetimes.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TestRuns(
     /// Registry state shared between the daemon worker and detached process tasks.
     Arc<Mutex<State>>,
+    /// The daemon's admission controller every run is an Execution-owned job of.
+    Arc<Mutex<crate::execution::AdmissionController>>,
 );
+
+impl Default for TestRuns {
+    /// A registry with its own controller of the daemon's limits.
+    fn default() -> Self {
+        Self::new(Arc::new(Mutex::new(super::worker::admission_controller())))
+    }
+}
 
 /// Mutable run registry protected only while job metadata is read or changed.
 #[derive(Default)]
@@ -196,30 +205,12 @@ pub async fn resolve_command(
     })
 }
 
-/// Sends a best-effort process-group kill if daemon shutdown drops a running task.
-#[cfg(unix)]
-struct KillOnDrop {
-    /// Process-group identifier assigned by `process_group(0)`.
-    pid: u32,
-    /// False after the process has been waited and its group is no longer owned.
-    armed: bool,
-}
-
-#[cfg(unix)]
-impl Drop for KillOnDrop {
-    /// Kills remaining descendants without blocking the daemon task shutdown path.
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = std::process::Command::new("/bin/kill")
-                .args(["-KILL", "--", &format!("-{}", self.pid)])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-        }
-    }
-}
-
 impl TestRuns {
+    /// An empty registry whose runs are Execution-owned jobs of `admission`.
+    pub fn new(admission: Arc<Mutex<crate::execution::AdmissionController>>) -> Self {
+        Self(Arc::default(), admission)
+    }
+
     /// Starts `argv` from `root` unless that worktree already has a live job.
     #[cfg(test)]
     pub fn start(
@@ -302,7 +293,14 @@ impl TestRuns {
             };
         };
         let lease = crate::retention::SettledLease::new(Some(lease));
-        let child = match spawn_resolved(&root, &cwd, &argv, &env, resolution.resolved.as_ref()) {
+        let child = match spawn_resolved(
+            &self.1,
+            &root,
+            &cwd,
+            &argv,
+            &env,
+            resolution.resolved.as_ref(),
+        ) {
             Ok(child) => child,
             Err(error) => {
                 lease.settled();
@@ -749,7 +747,7 @@ async fn run(
     budget: Duration,
 ) -> RunResult {
     match spawn_command(root, root, argv, &[], Some(language)) {
-        Ok(child) => run_child(language, budget, child, root).await,
+        Ok(spawned) => run_child(language, budget, spawned, root).await,
         Err(error) => failed_run(budget, error.to_string()),
     }
 }
@@ -798,27 +796,44 @@ fn spawn_command(
     argv: &[String],
     env: &[(String, String)],
     language: Option<Language>,
-) -> io::Result<tokio::process::Child> {
+) -> io::Result<Spawned> {
     let resolved = argv.first().and_then(|program| match language {
         Some(language) => language.support().command_env(worktree, cwd, program),
         None => crate::lang::registered()
             .iter()
             .find_map(|language| language.support().command_env(worktree, cwd, program)),
     });
-    spawn_resolved(worktree, cwd, argv, env, resolved.as_ref())
+    spawn_resolved(
+        &Arc::new(Mutex::new(super::worker::admission_controller())),
+        worktree,
+        cwd,
+        argv,
+        env,
+        resolved.as_ref(),
+    )
 }
 
-/// Spawns argv in its resolved command environment. The worktree and cwd are already admitted.
-/// Resolver variables override caller values and its prefix leads PATH. Stdin is closed,
-/// stdout/stderr captured and a private process group permits cancellation; empty argv and OS
-/// failures return errors without a child.
+/// A started test run: the Execution-owned job and its stdout and stderr pipes.
+type Spawned = (
+    crate::execution::job::StreamedJob,
+    tokio::process::ChildStdout,
+    tokio::process::ChildStderr,
+);
+
+/// Starts argv in its resolved command environment as an Execution-owned job of `admission`,
+/// owned per worktree. The worktree and cwd are already admitted. The daemon's environment is
+/// the base; caller values override it, resolver variables override those and its prefix leads
+/// PATH. Stdin is closed and stdout/stderr are piped to the caller; empty argv, a program not on
+/// PATH (`NotFound`) and a full admission queue (`WouldBlock`) start nothing.
 fn spawn_resolved(
-    _worktree: &std::path::Path,
+    admission: &Arc<Mutex<crate::execution::AdmissionController>>,
+    worktree: &std::path::Path,
     cwd: &std::path::Path,
     argv: &[String],
     env: &[(String, String)],
     resolved: Option<&crate::lang::environment::CommandEnv>,
-) -> io::Result<tokio::process::Child> {
+) -> io::Result<Spawned> {
+    use std::ffi::OsString;
     let Some((program, args)) = argv.split_first() else {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty argv"));
     };
@@ -828,12 +843,18 @@ fn spawn_resolved(
     if prefix.is_empty() {
         prefix.push(program.into());
     }
-    let mut command = tokio::process::Command::new(&prefix[0]);
-    command
-        .args(&prefix[1..])
-        .envs(env.iter().map(|(key, value)| (key, value)));
+    let mut vars: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+    vars.extend(
+        env.iter()
+            .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+    );
     if let Some(resolved) = resolved {
-        command.envs(resolved.vars.iter().map(|(key, value)| (key, value)));
+        vars.extend(
+            resolved
+                .vars
+                .iter()
+                .map(|(key, value)| (OsString::from(key), value.clone())),
+        );
         if let Some(bin) = &resolved.path_prefix {
             let caller_path = resolved
                 .vars
@@ -848,51 +869,62 @@ fn spawn_resolved(
                         .map(|(_, value)| value.into())
                 })
                 .unwrap_or_else(|| std::env::var_os("PATH").unwrap_or_default());
-            command.env("PATH", prepend_toolchain_path(bin, &caller_path)?);
+            vars.insert("PATH".into(), prepend_toolchain_path(bin, &caller_path)?);
         }
     }
-    command
-        .args(args)
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-    command.spawn()
+    let path = vars
+        .get(std::ffi::OsStr::new("PATH"))
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let executable = crate::execution::job::executable_on(&prefix[0].to_string_lossy(), cwd, &path)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "program not found"))?;
+    let command = crate::execution::ControlledCommand::from_validated_peer(
+        crate::execution::CommandKind::Job,
+        executable,
+        prefix[1..]
+            .iter()
+            .cloned()
+            .chain(args.iter().map(OsString::from))
+            .collect(),
+        cwd.to_path_buf(),
+        vars,
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::NotFound, format!("{error:?}")))?;
+    let owner = crate::execution::OwnerId::new(format!(
+        "test:{}",
+        blake3::hash(worktree.as_os_str().as_encoded_bytes()).to_hex()
+    ))
+    .map_err(|error| io::Error::other(format!("{error:?}")))?;
+    crate::execution::job::StreamedJob::start(
+        admission,
+        owner,
+        crate::execution::AdmissionClass::Background,
+        &command,
+    )
 }
 
 /// Runs one already-spawned child, enforcing its wall-clock budget and bounded pipe drain.
 async fn run_child(
     language: Language,
     budget: Duration,
-    mut child: tokio::process::Child,
+    spawned: Spawned,
     root: &std::path::Path,
 ) -> RunResult {
     let started = tokio::time::Instant::now();
-    let mut stopped = false;
-    let process_group = child.id();
-    #[cfg(unix)]
-    let mut kill_on_drop = process_group.map(|pid| KillOnDrop { pid, armed: true });
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let (job, stdout, stderr) = spawned;
+    let mut job = Some(job);
     let combined = Arc::new(tokio::sync::Mutex::new(VecDeque::with_capacity(MAX_OUTPUT)));
-    let mut out_task = tokio::spawn(read_into_tail(stdout, combined.clone()));
-    let mut err_task = tokio::spawn(read_into_tail(stderr, combined.clone()));
-    let status = match tokio::time::timeout(budget, child.wait()).await {
-        Ok(status) => status.ok(),
-        Err(_) => {
-            stopped = true;
-            #[cfg(unix)]
-            if let Some(pid) = process_group {
-                let _ = kill_group(pid).await;
-            }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            None
-        }
+    let mut out_task = tokio::spawn(read_into_tail(Some(stdout), combined.clone()));
+    let mut err_task = tokio::spawn(read_into_tail(Some(stderr), combined.clone()));
+    let status = match job.as_mut() {
+        Some(running) => running.wait(budget).await,
+        None => None,
     };
+    // Past its budget the whole group is torn down and reaped before the pipes are drained.
+    let mut stopped = status.is_none();
+    if stopped && let Some(running) = job.take() {
+        let _ = running.finish().await;
+    }
     let reader_budget = if stopped {
         READER_DRAIN_GRACE
     } else {
@@ -904,16 +936,12 @@ async fn run_child(
     };
     if tokio::time::timeout(reader_budget, drain).await.is_err() {
         stopped = true;
-        #[cfg(unix)]
-        if let Some(pid) = process_group {
-            let _ = kill_group(pid).await;
-        }
         out_task.abort();
         err_task.abort();
     }
-    #[cfg(unix)]
-    if let Some(guard) = &mut kill_on_drop {
-        guard.armed = false;
+    // A finished run's group is swept, so no descendant outlives it, and its slot released.
+    if let Some(finished) = job.take() {
+        let _ = finished.finish().await;
     }
     let bytes = combined.lock().await.iter().copied().collect::<Vec<_>>();
     let output = String::from_utf8_lossy(&bytes).into_owned();
@@ -997,17 +1025,6 @@ async fn read_into_tail<R: tokio::io::AsyncRead + Unpin>(
             }
         }
     }
-}
-
-/// Sends SIGKILL to the isolated child process group through the platform utility.
-#[cfg(unix)]
-async fn kill_group(pid: u32) -> io::Result<std::process::ExitStatus> {
-    tokio::process::Command::new("/bin/kill")
-        .args(["-KILL", "--", &format!("-{pid}")])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
 }
 
 #[cfg(test)]
@@ -1455,8 +1472,10 @@ mod runner_tests {
             );
             assert_eq!(result.report.passed, 1);
         }
-        let error =
-            spawn_command(&root, &root, &argv, &[], Some(crate::lang::testing::BETA)).unwrap_err();
+        let Err(error) = spawn_command(&root, &root, &argv, &[], Some(crate::lang::testing::BETA))
+        else {
+            panic!("a program on no PATH starts nothing");
+        };
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         let mut result = failed_run(Duration::from_secs(1), String::new());
         result.report.passed = 1;

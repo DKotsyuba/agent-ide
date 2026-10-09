@@ -3664,7 +3664,7 @@ async fn run_stdin(
     use std::ffi::OsString;
     let (program, args) = argv.split_first()?;
     let path = formatter_path();
-    let program = executable_on(program, root, &path)?;
+    let program = crate::execution::job::executable_on(program, root, &path)?;
     let mut env: std::collections::BTreeMap<OsString, OsString> = std::env::vars_os().collect();
     env.insert("PATH".into(), path.into());
     let command = crate::execution::ControlledCommand::from_validated_peer(
@@ -3692,24 +3692,6 @@ async fn run_stdin(
     .await
     .ok()?;
     (!output.timed_out && !output.truncated).then_some(output)
-}
-
-/// `program` as an absolute executable: a path (relative to `root`) as given, a bare name looked
-/// up on `path` like the shell would.
-fn executable_on(program: &str, root: &Path, path: &str) -> Option<std::path::PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    let runnable = |candidate: &Path| {
-        std::fs::metadata(candidate)
-            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-    };
-    if program.contains('/') {
-        let candidate = root.join(program);
-        return runnable(&candidate).then_some(candidate);
-    }
-    path.split(':')
-        .filter(|dir| Path::new(dir).is_absolute())
-        .map(|dir| Path::new(dir).join(program))
-        .find(|candidate| runnable(candidate))
 }
 
 /// A private, already-unlinked file holding `input`, positioned at its start.
