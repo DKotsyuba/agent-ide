@@ -113,34 +113,78 @@ impl RustChecker {
     /// capped at `MAX_OUTPUT_BYTES`. Ambient Cargo variables are ignored; HOME follows the
     /// configured `AGENT_IDE_HOME` override or the password database.
     pub fn cargo_check_spec(&self, request: &CheckRequest) -> RunSpec {
+        self.cargo_check_plan(request)
+            .to_spec(request, self.timeout)
+    }
+
+    /// The facts behind [`Self::cargo_check_spec`]: every path, directory and environment value
+    /// the confined run is built from, computed once so the in-process runner and the Rust
+    /// module's recipe request ([`CargoCheckPlan::to_effect`]) cannot drift apart.
+    pub(crate) fn cargo_check_plan(&self, request: &CheckRequest) -> CargoCheckPlan {
         let home = crate::home::real_home();
         let cargo_home = crate::home::effective_cargo_home(self.cargo_home.as_deref(), &home);
-        let rustup_home = derived_rustup_home(&self.toolchain_dir, &home);
-        let args: Vec<OsString> = vec![
-            "check",
-            "--workspace",
-            "--all-targets",
-            "--message-format=json",
-            "--offline",
-            "--keep-going",
-            "--locked",
-        ]
-        .into_iter()
-        .map(OsString::from)
-        .collect();
+        CargoCheckPlan {
+            rustup_home: derived_rustup_home(&self.toolchain_dir, &home),
+            toolchain_dir: self.toolchain_dir.clone(),
+            developer_roots: self.developer_roots.clone(),
+            ancestors: ancestor_manifest_roots(&request.worktree, &request.read_denies),
+            git_exclude: git_exclude_root(&home, &request.read_denies),
+            linker_env: self.linker_env.clone(),
+            cargo_home,
+            home,
+        }
+    }
+}
+
+/// The values one `cargo check` run is built from (see [`RustChecker::cargo_check_plan`]).
+pub(crate) struct CargoCheckPlan {
+    /// The real user home.
+    pub(crate) home: PathBuf,
+    /// The effective Cargo home.
+    pub(crate) cargo_home: PathBuf,
+    /// The rustup home derived from the toolchain directory.
+    pub(crate) rustup_home: PathBuf,
+    /// The toolchain root providing `bin/cargo`.
+    pub(crate) toolchain_dir: PathBuf,
+    /// Apple developer directories that exist.
+    pub(crate) developer_roots: Vec<PathBuf>,
+    /// Existing allowed ancestor manifest and configuration files of the worktree.
+    pub(crate) ancestors: Vec<PathBuf>,
+    /// Cargo's standard Git excludes file when it exists and is allowed.
+    pub(crate) git_exclude: Option<PathBuf>,
+    /// The resolved linker-bypass environment, in the order cargo receives it.
+    pub(crate) linker_env: Vec<(String, String)>,
+}
+
+impl CargoCheckPlan {
+    /// The cargo arguments of every check.
+    const ARGS: [&'static str; 7] = [
+        "check",
+        "--workspace",
+        "--all-targets",
+        "--message-format=json",
+        "--offline",
+        "--keep-going",
+        "--locked",
+    ];
+
+    /// The confined invocation: program `<toolchain>/bin/cargo`, `Self::ARGS` in the worktree,
+    /// the environment rebuilt from the allowlist, the read roots in a fixed order and the
+    /// private cache as the only write root.
+    fn to_spec(&self, request: &CheckRequest, timeout: Duration) -> RunSpec {
         RunSpec {
             program: self.toolchain_dir.join("bin").join("cargo"),
-            args,
+            args: Self::ARGS.into_iter().map(OsString::from).collect(),
             cwd: request.worktree.clone(),
             env: [
                 (
                     "PATH".to_owned(),
                     format!("{}/bin:/usr/bin:/bin", self.toolchain_dir.display()),
                 ),
-                ("HOME".to_owned(), home.to_string_lossy().into_owned()),
+                ("HOME".to_owned(), self.home.to_string_lossy().into_owned()),
                 (
                     "CARGO_HOME".to_owned(),
-                    cargo_home.to_string_lossy().into_owned(),
+                    self.cargo_home.to_string_lossy().into_owned(),
                 ),
                 (
                     "TMPDIR".to_owned(),
@@ -162,21 +206,18 @@ impl RustChecker {
             read_roots: [
                 request.worktree.clone(),
                 self.toolchain_dir.clone(),
-                cargo_home,
-                rustup_home,
+                self.cargo_home.clone(),
+                self.rustup_home.clone(),
                 PathBuf::from(ETC_READ_ROOT),
             ]
             .into_iter()
             .chain(self.developer_roots.iter().cloned())
-            .chain(ancestor_manifest_roots(
-                &request.worktree,
-                &request.read_denies,
-            ))
-            .chain(git_exclude_root(&home, &request.read_denies))
+            .chain(self.ancestors.iter().cloned())
+            .chain(self.git_exclude.iter().cloned())
             .collect(),
             write_roots: vec![request.cache_dir.clone()],
             read_denies: request.read_denies.clone(),
-            timeout: self.timeout,
+            timeout,
             max_output_bytes: MAX_OUTPUT_BYTES,
         }
     }
@@ -467,13 +508,19 @@ impl Checker for RustChecker {
 }
 
 impl RustChecker {
+    /// Whether `<toolchain>/bin/cargo` is absent or host-denied, which reports
+    /// [`UnavailableReason::ToolMissing`] before any process starts.
+    pub(crate) fn cargo_missing(&self, request: &CheckRequest) -> bool {
+        let cargo = self.toolchain_dir.join("bin").join("cargo");
+        request.read_denies.iter().any(|deny| deny.matches(&cargo)) || !cargo.is_file()
+    }
+
     /// Executes the check body behind [`RustChecker::check`].
     ///
     /// Split from the trait method only to keep the boxed future type uniform.
     async fn run_check(&self, request: CheckRequest) -> ProblemSnapshot {
         let started = Instant::now();
-        let cargo = self.toolchain_dir.join("bin").join("cargo");
-        if request.read_denies.iter().any(|deny| deny.matches(&cargo)) || !cargo.is_file() {
+        if self.cargo_missing(&request) {
             return ProblemSnapshot::unavailable(
                 crate::LANGUAGE,
                 UnavailableReason::ToolMissing,
@@ -521,7 +568,11 @@ impl RustChecker {
 /// Precedence: timeout, then truncation, then the cargo lockfile failure, then stream parsing.
 /// The generation is fenced to the triggering request; the duration measures the confined run
 /// (checker-side setup excluded).
-fn map_run_output(request: &CheckRequest, output: &RunOutput, duration_ms: u64) -> ProblemSnapshot {
+pub(crate) fn map_run_output(
+    request: &CheckRequest,
+    output: &RunOutput,
+    duration_ms: u64,
+) -> ProblemSnapshot {
     if output.timed_out {
         return ProblemSnapshot::unavailable(
             crate::LANGUAGE,

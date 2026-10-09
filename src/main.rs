@@ -646,7 +646,10 @@ async fn serve_bundled_module(language: &str, role: &str) -> ExitCode {
         |language| Unimplemented::new(ModuleId::bundled(language), env!("CARGO_PKG_VERSION"));
     let served = match language {
         "python" => serve_stdio(placeholder("python"), role).await,
-        "rust" => serve_stdio(placeholder("rust"), role).await,
+        "rust" => {
+            agent_ide::languages::install();
+            serve_stdio(agent_ide_lang_rust::module::RustModule::new(role), role).await
+        }
         "typescript" => serve_stdio(placeholder("typescript"), role).await,
         "html" => serve_stdio(placeholder("html"), role).await,
         "css" => serve_stdio(placeholder("css"), role).await,
