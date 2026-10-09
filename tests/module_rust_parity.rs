@@ -999,3 +999,128 @@ fn seconds_are_masked_and_nothing_else() {
         "two budgets stay different"
     );
 }
+
+/// The shipping binary's `module rust analyzer` process, spawned like the daemon spawns it
+/// (cleared environment plus the Rust module environment, the worktree as working directory),
+/// starts the pinned rust-analyzer within `hello` and answers readiness: the daemon↔module path
+/// without the daemon, so it runs without sockets.
+#[tokio::test]
+#[ignore = "requires the accepted AGENT_IDE_RUST_TOOLCHAIN_DIR, AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN inputs"]
+async fn the_module_process_starts_rust_analyzer_within_hello() {
+    use agent_ide_core::modules::{
+        contract::{Capability, ModuleId, Outcome, Readiness, Role},
+        host::{Call, HostChannel, NoEffects},
+        payload::{SemanticQuery, decode, encode},
+        provider::ProviderGrant,
+    };
+    let fixture = Fixture::new(PARITY_FILES, providers("module-rust-process"));
+    let dir = std::path::PathBuf::from(input("AGENT_IDE_RUST_TOOLCHAIN_DIR"));
+    let namespace = fixture.base.join("namespace");
+    for sub in ["cargo", "target", "tmp"] {
+        std::fs::create_dir_all(namespace.join(sub)).unwrap();
+    }
+    let settings = agent_ide_lang_rust::module::RustProviderSettings {
+        binary: input("AGENT_IDE_RUST_ANALYZER").into(),
+        version: "rust-analyzer 1.98.1 (48a229ce 2026-09-01)".into(),
+        cargo: dir.join("bin/cargo"),
+        cargo_home: None,
+        cargo_version: "cargo 1.98.1".into(),
+        rustc: dir.join("bin/rustc"),
+        rustc_version: "rustc 1.98.1".into(),
+        toolchain: input("AGENT_IDE_RUST_TOOLCHAIN"),
+        trust: "fixture-disabled".into(),
+        cache_namespace: namespace.display().to_string(),
+    };
+    let home = agent_ide_core::userhome::user_home();
+    let digest = |path: &std::path::Path| {
+        blake3::hash(&std::fs::read(path).unwrap())
+            .to_hex()
+            .to_string()
+    };
+    let mut env: Vec<(String, String)> = agent_ide_lang_rust::module::MODULE_ENV
+        .iter()
+        .filter_map(|name| Some(((*name).to_owned(), std::env::var(name).ok()?)))
+        .collect();
+    env.sort();
+    let mut child = tokio::process::Command::new(parity::binary())
+        .args(["module", "rust", "analyzer"])
+        .env_clear()
+        .envs(env)
+        .current_dir(&fixture.root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let offer = agent_ide_core::modules::contract::HelloOffer {
+        config: agent_ide_core::modules::contract::ModuleConfig {
+            worktree: Some(fixture.root.clone()),
+            provider: Some(json!({
+                "grant": ProviderGrant {
+                    accepted: [&settings.binary, &settings.cargo, &settings.rustc]
+                        .into_iter()
+                        .map(|path| (path.clone(), digest(path)))
+                        .collect(),
+                    request_timeout_ms: 30_000,
+                    roots: [namespace.clone()]
+                        .into_iter()
+                        .chain(home.clone())
+                        .chain(["/usr/bin", "/bin"].map(std::path::PathBuf::from))
+                        .collect(),
+                },
+                "settings": settings,
+            })),
+            checks: None,
+            env: Default::default(),
+            home,
+        },
+        ..agent_ide_core::modules::fake::offer(
+            ModuleId::bundled("rust"),
+            env!("CARGO_PKG_VERSION"),
+            Role::Analyzer,
+            1,
+        )
+    };
+    let started = Instant::now();
+    let opened = HostChannel::open(
+        child.stdout.take().unwrap(),
+        child.stdin.take().unwrap(),
+        offer,
+        Duration::from_secs(120),
+    )
+    .await;
+    let (mut channel, _) = opened.unwrap_or_else(|failure| panic!("hello: {failure}"));
+    eprintln!("hello answered after {:?}", started.elapsed());
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let reply = channel
+            .call(
+                Call {
+                    capability: Capability::Semantic,
+                    scope_key: "scope".into(),
+                    revision_key: "revision".into(),
+                    payload: encode(&SemanticQuery::Readiness {}),
+                    attachments: Vec::new(),
+                },
+                Duration::from_secs(5),
+                &mut NoEffects,
+            )
+            .await
+            .unwrap();
+        let readiness: Readiness = match reply.outcome {
+            Outcome::Result(value) => decode(value).unwrap(),
+            Outcome::Error(error) => panic!("readiness: {error:?}"),
+        };
+        eprintln!("readiness after {:?}: {readiness:?}", started.elapsed());
+        if readiness == Readiness::Ready {
+            break;
+        }
+        assert_ne!(
+            readiness,
+            Readiness::Degraded,
+            "the workspace failed to load"
+        );
+        assert!(Instant::now() < deadline, "never ready");
+    }
+}
