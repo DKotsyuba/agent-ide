@@ -312,3 +312,11 @@ process gives equal facts. A module that fails or is warming leaves its files sk
 next sweep asks again; nothing is cached and no in-process answer replaces it. The fact cache is
 keyed by language, extractor revision, **path** and content: identical bytes at two paths are two
 extractions.
+
+**Ranked next kinds (not in the first release).** (1) HTTP routes: a backend route registration
+(Python and Rust frameworks; Node `express`/`fastify`/`koa` `app.get('/x', …)` style registrations)
+linked to a `fetch`/`axios` call with a literal URL in script code. The false-edge rule is the same
+for every backend: exact only when method and literal path are equal, `unverified` when a base URL,
+router prefix or mount is unknown, no edge for template or computed URLs. (2) Node resolution:
+bare specifiers through `node_modules`, `package.json` `exports`/`main`, which the file-reference
+kind deliberately leaves without an edge today.
