@@ -719,7 +719,7 @@ mod tests {
         );
         assert!(
             !profile.accepts_server(Some(&async_lsp::lsp_types::ServerInfo {
-                name: "gopls".into(),
+                name: "foreign-server".into(),
                 version: None,
             }))
         );

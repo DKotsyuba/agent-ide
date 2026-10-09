@@ -77,7 +77,20 @@ fn launcher_mapping_is_closed_bounded_and_restart_only() {
         json!(unbound.expected_typescript_codex_macos_evidence().unwrap());
     assert!(LauncherConfig::parse(python_config.to_string().as_bytes()).is_ok());
     let loaded = LauncherConfig::parse(python_config.to_string().as_bytes()).unwrap();
-    let typescript = &loaded.target("private-attachment").unwrap().providers[3];
+    // The retired `gopls_defaults` entry (second in the file) is dropped before validation.
+    assert_eq!(
+        loaded.target("private-attachment").unwrap().providers.len(),
+        3
+    );
+    assert_eq!(
+        loaded
+            .retired_settings()
+            .iter()
+            .map(|retired| retired.key)
+            .collect::<Vec<_>>(),
+        ["gopls_defaults"]
+    );
+    let typescript = &loaded.target("private-attachment").unwrap().providers[2];
     assert!(typescript.typescript_codex_accepted());
     assert!(!typescript.typescript_claude_accepted());
     let accepted_claude = typescript
@@ -86,7 +99,7 @@ fn launcher_mapping_is_closed_bounded_and_restart_only() {
     python_config["targets"][0]["providers"][3]["typescript"]["claude_macos_evidence"] =
         json!(accepted_claude);
     let loaded = LauncherConfig::parse(python_config.to_string().as_bytes()).unwrap();
-    assert!(loaded.target("private-attachment").unwrap().providers[3].typescript_claude_accepted());
+    assert!(loaded.target("private-attachment").unwrap().providers[2].typescript_claude_accepted());
     let mut invented_claude = python_config.clone();
     invented_claude["targets"][0]["providers"][3]["typescript"]["claude_macos_evidence"] =
         json!("invented");
@@ -185,4 +198,76 @@ fn project_checks_accept_optional_typescript_and_reject_non_normal_paths() {
         parse(&json!({"typescript": {"node": "/abs/../node", "tsc_cli": "/abs/tsc.js"}})).err(),
         Some(LauncherError::Rejected)
     );
+}
+
+/// An old launcher file that still declares the removed Go provider keeps loading: the entry is
+/// dropped before registered-provider decoding whatever else it holds, once per file, and does not
+/// count against the provider ceiling. Every other entry stays closed.
+#[test]
+fn retired_provider_entries_are_ignored_and_every_other_entry_stays_closed() {
+    use serde_json::json;
+    crate::languages::install();
+    let executable = json!({"path":"/private/tmp/accepted-program","identity":"accepted-git","blake3":"0".repeat(64)});
+    let load = |providers: Value| {
+        let target = json!({"attachment":"private-attachment","candidate":"/private/tmp/worktree","git":executable,"providers":providers});
+        LauncherConfig::parse(
+            json!({"version":1,"limits":{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096},"targets":[target]})
+                .to_string()
+                .as_bytes(),
+        )
+    };
+    // A stale entry with no executable at all, and a second with null and foreign fields, still
+    // load; the notice is registered once and names the removal.
+    let loaded = load(json!([
+        {"settings":"gopls_defaults"},
+        {"executable":null,"settings":"gopls_defaults","extra":[1]}
+    ]))
+    .unwrap();
+    assert!(
+        loaded
+            .target("private-attachment")
+            .unwrap()
+            .providers
+            .is_empty()
+    );
+    let notices: Vec<_> = loaded.retired_settings().iter().map(|r| r.notice).collect();
+    assert_eq!(
+        notices,
+        ["Go support was removed in 0.10.8; the gopls provider entry is ignored"]
+    );
+    // An unknown settings key is still invalid, as is a duplicate key (top level or nested) in a
+    // non-retired entry: the entry is replayed through the exact provider decoder.
+    let python = |executable: &str| {
+        format!(
+            r#"{{"version":1,"limits":{{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096}},"targets":[{{"attachment":"private-attachment","candidate":"/private/tmp/worktree","git":{git},"providers":[{{"executable":{executable},"settings":"pyright_defaults_v1","toolchain":"accepted-git","node":{git},"trust":"accepted-local","cache_namespace":"pyright-cache"}}]}}]}}"#,
+            git = executable_json()
+        )
+    };
+    /// The accepted-program object used for `git`, `node` and the provider executable.
+    fn executable_json() -> String {
+        format!(
+            r#"{{"path":"/private/tmp/accepted-program","identity":"accepted-git","blake3":"{}"}}"#,
+            "0".repeat(64)
+        )
+    }
+    assert!(LauncherConfig::parse(python(&executable_json()).as_bytes()).is_ok());
+    let nested = executable_json().replacen(
+        r#""path":"/private/tmp/accepted-program""#,
+        r#""path":"/private/tmp/a","path":"/private/tmp/accepted-program""#,
+        1,
+    );
+    assert!(LauncherConfig::parse(python(&nested).as_bytes()).is_err());
+    assert!(
+        LauncherConfig::parse(
+            python(&executable_json())
+                .replacen(
+                    r#""trust":"accepted-local""#,
+                    r#""trust":"a","trust":"b""#,
+                    1
+                )
+                .as_bytes()
+        )
+        .is_err()
+    );
+    assert!(load(json!([{"settings":"unknown_defaults","executable":executable,"toolchain":"t","trust":"t","cache_namespace":"c"}])).is_err());
 }

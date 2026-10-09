@@ -2,7 +2,7 @@
 
 A resident stdio MCP server for Codex and Claude Code on macOS arm64: one
 language-server-backed tool surface over Rust, Python, TypeScript/JavaScript,
-CSS and HTML, with Go built in but outside the release scope.
+CSS and HTML (Go support was removed in 0.10.8).
 `docs/architecture.md` is the behaviour truth source; the machine-readable tool
 contract is `docs/contracts/tools-v0.4.md` with the exported snapshot in
 `schemas/tools.json`.
@@ -11,7 +11,7 @@ contract is `docs/contracts/tools-v0.4.md` with the exported snapshot in
 
 `cargo xtask check` is the full non-mutating gate; run it before claiming
 done. It runs fmt `--check`, the locked workspace tests with
-`--test-threads=1` and the three named gopls skips (built with the `test-seams`
+`--test-threads=1` (built with the `test-seams`
 cargo feature that the seam-driven product tests need, plus one default-build
 run proving a release build ignores every `AGENT_IDE_TEST_*` seam), the four ignored
 real-provider product tests, clippy and rustdoc with `-D warnings`, the

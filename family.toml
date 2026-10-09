@@ -21,11 +21,11 @@ qualified_targets = ["aarch64-apple-darwin"]
 qualified_hosts = ["claude-code", "codex"]
 
 # Release-qualified languages carry acceptance evidence (docs/qualification.md);
-# Go/gopls are built in but outside the release scope and stay experimental.
+# Go support was removed in 0.10.8.
 [languages]
 qualified = ["rust", "python", "typescript"]
 shipped = ["css", "html"]
-experimental = ["go"]
+experimental = []
 
 [release]
 enabled = true

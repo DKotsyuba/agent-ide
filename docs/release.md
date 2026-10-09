@@ -270,18 +270,13 @@ Every step below is a command; nothing is published from a developer machine.
 The build job repeats formatting, locked workspace tests, Clippy, rustdoc, the four ignored
 real-provider tests and the release build (`cargo xtask check`), then the complete product
 acceptance route against the packaged executable, on macOS arm64. The accepted release languages
-are Rust, Python, and TypeScript/JavaScript; Go and gopls are outside the release scope. No Go
-toolchain is installed, the workspace gate skips exactly the three real-gopls toolchain contracts
-(`real_gopls_production_context_tracks_exact_observed_bytes`,
-`shared_gopls_isolates_divergent_worktrees_and_detaches_one_view`, and
-`dropping_live_gopls_owner_closes_its_owned_listener`) by name while running every other
-workspace test, and the runner records `go` and `gopls` evidence as `not_tested`. Publication
+are Rust, Python, and TypeScript/JavaScript; Go support was removed in 0.10.8 and the runner
+records no Go evidence rows. Publication
 additionally requires the checked-in product, direct Codex, direct Claude, installed
 agent-run-to-Claude, and installed agent-run-to-Codex evidence to name one ancestor candidate
 revision. Every host scenario must be `real_pass`, the product scenarios must be `product_pass`,
-and all rows must carry the accepted language toolchain versions with `go` and `gopls` pinned to
-`not_tested` and closed privacy fields. Missing drivers, `failed`, `not_tested` outside the
-go/gopls rows, mixed revisions, partial scenarios, and Linux evidence all block publication.
+and all rows must carry the accepted language toolchain versions (legacy `not_tested` rows of retired
+toolchains are ignored; any other `not_tested` or version mismatch fails) and closed privacy fields. Missing drivers, `failed`, mixed revisions, partial scenarios, and Linux evidence all block publication.
 
 The toolchains prepared on the runner, and therefore the accepted versions in evidence rows, are
 rust-analyzer 1.98.1 (from the pinned Rust toolchain), pyright 1.1.413,

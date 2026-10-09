@@ -52,7 +52,7 @@ fn version_flag_prints_the_package_version_and_exits_zero() {
 /// exact payload, runs the product acceptance route against the packaged executable, validates the
 /// accepted host evidence and writes the release manifest before uploading the payload; and a
 /// tag-only publish job with the release environment that verifies hashes before any chmod,
-/// attests, and hands publication to `xtask release publish`. Go and gopls stay out of scope.
+/// attests, and hands publication to `xtask release publish`.
 #[test]
 fn release_workflow_builds_once_then_publishes_a_verified_draft() {
     let workflow = include_str!("../.github/workflows/release.yml");
@@ -123,6 +123,7 @@ fn release_workflow_builds_once_then_publishes_a_verified_draft() {
     assert!(!workflow.contains("go-version"));
     assert!(!workflow.contains("go install"));
     assert!(!workflow.contains("AGENT_IDE_GO"));
+    assert!(!workflow.to_lowercase().contains("gopls"));
     // Publication itself: a draft with every asset and generated notes, refused when any release
     // or draft exists, verified after download, published, then checked once more when visible.
     let release = include_str!("../xtask/src/release.rs");
@@ -196,9 +197,6 @@ fn ci_workflow_runs_the_xtask_gate_and_supply_chain_job() {
         "--test-threads=1",
         "\"--features\", \"test-seams\"",
         "release_build_ignores_the_version_seams",
-        "real_gopls_production_context_tracks_exact_observed_bytes",
-        "shared_gopls_isolates_divergent_worktrees_and_detaches_one_view",
-        "dropping_live_gopls_owner_closes_its_owned_listener",
         "configured_product_rust_resolves_definition_across_a_crate_boundary",
         "configured_product_returns_real_typescript_family_context_and_reaps",
         "configured_product_returns_real_pyright_semantic_context_and_reaps",
@@ -216,9 +214,9 @@ fn ci_workflow_runs_the_xtask_gate_and_supply_chain_job() {
 }
 
 /// Pins the publication evidence gate to all five complete macOS arm64 candidate rows carrying
-/// the accepted Rust, Python, and TypeScript/JavaScript toolchain versions with honestly
-/// `not_tested` Go/gopls rows, while rejecting partial scenario values, mixed revisions, and
-/// non-ancestors.
+/// the accepted Rust, Python, and TypeScript/JavaScript toolchain versions (older evidence may
+/// still carry `not_tested` Go/gopls rows), while rejecting partial scenario values, mixed
+/// revisions, and non-ancestors.
 #[test]
 fn release_evidence_gate_requires_the_complete_candidate_matrix() {
     let gate = include_str!("../scripts/validate-release-evidence.sh");
@@ -240,8 +238,7 @@ fn release_evidence_gate_requires_the_complete_candidate_matrix() {
         );
     }
     for version in [
-        "\"go\": \"not_tested\"",
-        "\"gopls\": \"not_tested\"",
+        "with_entries(select(.value != \"not_tested\"))",
         "1.98.1",
         "24.4.0",
         "1.1.413",

@@ -7,9 +7,8 @@ in each, runs the selected cell, and removes only those runner-owned worktrees a
 The default `product` route runs the locked real-provider product gates for the accepted release
 languages — Rust/rust-analyzer, Python/Pyright, Node/TypeScript r3 — plus the edit/diagnostic/fix/
 diff/stop loop, stale-edit zero-write, native fallback, compact MCP projection, telemetry
-restart/query/export, and the Claude Pyright and TypeScript gate. Go and gopls
-are outside the release scope: the runner neither requires nor executes them, their toolchain
-evidence stays `not_tested`, and the two locked Go/gopls provider gates are excluded. The Rust
+restart/query/export, and the Claude Pyright and TypeScript gate. Go support was
+removed in 0.10.8, so the runner knows no Go toolchain and emits no Go evidence rows. The Rust
 gate is the existing cross-crate rust-analyzer proof; `divergent_worktrees` is proven by the
 locked real TypeScript cross-worktree isolation gate, by the runner's verified divergent fixture
 worktrees, and by the exact real-host driver document. Every toolchain
@@ -158,8 +157,8 @@ The output must satisfy
 and is capped at 16 KiB. It contains only the project revision, closed route/status values, public
 platform and tool versions, eight closed scenario outcomes, and explicit false privacy fields. It
 contains no filesystem path, source, prompt, credential, command, diagnostic message, transcript,
-or private run identifier. The `go` and `gopls` toolchain rows always read `not_tested`; the
-release evidence gate rejects any version there. `product_pass` records a shipping
+or private run identifier. New evidence carries no `go`/`gopls` toolchain rows; the release evidence gate still accepts
+older evidence whose rows read `not_tested` and rejects any version there. `product_pass` records a shipping
 product/provider gate, while `real_pass` is reserved for a supplied real-host driver.
 
 Non-macOS execution emits `not_tested` evidence and does not create worktrees or claim support.

@@ -675,7 +675,7 @@ pub trait LanguageSupport: Send + Sync {
         where_: InsertWhere,
     ) -> Result<InsertSite, LangError>;
 
-    /// Whether `file` is a test file by the language's conventions (`tests/`, `test_*.py`, `*.test.ts`, `*_test.go`).
+    /// Whether `file` is a test file by the language's conventions (`tests/`, `test_*.py`, `*.test.ts`).
     fn is_test_file(&self, file: &Path) -> bool;
 
     /// Builds the runner command for a target, run from the project root.

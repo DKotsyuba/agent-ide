@@ -67,9 +67,7 @@ jobs:
       - name: Fetch dependencies
         run: cargo fetch --locked
       - name: Run the complete gate
-        # Go and gopls are outside the release scope: the runner installs no Go toolchain and the
-        # gate skips exactly the three real-gopls toolchain contracts by name. The gate ends with
-        # the one release build of target/release/agent-ide that is packaged below.
+        # The gate ends with the one release build of target/release/agent-ide that is packaged below.
         run: cargo xtask check
       - name: Package and verify the exact payload
         run: |

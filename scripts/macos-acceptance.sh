@@ -13,8 +13,6 @@ ACCEPTANCE_MAX_EVIDENCE_BYTES=16384
 ACCEPTANCE_TMP=
 ACCEPTANCE_LEFT=
 ACCEPTANCE_RIGHT=
-ACCEPTANCE_GO_VERSION=not_tested
-ACCEPTANCE_GOPLS_VERSION=not_tested
 ACCEPTANCE_RUST_VERSION=not_tested
 ACCEPTANCE_RUST_ANALYZER_VERSION=not_tested
 ACCEPTANCE_NODE_VERSION=not_tested
@@ -155,8 +153,7 @@ create_fixture() {
 # Verifies every exact external tool path and version consumed by the product gates.
 #
 # Inputs are the documented `AGENT_IDE_*` environment paths for the accepted release languages
-# Rust, Python, and TypeScript/JavaScript; Go and gopls are outside the release scope, are never
-# executed or required, and their evidence stays `not_tested`. The function executes only fixed
+# Rust, Python, and TypeScript/JavaScript. The function executes only fixed
 # version queries and returns nonzero on any mismatch; paths and command output never enter evidence.
 verify_toolchains() {
     : "${AGENT_IDE_RUST_ANALYZER:?AGENT_IDE_RUST_ANALYZER is required}"
@@ -199,8 +196,7 @@ verify_toolchains() {
 # Tests inherit only caller-selected exact tool paths. The preflight refuses a missing or renamed
 # test: Cargo returns success for a filtered run with zero matches. Each command is fixed, serial,
 # and locked; a first failure cannot become a passing evidence row.
-# The Rust gate is the existing cross-crate rust-analyzer proof; the two locked Go/gopls provider
-# gates are excluded with the language. `divergent_worktrees` is proven by the locked real
+# The Rust gate is the existing cross-crate rust-analyzer proof. `divergent_worktrees` is proven by the locked real
 # TypeScript cross-worktree isolation gate, by this runner's verified divergent fixture worktrees,
 # and by the exact real-host driver document.
 run_product_gates() {
@@ -269,7 +265,7 @@ write_evidence() {
         "  \"platform\": {\"os\": \"$ACCEPTANCE_OS\", \"version\": \"$ACCEPTANCE_OS_VERSION\", \"architecture\": \"$ACCEPTANCE_ARCH\"}," \
         "  \"host\": {\"version\": \"$ACCEPTANCE_HOST_VERSION\"}," \
         ${ACCEPTANCE_PAYLOAD_JSON:+"$ACCEPTANCE_PAYLOAD_JSON"} \
-        "  \"toolchains\": {\"go\": \"$ACCEPTANCE_GO_VERSION\", \"gopls\": \"$ACCEPTANCE_GOPLS_VERSION\", \"rust\": \"$ACCEPTANCE_RUST_VERSION\", \"rust_analyzer\": \"$ACCEPTANCE_RUST_ANALYZER_VERSION\", \"node\": \"$ACCEPTANCE_NODE_VERSION\", \"pyright\": \"$ACCEPTANCE_PYRIGHT_VERSION\", \"typescript_language_server\": \"$ACCEPTANCE_TYPESCRIPT_LANGUAGE_SERVER_VERSION\", \"typescript\": \"$ACCEPTANCE_TYPESCRIPT_VERSION\"}," \
+        "  \"toolchains\": {\"rust\": \"$ACCEPTANCE_RUST_VERSION\", \"rust_analyzer\": \"$ACCEPTANCE_RUST_ANALYZER_VERSION\", \"node\": \"$ACCEPTANCE_NODE_VERSION\", \"pyright\": \"$ACCEPTANCE_PYRIGHT_VERSION\", \"typescript_language_server\": \"$ACCEPTANCE_TYPESCRIPT_LANGUAGE_SERVER_VERSION\", \"typescript\": \"$ACCEPTANCE_TYPESCRIPT_VERSION\"}," \
         "  \"scenarios\": {\"edit_diagnostic_loop\": \"$2\", \"stale_edit_zero_write\": \"$2\", \"native_fallback\": \"$2\", \"telemetry_restart_query_export\": \"$2\", \"compact_content\": \"$2\", \"python_provider\": \"$2\", \"typescript_r3\": \"$2\", \"divergent_worktrees\": \"$2\"}," \
         '  "privacy": {"source": false, "prompts": false, "credentials": false, "commands": false, "paths": false, "diagnostic_messages": false, "private_ids": false}' \
         '}' >"$ACCEPTANCE_EVIDENCE"
