@@ -1269,4 +1269,16 @@ async fn module_session_fences_sources_and_reports_its_fault() {
         live.remote_fault(),
         Some("module_unavailable (bundled.alpha:provider:exited)")
     );
+    let typed = live.session.module_fault().expect("a typed provider fault");
+    assert_eq!(
+        (typed.stage, typed.cause),
+        (
+            crate::modules::contract::Stage::Provider,
+            crate::modules::contract::Cause::Exited
+        )
+    );
+    assert!(
+        !live.is_alive(),
+        "the provider fault retires the generation"
+    );
 }
