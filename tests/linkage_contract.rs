@@ -38,6 +38,7 @@ use agent_ide_core::{
 struct Scratch(PathBuf);
 
 impl Drop for Scratch {
+    /// Removes the scratch tree, ignoring a tree that is already gone.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
@@ -45,6 +46,7 @@ impl Drop for Scratch {
 
 impl std::ops::Deref for Scratch {
     type Target = Path;
+    /// The canonical scratch root.
     fn deref(&self) -> &Path {
         &self.0
     }
@@ -101,10 +103,13 @@ fn refresh(index: &mut NameIndex) {
 struct Module(Vec<Language>);
 
 impl AnchorSource for Module {
+    /// The languages this stand-in computes "in a module".
     fn routes(&self, language: Language) -> bool {
         self.0.contains(&language)
     }
 
+    /// The anchors the real support adapter serves for `text`; an adapter failure is a test bug
+    /// and panics instead of reading as a module fault.
     fn anchors(
         &self,
         _worktree: &Path,

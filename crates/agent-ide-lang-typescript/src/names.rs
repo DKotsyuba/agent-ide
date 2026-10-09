@@ -31,7 +31,7 @@ use std::{ops::Range, path::Path};
 
 use agent_ide_core::lang::names::{
     Certainty, FactSink, FileProbe, FileVerdict, NameFact, NameFacts, NameKey, Namespace,
-    NamespaceCoverage, Resolution, Role, ns, relative_reference, resolve_file_ref,
+    NamespaceCoverage, Resolved, Role, ns, relative_reference, resolve_file_ref,
 };
 
 /// Average line length past which a file counts as minified.
@@ -119,15 +119,9 @@ impl NameFacts for TsFacts {
     }
 
     /// The default interpretation, for relative specifiers only.
-    fn resolve(
-        &self,
-        namespace: Namespace,
-        raw: &str,
-        from: &Path,
-        limit: usize,
-    ) -> Vec<Resolution> {
+    fn resolve(&self, namespace: Namespace, raw: &str, from: &Path, limit: usize) -> Resolved {
         if !relative_specifier(raw.split(['?', '#']).next().unwrap_or("")) {
-            return Vec::new();
+            return Resolved::default();
         }
         resolve_file_ref(&FILE_PROBE, namespace, raw, from, limit)
     }
@@ -1192,6 +1186,7 @@ mod tests {
         let names = |raw| -> Vec<String> {
             TsFacts
                 .resolve(ns::FILE_REF, raw, from, 32)
+                .candidates
                 .into_iter()
                 .map(|resolution| resolution.name)
                 .collect()
@@ -1199,10 +1194,13 @@ mod tests {
         assert_eq!(names("./b")[..3], ["src/b", "src/b.ts", "src/b.tsx"]);
         assert_eq!(names("./b.js")[..2], ["src/b.js", "src/b.ts"]);
         assert!(names("react").is_empty() && names("@/x").is_empty() && names("/x").is_empty());
-        assert_eq!(TsFacts.resolve(ns::FILE_REF, "./b", from, 2).len(), 2);
+        let cut = TsFacts.resolve(ns::FILE_REF, "./b", from, 2);
+        assert_eq!((cut.candidates.len(), cut.capped), (2, true));
         // A query is file-name text first (CommonJS loads `plain.cjs?x`); dropping it is only an
         // assumption, so the literal file never silently becomes a different one.
-        let queried = TsFacts.resolve(ns::FILE_REF, "./plain.cjs?x", Path::new("a.cjs"), 32);
+        let queried = TsFacts
+            .resolve(ns::FILE_REF, "./plain.cjs?x", Path::new("a.cjs"), 32)
+            .candidates;
         assert_eq!(queried[0].name, "plain.cjs?x");
         assert_eq!(queried[0].certainty, Certainty::Exact);
         assert!(

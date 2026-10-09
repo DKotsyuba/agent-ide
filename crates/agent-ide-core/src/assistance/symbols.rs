@@ -1411,9 +1411,10 @@ impl Worker<'_> {
                     .unwrap_or_default(),
                 line: target.definition.as_ref().map_or(0, |(_, line)| *line),
                 is_test: false,
-                tag: Some(match target.definition {
-                    Some(_) => target.label.to_owned(),
-                    None => format!("{}, no indexed {}", target.label, target.define_word),
+                tag: Some(match (target.definition, target.uncertainty) {
+                    (Some(_), Some(reason)) => format!("{} ~{reason}", target.label),
+                    (Some(_), None) => target.label.to_owned(),
+                    (None, _) => format!("{}, no indexed {}", target.label, target.define_word),
                 }),
             };
             let related = match indexes.get(&node.path).copied() {

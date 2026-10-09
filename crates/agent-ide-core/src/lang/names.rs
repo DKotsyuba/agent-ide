@@ -451,6 +451,16 @@ pub struct Resolution {
     pub certainty: Certainty,
 }
 
+/// The answer of [`NameFacts::resolve`]: candidates most certain first, and whether the limit cut
+/// the list (a cut list is a lower bound, never a complete enumeration).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Resolved {
+    /// The candidates kept.
+    pub candidates: Vec<Resolution>,
+    /// Candidates beyond the limit were dropped.
+    pub capped: bool,
+}
+
 /// Most candidates one [`NameFacts::resolve`] returns.
 pub const MAX_RESOLUTIONS: usize = 32;
 
@@ -464,9 +474,9 @@ pub fn resolve_file_ref(
     raw: &str,
     from: &Path,
     limit: usize,
-) -> Vec<Resolution> {
+) -> Resolved {
     if namespace != ns::FILE_REF {
-        return Vec::new();
+        return Resolved::default();
     }
     let stripped = raw.split(['?', '#']).next().unwrap_or("");
     let mut found: Vec<Resolution> = Vec::new();
@@ -492,8 +502,13 @@ pub fn resolve_file_ref(
             });
         }
     }
-    found.truncate(limit.min(MAX_RESOLUTIONS));
-    found
+    let keep = limit.min(MAX_RESOLUTIONS);
+    let capped = found.len() > keep;
+    found.truncate(keep);
+    Resolved {
+        candidates: found,
+        capped,
+    }
 }
 
 /// Cross-language name facts of one language. Stateless, synchronous and pure over its inputs.
@@ -515,16 +530,10 @@ pub trait NameFacts: Send + Sync {
     }
 
     /// The keys the reference `raw` written in `from` may mean in `namespace`, most certain first
-    /// and at most `limit` (never more than [`MAX_RESOLUTIONS`]); nothing for a reference the
-    /// language cannot interpret. The default interprets `file-ref/v1` lexically through
+    /// and at most `limit` (never more than [`MAX_RESOLUTIONS`]; a cut list says so in
+    /// [`Resolved::capped`]); nothing for a reference the language cannot interpret. The default interprets `file-ref/v1` lexically through
     /// [`NameFacts::file_probe`]; no file is consulted and no edge is made here.
-    fn resolve(
-        &self,
-        namespace: Namespace,
-        raw: &str,
-        from: &Path,
-        limit: usize,
-    ) -> Vec<Resolution> {
+    fn resolve(&self, namespace: Namespace, raw: &str, from: &Path, limit: usize) -> Resolved {
         resolve_file_ref(self.file_probe(), namespace, raw, from, limit)
     }
 
@@ -623,6 +632,7 @@ mod tests {
         let from = Path::new("src/a.alpha");
         let rows: Vec<(String, Certainty)> = Probing
             .resolve(ns::FILE_REF, "./b", from, 32)
+            .candidates
             .into_iter()
             .map(|r| (r.name, r.certainty))
             .collect();
@@ -639,6 +649,7 @@ mod tests {
         // A query is file-name text first (CommonJS), URL metadata as an assumption.
         let queried: Vec<(String, Certainty)> = Probing
             .resolve(ns::FILE_REF, "./b?x", from, 32)
+            .candidates
             .into_iter()
             .map(|r| (r.name, r.certainty))
             .collect();
@@ -654,18 +665,33 @@ mod tests {
                 ("src/b.ts".to_owned(), Certainty::Heuristic("query dropped")),
             ]
         );
-        assert_eq!(Probing.resolve(ns::FILE_REF, "./b", from, 1).len(), 1);
-        assert!(Probing.resolve(ns::CLASS, "./b", from, 32).is_empty());
+        let cut = Probing.resolve(ns::FILE_REF, "./b", from, 1);
+        assert_eq!((cut.candidates.len(), cut.capped), (1, true));
+        assert!(!Probing.resolve(ns::FILE_REF, "./b", from, 2).capped);
+        assert!(
+            Probing
+                .resolve(ns::CLASS, "./b", from, 32)
+                .candidates
+                .is_empty()
+        );
         assert!(
             Probing
                 .resolve(ns::FILE_REF, "../../b", from, 32)
+                .candidates
                 .is_empty()
         );
         // A bare path is relative by default (a document URL); script languages override this.
-        assert_eq!(Probing.resolve(ns::FILE_REF, "pkg", from, 32).len(), 2);
+        assert_eq!(
+            Probing
+                .resolve(ns::FILE_REF, "pkg", from, 32)
+                .candidates
+                .len(),
+            2
+        );
         assert!(
             Probing
                 .resolve(ns::FILE_REF, "https://x/y", from, 32)
+                .candidates
                 .is_empty()
         );
     }

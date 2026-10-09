@@ -146,6 +146,9 @@ pub(super) struct LinkTarget {
     pub define_word: &'static str,
     /// File and line of the first indexed definition.
     pub definition: Option<(PathBuf, u32)>,
+    /// For a file reference, the assumption that reached `definition` (`extension probe`); a
+    /// reference that names its file exactly, and every other kind, has none.
+    pub uncertainty: Option<&'static str>,
 }
 
 /// `sigil + name` of a key, with its domain when scoped.
@@ -182,6 +185,16 @@ fn counted(count: usize, word: &str) -> String {
         format!("1 {word}")
     } else {
         format!("{count} {word}s")
+    }
+}
+
+/// The assumption behind a file-reference target (`extension probe`, `index probe`, …), shown so
+/// an inferred link never reads as exact; none for an exact reference and for every legacy kind,
+/// whose wording stays as it was.
+fn inferred(key: &NameKey, shown: &ShownSite) -> Option<&'static str> {
+    match shown.site.fact.certainty {
+        Certainty::Heuristic(reason) if key.namespace.path_keys() => Some(reason),
+        _ => None,
     }
 }
 
@@ -549,7 +562,13 @@ impl Worker<'_> {
                     let mut target = defines
                         .sites
                         .iter()
-                        .map(|shown| format!("{} {}", location(shown), selector(&shown.text)))
+                        .map(|shown| {
+                            let mut row = format!("{} {}", location(shown), selector(&shown.text));
+                            if let Some(reason) = inferred(key, shown) {
+                                row.push_str(&format!(" (~{reason})"));
+                            }
+                            row
+                        })
                         .collect::<Vec<_>>()
                         .join(", ");
                     if defines.more > 0 {
@@ -639,17 +658,20 @@ impl Worker<'_> {
         with_names(index, move |index| {
             keys.iter()
                 .take(limit)
-                .map(|key| LinkTarget {
-                    display: display(key),
-                    label: key.namespace.label(),
-                    define_word: key.namespace.define_word(),
-                    definition: match language {
+                .map(|key| {
+                    let proven = match language {
                         Some(language) => index.proven_definitions(language, key, 1),
                         None => index.proven_sites(key, Some(Role::Define), 1),
+                    };
+                    let first = proven.sites.first();
+                    LinkTarget {
+                        display: display(key),
+                        label: key.namespace.label(),
+                        define_word: key.namespace.define_word(),
+                        definition: first
+                            .map(|shown| (shown.site.file.clone(), shown.site.fact.line)),
+                        uncertainty: first.and_then(|shown| inferred(key, shown)),
                     }
-                    .sites
-                    .first()
-                    .map(|shown| (shown.site.file.clone(), shown.site.fact.line)),
                 })
                 .collect()
         })
@@ -978,6 +1000,40 @@ mod tests {
                 "links: partial (indexed 3 of 9 files); counts are indexed, not live",
                 "links: 2 files hit the per-file limit of 5000 facts; counts are lower bounds",
             ]
+        );
+    }
+
+    /// A file-reference target reached by an assumption is labelled with it; an exact one, and
+    /// an uncertain legacy kind, keep their wording.
+    #[test]
+    fn inferred_file_targets_are_labelled_and_legacy_rows_are_not() {
+        use crate::intelligence::names::Site;
+        use crate::lang::names::NameFact;
+        let shown = |key: &NameKey, certainty| ShownSite {
+            site: Site {
+                file: PathBuf::from("a"),
+                language: crate::lang::testing::ALPHA,
+                fact: NameFact {
+                    key: key.clone(),
+                    role: Role::Define,
+                    line: 1,
+                    column: 1,
+                    certainty,
+                },
+            },
+            text: String::new(),
+        };
+        let file = NameKey::global(ns::FILE_REF, "src/x");
+        let class = NameKey::global(ns::CLASS, "btn");
+        let probe = Certainty::Heuristic("extension probe");
+        assert_eq!(
+            inferred(&file, &shown(&file, probe)),
+            Some("extension probe")
+        );
+        assert_eq!(inferred(&file, &shown(&file, Certainty::Exact)), None);
+        assert_eq!(
+            inferred(&class, &shown(&class, Certainty::Heuristic("nested"))),
+            None
         );
     }
 }

@@ -56,10 +56,19 @@ pub fn install(source: Arc<dyn AnchorSource>) {
 struct Hosted;
 
 impl AnchorSource for Hosted {
+    /// Whether the module host runs `language` in its module (the fallback switch, a module that
+    /// ships and a pinned executable decide); a language the host does not run is extracted in
+    /// process by the caller.
     fn routes(&self, language: Language) -> bool {
         crate::modules::calls::mode(language) == crate::modules::mode::Mode::Module
     }
 
+    /// One `analyze_source` anchors request to `language`'s module, waited for with
+    /// `Handle::block_on` from the calling blocking-pool thread (never a runtime worker). The
+    /// batch is validated against the request and the module's declared coverage by the host
+    /// facade; a module fault, an invalid batch, a missing runtime or an answer that says the
+    /// language computes in process is the typed [`ModuleUnavailable`], never an empty batch. A
+    /// warming or unsupported module answers a skipped batch the caller retries.
     fn anchors(
         &self,
         worktree: &Path,
@@ -255,10 +264,12 @@ pub(crate) mod stub {
     }
 
     impl AnchorSource for ModuleStub {
+        /// The languages this stand-in was built for.
         fn routes(&self, language: Language) -> bool {
             self.routed.contains(&language)
         }
 
+        /// The real adapter's anchors for `text`, or an exited-module fault while `down` is set.
         fn anchors(
             &self,
             _worktree: &Path,
