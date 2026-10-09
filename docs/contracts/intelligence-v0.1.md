@@ -78,8 +78,8 @@ the requested URI; scope-less settings must be globally compatible or fail.
 Noninteractive prompts have no affirmative default. Unknown server commands
 remain inert observations.
 
-The production session on an Execution-owned real provider child (formerly exercised by a gopls
-contract, removed with Go in 0.10.8; `intelligence_rust_contract` now carries it) It proves capability negotiation, exact Workspace-byte open/change,
+`intelligence_rust_contract` runs the production session on an Execution-owned real
+rust-analyzer child (its gopls counterpart was removed with Go in 0.10.8). It proves capability negotiation, exact Workspace-byte open/change,
 definition/references, missing-path close/reopen, provisional pushed diagnostics,
 shutdown and reap. The focused session tests exercise malformed framing, UTF position
 conversion, callback refusal, request timeout/cancellation and EOF.

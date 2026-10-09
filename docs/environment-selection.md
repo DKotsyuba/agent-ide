@@ -338,7 +338,7 @@ environment: typescript node 22.11.0 (.nvmrc) ≠ volta.node 20.18.0 · server n
 - The `typescript` selector applies to ide.test, format and lint.
 - The card shows the project's node and TS next to the bundled server's.
 
-**Go:** experimental, unchanged.
+**Go:** removed in 0.10.8; there is no Go environment.
 
 ## 6. What the agent sees, end to end
 1. The `ide.start` card shows: `environment: python .venv (3.12.7, discovered) · also .venv-py314 (3.14.0) — choose: ide.start environment {"python": ".venv-py314"}`.

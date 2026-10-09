@@ -63,7 +63,7 @@ hook key cache `/private/tmp/ai-k-…`) and the persistent check caches under
 `$HOME/.agent-ide/checks`. Admission is restart-only launcher configuration (`allowed_roots`,
 `project_checks`); every failure is fail-open and never vetoes native agent work. The MVP targets
 macOS and Claude; phase 2 adds warm LSP, a launchd per-user service, subagent attach, TypeScript
-checks, the Codex active block, and Go checks last.
+checks, and the Codex active block.
 
 ## Crates (v0.5)
 

@@ -479,11 +479,9 @@ unverified joint window; a capture failure leaves activation usable but reports 
 as unknown. Exact activation retries reuse committed facts.
 
 Source context reads one registered relative path under durable authority.
-Optional accepted Go/Rust profiles supply semantic results over those exact bytes; absent or
-unavailable providers return explicit lexical context. Go worktrees whose canonical
-effective-rights identity matches share one accounted listener, one shared native cache namespace
-and separate protocol forwarders, while each keeps its own private per-view Go build/module/temp
-namespace; Rust uses an exclusive session.
+Optional accepted Rust, Python and TypeScript profiles supply semantic results over those exact
+bytes; absent or unavailable providers return explicit lexical context. Each uses an exclusive
+session.
 Semantic replies include only bounded diagnostics from the same Session when source binding,
 provider generation, and positive document version all match the returned context. Push feedback
 is labelled provisional. One nonempty current delta per binding is retained. A later native post
@@ -508,7 +506,7 @@ activation baseline accompanies same-scope HEAD comparisons; staged and unstaged
 their distinct scope and therefore report the baseline as not captured rather than crossing modes.
 
 `ide.stop` revokes only the exact binding, cancels pending work and reaps its owned provider
-processes before success. A shared listener survives another active Go view. Stop is not a
+processes before success. Stop is not a
 worktree closure or cache-retirement fact: configured provider cache namespaces are quiesced and
 retained under canonical nonce-bound worktree identity and incarnation for a compatible successor.
 A shared native namespace is reference-counted and quiesces only after the last sharing worktree

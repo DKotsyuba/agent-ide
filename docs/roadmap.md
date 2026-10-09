@@ -70,7 +70,7 @@ hooks and terminal replies at once (T29B) — and any future host without a hook
 of its terminal `ide.*` replies (T28B); Linux stays `not_tested`.
 
 Deferred to phase 2, in this order: warm LSP checks, launchd registration, a per-user service,
-subagent attach, TypeScript checks, and Go checks last.
+subagent attach, and TypeScript checks.
 
 ## Later increments
 
