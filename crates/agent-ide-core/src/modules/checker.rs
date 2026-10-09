@@ -88,7 +88,7 @@ impl ModuleChecker {
                                 section: self.section.clone(),
                             }),
                         ),
-                        PLAN_MARGIN,
+                        super::router::budget_or(PLAN_MARGIN),
                         &mut super::host::NoEffects,
                     )
                     .await?;
@@ -124,7 +124,7 @@ impl ModuleChecker {
                         timeout_ms: self.timeout.as_millis() as u64,
                     }),
                 ),
-                self.timeout + PLAN_MARGIN,
+                self.timeout + super::router::budget_or(PLAN_MARGIN),
                 &mut effects,
             )
             .await

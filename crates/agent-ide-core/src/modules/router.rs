@@ -46,11 +46,15 @@ pub const BUDGET_SEAM: &str = "AGENT_IDE_TEST_MODULE_BUDGET_MS";
 
 /// The ordinary request budget, or the seam's.
 fn request_budget() -> Duration {
+    budget_or(REQUEST_BUDGET)
+}
+
+/// `default`, or the [`BUDGET_SEAM`] budget in a `test-seams` build that sets it: the per-call
+/// budget of any module request (a hosted provider session's, a check's planning margin).
+pub fn budget_or(default: Duration) -> Duration {
     crate::test_seams::var(BUDGET_SEAM)
         .and_then(|value| value.parse::<u64>().ok())
-        .map_or(REQUEST_BUDGET, |ms| {
-            Duration::from_millis(ms.clamp(100, 60_000))
-        })
+        .map_or(default, |ms| Duration::from_millis(ms.clamp(100, 60_000)))
 }
 
 /// One supervised slot.
@@ -190,6 +194,11 @@ impl ModuleHost {
     /// The journal lines of ignored switch entries (`language_mode_ignored:<id>`).
     pub fn ignored_lines(&self) -> Vec<String> {
         self.modes.ignored_lines()
+    }
+
+    /// The pinned module executable, when one could be measured.
+    pub fn executable(&self) -> Option<Arc<ModuleExecutable>> {
+        self.executable.clone()
     }
 
     /// This daemon's [`effective_modes`] line for `languages`.

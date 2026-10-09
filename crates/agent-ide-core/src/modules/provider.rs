@@ -102,11 +102,22 @@ impl ProviderGrant {
     }
 }
 
-/// What a language supplies to host its provider: from the language-specific `settings` value
-/// of `hello.config.provider`, the session settings (profile) and the launch plan.
+/// What a language supplies to host its provider: from the module's `worktree` and the
+/// language-specific `settings` value of `hello.config.provider`, the session settings (profile)
+/// and the launch plan. The language computes its own facts here (an interpreter, import roots).
 pub trait ProviderBuilder: Send + 'static {
     /// Builds both; an error is a deterministic configuration refusal.
-    fn plan(&self, settings: &Value) -> io::Result<(ProviderSettings, ProviderLaunchPlan)>;
+    fn plan(
+        &self,
+        worktree: &Path,
+        settings: &Value,
+    ) -> io::Result<(ProviderSettings, ProviderLaunchPlan)>;
+
+    /// Adjusts the provider's diagnostics before they leave the module, as the language's
+    /// in-process backend does (a summary of a flood it explains once); the default keeps them.
+    fn diagnostics(&self, snapshot: &mut crate::intelligence::session::DiagnosticSnapshot) {
+        let _ = snapshot;
+    }
 }
 
 /// A started provider.
@@ -199,7 +210,7 @@ impl<B: ProviderBuilder> ProviderServer<B> {
                 .grant
                 .clone()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no provider granted"))?;
-            let (settings, plan) = self.builder.plan(&self.settings)?;
+            let (settings, plan) = self.builder.plan(&self.root, &self.settings)?;
             grant.verify(&plan)?;
             self.spent = true;
             let mut child = tokio::process::Command::new(&plan.program)
@@ -335,7 +346,8 @@ impl<B: ProviderBuilder> ProviderServer<B> {
                     let session = self.session().await?;
                     let result = session.context(&observation, &bytes, query).await?;
                     session.wait_for_matching_diagnostics().await;
-                    let snapshot = session.diagnostics();
+                    let mut snapshot = session.diagnostics();
+                    self.builder.diagnostics(&mut snapshot);
                     let encoding = result.position_encoding.clone();
                     let convert = |locations: Option<Vec<lsp::Location>>| {
                         locations.map(|locations| {
@@ -445,8 +457,9 @@ impl<B: ProviderBuilder> ProviderServer<B> {
                 SemanticQuery::Diagnostics { source } => {
                     let (observation, bytes) = self.observe(&source, request)?;
                     let session = self.session().await?;
-                    let snapshot = session.diagnostics();
+                    let mut snapshot = session.diagnostics();
                     let encoding = session.capabilities().position_encoding.clone();
+                    self.builder.diagnostics(&mut snapshot);
                     Ok(encode(&self.diagnostics(
                         &snapshot,
                         &observation,
@@ -761,10 +774,16 @@ impl<B: ProviderBuilder> ModuleServer for ProviderServer<B> {
     fn declaration(&self) -> Declaration {
         let mut declaration = self.support.declaration();
         for decl in &mut declaration.capabilities {
+            let calls = self
+                .support
+                .language()
+                .server()
+                .is_some_and(|server| server.call_hierarchy());
             if matches!(
                 decl.capability,
-                Capability::Outline | Capability::Semantic | Capability::Calls | Capability::Rename
-            ) {
+                Capability::Outline | Capability::Semantic | Capability::Rename
+            ) || (decl.capability == Capability::Calls && calls)
+            {
                 *decl = CapabilityDecl::v0(decl.capability, Support::Supported);
             }
         }
