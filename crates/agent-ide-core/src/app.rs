@@ -431,7 +431,10 @@ async fn run_daemon_inner(
                 }
                 _ = &mut termination => break,
                 _ = &mut idle_expired => { idle_exit = !lease.stop_requested(); break; }
-                _ = connections.join_next(), if !connections.is_empty() => continue,
+                joined = connections.join_next(), if !connections.is_empty() => {
+                    journal_connection_panic(joined);
+                    continue;
+                }
                 () = &mut failure, if draining.is_none() => {
                     drain_until = Some(tokio::time::Instant::now() + FAULT_DRAIN);
                     continue;
@@ -543,6 +546,26 @@ async fn run_daemon_inner(
     result
 }
 
+/// Journals the end of a connection task when it ended by panicking: method `daemon`, outcome
+/// `failed`, reason `internal`, detail `connection_task_panic` (closed cause, never the payload).
+///
+/// A panic in one connection task is contained there — the task is gone, the daemon and its other
+/// connections keep serving — but `JoinSet` would otherwise hand the failure to nobody. Normal
+/// completion and the cancellation of shutdown's `abort_all` are not faults and stay silent.
+fn journal_connection_panic(joined: Option<Result<(), tokio::task::JoinError>>) {
+    if matches!(joined, Some(Err(error)) if error.is_panic()) {
+        crate::errorlog::record(
+            crate::errorlog::Method::Daemon,
+            crate::errorlog::Outcome::Failed,
+            crate::errorlog::Fields {
+                reason: Some(crate::errorlog::ReasonCode::Internal),
+                detail: Some("connection_task_panic"),
+                ..Default::default()
+            },
+        );
+    }
+}
+
 /// Removes the launcher and Claude attachment records of the generation that is exiting after a
 /// fault, leaving every other file of the runtime directory (the store, its backups, caches).
 ///
@@ -639,7 +662,9 @@ async fn finish_daemon(
     lease: &lease::LeaseController,
 ) -> Result<(), AppError> {
     connections.abort_all();
-    while connections.join_next().await.is_some() {}
+    while let Some(joined) = connections.join_next().await {
+        journal_connection_panic(Some(joined));
+    }
     let shutdown = match dispatcher {
         Some(dispatcher) => shutdown_dispatcher(dispatcher).await,
         None => Ok(()),
@@ -2450,6 +2475,114 @@ mod tests {
 
         assert!(matches!(error, AppError::InvalidResponse));
         assert!(probe.shutdown_called.load(Ordering::SeqCst));
+    }
+
+    /// Counts the journal lines that name a panicked connection task.
+    fn connection_panic_lines(events: &[crate::errorlog::LoggedEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| {
+                (event.method.as_str(), event.outcome.as_str(), event.reason.as_deref())
+                    == ("daemon", "failed", Some("internal"))
+                    && event.detail.as_deref() == Some("connection_task_panic")
+            })
+            .count()
+    }
+
+    /// Dispatcher whose every call panics, so the connection task serving it panics.
+    struct PanickingDispatcher;
+
+    impl AssistanceDispatcher for PanickingDispatcher {
+        /// Panics inside the connection task that awaits it.
+        fn dispatch(
+            &self,
+            _request: AssistanceDispatch,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<AssistanceDispatchReply, AssistanceDispatchUnavailable>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { panic!("connection task fault") })
+        }
+    }
+
+    /// Removes a scratch runtime directory on every exit path, including a failing assertion.
+    struct ScratchRuntime(PathBuf);
+
+    impl Drop for ScratchRuntime {
+        /// Best-effort removal: the daemon already removes it after an orderly exit.
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A connection task that panics while the daemon serves is journaled with a closed cause (the
+    /// live `join_next` arm), the daemon keeps serving, and the cause carries no payload text.
+    ///
+    /// Before the fix the `JoinSet` result was discarded: the task died with nothing naming it.
+    #[tokio::test]
+    async fn a_panicking_connection_task_is_journaled_while_the_daemon_serves() {
+        crate::errorlog::capture_start();
+        let scratch = ScratchRuntime(std::env::temp_dir().join(format!(
+            "agent-ide-panic-live-{}",
+            std::process::id()
+        )));
+        let runtime = RuntimeDir::prepare_for_daemon(&scratch.0).unwrap();
+        let daemon = tokio::spawn(run_daemon_with_assistance(
+            runtime,
+            Arc::new(PanickingDispatcher),
+            config::EffectiveConfig::defaults(),
+            Duration::from_millis(1500),
+        ));
+        for _ in 0..200 {
+            if UnixStream::connect(scratch.0.join(SOCKET_NAME)).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let limits = HookTransportLimits::new(160 * 1024, 144 * 1024, Duration::from_secs(1))
+            .expect("fixed limits are valid");
+        let method = MethodDispatch::new(
+            "panic",
+            "panic",
+            "attachment",
+            AssistanceMethod::Context,
+            OpaqueJson::new("{}", 64).unwrap(),
+        )
+        .unwrap();
+        let outcome = dispatch_method_if_running(&scratch.0, method, limits).await;
+        assert!(!matches!(
+            outcome,
+            MethodDispatchTransportResult::Dispatched { .. }
+        ));
+        // The daemon outlives the panicked task: health still answers.
+        assert_eq!(probe_health(&scratch.0).await, HealthProbe::Healthy);
+        tokio::time::timeout(Duration::from_secs(10), daemon)
+            .await
+            .expect("the idle daemon exits")
+            .unwrap()
+            .unwrap();
+        let events = crate::errorlog::capture_take();
+        assert_eq!(connection_panic_lines(&events), 1, "{events:?}");
+    }
+
+    /// A connection task that panicked before shutdown's abort-and-join is journaled by the drain
+    /// too, while a task that is merely cancelled by the drain is not.
+    #[tokio::test]
+    async fn shutdown_drain_journals_a_panicked_task_but_not_a_cancelled_one() {
+        crate::errorlog::capture_start();
+        let mut connections = tokio::task::JoinSet::new();
+        connections.spawn(async { panic!("connection task fault") });
+        connections.spawn(std::future::pending::<()>());
+        tokio::task::yield_now().await;
+        let lease = lease::LeaseController::new(Duration::from_secs(300), || false);
+        finish_daemon(Ok(()), &mut connections, None, &lease)
+            .await
+            .unwrap();
+        let events = crate::errorlog::capture_take();
+        assert_eq!(connection_panic_lines(&events), 1, "{events:?}");
     }
 
     /// Descriptor or memory exhaustion and a handshake that died in the queue are transient accept

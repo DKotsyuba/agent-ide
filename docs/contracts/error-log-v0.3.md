@@ -175,6 +175,11 @@ New records:
 - **Daemon failure** — `daemon failed` carries `detail` `<stage>:<class>` (stage `initialize`,
   `serving` or `shutdown`; class an application error name or `io:<ErrorKind>`). Crash containment's
   `daemon fatal` lines also count as daemon failures.
+- **Connection-task panic** — a panic inside one accepted-connection task (the live accept loop
+  and shutdown's abort-and-join drain both observe the task's end) writes `daemon failed`, reason
+  `internal`, detail `connection_task_panic` (the closed cause, no payload) in addition to the
+  panic hook's own `panic at <file>:<line>:<column>` location line. Only that connection ends; the
+  daemon keeps serving. Normal completion and the cancellation of shutdown's drain write nothing.
 - **Forced replacement** — `client failed`, reason `deadline`, detail beginning
   `wedged_daemon_replaced` records the verified holder pid, failed probes, their elapsed span and
   whether `SIGKILL` was needed. The report counts and displays these as forced replacements in its
