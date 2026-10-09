@@ -14,13 +14,19 @@ use std::{
 };
 
 use agent_ide_core::{
+    checks::{CheckRequest, Checker, runner::AdmittedRunner},
     execution::{AdmissionController, AdmissionLimits},
     modules::{
+        checker::ModuleChecker,
         contract::{Capability, Cause, ModuleUnavailable, Stage},
         launch::ModuleExecutable,
-        payload::{FileDocRequest, SourceRef, SourceText, encode},
+        payload::{
+            Arg, EffectRecipe, ExecutableSlot, FileDocRequest, RunClass, SlotSource, SourceRef,
+            SourceText, Stdin, encode,
+        },
+        recipe,
         router::ModuleHost,
-        serve::FAULT_SEAM,
+        serve::{FAULT_SEAM, FIXTURE_SEAM},
     },
 };
 
@@ -49,23 +55,37 @@ impl Drop for Scratch {
     }
 }
 
-/// A host routing the style-sheet language to its real module, with `seam` in the module
-/// environment and a short request budget.
-fn host(seam: Option<String>) -> ModuleHost {
+/// One admission controller for a test's modules and jobs.
+fn admission() -> Arc<Mutex<AdmissionController>> {
+    Arc::new(Mutex::new(
+        AdmissionController::new(AdmissionLimits {
+            total_running: 4,
+            per_owner_running: 4,
+            per_owner_queued: 1,
+            total_queued: 1,
+            interactive_burst: 1,
+        })
+        .unwrap(),
+    ))
+}
+
+/// A host routing the style-sheet language to its real module under `admission`, with `env` in
+/// the module environment and a request `budget`.
+fn host_with(
+    admission: Arc<Mutex<AdmissionController>>,
+    env: Vec<(String, String)>,
+    budget: Duration,
+) -> ModuleHost {
     agent_ide::languages::install();
     let executable = ModuleExecutable::pin(&parity::binary().canonicalize().unwrap()).unwrap();
-    let admission = AdmissionController::new(AdmissionLimits {
-        total_running: 4,
-        per_owner_running: 4,
-        per_owner_queued: 1,
-        total_queued: 1,
-        interactive_burst: 1,
-    })
-    .unwrap();
-    ModuleHost::with_parts(
-        executable,
-        Arc::new(Mutex::new(admission)),
-        &["css"],
+    ModuleHost::with_parts(executable, admission, &["css"], env, budget)
+}
+
+/// A host routing the style-sheet language to its real module, with the fault `seam` in the
+/// module environment and a short request budget.
+fn host(seam: Option<String>) -> ModuleHost {
+    host_with(
+        admission(),
         seam.map(|value| vec![(FAULT_SEAM.to_owned(), value)])
             .unwrap_or_default(),
         Duration::from_millis(1500),
@@ -105,10 +125,18 @@ fn modules() -> Vec<parity::ProcessIdentity> {
         .collect()
 }
 
+/// The live module children of this test process, in any role.
+fn any_modules() -> Vec<parity::ProcessIdentity> {
+    parity::ProcessIdentity::children_of(std::process::id() as libc::pid_t)
+        .into_iter()
+        .filter(|id| id.command().contains("module css "))
+        .collect()
+}
+
 /// Waits until no module child of this process remains.
 async fn no_modules_left() -> bool {
     for _ in 0..250 {
-        if modules().is_empty() {
+        if any_modules().is_empty() {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -244,4 +272,84 @@ async fn a_crash_loop_exhausts_the_restart_budget() {
     assert!(error.retry_after_ms.is_some_and(|ms| ms > 0));
     assert!(no_modules_left().await, "nothing started while exhausted");
     host.stop_all().await;
+}
+
+/// The fixture's check recipe: the launcher program `tool` (a shell) writes `bytes` zero bytes,
+/// captured up to the job class ceiling of 64 MiB per stream.
+const RECIPES: &[EffectRecipe] = &[EffectRecipe {
+    id: "check",
+    program: "tool",
+    args: &[
+        Arg::Literal("-c"),
+        Arg::Literal("head -c \"$0\" /dev/zero"),
+        Arg::Param("bytes"),
+    ],
+    env: &[],
+    paths: &[],
+    executables: &[ExecutableSlot {
+        name: "tool",
+        source: SlotSource::Launcher("tool"),
+    }],
+    stdin: Stdin::Null,
+    class: RunClass::Background,
+    timeout_ceiling_ms: 900_000,
+    capture_bytes: 64 << 20,
+}];
+
+/// Check output of 3 MiB, 9 MiB and exactly the 64 MiB ceiling lands through a real checker
+/// module: the module plans the run, the core expands its recipe and runs it as an
+/// Execution-owned job, and the raw bytes travel back as attachments the module interprets. Past
+/// the ceiling the bytes are a prefix marked truncated. Nothing outlives the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_check_output_lands_through_the_module() {
+    let _serial = SERIAL.lock().await;
+    recipe::declare(&[("css", RECIPES)]);
+    let scratch = Scratch::new("large");
+    let admission = admission();
+    let host = Arc::new(host_with(
+        admission.clone(),
+        vec![(FIXTURE_SEAM.to_owned(), "1".to_owned())],
+        Duration::from_secs(30),
+    ));
+    let runner = Arc::new(AdmittedRunner::new(admission.clone(), false));
+    for (bytes, truncated) in [
+        (3u64 << 20, false),
+        (9 << 20, false),
+        (64 << 20, false),
+        ((64 << 20) + 1, true),
+    ] {
+        let checker = ModuleChecker::new(
+            agent_ide::languages::CSS,
+            host.clone(),
+            serde_json::json!({
+                "programs": [{"name": "tool", "path": "/bin/sh", "interpreter": null}],
+                "params": {"tool": {"executable": "tool"}, "bytes": {"scalar": bytes}},
+            }),
+            runner.clone(),
+            Duration::from_secs(120),
+        );
+        let snapshot = checker
+            .check(CheckRequest {
+                worktree: scratch.0.clone(),
+                cache_dir: scratch.0.join("cache"),
+                input_generation: 1,
+                read_denies: Vec::new(),
+            })
+            .await;
+        let landed = bytes.min(64 << 20);
+        assert_eq!(
+            snapshot.detail.as_deref(),
+            Some(
+                format!(
+                    "{landed} output bytes{}",
+                    if truncated { ", truncated" } else { "" }
+                )
+                .as_str()
+            ),
+            "{bytes} bytes: {snapshot:?}"
+        );
+    }
+    host.stop_all().await;
+    assert!(no_modules_left().await);
+    assert_eq!(admission.lock().unwrap().running_count(), 0);
 }

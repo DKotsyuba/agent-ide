@@ -642,6 +642,18 @@ async fn serve_bundled_module(language: &str, role: &str) -> ExitCode {
     ) else {
         return ExitCode::from(2);
     };
+    // Conformance fixture (test-seams builds only): the contract's fake module under the
+    // language's identity, so host tests drive checks and effects through a real process.
+    if agent_ide_core::test_seams::var(agent_ide_core::modules::serve::FIXTURE_SEAM).is_some() {
+        let fixture = agent_ide_core::modules::fake::FakeModule::new(
+            agent_ide_core::modules::contract::ModuleId::bundled(language),
+            env!("CARGO_PKG_VERSION"),
+        );
+        return match serve_stdio(fixture, role).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
     // The language's own support served through the module transport; a language's module
     // task wraps it with its provider and checks.
     let support = SupportServer::new(registered, env!("CARGO_PKG_VERSION"));

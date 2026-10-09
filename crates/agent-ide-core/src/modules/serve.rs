@@ -286,6 +286,10 @@ pub trait ModuleServer: Send {
 /// (leaves a TERM-resistant descendant in its group, its pid in `<flag file>.pid`, then exits); any
 /// kind on `hello` exits before answering. Honoured only in `test-seams` builds.
 pub const FAULT_SEAM: &str = "AGENT_IDE_TEST_MODULE_FAULT";
+/// Test seam serving the contract's fake module under a language's identity
+/// ([`FakeModule`](super::fake::FakeModule)) from the bundled binary; honoured only in
+/// `test-seams` builds.
+pub const FIXTURE_SEAM: &str = "AGENT_IDE_TEST_MODULE_FIXTURE";
 
 /// The one-time fault the seam selects for `target` (a capability's wire name, or `hello`),
 /// consumed when its flag file is removed; returns the kind and the flag path.

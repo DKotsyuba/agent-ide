@@ -108,6 +108,16 @@ pub struct AdmittedRunner {
     confine: bool,
 }
 
+impl AdmittedRunner {
+    /// Runs as Execution-owned jobs of `admission`, under the Seatbelt profile when `confine`.
+    pub fn new(
+        admission: Arc<Mutex<crate::execution::AdmissionController>>,
+        confine: bool,
+    ) -> Self {
+        Self { admission, confine }
+    }
+}
+
 impl ConfinedRunner for AdmittedRunner {
     fn run(&self, spec: RunSpec) -> BoxFuture<'_, io::Result<RunOutput>> {
         Box::pin(async move {

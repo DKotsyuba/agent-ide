@@ -102,7 +102,7 @@ impl ModuleHost {
                     .map(str::to_owned),
             );
         }
-        let extra_env = [super::serve::FAULT_SEAM]
+        let extra_env = [super::serve::FAULT_SEAM, super::serve::FIXTURE_SEAM]
             .into_iter()
             .filter_map(|seam| Some((seam.to_owned(), crate::test_seams::var(seam)?)))
             .collect();
