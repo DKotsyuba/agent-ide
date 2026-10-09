@@ -399,9 +399,30 @@ impl Worker<'_> {
         found: &Symbol,
         card: &mut SymbolCard,
     ) -> Result<(), FailureCode> {
+        let children: Vec<LineRange> = found.children.iter().map(|child| child.range).collect();
+        self.span_links(job, worktree, file, bytes, found.range, children, card)
+            .await
+    }
+
+    /// [`Self::card_links`] for the lines `range` of `file`, `children` being the nested ranges
+    /// whose definitions belong to other cards.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one coherent span of one observed file"
+    )]
+    async fn span_links(
+        &mut self,
+        job: &mut Job,
+        worktree: &WorktreeRef,
+        file: &Path,
+        bytes: &[u8],
+        range: LineRange,
+        children: Vec<LineRange>,
+        card: &mut SymbolCard,
+    ) -> Result<(), FailureCode> {
         // The file's own facts decide first, from the observed bytes: a symbol without name facts
         // (most code) never touches the index, so its card costs nothing extra.
-        if !has_facts_in(worktree.worktree_path(), file, bytes, found.range)
+        if !has_facts_in(worktree.worktree_path(), file, bytes, range)
             .await
             .map_err(|failure| super::symbols::module_failure(job, &failure))?
         {
@@ -411,8 +432,6 @@ impl Worker<'_> {
         let own_file = file.to_path_buf();
         let language = Lang::for_path(file);
         let (file, bytes) = (file.to_path_buf(), bytes.to_vec());
-        let range = found.range;
-        let children: Vec<LineRange> = found.children.iter().map(|child| child.range).collect();
         let gathered = with_names(index, move |index| {
             index.verify(&file, &bytes);
             let facts = index.facts_in(&file, range);
@@ -589,6 +608,56 @@ impl Worker<'_> {
         card.links
             .extend(notes(&gathered.uncovered, state, gathered.capped));
         Ok(())
+    }
+
+    /// The `related_links:` block of an `ide.context` reply for `lines` of `file` (the whole file
+    /// or the line under the requested position): the cross-language names defined there with
+    /// their indexed usages, the names used there with their definitions, and the same
+    /// `unavailable for:`/index notes as a symbol card, bounded by the card's ceilings. Empty when
+    /// the range has no name facts. The block is advisory: an index that cannot answer (still
+    /// building, a faulted worktree) says so in one line instead of failing the context.
+    pub(super) async fn related_links(
+        &mut self,
+        job: &mut Job,
+        worktree: &WorktreeRef,
+        file: &Path,
+        bytes: &[u8],
+        lines: LineRange,
+    ) -> String {
+        let mut card = SymbolCard::default();
+        if let Err(code) = self
+            .span_links(job, worktree, file, bytes, lines, Vec::new(), &mut card)
+            .await
+        {
+            job.failure_detail = None;
+            return format!(
+                "related_links: unavailable ({code:?}); ide.symbol on a symbol lists its links\n"
+            );
+        }
+        // Rows the card cut after its ceiling stay in the block: the reply's ordinary paging
+        // (`detail_ref`) carries them, the source bytes after the header stay untouched.
+        let hidden = render::hidden_usages_text(&card);
+        let text = render::symbol_card_text(&card);
+        // The card's first line is its heading; the block keeps the rows under its own.
+        let rows = text.split_once('\n').map_or("", |(_, rows)| rows);
+        let cut = format!(
+            "  … {} more\n",
+            card.usages.len().saturating_sub(render::MAX_USAGE_LINES)
+        );
+        let rows = match hidden.as_deref().and_then(|text| text.split_once('\n')) {
+            Some((_, more)) => rows.replace(&cut, more),
+            None => rows.to_owned(),
+        };
+        if rows.is_empty() {
+            return String::new();
+        }
+        let mut block = String::from("related_links:\n");
+        for row in rows.lines() {
+            block.push_str("  ");
+            block.push_str(row);
+            block.push('\n');
+        }
+        block
     }
 
     /// Use sites (file, line, language) of the names `found` defines, in site order, each proven
