@@ -7060,7 +7060,7 @@ fn plain_directory_without_git(candidate: &Path) -> bool {
 /// one anywhere above it, or an unproven inspection each keep the activation refusal.
 #[test]
 fn only_a_directory_without_any_git_is_plain() {
-    let base = std::env::temp_dir().join(format!("plain-probe-{}", std::process::id()));
+    let base = crate::scratch::ScratchDir::new("plain-probe");
     let folder = base.join("folder");
     std::fs::create_dir_all(&folder).unwrap();
     assert!(plain_directory_without_git(&folder));

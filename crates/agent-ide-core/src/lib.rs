@@ -62,6 +62,10 @@ pub mod selfinstall;
 /// Reads the environment seams of the product tests, only under the `test-seams` cargo feature.
 pub mod test_seams;
 
+/// Test-only scratch directories that own and remove their whole state.
+#[cfg(test)]
+pub(crate) mod scratch;
+
 /// Enforces the crate boundary: the core names no language and depends on no language crate.
 #[cfg(test)]
 mod language_free {

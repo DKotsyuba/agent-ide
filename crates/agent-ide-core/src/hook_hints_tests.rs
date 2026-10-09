@@ -6,12 +6,10 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 /// Two days: past [`STALE_AFTER`].
 const OLD: Duration = Duration::from_secs(2 * 86_400);
 
-/// Creates a fresh canonical scratch directory unique to this process and `name`.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("agent-ide-hints-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    fs::canonicalize(dir).unwrap()
+/// Creates a fresh canonical scratch directory that removes itself, and everything the test put in
+/// it, when dropped. `name` only labels it.
+fn scratch(name: &str) -> crate::scratch::ScratchDir {
+    crate::scratch::ScratchDir::new(&format!("hints-{name}"))
 }
 
 /// Builds the hint directory of `slot` (16 hex digits) below `root`, holding a `key` file naming

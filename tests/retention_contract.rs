@@ -10,12 +10,16 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
 use agent_ide::retention::{Fate, Lease, MARKER_FILE_NAME, Report, sweep_with, worktree_key};
+use support::Scratch;
+
+#[path = "support/scratch.rs"]
+mod support;
 
 /// Environment variable that turns [`lease_holder_helper`] into a lease-holding child process.
 const HOLDER_ENV: &str = "AGENT_IDE_RETENTION_LEASE_HOLDER";
 
 /// Creates a fresh canonical scratch directory unique to this process and `name`.
-fn scratch(name: &str) -> PathBuf {
+fn scratch(name: &str) -> Scratch {
     let dir = std::env::temp_dir().join(format!(
         "agent-ide-retention-contract-{}-{name}",
         std::process::id()
@@ -23,7 +27,7 @@ fn scratch(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
-    std::fs::canonicalize(dir).unwrap()
+    Scratch::own(std::fs::canonicalize(dir).unwrap())
 }
 
 /// Returns the fate the sweep gave `dir`, or `None` when the policy did not select it.

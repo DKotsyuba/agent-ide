@@ -17,8 +17,7 @@ use std::{
 };
 
 #[cfg(test)]
-use std::os::unix::fs::DirBuilderExt;
-
+use crate::scratch::ScratchDatabase;
 use rusqlite::{params, types::Value};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -1066,10 +1065,6 @@ fn map_store(_: StoreError) -> TelemetryError {
     TelemetryError::Store
 }
 
-/// Distinguishes temporary telemetry databases created by concurrent focused tests.
-#[cfg(test)]
-static NEXT_TEST_DATABASE: AtomicU64 = AtomicU64::new(0);
-
 /// Returns Application defaults so focused tests can open a standalone local telemetry store.
 #[cfg(test)]
 fn test_store_config() -> StoreConfig {
@@ -1082,48 +1077,25 @@ fn test_store_config() -> StoreConfig {
 }
 
 /// Opens a fresh temporary telemetry owner for module-local contract tests only.
+///
+/// The database comes first so that a caller's `let (database, telemetry) = ..` drops the owner
+/// before the directory it writes into.
 #[cfg(test)]
-pub(crate) async fn open_test_telemetry(
-    config: TelemetryConfig,
-) -> (Telemetry, std::path::PathBuf) {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("the system clock is after the Unix epoch in tests")
-        .as_nanos();
-    let ordinal = NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("agent-ide-telemetry-{nonce}-{ordinal}.sqlite"));
-    let store = Arc::new(Store::open(&path, test_store_config()).expect("test store opens"));
+pub(crate) async fn open_test_telemetry(config: TelemetryConfig) -> (ScratchDatabase, Telemetry) {
+    let database = ScratchDatabase::new("telemetry");
+    let store = Arc::new(Store::open(&database, test_store_config()).expect("test store opens"));
     (
+        database,
         Telemetry::open(store, config)
             .await
             .expect("test telemetry opens"),
-        path,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-    /// Creates a unique owner-only directory and returns its reserved telemetry database path.
-    fn private_database(prefix: &str) -> PathBuf {
-        let directory = std::env::temp_dir().join(format!(
-            "{prefix}-{}-{}",
-            std::process::id(),
-            NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed)
-        ));
-        let mut builder = fs::DirBuilder::new();
-        builder.mode(0o700).create(&directory).unwrap();
-        directory.join("state.sqlite")
-    }
-
-    /// Removes one test database's complete private state directory after all owners are dropped.
-    fn remove_private_database(database: &Path) {
-        let _ = fs::remove_dir_all(database.parent().unwrap());
-    }
+    use std::time::Duration;
 
     /// Supplies a representative schema-closed event without any user-controlled content field.
     fn event() -> Event {
@@ -1193,7 +1165,7 @@ mod tests {
     /// Proves smallest configured row ceiling evicts the oldest durable rows in sequence order.
     #[tokio::test]
     async fn retention_evicts_oldest_at_the_first_row_ceiling() {
-        let (telemetry, path) = open_test_telemetry(TelemetryConfig {
+        let (_database, telemetry) = open_test_telemetry(TelemetryConfig {
             max_rows: 2,
             ..TelemetryConfig::default()
         })
@@ -1205,14 +1177,13 @@ mod tests {
         let page = telemetry.query(Filter::All, None, 2).await.unwrap();
         assert_eq!(page.rows.len(), 2);
         assert!(page.rows[0].sequence > 1);
-        let _ = std::fs::remove_file(path);
     }
 
     /// Proves logical canonical payload bytes independently evict the oldest rows before row capacity.
     #[tokio::test]
     async fn retention_evicts_oldest_at_the_logical_byte_ceiling() {
         let one_event_bytes = event().encode().unwrap().len();
-        let (telemetry, path) = open_test_telemetry(TelemetryConfig {
+        let (_database, telemetry) = open_test_telemetry(TelemetryConfig {
             max_logical_bytes: one_event_bytes * 2,
             ..TelemetryConfig::default()
         })
@@ -1224,13 +1195,12 @@ mod tests {
         let page = telemetry.query(Filter::All, None, 3).await.unwrap();
         assert_eq!(page.rows.len(), 2);
         assert!(page.rows[0].sequence > 1);
-        let _ = std::fs::remove_file(path);
     }
 
     /// Proves page continuation is sequence ordered and tells callers where the next page begins.
     #[tokio::test]
     async fn query_exposes_contiguous_sequence_cursor() {
-        let (telemetry, path) = open_test_telemetry(TelemetryConfig::default()).await;
+        let (_database, telemetry) = open_test_telemetry(TelemetryConfig::default()).await;
         telemetry.record(event());
         telemetry.record(Event::NativeFallback {
             reason: FallbackReason::HookUnavailable,
@@ -1244,13 +1214,12 @@ mod tests {
             .unwrap();
         assert_eq!(second.rows.len(), 1);
         assert!(second.rows[0].sequence > first.rows[0].sequence);
-        let _ = std::fs::remove_file(path);
     }
 
     /// Proves a deliberately small export ceiling reports its first omitted sequence rather than sampling.
     #[tokio::test]
     async fn export_reports_explicit_byte_truncation() {
-        let (telemetry, path) = open_test_telemetry(TelemetryConfig {
+        let (_database, telemetry) = open_test_telemetry(TelemetryConfig {
             export_budget: 1,
             ..TelemetryConfig::default()
         })
@@ -1261,19 +1230,12 @@ mod tests {
         assert!(export.truncated);
         assert_eq!(export.first_omitted_sequence, Some(1));
         assert!(export.bytes.is_empty());
-        let _ = std::fs::remove_file(path);
     }
 
     /// Proves a reopened owner reads prior durable rows in sequence order after its writer stops.
     #[tokio::test]
     async fn reopen_preserves_durable_sequence_order() {
-        let path = std::env::temp_dir().join(format!(
-            "agent-ide-telemetry-reopen-{}.sqlite",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = ScratchDatabase::new("telemetry-reopen");
         let store = Arc::new(Store::open(&path, test_store_config()).unwrap());
         let telemetry = Telemetry::open(Arc::clone(&store), TelemetryConfig::default())
             .await
@@ -1290,13 +1252,12 @@ mod tests {
         let rows = reopened.query(Filter::All, None, 1).await.unwrap().rows;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].sequence, 1);
-        let _ = std::fs::remove_file(path);
     }
 
     /// Proves an immediate graceful stop commits the final accepted event before returning.
     #[tokio::test]
     async fn shutdown_drains_the_final_queued_event() {
-        let (telemetry, path) = open_test_telemetry(TelemetryConfig::default()).await;
+        let (path, telemetry) = open_test_telemetry(TelemetryConfig::default()).await;
         telemetry.record(event());
         telemetry.shutdown().await;
         let store = Arc::new(Store::open_read_only(&path, test_store_config()).unwrap());
@@ -1306,7 +1267,6 @@ mod tests {
         let page = reader.query(Filter::All, None, 1).await.unwrap();
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.dropped, None);
-        let _ = std::fs::remove_file(path);
     }
 
     /// Size of `database`'s write-ahead log file, `0` when it is absent.
@@ -1351,7 +1311,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_truncates_the_grown_wal_and_keeps_every_event() {
         crate::lang::testing::install();
-        let path = private_database("agent-ide-telemetry-wal-drain");
+        let path = ScratchDatabase::new("telemetry-wal-drain");
         let telemetry = Telemetry::open_database(&path, TelemetryConfig::default())
             .await
             .unwrap();
@@ -1361,7 +1321,6 @@ mod tests {
         assert_eq!(wal_len(&path), 0, "the drain truncated the WAL");
         assert_eq!(stored(&telemetry).await, 300);
         drop(telemetry);
-        remove_private_database(&path);
     }
 
     /// With no shutdown, a quiet writer truncates the WAL itself; new writes grow it again and
@@ -1369,7 +1328,7 @@ mod tests {
     #[tokio::test]
     async fn an_idle_writer_truncates_the_wal_and_keeps_every_event() {
         crate::lang::testing::install();
-        let path = private_database("agent-ide-telemetry-wal-idle");
+        let path = ScratchDatabase::new("telemetry-wal-idle");
         let config = TelemetryConfig {
             wal_idle: Duration::from_millis(400),
             ..TelemetryConfig::default()
@@ -1392,14 +1351,13 @@ mod tests {
         }
         telemetry.shutdown().await;
         drop(telemetry);
-        remove_private_database(&path);
     }
 
     /// A writer that receives no event at all still truncates what opening (migration) or an
     /// earlier owner left in the WAL, when quiet and at shutdown.
     #[tokio::test]
     async fn a_writer_without_ingress_truncates_the_opening_wal() {
-        let quiet_path = private_database("agent-ide-telemetry-wal-open-idle");
+        let quiet_path = ScratchDatabase::new("telemetry-wal-open-idle");
         let config = TelemetryConfig {
             wal_idle: Duration::from_millis(200),
             ..TelemetryConfig::default()
@@ -1414,9 +1372,8 @@ mod tests {
         .expect("the idle writer truncates the WAL its migration wrote");
         quiet.shutdown().await;
         drop(quiet);
-        remove_private_database(&quiet_path);
 
-        let drained_path = private_database("agent-ide-telemetry-wal-open-drain");
+        let drained_path = ScratchDatabase::new("telemetry-wal-open-drain");
         let drained = Telemetry::open_database(&drained_path, TelemetryConfig::default())
             .await
             .unwrap();
@@ -1424,14 +1381,13 @@ mod tests {
         drained.shutdown().await;
         assert_eq!(wal_len(&drained_path), 0, "the drain truncated them");
         drop(drained);
-        remove_private_database(&drained_path);
     }
 
     /// Every writable owner bounds the WAL it keeps after a reset, and a checkpoint blocked by a
     /// reader reports busy without losing anything, then succeeds once the reader is gone.
     #[tokio::test]
     async fn a_blocked_checkpoint_is_busy_not_lost_and_the_wal_residue_is_bounded() {
-        let path = private_database("agent-ide-telemetry-wal-busy");
+        let path = ScratchDatabase::new("telemetry-wal-busy");
         let store = Store::open(&path, test_store_config()).unwrap();
         let limit = store
             .read_one(
@@ -1467,13 +1423,12 @@ mod tests {
             .unwrap();
         assert_eq!(value, Some(7));
         drop(store);
-        remove_private_database(&path);
     }
 
     /// Keeps ownership through a contended background settlement so no second writer overlaps it.
     #[tokio::test]
     async fn stable_database_ownership_outlives_the_last_ingress_handle() {
-        let path = private_database("agent-ide-telemetry-owner");
+        let path = ScratchDatabase::new("telemetry-owner");
         let first = Telemetry::open_database(&path, TelemetryConfig::default())
             .await
             .unwrap();
@@ -1509,13 +1464,12 @@ mod tests {
         );
         reopened.shutdown().await;
         drop(reopened);
-        remove_private_database(&path);
     }
 
     /// Rejects preplaced database symlinks and world-readable state, then creates private files.
     #[tokio::test]
     async fn stable_database_requires_private_nonsymlink_state() {
-        let path = private_database("agent-ide-telemetry-private");
+        let path = ScratchDatabase::new("telemetry-private");
         let target = path.parent().unwrap().join("target.sqlite");
         std::os::unix::fs::symlink(&target, &path).unwrap();
         assert!(matches!(
@@ -1553,17 +1507,12 @@ mod tests {
         );
         telemetry.shutdown().await;
         drop(telemetry);
-        remove_private_database(&path);
     }
 
     /// Proves incompatible migration admission is not mistaken for an initialized telemetry schema.
     #[tokio::test]
     async fn incompatible_migration_is_propagated() {
-        let path = std::env::temp_dir().join(format!(
-            "agent-ide-telemetry-migration-{}-{}.sqlite",
-            std::process::id(),
-            NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed)
-        ));
+        let path = ScratchDatabase::new("telemetry-migration");
         let store = Arc::new(Store::open(&path, test_store_config()).unwrap());
         let sql = TrustedUpSql::new("CREATE TABLE incompatible(value INTEGER);").unwrap();
         assert!(matches!(
@@ -1582,17 +1531,12 @@ mod tests {
             Telemetry::open(store, TelemetryConfig::default()).await,
             Err(TelemetryError::MigrationIncompatible)
         ));
-        let _ = std::fs::remove_file(path);
     }
 
     /// Proves a nonfresh database without an approved backup root cannot masquerade as migrated.
     #[tokio::test]
     async fn backup_unavailable_migration_is_propagated() {
-        let path = std::env::temp_dir().join(format!(
-            "agent-ide-telemetry-backup-{}-{}.sqlite",
-            std::process::id(),
-            NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed)
-        ));
+        let path = ScratchDatabase::new("telemetry-backup");
         let store = Arc::new(Store::open(&path, test_store_config()).unwrap());
         assert!(matches!(
             store
@@ -1607,17 +1551,12 @@ mod tests {
             Telemetry::open(store, TelemetryConfig::default()).await,
             Err(TelemetryError::MigrationBackupUnavailable)
         ));
-        let _ = std::fs::remove_file(path);
     }
 
     /// Proves accepted migration timeout remains unknown instead of authorizing a telemetry owner.
     #[tokio::test]
     async fn outcome_unknown_migration_is_propagated() {
-        let path = std::env::temp_dir().join(format!(
-            "agent-ide-telemetry-unknown-{}-{}.sqlite",
-            std::process::id(),
-            NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed)
-        ));
+        let path = ScratchDatabase::new("telemetry-unknown");
         let config = StoreConfig {
             request_deadline: Duration::from_millis(10),
             ..test_store_config()
@@ -1641,17 +1580,12 @@ mod tests {
             blocker.await.unwrap().unwrap(),
             UntrackedOutcome::OutcomeUnknown
         ));
-        let _ = std::fs::remove_file(path);
     }
 
     /// Proves immediate shutdown waits through contention for the final accepted Store settlement.
     #[tokio::test]
     async fn immediate_shutdown_settles_the_final_accepted_event_under_contention() {
-        let path = std::env::temp_dir().join(format!(
-            "agent-ide-telemetry-timeout-{}-{}.sqlite",
-            std::process::id(),
-            NEXT_TEST_DATABASE.fetch_add(1, Ordering::Relaxed)
-        ));
+        let path = ScratchDatabase::new("telemetry-timeout");
         let config = StoreConfig {
             request_deadline: Duration::from_millis(10),
             ..test_store_config()
@@ -1678,13 +1612,12 @@ mod tests {
         let page = telemetry.query(Filter::All, None, 1).await.unwrap();
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.dropped, Some(0));
-        let _ = std::fs::remove_file(path);
     }
 
     /// Proves a disabled or unavailable telemetry owner drops ingress without returning an error.
     #[tokio::test]
     async fn disabled_sink_is_fail_open() {
-        let (telemetry, path) = open_test_telemetry(TelemetryConfig {
+        let (_database, telemetry) = open_test_telemetry(TelemetryConfig {
             enabled: false,
             ..TelemetryConfig::default()
         })
@@ -1693,13 +1626,12 @@ mod tests {
         let page = telemetry.query(Filter::All, None, 1).await.unwrap();
         assert!(page.rows.is_empty());
         assert_eq!(page.dropped, Some(1));
-        let _ = std::fs::remove_file(path);
     }
 
     /// Proves a full ingress queue drops observations synchronously without delaying the producer.
     #[tokio::test]
     async fn full_sink_is_fail_open() {
-        let (telemetry, path) = open_test_telemetry(TelemetryConfig {
+        let (_database, telemetry) = open_test_telemetry(TelemetryConfig {
             queue_capacity: 1,
             ..TelemetryConfig::default()
         })
@@ -1708,6 +1640,5 @@ mod tests {
             telemetry.record(event());
         }
         assert!(telemetry.dropped.as_ref().unwrap().load(Ordering::Relaxed) >= 7);
-        let _ = std::fs::remove_file(path);
     }
 }
