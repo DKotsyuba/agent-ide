@@ -25,8 +25,10 @@ subdirectories its server needs (rust-analyzer's build-script and proc-macro `ta
 and module caches, …). The key is stable across daemon restarts and reboots because it names the
 worktree by its directory — canonical path, inode and creation time, never the device number nor
 the per-database identity a new daemon mints afresh — and hashes every input that makes a native
-cache unsafe to reuse: accepted executable identity, settings, effective initialization
-configuration, toolchain and effective trust. A restarted daemon whose launch declaration is
+cache unsafe to reuse: the server and the language's own toolchain executables (compiler,
+interpreter) by path, identity and measured BLAKE3 digest — a selector such as `stable` or an
+unchanged label cannot hide a replaced binary — settings, effective initialization configuration,
+toolchain and effective trust. A restarted daemon whose launch declaration is
 unchanged therefore finds and adopts the existing namespace; a changed toolchain, setting,
 configuration, executable or trust derives another key and starts cold, and the old namespace ages
 out below. A worktree deleted and recreated at the same path has a new creation time and a new
