@@ -63,6 +63,7 @@ pub fn analyzer_command(
 
 /// The offer an analyzer module receives: the declaration's accepted files and admitted `roots`
 /// as its provider grant ([`ProviderGrant`]) and the language's settings value.
+#[allow(clippy::too_many_arguments)]
 pub fn analyzer_offer(
     executable: &ModuleExecutable,
     language: &str,
