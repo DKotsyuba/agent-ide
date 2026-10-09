@@ -223,7 +223,17 @@ impl PyrightBackend {
         let worktree_path = source.worktree().worktree_path();
         // In module mode the module resolves the interpreter and import roots itself; the
         // session restarts when any of the module's environment resolutions changes identity.
-        let module = agent_ide_core::modules::calls::module_executable(crate::LANGUAGE);
+        let module = match agent_ide_core::modules::calls::module_executable(crate::LANGUAGE) {
+            None => None,
+            Some(Ok(executable)) => Some(executable),
+            Some(Err(failure)) => {
+                job.set_stage_failure(
+                    &FailureCode::ProviderUnavailable,
+                    &format!("python: {failure}"),
+                );
+                return Err(FailureCode::ProviderUnavailable);
+            }
+        };
         let (interpreter, environment) = match &module {
             Some(_) => (None, module_environment(worktree_path).await),
             None => crate::environment::session(worktree_path),
