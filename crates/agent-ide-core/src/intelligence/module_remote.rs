@@ -205,6 +205,13 @@ impl LiveSession {
     }
 }
 
+/// The error text of a request a module's live provider failed (`ErrorCode::Failed`):
+/// `module_failed (<module>:provider:failed)`. A closed code, never the module's own message, and
+/// never a `module_unavailable`: the module is not retired.
+pub(crate) fn module_failed(module_id: &crate::modules::contract::ModuleId) -> String {
+    format!("module_failed ({module_id}:provider:failed)")
+}
+
 impl Session {
     /// Whether this session's provider is hosted by a bundled module.
     pub fn is_module(&self) -> bool {
@@ -401,6 +408,11 @@ impl Session {
                     remote.unavailable = Some(typed);
                     self.state.lock().expect("session lock").invalidate();
                     fault
+                }
+                // A live provider failed this one request: attributed to the module, which keeps
+                // serving (no fault recorded, the generation stays live).
+                None if error.code == crate::modules::contract::ErrorCode::Failed => {
+                    module_failed(&remote.channel.offer().module_id)
                 }
                 None => format!("module refused: {:?}", error.code),
             })),

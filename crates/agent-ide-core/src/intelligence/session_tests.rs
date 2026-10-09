@@ -1232,6 +1232,34 @@ async fn module_session_converts_product_answers() {
         !unknown.is_alive(),
         "the malformed answer retires the module"
     );
+
+    // A live provider that failed one request fails that request only, attributed to the module:
+    // no fault, the module stays live and its next request answers.
+    let mut failed = open(
+        FakeModule::new(ModuleId::bundled("alpha"), "1.0")
+            .with_fault(Capability::Semantic, Fault::RequestFailed),
+    )
+    .await;
+    let error = failed
+        .session
+        .definitions(&source, text.as_bytes(), 0)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "module_failed (bundled.alpha:provider:failed)"
+    );
+    assert!(failed.session.module_fault().is_none());
+    assert!(failed.is_alive(), "the module keeps serving");
+    assert_eq!(
+        failed
+            .session
+            .definitions(&source, text.as_bytes(), 0)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 /// Replaces the pilot session fence and fault tests: a module-hosted session applies the local
