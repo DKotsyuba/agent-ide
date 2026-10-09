@@ -390,6 +390,7 @@ impl PyrightBackend {
                                     (settings.node.clone(), settings.node_digest.clone()),
                                     (settings.binary.clone(), settings.script_digest.clone()),
                                 ],
+                                vec![PathBuf::from(&settings.cache_namespace)],
                                 Duration::from_secs(30),
                                 serde_json::json!(settings),
                             );
