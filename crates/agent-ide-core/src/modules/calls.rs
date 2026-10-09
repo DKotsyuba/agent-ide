@@ -48,6 +48,24 @@ fn module(language: Language) -> Option<&'static Arc<ModuleHost>> {
         .filter(|host| host.mode(language) == Mode::Module)
 }
 
+/// The project checker of `language` with its raw launcher `section` when the language computes
+/// in its module; `None` keeps the in-process checker.
+pub fn checker(
+    language: Language,
+    section: &serde_json::Value,
+    runner: Arc<dyn crate::checks::runner::ConfinedRunner>,
+    timeout: std::time::Duration,
+) -> Option<Arc<dyn crate::checks::Checker>> {
+    let host = module(language)?.clone();
+    Some(Arc::new(super::checker::ModuleChecker::new(
+        language,
+        host,
+        section.clone(),
+        runner,
+        timeout,
+    )))
+}
+
 /// Where `language` computes in this process.
 pub fn mode(language: Language) -> Mode {
     module(language).map_or(Mode::InProcess, |_| Mode::Module)

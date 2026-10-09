@@ -339,6 +339,8 @@ pub struct ProjectChecksConfig {
     check_timeout_s: u64,
     /// Declared language sections in registration order.
     sections: Vec<(Language, Arc<dyn CheckConfig>)>,
+    /// The same sections as written, for a language that interprets its section in its module.
+    raw: Vec<(Language, serde_json::Value)>,
 }
 
 /// The closed timing fields of `project_checks` plus the language sections.
@@ -366,9 +368,10 @@ impl<'de> Deserialize<'de> for ProjectChecksConfig {
     /// treated as absent.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error;
-        let raw = RawProjectChecksConfig::deserialize(deserializer)?;
+        let fields = RawProjectChecksConfig::deserialize(deserializer)?;
         let mut sections = Vec::new();
-        for (key, value) in raw.sections.0 {
+        let mut raw = Vec::new();
+        for (key, value) in fields.sections.0 {
             let Some((language, checks)) = Language::by_id(&key)
                 .and_then(|language| language.checks().map(|checks| (language, checks)))
             else {
@@ -377,6 +380,7 @@ impl<'de> Deserialize<'de> for ProjectChecksConfig {
             if value.is_null() {
                 continue;
             }
+            raw.push((language, value.clone()));
             sections.push((
                 language,
                 checks.parse_config(value).map_err(D::Error::custom)?,
@@ -384,10 +388,11 @@ impl<'de> Deserialize<'de> for ProjectChecksConfig {
         }
         sections.sort_by_key(|(language, _)| *language);
         Ok(Self {
-            debounce_ms: raw.debounce_ms,
-            idle_timeout_s: raw.idle_timeout_s,
-            check_timeout_s: raw.check_timeout_s,
+            debounce_ms: fields.debounce_ms,
+            idle_timeout_s: fields.idle_timeout_s,
+            check_timeout_s: fields.check_timeout_s,
             sections,
+            raw,
         })
     }
 }
@@ -411,6 +416,13 @@ impl ProjectChecksConfig {
             .iter()
             .find(|(declared, _)| *declared == language)
             .map(|(_, config)| &**config)
+    }
+    /// Returns `language`'s declared section as written.
+    pub fn raw_section(&self, language: Language) -> Option<&serde_json::Value> {
+        self.raw
+            .iter()
+            .find(|(declared, _)| *declared == language)
+            .map(|(_, section)| section)
     }
     /// Iterates the declared sections in registration order.
     pub fn sections(&self) -> impl Iterator<Item = (Language, &dyn CheckConfig)> {

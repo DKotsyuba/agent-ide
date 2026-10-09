@@ -241,7 +241,19 @@ impl ProjectProblemFeed {
         let runner = Arc::new(NestedSandboxFallbackRunner::new(Arc::new(SeatbeltRunner)));
         let checkers: Vec<Arc<dyn Checker>> = checks
             .sections()
-            .map(|(_, config)| config.checker(runner.clone(), checks.check_timeout()))
+            .map(|(language, config)| {
+                checks
+                    .raw_section(language)
+                    .and_then(|section| {
+                        crate::modules::calls::checker(
+                            language,
+                            section,
+                            runner.clone(),
+                            checks.check_timeout(),
+                        )
+                    })
+                    .unwrap_or_else(|| config.checker(runner.clone(), checks.check_timeout()))
+            })
             .collect();
         if checkers.is_empty() {
             return None;

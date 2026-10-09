@@ -43,6 +43,7 @@
 pub mod adapter;
 pub mod analyzer;
 pub mod calls;
+pub mod checker;
 pub mod contract;
 pub mod fake;
 pub mod host;

@@ -284,6 +284,24 @@ impl Described {
     }
 }
 
+/// Effect recipes of each language's descriptor, declared once by the root.
+static DECLARED: std::sync::OnceLock<&'static [(&'static str, &'static [EffectRecipe])]> =
+    std::sync::OnceLock::new();
+
+/// Declares every language's effect recipes (root composition data); later calls keep the first
+/// declaration.
+pub fn declare(recipes: &'static [(&'static str, &'static [EffectRecipe])]) {
+    let _ = DECLARED.set(recipes);
+}
+
+/// The declared recipes of the language `id`; none when it declares none.
+pub fn declared(id: &str) -> &'static [EffectRecipe] {
+    DECLARED
+        .get()
+        .and_then(|declared| declared.iter().find(|(language, _)| *language == id))
+        .map_or(&[], |(_, recipes)| recipes)
+}
+
 /// Expands `effect` with its recipe from `recipes` under `admission`.
 pub fn expand(
     recipes: &[EffectRecipe],

@@ -21,7 +21,7 @@ use super::{
         Capability, Cause, HelloOffer, Limits, ModuleConfig, ModuleId, ModuleUnavailable, PROTOCOL,
         Role, Stage, VERSION,
     },
-    host::{Call, NoEffects},
+    host::{Call, EffectRunner, NoEffects},
     launch::{ExecutionLauncher, MODULE_ENV, ModuleExecutable},
     mode::{LanguageModes, Mode},
     payload::{decode, encode},
@@ -240,8 +240,6 @@ impl ModuleHost {
         payload: serde_json::Value,
         attachments: Vec<Attachment>,
     ) -> Result<T, ModuleUnavailable> {
-        let slot = self.slot(language, worktree, Role::Analyzer).await?;
-        let mut supervisor = slot.lock().await;
         let call = Call {
             capability,
             scope_key: worktree.display().to_string(),
@@ -249,11 +247,35 @@ impl ModuleHost {
             payload,
             attachments,
         };
-        let reply = supervisor.call(call, self.budget, &mut NoEffects).await?;
+        self.call(
+            language,
+            worktree,
+            Role::Analyzer,
+            call,
+            self.budget,
+            &mut NoEffects,
+        )
+        .await
+    }
+
+    /// Sends one `call` to the `role` instance of `language` in `worktree` within `budget`,
+    /// serving its effects with `effects`, and decodes the typed result like [`Self::request`].
+    pub async fn call<T: DeserializeOwned>(
+        &self,
+        language: Language,
+        worktree: &Path,
+        role: Role,
+        call: Call,
+        budget: Duration,
+        effects: &mut dyn EffectRunner,
+    ) -> Result<T, ModuleUnavailable> {
+        let slot = self.slot(language, worktree, role).await?;
+        let mut supervisor = slot.lock().await;
+        let reply = supervisor.call(call, budget, effects).await?;
         let failure = |cause| ModuleUnavailable {
             module_id: ModuleId::bundled(language.name()),
             module_version: env!("CARGO_PKG_VERSION").to_owned(),
-            role: Role::Analyzer,
+            role,
             stage: Stage::Decode,
             cause,
             instance: None,
