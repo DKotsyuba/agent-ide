@@ -14,6 +14,9 @@ use agent_ide_core::modules::{
 use serde_json::json;
 use tokio::process::Command;
 
+/// Serializes the tests that start module processes: one counts this process's module children.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Starts `agent-ide module <language> <role>` with piped stdio.
 fn module_process(language: &str, role: &str) -> tokio::process::Child {
     Command::new(parity::binary())
@@ -33,6 +36,7 @@ fn module_process(language: &str, role: &str) -> tokio::process::Child {
 /// module's typed `unavailable (provider: tool_missing)`), and exits cleanly on `shutdown`.
 #[tokio::test]
 async fn hidden_module_mode_serves_the_placeholder_contract() {
+    let _serial = SERIAL.lock().await;
     agent_ide::languages::install();
     for language in ["python", "rust", "typescript", "html", "css"] {
         let mut child = module_process(language, "analyzer");
@@ -92,6 +96,7 @@ async fn hidden_module_mode_serves_the_placeholder_contract() {
 /// role exits with usage status 2 before reading anything.
 #[tokio::test]
 async fn hidden_module_mode_refuses_mismatches() {
+    let _serial = SERIAL.lock().await;
     agent_ide::languages::install();
     for (role, version) in [
         (Role::Checker, env!("CARGO_PKG_VERSION")),
@@ -142,6 +147,30 @@ fn parity_normalizer_masks_only_volatile_tokens() {
         normalized(&format!("ref {two}\n"))
     );
     assert_eq!(normalized("x\n"), "x\n");
+    // The generated activation id is masked only after its marker; other ids, short hex runs
+    // (a commit prefix) and paths still differ.
+    let (first, second) = ("a".repeat(64), "b".repeat(64));
+    assert_eq!(
+        normalized(&format!("activation {first} ready\n")),
+        normalized(&format!("activation {second} ready\n"))
+    );
+    assert_ne!(
+        normalized(&format!("op {first}\n")),
+        normalized(&format!("op {second}\n"))
+    );
+    assert_ne!(normalized("git 1a2b3c4\n"), normalized("git 5d6e7f8\n"));
+    assert_ne!(normalized("at /tmp/a/x\n"), normalized("at /tmp/b/x\n"));
+    // A request's echoed references are masked by value only; the request still differs by
+    // its other fields.
+    let reply = json!({"state":"complete","kind":"edit","code":null,"text":"ok"});
+    assert_eq!(
+        parity::line("ide.edit", &json!({"source_ref":"r1","path":"a"}), &reply),
+        parity::line("ide.edit", &json!({"source_ref":"r2","path":"a"}), &reply)
+    );
+    assert_ne!(
+        parity::line("ide.edit", &json!({"source_ref":"r1","path":"a"}), &reply),
+        parity::line("ide.edit", &json!({"source_ref":"r1","path":"b"}), &reply)
+    );
 }
 
 /// The parity harness runs the same calls on two fresh daemons, with and without the fallback
@@ -233,6 +262,7 @@ fn supervised(
 /// instance; an orderly stop leaves no process behind.
 #[tokio::test]
 async fn launcher_supervises_the_real_module() {
+    let _serial = SERIAL.lock().await;
     use agent_ide_core::modules::{
         host::Call,
         payload::{FileDocRequest, SourceRef, SourceText, encode},

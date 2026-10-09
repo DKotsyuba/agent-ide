@@ -199,6 +199,9 @@ impl Fixture {
             .env_clear()
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            // Identical fixtures commit to identical SHAs.
+            .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
             .arg("-C")
             .arg(&self.root)
             .args(args)
@@ -533,6 +536,15 @@ impl Session {
 
 /// One settled reply rendered as `tool args -> state kind code` plus its text.
 pub fn line(tool: &str, arguments: &Value, reply: &Value) -> String {
+    // A request echoes per-daemon references it was given; only their values are masked.
+    let mut arguments = arguments.clone();
+    if let Some(object) = arguments.as_object_mut() {
+        for key in ["source_ref", "detail_ref"] {
+            if let Some(value) = object.get_mut(key) {
+                *value = Value::String("<ref>".to_owned());
+            }
+        }
+    }
     format!(
         "{tool} {arguments} -> {} {} {}\n{}",
         reply["state"],
@@ -540,6 +552,12 @@ pub fn line(tool: &str, arguments: &Value, reply: &Value) -> String {
         reply["code"],
         reply["text"].as_str().unwrap_or_default()
     )
+}
+
+/// [`line`] with the fixture's own root (a private temporary path) written as `<root>`, keeping
+/// every relative suffix.
+pub fn line_for(fixture: &Fixture, tool: &str, arguments: &Value, reply: &Value) -> String {
+    line(tool, arguments, reply).replace(&fixture.root.display().to_string(), "<root>")
 }
 
 /// The replies of one daemon run and the process tree seen before `ide.stop`.
@@ -563,7 +581,7 @@ pub async fn transcript(
     let mut replies = Vec::new();
     for (tool, arguments) in calls {
         let reply = session.call(fixture, tool, arguments.clone()).await;
-        replies.push(line(tool, arguments, &reply));
+        replies.push(line_for(fixture, tool, arguments, &reply));
     }
     let tree = daemon.tree();
     session.close(fixture).await;
@@ -575,8 +593,9 @@ pub async fn transcript(
 }
 
 /// Masks only per-daemon tokens and keeps every other byte, whitespace included: a source-ref
-/// digest (a hex run over 64 characters, with `-`/`,` separators) and a numeric timing (`12ms`,
-/// `3.5ms`, optionally wrapped in punctuation such as `(12ms)` or `12ms,`).
+/// digest (a hex run over 64 characters, with `-`/`,` separators), a numeric timing (`12ms`,
+/// `3.5ms`, optionally wrapped in punctuation such as `(12ms)` or `12ms,`) and the generated
+/// 64-hex id right after a word naming the activation. Short hex runs and paths stay.
 pub fn normalized(text: &str) -> String {
     /// Whether `word` is one volatile token.
     fn volatile(word: &str) -> bool {
@@ -592,12 +611,30 @@ pub fn normalized(text: &str) -> String {
         });
         digest || timing
     }
+    /// Whether `word` is exactly a generated 64-hex identifier.
+    fn generated_id(word: &str) -> bool {
+        let core = word.trim_matches(|c: char| matches!(c, '(' | ')' | ',' | ';' | ':' | '.'));
+        core.len() == 64 && core.chars().all(|c| c.is_ascii_hexdigit())
+    }
     let mut out = String::with_capacity(text.len());
     let mut word = String::new();
+    let mut previous = String::new();
     for c in text.chars().chain(std::iter::once('\n')) {
         if c.is_whitespace() {
-            out.push_str(if volatile(&word) { "<volatile>" } else { &word });
-            word.clear();
+            if word.is_empty() {
+                out.push(c);
+                continue;
+            }
+            // The activation id a daemon generates follows its marker word.
+            let activation = previous.contains("activation") && generated_id(&word);
+            out.push_str(if activation {
+                "<activation>"
+            } else if volatile(&word) {
+                "<volatile>"
+            } else {
+                &word
+            });
+            previous = std::mem::take(&mut word);
             out.push(c);
         } else {
             word.push(c);
