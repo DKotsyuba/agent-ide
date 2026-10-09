@@ -45,6 +45,7 @@ pub mod launch;
 pub mod mode;
 pub mod payload;
 pub mod recipe;
+pub mod provider;
 pub mod router;
 pub mod runtime;
 pub mod serve;

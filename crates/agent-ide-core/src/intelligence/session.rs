@@ -1171,6 +1171,24 @@ impl Session {
             .unwrap_or_default())
     }
 
+    /// Outgoing calls of one call hierarchy item, one level (what it calls).
+    pub async fn outgoing_calls_for(
+        &mut self,
+        item: lsp::CallHierarchyItem,
+    ) -> io::Result<Vec<lsp::CallHierarchyOutgoingCall>> {
+        if self.remote.is_some() {
+            return Err(io::Error::other("not available through the pilot module"));
+        }
+        Ok(self
+            .request::<request::CallHierarchyOutgoingCalls>(lsp::CallHierarchyOutgoingCallsParams {
+                item,
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await?
+            .unwrap_or_default())
+    }
+
     /// Incoming calls of the callable at a byte offset (who calls it), one level.
     pub async fn incoming_calls(
         &mut self,
