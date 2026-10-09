@@ -23394,3 +23394,652 @@ async fn failed_stop_is_retried_by_the_daemon_without_another_call() {
     .expect("the daemon's own retry must revoke the grant without another call");
     actor.mcp.close().await;
 }
+
+// ---- M-011 phase-2b pilot: Python analyzer and checker as external module processes ----
+
+/// The command line of `id`, empty once it is gone.
+fn pilot_command(id: ProcessIdentity) -> String {
+    let listing = std::process::Command::new("/bin/ps")
+        .args(["-o", "command=", "-p", &id.pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&listing.stdout).trim().to_owned()
+}
+
+/// The daemon's `module-pilot <role>` child, if one runs.
+fn pilot_module(daemon: &OwnedDaemon, role: &str) -> Option<ProcessIdentity> {
+    let daemon = daemon.id()? as libc::pid_t;
+    ProcessIdentity::children_of(daemon)
+        .into_iter()
+        .find(|id| pilot_command(*id).ends_with(&format!("module-pilot {role}")))
+}
+
+/// The live children of a still-existing module process.
+fn pilot_children(module: ProcessIdentity) -> Vec<ProcessIdentity> {
+    if module.exists() {
+        ProcessIdentity::children_of(module.pid)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Waits up to five seconds for `id` to be gone; returns whether it is.
+async fn pilot_gone(id: ProcessIdentity) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while id.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    !id.exists()
+}
+
+/// Terminates every recorded module and Pyright process that survives, on success and on
+/// failure alike: the module's Pyright grandchild is not a direct daemon child, so the daemon
+/// owner's own cleanup would not cover it.
+#[derive(Default)]
+struct PilotReaper(Vec<ProcessIdentity>);
+
+impl Drop for PilotReaper {
+    /// Terminates the recorded processes that are still running.
+    fn drop(&mut self) {
+        ProcessIdentity::terminate(&self.0);
+    }
+}
+
+/// A Python fixture with a cross-file call, a class method, a type error, a `.venv` and the
+/// real Pyright analyzer plus confined Pyright checks.
+fn pilot_fixture(cache: &str) -> ProductFixture {
+    let fixture = ProductFixture::new(json!([accepted_pyright_provider(cache)]));
+    enable_real_pyright_checks(&fixture);
+    std::fs::write(
+        fixture.root.join("pyproject.toml"),
+        "[project]\nname = \"pilot\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("helper.py"),
+        "def double(x: int) -> int:\n    return x * 2\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("main.py"),
+        "from helper import double\n\n\nclass Greeter:\n    def greet(self, name: str) -> str:\n        return \"hi \" + name\n\n\ndef run() -> int:\n    return double(2)\n\n\ndef bad() -> int:\n    return \"bad\"\n",
+    )
+    .unwrap();
+    // Only the fixture's own sources are checked, not the linked interpreter's library.
+    std::fs::write(
+        fixture.root.join("pyrightconfig.json"),
+        "{\"include\": [\"main.py\", \"helper.py\"]}\n",
+    )
+    .unwrap();
+    python_venv_at(&fixture.root, ".venv");
+    fixture.git(&[
+        "add",
+        "--",
+        "pyproject.toml",
+        "pyrightconfig.json",
+        "helper.py",
+        "main.py",
+    ]);
+    fixture.git(&["commit", "--quiet", "-m", "pilot fixture"]);
+    fixture
+}
+
+/// Polls the problems page until Python's check lands (or 20 s pass) and returns its text.
+async fn pilot_problems(actor: &mut ProductActor, fixture: &ProductFixture) -> String {
+    let mut text = String::new();
+    for _ in 0..80 {
+        let problems = actor
+            .call(
+                fixture,
+                "ide.context",
+                json!({"kind":"problems","language":"python"}),
+            )
+            .await;
+        let problems = actor.settle(fixture, problems).await;
+        text = problems["text"].as_str().unwrap_or_default().to_owned();
+        if !text.contains("python: checking") && text.contains("python: ") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    text
+}
+
+/// The read-only tool calls whose replies must not depend on where the analyzer runs.
+fn pilot_calls() -> Vec<(&'static str, Value)> {
+    vec![
+        ("ide.outline", json!({"path":"main.py"})),
+        ("ide.outline", json!({"path":"helper.py"})),
+        ("ide.symbol", json!({"symbol":"helper.py#double"})),
+        ("ide.symbol", json!({"symbol":"main.py#run","callees":1})),
+        ("ide.symbol", json!({"symbol":"double"})),
+        ("ide.read", json!({"symbol":"main.py#Greeter/greet"})),
+        ("ide.graph", json!({"symbol":"helper.py#double"})),
+        ("ide.context", json!({"path":"main.py","byte_offset":141})),
+    ]
+}
+
+/// The pilot processes seen while a session was live: analyzer module, checker module, the
+/// analyzer's own children with their command lines, and whether any language server was a
+/// direct daemon child.
+type PilotTree = (
+    Option<ProcessIdentity>,
+    Option<ProcessIdentity>,
+    Vec<(ProcessIdentity, String)>,
+    bool,
+);
+
+/// Starts a daemon on `fixture` with `env` and an activated actor.
+async fn pilot_session(
+    fixture: &ProductFixture,
+    env: &[(&str, &str)],
+) -> (OwnedDaemon, ProductActor) {
+    let daemon = fixture
+        .spawn_configured_daemon_with_env(None, false, Duration::from_secs(30), None, env)
+        .await;
+    let mut actor = ProductActor::new(fixture, "pilot").await;
+    let start = actor
+        .call(fixture, "ide.start", json!({"activation_id":"pilot-start"}))
+        .await;
+    let start = actor.settle(fixture, start).await;
+    assert_eq!(start["kind"], "activation", "{start}");
+    (daemon, actor)
+}
+
+/// One settled call: the reply's state, kind, refusal code and text.
+async fn pilot_call(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    tool: &str,
+    arguments: Value,
+) -> String {
+    let reply = actor.call(fixture, tool, arguments.clone()).await;
+    let reply = actor.settle(fixture, reply).await;
+    format!(
+        "{tool} {arguments} -> {} {} {}\n{}",
+        reply["state"],
+        reply["kind"],
+        reply["code"],
+        reply["text"].as_str().unwrap_or_default()
+    )
+}
+
+/// Runs [`pilot_calls`] and the problems page on a fresh daemon with `env`, returning each
+/// reply's kind and text, the pilot processes seen before `ide.stop`, and the daemon.
+async fn pilot_transcript(
+    fixture: &ProductFixture,
+    env: &[(&str, &str)],
+) -> (Vec<String>, PilotTree, OwnedDaemon) {
+    let (daemon, mut actor) = pilot_session(fixture, env).await;
+    let mut transcript = Vec::new();
+    for (tool, arguments) in pilot_calls() {
+        transcript.push(pilot_call(&mut actor, fixture, tool, arguments).await);
+    }
+    transcript.push(pilot_problems(&mut actor, fixture).await);
+    let analyzer = pilot_module(&daemon, "analyzer");
+    let daemon_pid = daemon.id().unwrap() as libc::pid_t;
+    let tree = (
+        analyzer,
+        pilot_module(&daemon, "checker"),
+        analyzer
+            .map(pilot_children)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| (id, pilot_command(id)))
+            .collect(),
+        ProcessIdentity::children_of(daemon_pid)
+            .into_iter()
+            .any(|id| pilot_command(id).contains("langserver")),
+    );
+    let stopped = actor.call(fixture, "ide.stop", json!({})).await;
+    actor.settle(fixture, stopped).await;
+    actor.mcp.close().await;
+    (transcript, tree, daemon)
+}
+
+/// Drops the volatile per-daemon tokens (source-ref digests and timings) from a transcript line.
+fn pilot_normalized(text: &str) -> String {
+    text.split_whitespace()
+        .map(|word| {
+            let digest = word.len() > 64
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || c == '-' || c == ',');
+            if digest || word.ends_with("ms") || word.ends_with("ms)") {
+                "<volatile>"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// M-011: with `AGENT_IDE_PILOT_MODULE=python` the Python outline/symbol/graph/read, context and
+/// problems answers come from the external module processes and match the in-process answers
+/// on the same fixture; the analyzer module owns the Pyright process and a checker module runs.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT, AGENT_IDE_NODE and AGENT_IDE_PYTHON environments"]
+async fn pilot_python_module_matches_in_process_answers() {
+    let fixture = pilot_fixture("pilot-parity-cache");
+    let mut reaper = PilotReaper::default();
+    let (in_process, (analyzer, checker, _, direct), daemon) =
+        pilot_transcript(&fixture, &[("AGENT_IDE_PILOT_MODULE", "off")]).await;
+    assert!(
+        analyzer.is_none() && checker.is_none() && direct,
+        "without the flag Pyright is a direct daemon child and no module runs"
+    );
+    drop(daemon);
+    let (external, (analyzer, checker, pyright, direct), daemon) =
+        pilot_transcript(&fixture, &[("AGENT_IDE_PILOT_MODULE", "python")]).await;
+    let analyzer = analyzer.expect("the analyzer module ran");
+    let checker = checker.expect("the checker module ran");
+    reaper.0.extend([analyzer, checker]);
+    reaper.0.extend(pyright.iter().map(|(id, _)| *id));
+    assert!(
+        matches!(pyright.as_slice(), [(_, command)]
+            if command.contains("pyright-langserver") && command.ends_with("--stdio")),
+        "the analyzer module owns one Pyright process: {pyright:?}"
+    );
+    assert!(
+        !direct,
+        "no Pyright language server is a direct daemon child in pilot mode"
+    );
+    let problems = in_process.last().unwrap();
+    assert!(
+        problems.contains("python: ready") || problems.contains("python: partial"),
+        "the in-process check landed:\n{problems}"
+    );
+    assert!(
+        external
+            .iter()
+            .any(|reply| reply.contains("mode: semantic"))
+    );
+    assert!(
+        external
+            .iter()
+            .any(|reply| reply.contains("main.py:10  return double(2)"))
+    );
+    assert_eq!(in_process.len(), external.len());
+    for (local, remote) in in_process.iter().zip(&external) {
+        assert_eq!(
+            pilot_normalized(local),
+            pilot_normalized(remote),
+            "\n--- in process ---\n{local}\n--- pilot module ---\n{remote}"
+        );
+    }
+    drop(daemon);
+    for id in &reaper.0 {
+        assert!(
+            pilot_gone(*id).await,
+            "pilot process {id:?} survived the daemon stop"
+        );
+    }
+}
+
+/// M-011: a stall past the call budget, a malformed frame and a `kill -9` of the analyzer module
+/// in the middle of a call each answer that call with a typed `provider_unavailable` refusal
+/// and the next call restarts a fresh module and answers, on the same daemon; a `kill -9` while
+/// idle is noticed before the next call, which restarts and answers. No module or Pyright
+/// process of a failed instance survives.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT, AGENT_IDE_NODE and AGENT_IDE_PYTHON environments"]
+async fn pilot_python_analyzer_faults_are_typed_and_restart() {
+    let fixture = pilot_fixture("pilot-fault-cache");
+    let mut reaper = PilotReaper::default();
+    let usages = json!({"symbol":"helper.py#double"});
+    for fault in ["stall", "malformed", "kill", "kill-idle"] {
+        let flag = fixture.base.join(format!("pilot-fault-{fault}"));
+        std::fs::write(&flag, "").unwrap();
+        let seam = match fault {
+            "malformed" => format!("malformed:references:{}", flag.display()),
+            _ => format!("stall:references:{}", flag.display()),
+        };
+        let budget = if fault == "stall" { "3000" } else { "20000" };
+        let (mut daemon, mut actor) = pilot_session(
+            &fixture,
+            &[
+                ("AGENT_IDE_PILOT_MODULE", "python"),
+                ("AGENT_IDE_PILOT_BUDGET_MS", budget),
+                ("AGENT_IDE_TEST_PILOT_FAULT", &seam),
+            ],
+        )
+        .await;
+        let daemon_pid = daemon.id().unwrap();
+        let warm = pilot_call(
+            &mut actor,
+            &fixture,
+            "ide.outline",
+            json!({"path":"main.py"}),
+        )
+        .await;
+        assert!(warm.contains("def run() -> int"), "{fault}: {warm}");
+        let first = pilot_module(&daemon, "analyzer").expect("analyzer module runs");
+        let pyright = pilot_children(first);
+        reaper.0.push(first);
+        reaper.0.extend(&pyright);
+        let started = std::time::Instant::now();
+        let failed = match fault {
+            "kill" => {
+                let killer = tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(800)).await;
+                    if first.running() {
+                        // SAFETY: `first` is the exact module identity captured as a child of
+                        // this test's daemon a moment ago.
+                        unsafe { libc::kill(first.pid, libc::SIGKILL) };
+                    }
+                });
+                let reply = pilot_call(&mut actor, &fixture, "ide.symbol", usages.clone()).await;
+                killer.await.unwrap();
+                Some(reply)
+            }
+            "kill-idle" => {
+                // SAFETY: as above, the exact module identity of this test's daemon.
+                unsafe { libc::kill(first.pid, libc::SIGKILL) };
+                assert!(pilot_gone(first).await, "killed module is reaped");
+                std::fs::remove_file(&flag).unwrap();
+                None
+            }
+            _ => Some(pilot_call(&mut actor, &fixture, "ide.symbol", usages.clone()).await),
+        };
+        let failed_after = started.elapsed();
+        if let Some(failed) = &failed {
+            assert!(
+                failed.contains("-> \"error\" null \"provider_unavailable\""),
+                "{fault}: typed refusal expected:\n{failed}"
+            );
+        }
+        match fault {
+            "stall" => assert!(
+                failed_after >= Duration::from_millis(3000)
+                    && failed_after < Duration::from_secs(10),
+                "stall answered after {failed_after:?}"
+            ),
+            "kill" | "malformed" => assert!(
+                failed_after < Duration::from_secs(5),
+                "{fault} answered after {failed_after:?}"
+            ),
+            _ => {}
+        }
+        // The next call restarts the module and answers; a freshly started Pyright may still be
+        // indexing the workspace, so full cross-file usages can take a few more calls.
+        let restarted_at = std::time::Instant::now();
+        let recovered = pilot_call(&mut actor, &fixture, "ide.symbol", usages.clone()).await;
+        let restart = restarted_at.elapsed();
+        assert!(
+            recovered.contains("-> \"complete\" \"symbol\""),
+            "{fault}: the next call restarts and answers:\n{recovered}"
+        );
+        assert!(
+            restart < Duration::from_secs(15),
+            "{fault}: restart took {restart:?}"
+        );
+        let mut complete = recovered;
+        while !complete.contains("usages: 2 in 1 files")
+            && restarted_at.elapsed() < Duration::from_secs(20)
+        {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            complete = pilot_call(&mut actor, &fixture, "ide.symbol", usages.clone()).await;
+        }
+        assert!(
+            complete.contains("usages: 2 in 1 files"),
+            "{fault}: full usages after restart:\n{complete}"
+        );
+        eprintln!(
+            "pilot-fault {fault}: refusal after {} ms, restart call {} ms, full usages after {} ms",
+            failed_after.as_millis(),
+            restart.as_millis(),
+            restarted_at.elapsed().as_millis()
+        );
+        let second = pilot_module(&daemon, "analyzer").expect("a fresh module runs");
+        reaper.0.push(second);
+        reaper.0.extend(pilot_children(second));
+        assert_ne!(first, second, "{fault}: the failed module was replaced");
+        assert!(pilot_gone(first).await, "{fault}: failed module survived");
+        for id in &pyright {
+            assert!(
+                pilot_gone(*id).await,
+                "{fault}: failed module's Pyright survived"
+            );
+        }
+        assert!(
+            daemon.try_wait().unwrap().is_none(),
+            "{fault}: the daemon stays up"
+        );
+        assert_eq!(daemon.id(), Some(daemon_pid), "{fault}: same daemon");
+        let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+        actor.settle(&fixture, stopped).await;
+        actor.mcp.close().await;
+        drop(daemon);
+    }
+}
+
+/// M-011: a stall past the call budget, a malformed frame and a `kill -9` of the checker module
+/// each answer Python's check `unavailable (fatal)` naming the module fault, and a run the module
+/// proposes with a write root escaping the check cache is refused by the core (the check fails
+/// without running it). After an edit the next check starts a fresh module and lands, on the
+/// same daemon.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT, AGENT_IDE_NODE and AGENT_IDE_PYTHON environments"]
+async fn pilot_python_checker_faults_are_typed_and_restart() {
+    let fixture = pilot_fixture("pilot-check-fault-cache");
+    let mut reaper = PilotReaper::default();
+    for (fault, expected) in [
+        ("stall", "pilot module stalled past its 3000 ms budget"),
+        (
+            "malformed",
+            "pilot module sent a bad frame (malformed frame)",
+        ),
+        ("kill", "pilot module exited"),
+        ("widen", "run refused by the core policy"),
+    ] {
+        let flag = fixture.base.join(format!("pilot-check-{fault}"));
+        std::fs::write(&flag, "").unwrap();
+        let seam = match fault {
+            "malformed" => format!("malformed:check:{}", flag.display()),
+            "widen" => format!("widen:run:{}", flag.display()),
+            _ => format!("stall:check:{}", flag.display()),
+        };
+        let budget = if fault == "stall" { "3000" } else { "20000" };
+        let (mut daemon, mut actor) = pilot_session(
+            &fixture,
+            &[
+                ("AGENT_IDE_PILOT_MODULE", "python"),
+                ("AGENT_IDE_PILOT_BUDGET_MS", budget),
+                ("AGENT_IDE_TEST_PILOT_FAULT", &seam),
+            ],
+        )
+        .await;
+        let daemon_pid = daemon.id().unwrap();
+        let mut first = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while first.is_none() && std::time::Instant::now() < deadline {
+            first = pilot_module(&daemon, "checker");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // A malformed or refused module may already be gone; the stalled one must be seen.
+        reaper.0.extend(first);
+        if fault == "kill" {
+            let first = first.expect("the stalled checker module runs");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(!flag.exists(), "the stall seam fired before the kill");
+            // SAFETY: `first` is the exact module identity captured as a child of this test's
+            // daemon a moment ago.
+            unsafe { libc::kill(first.pid, libc::SIGKILL) };
+        }
+        let failed = pilot_problems(&mut actor, &fixture).await;
+        assert!(
+            failed.contains(expected),
+            "{fault}: the check names the module fault:\n{failed}"
+        );
+        if let Some(first) = first.filter(|_| fault != "widen") {
+            assert!(pilot_gone(first).await, "{fault}: module survived");
+        }
+        std::fs::write(
+            fixture.root.join("main.py"),
+            format!("def edited_{fault}() -> int:\n    return \"bad\"\n"),
+        )
+        .unwrap();
+        // The fault left the check unavailable, so `ready` can only come from a fresh module.
+        let mut landed = String::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline && !landed.contains("python: ready") {
+            landed = pilot_problems(&mut actor, &fixture).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(
+            landed.contains("python: ready"),
+            "{fault}: the next check lands:\n{landed}"
+        );
+        if let Some(second) = pilot_module(&daemon, "checker") {
+            reaper.0.push(second);
+        }
+        assert!(
+            daemon.try_wait().unwrap().is_none(),
+            "{fault}: the daemon stays up"
+        );
+        assert_eq!(daemon.id(), Some(daemon_pid), "{fault}: same daemon");
+        let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+        actor.settle(&fixture, stopped).await;
+        actor.mcp.close().await;
+        drop(daemon);
+    }
+}
+
+/// Resident set size of `id` in KiB, `0` once it is gone.
+fn pilot_rss_kib(id: ProcessIdentity) -> u64 {
+    let listing = std::process::Command::new("/bin/ps")
+        .args(["-o", "rss=", "-p", &id.pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&listing.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// Milliseconds of one settled call that must answer `kind`.
+async fn pilot_timed(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    tool: &str,
+    arguments: Value,
+    kind: &str,
+) -> f64 {
+    let started = std::time::Instant::now();
+    let reply = pilot_call(actor, fixture, tool, arguments).await;
+    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+    assert!(
+        reply.contains(&format!("\"complete\" \"{kind}\"")),
+        "{reply}"
+    );
+    elapsed
+}
+
+/// M-011 measurement harness, not a pass/fail contract: for the in-process path and the pilot
+/// module it records raw samples of cold session start (stop/start then the first outline),
+/// warm per-call latency of `ide.outline` (documentSymbols) and `ide.symbol` (hover plus
+/// references), and the resident memory of the daemon and its provider process tree, and
+/// writes them as JSON to `AGENT_IDE_PILOT_MEASURE_OUT`. Run it on a release build. Without
+/// that variable it measures nothing and passes, so configured runs of every ignored test skip it.
+#[tokio::test]
+#[ignore = "measurement; requires AGENT_IDE_PYRIGHT, AGENT_IDE_NODE, AGENT_IDE_PYTHON and AGENT_IDE_PILOT_MEASURE_OUT"]
+async fn pilot_python_measure() {
+    let Some(out) = std::env::var_os("AGENT_IDE_PILOT_MEASURE_OUT").map(PathBuf::from) else {
+        eprintln!("pilot_python_measure skipped: AGENT_IDE_PILOT_MEASURE_OUT is not set");
+        return;
+    };
+    let fixture = pilot_fixture("pilot-measure-cache");
+    let mut reaper = PilotReaper::default();
+    let (cold_runs, warmup, calls) = (15, 20, 200);
+    let mut report = serde_json::Map::new();
+    for mode in ["off", "python"] {
+        let (daemon, mut actor) =
+            pilot_session(&fixture, &[("AGENT_IDE_PILOT_MODULE", mode)]).await;
+        let outline = json!({"path":"main.py"});
+        let symbol = json!({"symbol":"helper.py#double"});
+        // Cold starts: the first outline after a stop starts the provider (and module).
+        let mut cold = Vec::new();
+        for run in 0..cold_runs {
+            if run > 0 {
+                let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+                actor.settle(&fixture, stopped).await;
+                let start = actor
+                    .call(
+                        &fixture,
+                        "ide.start",
+                        json!({"activation_id":"pilot-start"}),
+                    )
+                    .await;
+                actor.settle(&fixture, start).await;
+            }
+            cold.push(
+                pilot_timed(
+                    &mut actor,
+                    &fixture,
+                    "ide.outline",
+                    outline.clone(),
+                    "outline",
+                )
+                .await,
+            );
+        }
+        // Full usages prove the workspace is indexed before warm sampling.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !pilot_call(&mut actor, &fixture, "ide.symbol", symbol.clone())
+            .await
+            .contains("usages: 2 in 1 files")
+        {
+            assert!(std::time::Instant::now() < deadline, "workspace indexed");
+        }
+        let mut samples = serde_json::Map::new();
+        samples.insert("cold_outline_ms".into(), json!(cold));
+        for (name, tool, arguments, kind) in [
+            ("warm_outline_ms", "ide.outline", outline.clone(), "outline"),
+            ("warm_symbol_ms", "ide.symbol", symbol.clone(), "symbol"),
+        ] {
+            for _ in 0..warmup {
+                pilot_timed(&mut actor, &fixture, tool, arguments.clone(), kind).await;
+            }
+            let mut values = Vec::new();
+            for _ in 0..calls {
+                values.push(pilot_timed(&mut actor, &fixture, tool, arguments.clone(), kind).await);
+            }
+            samples.insert(name.into(), json!(values));
+        }
+        let problems = pilot_problems(&mut actor, &fixture).await;
+        assert!(problems.contains("python: ready"), "{problems}");
+        let daemon_pid = daemon.id().unwrap() as libc::pid_t;
+        let daemon_id = ProcessIdentity::of(daemon_pid).unwrap().0;
+        let mut tree = vec![("daemon".to_owned(), daemon_id)];
+        for child in ProcessIdentity::children_of(daemon_pid) {
+            let command = pilot_command(child);
+            reaper.0.push(child);
+            for grandchild in pilot_children(child) {
+                reaper.0.push(grandchild);
+                tree.push((format!("  {}", pilot_command(grandchild)), grandchild));
+            }
+            tree.push((command, child));
+        }
+        let memory: Vec<Value> = tree
+            .iter()
+            .map(|(command, id)| json!({"process": command, "rss_kib": pilot_rss_kib(*id)}))
+            .collect();
+        samples.insert("rss".into(), json!(memory));
+        report.insert(mode.into(), Value::Object(samples));
+        let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+        actor.settle(&fixture, stopped).await;
+        actor.mcp.close().await;
+        drop(daemon);
+    }
+    report.insert(
+        "method".into(),
+        json!({"cold_runs": cold_runs, "warmup": warmup, "calls": calls,
+               "clock": "wall time of one settled MCP tools/call round trip measured in the test process"}),
+    );
+    std::fs::write(
+        &out,
+        serde_json::to_vec_pretty(&Value::Object(report)).unwrap(),
+    )
+    .unwrap();
+}

@@ -909,6 +909,15 @@ impl CheckConfig for ProjectPythonChecksConfig {
 
     /// Builds the confined Pyright runner for these tools.
     fn checker(&self, runner: Arc<dyn ConfinedRunner>, timeout: Duration) -> Arc<dyn Checker> {
+        // M-011 pilot: the external checker module, its runs still on `runner`.
+        if crate::pilot::enabled() {
+            return Arc::new(crate::pilot::PilotChecker::new(
+                runner,
+                self.node.clone(),
+                self.pyright_cli.clone(),
+                timeout,
+            ));
+        }
         Arc::new(PythonChecker::new(
             runner,
             self.node.clone(),

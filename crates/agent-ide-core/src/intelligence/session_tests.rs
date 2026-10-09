@@ -268,6 +268,7 @@ async fn unversioned_diagnostics_require_unchanged_initial_open() {
         deadline: Instant::now() + Duration::from_secs(1),
         sequence: 1,
         version: 2,
+        remote: None,
     };
     assert_eq!(
         session
@@ -1095,4 +1096,186 @@ async fn live_session_outlives_requests_and_waits_for_readiness_per_request() {
     assert!(live.is_alive());
     live.shutdown().await;
     let _ = tokio::time::timeout(Duration::from_secs(2), peer_task).await;
+}
+
+/// Opens an M-011 pilot (remote) session against an in-memory module that answers `hello`, then
+/// answers every later request with `reply` and records its method.
+async fn remote_session(reply: serde_json::Value) -> (LiveSession, Arc<Mutex<Vec<String>>>) {
+    use super::super::pilot::{read_frame, write_frame};
+    let (core_out, mut module_in) = tokio::io::duplex(1 << 16);
+    let (mut module_out, core_in) = tokio::io::duplex(1 << 16);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let seen = log.clone();
+    tokio::spawn(async move {
+        let hello = read_frame(&mut module_in).await.unwrap();
+        let capabilities =
+            json!({"advertised": {}, "position_encoding": "utf-16", "server_info": null});
+        write_frame(
+            &mut module_out,
+            &json!({"id": hello["id"], "result": capabilities}),
+        )
+        .await
+        .unwrap();
+        while let Ok(request) = read_frame(&mut module_in).await {
+            seen.lock()
+                .unwrap()
+                .push(request["method"].as_str().unwrap().to_owned());
+            write_frame(
+                &mut module_out,
+                &json!({"id": request["id"], "result": reply}),
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let generation = ViewGeneration {
+        backend: 1,
+        configuration: 1,
+        toolchain: 1,
+        view: 1,
+    };
+    let live = LiveSession::open_remote(
+        core_in,
+        core_out,
+        tree(),
+        1,
+        generation,
+        plain_settings(),
+        Duration::from_secs(5),
+        json!({}),
+    )
+    .await
+    .unwrap();
+    (live, log)
+}
+
+/// A remote session applies the local source fences before any byte reaches the module: another
+/// worktree, another epoch, bytes that do not match the observation and a stale sequence are
+/// refused, and only the one valid request is forwarded.
+#[tokio::test]
+async fn remote_session_fences_source_before_forwarding() {
+    let (mut live, log) = remote_session(json!([])).await;
+    let other_tree =
+        WorktreeRef::from_discovery("/tmp/other".into(), "/tmp/other".into(), ".git".into(), 1)
+            .unwrap();
+    let foreign = |worktree: WorktreeRef, epoch: u64| {
+        SourceObservation::new(
+            worktree,
+            epoch,
+            5,
+            ObservationRef::new("source-5").unwrap(),
+            "main.go".into(),
+            Some(SourceBytes::from_bytes(b"a")),
+            SourceRevision::new("revision-5").unwrap(),
+            SourceCoverage::Complete,
+            ObservedState::Present,
+        )
+        .unwrap()
+    };
+    let session = &mut live.session;
+    let error = session
+        .document_symbols(&foreign(other_tree, 1), b"a")
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    let error = session
+        .document_symbols(&foreign(tree(), 2), b"a")
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(
+        session
+            .document_symbols(&observation("a", 2), b"b")
+            .await
+            .is_err()
+    );
+    assert!(
+        session
+            .document_symbols(&observation("a", 3), b"a")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let error = session
+        .document_symbols(&observation("a", 2), b"a")
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(
+        session
+            .rename(&observation("a", 4), b"a", 0, "b")
+            .await
+            .is_err()
+    );
+    assert_eq!(*log.lock().unwrap(), ["document_symbols"]);
+}
+
+/// The module's context evidence counts only for the core's own generation, and its
+/// diagnostics bind to the core's observation only when the module saw the same sequence.
+#[tokio::test]
+async fn remote_context_checks_generation_and_diagnostic_binding() {
+    let diagnostic = json!({"range": {"start": {"line": 0, "character": 0},
+        "end": {"line": 0, "character": 1}}, "message": "m"});
+    let reply = |generation: u64, sequence: u64| {
+        let generation = (generation > 0).then_some([generation, 1, 1, generation]);
+        json!({
+            "context": {"generation": generation, "document_version": 1,
+                "position_encoding": "utf-16", "lexical": null, "definitions": [],
+                "references": [], "truncated": false},
+            "diagnostics": {"source_sequence": sequence, "document_version": 1,
+                "readiness": "reported", "freshness": "provisional",
+                "diagnostics": [diagnostic], "truncated": false},
+        })
+    };
+    let query = ContextQuery::Symbol { byte_offset: 0 };
+
+    let (mut live, _) = remote_session(reply(1, 2)).await;
+    let result = live
+        .session
+        .context(&observation("a", 2), b"a", query)
+        .await
+        .unwrap();
+    assert_eq!(result.mode, ContextMode::Semantic);
+    assert_eq!(
+        result.source,
+        SourceBinding::from_observation(&observation("a", 2))
+    );
+    let diagnostics = live.session.diagnostics();
+    assert_eq!(diagnostics.readiness, DiagnosticReadiness::Reported);
+    assert_eq!(diagnostics.diagnostics.len(), 1);
+
+    let (mut live, _) = remote_session(reply(1, 9)).await;
+    live.session
+        .context(&observation("a", 2), b"a", query)
+        .await
+        .unwrap();
+    let diagnostics = live.session.diagnostics();
+    assert_eq!(diagnostics.readiness, DiagnosticReadiness::Unknown);
+    assert!(diagnostics.source.is_none() && diagnostics.diagnostics.is_empty());
+
+    // Another generation, and semantic evidence without any generation (0 = null here).
+    for generation in [7, 0] {
+        let (mut live, _) = remote_session(reply(generation, 2)).await;
+        let result = live
+            .session
+            .context(&observation("a", 2), b"a", query)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.mode,
+            ContextMode::Lexical {
+                reason: "pilot module answered for another generation".into()
+            }
+        );
+        assert!(result.generation.is_none() && result.definitions.is_none());
+        assert!(
+            !live.is_alive(),
+            "a reply for another generation retires the session"
+        );
+        assert_eq!(
+            live.remote_fault(),
+            Some("pilot module answered for another generation"),
+            "and is a module fault its owner turns into a typed refusal"
+        );
+    }
 }
