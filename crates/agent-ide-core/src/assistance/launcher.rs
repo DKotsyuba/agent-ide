@@ -226,6 +226,65 @@ struct RawProviderLaunch {
     fields: UniqueEntries,
 }
 
+/// A settings identifier whose server was removed from the product, with the doctor sentence that
+/// tells the operator its provider entry is ignored. Supplied once by the root application.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetiredSettings {
+    /// The retired closed settings identifier.
+    pub key: &'static str,
+    /// One-line doctor explanation of the ignored entry.
+    pub notice: &'static str,
+}
+
+/// Retired settings identifiers for this process; set once by [`install_retired_settings`].
+static RETIRED: std::sync::OnceLock<&'static [RetiredSettings]> = std::sync::OnceLock::new();
+
+/// Registers the settings identifiers whose provider entries are dropped before validation
+/// instead of failing the whole launcher. Only the first call installs; call it before parsing a
+/// launcher configuration.
+pub fn install_retired_settings(retired: &'static [RetiredSettings]) {
+    RETIRED.get_or_init(|| retired);
+}
+
+/// One decoded provider declaration: a launch, or an entry of a retired server that is ignored.
+enum ProviderEntry {
+    /// A registered server's declaration.
+    Launch(Box<ProviderLaunch>),
+    /// A declaration whose settings identifier was retired; its other fields are not decoded.
+    Retired(&'static RetiredSettings),
+}
+
+impl<'de> Deserialize<'de> for ProviderEntry {
+    /// Drops a retired server's declaration before registered-provider decoding, whatever its
+    /// other fields hold; every non-retired entry is replayed from its exact text through
+    /// [`ProviderLaunch`], so for those an unknown settings key and a repeated key at any depth stay invalid.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        /// Reads only the settings identifier of one declaration and ignores everything else.
+        #[derive(Deserialize)]
+        struct Probe {
+            /// Closed settings identifier of the declaration.
+            settings: Option<String>,
+        }
+        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        let probe: Probe = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+        let retired = probe.settings.as_deref().and_then(|settings| {
+            RETIRED
+                .get()
+                .copied()
+                .unwrap_or(&[])
+                .iter()
+                .find(|retired| retired.key == settings)
+        });
+        match retired {
+            Some(retired) => Ok(Self::Retired(retired)),
+            None => serde_json::from_str(raw.get())
+                .map(|launch| Self::Launch(Box::new(launch)))
+                .map_err(D::Error::custom),
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for ProviderLaunch {
     /// Decodes the closed declaration schema of the registered servers.
     ///
@@ -451,7 +510,7 @@ struct RawTarget {
     #[serde(default, rename = "cwd_trampoline")]
     _cwd_trampoline: Option<Value>,
     /// At most one declaration per registered server; duplicate settings/languages are rejected.
-    providers: Vec<ProviderLaunch>,
+    providers: Vec<ProviderEntry>,
     #[serde(default, rename = "profiles")]
     _profiles: Vec<Value>,
     #[serde(default, rename = "allow_disabled_host")]
@@ -501,6 +560,8 @@ pub struct LauncherConfig {
     allowed_roots: Vec<PathBuf>,
     /// Validated project-check declarations; `None` disables project checks.
     project_checks: Option<ProjectChecksConfig>,
+    /// Retired settings identifiers whose provider entries were dropped, each once.
+    retired: Vec<&'static RetiredSettings>,
 }
 impl std::fmt::Debug for LauncherConfig {
     /// Emits no attachment, path, accepted profile or executable identity.
@@ -592,17 +653,28 @@ impl LauncherConfig {
             return Err(LauncherError::Rejected);
         }
         let mut targets = BTreeMap::new();
+        let mut retired: Vec<&'static RetiredSettings> = Vec::new();
         for target in raw.targets {
+            let mut providers = Vec::new();
+            for entry in target.providers {
+                match entry {
+                    ProviderEntry::Launch(launch) => providers.push(*launch),
+                    ProviderEntry::Retired(entry) if !retired.contains(&entry) => {
+                        retired.push(entry);
+                    }
+                    ProviderEntry::Retired(_) => {}
+                }
+            }
             if !identifier(&target.attachment)
                 || target.attachment.len() > 128
                 || !absolute(&target.candidate)
-                || target.providers.len() > server_count()
+                || providers.len() > server_count()
             {
                 return Err(LauncherError::Rejected);
             }
             target.git.validate()?;
             let mut provider_kinds = Vec::new();
-            for provider in &target.providers {
+            for provider in &providers {
                 provider.executable.validate()?;
                 if provider_kinds.contains(&provider.language)
                     || !identifier(&provider.toolchain)
@@ -619,7 +691,7 @@ impl LauncherConfig {
             let launch = LaunchTarget {
                 candidate: target.candidate,
                 git: target.git,
-                providers: target.providers,
+                providers,
             };
             if targets.insert(target.attachment, launch).is_some() {
                 return Err(LauncherError::Rejected);
@@ -630,7 +702,12 @@ impl LauncherConfig {
             limits: raw.limits,
             allowed_roots: raw.allowed_roots,
             project_checks: raw.project_checks,
+            retired,
         })
+    }
+    /// The retired settings identifiers this file still declares; their entries were ignored.
+    pub fn retired_settings(&self) -> &[&'static RetiredSettings] {
+        &self.retired
     }
     /// Verifies each immutable configured executable once before the worker becomes visible.
     /// Duplicate paths share verification; conflicting fingerprints and cancellation fail closed.

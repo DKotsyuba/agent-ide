@@ -103,11 +103,10 @@ fn runner_covers_all_cells_without_embedding_private_run_identifiers() {
     ] {
         assert!(runner.contains(gate));
     }
-    // Go and gopls are outside the release scope: the runner neither requires nor executes them
-    // and their toolchain evidence rows stay honestly `not_tested`.
-    assert!(runner.contains("ACCEPTANCE_GO_VERSION=not_tested"));
-    assert!(runner.contains("ACCEPTANCE_GOPLS_VERSION=not_tested"));
-    assert!(!runner.contains("AGENT_IDE_GO"));
+    // Go was removed from the product: the runner neither requires nor executes it and emits no
+    // Go toolchain evidence rows.
+    assert!(!runner.contains("ACCEPTANCE_GO"));
+    assert!(!runner.to_lowercase().contains("gopls"));
     // The fixture worktrees come from a private clone, so the managed Claude rendezvous (keyed by
     // the git common directory) never attaches to a live session's daemon.
     assert!(runner.contains(

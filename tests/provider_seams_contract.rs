@@ -4,7 +4,7 @@
 mod provider;
 use agent_ide::{
     execution::*,
-    intelligence::gopls::{GoplsProfile, SharedGopls},
+    intelligence::rust::{RustProfile, RustProfileIdentity, RustWorktree},
     workspace::authority::WorktreeRef,
 };
 use provider::BoundRequest;
@@ -411,94 +411,6 @@ async fn discovery_can_be_cancelled_without_losing_query_or_release_evidence() {
     assert_eq!(admission.running_count(), 0);
 }
 
-/// gopls listener/forwarder wrappers accept genuine host-bound fresh uses instead of substituting None.
-#[tokio::test]
-async fn gopls_wrappers_forward_fresh_binding_uses() {
-    let fixture = Fixture::new();
-    let (tree, authority) = fixture.scope();
-    let profile = GoplsProfile::new(
-        "/usr/bin/true".into(),
-        "fixture".into(),
-        "v1".into(),
-        "default".into(),
-        "/usr/bin/true".into(),
-        "test".into(),
-        fixture.0.join("gopls-cache").display().to_string(),
-    )
-    .unwrap();
-    let socket = fixture.0.join("unused.sock");
-    let (mut admission, mut registry) = controllers(2);
-    let view = match registry.request(
-        &mut admission,
-        OwnerId::new("gopls").unwrap(),
-        AdmissionClass::Interactive,
-        profile.compatibility_key(),
-        ProviderBackendKind::OwnedShared,
-        &authority,
-    ) {
-        ProviderLeaseAdmission::Granted(view) => view,
-        _ => panic!("gopls view"),
-    };
-    let mut listener = BoundRequest::new(
-        "gopls-listener",
-        authority.clone(),
-        profile.listener_command(&authority, &socket).unwrap(),
-        Path::new("/usr/bin/true"),
-    );
-    let active = listener.fresh();
-    let mut shared = SharedGopls::start(
-        &profile,
-        &listener.request,
-        registry.take_spawn_lease(view).unwrap(),
-        Some(active),
-        64,
-    )
-    .unwrap();
-    let mut forwarder = BoundRequest::new(
-        "gopls-forwarder",
-        authority.clone(),
-        profile.forwarder_command(&authority, &socket).unwrap(),
-        Path::new("/usr/bin/true"),
-    );
-    let slot = match admission.submit(
-        OwnerId::new("forwarder").unwrap(),
-        AdmissionClass::Interactive,
-    ) {
-        Admission::Granted(lease) => lease,
-        _ => panic!("forwarder slot"),
-    };
-    let capability = registry
-        .take_forwarder_spawn_lease(&mut admission, view, &forwarder.request, slot)
-        .unwrap();
-    let active = forwarder.fresh();
-    let child = shared
-        .open_view(
-            tree.clone(),
-            1,
-            &forwarder.request,
-            capability,
-            Some(active),
-            64,
-        )
-        .unwrap();
-    let reaped = child.child.reap(Duration::from_secs(1)).await.unwrap();
-    registry
-        .complete_forwarder_reap(&mut admission, reaped.proof)
-        .unwrap();
-    shared.release_view(&tree, view).unwrap();
-    let BackendRelease::ReapOwned(capability) = registry.release(view).unwrap() else {
-        panic!("draining capability")
-    };
-    let listener = shared
-        .stop(Duration::from_millis(10), Duration::from_secs(1))
-        .await
-        .unwrap();
-    registry
-        .complete_reap(&mut admission, capability, listener.settlement)
-        .unwrap();
-    assert_eq!(admission.running_count(), 0);
-}
-
 /// Settles each ordinary captured slot immediately, returning only bounded immutable snapshot evidence.
 async fn settled_snapshot(
     admission: &mut AdmissionController,
@@ -765,22 +677,28 @@ fn provider_compatibility_uses_measured_executable_bytes() {
     fs::write(&right, "#!/bin/sh\nexit 1\n").unwrap();
     fs::set_permissions(&left, fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&right, fs::Permissions::from_mode(0o700)).unwrap();
-    let cache_namespace = fixture.0.join("gopls-cache").display().to_string();
-    let profile = |binary| {
-        GoplsProfile::new(
+    let (tree, authority) = fixture.scope();
+    let worktree = RustWorktree::new(tree, authority).unwrap();
+    let profile = |binary: PathBuf| {
+        RustProfile::new(RustProfileIdentity {
             binary,
-            "self-attested-version".into(),
-            "v1".into(),
-            "default".into(),
-            "/usr/bin/true".into(),
-            "test".into(),
-            cache_namespace.clone(),
-        )
+            rust_analyzer_version: "self-attested-version".into(),
+            cargo: "/usr/bin/true".into(),
+            cargo_home: None,
+            cargo_version: "cargo-test".into(),
+            rustc: "/usr/bin/true".into(),
+            rustc_version: "rustc-test".into(),
+            rustup_toolchain: "test-toolchain".into(),
+            configuration: "cache-priming-check-on-save-disabled-v1".into(),
+            trust: "test".into(),
+            transport: "stdio-v1".into(),
+            cache_namespace: fixture.0.join("rust-cache").display().to_string(),
+        })
         .unwrap()
     };
     assert_ne!(
-        profile(left).compatibility_key(),
-        profile(right).compatibility_key()
+        profile(left).compatibility_key(&worktree),
+        profile(right).compatibility_key(&worktree)
     );
 }
 

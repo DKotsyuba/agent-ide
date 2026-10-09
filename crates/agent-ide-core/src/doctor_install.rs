@@ -155,6 +155,15 @@ fn check_launcher(findings: &mut Vec<Finding>, effective: &Path) -> Option<Launc
                     "launcher_config",
                     format!("launcher configuration {} verified", path.display()),
                 );
+                for retired in config.retired_settings() {
+                    push(
+                        findings,
+                        "retired_provider",
+                        "info",
+                        "launcher_config",
+                        retired.notice.to_owned(),
+                    );
+                }
                 Some(config)
             }
             Err(_) => {

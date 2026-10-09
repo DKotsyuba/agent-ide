@@ -8,7 +8,7 @@ A coding actor explicitly activates assistance for its own Git worktree. The ini
 
 Activation is actor-specific. Native subagents do not inherit it. The host adapter must prove the relation between the actor, MCP invocation, and hook/delivery channel; model arguments, working directory, timing, parent IDs, and peer user identity alone are insufficient proof. A failed or unavailable IDE must leave native tools and turn completion usable. Hooks have independently enforced deadlines and never wait for compiler warmup.
 
-The real provider loop covers shared Go/gopls, a bounded exclusive Rust profile, and a bounded exclusive Pyright profile for Codex and Claude Python (`.py` and `.pyi`) on macOS. Pyright is always one worktree-isolated stdio child with fixed configuration; Claude runs it through the shared daemon route. Intelligence chooses the provider topology; Execution admits and supervises physical processes and forwarders. Unsupported sharing stays explicitly unsupported. A shared daemon must not gain authority beyond the host's verified execution profile. Where enforcement is unproven, affected execution is unavailable.
+The real provider loop covers a bounded exclusive Rust profile, and a bounded exclusive Pyright profile for Codex and Claude Python (`.py` and `.pyi`) on macOS. Pyright is always one worktree-isolated stdio child with fixed configuration; Claude runs it through the shared daemon route. Intelligence chooses the provider topology; Execution admits and supervises physical processes and forwarders. Unsupported sharing stays explicitly unsupported. A shared daemon must not gain authority beyond the host's verified execution profile. Where enforcement is unproven, affected execution is unavailable.
 
 ### Responsibilities
 
@@ -29,7 +29,7 @@ Domain policy stays in its owning module. Shared assembly, manifests and migrati
 2. Build the smallest real host roundtrip and prove actor binding and execution-profile enforcement before expanding abstractions.
 3. Add the bounded daemon, IPC, configuration, storage mechanics and ownership path needed by that roundtrip. Restart-only configuration is acceptable initially.
 4. Connect safe Git/source reads, observations and the real provider loop. Git reads preserve raw paths and use literal pathspecs; external diff, text conversion, filters and network effects are not allowed.
-5. Establish shared gopls, bounded Rust operation and resource isolation, then run fault and productivity checks.
+5. Establish bounded Rust operation and resource isolation, then run fault and productivity checks.
 
 Only types, tables and settings actually consumed by this path are implemented. `async-lsp` is a candidate to verify with a compile test and real provider exchange, not a reason to build a replacement JSON-RPC framework in advance.
 
@@ -37,7 +37,7 @@ Only types, tables and settings actually consumed by this path are implemented. 
 
 The target platforms are Linux and macOS. Current v0.1 acceptance runs real Codex CLI and Claude CLI scenarios on the available Mac, including native coding subagents. Linux validation is deferred and must remain explicitly unverified; it does not block this delivery. A single passing host cell is still only an intermediate milestone. Record exact versions and explicit `not_tested`, `mocked`, or `real_pass` evidence; a passing mock never grants support status.
 
-The evidence table below is the historical v0.1 record (recorded 2026-09-12 against Codex CLI 0.154.0 and Claude Code 2.1.267). Go and gopls left the release scope in 0.6: the publication gate pins their evidence rows to `not_tested` ([release gate](release.md#publication-gate)), so those two `real_pass` cells record past capability, not a current claim.
+The evidence table below is the historical v0.1 record (recorded 2026-09-12 against Codex CLI 0.154.0 and Claude Code 2.1.267). Go and gopls left the release scope in 0.6 and the product in 0.10.8 ([release gate](release.md#publication-gate)), so those two `real_pass` cells record past capability, not a current claim.
 
 | Host/provider cell | v0.1 evidence (historical) |
 |---|---|
@@ -70,7 +70,7 @@ hooks and terminal replies at once (T29B) — and any future host without a hook
 of its terminal `ide.*` replies (T28B); Linux stays `not_tested`.
 
 Deferred to phase 2, in this order: warm LSP checks, launchd registration, a per-user service,
-subagent attach, TypeScript checks, and Go checks last.
+subagent attach, and TypeScript checks.
 
 ## Later increments
 

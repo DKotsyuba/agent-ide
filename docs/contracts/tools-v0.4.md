@@ -14,7 +14,7 @@ Revision: v0.4. Provider: Agent IDE. Consumers: coding agents and IDE hosts.
 | `ide.graph` (`symbol`, `direction`, `depth`, `tests`; live bounded caller/callee tree; only functions and methods are nodes, and tests collapse to one `+N tests` line per parent unless `tests: true` expands them with `[test]` marks) | implemented (wire version 5, 11 tools) |
 | `ide.diff` cleanup (compact default, `provenance` flag, plain-`git diff` fallback, untracked symlinks listed) | implemented (v0.6.1) |
 | `ide.problems` cleanup | planned |
-| Live language server sessions for Python and TypeScript (one per binding and language) | implemented (Go planned) |
+| Live language server sessions for Python and TypeScript (one per binding and language) | implemented |
 
 ## 0. Principles
 
@@ -486,9 +486,9 @@ Output uses the current `file:line:column code message` form, grouped by file an
 | `tests_for(symbol|path) -> TestSelection` | Test list and filtered test command. |
 | `parse_test_output(bytes) -> TestReport` | Passed/failed status and first error with location. |
 | `format(file) -> Option<Command>` | Project formatter, if available. |
-| `problems_command(project) -> Command` | As today: `cargo check`, `pyright`, `tsc`, or `go vet`. |
+| `problems_command(project) -> Command` | As today: `cargo check`, `pyright`, or `tsc`. |
 
-Languages: `rust`, `python`, `typescript`, `go`. Start with modules from a single crate; support crates after one week.
+Languages: `rust`, `python`, `typescript`. Start with modules from a single crate; support crates after one week.
 
 ## 4. Non-goals
 
@@ -503,7 +503,7 @@ Languages: `rust`, `python`, `typescript`, `go`. Start with modules from a singl
 2. Symbol-based `ide.edit` (replace/insert/delete/rename) and diagnostics afterward — 2 days.
 3. `ide.start` project card, `ide.problems`, and `ide.diff` cleanup — 1.5 days.
 4. `ide.test` — 1.5 days.
-5. Python, TypeScript, and Go support under `LanguageSupport` — 1–1.5 days each.
+5. Python and TypeScript support under `LanguageSupport` — 1–1.5 days each.
 
 Total: about two weeks; Rust is fully implemented by the end of the first week.
 

@@ -225,6 +225,62 @@ fn healthy_layout_exits_zero_with_no_error_findings() {
     let _ = fs::remove_dir_all(&layout.root);
 }
 
+/// An old launcher file still declaring the removed Go provider verifies and reports exactly one
+/// informational line saying the entry is ignored.
+#[test]
+fn retired_go_provider_entry_is_ignored_with_one_doctor_line() {
+    let layout = Layout::new("retired-go");
+    layout.install(BINVER);
+    layout.shim();
+    layout.plugin(BINVER);
+    layout.hosts();
+    let program = std::path::Path::new("/usr/bin/true");
+    let digest = blake3::hash(&fs::read(program).unwrap())
+        .to_hex()
+        .to_string();
+    let accepted = format!(
+        r#"{{"path":"{}","identity":"accepted-true","blake3":"{digest}"}}"#,
+        program.display()
+    );
+    let target = |attachment: &str| {
+        format!(
+            r#"{{"attachment":"{attachment}","candidate":"{root}","git":{accepted},"providers":[{{"executable":{accepted},"settings":"gopls_defaults","toolchain":"/usr/bin/true","trust":"accepted-local","cache_namespace":"go-cache"}}]}}"#,
+            root = layout.root.display()
+        )
+    };
+    fs::write(
+        layout.config(),
+        format!(
+            r#"{{"version":1,"limits":{{"queued":4,"details":8,"operation_ms":1000,"output_bytes":4096}},"targets":[{},{}],"allowed_roots":["{}"]}}"#,
+            target("first-attachment"),
+            target("second-attachment"),
+            layout.root.display()
+        ),
+    )
+    .unwrap();
+    let output = layout.doctor();
+    assert!(
+        output.status.success(),
+        "an old Go entry must not break the doctor: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = report_of(&output);
+    let retired: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["code"] == "retired_provider")
+        .collect();
+    assert_eq!(retired.len(), 1, "{retired:?}");
+    assert_eq!(retired[0]["component"], "launcher_config");
+    assert_eq!(retired[0]["severity"], "info");
+    assert_eq!(
+        retired[0]["detail"],
+        "Go support was removed in 0.10.8; the gopls provider entry is ignored"
+    );
+    let _ = fs::remove_dir_all(&layout.root);
+}
+
 #[test]
 fn missing_config_is_an_error_exiting_two() {
     let layout = Layout::new("no-config");

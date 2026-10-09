@@ -63,7 +63,7 @@ hook key cache `/private/tmp/ai-k-…`) and the persistent check caches under
 `$HOME/.agent-ide/checks`. Admission is restart-only launcher configuration (`allowed_roots`,
 `project_checks`); every failure is fail-open and never vetoes native agent work. The MVP targets
 macOS and Claude; phase 2 adds warm LSP, a launchd per-user service, subagent attach, TypeScript
-checks, the Codex active block, and Go checks last.
+checks, and the Codex active block.
 
 ## Crates (v0.5)
 
@@ -76,7 +76,6 @@ the root package that assembles them.
 | `agent-ide-lang-rust` | `crates/agent-ide-lang-rust` | Rust symbol support, confined `cargo check`, the rust-analyzer profile and backend | ~3 900 |
 | `agent-ide-lang-python` | `crates/agent-ide-lang-python` | Python symbol support, confined Pyright checks, the Pyright profile and backend | ~3 900 |
 | `agent-ide-lang-typescript` | `crates/agent-ide-lang-typescript` | TypeScript/JavaScript symbol support, confined `tsc` checks, the release-pinned TypeScript profile and backend | ~6 000 |
-| `agent-ide-lang-go` | `crates/agent-ide-lang-go` | Go symbol support, the shared-listener gopls profile and backend (no project check) | ~2 800 |
 | `agent-ide-lang-css` | `crates/agent-ide-lang-css` | Style sheets (CSS, SCSS, Sass, LESS): a hand-written tokenizer, outlines from source, cross-language name facts (no server, no project check) | ~1 200 |
 | `agent-ide-lang-html` | `crates/agent-ide-lang-html` | HTML documents: a hand-written tag tokenizer, element outlines from source, cross-language name facts (no server, no project check) | ~800 |
 | `agent-ide` (root) | `.` | The `agent-ide` binary (`src/main.rs`), registration of the bundled languages (`agent_ide::languages`), and re-exports of every core and language module under the historical `agent_ide::…` paths | ~3 400 |
@@ -162,8 +161,8 @@ downgrade, handover) drops it.
 ### Adding a language (recipe)
 
 The steps are the same for any language. Use the
-smallest existing crate as the template: `agent-ide-lang-go` when the language has no project
-check, `agent-ide-lang-python` when it does, and `agent-ide-lang-css` when it has no server
+smallest existing crate as the template: `agent-ide-lang-rust` or `agent-ide-lang-python` when the
+language has a server and a project check, and `agent-ide-lang-css` when it has no server
 either (outline from source plus name facts).
 
 1. Create `crates/agent-ide-lang-<name>` with `version.workspace = true`,

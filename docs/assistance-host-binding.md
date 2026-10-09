@@ -430,8 +430,7 @@ active hints and suppression after stop, without claiming those fixtures changed
 The controlled process tests are complemented by live macOS checks. Release 0.6.2 (revision
 `2db699f`) records all five routes `real_pass`/`product_pass` on one revision — the product
 contract, direct Codex CLI 0.156.1, direct Claude Code 2.1.280, and installed agent-run 0.19.0 to
-each host ([docs/evidence](evidence/)). Go and gopls are outside the release scope and their
-evidence rows are pinned `not_tested`. Linux, real `PostToolBatch` availability, and formal
+each host ([docs/evidence](evidence/)). Go support was removed in 0.10.8. Linux, real `PostToolBatch` availability, and formal
 host-confirmed `model_seen` delivery remain unverified.
 
 The executable deadline regressions enforce a 450 ms wall-clock ceiling: the 250 ms
@@ -480,11 +479,9 @@ unverified joint window; a capture failure leaves activation usable but reports 
 as unknown. Exact activation retries reuse committed facts.
 
 Source context reads one registered relative path under durable authority.
-Optional accepted Go/Rust profiles supply semantic results over those exact bytes; absent or
-unavailable providers return explicit lexical context. Go worktrees whose canonical
-effective-rights identity matches share one accounted listener, one shared native cache namespace
-and separate protocol forwarders, while each keeps its own private per-view Go build/module/temp
-namespace; Rust uses an exclusive session.
+Optional accepted Rust, Python and TypeScript profiles supply semantic results over those exact
+bytes; absent or unavailable providers return explicit lexical context. Each uses an exclusive
+session.
 Semantic replies include only bounded diagnostics from the same Session when source binding,
 provider generation, and positive document version all match the returned context. Push feedback
 is labelled provisional. One nonempty current delta per binding is retained. A later native post
@@ -509,11 +506,11 @@ activation baseline accompanies same-scope HEAD comparisons; staged and unstaged
 their distinct scope and therefore report the baseline as not captured rather than crossing modes.
 
 `ide.stop` revokes only the exact binding, cancels pending work and reaps its owned provider
-processes before success. A shared listener survives another active Go view. Stop is not a
+processes before success. Stop is not a
 worktree closure or cache-retirement fact: configured provider cache namespaces are quiesced and
 retained under canonical nonce-bound worktree identity and incarnation for a compatible successor.
 A shared native namespace is reference-counted and quiesces only after the last sharing worktree
-stops; gopls may evict its contents independently, which costs recomputation, not IDE-owned state. Only the
+stops; a provider may evict its contents independently, which costs recomputation, not IDE-owned state. Only the
 existing verified Workspace closure or explicit reset fact may retire the retained namespace.
 Restart discards bindings and detail references;
 new activation uses a boot-specific channel identity and the durable native-identity fence.

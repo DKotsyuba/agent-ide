@@ -319,7 +319,7 @@ impl Worker<'_> {
     /// `Conflict` when another actor still actively owns this worktree's namespace, `Capacity` when
     /// in-memory lifecycle ownership is full, and `ProviderUnavailable` for a local cache-directory
     /// or identity failure. `Internal` reports a namespace component this module itself derived
-    /// wrongly. `shared_go` retains the extra shared native namespace of servers that have one (see
+    /// wrongly. `shared_native` retains the extra shared native namespace of servers that have one (see
     /// [`LanguageServer::shared_cache_directories`]) only for the managed shared-listener path; one-shot Claude helpers pass false and retain only their worktree namespace. No failure
     /// deletes or quiesces a retained namespace.
     pub(super) fn retain_worktree_caches(
@@ -327,7 +327,7 @@ impl Worker<'_> {
         binding: &BindingRef,
         authority: &AuthorityStamp,
         launches: &[ProviderLaunch],
-        shared_go: bool,
+        shared_native: bool,
     ) -> Result<(), FailureCode> {
         let root = CacheRoot::prepare(&self.providers.cache_root)
             .map_err(|_| FailureCode::ProviderUnavailable)?;
@@ -352,7 +352,7 @@ impl Worker<'_> {
                 required: server.cache_directories(),
                 shared: false,
             });
-            if shared_go && let Some(required) = server.shared_cache_directories() {
+            if shared_native && let Some(required) = server.shared_cache_directories() {
                 plan.push(CacheRequest {
                     key: provider_cache_key(
                         SHARED_NATIVE_CACHE_STATE,

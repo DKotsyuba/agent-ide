@@ -21,8 +21,7 @@ keeps them there.
 ## Provider caches
 
 Each retained language-server launch has one namespace `~/.agent-ide/providers/<key>` holding the
-subdirectories its server needs (rust-analyzer's build-script and proc-macro `target`, gopls' build
-and module caches, …). The key is stable across daemon restarts and reboots because it names the
+subdirectories its server needs (rust-analyzer's build-script and proc-macro `target`, Pyright's private temporary directory, …). The key is stable across daemon restarts and reboots because it names the
 worktree by its directory — canonical path, inode and creation time, never the device number nor
 the per-database identity a new daemon mints afresh — and hashes every input that makes a native
 cache unsafe to reuse: the server and the language's own toolchain executables (compiler,

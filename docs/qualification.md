@@ -24,7 +24,7 @@ qualification evidence.
 
 | Area | What was run | Result |
 |---|---|---|
-| Native gate | fmt, locked workspace tests (`--test-threads=1`, three named gopls skips), four ignored real-provider tests, clippy/rustdoc `-D warnings`, release build — on `macos-26` arm64 in CI and locally via `cargo xtask check` | green on `e96830b` |
+| Native gate | fmt, locked workspace tests (`--test-threads=1`, three named gopls skips then; none since Go was removed in 0.10.8), four ignored real-provider tests, clippy/rustdoc `-D warnings`, release build — on `macos-26` arm64 in CI and locally via `cargo xtask check` | green on `e96830b` |
 | Product acceptance | `scripts/macos-acceptance.sh --route product`: Rust/rust-analyzer, Python/Pyright and TypeScript/JS r3 provider gates, the edit/diagnostic/fix/diff/stop loop, stale-edit zero-write, native fallback, compact MCP projection, telemetry restart/query/export, Claude Pyright gate, divergent-worktree isolation | `product_pass`, all scenarios `product_pass` (`macos-v0.2-product.json`) |
 | Direct Codex | committed driver against the real Codex CLI 0.156.1 | `real_pass` (`macos-v0.2-direct-codex.json`) |
 | Direct Claude | committed driver against real Claude Code 2.1.280 | `real_pass` (`macos-v0.2-direct-claude.json`) |
@@ -34,9 +34,8 @@ qualification evidence.
 
 ## Known limits and deliberate exceptions to the family standard
 
-- Go/gopls are built in but **experimental**: no Go toolchain is installed in
-  CI or release, the three real-gopls tests are skipped by name, and evidence
-  rows record `go`/`gopls` as `not_tested` (TEST-02, MCP-05-adjacent).
+- Go support was removed in 0.10.8; evidence recorded earlier may still carry
+  `go`/`gopls` rows as `not_tested`.
 - `unavailable` and `outcome_unknown` results carry `isError=false`: the tool
   answered honestly within its contract; this differs from a business refusal
   and is pinned by product tests.

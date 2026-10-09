@@ -83,7 +83,7 @@ So three consumers draw from three different toolchain sources, and the card rep
   - the daemon idle exit, default 300 s (:317-320).
 
   It holds no per-project environment.
-- **`AGENT_IDE_*` overrides.** These cover launcher, attachment, state, home and log, plus `AGENT_IDE_RUST_TOOLCHAIN_DIR` and `AGENT_IDE_GOPLS_PROFILE`. None of them selects a Python or Node environment.
+- **`AGENT_IDE_*` overrides.** These cover launcher, attachment, state, home and log, plus `AGENT_IDE_RUST_TOOLCHAIN_DIR`. None of them selects a Python or Node environment.
 - **Card.** `render_environment` prints `"<lang> <key> <value>"` joined by ` · ` (project/mod.rs:748-767), from `LanguageProject.environment/interpreter` (lang/mod.rs:583-586). The test toolchain seam is `LanguageSupport::test_toolchain` (lang/mod.rs:717-725).
 - **Check scheduler.**
   - The skip-unchanged fingerprint is `git ls-files` plus untracked directories, ignored ones included, so an env directory appearing or vanishing moves it (checks/fingerprint.rs:40-101).
@@ -338,7 +338,7 @@ environment: typescript node 22.11.0 (.nvmrc) ≠ volta.node 20.18.0 · server n
 - The `typescript` selector applies to ide.test, format and lint.
 - The card shows the project's node and TS next to the bundled server's.
 
-**Go:** experimental, unchanged.
+**Go:** removed in 0.10.8; there is no Go environment.
 
 ## 6. What the agent sees, end to end
 1. The `ide.start` card shows: `environment: python .venv (3.12.7, discovered) · also .venv-py314 (3.14.0) — choose: ide.start environment {"python": ".venv-py314"}`.
