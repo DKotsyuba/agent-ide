@@ -257,6 +257,46 @@ impl Session {
         attachments: Vec<Attachment>,
     ) -> io::Result<T> {
         let budget = self.options.request_timeout;
+        self.module_call_within(budget, capability, payload, attachments)
+            .await
+    }
+
+    /// The hosted provider's status barrier within `budget`: ready, still loading, or a
+    /// workspace that failed to load; a module fault is a gone transport.
+    pub(super) async fn module_readiness(
+        &mut self,
+        budget: std::time::Duration,
+    ) -> Result<(), super::ReadinessError> {
+        use super::ReadinessError;
+        // The module waits within the budget; the margin carries its answer back.
+        let answer: io::Result<crate::modules::contract::Readiness> = self
+            .module_call_within(
+                budget + std::time::Duration::from_millis(500),
+                Capability::Semantic,
+                encode(&SemanticQuery::Readiness {}),
+                Vec::new(),
+            )
+            .await;
+        match answer {
+            Ok(crate::modules::contract::Readiness::Ready) => Ok(()),
+            Ok(crate::modules::contract::Readiness::Warming) => Err(ReadinessError::Loading),
+            Ok(crate::modules::contract::Readiness::Degraded) => {
+                Err(ReadinessError::WorkspaceError)
+            }
+            Ok(crate::modules::contract::Readiness::Unavailable) | Err(_) => {
+                Err(ReadinessError::Gone)
+            }
+        }
+    }
+
+    /// [`Self::module_call`] within an explicit `budget`.
+    async fn module_call_within<T: DeserializeOwned>(
+        &mut self,
+        budget: std::time::Duration,
+        capability: Capability,
+        payload: serde_json::Value,
+        attachments: Vec<Attachment>,
+    ) -> io::Result<T> {
         let remote = self
             .module
             .as_mut()
