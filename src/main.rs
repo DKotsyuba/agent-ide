@@ -2677,7 +2677,10 @@ async fn run_managed_claude_mcp(
 /// next tool call re-runs the remembered activation itself. A failed heal retries at a bounded
 /// cadence; nothing here can block or fail the MCP's serving loop.
 async fn watch_claude_lease(lease: Arc<Mutex<Option<UnixStream>>>, facade: StdioFacade) {
-    follow_lease(lease, || facade.recover_lost_daemon()).await;
+    follow_lease(lease, || facade.current_pair(), |observed| {
+        facade.recover_lost_daemon(observed)
+    })
+    .await;
 }
 
 /// How often the lease watcher checks whether a newer lease replaced the one it is reading.
@@ -2690,9 +2693,14 @@ const LEASE_SWAP_POLL: Duration = Duration::from_millis(250);
 /// that stores a newer lease while the watcher is still reading the old one makes the watcher drop
 /// the old stream — so the old daemon can idle out — and follow the new one, whose daemon's death
 /// it must notice. Never returns.
-async fn follow_lease<Heal, Healed>(lease: Arc<Mutex<Option<UnixStream>>>, mut heal: Heal)
-where
-    Heal: FnMut() -> Healed,
+async fn follow_lease<Observe, Observed, Pair, Heal, Healed>(
+    lease: Arc<Mutex<Option<UnixStream>>>,
+    mut observe: Observe,
+    mut heal: Heal,
+) where
+    Observe: FnMut() -> Observed,
+    Observed: std::future::Future<Output = Pair>,
+    Heal: FnMut(Pair) -> Healed,
     Healed: std::future::Future<Output = bool>,
 {
     use tokio::io::AsyncReadExt as _;
@@ -2719,7 +2727,22 @@ where
                 // This generation ended. Heal until a fresh one is attached, then watch it — but
                 // only while no newer lease is stored: a replaced daemon closing its old stream
                 // must not make the current, healthy daemon look replaced.
-                while lease.lock().await.is_none() && !heal().await {
+                //
+                // `observe` runs under the lease lock: a healer stores its new lease before it
+                // publishes its pair, so with no newer lease stored the pair read here is still
+                // the dead generation's, and a heal that finds the pair already moved on adopts
+                // it instead of attaching again.
+                loop {
+                    let observed = {
+                        let stored = lease.lock().await;
+                        if stored.is_some() {
+                            break;
+                        }
+                        observe().await
+                    };
+                    if heal(observed).await {
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
@@ -4272,10 +4295,14 @@ mod tests {
         let lease = Arc::new(Mutex::new(Some(old_lease)));
         let healed = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&healed);
-        let watcher = tokio::spawn(follow_lease(Arc::clone(&lease), move || {
-            counter.fetch_add(1, Ordering::SeqCst);
-            std::future::ready(true)
-        }));
+        let watcher = tokio::spawn(follow_lease(
+            Arc::clone(&lease),
+            || std::future::ready(()),
+            move |()| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(true)
+            },
+        ));
         // Wait until the watcher has taken the old stream, then swap in a newer lease exactly as
         // a re-root's attach does.
         while lease.lock().await.is_some() {
@@ -4314,10 +4341,14 @@ mod tests {
         let lease = Arc::new(Mutex::new(Some(old_lease)));
         let healed = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&healed);
-        let watcher = tokio::spawn(follow_lease(Arc::clone(&lease), move || {
-            counter.fetch_add(1, Ordering::SeqCst);
-            std::future::ready(true)
-        }));
+        let watcher = tokio::spawn(follow_lease(
+            Arc::clone(&lease),
+            || std::future::ready(()),
+            move |()| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(true)
+            },
+        ));
         while lease.lock().await.is_some() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

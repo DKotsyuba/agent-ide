@@ -38,6 +38,7 @@ impl Scratch {
 }
 
 impl Deref for Scratch {
+    /// Derefs to the directory (or database) path.
     type Target = Path;
 
     /// The presented directory.

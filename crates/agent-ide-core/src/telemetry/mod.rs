@@ -1082,6 +1082,8 @@ fn test_store_config() -> StoreConfig {
 /// before the directory it writes into.
 #[cfg(test)]
 pub(crate) async fn open_test_telemetry(config: TelemetryConfig) -> (ScratchDatabase, Telemetry) {
+    // The event decoding below needs the neutral test languages whichever test runs alone.
+    crate::lang::testing::install();
     let database = ScratchDatabase::new("telemetry");
     let store = Arc::new(Store::open(&database, test_store_config()).expect("test store opens"));
     (

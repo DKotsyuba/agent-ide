@@ -92,8 +92,11 @@ type SelectionMap = HashMap<(PathBuf, Language), Vec<EnvSelection>>;
 static SELECTIONS: LazyLock<Mutex<SelectionMap>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// The selections in force for one language in one worktree, in no particular order.
+///
+/// The map is a cache of the durable store, so a lock poisoned by a panicking holder is recovered
+/// (poisoned-lock policy, `docs/architecture.md`): the lookup answers what was last written
+/// instead of panicking every later reader.
 pub fn selections(worktree: &Path, language: Language) -> Vec<EnvSelection> {
-    // Poisoned-lock policy: a derived cache of the durable store, recovered rather than propagated.
     SELECTIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -103,6 +106,9 @@ pub fn selections(worktree: &Path, language: Language) -> Vec<EnvSelection> {
 }
 
 /// Replaces every selection of one language in one worktree; an empty list clears them.
+///
+/// Recovers a poisoned lock like [`selections`]: the next load from the durable store rewrites the
+/// worktree's rows whole.
 pub fn replace_selections(worktree: &Path, language: Language, selections: Vec<EnvSelection>) {
     let mut map = SELECTIONS
         .lock()

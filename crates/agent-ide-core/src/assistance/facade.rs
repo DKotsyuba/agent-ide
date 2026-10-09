@@ -2360,6 +2360,10 @@ struct ManagedConnection {
     evict: Option<EvictFn>,
     /// Set while a background wedge watch runs, so one watch serves every concurrent failure.
     watching: Arc<std::sync::atomic::AtomicBool>,
+    /// Held for the whole of one re-establishment, from the attach to the publication of its
+    /// pair: the lease watcher, the wedge watch and a failed call can all notice the same dead
+    /// daemon at once, and only one of them may attach and publish.
+    healing: Arc<Mutex<()>>,
 }
 
 impl ManagedConnection {
@@ -2378,6 +2382,7 @@ impl ManagedConnection {
             reestablish,
             evict: None,
             watching: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            healing: Arc::new(Mutex::new(())),
         }
     }
 
@@ -2501,12 +2506,48 @@ impl ManagedConnection {
     /// Re-establishes the daemon and publishes the new pair for later calls, marking the session
     /// replaced when the pair changed. A failed re-establishment changes nothing.
     async fn heal(&self, runtime_dir: &Path, attachment: &str) {
-        if let Some((new_runtime, new_attachment)) = (self.reestablish)().await {
-            if new_runtime != runtime_dir || new_attachment != attachment {
-                self.mark_replaced();
-            }
-            self.store(new_runtime, new_attachment).await;
+        self.reestablish_from(&(runtime_dir.to_path_buf(), attachment.to_owned()), false)
+            .await;
+    }
+
+    /// Re-establishes the daemon `observed` as dead, serialized with every other re-establishment,
+    /// and publishes the result; returns the pair now in force.
+    ///
+    /// The lease watcher (the held lease stream ends the moment a daemon dies), the wedge watch
+    /// (after it evicted the daemon) and a call that found the daemon gone each attach and write
+    /// the candidate attachment the hooks read. Run together they published whichever pair
+    /// finished last while the hooks paired with another, so the next call was refused
+    /// `host_binding`; a call that arrived between the new daemon answering and the pair being
+    /// published used the dead daemon's pair. One at a time, a caller that finds the pair already
+    /// moved on from `observed` uses that pair instead of attaching again, and a call waits for a
+    /// re-establishment in flight ([`Self::current_settled`]). The replacement is marked before the
+    /// new pair is published, so no concurrent call reaches it without announcing its actors.
+    ///
+    /// `daemon_lost` says the daemon of `observed` is known to have ended (its held lease broke),
+    /// so its bindings are gone even if the new pair equals the old one.
+    async fn reestablish_from(
+        &self,
+        observed: &(PathBuf, String),
+        daemon_lost: bool,
+    ) -> Option<(PathBuf, String)> {
+        let _healing = self.healing.lock().await;
+        let current = self.current().await;
+        if &current != observed {
+            return Some(current);
         }
+        let healed = (self.reestablish)().await?;
+        if daemon_lost || &healed != observed {
+            self.mark_replaced();
+        }
+        self.store(healed.0.clone(), healed.1.clone()).await;
+        Some(healed)
+    }
+
+    /// Returns the pair a call should dispatch against, once any re-establishment in flight has
+    /// published its result.
+    async fn current_settled(&self) -> (PathBuf, String) {
+        let _healing = self.healing.lock().await;
+        self.current().await
     }
 
     /// Starts the background liveness check of a daemon a delivered call just suspected of being
@@ -2810,7 +2851,7 @@ impl StdioFacade {
     /// Returns the current `(runtime_dir, attachment)` this facade should dispatch against.
     async fn current_connection(&self) -> Option<(PathBuf, String)> {
         match &self.reconnect {
-            Some(reconnect) => Some(reconnect.current().await),
+            Some(reconnect) => Some(reconnect.current_settled().await),
             None => Some((self.facade.runtime_dir.clone()?, self.attachment.clone()?)),
         }
     }
@@ -2982,18 +3023,16 @@ impl StdioFacade {
             }
             return (outcome, resume, tag);
         }
-        let Some((new_runtime, new_attachment)) = (reconnect.reestablish)().await else {
+        let Some((new_runtime, new_attachment)) = reconnect
+            .reestablish_from(&(runtime_dir.clone(), attachment.clone()), false)
+            .await
+        else {
             return (FacadeOutcome::ReestablishFailed, resume, None);
         };
         if new_runtime != runtime_dir || new_attachment != attachment {
+            // The replacement discarded this session's bindings.
             resume = Resume::Restarted;
-            // The replacement discarded this session's bindings; marked before the new pair is
-            // published, so no concurrent call reaches it without announcing its actors.
-            reconnect.mark_replaced();
         }
-        reconnect
-            .store(new_runtime.clone(), new_attachment.clone())
-            .await;
         let (retried, tag) = self
             .dispatch_once(
                 &new_runtime,
@@ -3106,21 +3145,29 @@ impl StdioFacade {
         }
     }
 
-    /// Re-attaches after the shared daemon generation ended and marks the session for transparent
-    /// re-activation (T15B restart recovery); called from the lease watcher the moment the held
-    /// lease stream observes the daemon's end, and safe to repeat.
+    /// Returns the `(runtime_dir, attachment)` pair in force now, or `None` for a facade that does
+    /// not re-establish. The lease watcher reads it while it still holds proof that no newer
+    /// lease exists, and hands it back to [`Self::recover_lost_daemon`] as the pair that died.
+    pub async fn current_pair(&self) -> Option<(PathBuf, String)> {
+        Some(self.reconnect.as_ref()?.current().await)
+    }
+
+    /// Re-attaches after the shared daemon generation `observed` ended and marks the session for
+    /// transparent re-activation (T15B restart recovery); called from the lease watcher the
+    /// moment the held lease stream observes the daemon's end, and safe to repeat.
+    ///
+    /// A re-establishment that already moved the pair on from `observed` (the wedge watch or a
+    /// failed call healed first) is adopted, not repeated.
     ///
     /// Returns whether a live daemon is attached again. Re-activation itself waits for the next
     /// dispatched call, whose own pre-hook names the actor to restore.
-    pub async fn recover_lost_daemon(&self) -> bool {
-        let Some(reconnect) = &self.reconnect else {
+    pub async fn recover_lost_daemon(&self, observed: Option<(PathBuf, String)>) -> bool {
+        let (Some(reconnect), Some(observed)) = (&self.reconnect, observed) else {
             return false;
         };
-        reconnect.mark_replaced();
-        let Some((runtime, attachment)) = (reconnect.reestablish)().await else {
+        if reconnect.reestablish_from(&observed, true).await.is_none() {
             return false;
-        };
-        reconnect.store(runtime.clone(), attachment.clone()).await;
+        }
         // Nothing is re-activated here: with no call in hand, any pre on this attachment could
         // lend its actor to another's start. The next ordinary call recovers (see
         // `dispatch_with_reconnect`).
@@ -4133,6 +4180,96 @@ async fn rootless_missing_pre_start_names_current_directory_hint() {
         .unwrap();
     assert!(hint.contains("ide.start {root:"));
     assert!(hint.contains(&std::env::current_dir().unwrap().display().to_string()));
+}
+
+/// Builds a connection whose re-establishment sleeps `delays[n]` on its `n`th invocation and then
+/// answers the pair `("/runtime", "healed-<n>")`; the counter reports how often it was invoked.
+#[cfg(test)]
+fn slow_reestablish(
+    delays: Vec<Duration>,
+) -> (ManagedConnection, Arc<std::sync::atomic::AtomicUsize>) {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let reestablish: ReestablishFn = Arc::new(move || {
+        let attempt = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let delay = delays.get(attempt).copied().unwrap_or_default();
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Some((PathBuf::from("/runtime"), format!("healed-{attempt}")))
+        })
+    });
+    (
+        ManagedConnection::new(PathBuf::from("/runtime"), "dead".to_owned(), reestablish),
+        calls,
+    )
+}
+
+/// The lease watcher, the wedge watch and a failed call can notice one dead daemon together. Only
+/// one attaches; the others use its pair instead of attaching again and publishing a second one
+/// that the hooks (which read the latest attachment record) no longer pair with.
+///
+/// Before the fix both attached: the slower first attach published its pair last, over the pair
+/// the second attach had written for the hooks.
+#[tokio::test(start_paused = true)]
+async fn concurrent_reestablishments_attach_once_and_publish_one_pair() {
+    let (connection, calls) =
+        slow_reestablish(vec![Duration::from_millis(100), Duration::from_millis(10)]);
+    let observed = (PathBuf::from("/runtime"), "dead".to_owned());
+    tokio::join!(
+        connection.heal(&observed.0, &observed.1),
+        connection.heal(&observed.0, &observed.1),
+        async {
+            assert!(
+                connection
+                    .reestablish_from(&observed, false)
+                    .await
+                    .is_some_and(|pair| pair.1 == "healed-0")
+            );
+        }
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        connection.current().await,
+        (PathBuf::from("/runtime"), "healed-0".to_owned())
+    );
+}
+
+/// A lease watcher whose notice about the dead daemon arrives after another healer already
+/// published the replacement's pair adopts that pair: no second attach, no second publication.
+#[tokio::test(start_paused = true)]
+async fn a_late_lost_daemon_notice_adopts_the_pair_already_published() {
+    let (connection, calls) = slow_reestablish(vec![Duration::from_millis(50)]);
+    let mut facade = StdioFacade::new(PathBuf::from("/runtime"));
+    facade.reconnect = Some(connection.clone());
+    let dead = facade.current_pair().await;
+    connection.heal(Path::new("/runtime"), "dead").await;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(facade.recover_lost_daemon(dead).await);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        connection.current().await,
+        (PathBuf::from("/runtime"), "healed-0".to_owned())
+    );
+}
+
+/// A call that arrives while the dead daemon's replacement is being attached waits for the new
+/// pair; dispatching the dead daemon's pair at the already answering replacement was refused as
+/// `host_binding` although the very next call succeeded.
+#[tokio::test(start_paused = true)]
+async fn a_call_waits_for_the_reestablishment_in_flight_and_uses_its_pair() {
+    let (connection, _) = slow_reestablish(vec![Duration::from_millis(200)]);
+    let mut facade = StdioFacade::new(PathBuf::from("/runtime"));
+    facade.reconnect = Some(connection.clone());
+    let healing = tokio::spawn({
+        let connection = connection.clone();
+        async move { connection.heal(Path::new("/runtime"), "dead").await }
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(
+        facade.current_connection().await,
+        Some((PathBuf::from("/runtime"), "healed-0".to_owned()))
+    );
+    healing.await.unwrap();
 }
 
 /// Ensures escaped compact text cannot defeat the actual serialized response budget.
@@ -5910,7 +6047,7 @@ mod managed_claude_front_tests {
             activation_id: "anonymous".to_owned(),
             root: None,
         });
-        let (healed, request) = tokio::join!(front.recover_lost_daemon(), daemon.request());
+        let (healed, request) = tokio::join!(front.recover_lost_daemon(front.current_pair().await), daemon.request());
         assert!(healed);
         assert!(request.is_none(), "lease recovery must send nothing");
         assert!(
