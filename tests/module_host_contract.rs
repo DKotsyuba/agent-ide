@@ -63,26 +63,10 @@ async fn hidden_module_mode_serves_the_placeholder_contract() {
             )
             .await
             .unwrap();
-        // A module that hosts its provider (Python's Pyright) and was granted none answers the
-        // provider capability with its typed dependency failure, whatever tools the machine
-        // has; the others do not host one yet and answer `unsupported`.
-        match language {
-            "python" => assert!(
-                matches!(
-                    answer.outcome,
-                    Outcome::Error(ref error) if error.code == ErrorCode::Unavailable
-                        && error.unavailable.is_some_and(|unavailable| {
-                            unavailable.stage == Stage::Provider
-                                && unavailable.cause == Cause::ToolMissing
-                        })
-                ),
-                "{language}: {answer:?}"
-            ),
-            _ => assert!(
-                matches!(answer.outcome, Outcome::Error(ref error) if error.code == ErrorCode::Unsupported),
-                "{language}: {answer:?}"
-            ),
-        }
+        assert!(
+            matches!(answer.outcome, Outcome::Error(ref error) if error.code == ErrorCode::Unsupported),
+            "{language}: {answer:?}"
+        );
         channel.shutdown().await;
         let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
             .await
