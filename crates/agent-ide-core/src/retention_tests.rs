@@ -1155,7 +1155,7 @@ fn perfect_clones_are_charged_once_and_private_bytes_are_an_estimate() {
 /// caller's), plus a working session, each with its lock file.
 fn rustc_cache(home: &Path, name: &str, finalized: &[&str]) -> PathBuf {
     let dir = sharing_cache(home, name, 8 << 10);
-    let target = dir.join("digest/rust/target/debug");
+    let target = dir.join("digest/lang/target/debug");
     big_file(&target.join("deps/libdep.rlib"), 16 << 10);
     let krate = target.join("incremental/krate-1abc");
     for session in finalized.iter().chain(&["s-zz-w1-working"]) {
@@ -1169,7 +1169,7 @@ fn rustc_cache(home: &Path, name: &str, finalized: &[&str]) -> PathBuf {
 /// Names of the session directories left in the fixture crate directory.
 fn sessions_left(cache: &Path) -> Vec<String> {
     let mut names: Vec<_> =
-        fs::read_dir(cache.join("digest/rust/target/debug/incremental/krate-1abc"))
+        fs::read_dir(cache.join("digest/lang/target/debug/incremental/krate-1abc"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| !name.ends_with(".lock"))
@@ -1187,7 +1187,7 @@ fn older_finalized_sessions_are_swept_keeping_the_newest_and_working() {
     let cache = rustc_cache(&home, "s", &["s-z-a1-h1", "s-10-b2-h2", "s-1a-c3-h3"]);
     // The newest session has the oldest mtime: mtime must not decide.
     backdate(
-        &cache.join("digest/rust/target/debug/incremental/krate-1abc/s-1a-c3-h3"),
+        &cache.join("digest/lang/target/debug/incremental/krate-1abc/s-1a-c3-h3"),
         DAY * 5,
     );
 
@@ -1200,12 +1200,12 @@ fn older_finalized_sessions_are_swept_keeping_the_newest_and_working() {
     );
     assert!(swept.bytes >= 32 << 10, "{swept:?}");
     assert_eq!(sessions_left(&cache), ["s-1a-c3-h3", "s-zz-w1-working"]);
-    let krate = cache.join("digest/rust/target/debug/incremental/krate-1abc");
+    let krate = cache.join("digest/lang/target/debug/incremental/krate-1abc");
     assert!(!krate.join("s-z-a1.lock").exists() && !krate.join("s-10-b2.lock").exists());
     assert!(krate.join("s-1a-c3.lock").exists() && krate.join("s-zz-w1.lock").exists());
     assert!(
         cache
-            .join("digest/rust/target/debug/deps/libdep.rlib")
+            .join("digest/lang/target/debug/deps/libdep.rlib")
             .exists()
     );
 }
@@ -1216,7 +1216,7 @@ fn older_finalized_sessions_are_swept_keeping_the_newest_and_working() {
 fn a_session_whose_rustc_lock_is_held_is_kept() {
     let home = scratch("session-lock");
     let cache = rustc_cache(&home, "l", &["s-a-a1-h1", "s-b-b2-h2", "s-c-c3-h3"]);
-    let krate = cache.join("digest/rust/target/debug/incremental/krate-1abc");
+    let krate = cache.join("digest/lang/target/debug/incremental/krate-1abc");
     let held = File::open(krate.join("s-a-a1.lock")).unwrap();
     assert!(flock(&held, libc::LOCK_SH | libc::LOCK_NB));
 
@@ -1244,7 +1244,7 @@ fn uncertain_crates_and_ties_are_left_alone() {
     let home = scratch("session-uncertain");
     let malformed = rustc_cache(&home, "m", &["s-a-a1-h1", "s-b-b2-h2"]);
     big_file(
-        &malformed.join("digest/rust/target/debug/incremental/krate-1abc/s-Not_A_Session/x"),
+        &malformed.join("digest/lang/target/debug/incremental/krate-1abc/s-Not_A_Session/x"),
         10,
     );
     let tied = rustc_cache(&home, "t", &["s-a-a1-h1", "s-b-b2-h2", "s-b-c3-h3"]);
@@ -1263,7 +1263,7 @@ fn uncertain_crates_and_ties_are_left_alone() {
 fn a_dry_run_reports_session_sweeps_without_touching_them() {
     let home = scratch("session-dry");
     let cache = rustc_cache(&home, "d", &["s-a-a1-h1", "s-b-b2-h2"]);
-    let krate = cache.join("digest/rust/target/debug/incremental/krate-1abc");
+    let krate = cache.join("digest/lang/target/debug/incremental/krate-1abc");
     fs::remove_file(krate.join("s-a-a1.lock")).unwrap();
 
     let report = sweep_with(&home, false, SystemTime::now(), &nobody);
@@ -1309,9 +1309,9 @@ fn an_idle_worktree_loses_incremental_state_before_the_worktree() {
         (tier.reason, tier.fate),
         (Reason::Incremental, Fate::Removed)
     );
-    assert!(!idle.join("digest/rust/target/debug/incremental").exists());
+    assert!(!idle.join("digest/lang/target/debug/incremental").exists());
     assert!(
-        idle.join("digest/rust/target/debug/deps/libdep.rlib")
+        idle.join("digest/lang/target/debug/deps/libdep.rlib")
             .exists()
     );
     assert!(
