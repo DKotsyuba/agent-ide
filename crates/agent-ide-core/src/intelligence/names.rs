@@ -66,6 +66,13 @@ const WALK_MAX_DIRECTORIES: usize = 10_000;
 const FACTS_CAP: &str = "facts cap";
 /// Skip reason of a file whose language module did not answer; never cached, retried every sweep.
 const MODULE_UNAVAILABLE: &str = "module unavailable";
+/// Skip reason of a file whose language module is still warming up; handled like a fault.
+const MODULE_WARMING: &str = "module warming";
+
+/// Whether a skip reason is transient: the file is asked again on the next sweep.
+fn transient(skipped: Option<&str>) -> bool {
+    matches!(skipped, Some(MODULE_UNAVAILABLE | MODULE_WARMING))
+}
 
 /// Directories no language walk enters: VCS internals, virtual environments, dependency installs
 /// and build output.
@@ -804,7 +811,7 @@ impl NameIndex {
             if self.files.get(path).is_some_and(|entry| {
                 entry.content == *content
                     && entry.language == language
-                    && entry.extracted.skipped != Some(MODULE_UNAVAILABLE)
+                    && !transient(entry.extracted.skipped)
             }) {
                 return;
             }
@@ -823,7 +830,7 @@ impl NameIndex {
         if content.is_none()
             && self.files.get(path).is_some_and(|entry| {
                 entry.stamp == Some(stamp)
-                    && entry.extracted.skipped != Some(MODULE_UNAVAILABLE)
+                    && !transient(entry.extracted.skipped)
                     && entry.language == language
                     && matches!(entry.content, ContentKey::Digest(_))
             })
@@ -871,7 +878,7 @@ impl NameIndex {
         if let Some(entry) = self.files.get_mut(path)
             && entry.digest == Some(digest)
             && entry.language == language
-            && entry.extracted.skipped != Some(MODULE_UNAVAILABLE)
+            && !transient(entry.extracted.skipped)
         {
             entry.stamp = stamp;
             if let Some(content) = content {
@@ -907,6 +914,10 @@ impl NameIndex {
                     // Not cached, so the next sweep asks the module again.
                     self.faulted.insert(language);
                     skipped(MODULE_UNAVAILABLE)
+                }
+                Extraction::Warming => {
+                    self.faulted.insert(language);
+                    skipped(MODULE_WARMING)
                 }
                 Extraction::Done(extracted) => {
                     let extracted = Arc::new(extracted);
@@ -1030,6 +1041,8 @@ enum Extraction {
     NoProvider,
     /// The language's module did not answer.
     Faulted(crate::modules::contract::ModuleUnavailable),
+    /// The language's module answered that it is not ready yet.
+    Warming,
     /// The facts (possibly none).
     Done(Extracted),
 }
@@ -1072,6 +1085,9 @@ fn extract(
             }
         }
     };
+    if skipped == Some("warming") {
+        return Extraction::Warming;
+    }
     if skipped.is_some() {
         return Extraction::Done(Extracted {
             facts: Box::new([]),
@@ -1115,6 +1131,16 @@ pub fn facts_of(
         Extraction::Done(extracted) => Ok(Some(extracted.facts.into_vec())),
         Extraction::NoProvider => Ok(None),
         Extraction::Faulted(fault) => Err(fault),
+        // The module is up but not ready: the caller is told to retry, never that there are no links.
+        Extraction::Warming => Err(crate::modules::contract::ModuleUnavailable {
+            module_id: crate::modules::contract::ModuleId::bundled(language.name()),
+            module_version: env!("CARGO_PKG_VERSION").to_owned(),
+            role: crate::modules::contract::Role::Analyzer,
+            stage: crate::modules::contract::Stage::Provider,
+            cause: crate::modules::contract::Cause::Timeout,
+            instance: None,
+            retry_after_ms: Some(1_000),
+        }),
     }
 }
 

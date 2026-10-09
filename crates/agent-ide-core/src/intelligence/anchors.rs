@@ -44,22 +44,64 @@ pub trait AnchorSource: Send + Sync {
     ) -> Result<AnchorBatch, ModuleUnavailable>;
 }
 
-/// The installed source.
+/// The source tests install; the daemon uses [`Hosted`].
 static SOURCE: OnceLock<Arc<dyn AnchorSource>> = OnceLock::new();
 
-/// Installs the daemon's anchor source; later calls keep the first.
+/// Installs an anchor source instead of the module host's (tests); later calls keep the first.
 pub fn install(source: Arc<dyn AnchorSource>) {
     let _ = SOURCE.set(source);
 }
 
-/// The installed source, if any.
-pub fn installed() -> Option<Arc<dyn AnchorSource>> {
-    SOURCE.get().cloned()
+/// The daemon's own source: the module host's routing ([`calls`](crate::modules::calls)).
+struct Hosted;
+
+impl AnchorSource for Hosted {
+    fn routes(&self, language: Language) -> bool {
+        crate::modules::calls::mode(language) == crate::modules::mode::Mode::Module
+    }
+
+    fn anchors(
+        &self,
+        worktree: &Path,
+        language: Language,
+        path: &Path,
+        text: &str,
+    ) -> Result<AnchorBatch, ModuleUnavailable> {
+        let (worktree, path, text) = (worktree.to_path_buf(), path.to_path_buf(), text.to_owned());
+        let answer =
+            async move { crate::modules::calls::anchors(language, &worktree, &path, &text).await };
+        // Callers run on blocking-pool threads, where waiting on the runtime is allowed.
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| unavailable(language))?;
+        handle
+            .block_on(answer)?
+            .ok_or_else(|| unavailable(language))
+    }
 }
 
-/// The installed source when it routes `language` to its module.
-pub fn routed(language: Language) -> Option<&'static Arc<dyn AnchorSource>> {
-    SOURCE.get().filter(|source| source.routes(language))
+/// A module fault for `language` where the host gave no answer.
+fn unavailable(language: Language) -> ModuleUnavailable {
+    ModuleUnavailable {
+        module_id: crate::modules::contract::ModuleId::bundled(language.name()),
+        module_version: env!("CARGO_PKG_VERSION").to_owned(),
+        role: crate::modules::contract::Role::Analyzer,
+        stage: crate::modules::contract::Stage::Request,
+        cause: crate::modules::contract::Cause::Exited,
+        instance: None,
+        retry_after_ms: None,
+    }
+}
+
+/// The source in use: the one installed (tests), else the module host's.
+pub fn installed() -> Option<Arc<dyn AnchorSource>> {
+    SOURCE
+        .get()
+        .cloned()
+        .or_else(|| Some(Arc::new(Hosted) as Arc<dyn AnchorSource>))
+}
+
+/// The source in use when it routes `language` to its module.
+pub fn routed(language: Language) -> Option<Arc<dyn AnchorSource>> {
+    installed().filter(|source| source.routes(language))
 }
 
 /// Most distinct reason labels kept; later ones share a generic label.
