@@ -5817,7 +5817,8 @@ async fn wait_for_healed_daemon(project: &Path, runtime: &Path, stale_attachment
     .expect("the lease watcher must heal the shared daemon");
 }
 
-/// The window [`wait_for_healed_daemon`] closes, forced deterministically: while the candidate
+/// The window [`wait_for_healed_daemon`] closes, simulated deterministically (no restart happens;
+/// an unregistered all-zero attachment stands for the dead generation's): while the candidate
 /// attachment still names a dead generation (the replacement answers but the front has not
 /// republished yet), the pre-hook submits an attachment the daemon does not know, fails open, and
 /// the call is refused `host_binding`; once the cache names the live attachment again the same
