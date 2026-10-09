@@ -641,3 +641,195 @@ async fn rust_module_measure() {
     )
     .unwrap();
 }
+
+/// The module fault seam (`agent_ide_core::modules::serve::FAULT_SEAM`).
+const FAULT_SEAM: &str = "AGENT_IDE_TEST_MODULE_FAULT";
+/// The module request budget seam (`agent_ide_core::modules::router::BUDGET_SEAM`).
+const BUDGET_SEAM: &str = "AGENT_IDE_TEST_MODULE_BUDGET_MS";
+
+/// The M-A conformance cases on the Rust analyzer module with the real rust-analyzer: once the
+/// analyzer is ready, a stall past the module budget and a malformed reply each settle the next
+/// semantic call with a typed `module_unavailable (bundled.rust:…)` (timeout, malformed) on the
+/// same healthy daemon, and the following call starts a fresh module that answers semantically;
+/// neither the failed module nor its rust-analyzer survives.
+#[tokio::test]
+#[ignore = "requires the accepted AGENT_IDE_RUST_TOOLCHAIN_DIR, AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN inputs"]
+async fn rust_analyzer_seam_faults_are_typed_and_restart() {
+    let fixture = rust_fixture(PARITY_FILES, "module-rust-seams", 300);
+    let usages = json!({"symbol":"src/lib.rs#Service/work"});
+    for (fault, cause) in [("stall", "timeout"), ("malformed", "malformed")] {
+        // The flag is created only once the analyzer is ready, so the seam fires on the next
+        // semantic request rather than on the warm-up.
+        let flag = fixture.base.join(format!("rust-module-fault-{fault}"));
+        let seam = format!("{fault}:semantic:{}", flag.display());
+        let mut daemon = Daemon::start(
+            &fixture,
+            &[MODULE, (FAULT_SEAM, &seam), (BUDGET_SEAM, "5000")],
+        )
+        .await;
+        let daemon_pid = daemon.pid();
+        let mut session = Session::start(&fixture).await;
+        ready(&mut session, &fixture).await;
+        let (first, server) = analyzer(&daemon.tree()).expect("the analyzer module runs");
+        std::fs::write(&flag, "").unwrap();
+        let started = Instant::now();
+        let failed = session.call(&fixture, "ide.symbol", usages.clone()).await;
+        let failed_after = started.elapsed();
+        assert!(!flag.exists(), "{fault}: the seam fired");
+        assert!(
+            failed
+                .to_string()
+                .contains("module_unavailable (bundled.rust:")
+                && failed.to_string().contains(cause),
+            "{fault}: the call names the typed module fault: {failed}"
+        );
+        assert!(
+            failed_after < Duration::from_secs(30),
+            "{fault} answered after {failed_after:?}"
+        );
+        assert!(first.id.gone().await, "{fault}: the failed module survived");
+        assert!(server.gone().await, "{fault}: its rust-analyzer survived");
+        ready(&mut session, &fixture).await;
+        let (second, _) = analyzer(&daemon.tree()).expect("a fresh analyzer module runs");
+        assert_ne!(
+            first.id, second.id,
+            "{fault}: the failed module was replaced"
+        );
+        assert_eq!(daemon.pid(), daemon_pid, "{fault}: same daemon");
+        let owned = daemon.tree().all();
+        session.close(&fixture).await;
+        drop(daemon);
+        for id in owned {
+            assert!(id.gone().await, "{fault}: {id:?} survived the daemon");
+        }
+    }
+}
+
+/// The M-A conformance cases on the Rust checker module: a stall past the budget, a malformed
+/// reply and a `kill -9` of the checker module each leave Rust's check `check failed` naming
+/// `module_unavailable (bundled.rust:…)`, never clean; after an edit the next check starts a
+/// fresh module and lands, on the same daemon.
+#[tokio::test]
+#[ignore = "requires the accepted AGENT_IDE_RUST_TOOLCHAIN_DIR, AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN inputs"]
+async fn rust_checker_seam_faults_are_typed_and_restart() {
+    let fixture = rust_fixture(PARITY_FILES, "module-rust-check-seams", 30);
+    for (fault, expected) in [
+        ("stall", "module_unavailable (bundled.rust:request:timeout)"),
+        (
+            "malformed",
+            "module_unavailable (bundled.rust:request:malformed)",
+        ),
+        ("kill", "module_unavailable (bundled.rust:request:exited)"),
+    ] {
+        let flag = fixture.base.join(format!("rust-check-fault-{fault}"));
+        std::fs::write(&flag, "").unwrap();
+        let kind = if fault == "malformed" {
+            "malformed"
+        } else {
+            "stall"
+        };
+        let seam = format!("{kind}:check_plan:{}", flag.display());
+        let mut daemon = Daemon::start(
+            &fixture,
+            &[MODULE, (FAULT_SEAM, &seam), (BUDGET_SEAM, "3000")],
+        )
+        .await;
+        let daemon_pid = daemon.pid();
+        let mut session = Session::start(&fixture).await;
+        if fault == "kill" {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let checker = loop {
+                if let Some(node) = daemon.tree().module("rust", "checker").cloned()
+                    && !flag.exists()
+                {
+                    break node;
+                }
+                assert!(Instant::now() < deadline, "the stalled checker never ran");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            // SAFETY: the exact module identity captured as this test's daemon child just now.
+            unsafe { libc::kill(checker.id.pid, libc::SIGKILL) };
+        }
+        let failed = problems(&mut session, &fixture, Duration::from_secs(60), |text| {
+            text.contains(expected)
+        })
+        .await;
+        assert!(
+            failed.starts_with("rust: check failed") && failed.contains(expected),
+            "{fault}: the check names the fault:\n{failed}"
+        );
+        std::fs::write(
+            fixture.root.join("src/lib.rs"),
+            format!("pub fn edited_{fault}() -> u8 {{\n    1\n}}\n"),
+        )
+        .unwrap();
+        let landed = problems(&mut session, &fixture, Duration::from_secs(120), |text| {
+            text.starts_with("rust: ready")
+        })
+        .await;
+        assert!(
+            landed.starts_with("rust: ready"),
+            "{fault}: the next check lands:\n{landed}"
+        );
+        assert_eq!(daemon.pid(), daemon_pid, "{fault}: same daemon");
+        session.close(&fixture).await;
+        drop(daemon);
+        fixture.git(&["checkout", "--quiet", "--", "."]);
+    }
+}
+
+/// The Rust analyzer module shares the supervised slots' restart policy: after the initial
+/// start and three restarts within the window (each death settled typed on the next demand),
+/// a further demand is refused `restart_exhausted` (typed, on the same daemon) and no fifth
+/// module starts.
+#[tokio::test]
+#[ignore = "requires the accepted AGENT_IDE_RUST_TOOLCHAIN_DIR, AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN inputs"]
+async fn rust_analyzer_crash_loop_exhausts_the_restart_budget() {
+    let fixture = rust_fixture(PARITY_FILES, "module-rust-crash-loop", 300);
+    let mut daemon = Daemon::start(&fixture, &[MODULE]).await;
+    let daemon_pid = daemon.pid();
+    let mut session = Session::start(&fixture).await;
+    let outline = json!({"path":"src/lib.rs"});
+    let context = json!({"path":"src/lib.rs","byte_offset":WORK_OFFSET});
+    for attempt in 0..4 {
+        // A demand starts the module (the first after a death is settled with its fault).
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let module = loop {
+            let _ = session.call(&fixture, "ide.context", context.clone()).await;
+            if let Some((module, _)) = analyzer(&daemon.tree()) {
+                break module;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "attempt {attempt}: no analyzer module"
+            );
+        };
+        // SAFETY: the exact module identity captured as a child of this test's daemon.
+        unsafe { libc::kill(module.id.pid, libc::SIGKILL) };
+        assert!(module.id.gone().await);
+        // Let each backoff (250 ms, 1 s, 4 s) pass so the next start really happens.
+        tokio::time::sleep(Duration::from_millis([300, 1100, 4100, 0][attempt])).await;
+    }
+    let mut refused = Value::Null;
+    for _ in 0..3 {
+        refused = session.call(&fixture, "ide.context", context.clone()).await;
+        if refused.to_string().contains("restart_exhausted") {
+            break;
+        }
+    }
+    assert!(
+        refused.to_string().contains("restart_exhausted"),
+        "a demand names the exhausted budget: {refused}"
+    );
+    assert!(
+        analyzer(&daemon.tree()).is_none(),
+        "no fifth module started"
+    );
+    let lexical = session.call(&fixture, "ide.outline", outline).await;
+    assert_eq!(
+        lexical["kind"], "outline",
+        "outline still answers from source: {lexical}"
+    );
+    assert_eq!(daemon.pid(), daemon_pid, "same daemon");
+    session.close(&fixture).await;
+}
