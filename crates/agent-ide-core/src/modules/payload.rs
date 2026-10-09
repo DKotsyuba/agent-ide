@@ -342,6 +342,9 @@ pub struct ContextEvidence {
     pub lexical: Option<String>,
     /// Synchronized document version.
     pub document_version: Option<i32>,
+    /// The provider's negotiated position encoding (`utf-8`, `utf-16` or `utf-32`): the core
+    /// reports it and converts byte locations into its positions.
+    pub position_encoding: String,
     /// `None`: unsupported; `Some([])`: an empty reply.
     pub definitions: Option<Vec<Location>>,
     /// `None`: unsupported; `Some([])`: an empty reply.
@@ -358,6 +361,9 @@ pub struct ContextEvidence {
 pub struct DiagnosticsEvidence {
     /// The revision the provider's push was bound to; anything but the request's stays unknown.
     pub revision: Option<String>,
+    /// The provider document version the push named, when bound to that revision; `None` for an
+    /// unversioned push (its count is then a lower bound).
+    pub document_version: Option<i32>,
     /// `clean`, `reported` or `unknown`.
     pub readiness: String,
     /// `current`, `stale`, `provisional` or `unknown`.
