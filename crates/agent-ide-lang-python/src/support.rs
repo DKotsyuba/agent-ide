@@ -100,7 +100,7 @@ fn has_manifest(names: &[String]) -> bool {
 /// subdirectory — down to [`PROBE_MAX_DEPTH`] levels, skipping dot, vendor and
 /// build-output directories, at most [`PROBE_MAX_DIRECTORIES`] of them — that holds its own
 /// manifest and at least one `.py` file within a bounded walk beneath it, so a docs-only
-/// `docs/requirements.txt` (Sphinx in a Rust or Go repository) is not a root. Sorted, and capped
+/// `docs/requirements.txt` (Sphinx in a Rust repository) is not a root. Sorted, and capped
 /// at [`PROBE_MAX_ROOTS`]. Empty when no manifest exists anywhere.
 ///
 /// Shared by the project card, the presence rule and the per-root check runs, so the three can

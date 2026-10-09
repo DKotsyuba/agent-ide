@@ -40,7 +40,7 @@ jobs:
         run: cargo fetch --locked
       - name: Gate
         # The xtask gate is the exact former inline gate — fmt, the locked workspace tests with
-        # --test-threads=1 and the three named gopls skips, the four ignored provider tests,
+        # --test-threads=1, the four ignored provider tests,
         # clippy -D warnings, rustdoc -D warnings, the release build — with --no-fail-fast,
         # plus the family standard and contract-snapshot checks.
         run: cargo xtask check

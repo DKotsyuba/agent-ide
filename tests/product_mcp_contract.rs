@@ -2701,16 +2701,6 @@ impl ProductFixture {
             "pub fn value() -> i32 { 7 }\npub fn caller() -> i32 { value() }\n",
         )
         .unwrap();
-        std::fs::write(
-            fixture.root.join("go.mod"),
-            "module contract.local/product\n\ngo 1.25.0\n",
-        )
-        .unwrap();
-        std::fs::write(
-            fixture.root.join("main.go"),
-            "package main\nfunc Value() int { return 7 }\nfunc main() { _ = Value() }\n",
-        )
-        .unwrap();
         std::fs::write(fixture.root.join("tracked.txt"), "base\n").unwrap();
         fixture.git(&["init", "--quiet"]);
         fixture.git(&["config", "user.email", "fixture@example.invalid"]);
@@ -6738,6 +6728,61 @@ fn daemon_journal(home: &Path, fixture: &ProductFixture) -> String {
     .unwrap_or_default()
 }
 
+/// A launcher file written before Go support was removed still starts the daemon: its
+/// `gopls_defaults` provider entry is ignored with exactly one journal line per daemon start, the
+/// other tools keep working, and a `.go` file answers the generic `unsupported_file` refusal while
+/// its bytes stay readable by path.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn configured_product_old_go_provider_entry_starts_the_daemon_with_one_journal_line() {
+    let fixture = ProductFixture::new(json!([
+        {"executable":accepted_program("/bin/sh","gopls-fixture"),"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"retired-go-cache"}
+    ]));
+    std::fs::write(
+        fixture.root.join("main.go"),
+        "package main\nfunc main() {}\n",
+    )
+    .unwrap();
+    let home = provider_home(&fixture);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "retired-go").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"retired-go"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let outline = actor
+        .call(&fixture, "ide.outline", json!({"path":"main.go"}))
+        .await;
+    let outline = actor.settle(&fixture, outline).await;
+    assert_eq!(outline["code"]["unsupported_file"], "main.go", "{outline}");
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"path":"main.go","lines":"1-2"}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    assert!(
+        read["text"].as_str().unwrap().contains("package main"),
+        "{read}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+    let journal = daemon_journal(&home, &fixture);
+    assert_eq!(
+        journal
+            .matches("provider_settings_retired:gopls_defaults")
+            .count(),
+        1,
+        "{journal}"
+    );
+}
+
 /// A fault in the daemon's own execution machinery — the worker loop panicking, the worker
 /// returning outside shutdown, a panic while the worker is constructed — marks the daemon failed
 /// at once: it exits by itself keeping its runtime store, and its journal names the closed cause.
@@ -8670,8 +8715,6 @@ async fn diff_plain_fallback_refuses_a_path_the_exact_capture_refuses() {
 async fn configured_product_python_non_test_file_answers_no_tests() {
     let fixture = ProductFixture::new(json!([]));
     std::fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
-    std::fs::remove_file(fixture.root.join("go.mod")).unwrap();
-    std::fs::remove_file(fixture.root.join("main.go")).unwrap();
     std::fs::remove_file(fixture.root.join("src/lib.rs")).unwrap();
     std::fs::write(
         fixture.root.join("pyproject.toml"),
@@ -8722,8 +8765,6 @@ async fn configured_product_python_non_test_file_answers_no_tests() {
 async fn configured_product_test_command_uses_cwd_env_and_parses_wrapped_pytest_summary() {
     let fixture = ProductFixture::new(json!([]));
     std::fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
-    std::fs::remove_file(fixture.root.join("go.mod")).unwrap();
-    std::fs::remove_file(fixture.root.join("main.go")).unwrap();
     std::fs::remove_file(fixture.root.join("src/lib.rs")).unwrap();
     std::fs::write(
         fixture.root.join("pyproject.toml"),
@@ -8808,8 +8849,6 @@ async fn configured_product_test_command_uses_cwd_env_and_parses_wrapped_pytest_
 #[tokio::test]
 async fn configured_product_test_path_selects_the_targets_language_runner() {
     let fixture = ProductFixture::new(json!([]));
-    std::fs::remove_file(fixture.root.join("go.mod")).unwrap();
-    std::fs::remove_file(fixture.root.join("main.go")).unwrap();
     std::fs::create_dir_all(fixture.root.join("tools")).unwrap();
     std::fs::write(fixture.root.join("tools/requirements-ml.txt"), "pytest\n").unwrap();
     // The nested marker registers Python only beside a `.py` file in the same directory.
@@ -8852,8 +8891,6 @@ async fn configured_product_test_path_selects_the_targets_language_runner() {
 async fn configured_product_typescript_non_test_file_answers_no_tests() {
     let fixture = ProductFixture::new(json!([]));
     std::fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
-    std::fs::remove_file(fixture.root.join("go.mod")).unwrap();
-    std::fs::remove_file(fixture.root.join("main.go")).unwrap();
     std::fs::remove_file(fixture.root.join("src/lib.rs")).unwrap();
     std::fs::write(
         fixture.root.join("package.json"),
@@ -10587,8 +10624,6 @@ async fn configured_product_batch_several_refusals_in_one_bounded_reply() {
 fn batch_python_fixture(interpreter: Option<&str>) -> ProductFixture {
     let fixture = ProductFixture::new(json!([]));
     std::fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
-    std::fs::remove_file(fixture.root.join("go.mod")).unwrap();
-    std::fs::remove_file(fixture.root.join("main.go")).unwrap();
     std::fs::remove_file(fixture.root.join("src/lib.rs")).unwrap();
     std::fs::remove_dir_all(fixture.root.join("src")).unwrap();
     std::fs::write(
@@ -10778,8 +10813,6 @@ async fn configured_product_batch_typescript_syntax_gate_refuses_and_writes() {
     let typescript = tsserver.parent().unwrap().parent().unwrap().to_path_buf();
     let fixture = ProductFixture::new(json!([]));
     std::fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
-    std::fs::remove_file(fixture.root.join("go.mod")).unwrap();
-    std::fs::remove_file(fixture.root.join("main.go")).unwrap();
     std::fs::remove_file(fixture.root.join("src/lib.rs")).unwrap();
     std::fs::remove_dir_all(fixture.root.join("src")).unwrap();
     std::fs::write(
@@ -10889,8 +10922,6 @@ async fn configured_product_batch_typescript_gate_uses_the_configured_package() 
     let providers = json!([accepted_typescript_provider()]);
     let fixture = ProductFixture::new(providers);
     std::fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
-    std::fs::remove_file(fixture.root.join("go.mod")).unwrap();
-    std::fs::remove_file(fixture.root.join("main.go")).unwrap();
     std::fs::remove_file(fixture.root.join("src/lib.rs")).unwrap();
     std::fs::remove_dir_all(fixture.root.join("src")).unwrap();
     std::fs::write(
@@ -11717,7 +11748,7 @@ async fn product_style_sheets_answer_symbol_tools_without_a_server() {
          usages: 0 indexed in 0 files (src 0, tests 0)\n\
          links: 1 style variable used here\n\
          \x20 --brand  → no indexed declaration\n\
-         unavailable for: rust, go\n\
+         unavailable for: rust\n\
          callers: unavailable (css has no call hierarchy)\n",
         "{symbol}"
     );
@@ -11776,15 +11807,7 @@ async fn configured_product_links_css_html_and_python_names() {
         accepted_pyright_provider("links-pyright-cache"),
         accepted_typescript_provider()
     ]));
-    fixture.git(&[
-        "rm",
-        "--quiet",
-        "--",
-        "Cargo.toml",
-        "src/lib.rs",
-        "go.mod",
-        "main.go",
-    ]);
+    fixture.git(&["rm", "--quiet", "--", "Cargo.toml", "src/lib.rs"]);
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mixed-frontend");
     std::fs::create_dir_all(fixture.root.join("src")).unwrap();
     for name in [
@@ -11993,15 +12016,7 @@ async fn product_start_prewarms_the_name_index() {
 #[tokio::test]
 async fn product_graph_names_use_sites_the_server_cannot_outline() {
     let fixture = ProductFixture::new(json!([accepted_typescript_provider()]));
-    fixture.git(&[
-        "rm",
-        "--quiet",
-        "--",
-        "Cargo.toml",
-        "src/lib.rs",
-        "go.mod",
-        "main.go",
-    ]);
+    fixture.git(&["rm", "--quiet", "--", "Cargo.toml", "src/lib.rs"]);
     std::fs::create_dir_all(fixture.root.join("frontend/src")).unwrap();
     for (name, text) in [
         (
@@ -14265,7 +14280,7 @@ async fn configured_product_reader_start_never_checks_and_reads_the_writers_prob
 
 /// The activation reply keeps its compact epoch line and appends the project card: one rendered
 /// block describing the fixture worktree (rust from Cargo.toml, typescript from package.json,
-/// plus the go module the shared fixture ships), with the layout, docs, and not-started server
+/// plus no other language), with the layout, docs, and not-started server
 /// lines exactly as `project::render` prints them.
 #[tokio::test]
 async fn configured_product_activation_reply_includes_the_project_card() {
@@ -14286,16 +14301,15 @@ async fn configured_product_activation_reply_includes_the_project_card() {
     let text = started["text"].as_str().unwrap();
     assert!(text.starts_with("activated: epoch "), "{text}");
     assert!(text.contains("\n\nproject: repo  root: "), "{text}");
-    // Sorted by line count: main.go (3 lines) leads src/lib.rs (2 lines); package.json maps to
-    // no owned source files, so typescript reports 0 in 0.
+    // package.json maps to no owned source files, so typescript reports 0 in 0.
     assert!(
-        text.contains("languages: go 3 lines in 1 files · rust 2 in 1 · typescript 0 in 0"),
+        text.contains("languages: rust 2 lines in 1 files · typescript 0 in 0"),
         "{text}"
     );
     assert!(text.contains("\nlayout: src/ 1"), "{text}");
     assert!(text.contains("\ndocs: README.md"), "{text}");
     assert!(
-        text.contains("\nservers: rust not started; ide.outline, ide.read and ide.edit answer from source now; ide.symbol and ide.graph wait for the server, which starts on their first use · typescript not started; starts on first use · go not started; starts on first use"),
+        text.contains("\nservers: rust not started; ide.outline, ide.read and ide.edit answer from source now; ide.symbol and ide.graph wait for the server, which starts on their first use · typescript not started; starts on first use"),
         "{text}"
     );
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
@@ -14500,13 +14514,11 @@ async fn configured_product_stop_reclaims_only_its_binding_details() {
     daemon.wait().await.unwrap();
 }
 
-/// Exercises two fresh source/cache roots through actual gopls and accepted Rust product sessions.
+/// Exercises two fresh source/cache roots through accepted Rust product sessions.
 #[tokio::test]
-#[ignore = "requires accepted AGENT_IDE_GOPLS, AGENT_IDE_GO, AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment"]
-async fn configured_product_returns_real_go_and_rust_semantic_context() {
+#[ignore = "requires accepted AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment"]
+async fn configured_product_returns_real_rust_semantic_context() {
     use std::os::unix::fs::PermissionsExt;
-    let gopls = std::env::var("AGENT_IDE_GOPLS").unwrap();
-    let go = std::env::var("AGENT_IDE_GO").unwrap();
     let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN").unwrap();
     let analyzer = std::env::var("AGENT_IDE_RUST_ANALYZER").unwrap();
     for _ in 0..2 {
@@ -14521,7 +14533,7 @@ async fn configured_product_returns_real_go_and_rust_semantic_context() {
         )
         .unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let providers = json!([{"executable":accepted_program(&gopls,"golang.org/x/tools/gopls v0.23.0"),"settings":"gopls_defaults","toolchain":go,"cargo":null,"cargo_version":null,"rustc":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"fixture-go-cache"},{"executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),"settings":"rust_cache_priming_disabled_v1","toolchain":toolchain,"cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"fixture-rust-cache"}]);
+        let providers = json!([{"executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),"settings":"rust_cache_priming_disabled_v1","toolchain":toolchain,"cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"fixture-rust-cache"}]);
         fixture.write_config(providers);
         let mut daemon = fixture.daemon().await;
         let mut actor = ProductActor::new(&fixture, "provider-root").await;
@@ -14534,7 +14546,7 @@ async fn configured_product_returns_real_go_and_rust_semantic_context() {
             .await;
         let start = actor.settle(&fixture, start).await;
         assert_eq!(start["kind"], "activation", "{start}");
-        for (path, symbol) in [("main.go", "Value()"), ("src/lib.rs", "value()")] {
+        for (path, symbol) in [("src/lib.rs", "value()")] {
             let bytes = std::fs::read_to_string(fixture.root.join(path)).unwrap();
             let offset = bytes.rfind(symbol).unwrap();
             let response = actor
@@ -17165,9 +17177,8 @@ async fn configured_product_reports_a_second_actor_on_one_worktree_as_a_conflict
     daemon.wait().await.unwrap();
 }
 
-/// Cancels a configured owned provider during warmup: the direct child is still killed and reaped even
-/// though its socket identity was never captured, and the stop honestly reports that uncertainty
-/// instead of a false success.
+/// Cancels a configured owned provider during warmup: the direct child is still killed and reaped,
+/// its environment is exactly the finite cleared set, and the stop reports success.
 #[tokio::test]
 async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     use std::os::unix::fs::PermissionsExt;
@@ -17179,7 +17190,7 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     std::fs::write(
         &program,
         format!(
-            "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n%s\\n%s\\n%s' \"$GOPLSCACHE\" \"$GOCACHE\" \"$GOMODCACHE\" \"$GOTMPDIR\" \"$TMPDIR\" \"$PATH\" > '{}'\nenv | sed 's/=.*//' | sort > '{}'\nprintf '%s' $$ > '{}'\nexec /bin/sleep 30\n",
+            "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n%s' \"$CARGO_HOME\" \"$CARGO_TARGET_DIR\" \"$TMPDIR\" \"$RUSTUP_TOOLCHAIN\" > '{}'\nenv | sed 's/=.*//' | sort > '{}'\nprintf '%s' $$ > '{}'\nexec /bin/sleep 30\n",
             environment.display(),
             environment_keys.display(),
             marker.display(),
@@ -17187,7 +17198,7 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"slow-fixture-provider"),"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"slow-fixture-cache"}]));
+    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"slow-fixture-provider"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"slow-fixture-cache"}]));
     let mut daemon = fixture
         .daemon_with_home(Some(&provider_home(&fixture)))
         .await;
@@ -17206,15 +17217,13 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .collect::<Vec<_>>();
-    // One shared native namespace (holding `gopls/`/`tmp`, keyed by executable/settings/toolchain/
-    // trust) plus one private per-worktree namespace (also holding `gopls/`, with
-    // `go-build`/`go-mod` distinguishing it from the shared namespace).
-    assert_eq!(cache_namespaces.len(), 2);
+    // One private per-worktree namespace; this provider has no shared native namespace.
+    assert_eq!(cache_namespaces.len(), 1);
     let pending = actor
         .call(
             &fixture,
             "ide.context",
-            json!({"path":"main.go","byte_offset":59}),
+            json!({"path":"src/lib.rs","byte_offset":48}),
         )
         .await;
     assert!(
@@ -17230,28 +17239,14 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     .unwrap();
     let pid: libc::pid_t = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
     let provider_environment = std::fs::read_to_string(environment).unwrap();
-    let shared_namespace = cache_namespaces
-        .iter()
-        .find(|namespace| namespace.join("gopls").is_dir() && !namespace.join("go-build").exists())
-        .expect("shared native namespace");
-    let worktree_namespace = cache_namespaces
-        .iter()
-        .find(|namespace| namespace.join("go-build").is_dir())
-        .expect("per-worktree namespace");
-    assert!(worktree_namespace.join("gopls").is_dir());
-    // The shared listener process env carries only the shared, process-global `GOPLSCACHE` and a
-    // backend-scoped native `TMPDIR` inside that same shared namespace; the per-worktree
-    // `GOCACHE`/`GOMODCACHE`/`GOTMPDIR` are never process env (they are delivered per view through
-    // the LSP session instead), so those three are unset here.
+    let namespace = &cache_namespaces[0];
     assert_eq!(
         provider_environment.lines().collect::<Vec<_>>(),
         vec![
-            shared_namespace.join("gopls").to_str().unwrap(),
-            "",
-            "",
-            "",
-            shared_namespace.join("tmp").to_str().unwrap(),
-            "/usr/bin",
+            operator_cargo_home(namespace).to_str().unwrap(),
+            namespace.join("target").to_str().unwrap(),
+            namespace.join("tmp").to_str().unwrap(),
+            "stable",
         ]
     );
     // `/bin/sh` sets PWD, SHLVL and _ in the fixture script itself; every other name in the
@@ -17263,22 +17258,20 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
             .filter(|key| !matches!(*key, "PWD" | "SHLVL" | "_"))
             .collect::<Vec<_>>(),
         vec![
-            "AGENT_IDE_GOPLS_PROFILE",
-            "GOPLSCACHE",
-            "GOTOOLCHAIN",
+            "CARGO",
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+            "HOME",
             "PATH",
+            "RUSTC",
+            "RUSTUP_TOOLCHAIN",
             "TMPDIR",
         ],
         "the provider environment must be exactly this finite cleared set"
     );
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
-    // The provider never created its socket, so `close_provider` cannot prove the on-disk socket's
-    // fate; it still kills and reaps the direct child below but reports the cleanup honestly instead
-    // of a false "stop" success.
-    assert_eq!(stopped["code"], "internal", "{stopped}");
-    assert_eq!(stopped["state"], "error", "{stopped}");
-    assert!(shared_namespace.is_dir());
-    assert!(worktree_namespace.is_dir());
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    assert!(namespace.is_dir());
     // SAFETY: zero only probes the fixture's previously recorded direct-child PID; it sends no signal.
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
     assert_eq!(
@@ -17290,17 +17283,12 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     daemon.wait().await.unwrap();
 }
 
-/// A provider that exits before ever attempting to bind its listener (a sandboxed `gopls` refused the
-/// `bind()` syscall is the real-world case) must fall back to a lexical `ide.context` result almost
-/// immediately, never by exhausting the 120s operation budget polling a socket that has not appeared
-/// yet. `context` treats `FailureCode::ProviderUnavailable` as a deliberate lexical fallback rather
+/// A provider that exits before it ever answers must fall back to a lexical `ide.context` result
+/// almost immediately, never by exhausting the 120s operation budget polling a provider that is
+/// already dead. `context` treats `FailureCode::ProviderUnavailable` as a deliberate lexical fallback rather
 /// than a fatal error, so the settled reply is `state: "complete"` carrying the fallback reason, not
-/// `state: "error"`. This fixture's provider never touches its socket path at all, so its cleanup
-/// stays exactly as unproved/uncertain as the still-alive never-ready case (preceding test): Stop
-/// still honestly reports `internal` here, since nothing ever proved that path clean; what changed is
-/// only that `ide.context` no longer waits out the full operation deadline to learn that. A fresh
-/// restart afterward must still work end to end, proving no leaked capacity or process from the first
-/// failure.
+/// `state: "error"`. Stop then reports success, and a fresh restart afterward must still work end to
+/// end, proving no leaked capacity or process from the first failure.
 #[tokio::test]
 async fn configured_product_context_settles_promptly_when_provider_exits_before_bind() {
     use std::os::unix::fs::PermissionsExt;
@@ -17317,7 +17305,7 @@ async fn configured_product_context_settles_promptly_when_provider_exits_before_
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
     fixture.write_config(
-        json!([{"executable":accepted_program(program.to_str().unwrap(),"exit-before-bind-fixture-provider"),"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"exit-before-bind-fixture-cache"}]),
+        json!([{"executable":accepted_program(program.to_str().unwrap(),"exit-before-bind-fixture-provider"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"exit-before-bind-fixture-cache"}]),
     );
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "exit-before-bind-root").await;
@@ -17335,7 +17323,7 @@ async fn configured_product_context_settles_promptly_when_provider_exits_before_
         .call(
             &fixture,
             "ide.context",
-            json!({"path":"main.go","byte_offset":59}),
+            json!({"path":"src/lib.rs","byte_offset":48}),
         )
         .await;
     assert!(
@@ -17365,12 +17353,8 @@ async fn configured_product_context_settles_promptly_when_provider_exits_before_
     .await
     .unwrap();
 
-    // This provider never touches its socket path, so nothing ever proves that path clean; Stop
-    // honestly reports the same unproved `internal` disposition as the still-alive never-ready case,
-    // exactly like `configured_product_stop_reaps_a_provider_that_never_becomes_ready` above.
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
-    assert_eq!(stopped["state"], "error", "{stopped}");
-    assert_eq!(stopped["code"], "internal", "{stopped}");
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
 
     // A fresh Start/Context cycle against the same always-failing configured provider must still
     // work end to end, proving no quarantined capacity or leaked process from the first failure.
@@ -17387,7 +17371,7 @@ async fn configured_product_context_settles_promptly_when_provider_exits_before_
         .call(
             &fixture,
             "ide.context",
-            json!({"path":"main.go","byte_offset":59}),
+            json!({"path":"src/lib.rs","byte_offset":48}),
         )
         .await;
     assert!(
@@ -17407,110 +17391,6 @@ async fn configured_product_context_settles_promptly_when_provider_exits_before_
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
-}
-
-/// SIGTERM stops admission, reaps an active owned provider, and removes both owned socket paths.
-#[tokio::test]
-async fn configured_product_sigterm_reaps_active_provider_and_owned_sockets() {
-    use std::os::unix::fs::PermissionsExt;
-    let fixture = ProductFixture::new(json!([]));
-    let program = fixture.base.join("signal-provider");
-    let listener_ready = fixture.base.join("listener-ready");
-    let forwarder_ready = fixture.base.join("forwarder-ready");
-    let process = fixture.base.join("provider-process");
-    std::fs::write(
-        &program,
-        format!(
-            "#!/bin/sh\ncase \"$*\" in *-listen=unix*) ready='{}';; *) ready='{}';; esac\nprintf '%s\\t%s\\n' $$ \"$*\" >> '{}'\n: > \"$ready\"\nexec /bin/sleep 30\n",
-            listener_ready.display(),
-            forwarder_ready.display(),
-            process.display(),
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"signal-fixture-provider"),"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"signal-fixture-cache"}]));
-    let mut daemon = fixture.daemon().await;
-    let mut actor = ProductActor::new(&fixture, "signal-root").await;
-    let started = actor
-        .call(
-            &fixture,
-            "ide.start",
-            json!({"activation_id":"signal-start"}),
-        )
-        .await;
-    let started = actor.settle(&fixture, started).await;
-    assert_eq!(started["kind"], "activation", "{started}");
-    let pending = actor
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"main.go","byte_offset":59}),
-        )
-        .await;
-    assert!(
-        matches!(pending["state"].as_str(), Some("pending" | "complete")),
-        "{pending}"
-    );
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !listener_ready.exists() {
-            assert!(daemon.try_wait().unwrap().is_none());
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let listener = std::fs::read_to_string(&process).unwrap();
-    let (listener_pid, listener_arguments) =
-        listener.lines().next().unwrap().split_once('\t').unwrap();
-    let listener_pid: libc::pid_t = listener_pid.parse().unwrap();
-    let listener_socket = listener_arguments
-        .split_whitespace()
-        .find_map(|argument| argument.strip_prefix("-listen=unix;"))
-        .map(PathBuf::from)
-        .unwrap();
-    let _provider_socket = std::os::unix::net::UnixListener::bind(&listener_socket).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !forwarder_ready.exists() {
-            assert!(daemon.try_wait().unwrap().is_none());
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let processes = std::fs::read_to_string(&process).unwrap();
-    let provider_pids = processes
-        .lines()
-        .map(|line| {
-            line.split_once('\t')
-                .unwrap()
-                .0
-                .parse::<libc::pid_t>()
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(provider_pids.len(), 2, "{processes}");
-    // SAFETY: signal zero only observes the readiness-marked direct child and changes no state.
-    assert_eq!(unsafe { libc::kill(listener_pid, 0) }, 0);
-    let daemon_pid = daemon.id().unwrap() as libc::pid_t;
-    // SAFETY: this test owns the live daemon subprocess identified by its Tokio Child handle.
-    assert_eq!(unsafe { libc::kill(daemon_pid, libc::SIGTERM) }, 0);
-    let status = tokio::time::timeout(Duration::from_secs(5), daemon.wait())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(status.success(), "daemon exited with {status}");
-    for provider_pid in provider_pids {
-        // SAFETY: signal zero only verifies a readiness-marked provider PID after daemon completion.
-        assert_eq!(unsafe { libc::kill(provider_pid, 0) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
-        );
-    }
-    assert!(!listener_socket.exists());
-    assert!(!fixture.runtime.join("agent-ide.sock").exists());
-    actor.mcp.close().await;
 }
 
 /// SIGTERM cooperatively cancels and reaps an in-flight Rust-only provider before daemon exit.
@@ -17605,531 +17485,24 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
     actor.mcp.close().await;
 }
 
-/// Two configured root/child channels on divergent worktrees share the one compatible heavy
-/// listener and its shared native namespace, each through its own forwarder view and its own
-/// private Go build/module/temp namespace, while current source and stop stay isolated.
-#[tokio::test]
-#[ignore = "requires accepted AGENT_IDE_GOPLS and AGENT_IDE_GO environment"]
-async fn configured_product_isolates_go_across_two_divergent_worktree_actors() {
-    use std::os::unix::fs::PermissionsExt;
-    let gopls = std::env::var("AGENT_IDE_GOPLS").unwrap();
-    let go = std::env::var("AGENT_IDE_GO").unwrap();
-    let fixture = ProductFixture::new(json!([]));
-    let invocation_log = fixture.base.join("gopls-invocations");
-    let wrapper = fixture.base.join("gopls-provider");
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nprintf '%s\\t%s\\t%s\\n' \"$$\" \"$PWD\" \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
-            invocation_log.display(),
-            gopls.replace('\'', "'\\''")
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(wrapper.to_str().unwrap(),"golang.org/x/tools/gopls v0.23.0"),"settings":"gopls_defaults","toolchain":go,"cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"shared-fixture-cache"}]));
-    let child_root = fixture.base.join("child");
-    std::fs::create_dir(&child_root).unwrap();
-    let git = |args: &[&str]| {
-        let output = std::process::Command::new("/usr/bin/git")
-            .env_clear()
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .arg("-C")
-            .arg(&child_root)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-    };
-    std::fs::write(
-        child_root.join("go.mod"),
-        "module contract.local/product\n\ngo 1.25.0\n",
-    )
-    .unwrap();
-    std::fs::write(child_root.join("main.go"),"package main\nfunc Value() string { return \"child-value\" }\nfunc main() { _ = Value() }\n").unwrap();
-    git(&["init", "--quiet"]);
-    git(&["config", "user.email", "fixture@example.invalid"]);
-    git(&["config", "user.name", "Fixture"]);
-    git(&["add", "--", "."]);
-    git(&["commit", "--quiet", "-m", "fixture"]);
-    let mut config: Value =
-        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
-    let mut child_target = config["targets"][0].clone();
-    child_target["attachment"] = json!("private-child-channel");
-    child_target["candidate"] = json!(child_root);
-    config["targets"].as_array_mut().unwrap().push(child_target);
-    std::fs::write(&fixture.config, config.to_string()).unwrap();
-    let mut daemon = fixture
-        .daemon_with_home(Some(&provider_home(&fixture)))
-        .await;
-    let mut root = ProductActor::new(&fixture, "root-view").await;
-    let mut child_state = fixture.state();
-    child_state["sandboxCwd"] = json!(child_root);
-    let mut child = ProductActor::new_at(
-        &fixture,
-        "child-view",
-        "private-child-channel",
-        "agent_id",
-        child_state,
-    )
-    .await;
-    let (root_start, child_start) = tokio::join!(
-        root.call(&fixture, "ide.start", json!({"activation_id":"same-start"})),
-        child.call(&fixture, "ide.start", json!({"activation_id":"same-start"}))
-    );
-    let (root_start, child_start) = tokio::join!(
-        root.settle(&fixture, root_start),
-        child.settle(&fixture, child_start)
-    );
-    assert_eq!(root_start["kind"], "activation", "{root_start}");
-    assert_eq!(child_start["kind"], "activation", "{child_start}");
-    let root_offset = std::fs::read_to_string(fixture.root.join("main.go"))
-        .unwrap()
-        .rfind("Value()")
-        .unwrap();
-    let child_offset = std::fs::read_to_string(child_root.join("main.go"))
-        .unwrap()
-        .rfind("Value()")
-        .unwrap();
-    let (a, b) = tokio::join!(
-        root.call(
-            &fixture,
-            "ide.context",
-            json!({"path":"main.go","byte_offset":root_offset})
-        ),
-        child.call(
-            &fixture,
-            "ide.context",
-            json!({"path":"main.go","byte_offset":child_offset})
-        )
-    );
-    let (a, b) = tokio::join!(root.settle(&fixture, a), child.settle(&fixture, b));
-    assert!(
-        a["text"].as_str().unwrap().contains("mode: semantic"),
-        "{a}"
-    );
-    assert!(
-        b["text"].as_str().unwrap().contains("mode: semantic"),
-        "{b}"
-    );
-    assert!(a["text"].as_str().unwrap().contains("return 7"));
-    assert!(b["text"].as_str().unwrap().contains("child-value"));
-    assert!(!a["text"].as_str().unwrap().contains("child-value"));
-    let invocations = std::fs::read_to_string(&invocation_log).unwrap();
-    let listeners = invocations
-        .lines()
-        .filter(|line| line.contains("-listen=unix;"))
-        .collect::<Vec<_>>();
-    let forwarders = invocations
-        .lines()
-        .filter(|line| line.contains("-remote=unix;"))
-        .collect::<Vec<_>>();
-    // Root and child are divergent worktrees with a compatible executable/settings/toolchain/trust
-    // identity, so they share the one heavy gopls listener (its process-global on-disk filecache is
-    // bound to a single shared native namespace) while each worktree still gets its own forwarder
-    // view and its own private Go build/module/temp namespace.
-    assert_eq!(listeners.len(), 1, "{invocations}");
-    assert_eq!(forwarders.len(), 2, "{invocations}");
-    assert!(
-        forwarders
-            .iter()
-            .any(|line| line.contains(fixture.root.to_str().unwrap())),
-        "{invocations}"
-    );
-    assert!(
-        forwarders
-            .iter()
-            .any(|line| line.contains(child_root.to_str().unwrap())),
-        "{invocations}"
-    );
-    let listener_pid: libc::pid_t = listeners[0].split('\t').next().unwrap().parse().unwrap();
-    // SAFETY: signal zero only observes the wrapper-recorded listener PID and changes no process state.
-    assert_eq!(unsafe { libc::kill(listener_pid, 0) }, 0);
-    let sockets = std::fs::read_dir(&fixture.runtime)
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("g-"))
-        .count();
-    assert_eq!(sockets, 1);
-    let cache_root = provider_cache(&fixture);
-    let worktree_namespaces_before = std::fs::read_dir(&cache_root)
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().join("go-build").is_dir())
-        .count();
-    // One shared native namespace (holding `gopls/`) plus one private namespace per worktree
-    // (holding `go-build`/`go-mod`/`tmp`).
-    assert_eq!(worktree_namespaces_before, 2, "{cache_root:?}");
-    assert!(
-        std::fs::read_dir(&cache_root)
-            .unwrap()
-            .filter_map(Result::ok)
-            .any(|entry| entry.path().join("gopls").is_dir()),
-        "{cache_root:?}"
-    );
-    let stop = root.call(&fixture, "ide.stop", json!({})).await;
-    assert_eq!(stop["kind"], "stop", "{stop}");
-    // Stopping root's actor must not retire child's still-live worktree namespace, and the shared
-    // native namespace and root's own worktree namespace must also survive this handoff.
-    let worktree_namespaces_after = std::fs::read_dir(&cache_root)
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().join("go-build").is_dir())
-        .count();
-    assert_eq!(worktree_namespaces_after, 2, "{cache_root:?}");
-    assert!(
-        std::fs::read_dir(&cache_root)
-            .unwrap()
-            .filter_map(Result::ok)
-            .any(|entry| entry.path().join("gopls").is_dir()),
-        "{cache_root:?}"
-    );
-    let live = child
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"main.go","byte_offset":child_offset}),
-        )
-        .await;
-    let live = child.settle(&fixture, live).await;
-    assert!(live["text"].as_str().unwrap().contains("mode: semantic"));
-    assert!(live["text"].as_str().unwrap().contains("child-value"));
-    let stop = child.call(&fixture, "ide.stop", json!({})).await;
-    assert_eq!(stop["kind"], "stop", "{stop}");
-    tokio::join!(root.mcp.close(), child.mcp.close());
-    daemon.kill().await.unwrap();
-    daemon.wait().await.unwrap();
-}
-
-/// Holds the first real shared gopls listener before startup, then proves a bounded product burst
-/// queues valid work, refuses overflow, starts one listener/two forwarders, and keeps the peer view.
-#[tokio::test]
-#[ignore = "requires accepted AGENT_IDE_GOPLS and AGENT_IDE_GO environment"]
-async fn configured_product_cold_go_burst_preserves_admission_and_peer_view() {
-    use std::os::unix::fs::PermissionsExt;
-    let gopls = std::env::var("AGENT_IDE_GOPLS").unwrap();
-    let go = std::env::var("AGENT_IDE_GO").unwrap();
-    let fixture = ProductFixture::new(json!([]));
-    let gate = fixture.base.join("release-gopls-listener");
-    let invocation_log = fixture.base.join("gopls-cold-invocations");
-    let wrapper = fixture.base.join("gopls-cold-provider");
-    fixture.guard_gate(&gate);
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nprintf '%s\\t%s\\t%s\\n' \"$$\" \"$PWD\" \"$*\" >> '{}'\ncase \"$*\" in *'-listen=unix;'*) while [ ! -f '{}' ]; do [ -d '{}' ] || exit 1; sleep 0.01; done;; esac\nexec '{}' \"$@\"\n",
-            invocation_log.display(),
-            gate.display(),
-            fixture.base.display(),
-            gopls.replace('\'', "'\\''")
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-    fixture.write_config(json!([{"executable":accepted_program(wrapper.to_str().unwrap(),"golang.org/x/tools/gopls v0.23.0"),"settings":"gopls_defaults","toolchain":go,"cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"cold-shared-fixture-cache"}]));
-    let child_root = fixture.base.join("cold-child");
-    std::fs::create_dir(&child_root).unwrap();
-    let git = |args: &[&str]| {
-        let output = std::process::Command::new("/usr/bin/git")
-            .env_clear()
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .arg("-C")
-            .arg(&child_root)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-    };
-    std::fs::write(
-        child_root.join("go.mod"),
-        "module contract.local/cold-child\n\ngo 1.25.0\n",
-    )
-    .unwrap();
-    std::fs::write(child_root.join("main.go"), "package main\nfunc Value() string { return \"cold-child\" }\nfunc main() { _ = Value() }\n").unwrap();
-    git(&["init", "--quiet"]);
-    git(&["config", "user.email", "fixture@example.invalid"]);
-    git(&["config", "user.name", "Fixture"]);
-    git(&["add", "--", "."]);
-    git(&["commit", "--quiet", "-m", "fixture"]);
-    let mut config: Value =
-        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
-    let mut child_target = config["targets"][0].clone();
-    child_target["attachment"] = json!("private-child-channel");
-    child_target["candidate"] = json!(child_root);
-    config["targets"].as_array_mut().unwrap().push(child_target);
-    std::fs::write(&fixture.config, config.to_string()).unwrap();
-    for index in 0..15 {
-        std::fs::write(
-            fixture.root.join(format!("burst-{index}.go")),
-            format!(
-                "package main\nfunc Burst{index}() string {{ return \"burst-{index}\" }}\nfunc callBurst{index}() {{ _ = Burst{index}() }}\n"
-            ),
-        )
-        .unwrap();
-    }
-    std::fs::write(
-        fixture.root.join("burst-overflow.go"),
-        "package main\nfunc BurstOverflow() string { return \"burst-overflow\" }\nfunc callBurstOverflow() { _ = BurstOverflow() }\n",
-    )
-    .unwrap();
-    let mut daemon = fixture.daemon().await;
-    let mut root = ProductActor::new(&fixture, "cold-root").await;
-    let mut child_state = fixture.state();
-    child_state["sandboxCwd"] = json!(child_root);
-    let mut child = ProductActor::new_at(
-        &fixture,
-        "cold-child",
-        "private-child-channel",
-        "agent_id",
-        child_state,
-    )
-    .await;
-    let (root_start, child_start) = tokio::join!(
-        root.call(&fixture, "ide.start", json!({"activation_id":"cold-start"})),
-        child.call(&fixture, "ide.start", json!({"activation_id":"cold-start"}))
-    );
-    assert_eq!(
-        root.settle(&fixture, root_start).await["kind"],
-        "activation"
-    );
-    assert_eq!(
-        child.settle(&fixture, child_start).await["kind"],
-        "activation"
-    );
-    let root_offset = std::fs::read_to_string(fixture.root.join("main.go"))
-        .unwrap()
-        .rfind("Value()")
-        .unwrap();
-    let child_offset = std::fs::read_to_string(child_root.join("main.go"))
-        .unwrap()
-        .rfind("Value()")
-        .unwrap();
-    let (root_pending, child_pending) = tokio::join!(
-        root.call(
-            &fixture,
-            "ide.context",
-            json!({"path":"main.go","byte_offset":root_offset})
-        ),
-        child.call(
-            &fixture,
-            "ide.context",
-            json!({"path":"main.go","byte_offset":child_offset})
-        )
-    );
-    assert_eq!(root_pending["state"], "pending", "{root_pending}");
-    assert_eq!(child_pending["state"], "pending", "{child_pending}");
-    let mut burst_pending = Vec::with_capacity(15);
-    for index in 0..15 {
-        let name = format!("burst-{index}.go");
-        let offset = std::fs::read_to_string(fixture.root.join(&name))
-            .unwrap()
-            .rfind(&format!("Burst{index}()"))
-            .unwrap();
-        let queued = root
-            .call(
-                &fixture,
-                "ide.context",
-                json!({"path":name,"byte_offset":offset}),
-            )
-            .await;
-        assert_eq!(queued["state"], "pending", "{queued}");
-        burst_pending.push((index, queued));
-    }
-    let overflow_offset = std::fs::read_to_string(fixture.root.join("burst-overflow.go"))
-        .unwrap()
-        .rfind("BurstOverflow()")
-        .unwrap();
-    let refused = root
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"burst-overflow.go","byte_offset":overflow_offset}),
-        )
-        .await;
-    assert_eq!(refused["state"], "error", "{refused}");
-    assert_eq!(refused["code"], "capacity", "{refused}");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !std::fs::read_to_string(&invocation_log)
-            .ok()
-            .is_some_and(|log| log.contains("-listen=unix;"))
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("listener wrapper must record the gated cold start");
-    std::fs::write(&gate, "release\n").unwrap();
-    let root_context = root.settle(&fixture, root_pending).await;
-    let child_context = child.settle(&fixture, child_pending).await;
-    assert!(
-        root_context["text"]
-            .as_str()
-            .unwrap()
-            .contains("mode: semantic"),
-        "{root_context}"
-    );
-    assert!(
-        child_context["text"]
-            .as_str()
-            .unwrap()
-            .contains("mode: semantic"),
-        "{child_context}"
-    );
-    assert!(
-        child_context["text"]
-            .as_str()
-            .unwrap()
-            .contains("cold-child"),
-        "{child_context}"
-    );
-    // Settle every accepted burst reply too: this is the full set of 17 admitted operations
-    // (root + child + 15 burst), not an arbitrary early prefix of the invocation log.
-    for (index, pending) in burst_pending {
-        let settled = root.settle(&fixture, pending).await;
-        assert!(
-            settled["text"].as_str().unwrap().contains("mode: semantic"),
-            "burst-{index}: {settled}"
-        );
-        assert!(
-            settled["text"]
-                .as_str()
-                .unwrap()
-                .contains(&format!("burst-{index}")),
-            "burst-{index}: {settled}"
-        );
-    }
-    let invocations = std::fs::read_to_string(&invocation_log).unwrap();
-    let listeners = invocations
-        .lines()
-        .filter(|line| line.contains("-listen=unix;"))
-        .collect::<Vec<_>>();
-    let forwarders = invocations
-        .lines()
-        .filter(|line| line.contains("-remote=unix;"))
-        .collect::<Vec<_>>();
-    assert_eq!(listeners.len(), 1, "{invocations}");
-    assert_eq!(forwarders.len(), 17, "{invocations}");
-    let root_forwarders = forwarders
-        .iter()
-        .filter(|line| line.contains(fixture.root.to_str().unwrap()))
-        .count();
-    let child_forwarders = forwarders
-        .iter()
-        .filter(|line| line.contains(child_root.to_str().unwrap()))
-        .count();
-    assert_eq!(root_forwarders, 16, "{invocations}");
-    assert_eq!(child_forwarders, 1, "{invocations}");
-    let listener_pid: libc::pid_t = listeners[0].split('\t').next().unwrap().parse().unwrap();
-    let forwarder_pids: Vec<libc::pid_t> = forwarders
-        .iter()
-        .map(|line| line.split('\t').next().unwrap().parse().unwrap())
-        .collect();
-    let mut unique_pids: std::collections::BTreeSet<libc::pid_t> =
-        forwarder_pids.iter().copied().collect();
-    assert_eq!(unique_pids.len(), forwarder_pids.len(), "{invocations}");
-    unique_pids.insert(listener_pid);
-    assert_eq!(unique_pids.len(), forwarder_pids.len() + 1, "{invocations}");
-    // SAFETY: signal zero only observes the wrapper-recorded listener PID and changes no process
-    // state.
-    assert_eq!(unsafe { libc::kill(listener_pid, 0) }, 0);
-    // Every forwarder above is a one-shot process the product reaps immediately after its own
-    // exchange settles (see `SharedGopls::open_view`/`cancel_and_reap`), so now that every reply
-    // has settled none of the recorded PIDs should still be running.
-    for pid in &forwarder_pids {
-        // SAFETY: signal zero only observes a recorded PID and changes no process state.
-        assert_ne!(
-            unsafe { libc::kill(*pid, 0) },
-            0,
-            "settled forwarder pid {pid} is still alive: {invocations}"
-        );
-    }
-    let stopped = root.call(&fixture, "ide.stop", json!({})).await;
-    assert_eq!(stopped["kind"], "stop", "{stopped}");
-    // SAFETY: signal zero only observes the wrapper-recorded listener PID and changes no process
-    // state.
-    assert_eq!(unsafe { libc::kill(listener_pid, 0) }, 0);
-    // Change the child's own source after root's actor has fully torn down, so a stale/cached
-    // answer or a dead peer backend cannot coincidentally still satisfy this assertion.
-    std::fs::write(
-        child_root.join("main.go"),
-        "package main\nfunc Value() string { return \"cold-child-poststop\" }\nfunc main() { _ = Value() }\n",
-    )
-    .unwrap();
-    let child_offset_after_edit = std::fs::read_to_string(child_root.join("main.go"))
-        .unwrap()
-        .rfind("Value()")
-        .unwrap();
-    let live = child
-        .call(
-            &fixture,
-            "ide.context",
-            json!({"path":"main.go","byte_offset":child_offset_after_edit}),
-        )
-        .await;
-    let live = child.settle(&fixture, live).await;
-    assert!(
-        live["text"].as_str().unwrap().contains("mode: semantic"),
-        "{live}"
-    );
-    assert!(
-        live["text"]
-            .as_str()
-            .unwrap()
-            .contains("cold-child-poststop"),
-        "{live}"
-    );
-    let invocations_after_stop = std::fs::read_to_string(&invocation_log).unwrap();
-    let listeners_after_stop = invocations_after_stop
-        .lines()
-        .filter(|line| line.contains("-listen=unix;"))
-        .collect::<Vec<_>>();
-    let forwarders_after_stop = invocations_after_stop
-        .lines()
-        .filter(|line| line.contains("-remote=unix;"))
-        .collect::<Vec<_>>();
-    assert_eq!(listeners_after_stop.len(), 1, "{invocations_after_stop}");
-    assert_eq!(forwarders_after_stop.len(), 18, "{invocations_after_stop}");
-    let new_forwarders: Vec<&&str> = forwarders_after_stop
-        .iter()
-        .filter(|line| {
-            let pid: libc::pid_t = line.split('\t').next().unwrap().parse().unwrap();
-            !forwarder_pids.contains(&pid)
-        })
-        .collect();
-    assert_eq!(new_forwarders.len(), 1, "{invocations_after_stop}");
-    assert!(
-        new_forwarders[0].contains(child_root.to_str().unwrap()),
-        "{invocations_after_stop}"
-    );
-    assert_eq!(
-        child.call(&fixture, "ide.stop", json!({})).await["kind"],
-        "stop"
-    );
-    tokio::join!(root.mcp.close(), child.mcp.close());
-    daemon.kill().await.unwrap();
-    daemon.wait().await.unwrap();
-}
-
 /// A real background Context job that finishes while its own caller only ever saw `Pending`
 /// leaves a genuinely undelivered new fact: the first eligible native-edit hook must deliver it
 /// once, and a second must not resurrect it. This drives the actual product Worker/dispatcher
-/// entry path end to end (real daemon, real gopls, real hook binary) — `ide.inspect` is never
+/// entry path end to end (real daemon, real rust-analyzer, real hook binary) — `ide.inspect` is never
 /// called for this detail, so nothing but the job's own completion and the hook can be the source
 /// of delivery.
 #[tokio::test]
-#[ignore = "requires accepted AGENT_IDE_GOPLS and AGENT_IDE_GO environment"]
+#[ignore = "requires accepted AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment"]
 async fn configured_product_pending_context_job_completes_and_native_hook_delivers_its_feedback_once()
  {
     use std::os::unix::fs::PermissionsExt;
-    let gopls = std::env::var("AGENT_IDE_GOPLS").unwrap();
-    let go = std::env::var("AGENT_IDE_GO").unwrap();
+    let analyzer = std::env::var("AGENT_IDE_RUST_ANALYZER").unwrap();
+    let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN").unwrap();
     let fixture = ProductFixture::new(json!([]));
-    // gopls cannot start until this test releases the gate, so the very first `ide.context` must
-    // observe the job still queued (`Pending`) rather than racing a fast real provider.
-    let gate = fixture.base.join("release-gopls-listener");
-    let wrapper = fixture.base.join("gopls-gated-provider");
+    // rust-analyzer cannot start until this test releases the gate, so the very first `ide.context`
+    // must observe the job still queued (`Pending`) rather than racing a fast real provider.
+    let gate = fixture.base.join("release-provider");
+    let wrapper = fixture.base.join("rust-gated-provider");
     fixture.guard_gate(&gate);
     std::fs::write(
         &wrapper,
@@ -18137,19 +17510,19 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
             "#!/bin/sh\nwhile [ ! -f '{}' ]; do [ -d '{}' ] || exit 1; sleep 0.02; done\nexec '{}' \"$@\"\n",
             gate.display(),
             fixture.base.display(),
-            gopls.replace('\'', "'\\''")
+            analyzer.replace('\'', "'\\''")
         ),
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let providers = json!([{
-        "executable":accepted_program(wrapper.to_str().unwrap(),"golang.org/x/tools/gopls v0.23.0"),
-        "settings":"gopls_defaults",
-        "toolchain":go,
-        "cargo":null,
-        "cargo_version":null,
-        "rustc":null,
-        "rustc_version":null,
+        "executable":accepted_program(wrapper.to_str().unwrap(),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
+        "settings":"rust_cache_priming_disabled_v1",
+        "toolchain":toolchain,
+        "cargo":accepted_program(&toolchain_bin("cargo"),"cargo 1.98.1"),
+        "cargo_version":"cargo 1.98.1",
+        "rustc":accepted_program(&toolchain_bin("rustc"),"rustc 1.98.1"),
+        "rustc_version":"rustc 1.98.1",
         "trust":"fixture-disabled",
         "cache_namespace":"fixture-pending-feedback-cache"
     }]);
@@ -18167,24 +17540,24 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
     assert_eq!(start["kind"], "activation", "{start}");
 
     std::fs::write(
-        fixture.root.join("main.go"),
-        "package main\nfunc Value() int { return \"bad\" }\nfunc main() { _ = Value() }\n",
+        fixture.root.join("src/lib.rs"),
+        "pub fn value() -> i32 { \"bad\" }\npub fn caller() -> i32 { value() }\n",
     )
     .unwrap();
-    let offset = std::fs::read_to_string(fixture.root.join("main.go"))
+    let offset = std::fs::read_to_string(fixture.root.join("src/lib.rs"))
         .unwrap()
-        .find("Value")
+        .find("value")
         .unwrap();
     let response = actor
         .call(
             &fixture,
             "ide.context",
-            json!({"path":"main.go","byte_offset":offset}),
+            json!({"path":"src/lib.rs","byte_offset":offset}),
         )
         .await;
     assert_eq!(
         response["state"], "pending",
-        "gopls is gated and must not have answered synchronously: {response}"
+        "rust-analyzer is gated and must not have answered synchronously: {response}"
     );
 
     // Release the gate: the job now finishes for real inside the daemon's own worker loop. This
@@ -20074,24 +19447,11 @@ async fn claude_later_binding_diffs_path_edited_under_earlier_grant() {
 /// Cross-production identity replacement is covered by the worker's bounded ledger regression;
 /// this test owns the real Claude host surfaces.
 #[tokio::test]
-#[ignore = "requires accepted AGENT_IDE_GOPLS and AGENT_IDE_GO environment"]
+#[ignore = "requires accepted AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN environment"]
 async fn configured_product_claude_returns_context_diff_and_feedback() {
-    let gopls = std::env::var("AGENT_IDE_GOPLS").unwrap();
-    let go = std::env::var("AGENT_IDE_GO").unwrap();
     let rust_analyzer = std::env::var("AGENT_IDE_RUST_ANALYZER").unwrap();
     let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN").unwrap();
     let providers = json!([
-        {
-            "executable":accepted_program(&gopls,"golang.org/x/tools/gopls v0.23.0"),
-            "settings":"gopls_defaults",
-            "toolchain":go,
-            "cargo":null,
-            "cargo_version":null,
-            "rustc":null,
-            "rustc_version":null,
-            "trust":"fixture-disabled",
-            "cache_namespace":"fixture-claude-go-cache"
-        },
         {
             "executable":accepted_program(&rust_analyzer,"1.98.1 (48a229ce 2026-09-01)"),
             "settings":"rust_cache_priming_disabled_v1",
@@ -20125,15 +19485,15 @@ async fn configured_product_claude_returns_context_diff_and_feedback() {
     assert!(feedback.is_empty());
 
     std::fs::write(
-        fixture.root.join("main.go"),
-        "package main\nfunc Value() int { return \"bad\" }\nfunc main() { _ = Value() }\n",
+        fixture.root.join("src/lib.rs"),
+        "pub fn value() -> i32 { \"bad\" }\npub fn caller() -> i32 { value() }\n",
     )
     .unwrap();
-    let offset = std::fs::read_to_string(fixture.root.join("main.go"))
+    let offset = std::fs::read_to_string(fixture.root.join("src/lib.rs"))
         .unwrap()
-        .find("Value")
+        .find("value")
         .unwrap();
-    let arguments = json!({"path":"main.go","byte_offset":offset});
+    let arguments = json!({"path":"src/lib.rs","byte_offset":offset});
     let pending = actor
         .call_claude(&fixture, "ide.context", arguments.clone())
         .await;
@@ -20143,7 +19503,7 @@ async fn configured_product_claude_returns_context_diff_and_feedback() {
     assert_eq!(context["kind"], "context", "{context}");
     let context_text = context["text"].as_str().unwrap();
     assert!(context_text.contains("mode: semantic"), "{context_text}");
-    assert!(context_text.contains("return \"bad\""), "{context_text}");
+    assert!(context_text.contains("\"bad\""), "{context_text}");
     assert!(
         context_text.contains("diagnostic_count: 1"),
         "{context_text}"
@@ -20158,25 +19518,6 @@ async fn configured_product_claude_returns_context_diff_and_feedback() {
     actor
         .claude_lifecycle(&fixture, "PostToolUse", "native-edit-after-context")
         .await;
-
-    let rust_source = std::fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap();
-    let pending = actor
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"src/lib.rs","byte_offset":rust_source.find("value").unwrap()}),
-        )
-        .await;
-    let (rust_context, feedback) = actor.settle_claude(&fixture, pending).await;
-    assert_eq!(rust_context["kind"], "context", "{rust_context}");
-    let rust_text = rust_context["text"].as_str().unwrap();
-    assert!(rust_text.contains("mode: semantic"), "{rust_text}");
-    assert!(rust_text.contains("pub fn value()"), "{rust_text}");
-    assert!(
-        rust_text.contains("provider_generation: Some"),
-        "{rust_text}"
-    );
-    assert!(feedback.is_empty());
 
     // `provenance: true` keeps this test on the exact header carrying `baseline_coverage`,
     // `baseline_window` and `tracked_path`; the compact default is covered by its own
@@ -20207,19 +19548,19 @@ async fn configured_product_claude_returns_context_diff_and_feedback() {
         "{diff_text}"
     );
     assert!(
-        diff_text.contains("tracked_path: \"main.go\""),
+        diff_text.contains("tracked_path: \"src/lib.rs\""),
         "{diff_text}"
     );
-    assert!(diff_text.contains("return \"bad\""), "{diff_text}");
+    assert!(diff_text.contains("\"bad\""), "{diff_text}");
 
     let mut retained = std::fs::read_dir(provider_cache(&fixture))
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect::<Vec<_>>();
     retained.sort();
-    // The daemon-owned providers use the same layout as on the Codex route: one shared native
-    // gopls namespace, one private per-worktree gopls namespace, and one rust-analyzer namespace.
-    assert_eq!(retained.len(), 3, "{retained:?}");
+    // The daemon-owned provider uses the same layout as on the Codex route: one rust-analyzer
+    // namespace.
+    assert_eq!(retained.len(), 1, "{retained:?}");
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     let mut after_stop = std::fs::read_dir(provider_cache(&fixture))
@@ -22073,8 +21414,6 @@ async fn configured_product_batch_typescript_tsx_gate_parses_jsx_in_the_real_lau
     )]);
     fixture.write_config(providers);
     std::fs::remove_file(fixture.root.join("Cargo.toml")).unwrap();
-    std::fs::remove_file(fixture.root.join("go.mod")).unwrap();
-    std::fs::remove_file(fixture.root.join("main.go")).unwrap();
     std::fs::remove_file(fixture.root.join("src/lib.rs")).unwrap();
     std::fs::remove_dir_all(fixture.root.join("src")).unwrap();
     std::fs::write(
@@ -22204,7 +21543,7 @@ async fn configured_product_environment_repeat_start_keeps_own_cache_and_binding
     let fixture = ProductFixture::new(json!([]));
     fixture.write_config(json!([
         {"executable":accepted_program("/bin/sh","pyright-fixture"),"settings":"pyright_defaults_v1","toolchain":"node-fixture","node":accepted_program("/bin/sh","node-fixture"),"cargo":null,"cargo_version":null,"rustc":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"repeat-environment-cache"},
-        {"executable":accepted_program("/bin/sh","gopls-fixture"),"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"repeat-shared-cache"}
+        {"executable":accepted_program("/bin/sh","rust-analyzer fixture"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"repeat-rust-cache"}
     ]));
     std::fs::write(
         fixture.root.join("pyproject.toml"),
@@ -22253,7 +21592,7 @@ async fn configured_product_environment_repeat_start_keeps_own_cache_and_binding
         .map(|entry| entry.unwrap().path())
         .collect::<Vec<_>>();
     namespaces.sort();
-    assert_eq!(namespaces.len(), 3);
+    assert_eq!(namespaces.len(), 2);
     let run = actor
         .call(
             &fixture,

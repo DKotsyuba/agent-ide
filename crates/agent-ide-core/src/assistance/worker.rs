@@ -1466,6 +1466,17 @@ impl WorkerHandle {
                 let _ = ready.send(Err(FailureCode::ExecutionProfile));
                 return;
             }
+            // Once per daemon start: a provider entry of a retired server was ignored.
+            for retired in shared.launcher.retired_settings() {
+                crate::errorlog::record(
+                    crate::errorlog::Method::Daemon,
+                    crate::errorlog::Outcome::Skipped,
+                    crate::errorlog::Fields {
+                        detail: Some(&format!("provider_settings_retired:{}", retired.key)),
+                        ..crate::errorlog::Fields::default()
+                    },
+                );
+            }
 
             let database = std::env::var_os("AGENT_IDE_STATE_DATABASE")
                 .map(std::path::PathBuf::from)

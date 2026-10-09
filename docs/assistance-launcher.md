@@ -52,8 +52,9 @@ on a target; they are accepted and ignored, because no
 host sandbox is replayed any more. New configurations should omit them.
 
 Each optional provider has `executable` in the same shape as `git`, a closed `settings`
-value, `toolchain`, `trust`, and `cache_namespace`. `gopls_defaults` requires an absolute
-Go executable as `toolchain` and absent/null `cargo_version` and `rustc_version`.
+value, `toolchain`, `trust`, and `cache_namespace`. A provider entry with the retired `gopls_defaults` settings (Go support was removed in 0.10.8) is
+ignored before validation: the daemon starts normally, journals one `provider_settings_retired:gopls_defaults` line per
+start, and `agent-ide doctor` prints one `retired_provider` line; any other unknown settings value is still invalid.
 `rust_cache_priming_disabled_v1` requires a nonempty rustup toolchain selector plus accepted
 nonempty `cargo_version` and `rustc_version` identities. Arbitrary settings objects and
 duplicate language/settings entries are rejected.

@@ -20,8 +20,7 @@
 //! trait impl keeps the server's full name (`impl Display for Foo`) as its segment, so trait
 //! methods are addressed as `impl Display for Foo/fmt`.
 //!
-//! The helpers marked `pub(super)` are shared with the Go module, whose line-oriented rules are
-//! the same apart from the comment syntax.
+//! The helpers marked `pub(super)` are shared with the sibling modules of this crate.
 
 use std::{
     collections::HashMap,

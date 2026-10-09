@@ -39,7 +39,7 @@
     "toolchains": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["go", "gopls", "rust", "rust_analyzer", "node", "pyright", "typescript_language_server", "typescript"],
+      "required": ["rust", "rust_analyzer", "node", "pyright", "typescript_language_server", "typescript"],
       "properties": {
         "go": {"$ref": "#/$defs/token"},
         "gopls": {"$ref": "#/$defs/token"},

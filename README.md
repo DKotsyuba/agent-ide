@@ -9,7 +9,7 @@ language, a cross-language name bridge (CSS selectors ↔ HTML/TSX class names),
 directories without Git (every tool except the Git views; those answer "not a git repository").
 Every release
 passes five live macOS acceptance routes (product, direct Codex, direct Claude, agent-run to Claude,
-agent-run to Codex). Go/gopls support is built in but outside the release scope and `not_tested`.
+agent-run to Codex). Go support was removed in 0.10.8; an old launcher entry for it is ignored with a doctor line.
 
 Tagged releases are built on GitHub Actions using an arm64 macOS runner and published
 with a SHA-256 checksum in GitHub Releases. See [docs/release.md](docs/release.md).
@@ -251,7 +251,7 @@ Persistent LSP caches follow the worktree, including sequential coder-to-reviewe
 
 Stopping a coder releases its analysis leases and retains its worktree's cache directories. A verified Workspace closure or reset is the only fact that retires a cache namespace; v0.1 has no worktree-close surface that produces that fact yet, so namespaces accumulate up to a fixed ceiling for the daemon's lifetime rather than being retired automatically. Shared backends remain available to other open worktrees. Retained directories do not imply retained hot provider indexes; the strict retention requirement in the [roadmap](docs/roadmap.md#acceptance) remains unresolved.
 
-Go worktrees split their cache in two. Each worktree keeps a private namespace holding its own `GOCACHE`/`GOMODCACHE`/`GOTMPDIR`, delivered per LSP view rather than as process environment, so a view without one fails closed instead of reading another worktree's build state. Compatible worktrees additionally share one backend-scoped native namespace holding gopls' own on-disk filecache and the listener's temporary directory: gopls binds that filecache once per process, so sharing it is what lets divergent worktrees run on a single physical listener with one forwarder each. Compatibility is one canonical effective-rights identity — provider, settings, toolchain, and the rights the observed sandbox state actually grants; cwd-relative sandbox roots are resolved to absolute rights first, and any policy whose rights cannot be proven equal is never shared. The shared namespace is reference-counted, so it survives a partial stop while any sharing worktree is still live, and both namespaces persist across stop and handoff. gopls manages the contents of its shared native namespace itself and may evict them at any time; that eviction is a cache miss, never a loss of IDE-owned worktree state.
+Retained cache namespaces are private per worktree; an old shared-gopls namespace under `~/.agent-ide/providers` is no longer adopted and retires through the normal idle, missing-worktree and size rules.
 
 Pyright v0.1.1 supports Codex and Claude Python (`.py` and `.pyi`). Configure its closed `pyright_defaults_v1` provider with accepted absolute `pyright-langserver` and `node` executable objects, and set `toolchain` to the accepted Node identity. The launcher invokes that exact Node executable with the absolute Pyright script and `--stdio`; The daemon uses the same accepted paths, identities, and BLAKE3 digests. The MCP surface keeps wire v2 for the original five methods and uses wire v3 for `ide.edit`.
 

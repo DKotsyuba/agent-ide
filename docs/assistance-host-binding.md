@@ -430,8 +430,7 @@ active hints and suppression after stop, without claiming those fixtures changed
 The controlled process tests are complemented by live macOS checks. Release 0.6.2 (revision
 `2db699f`) records all five routes `real_pass`/`product_pass` on one revision — the product
 contract, direct Codex CLI 0.156.1, direct Claude Code 2.1.280, and installed agent-run 0.19.0 to
-each host ([docs/evidence](evidence/)). Go and gopls are outside the release scope and their
-evidence rows are pinned `not_tested`. Linux, real `PostToolBatch` availability, and formal
+each host ([docs/evidence](evidence/)). Go support was removed in 0.10.8. Linux, real `PostToolBatch` availability, and formal
 host-confirmed `model_seen` delivery remain unverified.
 
 The executable deadline regressions enforce a 450 ms wall-clock ceiling: the 250 ms
@@ -513,7 +512,7 @@ processes before success. A shared listener survives another active Go view. Sto
 worktree closure or cache-retirement fact: configured provider cache namespaces are quiesced and
 retained under canonical nonce-bound worktree identity and incarnation for a compatible successor.
 A shared native namespace is reference-counted and quiesces only after the last sharing worktree
-stops; gopls may evict its contents independently, which costs recomputation, not IDE-owned state. Only the
+stops; a provider may evict its contents independently, which costs recomputation, not IDE-owned state. Only the
 existing verified Workspace closure or explicit reset fact may retire the retained namespace.
 Restart discards bindings and detail references;
 new activation uses a boot-specific channel identity and the durable native-identity fence.

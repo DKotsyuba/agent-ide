@@ -938,7 +938,7 @@ mod linked_project_tests {
         };
         assert!(profile.accepts_server(Some(&info("rust-analyzer", "contract-1"))));
         assert!(!profile.accepts_server(Some(&info("rust-analyzer", "wrong-version"))));
-        assert!(!profile.accepts_server(Some(&info("gopls", "contract-1"))));
+        assert!(!profile.accepts_server(Some(&info("foreign-server", "contract-1"))));
         assert!(!profile.accepts_server(None));
         assert_eq!(
             profile.experimental_capabilities(),
@@ -946,7 +946,7 @@ mod linked_project_tests {
         );
         assert_eq!(profile.status_method(), Some("experimental/serverStatus"));
         assert_eq!(profile.language_id(Path::new("lib.rs")), "rust");
-        assert_eq!(profile.language_id(Path::new("main.go")), "plaintext");
+        assert_eq!(profile.language_id(Path::new("main.txt")), "plaintext");
     }
 
     /// Quiescent `ok` or `warning` (failed build scripts) is ready, quiescent `error` failed,

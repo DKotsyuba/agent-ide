@@ -78,8 +78,8 @@ the requested URI; scope-less settings must be globally compatible or fail.
 Noninteractive prompts have no affirmative default. Unknown server commands
 remain inert observations.
 
-`intelligence_context_contract` runs the production session on an Execution-owned
-real gopls child. It proves capability negotiation, exact Workspace-byte open/change,
+The production session on an Execution-owned real provider child (formerly exercised by a gopls
+contract, removed with Go in 0.10.8; `intelligence_rust_contract` now carries it) It proves capability negotiation, exact Workspace-byte open/change,
 definition/references, missing-path close/reopen, provisional pushed diagnostics,
 shutdown and reap. The focused session tests exercise malformed framing, UTF position
 conversion, callback refusal, request timeout/cancellation and EOF.
@@ -98,7 +98,7 @@ The caller must check its live authority and cancel on its exact revocation even
 
 `Session::capabilities` returns the actual initialize report, optional server identity,
 and negotiated UTF-8/16/32 positions; an omitted encoding means UTF-16. It does not
-assert diagnostic cleanliness. `ProviderSettings::GoplsDefaults` preserves the accepted null/default configuration and cannot identify a Rust server. `ProviderSettings::Rust(profile)` retains the exact immutable Rust identity, checks the initialize analyzer name/version, sends `cache-priming-check-on-save-disabled-v1` initialization/configuration, and waits for `experimental/serverStatus` with both `health=ok` and `quiescent=true`. Missing, malformed, unhealthy, or non-quiescent status cannot satisfy the bounded barrier. `provider_readiness` is an opaque provider-status observation minted only by the correlated session router; consumers can query it but cannot construct healthy evidence. It remains separate from push-diagnostic readiness.
+assert diagnostic cleanliness. `ProviderSettings::Rust(profile)` retains the exact immutable Rust identity, checks the initialize analyzer name/version, sends `cache-priming-check-on-save-disabled-v1` initialization/configuration, and waits for `experimental/serverStatus` with both `health=ok` and `quiescent=true`. Missing, malformed, unhealthy, or non-quiescent status cannot satisfy the bounded barrier. `provider_readiness` is an opaque provider-status observation minted only by the correlated session router; consumers can query it but cannot construct healthy evidence. It remains separate from push-diagnostic readiness.
 
 `Session::context(observation, bytes, ContextQuery::File | Symbol { byte_offset })`
 checks the exact Workspace worktree, epoch, source sequence, size and digest. It
@@ -162,38 +162,12 @@ configuration, toolchain, trust boundary, transport, lifecycle and sharing
 mode. The compatibility key contains those inputs. An exclusive profile also
 contains the measured executable-byte digest and the canonical `WorktreeRef` including incarnation. A shared profile
 uses that worktree identity as an isolated view key and never shares mutable
-document buffers across views. A `gopls` profile supplies the absolute Go
-toolchain path and forwards only its parent as the process `PATH`. After
-Execution clears the ambient environment, every owned listener and forwarder
-receives `GOPLSCACHE`, `GOCACHE`, `GOMODCACHE`, `GOTMPDIR`, and `TMPDIR` beneath the private
-namespace retained for that durable worktree identity. No `HOME` is supplied.
-
-`rust-analyzer` is exclusive in v0.1. The shared `gopls` profile starts one
-controlled `gopls -listen=unix;<owned socket> -listen.timeout=10m` listener per
-compatibility key. Each `WorktreeRef` incarnation receives an independently
-piped explicit `gopls -remote=unix;<owned socket>` forwarder, initialize
-root/workspace folder, document state, request IDs, source sequence and logical
-lease. `-remote=auto` is never used. The worktree is therefore an isolated view
-key, not a second heavy daemon. If divergent-worktree isolation or
-detach-with-peer-survival is not proved, the profile reports
-unsupported/exclusive rather than shared.
-The ten-minute idle timeout is the v0.1 orphan safety ceiling: it spans ordinary model and
-subagent handoffs observed in the supported host flow, normal owners still cancel and reap the
-listener explicitly, and hard daemon death cannot leave an idle listener permanently.
-For `gopls v0.23.0`, an explicitly shutdown/exit forwarder may report its
-documented terminal `remote disconnected` exit after the daemon closes that
-session; it is accepted only with exact captured evidence and a still-live peer
-semantic check.
-
-The listener consumes a registry-issued, one-time `ProviderSpawnLease` bound to
-the full admitted Workspace authority. Each forwarder consumes a distinct
-central process slot through a non-cloneable `ProviderForwarderSpawnLease`,
-bound once to its registry view and authority. The registry counts one shared
-backend and two logical views; two live forwarders add two separately counted
-process slots, giving three centrally admitted processes. Repeated capability
-issuance, slot reuse, and identity/incarnation/root/authority-epoch substitution
-are rejected before spawning. Listener, forwarder, and Rust spawns receive a newly consumed ActiveBindingUse; none caches liveness across delayed admission. Gopls view keys use Workspace's canonical
-`WorktreeRef` rather than independently supplied names.
+document buffers across views. Every bundled profile (`rust-analyzer`, Pyright, the TypeScript bundle) is
+exclusive in v0.1 and spawns through a newly consumed ActiveBindingUse; none caches liveness across
+delayed admission. The shared-listener profile for Go was removed in 0.10.8; the language-neutral
+shared-backend and forwarder lease machinery of the registry stays but no bundled profile uses it.
+Repeated capability issuance, slot reuse, and identity/incarnation/root/authority-epoch substitution
+are rejected before spawning.
 
 `observe_source` advances an exact logical view lease monotonically without
 resetting its request IDs. A reply's worktree, lease and source sequence must
@@ -260,10 +234,7 @@ analysis.
    malformed/fragmented/coalesced framing, cancellation with late response
    disposal, read-only callbacks, EOF generation invalidation and owned-pipe
    cleanup handoff.
-2. Prove a real shared `gopls` profile with two divergent worktrees containing
-   duplicate module/symbol names and different configuration; stop one view and
-   confirm the peer remains semantically usable and isolated. This acceptance
-   also reports one listener and its separately counted per-view forwarders.
+2. (Retired in 0.10.8 with Go: the shared-listener profile proof.)
 3. Prove the exclusive real `rust-analyzer` profile: no cross-worktree reuse;
    a second demand is separately admitted, queued or refused.
 4. Prove source-sequence freshness, provisional diagnostics, same-worktree

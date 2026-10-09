@@ -268,7 +268,7 @@ async fn diagnostics_are_bounded_and_cache_reuse_requires_quiescent_compatibilit
     let cache_path = temporary("cache");
     let cache_root = CacheRoot::prepare(&cache_path).unwrap();
     let identity = CacheIdentity::new(
-        "gopls",
+        "provider-fixture",
         "shared",
         "config",
         "toolchain",
@@ -277,7 +277,7 @@ async fn diagnostics_are_bounded_and_cache_reuse_requires_quiescent_compatibilit
     )
     .unwrap();
     let incompatible = CacheIdentity::new(
-        "gopls",
+        "provider-fixture",
         "shared",
         "config",
         "toolchain",

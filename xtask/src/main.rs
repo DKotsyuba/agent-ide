@@ -25,12 +25,6 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// Wall-clock ceiling for one MCP handshake plus `tools/list`.
 const CONTRACT_DEADLINE: Duration = Duration::from_secs(120);
-/// The three real-gopls toolchain contracts CI skips by name: no Go toolchain is installed.
-const GOPLS_SKIPS: [&str; 3] = [
-    "real_gopls_production_context_tracks_exact_observed_bytes",
-    "shared_gopls_isolates_divergent_worktrees_and_detaches_one_view",
-    "dropping_live_gopls_owner_closes_its_owned_listener",
-];
 /// The four ignored real-provider product tests, run exactly as CI does. The fourth name fixes a
 /// pre-existing CI typo (`claude_helper_…`) that matched no test and silently ran nothing.
 const PROVIDER_TESTS: [&str; 4] = [
@@ -255,18 +249,12 @@ fn collect_non_rust(dir: &Path, out: &mut Vec<String>) -> Result<()> {
 }
 
 /// The full CI gate in one command: standard checks, fmt, the workspace tests (serialized, with
-/// the three gopls skips and `--no-fail-fast`, built with the `test-seams` feature the seam-driven
+/// `--no-fail-fast`, built with the `test-seams` feature the seam-driven
 /// product tests need), one default-build run proving a release build ignores those seams, the
 /// four ignored provider tests, clippy, rustdoc, the release build and the contract snapshot check.
 fn check(root: &Path) -> Result<()> {
     standard(root)?;
     run(root, "cargo", &["fmt", "--all", "--check"])?;
-    let mut skips = Vec::new();
-    for name in GOPLS_SKIPS {
-        skips.push("--skip".to_string());
-        skips.push(name.to_string());
-    }
-    let skip_refs: Vec<&str> = skips.iter().map(String::as_str).collect();
     // The seam-driven product tests need the `test-seams` feature; the next run proves a release
     // build ignores every seam.
     #[rustfmt::skip]
@@ -274,7 +262,7 @@ fn check(root: &Path) -> Result<()> {
     run(
         root,
         "cargo",
-        &[workspace_tests, vec!["--test-threads=1"], skip_refs].concat(),
+        &[workspace_tests, vec!["--test-threads=1"]].concat(),
     )?;
     // A release build (no `test-seams` feature) must ignore every environment seam: the version
     // seams and the job-panic seam.
