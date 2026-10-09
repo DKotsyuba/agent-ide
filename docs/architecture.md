@@ -41,6 +41,15 @@ flowchart LR
 
 These are runtime relationships, not a serial implementation schedule. Application composes the components. Workspace owns lifecycle identity; persistent analysis cache follows that worktree lifecycle independently of actor/session changes. A failed assistance component cannot veto native agent work. The daemon is crash-only: a caught panic or unexpected task end marks it failed, it answers `restarting`, exits keeping its runtime store and receipts, and the front starts a replacement in the same directory without ever replaying a mutation (a written edit stays `outcome_unknown`); a daemon whose health path stays silent for 30 seconds is force-replaced after the lock holder is verified ([Core IPC](contracts/core-ipc.md)).
 
+### Poisoned locks
+
+A `std::sync::Mutex` is poisoned when a holder panics. The daemon never treats that as a reason to panic a second time, and the rule depends on what the lock guards:
+
+- **Authority and ordering state** (host bindings and pre-attachments, the worker ledger, provider-session state, the check scheduler's state) fails closed. Connection-level code answers the call with a typed refusal and no guessed state (`unavailable: host_binding` with cause `internal_lock`, or `internal`); inside a job the panic is caught, the daemon is marked failed and replaced crash-only with its store and receipts kept. Half-updated authority is never served.
+- **Advisory bookkeeping that every use overwrites or drains whole** (the lease idle clock and shutdown hooks, derived caches such as the environment selections, provider refusal and store-cause notes) is recovered with `PoisonError::into_inner`: a failed call must not also stop the idle exit, the shutdown hooks or the next lookup.
+
+A panic inside one accepted-connection task is contained to that connection and journaled (`daemon failed internal connection_task_panic`, [error log](contracts/error-log-v0.3.md)); the daemon keeps serving. The tests are `a_panicking_connection_task_is_journaled_while_the_daemon_serves`, `poisoned_bookkeeping_locks_are_recovered_not_propagated`, `poisoned_selection_cache_is_recovered_not_propagated` and the `internal_lock` host-binding control in `assistance::assembly`.
+
 ## v0.3 MVP: project problem feed
 
 [EYES-r2](contracts/eyes-v0.3.md) extends the composed application with a shared per-repository

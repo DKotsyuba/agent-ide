@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- A panic in an accepted-connection task is journaled (`daemon failed internal`, detail `connection_task_panic`) on both the live accept loop and the shutdown drain; cancellation by the drain stays silent.
+- The daemon's poisoned-lock policy is stated and tested (`docs/architecture.md`, "Poisoned locks"): the lease idle clock, the shutdown hooks and the environment selection cache recover a poisoned lock instead of panicking; authority state keeps failing closed.
+
 ## 0.10.7 — 2026-10-08
 
 ### Fixed

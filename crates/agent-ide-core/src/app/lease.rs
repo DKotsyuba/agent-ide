@@ -7,7 +7,7 @@
 //! daemon-owned work has been in flight, for the configured idle timeout.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -24,6 +24,16 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// The predicate has no change signal of its own, so a busy daemon polls it at this interval to
 /// notice that its last check finished and the idle countdown may begin.
 const BUSY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Locks `mutex`, recovering the guard when a holder panicked.
+///
+/// Poisoned-lock policy (docs/architecture.md, "Poisoned locks"): the idle clock and the shutdown
+/// hook list are advisory bookkeeping that every use overwrites or drains whole, so a panic
+/// elsewhere in the daemon must never also panic the connection task that merely counts a call or
+/// the shutdown that must run the hooks. Authority state is the opposite and fails closed.
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Shared state behind every [`LeaseController`] clone and every outstanding [`LeaseGuard`].
 struct Inner {
@@ -72,7 +82,7 @@ impl LeaseController {
     /// reason (orderly idle expiry, SIGINT/SIGTERM, or a serving failure), after the dispatcher's
     /// own asynchronous shutdown (which already cancels project checks) has completed.
     pub fn on_shutdown(&self, hook: impl FnOnce() + Send + 'static) {
-        self.0.hooks.lock().unwrap().push(Box::new(hook));
+        locked(&self.0.hooks).push(Box::new(hook));
     }
 
     /// Reports one served client call, restarting the idle countdown from now (T26B).
@@ -81,7 +91,7 @@ impl LeaseController {
     /// counts as activity, so a call restarts the idle window while no lease is open. Managed MCPs
     /// hold leases for their lifetimes and suppress this countdown altogether.
     pub fn mark_activity(&self) {
-        *self.0.became_idle_at.lock().unwrap() = Some(Instant::now());
+        *locked(&self.0.became_idle_at) = Some(Instant::now());
         self.0.changed.notify_waiters();
     }
 
@@ -129,7 +139,7 @@ impl LeaseController {
                 Err(observed) => open = observed,
             }
         }
-        *self.0.became_idle_at.lock().unwrap() = None;
+        *locked(&self.0.became_idle_at) = None;
         self.0.changed.notify_waiters();
         crate::errorlog::record(
             crate::errorlog::Method::Daemon,
@@ -180,7 +190,7 @@ impl LeaseController {
 
     /// Runs every registered shutdown hook exactly once, in registration order, then clears them.
     pub async fn run_shutdown_hooks(&self) {
-        let hooks = std::mem::take(&mut *self.0.hooks.lock().unwrap());
+        let hooks = std::mem::take(&mut *locked(&self.0.hooks));
         for hook in hooks {
             hook();
         }
@@ -197,13 +207,13 @@ impl LeaseController {
             return None;
         }
         if (self.0.is_busy)() {
-            *self.0.became_idle_at.lock().unwrap() = Some(Instant::now());
+            *locked(&self.0.became_idle_at) = Some(Instant::now());
             return None;
         }
         self.0
             .became_idle_at
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .map(|since| since + self.0.idle_timeout)
     }
 }
@@ -215,7 +225,7 @@ impl Drop for LeaseGuard {
     /// Decrements the open lease count and, if this was the last open lease, starts the idle clock.
     fn drop(&mut self) {
         if self.0.open.fetch_sub(1, Ordering::SeqCst) == 1 {
-            *self.0.became_idle_at.lock().unwrap() = Some(Instant::now());
+            *locked(&self.0.became_idle_at) = Some(Instant::now());
         }
         self.0.changed.notify_waiters();
         crate::errorlog::record(
@@ -414,4 +424,31 @@ mod tests {
             .expect("the stop must exit once the last binding stops")
             .unwrap();
     }
+
+    /// A holder that panicked while holding either bookkeeping lock leaves the daemon's idle clock
+    /// and shutdown hooks fully usable: counting a call, admitting a lease, arming the idle
+    /// countdown and running the hooks neither panic nor lose a hook.
+    #[tokio::test]
+    async fn poisoned_bookkeeping_locks_are_recovered_not_propagated() {
+        let lease = LeaseController::new(Duration::from_secs(300), || false);
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        lease.on_shutdown(move || flag.store(true, Ordering::SeqCst));
+        let inner = Arc::clone(&lease.0);
+        let poisoned = std::thread::spawn(move || {
+            let _clock = inner.became_idle_at.lock().unwrap();
+            let _hooks = inner.hooks.lock().unwrap();
+            panic!("poison the lease bookkeeping");
+        })
+        .join();
+        assert!(poisoned.is_err());
+        assert!(lease.0.became_idle_at.is_poisoned() && lease.0.hooks.is_poisoned());
+
+        lease.mark_activity();
+        drop(lease.try_admit().expect("a lease is admitted"));
+        assert!(lease.current_deadline().is_some());
+        lease.run_shutdown_hooks().await;
+        assert!(ran.load(Ordering::SeqCst), "the registered hook still ran");
+    }
 }
+
