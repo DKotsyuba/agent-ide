@@ -10,7 +10,8 @@
 //!   (partially shared extents stay overcharged) and falls back to per-inode allocation where the
 //!   clone attributes are unavailable;
 //! - **private**: an estimate of what the volume gets back at once when everything is removed (APFS
-//!   private size per inode). It explains reclaim; it never replaces the charge.
+//!   private size per inode, counted only when every hard link of the inode is inside the family:
+//!   a link outside keeps the data allocated). It explains reclaim; it never replaces the charge.
 //!
 //! Removing one entry only frees the groups no other entry still holds, so the family charge is
 //! recomputed from the surviving holders after every removal, never decremented by the removed

@@ -68,7 +68,9 @@ measured as a whole and `cache status` shows three numbers for it:
   This is what the budget bounds. It is an upper bound of the physical footprint — partially shared
   extents stay overcharged — and directories, symlinks and unshared files count as they are;
 - **private**: an estimate of what the volume gets back at once if everything went (APFS private
-  bytes summed once per inode). It explains reclaim and is never charged: a family of perfect clones
+  bytes summed once per inode, and only for inodes all of whose hard links are inside the family: a
+  link outside, for example a file also linked from a build outside the cache, keeps the data
+  allocated). It explains reclaim and is never charged: a family of perfect clones
   has almost no private bytes yet still occupies the shared extents.
 
 Removing one entry frees only the streams no surviving entry still holds, so the charge is
@@ -92,7 +94,8 @@ and no legacy process may be alive):
    removed; rustc loads only the newest and collects the rest itself only when that crate is built
    again. The newest is chosen by the base-36 `<timestamp>` rustc encodes, never by mtime. Each
    session is removed only while its sibling `s-<timestamp>-<random>.lock` — the file rustc
-   `flock`s — is held exclusively and without waiting (a busy lock keeps the session), the lock file
+   locks while it reads, writes or collects the session (an `fcntl` lock on macOS, which the `flock`
+   taken here excludes) — is held exclusively and without waiting (a busy lock keeps the session), the lock file
    goes last, still held. `-working` sessions and their locks are never touched. A crate directory
    with a malformed `s-…` entry, an unreadable one, a finalized entry that is not a real directory,
    or a tie at the newest timestamp is left entirely alone.
