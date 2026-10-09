@@ -1165,3 +1165,121 @@ fn references_are_masked_and_nothing_else() {
             "detail_ref":null,"items":[{"detail_ref":"<ref>"}]})
     );
 }
+
+/// The daemon's own open path for a Rust analyzer module, without the daemon: the pinned
+/// shipping binary started by `analyzer_command` (the module environment the root declares),
+/// `analyzer_offer` with the backend's grant and settings, `open_session` with the static Rust
+/// session shape, then the session's readiness barrier across the boundary until ready.
+#[tokio::test]
+#[ignore = "requires the accepted AGENT_IDE_RUST_TOOLCHAIN_DIR, AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN inputs"]
+async fn the_daemon_open_path_reaches_a_ready_rust_analyzer() {
+    use agent_ide_core::{
+        intelligence::{freshness::ViewGeneration, session::ProviderSettings},
+        modules::{analyzer, launch::ModuleExecutable},
+        workspace::authority::WorktreeRef,
+    };
+    agent_ide::languages::install();
+    let fixture = Fixture::new(PARITY_FILES, providers("module-rust-open"));
+    let dir = std::path::PathBuf::from(input("AGENT_IDE_RUST_TOOLCHAIN_DIR"));
+    let namespace = fixture.base.join("namespace");
+    for sub in ["cargo", "target", "tmp"] {
+        std::fs::create_dir_all(namespace.join(sub)).unwrap();
+    }
+    let settings = agent_ide_lang_rust::module::RustProviderSettings {
+        binary: input("AGENT_IDE_RUST_ANALYZER").into(),
+        version: "rust-analyzer 1.98.1 (48a229ce 2026-09-01)".into(),
+        cargo: dir.join("bin/cargo"),
+        cargo_home: None,
+        cargo_version: "cargo 1.98.1".into(),
+        rustc: dir.join("bin/rustc"),
+        rustc_version: "rustc 1.98.1".into(),
+        toolchain: input("AGENT_IDE_RUST_TOOLCHAIN"),
+        trust: "fixture-disabled".into(),
+        cache_namespace: namespace.display().to_string(),
+    };
+    let digest = |path: &std::path::Path| {
+        blake3::hash(&std::fs::read(path).unwrap())
+            .to_hex()
+            .to_string()
+    };
+    let executable = ModuleExecutable::pin(&parity::binary()).expect("a pinned module binary");
+    let worktree = WorktreeRef::from_discovery(
+        fixture.root.clone(),
+        fixture.root.clone(),
+        fixture.root.join(".git"),
+        1,
+    )
+    .unwrap();
+    let command = analyzer::analyzer_command(&executable, "rust", &worktree).expect("a command");
+    let mut child = agent_ide_core::execution::spawn_granted_provider(&command).unwrap();
+    let offer = analyzer::analyzer_offer(
+        &executable,
+        "rust",
+        1,
+        &worktree,
+        [&settings.binary, &settings.cargo, &settings.rustc]
+            .into_iter()
+            .map(|path| (path.clone(), digest(path)))
+            .collect(),
+        [namespace.clone()]
+            .into_iter()
+            .chain(agent_ide_core::userhome::user_home())
+            .chain(["/usr/bin", "/bin"].map(std::path::PathBuf::from))
+            .collect(),
+        Duration::from_secs(30),
+        serde_json::to_value(&settings).unwrap(),
+    );
+    let generation = ViewGeneration {
+        backend: 1,
+        configuration: 1,
+        toolchain: 1,
+        view: 1,
+    };
+    let started = Instant::now();
+    let mut live = analyzer::open_session(
+        child.stdout.take().unwrap(),
+        child.stdin.take().unwrap(),
+        offer,
+        worktree,
+        1,
+        generation,
+        ProviderSettings::new(agent_ide_lang_rust::profile::RustModuleSession),
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("open: {error}"));
+    eprintln!("open after {:?}", started.elapsed());
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        match live.wait_ready(Duration::from_millis(100)).await {
+            Ok(()) => break,
+            Err(error) => {
+                // A warming provider is loading, never a gone transport.
+                assert!(
+                    !matches!(
+                        error,
+                        agent_ide_core::intelligence::session::ReadinessError::Gone
+                    ),
+                    "a live module answered its readiness as gone: alive {} fault {:?}",
+                    live.is_alive(),
+                    live.module_unavailable()
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "never ready: {error:?}; fault {:?}",
+                    live.module_unavailable()
+                );
+                eprintln!(
+                    "readiness after {:?}: {error:?} alive {} fault {:?} remote {:?}",
+                    started.elapsed(),
+                    live.is_alive(),
+                    live.module_unavailable(),
+                    live.remote_fault()
+                );
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+    }
+    eprintln!("ready after {:?}", started.elapsed());
+    let _ = child.kill().await;
+}
