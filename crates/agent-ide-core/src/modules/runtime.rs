@@ -186,7 +186,7 @@ pub struct Supervisor<L: Launcher> {
 }
 
 /// Whether `cause` repeats until the accepted inputs change.
-fn deterministic(cause: Cause) -> bool {
+pub(crate) fn deterministic(cause: Cause) -> bool {
     matches!(
         cause,
         Cause::Incompatible | Cause::ToolMissing | Cause::PolicyRefused

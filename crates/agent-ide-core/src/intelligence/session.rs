@@ -1576,6 +1576,12 @@ impl Session {
 }
 
 impl LiveSession {
+    /// The typed failure that retired this session's bundled module (its channel or its
+    /// provider), if any.
+    pub fn module_unavailable(&self) -> Option<crate::modules::contract::ModuleUnavailable> {
+        self.session.module_fault()
+    }
+
     /// The typed `module_unavailable` that retired this session's bundled module, if any.
     pub fn remote_fault(&self) -> Option<&str> {
         self.session
