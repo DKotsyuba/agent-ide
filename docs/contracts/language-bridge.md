@@ -51,9 +51,16 @@ bumps the version, so old and new facts never join by accident.
 |---|---|---|---|---|---|
 | `ns::CLASS` | `class/v1` | class name | style rule selector (`rule`) | class attribute or expression | `.btn` |
 | `ns::ELEMENT_ID` | `id/v1` | element id | markup `id` attribute (`element`) | selector `#x`, fragment link `#x`, DOM query | `##main` |
+| `ns::FILE_REF` | `file-ref/v1` | file reference | the file itself (`file`), known to the core's listing, never to an extractor | `<script src>`, `<link href>`, static `import`/`export … from`/`require`/`import()` | none |
 | `ns::STYLE_VARIABLE` | `style-variable/v1` | style variable | `--x:` declaration (`declaration`) | `var(--x)` | `--brand` |
 
 A new namespace is one more constant plus extractors in the language crates; no core logic changes.
+
+`file-ref/v1` is path-keyed (`NamespaceDescriptor::path_keys`): its name is the worktree-relative
+path the reference spells, lexically normalized (`.` dropped, `..` resolved, never above the
+worktree root), spaces allowed, 1..=4096 bytes, no control characters, always an empty domain. It
+is a relation between files, so it appears in no sigil address, in no bare-name lookup and not on
+the `ide.start` card's `links:` line.
 
 ## 3. Normalization per namespace
 
@@ -266,3 +273,42 @@ line exceeds 2 000 bytes are `Skipped("minified")`.
 **Cost.** A symbol card consults the index only when the symbol's own file states a fact inside
 the symbol (checked from the observed bytes), so cards of ordinary code keep their latency. Bare
 names consult the index only when a language that defines names (style sheets, markup) is present.
+
+## 10. File references and CSS-module members (first-release link kinds)
+
+Both kinds travel as ordinary facts, in process or as `linkage/0` anchors served by a language
+module; the core joins them at query time and never stores an edge.
+
+**`file-ref/v1`.** Emitters: HTML `<script src>` and `<link href>` (relative URL, query and
+fragment dropped, percent escapes decoded, joined to the document's directory; `<base href>` voids
+every reference of the document; absolute, network, `data:` and templated values name nothing) and
+TS/JS static relative specifiers of `import … from`, `export … from`, `import "x"`, `import("x")`
+and `require("x")` (`./`, `../` only; packages, aliases, absolute and URL specifiers, templates and
+computed arguments name nothing). `import`/`export` drop a static `?`/`#` as URL metadata;
+`require` keeps it (CommonJS file-name text). Only the loader forms prove a reference: a member
+call named `import`/`require` and a file that declares its own `require` give none.
+
+The core reaches the file with the **referencing language's** static `FileProbe` vocabulary
+(`NameFacts::file_probe`): the exact file first, then `.js`-family-to-source swaps, then
+extension suffixes, then directory index files, each probe labelled `Heuristic("extension swap")`,
+`("extension probe")` or `("index probe")`. A language without a probe (HTML) reaches exact files
+only. A directory, a missing file or a file outside the listing reaches nothing; a displayed
+target is its first line read now, so an edit changes it and a deletion removes the edge.
+`NameFacts::resolve` (the callable `linkage.resolve`) enumerates the same candidates for a raw
+reference, the literal path first and a query-dropped variant only as an assumption.
+
+**CSS-module members.** A script binding of a CSS module (`import styles from './a.module.css'`,
+`import * as styles …`, `const styles = require(…)`; `.css`, `.scss`, `.sass`, `.less`) makes
+`styles.foo`, `styles?.foo` and `styles["foo"]` exact uses of class `foo` in the domain
+`<worktree-relative module path>`, exactly the domain the style-sheet provider gives that file's
+classes. Any redeclaration, assignment, parameter or destructuring target of the binding anywhere in
+the file voids it (scope-blind on purpose); dynamic access, global style sheets and named imports
+give nothing.
+
+**Module-computed facts.** When a language computes in its module the index takes its facts from
+the module's anchors (`AnchorSource`), converted back to the facts above; the same language in
+process gives equal facts. A module that fails or is warming leaves its files skipped
+(`module unavailable` / `module warming`), the languages are listed as `unavailable for:` and the
+next sweep asks again; nothing is cached and no in-process answer replaces it. The fact cache is
+keyed by language, extractor revision, **path** and content: identical bytes at two paths are two
+extractions.
