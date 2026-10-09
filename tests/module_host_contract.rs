@@ -174,7 +174,7 @@ fn parity_normalizer_masks_only_volatile_tokens() {
 }
 
 /// The parity harness runs the same calls on two fresh daemons, with and without the fallback
-/// switch, and finds them equal; no module process runs yet (every language is in process).
+/// switch, and finds them equal; CSS runs as a module only by default.
 #[tokio::test]
 async fn parity_harness_compares_two_daemon_runs() {
     let fixture = parity::Fixture::new(
@@ -202,8 +202,8 @@ async fn parity_harness_compares_two_daemon_runs() {
     drop(in_process.daemon);
     let default = parity::transcript(&fixture, &[], &calls).await;
     assert!(
-        default.tree.module("css", "analyzer").is_none(),
-        "no module runs before its language ships"
+        default.tree.module("css", "analyzer").is_some(),
+        "css ships as a module by default"
     );
     assert!(
         in_process.replies[0].contains(".btn"),

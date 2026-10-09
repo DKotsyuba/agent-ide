@@ -7,12 +7,10 @@
 
 #[path = "support/parity.rs"]
 mod parity;
-#[path = "support/scrub.rs"]
-mod scrub;
 
 use std::time::{Duration, Instant};
 
-use parity::{Daemon, Fixture, LANGUAGE_MODE, Session};
+use parity::{Daemon, Fixture, LANGUAGE_MODE, Session, line_for};
 use serde_json::{Value, json};
 
 /// The in-process fallback of both web modules.
@@ -96,13 +94,7 @@ async fn run(env: &[(&str, &str)]) -> (Vec<String>, Vec<String>, Daemon) {
     let mut replies = Vec::new();
     for (tool, arguments) in calls() {
         let reply = session.call(&fixture, tool, arguments.clone()).await;
-        replies.push(scrub::line(
-            tool,
-            &arguments,
-            &reply,
-            &fixture.root,
-            &fixture.base,
-        ));
+        replies.push(line_for(&fixture, tool, &arguments, &reply));
     }
     let tree = daemon.tree();
     let modules = ["html", "css"]
@@ -168,13 +160,7 @@ async fn web_edits_match_in_process_results() {
         let (mut replies, mut raw) = (Vec::new(), Vec::new());
         for edit in &edits {
             let reply = session.call(&fixture, "ide.edit", edit.clone()).await;
-            replies.push(scrub::line(
-                "ide.edit",
-                edit,
-                &reply,
-                &fixture.root,
-                &fixture.base,
-            ));
+            replies.push(line_for(&fixture, "ide.edit", edit, &reply));
             raw.push(reply);
         }
         // A line edit proves its source with the reference of a fresh read.
@@ -188,13 +174,7 @@ async fn web_edits_match_in_process_results() {
         let edit = json!({"operation_id":"html-lines","path":"index.html","lines":"1-1",
             "source_ref":read["detail_ref"],"content":"<!DOCTYPE html>"});
         let reply = session.call(&fixture, "ide.edit", edit.clone()).await;
-        replies.push(scrub::line(
-            "ide.edit",
-            &edit,
-            &reply,
-            &fixture.root,
-            &fixture.base,
-        ));
+        replies.push(line_for(&fixture, "ide.edit", &edit, &reply));
         raw.push(reply);
         let files = ["index.html", "styles.css"]
             .iter()
