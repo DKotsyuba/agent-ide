@@ -20,8 +20,21 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+mod rustc;
+mod usage;
+use usage::{Sharing, Usage};
+
+/// Last-use age after which a worktree's rustc `incremental` tier is removed, keeping the rest.
+pub const INCREMENTAL_IDLE: Duration = Duration::from_secs(2 * 86_400);
+
 /// Allocated bytes the check caches may keep before least-recently-used eviction.
 pub const CHECKS_BUDGET_BYTES: u64 = 15 << 30;
+/// Allocated bytes the provider caches may keep before least-recently-used eviction.
+pub const PROVIDERS_BUDGET_BYTES: u64 = 8 << 30;
+
+/// Last-use age after which a provider cache namespace is removed.
+pub const PROVIDERS_IDLE: Duration = Duration::from_secs(14 * 86_400);
+
 /// Last-use age after which a check cache is removed.
 pub const CHECKS_IDLE: Duration = Duration::from_secs(7 * 86_400);
 /// Allocated bytes the telemetry stores may keep before least-recently-used eviction.
@@ -363,6 +376,8 @@ pub enum Kind {
     Checks,
     /// `telemetry/<digest>`: one launch directory's telemetry store.
     Telemetry,
+    /// `providers/<namespace>`: one language server's native cache namespace.
+    Providers,
     /// `standalone/releases/<X.Y.Z>`: one installed release.
     Release,
 }
@@ -373,6 +388,7 @@ impl Kind {
         match self {
             Self::Checks => "checks",
             Self::Telemetry => "telemetry",
+            Self::Providers => "providers",
             Self::Release => "release",
         }
     }
@@ -391,6 +407,10 @@ pub enum Reason {
     Superseded,
     /// Trash left by an interrupted sweep.
     Leftover,
+    /// An idle worktree's rustc `incremental` tier, removed before the worktree itself.
+    Incremental,
+    /// Finalized rustc sessions older than the newest of their crate.
+    Sessions,
 }
 
 impl Reason {
@@ -402,6 +422,8 @@ impl Reason {
             Self::Budget => "budget",
             Self::Superseded => "superseded",
             Self::Leftover => "leftover",
+            Self::Incremental => "incremental",
+            Self::Sessions => "sessions",
         }
     }
 }
@@ -448,8 +470,10 @@ struct Entry {
     worktree: Option<PathBuf>,
     /// Lease keys whose exclusive locks claim the entry.
     lease_keys: Vec<String>,
-    /// Allocated bytes below `path`.
+    /// Allocated bytes below `path` counting each shared group once, as if no other entry existed.
     bytes: u64,
+    /// What the tree shares with the rest of its family.
+    usage: Usage,
     /// Newest mtime of the tree and its lease file.
     last_used: SystemTime,
     /// The marker was read and its path is definitely missing.
@@ -463,8 +487,14 @@ struct Entry {
 pub struct Totals {
     /// Entries found.
     pub entries: usize,
-    /// Allocated bytes found.
+    /// Charged bytes found: allocation with every hard-linked inode and perfect-clone stream
+    /// counted once. This is what the budget bounds.
     pub bytes: u64,
+    /// Sum of file lengths found, every link and clone counted.
+    pub logical: u64,
+    /// Estimate of what the volume gets back at once if all entries went (APFS private bytes);
+    /// shown for reclaim only, never charged.
+    pub private: u64,
     /// Budget in bytes, `0` for releases (no budget).
     pub budget: u64,
     /// Why the family was not (fully) evaluated: unsafe root, incomplete listing (budget not
@@ -484,6 +514,8 @@ pub struct Report {
     pub checks: Totals,
     /// Telemetry store totals before the sweep.
     pub telemetry: Totals,
+    /// Provider cache namespace totals before the sweep.
+    pub providers: Totals,
     /// Installed release totals before the sweep.
     pub releases: Totals,
     /// Every entry the policy selected, in decision order.
@@ -502,6 +534,7 @@ impl Report {
         for (name, totals) in [
             ("checks", self.checks),
             ("telemetry", self.telemetry),
+            ("providers", self.providers),
             ("releases", self.releases),
         ] {
             let _ = write!(
@@ -511,6 +544,12 @@ impl Report {
                 human(totals.bytes)
             );
             if totals.budget > 0 {
+                let _ = write!(
+                    text,
+                    " charged ({} logical, {} private reclaim estimate)",
+                    human(totals.logical),
+                    human(totals.private)
+                );
                 let _ = write!(text, " (budget {})", human(totals.budget));
             }
             if let Some(note) = totals.note {
@@ -974,19 +1013,25 @@ fn subdirectories(dir: &Path, accept: impl Fn(&OsStr) -> bool) -> (Vec<PathBuf>,
     (found, complete)
 }
 
-/// Sums allocated bytes and finds the newest mtime of a tree without following symlinks;
-/// the flag is `false` when any directory or entry could not be read.
-fn measure(root: &Path) -> (u64, SystemTime, bool) {
-    let mut bytes = 0u64;
+/// Visits every entry of a tree without following symlinks, reporting the newest mtime; the flag
+/// is `false` when any directory or entry could not be read.
+fn walk(
+    root: &Path,
+    skip: &[PathBuf],
+    mut visit: impl FnMut(&Path, &fs::Metadata),
+) -> (SystemTime, bool) {
     let mut newest = SystemTime::UNIX_EPOCH;
     let mut complete = true;
     let mut stack = vec![root.to_path_buf()];
     while let Some(path) = stack.pop() {
+        if skip.contains(&path) {
+            continue;
+        }
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             complete = false;
             continue;
         };
-        bytes = bytes.saturating_add(metadata.blocks().saturating_mul(512));
+        visit(&path, &metadata);
         if let Ok(modified) = metadata.modified() {
             newest = newest.max(modified);
         }
@@ -1004,7 +1049,36 @@ fn measure(root: &Path) -> (u64, SystemTime, bool) {
             }
         }
     }
+    (newest, complete)
+}
+
+/// Sums allocated bytes and finds the newest mtime of a tree without following symlinks;
+/// the flag is `false` when any directory or entry could not be read.
+fn measure(root: &Path) -> (u64, SystemTime, bool) {
+    let mut bytes = 0u64;
+    let (newest, complete) = walk(root, &[], |_, metadata| {
+        bytes = bytes.saturating_add(metadata.blocks().saturating_mul(512));
+    });
     (bytes, newest, complete)
+}
+
+/// [`measure`] for a cache entry: what the tree shares with the rest of its family, the newest
+/// mtime, and whether every part was readable.
+fn measure_usage(root: &Path) -> (Usage, SystemTime, bool) {
+    measure_usage_excluding(root, &[])
+}
+
+/// [`measure_usage`] leaving out the subtrees at `skip`.
+fn measure_usage_excluding(root: &Path, skip: &[PathBuf]) -> (Usage, SystemTime, bool) {
+    let mut usage = Usage::default();
+    let (newest, complete) = walk(root, skip, |path, metadata| {
+        if metadata.file_type().is_file() {
+            usage.add_file(path, metadata);
+        } else {
+            usage.add_other(metadata);
+        }
+    });
+    (usage, newest, complete)
 }
 
 /// Deletes one claimed tree and returns the allocated bytes actually freed: its measured size
@@ -1077,7 +1151,7 @@ fn entry(
     locks: &Path,
     marker: Marker,
 ) -> Entry {
-    let (bytes, newest, complete) = measure(&path);
+    let (usage, newest, complete) = measure_usage(&path);
     let leased = lease_keys
         .iter()
         .filter_map(|key| fs::metadata(locks.join(format!("{key}.lock"))).ok())
@@ -1090,7 +1164,8 @@ fn entry(
         path,
         worktree: marker.path,
         lease_keys,
-        bytes,
+        bytes: usage.standalone(),
+        usage,
         last_used: newest.max(leased),
         gone: marker.gone,
         complete: complete && marker.known,
@@ -1139,80 +1214,185 @@ fn scan_telemetry(root: &Path, locks: &Path) -> (Vec<Entry>, bool) {
     (entries, complete)
 }
 
+/// Scans `providers/<namespace>` entries (64-hex keys). A namespace names its worktree in its
+/// marker and is claimed through that worktree's lease; one without a marker (the shared native
+/// namespace, or one whose marker is not yet published) could be in use by any activation, so its
+/// claim needs the machine-wide `any` lease exclusively.
+fn scan_providers(root: &Path, locks: &Path) -> (Vec<Entry>, bool) {
+    let (namespaces, complete) = subdirectories(root, |name| is_hex(name, 64));
+    let entries = namespaces
+        .into_iter()
+        .map(|namespace| {
+            let marker = read_marker(&namespace);
+            let keys = match &marker.path {
+                Some(worktree) => vec![worktree_key(worktree)],
+                None => vec![ANY_LEASE.to_owned()],
+            };
+            entry(Kind::Providers, namespace, keys, locks, marker)
+        })
+        .collect();
+    (entries, complete)
+}
+
+/// Returns `<state_root>/providers`, creating it `0700` when missing; `None` when the state root
+/// or the directory is not a private real directory of this user (the caller then keeps its
+/// namespaces runtime-local).
+pub fn providers_root(state_root: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(state_root).ok()?;
+    let root = state_root.join("providers");
+    let _ = builder.create(&root);
+    (safe_dir(state_root) && safe_dir(&root)).then_some(root)
+}
+
+/// Names the worktree a provider cache namespace belongs to, so retention can tell when the
+/// worktree is gone and claim the namespace through its lease. The marker is a fresh `0600` file
+/// renamed into place; one already naming the worktree is left alone.
+pub fn publish_namespace_marker(namespace: &Path, worktree: &Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let canonical = fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+    let marker = namespace.join(MARKER_FILE_NAME);
+    if fs::read(&marker).is_ok_and(|bytes| bytes == canonical.as_os_str().as_bytes()) {
+        return Ok(());
+    }
+    let temporary = namespace.join(format!("{MARKER_FILE_NAME}.{}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temporary)?;
+    file.write_all(canonical.as_os_str().as_bytes())?;
+    file.sync_all()?;
+    fs::rename(&temporary, &marker)
+}
+
+/// Which part of a check cache a partial claim removes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tier {
+    /// Every rustc `incremental` directory (the whole tier of an idle worktree).
+    Incremental,
+    /// Finalized rustc sessions older than the newest of their crate.
+    Sessions,
+}
+
+/// The outcome of a partial claim: what happened, what it freed (charge) and the entry's usage
+/// afterwards (`None` when nothing changed).
+struct Trimmed {
+    /// Outcome.
+    fate: Fate,
+    /// Charged bytes freed.
+    freed: u64,
+    /// The entry's measurement after the removal (dry run: with the removable parts left out).
+    usage: Option<Usage>,
+}
+
+/// Claims one entry for removal: `(Fate, charged bytes freed)`; the second argument is the charge
+/// that disappears with the entry (see [`Sharing::freed`]).
+type Claim<'a> = dyn FnMut(&Entry, u64) -> (Fate, u64) + 'a;
+
+/// Removes part of one entry, or `None` when it has nothing to remove at that tier.
+type Trim<'a> = dyn FnMut(&Entry, Tier) -> Option<Trimmed> + 'a;
+
 /// Applies the gone/idle/budget policy to one family; `claim` removes (or probes) one entry and
-/// returns its fate and the bytes it freed. Gone and idle entries are decided first, then the
-/// least recently used of the rest while the remaining total exceeds `budget` (`None` skips the
-/// budget rule). Unreadable entries are never claimed and stay counted.
+/// returns its fate and the bytes it freed. Gone and idle entries are decided first. The rest of
+/// a check cache then loses its parts before any whole entry does (`trim`, when given): older
+/// finalized rustc sessions, and the whole `incremental` tier of a worktree idle for
+/// [`INCREMENTAL_IDLE`]. Last, the least recently used of what is left go while the remaining
+/// charge exceeds `budget` (`None` skips the budget rule). The charge is recomputed from the
+/// surviving entries after every removal, so a hard link or clone still held elsewhere frees
+/// nothing. Unreadable entries are never claimed and stay counted.
 fn select(
     mut entries: Vec<Entry>,
     idle: Duration,
     budget: Option<u64>,
     now: SystemTime,
-    claim: &mut dyn FnMut(&Entry) -> (Fate, u64),
+    claim: &mut Claim<'_>,
+    mut trim: Option<&mut Trim<'_>>,
 ) -> Vec<Verdict> {
     entries.sort_by_key(|entry| entry.last_used);
-    let mut total: u64 = entries.iter().map(|entry| entry.bytes).sum();
+    let mut sharing = Sharing::new(entries.iter().map(|entry| &entry.usage));
     let mut verdicts = Vec::new();
-    let mut decide = |entry: &Entry, reason: Reason, total: &mut u64| {
-        let (fate, bytes) = if entry.complete {
-            claim(entry)
-        } else {
-            (Fate::Unreadable, entry.bytes)
+    let mut decide =
+        |entry: &Entry, reason: Reason, sharing: &mut Sharing, verdicts: &mut Vec<Verdict>| {
+            let (fate, bytes) = if entry.complete {
+                claim(entry, sharing.freed(&entry.usage))
+            } else {
+                (Fate::Unreadable, entry.bytes)
+            };
+            // A paused entry would be removed but for legacy processes; counting it keeps the
+            // report to what the budget actually selects.
+            if matches!(fate, Fate::Removed | Fate::Paused) {
+                sharing.release(&entry.usage);
+            }
+            verdicts.push(Verdict {
+                kind: entry.kind,
+                path: entry.path.clone(),
+                worktree: entry.worktree.clone(),
+                bytes,
+                reason,
+                fate,
+            });
         };
-        // A paused entry would be removed but for legacy processes; counting it keeps the
-        // report to what the budget actually selects.
-        if matches!(fate, Fate::Removed | Fate::Paused) {
-            *total = total.saturating_sub(bytes);
-        }
-        verdicts.push(Verdict {
-            kind: entry.kind,
-            path: entry.path.clone(),
-            worktree: entry.worktree.clone(),
-            bytes,
-            reason,
-            fate,
-        });
-    };
     let mut rest = Vec::new();
     for entry in entries {
         let idle_for = now.duration_since(entry.last_used).unwrap_or_default();
         if entry.gone {
-            decide(&entry, Reason::Gone, &mut total);
+            decide(&entry, Reason::Gone, &mut sharing, &mut verdicts);
         } else if idle_for > idle {
-            decide(&entry, Reason::Idle, &mut total);
+            decide(&entry, Reason::Idle, &mut sharing, &mut verdicts);
         } else {
             rest.push(entry);
         }
     }
+    if let Some(trim) = trim.as_mut() {
+        for entry in rest.iter_mut().filter(|entry| entry.complete) {
+            let idle_for = now.duration_since(entry.last_used).unwrap_or_default();
+            let (tier, reason) = if idle_for > INCREMENTAL_IDLE {
+                (Tier::Incremental, Reason::Incremental)
+            } else {
+                (Tier::Sessions, Reason::Sessions)
+            };
+            let Some(trimmed) = trim(entry, tier) else {
+                continue;
+            };
+            if let (Fate::Removed | Fate::Paused, Some(usage)) = (trimmed.fate, trimmed.usage) {
+                sharing.release(&entry.usage);
+                sharing.add(&usage);
+                entry.bytes = usage.standalone();
+                entry.usage = usage;
+            }
+            verdicts.push(Verdict {
+                kind: entry.kind,
+                path: entry.path.clone(),
+                worktree: entry.worktree.clone(),
+                bytes: trimmed.freed,
+                reason,
+                fate: trimmed.fate,
+            });
+        }
+    }
     if let Some(budget) = budget {
         for entry in rest {
-            if total <= budget {
+            if sharing.charged() <= budget {
                 break;
             }
-            decide(&entry, Reason::Budget, &mut total);
+            decide(&entry, Reason::Budget, &mut sharing, &mut verdicts);
         }
     }
     verdicts
 }
 
-/// Claims one checks/telemetry entry: exclusive non-blocking locks on its lease (and telemetry
-/// writer lock), a lease untouched since the scan began, no legacy process, then a rename into the
-/// family's trash; the locks are released before the trash is deleted. A dry run only probes the
-/// locks. Returns the fate and the bytes freed (the measured size in a dry run).
-fn claim_entry(
-    entry: &Entry,
-    locks: &Path,
-    scan_started: SystemTime,
-    apply: bool,
-    legacy_free: &dyn Fn() -> bool,
-) -> (Fate, u64) {
-    let kept = (Fate::InUse, entry.bytes);
+/// Takes the exclusive non-blocking locks that claim `entry` (its leases and, for a telemetry
+/// store, its writer lock), refusing a lease used since `scan_started`. `None` means in use.
+fn lock_entry(entry: &Entry, locks: &Path, scan_started: SystemTime) -> Option<Vec<File>> {
     let mut held = Vec::new();
     for key in &entry.lease_keys {
         let lease = locks.join(format!("{key}.lock"));
-        let Some(file) = try_exclusive(&lease) else {
-            return kept;
-        };
+        let file = try_exclusive(&lease)?;
         // Only a lease taken since the scan stamps the file and moves its mtime past it; a file
         // this or another probe just created is empty.
         let used_since_scan = file.metadata().map_or(true, |metadata| {
@@ -1222,21 +1402,38 @@ fn claim_entry(
                     .map_or(true, |modified| modified > scan_started)
         });
         if used_since_scan {
-            return kept;
+            return None;
         }
         held.push(file);
     }
     if entry.kind == Kind::Telemetry {
-        let Some(file) = try_exclusive(&entry.path.join(TELEMETRY_LOCK)) else {
-            return kept;
-        };
-        held.push(file);
+        held.push(try_exclusive(&entry.path.join(TELEMETRY_LOCK))?);
     }
+    Some(held)
+}
+
+/// Claims one checks/telemetry entry: exclusive non-blocking locks on its lease (and telemetry
+/// writer lock), a lease untouched since the scan began, no legacy process, then a rename into the
+/// family's trash; the locks are released before the trash is deleted. A dry run only probes the
+/// locks. `charge` is the charged bytes that disappear with the entry. Returns the fate and the
+/// bytes freed (`charge` in a dry run).
+fn claim_entry(
+    entry: &Entry,
+    charge: u64,
+    locks: &Path,
+    scan_started: SystemTime,
+    apply: bool,
+    legacy_free: &dyn Fn() -> bool,
+) -> (Fate, u64) {
+    let kept = (Fate::InUse, charge);
+    let Some(held) = lock_entry(entry, locks, scan_started) else {
+        return kept;
+    };
     if !apply {
-        return (Fate::Removed, entry.bytes);
+        return (Fate::Removed, charge);
     }
     if !legacy_free() {
-        return (Fate::Paused, entry.bytes);
+        return (Fate::Paused, charge);
     }
     let Some(trash) = trash_path(entry) else {
         return kept;
@@ -1245,7 +1442,7 @@ fn claim_entry(
         return kept;
     }
     drop(held);
-    let freed = delete(&trash, entry.bytes);
+    let freed = delete(&trash, charge);
     if entry.kind == Kind::Checks
         && let Some(repository) = entry.path.parent()
     {
@@ -1255,11 +1452,123 @@ fn claim_entry(
     (Fate::Removed, freed)
 }
 
+/// Removes one [`Tier`] of a check cache under the same claim as [`claim_entry`].
+///
+/// The entry's lease is held exclusively throughout, so no check of this worktree runs. The
+/// `incremental` tier is renamed into the trash and deleted after the locks are released. Older
+/// finalized sessions are removed one by one while the sibling rustc lock of each is held
+/// exclusively and non-blockingly (a busy lock keeps that session) and are never `-working`
+/// directories; the lock file goes last, still under the lock. A dry run probes the same locks
+/// and removes nothing.
+fn trim_entry(
+    entry: &Entry,
+    tier: Tier,
+    locks: &Path,
+    scan_started: SystemTime,
+    apply: bool,
+    legacy_free: &dyn Fn() -> bool,
+) -> Option<Trimmed> {
+    let incremental = rustc::incremental_dirs(&entry.path);
+    let sessions: Vec<_> = match tier {
+        Tier::Incremental => Vec::new(),
+        Tier::Sessions => incremental
+            .iter()
+            .flat_map(|dir| rustc::older_sessions(dir))
+            .collect(),
+    };
+    if incremental.is_empty() || (tier == Tier::Sessions && sessions.is_empty()) {
+        return None;
+    }
+    let untouched = |fate| {
+        Some(Trimmed {
+            fate,
+            freed: 0,
+            usage: None,
+        })
+    };
+    let Some(held) = lock_entry(entry, locks, scan_started) else {
+        return untouched(Fate::InUse);
+    };
+    if apply && !legacy_free() {
+        return untouched(Fate::Paused);
+    }
+    let mut gone: Vec<PathBuf> = Vec::new();
+    let mut trash = None;
+    match tier {
+        Tier::Incremental if !apply => gone.extend(incremental.iter().cloned()),
+        Tier::Incremental => {
+            // One unique trash directory per trim; each `incremental` directory moves in by rename.
+            let base = trash_path(entry).filter(|base| fs::create_dir(base).is_ok());
+            for (index, dir) in incremental.iter().enumerate() {
+                if let Some(base) = &base
+                    && fs::rename(dir, base.join(index.to_string())).is_ok()
+                {
+                    gone.push(dir.clone());
+                }
+            }
+            trash = base;
+        }
+        Tier::Sessions => {
+            for session in &sessions {
+                // rustc's own protocol: the session is only collected while its lock is ours.
+                let Some(lock) = lock_session(&session.lock, apply) else {
+                    continue;
+                };
+                if !apply {
+                    gone.push(session.dir.clone());
+                } else if fs::remove_dir_all(&session.dir).is_ok() {
+                    let _ = fs::remove_file(&session.lock);
+                    gone.push(session.dir.clone());
+                }
+                drop(lock);
+            }
+        }
+    }
+    drop(held);
+    if let Some(base) = trash {
+        let _ = fs::remove_dir_all(base);
+    }
+    if gone.is_empty() {
+        return untouched(Fate::InUse);
+    }
+    let (usage, _, complete) = measure_usage_excluding(&entry.path, &gone);
+    if !complete {
+        return untouched(Fate::Unreadable);
+    }
+    let freed = entry.bytes.saturating_sub(usage.standalone());
+    Some(Trimmed {
+        fate: Fate::Removed,
+        freed,
+        usage: Some(usage),
+    })
+}
+
+/// Exclusively, non-blockingly locks one rustc session lock file: `None` when another process
+/// holds it or it is not a regular file, `Some(None)` for a dry run's lock that does not exist
+/// (nothing can hold it, and a probe creates nothing), else the held file. With `create` a missing
+/// file is created, as rustc does.
+fn lock_session(path: &Path, create: bool) -> Option<Option<File>> {
+    let opened = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path);
+    let file = match opened {
+        Ok(file) => file,
+        Err(error) if !create && error.kind() == ErrorKind::NotFound => return Some(None),
+        Err(_) => return None,
+    };
+    (file.metadata().ok()?.is_file() && flock(&file, libc::LOCK_EX | libc::LOCK_NB))
+        .then_some(Some(file))
+}
+
 /// Creates the family trash directory and names a unique destination inside it.
 fn trash_path(entry: &Entry) -> Option<PathBuf> {
     let family = match entry.kind {
         Kind::Checks => entry.path.parent()?.parent()?,
-        Kind::Telemetry | Kind::Release => entry.path.parent()?,
+        Kind::Telemetry | Kind::Providers | Kind::Release => entry.path.parent()?,
     };
     let trash = family.join(TRASH_DIR);
     {
@@ -1494,6 +1803,10 @@ fn sweep_as(
             budget: TELEMETRY_BUDGET_BYTES,
             ..Totals::default()
         },
+        providers: Totals {
+            budget: PROVIDERS_BUDGET_BYTES,
+            ..Totals::default()
+        },
         ..Report::default()
     };
     if !safe_dir(state_root) {
@@ -1512,11 +1825,13 @@ fn sweep_as(
     for (kind, idle) in [
         (Kind::Checks, CHECKS_IDLE),
         (Kind::Telemetry, TELEMETRY_IDLE),
+        (Kind::Providers, PROVIDERS_IDLE),
     ] {
         let root = state_root.join(kind.as_str());
         let totals = match kind {
             Kind::Checks => &mut report.checks,
-            _ => &mut report.telemetry,
+            Kind::Telemetry => &mut report.telemetry,
+            _ => &mut report.providers,
         };
         if !safe_dir(&root) {
             if root.exists() {
@@ -1529,25 +1844,36 @@ fn sweep_as(
         }
         let (entries, complete) = match kind {
             Kind::Checks => scan_checks(&root, &locks),
-            _ => scan_telemetry(&root, &locks),
+            Kind::Telemetry => scan_telemetry(&root, &locks),
+            _ => scan_providers(&root, &locks),
         };
+        let sharing = Sharing::new(entries.iter().map(|entry| &entry.usage));
         totals.entries = entries.len();
-        totals.bytes = entries.iter().map(|entry| entry.bytes).sum();
+        totals.bytes = sharing.charged();
+        totals.logical = sharing.logical();
+        totals.private = sharing.private();
         if !complete {
             totals.note = Some("listing incomplete, budget not applied");
         } else if entries.iter().any(|entry| !entry.complete) {
             totals.note = Some("some entries unreadable and kept, total is a lower bound");
         }
         let budget = complete.then_some(totals.budget);
-        let mut claim = |entry: &Entry| {
+        let mut claim = |entry: &Entry, charge: u64| {
             if paused {
-                return (Fate::Paused, entry.bytes);
+                return (Fate::Paused, charge);
             }
-            claim_entry(entry, &locks, scan_started, apply, &legacy_free)
+            claim_entry(entry, charge, &locks, scan_started, apply, &legacy_free)
         };
+        let mut trim = |entry: &Entry, tier: Tier| {
+            if paused {
+                return None;
+            }
+            trim_entry(entry, tier, &locks, scan_started, apply, &legacy_free)
+        };
+        let trimming: Option<&mut Trim<'_>> = (kind == Kind::Checks).then_some(&mut trim);
         report
             .verdicts
-            .extend(select(entries, idle, budget, now, &mut claim));
+            .extend(select(entries, idle, budget, now, &mut claim, trimming));
     }
     let verdicts = sweep_releases(
         &state_root.join("standalone"),

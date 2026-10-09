@@ -62,6 +62,10 @@ struct ServerSlot {
 
 /// Provider state owned by the sole worker; no client holds executable or settlement capabilities.
 pub(super) struct Providers {
+    /// Directory holding every retained native cache namespace: `~/.agent-ide/providers` so a
+    /// restarted daemon (or a rebooted machine) adopts them, the runtime-local `cache` only when
+    /// the per-user state root is unusable.
+    cache_root: std::path::PathBuf,
     /// Central typed backend/view accounting; physical limits live in the worker admission controller.
     registry: ProviderLeaseRegistry,
     /// One slot per registered language server, in registration order.
@@ -121,11 +125,20 @@ struct SessionBasis {
     inputs: [u8; 32],
 }
 
+/// Chooses where a daemon whose runtime directory is `runtime` keeps its provider cache
+/// namespaces: `<state root>/providers` when that is a private directory, else `<runtime>/cache`.
+pub(super) fn cache_root(runtime: &std::path::Path) -> std::path::PathBuf {
+    crate::retention::state_root()
+        .and_then(|state| crate::retention::providers_root(&state))
+        .unwrap_or_else(|| runtime.join("cache"))
+}
+
 impl Providers {
     /// Creates fixed finite provider bookkeeping and one idle backend per server without launching
     /// processes.
-    pub(super) fn new() -> Self {
+    pub(super) fn new(cache_root: std::path::PathBuf) -> Self {
         Self {
+            cache_root,
             registry: ProviderLeaseRegistry::new(ProviderLeaseLimits {
                 total_views: 64,
                 per_backend_views: 64,
@@ -316,13 +329,9 @@ impl Worker<'_> {
         launches: &[ProviderLaunch],
         shared_go: bool,
     ) -> Result<(), FailureCode> {
-        let root = CacheRoot::prepare(self.runtime.join("cache"))
+        let root = CacheRoot::prepare(&self.providers.cache_root)
             .map_err(|_| FailureCode::ProviderUnavailable)?;
-        let worktree_state = format!(
-            "{}:{}",
-            authority.worktree().id(),
-            authority.worktree().incarnation()
-        );
+        let worktree_state = cache_state(authority.worktree());
         let mut plan = Vec::with_capacity(launches.len() * 2);
         for launch in launches {
             let server = launch.server();
@@ -330,7 +339,7 @@ impl Worker<'_> {
             let configuration = server.effective_configuration();
             let trust = server::effective_trust(launch);
             plan.push(CacheRequest {
-                key: provider_cache_key(&worktree_state, launch, settings, &trust),
+                key: provider_cache_key(&worktree_state, launch, settings, configuration, &trust),
                 identity: CacheIdentity::new(
                     launch.executable.identity.clone(),
                     settings,
@@ -345,7 +354,13 @@ impl Worker<'_> {
             });
             if shared_go && let Some(required) = server.shared_cache_directories() {
                 plan.push(CacheRequest {
-                    key: provider_cache_key(SHARED_NATIVE_CACHE_STATE, launch, settings, &trust),
+                    key: provider_cache_key(
+                        SHARED_NATIVE_CACHE_STATE,
+                        launch,
+                        settings,
+                        configuration,
+                        &trust,
+                    ),
                     identity: CacheIdentity::new(
                         launch.executable.identity.clone(),
                         settings,
@@ -974,17 +989,14 @@ impl Worker<'_> {
         launch: &ProviderLaunch,
         trust: &str,
     ) -> Result<String, FailureCode> {
-        let worktree_state = format!(
-            "{}:{}",
-            authority.worktree().id(),
-            authority.worktree().incarnation()
-        );
+        let worktree_state = cache_state(authority.worktree());
         self.retained_cache_namespace(
             binding,
             &provider_cache_key(
                 &worktree_state,
                 launch,
                 launch.server().cache_settings(),
+                launch.server().effective_configuration(),
                 trust,
             ),
         )
@@ -1004,6 +1016,7 @@ impl Worker<'_> {
                 SHARED_NATIVE_CACHE_STATE,
                 launch,
                 launch.server().cache_settings(),
+                launch.server().effective_configuration(),
                 trust,
             ),
         )
@@ -1243,6 +1256,17 @@ fn retain_cache_plan(
         // owner both for a first retention and for an accepted handoff of an existing namespace.
         caches.insert(key, cache);
     }
+    // A per-worktree namespace names its worktree so retention can tell when it is gone and claim
+    // it through the worktree's lease. Without the marker the namespace is merely protected by the
+    // machine-wide lease (retention keeps it while any lease is held), so a failure is harmless.
+    for request in plan.iter().filter(|request| !request.shared) {
+        if let Some(path) = caches
+            .get(&request.key)
+            .and_then(CacheLifecycle::namespace_path)
+        {
+            let _ = crate::retention::publish_namespace_marker(path, worktree.worktree_path());
+        }
+    }
     Ok(keys)
 }
 
@@ -1332,20 +1356,59 @@ fn roll_back_prepared(caches: &mut BTreeMap<String, CacheLifecycle>, prepared: V
 /// through it, to the same one heavy shared listener.
 pub(super) const SHARED_NATIVE_CACHE_STATE: &str = "shared-native-v1";
 
+/// Names the worktree a provider namespace belongs to in a way that survives a daemon restart.
+///
+/// The durable `WorktreeRef::id()` is bound to the Application database's nonce, which a new
+/// daemon mints afresh, so it cannot name a namespace a restart should adopt. The canonical path
+/// and the directory's inode and creation time can: the same directory yields the same state in
+/// every boot, while a deleted and recreated one (new creation time) or another path yields a new
+/// one and never reaches the old namespace. The device number is left out because it is not
+/// stable across reboots. A reference whose directory cannot be inspected keeps the boot-local
+/// identity, so its namespace is never adopted by anyone else.
+fn cache_state(worktree: &crate::workspace::authority::WorktreeRef) -> String {
+    use std::os::unix::{ffi::OsStrExt as _, fs::MetadataExt as _};
+    let path = worktree.worktree_path();
+    let created = std::fs::symlink_metadata(path).ok().and_then(|metadata| {
+        let created = metadata
+            .created()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        (metadata.is_dir() && !created.is_zero()).then_some((metadata.ino(), created))
+    });
+    let Some((inode, created)) = created else {
+        return format!("{}:{}", worktree.id(), worktree.incarnation());
+    };
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"provider-cache-state-v1");
+    hash.update(path.as_os_str().as_bytes());
+    hash.update(&inode.to_le_bytes());
+    hash.update(&created.as_secs().to_le_bytes());
+    hash.update(&created.subsec_nanos().to_le_bytes());
+    format!("tree-{}", hash.finalize().to_hex())
+}
+
 /// Derives one opaque namespace component from durable worktree and accepted provider identities.
+///
+/// Every input that makes an existing native cache unsafe to reuse is hashed: the accepted
+/// executable, settings, effective initialization configuration, toolchain and effective trust.
+/// A restarted daemon whose launch declaration changed in any of them computes a different key,
+/// finds no namespace and starts cold; the old one ages out under the retention rules.
 fn provider_cache_key(
     worktree_state: &str,
     launch: &ProviderLaunch,
     settings: &str,
+    configuration: &str,
     trust: &str,
 ) -> String {
     blake3::hash(
         format!(
-            "{}\0{}\0{}\0{}\0{}\0{}",
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}",
             worktree_state,
             launch.cache_namespace,
             launch.executable.identity,
             settings,
+            configuration,
             launch.toolchain,
             trust
         )
