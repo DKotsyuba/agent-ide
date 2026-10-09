@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Rust runs as a bundled language module (`module rust analyzer` and `module rust checker`), default-on: rust-analyzer now runs inside the analyzer module, which also computes Rust's project facts, the source outline and syntax verdict (outline, read and edit still answer from source while the server loads), insertion geometry, `cargo test` selection and libtest parsing, and the rustfmt plan; the checker module plans `cargo check` and parses its JSON. Every process a Rust module needs (`cargo check`, `rustfmt`, the `xcode-select -p` developer-directory probe) is a fixed recipe the daemon admits and runs itself, with the same confinement, Cargo cache layout and 64 MiB per-stream capture as before. Answers are the same as in process. A killed, stalled or malformed Rust module is a typed `module_unavailable (bundled.rust:…)` refusal and is restarted within the shared restart budget while the daemon keeps serving. `AGENT_IDE_LANGUAGE_MODE=rust=in_process` in the daemon's environment sends Rust back in process for this release.
+
 ## 0.10.8 — 2026-10-09
 
 ### Added

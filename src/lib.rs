@@ -72,10 +72,8 @@ pub mod languages {
     }];
 
     /// Languages whose bundled module ships default-on in this release; the others compute in
-    /// process. `AGENT_IDE_LANGUAGE_MODE=<id>=in_process` sends a shipped one back. Rust joins
-    /// once module sessions report truthful readiness (M-A); until then its module runs only
-    /// through the test seam.
-    pub const SHIPPED_MODULES: [&str; 1] = ["python"];
+    /// process. `AGENT_IDE_LANGUAGE_MODE=<id>=in_process` sends a shipped one back.
+    pub const SHIPPED_MODULES: [&str; 2] = ["python", "rust"];
 
     /// Each language's effect recipes: the only processes its module may ask the core to run.
     pub static RECIPES: [(&str, &[agent_ide_core::modules::payload::EffectRecipe]); 2] = [
