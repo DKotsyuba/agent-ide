@@ -20,11 +20,11 @@ use super::{
     contract::{Capability, ModuleUnavailable},
     mode::Mode,
     payload::{
-        AnalysisScopeRequest, AnalyzeSource, CheckSelectionAnswer, CommandEnvAnswer, DetectAnswer,
-        EffectRequest, EnvironmentsAnswer, Field, FileDocRequest, FormatPlanRequest,
-        InsertSiteAnswer, InsertSiteRequest, ProjectQuery, SelectionAnswer, SourceAnalysis,
-        SourceField, SourceRef, SourceText, SyntaxQuery, TestFacts, TestParseRequest,
-        TestPlanQuery, TestToolchainAnswer, encode,
+        AnalysisScopeRequest, AnalyzeSource, AnchorBatch, CheckSelectionAnswer, CommandEnvAnswer,
+        DetectAnswer, EffectRequest, EnvironmentsAnswer, Field, FileDocRequest, FileVerdict,
+        FormatPlanRequest, InsertSiteAnswer, InsertSiteRequest, ProjectQuery, SelectionAnswer,
+        SourceAnalysis, SourceField, SourceRef, SourceText, SyntaxQuery, TestFacts,
+        TestParseRequest, TestPlanQuery, TestToolchainAnswer, encode,
     },
     router::ModuleHost,
     wire::Attachment,
@@ -143,6 +143,58 @@ async fn analyze(
         attachments,
     )
     .await
+}
+
+/// The linkage anchors of `path` with `text`: `Ok(None)` when `language` computes in process
+/// (the caller extracts its name facts itself); in module mode one `analyze_source` anchors
+/// batch, validated against the request's source and the coverage the module declared in its
+/// `hello` (a language that computes none, or not yet, answers an empty skipped batch). A module
+/// fault or an invalid batch is the typed failure. Async: a synchronous caller blocks on it from
+/// a blocking thread, never a runtime worker.
+pub async fn anchors(
+    language: Language,
+    worktree: &Path,
+    path: &Path,
+    text: &str,
+) -> Routed<Option<AnchorBatch>> {
+    let Some(host) = module(language) else {
+        return Ok(None);
+    };
+    let analysis = analyze(
+        host,
+        language,
+        worktree,
+        path,
+        Some(text),
+        vec![SourceField::Anchors],
+    )
+    .await?;
+    let skipped = |reason: &str| AnchorBatch {
+        verdict: FileVerdict::Skipped(reason.to_owned()),
+        capped: false,
+        rejected: 0,
+        coverage: Vec::new(),
+        anchors: Vec::new(),
+    };
+    let batch = match analysis.anchors {
+        Field::Available(batch) => batch,
+        Field::Warming => return Ok(Some(skipped("warming"))),
+        Field::Unsupported | Field::NotRequested => return Ok(Some(skipped("unsupported"))),
+    };
+    let declared = host.linkage(language, worktree).await.unwrap_or_default();
+    let (source, _) = source(path, text);
+    batch
+        .validate(&source, text, &declared)
+        .map_err(|_| ModuleUnavailable {
+            module_id: super::contract::ModuleId::bundled(language.name()),
+            module_version: env!("CARGO_PKG_VERSION").to_owned(),
+            role: super::contract::Role::Analyzer,
+            stage: super::contract::Stage::Decode,
+            cause: super::contract::Cause::Malformed,
+            instance: None,
+            retry_after_ms: None,
+        })?;
+    Ok(Some(batch))
 }
 
 /// `value` when computed; an unsupported or warming field answers `default` (the language does

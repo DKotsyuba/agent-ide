@@ -158,6 +158,8 @@ struct Live<P> {
     process: P,
     /// Its captured stderr.
     stderr: Arc<Mutex<StderrTail>>,
+    /// The linkage coverage its `hello` declared.
+    linkage: Vec<crate::modules::payload::LinkageCoverage>,
 }
 
 /// Supervises one `(module, scope, role)` slot.
@@ -226,6 +228,11 @@ impl<L: Launcher> Supervisor<L> {
         self.live
             .as_mut()
             .is_some_and(|live| live.channel.idle_fault().is_none())
+    }
+
+    /// The linkage coverage the live instance declared in its `hello`.
+    pub fn linkage(&self) -> Option<&[crate::modules::payload::LinkageCoverage]> {
+        self.live.as_ref().map(|live| live.linkage.as_slice())
     }
 
     /// Stderr of the latest instance (private diagnostics).
@@ -319,11 +326,12 @@ impl<L: Launcher> Supervisor<L> {
         let opened = HostChannel::open(spawned.stdout, spawned.stdin, offer, hello_budget).await;
         let process = self.starting.take().expect("kept across the hello");
         match opened {
-            Ok((channel, _)) => {
+            Ok((channel, reply)) => {
                 self.live = Some(Live {
                     channel,
                     process,
                     stderr: self.stderr.clone(),
+                    linkage: reply.linkage_kinds,
                 });
                 Ok(())
             }

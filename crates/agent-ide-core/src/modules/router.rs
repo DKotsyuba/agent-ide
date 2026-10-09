@@ -441,6 +441,23 @@ impl ModuleHost {
         }
     }
 
+    /// The linkage coverage the live analyzer instance of `language` in `worktree` declared in
+    /// its `hello`; `None` while none is live.
+    pub async fn linkage(
+        &self,
+        language: Language,
+        worktree: &Path,
+    ) -> Option<Vec<super::payload::LinkageCoverage>> {
+        let key = (
+            language.name().to_owned(),
+            worktree.to_path_buf(),
+            Role::Analyzer,
+        );
+        let slot = self.slots.lock().await.get(&key)?.clone();
+        let supervisor = slot.supervisor.lock().await;
+        supervisor.linkage().map(<[_]>::to_vec)
+    }
+
     /// Stops every slot of `worktree` (view release, binding stop) in order.
     pub async fn stop_worktree(&self, worktree: &Path) {
         let stopping: Vec<Slot> = {

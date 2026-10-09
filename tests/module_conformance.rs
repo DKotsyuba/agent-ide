@@ -417,3 +417,50 @@ async fn waiters_are_bounded_and_a_stop_cancels_them() {
     }
     assert!(no_modules_left().await);
 }
+
+/// Linkage anchors computed by a real module: validated against the request's source and the
+/// coverage the module declared in its `hello`, the same facts the language extracts in
+/// process (namespace, key and role for each).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchors_cross_the_module_validated() {
+    let _serial = SERIAL.lock().await;
+    let scratch = Scratch::new("anchors");
+    let host = Arc::new(host_with(admission(), Vec::new(), Duration::from_secs(30)));
+    agent_ide_core::modules::calls::install(host.clone());
+    let text = ".btn { color: red }\n#main .card:hover { margin: 0 }\n";
+    let batch = agent_ide_core::modules::calls::anchors(
+        agent_ide::languages::CSS,
+        &scratch.0,
+        Path::new("a.css"),
+        text,
+    )
+    .await
+    .unwrap()
+    .expect("css computes in its module here");
+    let mut sink = agent_ide_core::lang::names::FactSink::new();
+    agent_ide::languages::CSS
+        .names()
+        .unwrap()
+        .extract(Path::new("a.css"), text, &mut sink);
+    let expected: Vec<(String, String)> = sink
+        .into_facts()
+        .into_iter()
+        .map(|fact| {
+            (
+                fact.key.namespace.id().to_owned(),
+                fact.key.name.to_string(),
+            )
+        })
+        .collect();
+    assert!(!expected.is_empty());
+    assert_eq!(
+        batch
+            .anchors
+            .iter()
+            .map(|anchor| (anchor.namespace.clone(), anchor.normalized_key.clone()))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    host.stop_all().await;
+    assert!(no_modules_left().await);
+}
