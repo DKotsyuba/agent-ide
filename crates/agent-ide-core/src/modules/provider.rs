@@ -191,6 +191,8 @@ pub struct ProviderServer<B: ProviderBuilder> {
     hosted: Option<Hosted>,
     /// The provider was started once and is gone; this instance never starts another.
     spent: bool,
+    /// Why the one start failed, answered again by every later provider request.
+    start_failure: Option<(io::ErrorKind, String)>,
     /// The provider's most recent stderr bytes (private diagnostics only).
     stderr: Arc<Mutex<Vec<u8>>>,
     /// Local source sequence.
@@ -221,6 +223,7 @@ impl<B: ProviderBuilder> ProviderServer<B> {
             settings: Value::Null,
             hosted: None,
             spent: false,
+            start_failure: None,
             stderr: Arc::default(),
             sequence: 0,
             items: HashMap::new(),
@@ -252,16 +255,31 @@ impl<B: ProviderBuilder> ProviderServer<B> {
             self.spent = true;
         }
         if self.spent {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "provider exited"));
+            return Err(match &self.start_failure {
+                Some((kind, message)) => io::Error::new(*kind, message.clone()),
+                None => io::Error::new(io::ErrorKind::BrokenPipe, "provider exited"),
+            });
         }
         if self.hosted.is_none() {
             let grant = self
                 .grant
                 .clone()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no provider granted"))?;
+            self.spent = true;
+            let started = self.start(grant).await;
+            if let Err(error) = &started {
+                self.start_failure = Some((error.kind(), error.to_string()));
+            }
+            started?;
+        }
+        Ok(&mut self.hosted.as_mut().expect("started above").live.session)
+    }
+
+    /// Plans, admits and starts the granted provider and opens its session.
+    async fn start(&mut self, grant: ProviderGrant) -> io::Result<()> {
+        {
             let (settings, plan) = self.builder.plan(&self.root, &self.settings)?;
             let command = grant.admit(&self.root, &plan)?;
-            self.spent = true;
             let mut child = crate::execution::spawn_granted_provider(&command)
                 .map_err(|error| io::Error::other(format!("{error:?}")))?;
             let (Some(stdin), Some(stdout), Some(mut stderr)) =
@@ -301,7 +319,7 @@ impl<B: ProviderBuilder> ProviderServer<B> {
             });
             // A started provider is spent once it dies: mark it now, clear above on death.
         }
-        Ok(&mut self.hosted.as_mut().expect("started above").live.session)
+        Ok(())
     }
 
     /// The exact text of `source`.
@@ -859,12 +877,21 @@ impl<B: ProviderBuilder> ModuleServer for ProviderServer<B> {
             Some(Ok(grant)) => {
                 self.grant = Some(grant);
                 self.settings = provider.get("settings").cloned().unwrap_or(Value::Null);
-                Ok(())
+                Ok(true)
             }
             Some(Err(error)) => Err(format!("invalid provider grant: {error}")),
-            None => Ok(()),
+            None => Ok(false),
         };
-        async move { outcome }
+        async move {
+            // A granted provider starts (and initializes) before `hello` is answered, as the
+            // in-process session starts within its open: a later readiness query or request
+            // never pays the start. A start failure does not refuse `hello`; it is answered
+            // typed by every provider request.
+            if outcome? {
+                let _ = self.session().await;
+            }
+            Ok(())
+        }
     }
 
     /// Provider capabilities through the hosted session, the rest through the support adapter.
