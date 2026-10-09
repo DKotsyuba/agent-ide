@@ -5817,6 +5817,67 @@ async fn wait_for_healed_daemon(project: &Path, runtime: &Path, stale_attachment
     .expect("the lease watcher must heal the shared daemon");
 }
 
+/// The window [`wait_for_healed_daemon`] closes, forced deterministically: while the candidate
+/// attachment still names a dead generation (the replacement answers but the front has not
+/// republished yet), the pre-hook submits an attachment the daemon does not know, fails open, and
+/// the call is refused `host_binding`; once the cache names the live attachment again the same
+/// session reads normally. A test that proceeds on daemon health alone therefore fails by timing
+/// (the wedge-replacement flake); synchronizing on the cache is what makes it deterministic.
+#[tokio::test]
+async fn a_pre_hook_on_a_dead_generations_attachment_fails_open_until_the_cache_is_republished() {
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let session = "stale-cache";
+    let mut next = 10;
+    claude_start_actor(
+        &mut mcp,
+        &fixture.root,
+        &mut next,
+        session,
+        None,
+        json!({"activation_id":"stale-cache"}),
+    )
+    .await;
+    claude_read_ok(&mut mcp, &fixture.root, &mut next, session, None).await;
+
+    let live = managed_claude_candidate_attachment(&fixture.root);
+    assert_eq!(live.len(), 64, "a published attachment is 64 hex digits");
+    let cache = std::fs::canonicalize("/private/tmp")
+        .unwrap()
+        .join(format!(
+            "ai-k-{}",
+            &blake3::hash(
+                std::fs::canonicalize(&fixture.root)
+                    .unwrap()
+                    .as_os_str()
+                    .as_bytes()
+            )
+            .to_hex()
+            .as_str()[..16]
+        ))
+        .join("candidate-attachment");
+    std::fs::write(&cache, "0".repeat(64)).unwrap();
+    next += 1;
+    let refused = managed_claude_call(
+        &mut mcp,
+        &fixture.root,
+        next,
+        session,
+        None,
+        "ide.read",
+        json!({"path":"src/lib.rs","lines":"1-2"}),
+    )
+    .await;
+    assert_eq!(refused["state"], "unavailable", "{refused}");
+    assert_eq!(refused["reason"], "host_binding", "{refused}");
+
+    std::fs::write(&cache, &live).unwrap();
+    claude_read_ok(&mut mcp, &fixture.root, &mut next, session, None).await;
+    mcp.close().await;
+}
+
 /// A paged Context survives native tool activity between its pages: a non-inert post (Bash) no
 /// longer discards a page whose bytes are unchanged, while a real edit between pages still
 /// refuses with the explicit changed-source recovery.
@@ -22795,6 +22856,7 @@ async fn managed_claude_wedged_shared_daemon_is_replaced_without_agent_action() 
         .trim()
         .parse::<libc::pid_t>()
         .expect("the daemon lock records its holder");
+    let stale_attachment = managed_claude_candidate_attachment(&fixture.root);
     assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
     let _paused = PausedDaemon(pid);
     next += 1;
@@ -22814,6 +22876,11 @@ async fn managed_claude_wedged_shared_daemon_is_replaced_without_agent_action() 
     assert_eq!(lost["result"]["isError"], true, "{lost}");
     let fresh = replacement_daemon_pid(&runtime, pid, Duration::from_secs(120)).await;
     assert_ne!(fresh, pid);
+    // A healthy replacement is not yet a healed session: until the front re-attached and
+    // republished the candidate attachment, the next pre-hook submits the dead generation's
+    // attachment and fails open, and the call is refused `host_binding`. The heal is complete
+    // only when the cache names the replacement, exactly as the restart test waits for it.
+    wait_for_healed_daemon(&fixture.root, &runtime, &stale_attachment).await;
     claude_read_ok(&mut mcp, &fixture.root, &mut next, session, None).await;
     mcp.close().await;
 }
