@@ -262,16 +262,21 @@ impl Session {
     }
 
     /// The hosted provider's status barrier within `budget`: ready, still loading, or a
-    /// workspace that failed to load; a module fault is a gone transport.
+    /// workspace that failed to load. Anything else retires the module typed (a fault it already
+    /// recorded, else this barrier's own `request` fault), never a silent gone on a live module.
     pub(super) async fn module_readiness(
         &mut self,
         budget: std::time::Duration,
     ) -> Result<(), super::ReadinessError> {
         use super::ReadinessError;
-        // The module waits within the budget; the margin carries its answer back.
+        // The module waits exactly `budget` (as an in-process wait does); the margin carries its
+        // answer back.
         let answer: io::Result<crate::modules::contract::Readiness> = self
             .module_call_within(
-                budget + std::time::Duration::from_millis(500),
+                budget
+                    + std::time::Duration::from_millis(
+                        crate::modules::provider::READINESS_MARGIN_MS,
+                    ),
                 Capability::Semantic,
                 encode(&SemanticQuery::Readiness {}),
                 Vec::new(),
@@ -287,6 +292,26 @@ impl Session {
                 Err(ReadinessError::WorkspaceError)
             }
             Ok(crate::modules::contract::Readiness::Unavailable) | Err(_) => {
+                if self.module_fault().is_none() {
+                    let cause = match answer {
+                        Ok(_) => crate::modules::contract::Cause::Exited,
+                        Err(_) => crate::modules::contract::Cause::Malformed,
+                    };
+                    let remote = self.module.as_mut().expect("a module session");
+                    let offer = remote.channel.offer();
+                    let typed = crate::modules::contract::ModuleUnavailable {
+                        module_id: offer.module_id.clone(),
+                        module_version: offer.package_version.clone(),
+                        role: offer.role,
+                        stage: crate::modules::contract::Stage::Request,
+                        cause,
+                        instance: Some(offer.instance),
+                        retry_after_ms: None,
+                    };
+                    remote.fault = Some(typed.to_string());
+                    remote.unavailable = Some(typed);
+                    self.state.lock().expect("session lock").invalidate();
+                }
                 Err(ReadinessError::Gone)
             }
         }
@@ -300,6 +325,9 @@ impl Session {
         payload: serde_json::Value,
         attachments: Vec<Attachment>,
     ) -> io::Result<T> {
+        // The readiness barrier reports how far the provider is: its coverage is that state,
+        // never a partial answer to hold back.
+        let barrier = payload == encode(&SemanticQuery::Readiness {});
         let remote = self
             .module
             .as_mut()
@@ -329,10 +357,12 @@ impl Session {
         self.record_module_readiness(reply.readiness);
         // A semantic answer the module marks as covering only part of the workspace (its
         // provider still loading) is never taken as a complete answer.
-        if matches!(
-            capability,
-            Capability::Semantic | Capability::Calls | Capability::Rename
-        ) && reply.coverage != crate::modules::contract::Coverage::Complete
+        if !barrier
+            && matches!(
+                capability,
+                Capability::Semantic | Capability::Calls | Capability::Rename
+            )
+            && reply.coverage != crate::modules::contract::Coverage::Complete
             && matches!(reply.outcome, Outcome::Result(_))
         {
             return Err(io::Error::new(

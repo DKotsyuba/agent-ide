@@ -1463,3 +1463,86 @@ async fn partial_module_answers_are_not_complete() {
     );
     assert!(live.session.provider_readiness().is_ready());
 }
+
+/// The readiness barrier of a warming provider (answered warming, partial) is loading on a live
+/// module, then ready; a module that refuses the barrier is retired with its typed `request`
+/// fault, never released as a silent gone.
+#[tokio::test]
+async fn a_warming_readiness_barrier_is_loading_not_gone() {
+    use crate::modules::{
+        contract::{Cause, Coverage, Declaration, ErrorCode, ModuleId, Readiness, Role, Stage},
+        fake::{FakeModule, in_memory, offer},
+        serve::{Answer, Effects, Incoming, ModuleServer, ServeError},
+    };
+    /// Answers like the fake, first warming and partial (or refusing), then ready.
+    struct Barrier(FakeModule, Option<bool>);
+    impl ModuleServer for Barrier {
+        fn declaration(&self) -> Declaration {
+            self.0.declaration()
+        }
+        async fn call<'a>(
+            &'a mut self,
+            request: Incoming,
+            effects: Effects<'a>,
+        ) -> Result<Answer, ServeError> {
+            let mut answer = self.0.call(request, effects).await?;
+            match self.1.take() {
+                Some(true) => {
+                    answer = Answer::result(crate::modules::payload::encode(&Readiness::Warming));
+                    answer.readiness = Readiness::Warming;
+                    answer.coverage = Coverage::Partial;
+                }
+                Some(false) => answer = Answer::error(ErrorCode::InvalidRequest, "no barrier"),
+                None => {}
+            }
+            Ok(answer)
+        }
+    }
+    crate::lang::testing::install();
+    let open = |warming: bool| async move {
+        let (channel, _) = in_memory(
+            Barrier(
+                FakeModule::new(ModuleId::bundled("alpha"), "1.0"),
+                Some(warming),
+            ),
+            offer(ModuleId::bundled("alpha"), "1.0", Role::Analyzer, 1),
+        )
+        .await
+        .unwrap();
+        LiveSession::open_module(
+            channel,
+            true,
+            tree(),
+            1,
+            ViewGeneration {
+                backend: 1,
+                configuration: 1,
+                toolchain: 1,
+                view: 1,
+            },
+            status_settings(),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    };
+    let mut live = open(true).await;
+    assert_eq!(
+        live.wait_ready(Duration::from_millis(100)).await,
+        Err(ReadinessError::Loading)
+    );
+    assert!(live.is_alive(), "a warming module stays live");
+    assert!(live.module_unavailable().is_none());
+    assert_eq!(live.wait_ready(Duration::from_millis(100)).await, Ok(()));
+
+    let mut live = open(false).await;
+    assert_eq!(
+        live.wait_ready(Duration::from_millis(100)).await,
+        Err(ReadinessError::Gone)
+    );
+    let fault = live.module_unavailable().expect("a typed barrier fault");
+    assert_eq!(
+        (fault.stage, fault.cause),
+        (Stage::Request, Cause::Malformed)
+    );
+    assert!(!live.is_alive());
+}

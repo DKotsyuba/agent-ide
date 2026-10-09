@@ -58,6 +58,11 @@ use crate::{
 /// Retained provider stderr bytes (the most recent ones).
 const PROVIDER_STDERR: usize = 64 * 1024;
 
+/// The part of a readiness query's budget that carries the answer back: the core asks with its
+/// own wait plus this margin, and the hosted provider's barrier waits the budget less it, so a
+/// module answers when an in-process wait would.
+pub(crate) const READINESS_MARGIN_MS: u64 = 500;
+
 /// The provider launch the core granted this instance (`hello.config.provider.grant`): the
 /// declaration's accepted executables and files with their digests. Only these may run or be
 /// loaded as the provider; the module computes the arguments and environment itself.
@@ -515,7 +520,10 @@ impl<B: ProviderBuilder> ProviderServer<B> {
                 }
                 SemanticQuery::Readiness {} => {
                     self.session().await?;
-                    let budget = Duration::from_millis(request.budget_ms.saturating_sub(200));
+                    // The core's own wait: its request budget less the answer margin it added.
+                    let budget = Duration::from_millis(
+                        request.budget_ms.saturating_sub(READINESS_MARGIN_MS),
+                    );
                     let hosted = self.hosted.as_mut().expect("started above");
                     let readiness = match hosted.live.wait_ready(budget).await {
                         Ok(()) => Readiness::Ready,
