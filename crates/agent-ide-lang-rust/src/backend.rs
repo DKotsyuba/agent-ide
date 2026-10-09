@@ -336,6 +336,8 @@ struct RustLive {
     live: LiveSession,
     /// The accepted inputs of a module-hosted session, against which its failures count.
     module_inputs: Option<String>,
+    /// A call parked waiting for this session to load.
+    waited: bool,
 }
 
 /// Exclusive Rust generations and every binding's retained analyzer session.
@@ -369,9 +371,23 @@ impl RustBackend {
             if entry.live.is_alive() {
                 return Ok(());
             }
-            // A module session that died counts against the shared restart policy.
+            // A module session that died counts against the shared restart policy. A call that
+            // was waiting for its analyzer to load is settled with the module's typed fault,
+            // never silently answered by a restarted one; a death while idle restarts on demand.
             if let Some(inputs) = &entry.module_inputs {
-                record_module_failure(worktree_path, inputs, entry.live.module_unavailable());
+                let failure = entry.live.module_unavailable();
+                record_module_failure(worktree_path, inputs, failure.clone());
+                if entry.waited {
+                    self.release(host, &binding).await;
+                    job.set_stage_failure(
+                        &FailureCode::ProviderUnavailable,
+                        &failure.map_or_else(
+                            || "rust: request failed".to_owned(),
+                            |failure| format!("rust: {failure}"),
+                        ),
+                    );
+                    return Err(FailureCode::ProviderUnavailable);
+                }
             }
             self.release(host, &binding).await;
         }
@@ -531,6 +547,7 @@ impl RustBackend {
                         view,
                         live,
                         module_inputs,
+                        waited: false,
                     },
                 );
                 Ok(())
@@ -602,6 +619,7 @@ impl RustBackend {
             };
             match readiness {
                 Ok(()) => {
+                    entry.waited = false;
                     // A whole-file query is the post-edit diagnostic read: give the analyzer a
                     // few seconds to publish diagnostics for the synchronized version before
                     // snapshotting, so an edit reply can report `current_clean`/`current_reported`
@@ -629,6 +647,7 @@ impl RustBackend {
                             .saturating_duration_since(tokio::time::Instant::now())
                             > Duration::from_secs(1)
                     {
+                        entry.waited = true;
                         job.park_until(tokio::time::Instant::now() + Duration::from_millis(300));
                     }
                     return Err(FailureCode::ProviderLoading);

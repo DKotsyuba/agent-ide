@@ -1,26 +1,28 @@
 //! Rust module parity and faults: the same MCP calls answer equally with `bundled.rust` in its
-//! module and in process (`AGENT_IDE_LANGUAGE_MODE=rust=in_process`), rust-analyzer's parent is
-//! the module, the module is a direct daemon child, and a module death is a typed unavailable
-//! outcome that neither restarts the daemon nor leaves an orphan. Needs the pinned 1.98.1
-//! toolchain and a binary built with `--features test-seams`.
+//! module and in process (`AGENT_IDE_LANGUAGE_MODE=rust=in_process`) over
+//! every Rust row of the parity inventory; rust-analyzer's parent is the module, the module is a
+//! direct daemon child; killing the module while rust-analyzer indexes and a `cargo check` that
+//! never finishes are typed outcomes that neither restart the daemon nor leave an orphan. Needs
+//! the accepted pinned 1.98.1 inputs (`AGENT_IDE_RUST_TOOLCHAIN_DIR`, `AGENT_IDE_RUST_ANALYZER`,
+//! `AGENT_IDE_RUST_TOOLCHAIN`) and a binary built with `--features test-seams`.
 #![cfg(feature = "test-seams")]
 
 #[path = "support/parity.rs"]
 mod parity;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use parity::{Daemon, Fixture, ProcessIdentity, ProcessTree, Session, line};
 use serde_json::{Value, json};
 
-/// The module-routing seam of a pre-release build.
-const SHIPPED: (&str, &str) = ("AGENT_IDE_TEST_MODULE_LANGUAGES", "rust");
 /// The fallback switch for the in-process side.
 const IN_PROCESS: (&str, &str) = (parity::LANGUAGE_MODE, "rust=in_process");
+/// Routes Rust to its module (the test seam until Rust ships default-on; harmless after).
+const MODULE: (&str, &str) = ("AGENT_IDE_TEST_MODULE_LANGUAGES", "rust");
 
-/// The accepted rustup toolchain directory.
-fn toolchain_dir() -> String {
-    std::env::var("AGENT_IDE_RUST_TOOLCHAIN_DIR")
-        .unwrap_or_else(|_| "/Users/pluto/.rustup/toolchains/1.98.1-aarch64-apple-darwin".into())
+/// One required accepted input; there is no developer default.
+fn input(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| panic!("{name} must name the accepted Rust input"))
 }
 
 /// One accepted program: path, identity and BLAKE3 of its bytes.
@@ -29,72 +31,106 @@ fn accepted(path: &str, identity: &str) -> Value {
         "blake3":blake3::hash(&std::fs::read(path).unwrap()).to_hex().to_string()})
 }
 
-/// The launcher `providers` entry for the accepted rust-analyzer.
-fn providers() -> Value {
-    let dir = toolchain_dir();
-    let analyzer = std::env::var("AGENT_IDE_RUST_ANALYZER")
-        .unwrap_or_else(|_| format!("{dir}/bin/rust-analyzer"));
-    let toolchain = std::env::var("AGENT_IDE_RUST_TOOLCHAIN").unwrap_or_else(|_| {
-        std::path::Path::new(&dir)
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned()
-    });
+/// The launcher `providers` entry for the accepted rust-analyzer in `cache_namespace`.
+fn providers(cache_namespace: &str) -> Value {
+    let dir = input("AGENT_IDE_RUST_TOOLCHAIN_DIR");
     json!([{
-        "executable":accepted(&analyzer,"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
+        "executable":accepted(&input("AGENT_IDE_RUST_ANALYZER"),"rust-analyzer 1.98.1 (48a229ce 2026-09-01)"),
         "settings":"rust_cache_priming_disabled_v1",
-        "toolchain":toolchain,
+        "toolchain":input("AGENT_IDE_RUST_TOOLCHAIN"),
         "cargo":accepted(&format!("{dir}/bin/cargo"),"cargo 1.98.1"),
         "cargo_version":"cargo 1.98.1",
         "rustc":accepted(&format!("{dir}/bin/rustc"),"rustc 1.98.1"),
         "rustc_version":"rustc 1.98.1",
         "trust":"fixture-disabled",
-        "cache_namespace":"fixture-module-rust-parity"
+        "cache_namespace":cache_namespace
     }])
 }
 
-/// A small crate with a type, methods, a caller chain, a unit test and an integration test.
-fn fixture() -> parity::Fixture {
-    parity::Fixture::new(
-        &[
-            (
-                "Cargo.toml",
-                "[package]\nname = \"paritycrate\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-            ),
-            (
-                "src/lib.rs",
-                "//! Parity crate.\n\n/// A service.\npub struct Service;\n\nimpl Service {\n    /// Works.\n    pub fn work(&self) -> bool {\n        Self::helper()\n    }\n    fn helper() -> bool {\n        true\n    }\n}\n\npub fn user() -> bool {\n    Service.work()\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn works() {\n        assert!(user());\n    }\n}\n",
-            ),
-            (
-                "tests/service.rs",
-                "#[test]\nfn integration() {\n    assert!(paritycrate::user());\n}\n",
-            ),
-        ],
-        providers(),
-    )
+/// A committed fixture with the accepted analyzer and confined Rust checks (`check_timeout_s`).
+fn rust_fixture(files: &[(&str, &str)], cache_namespace: &str, check_timeout_s: u64) -> Fixture {
+    let fixture = Fixture::new(files, providers(cache_namespace));
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    config["project_checks"] = json!({
+        "debounce_ms":100,
+        "check_timeout_s":check_timeout_s,
+        "rust":{"toolchain_dir":input("AGENT_IDE_RUST_TOOLCHAIN_DIR")}
+    });
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+    fixture
 }
 
-/// The calls both transports answer: lexical answers before the server is ready, then semantic
-/// queries, symbol edits (insert, rename), a format-on-edit, a test run and the problems view.
-fn calls() -> Vec<(&'static str, Value)> {
-    let edit = |params: Value| ("ide.edit", params);
+/// The parity crate: a type with methods, a caller chain, a unit-test module, an integration
+/// test, a failing test, a warning for the check, a file the crate never compiles (module-graph
+/// noncoverage), a file only the quadratic-syntax refusal sees, and a stylesheet.
+const PARITY_FILES: &[(&str, &str)] = &[
+    (
+        "Cargo.toml",
+        "[package]\nname = \"paritycrate\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    ),
+    (
+        "src/lib.rs",
+        "//! Parity crate.\n\n/// A service.\npub struct Service;\n\nimpl Service {\n    /// Works.\n    pub fn work(&self) -> bool {\n        Self::helper()\n    }\n    fn helper() -> bool {\n        let unused = 1;\n        true\n    }\n}\n\npub fn user() -> bool {\n    Service.work()\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn works() {\n        assert!(user());\n    }\n}\n",
+    ),
+    (
+        "tests/service.rs",
+        "#[test]\nfn integration() {\n    assert!(paritycrate::user());\n}\n",
+    ),
+    (
+        "tests/broken.rs",
+        "#[test]\nfn fails() {\n    assert!(!paritycrate::user(), \"expected failure\");\n}\n",
+    ),
+    ("src/orphan.rs", "pub fn orphan() -> u8 {\n    1\n}\n"),
+    (
+        "src/boxed.rs",
+        "pub fn boxed() -> i32 {\n    let b = box 1;\n    *b\n}\n",
+    ),
+    ("style.css", ".button {\n  color: red;\n}\n"),
+];
+
+/// Calls answered from source while rust-analyzer still loads: outline (with its marker), the
+/// quadratic-syntax refusal, a symbol read and a symbol edit.
+fn before_ready() -> Vec<(&'static str, Value)> {
     vec![
         ("ide.outline", json!({"path":"src/lib.rs"})),
-        ("ide.read", json!({"path":"src/lib.rs","lines":"1-12"})),
+        ("ide.outline", json!({"path":"src/boxed.rs"})),
         ("ide.read", json!({"symbol":"src/lib.rs#Service/work"})),
-        ("ide.symbol", json!({"symbol":"src/lib.rs#Service/work"})),
         (
-            "ide.graph",
-            json!({"symbol":"src/lib.rs#user","direction":"both","depth":2}),
+            "ide.edit",
+            json!({"operation_id":"p-early","op":"replace","symbol":"src/lib.rs#user",
+            "content":"pub fn user() -> bool {\n    Service.work()\n}"}),
         ),
-        ("ide.context", json!({"path":"src/lib.rs"})),
+    ]
+}
+
+/// Calls answered by the ready analyzer, the formatter, the test runner and the card.
+fn semantic() -> Vec<(&'static str, Value)> {
+    let edit = |params: Value| ("ide.edit", params);
+    vec![
+        ("ide.start", json!({"activation_id":"parity-start"})),
+        ("ide.outline", json!({"path":"src/lib.rs"})),
         (
             "ide.outline",
             json!({"path":"src/lib.rs","kinds":"fn,method"}),
         ),
+        ("ide.read", json!({"path":"src/lib.rs","lines":"1-12"})),
+        ("ide.symbol", json!({"symbol":"src/lib.rs#Service/work"})),
+        ("ide.symbol", json!({"symbol":"helper"})),
+        (
+            "ide.graph",
+            json!({"symbol":"src/lib.rs#user","direction":"both","depth":2}),
+        ),
+        (
+            "ide.context",
+            json!({"path":"src/lib.rs","byte_offset":120}),
+        ),
         edit(
-            json!({"operation_id":"p-insert","op":"insert","symbol":"src/lib.rs#user",
+            json!({"operation_id":"p-container","op":"insert","symbol":"src/lib.rs#tests",
+            "where":"last","content":"#[test]\nfn added_test() {\n    assert!(user());\n}"}),
+        ),
+        edit(
+            json!({"operation_id":"p-format","op":"insert","symbol":"src/lib.rs#user",
             "where":"after","content":"pub   fn added()->bool{ true }"}),
         ),
         edit(
@@ -103,119 +139,285 @@ fn calls() -> Vec<(&'static str, Value)> {
         ),
         ("ide.diff", json!({})),
         ("ide.test", json!({"symbol":"src/lib.rs#user"})),
-        ("ide.context", json!({"kind":"problems"})),
+        ("ide.test", json!({"path":"tests/service.rs"})),
+        ("ide.test", json!({"path":"tests/broken.rs"})),
+        ("ide.test", json!({"pattern":"added_test"})),
     ]
 }
 
-/// The module run's tree: the module is a direct daemon child, rust-analyzer's parent is the
-/// module, and no language server is a direct daemon child.
-fn assert_module_tree(tree: &parity::ProcessTree) {
-    let module = tree
-        .module("rust", "analyzer")
-        .unwrap_or_else(|| panic!("no rust analyzer module in {tree:?}"));
-    assert!(
-        module
-            .children
-            .iter()
-            .any(|(_, command)| command.contains("rust-analyzer")),
-        "rust-analyzer must run under the module: {module:?}"
-    );
-    assert!(
-        !tree.direct_child_runs("rust-analyzer"),
-        "no direct daemon child runs rust-analyzer: {tree:?}"
-    );
+/// Polls `ide.context` on `src/lib.rs` until rust-analyzer answers semantically (60 s).
+async fn ready(session: &mut Session, fixture: &Fixture) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let reply = session
+            .call(fixture, "ide.context", json!({"path":"src/lib.rs"}))
+            .await;
+        if reply["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("mode: semantic"))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rust-analyzer never ready: {reply}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
-/// Every Rust row answers equally in the module and in process, with the process tree of §4.2.
+/// Polls Rust's problems page until `done` holds for a landed result (`limit`).
+async fn problems(
+    session: &mut Session,
+    fixture: &Fixture,
+    limit: Duration,
+    done: impl Fn(&str) -> bool,
+) -> String {
+    let deadline = Instant::now() + limit;
+    loop {
+        let reply = session
+            .call(
+                fixture,
+                "ide.context",
+                json!({"kind":"problems","language":"rust"}),
+            )
+            .await;
+        let text = reply["text"].as_str().unwrap_or_default().to_owned();
+        if (!text.contains("rust: checking") && done(&text)) || Instant::now() >= deadline {
+            return text;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Every descendant of `pid` with its command line, depth first.
+fn descendants(pid: libc::pid_t) -> Vec<(ProcessIdentity, String)> {
+    ProcessIdentity::children_of(pid)
+        .into_iter()
+        .flat_map(|child| std::iter::once((child, child.command())).chain(descendants(child.pid)))
+        .collect()
+}
+
+/// The analyzer module that hosts rust-analyzer, with that child.
+fn analyzer(tree: &ProcessTree) -> Option<(parity::Node, ProcessIdentity)> {
+    let module = tree.module("rust", "analyzer")?;
+    let server = module
+        .children
+        .iter()
+        .find(|(_, command)| command.contains("rust-analyzer"))?;
+    Some((module.clone(), server.0))
+}
+
+/// The transcript of one daemon run with `env`: source-first answers, the semantic and editing
+/// rows, the landed project check, then an edit of a file the crate never compiles.
+async fn run(fixture: &Fixture, env: &[(&str, &str)]) -> (Vec<String>, ProcessTree, Daemon) {
+    let mut daemon = Daemon::start(fixture, env).await;
+    let mut session = Session::start(fixture).await;
+    let mut replies = Vec::new();
+    for (tool, arguments) in before_ready() {
+        let reply = session.call(fixture, tool, arguments.clone()).await;
+        replies.push(line(tool, &arguments, &reply));
+    }
+    ready(&mut session, fixture).await;
+    for (tool, arguments) in semantic() {
+        let reply = session.call(fixture, tool, arguments.clone()).await;
+        replies.push(line(tool, &arguments, &reply));
+    }
+    replies.push(
+        problems(&mut session, fixture, Duration::from_secs(120), |text| {
+            text.starts_with("rust: ready")
+        })
+        .await,
+    );
+    let orphan = json!({"operation_id":"p-orphan","op":"replace","path":"src/orphan.rs",
+        "lines":"2-2","content":"    2"});
+    let reply = session.call(fixture, "ide.edit", orphan.clone()).await;
+    replies.push(line("ide.edit", &orphan, &reply));
+    let tree = daemon.tree();
+    session.close(fixture).await;
+    (replies, tree, daemon)
+}
+
+/// Every Rust row answers equally in the module and in process, with the process tree of §4.2:
+/// in module mode rust-analyzer runs under the `module rust analyzer` child and no language
+/// server is a direct daemon child; in process rust-analyzer is a direct child and no Rust
+/// module runs. Nothing either daemon started survives it.
 #[tokio::test]
+#[ignore = "requires the accepted AGENT_IDE_RUST_TOOLCHAIN_DIR, AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN inputs"]
 async fn rust_module_and_in_process_transcripts_are_equal() {
-    let fixture = fixture();
-    let calls = calls();
-    let local = parity::transcript(&fixture, &[IN_PROCESS], &calls).await;
-    assert!(local.tree.module("rust", "analyzer").is_none());
+    let fixture = rust_fixture(PARITY_FILES, "module-rust-parity", 300);
+    let (local, tree, daemon) = run(&fixture, &[IN_PROCESS]).await;
     assert!(
-        local.tree.direct_child_runs("rust-analyzer")
-            || local
-                .tree
-                .children
-                .iter()
-                .all(|node| !node.command.contains("module rust")),
-        "the in-process run has no rust module: {:?}",
-        local.tree
+        tree.module("rust", "analyzer").is_none() && tree.direct_child_runs("rust-analyzer"),
+        "in process: rust-analyzer is a direct daemon child: {tree:?}"
     );
-    assert!(
-        local.replies[0].contains("Service"),
-        "outline answers: {}",
-        local.replies[0]
-    );
-    drop(local.daemon);
+    let mut owned = tree.all();
+    drop(daemon);
     fixture.git(&["checkout", "--quiet", "--", "."]);
     fixture.git(&["clean", "--quiet", "-fd"]);
-    let remote = parity::transcript(&fixture, &[SHIPPED], &calls).await;
-    assert_module_tree(&remote.tree);
-    parity::assert_parity(&local.replies, &remote.replies);
-    let owned = remote.tree.all();
-    drop(remote.daemon);
+    let (moduled, tree, daemon) = run(&fixture, &[MODULE]).await;
+    let (module, _) = analyzer(&tree).expect("the analyzer module hosts rust-analyzer");
+    assert!(
+        !tree.direct_child_runs("rust-analyzer"),
+        "no language server is a direct daemon child: {tree:?}"
+    );
+    assert!(module.command.ends_with("module rust analyzer"));
+    // The rows the transcript must exercise, in both modes.
+    for replies in [&local, &moduled] {
+        let all = replies.join("\n");
+        assert!(
+            replies[0].contains("outline: from source"),
+            "{}",
+            replies[0]
+        );
+        assert!(replies[2].contains("work"), "{}", replies[2]);
+        assert!(all.contains("mode: semantic"), "semantic context");
+        assert!(all.contains("operate"), "the rename applied");
+        assert!(
+            all.contains("pub fn added() -> bool"),
+            "rustfmt formatted the insert"
+        );
+        assert!(all.contains("expected failure"), "libtest failure parsed");
+        assert!(all.contains("rust: ready"), "the check landed");
+        assert!(all.contains("unused"), "the check reported the warning");
+        assert!(all.contains("not_analysed"), "module-graph noncoverage");
+    }
+    parity::assert_parity(&local, &moduled);
+    owned.extend(tree.all());
+    drop(daemon);
     for id in owned {
-        assert!(id.gone().await, "{id:?} survived the daemon");
+        assert!(id.gone().await, "{id:?} survived its daemon");
     }
 }
 
-/// Killing the module while rust-analyzer indexes is a typed unavailable outcome: the daemon is
-/// the same process, rust-analyzer is gone with the module, and the next call is answered.
+/// A `cargo check` whose report exceeds 2 MiB (thousands of warnings, raw attachment bytes
+/// through the checker module) lands with the same counts as in process.
 #[tokio::test]
-async fn killing_the_module_while_rust_analyzer_indexes_is_typed_and_leaves_no_orphan() {
-    let fixture = fixture();
-    let mut daemon = parity::Daemon::start(&fixture, &[SHIPPED]).await;
-    let daemon_pid = daemon.pid();
-    let mut session = parity::Session::start(&fixture).await;
-    // Starts the session; the symbol request waits on indexing, so the module is busy.
-    let warm = session
-        .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+#[ignore = "requires the accepted AGENT_IDE_RUST_TOOLCHAIN_DIR, AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN inputs"]
+async fn a_check_report_over_two_mib_lands_equally() {
+    let many: String = (0..4000)
+        .map(|index| format!("fn unused_{index}() {{}}\n"))
+        .collect();
+    let fixture = rust_fixture(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"loud\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            ("src/lib.rs", &many),
+        ],
+        "module-rust-loud",
+        300,
+    );
+    let mut pages = Vec::new();
+    for env in [IN_PROCESS, MODULE] {
+        let daemon = Daemon::start(&fixture, &[env]).await;
+        let mut session = Session::start(&fixture).await;
+        let page = problems(&mut session, &fixture, Duration::from_secs(180), |text| {
+            text.starts_with("rust: ready")
+        })
         .await;
-    assert_eq!(warm["kind"], "outline", "{warm}");
-    let tree = daemon.tree();
-    let module = tree
-        .module("rust", "analyzer")
-        .expect("a rust module")
-        .clone();
-    let owned = tree.all();
-    // SAFETY: the module is this test's own daemon child, identified a moment ago.
-    unsafe { libc::kill(module.id.pid, libc::SIGKILL) };
-    assert!(module.id.gone().await, "the killed module is gone");
-    for (id, command) in &module.children {
-        assert!(id.gone().await, "{command} outlived its module");
+        assert!(
+            page.starts_with("rust: ready; errors: 0; warnings: 4000"),
+            "{page}"
+        );
+        pages.push(page);
+        session.close(&fixture).await;
+        drop(daemon);
     }
-    let after = session
-        .call(
-            &fixture,
-            "ide.symbol",
-            json!({"symbol":"src/lib.rs#Service/work"}),
-        )
-        .await;
-    let text = after["text"].as_str().unwrap_or_default();
+    parity::assert_parity(&pages[..1], &pages[1..]);
+}
+
+/// Killing the Rust module while rust-analyzer indexes settles the waiting semantic call with a
+/// typed `module_unavailable (bundled.rust:…)` refusal; the daemon is the same process and still
+/// healthy, an unrelated language answers on it, rust-analyzer dies with its module, the next
+/// Rust call starts a fresh module, and nothing survives the daemon.
+#[tokio::test]
+#[ignore = "requires the accepted AGENT_IDE_RUST_TOOLCHAIN_DIR, AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN inputs"]
+async fn killing_the_module_while_rust_analyzer_indexes_is_typed_and_leaves_no_orphan() {
+    let fixture = rust_fixture(PARITY_FILES, "module-rust-kill", 300);
+    let mut daemon = Daemon::start(&fixture, &[MODULE]).await;
+    let daemon_pid = daemon.pid();
+    let mut session = Session::start(&fixture).await;
+    let call = json!({"symbol":"src/lib.rs#Service/work"});
+    // The semantic call starts the module and rust-analyzer; it cannot answer before the
+    // analyzer has loaded the workspace.
+    let (fixture, outcome) = {
+        let pending = tokio::spawn(async move {
+            let reply = session.call(&fixture, "ide.symbol", call).await;
+            (session, fixture, reply)
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (module, server) = loop {
+            if let Some(found) = analyzer(&daemon.tree()) {
+                break found;
+            }
+            assert!(Instant::now() < deadline, "rust-analyzer never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        // Indexing: rust-analyzer runs, loading the workspace, and the call is still waiting.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(server.exists(), "rust-analyzer is loading");
+        assert!(
+            !pending.is_finished(),
+            "the semantic call waits for indexing"
+        );
+        let loading: Vec<ProcessIdentity> = descendants(module.id.pid)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        // SAFETY: `module` is the exact identity captured as this test's daemon child just now.
+        unsafe { libc::kill(module.id.pid, libc::SIGKILL) };
+        let (returned, fixture, reply) = pending.await.unwrap();
+        session = returned;
+        assert!(module.id.gone().await, "the killed module is reaped");
+        for id in loading {
+            assert!(id.gone().await, "{id:?} outlived its module");
+        }
+        (fixture, reply)
+    };
+    let text = outcome["text"].as_str().unwrap_or_default();
+    assert_eq!(outcome["code"], "provider_unavailable", "{outcome}");
     assert!(
-        after["kind"] == "symbol" || text.contains("unavailable"),
-        "a typed outcome, never a hang or a daemon death: {after}"
+        text.contains("module_unavailable (bundled.rust:"),
+        "the original call names the module fault: {outcome}"
     );
     assert_eq!(daemon.pid(), daemon_pid, "the daemon is the same process");
     assert!(
         std::os::unix::net::UnixStream::connect(fixture.runtime.join("agent-ide.sock")).is_ok(),
         "the daemon still serves"
     );
+    let unrelated = session
+        .call(&fixture, "ide.outline", json!({"path":"style.css"}))
+        .await;
+    assert_eq!(unrelated["kind"], "outline", "{unrelated}");
+    assert!(
+        unrelated["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(".button")
+    );
+    // The next Rust demand starts a fresh module and answers.
+    let restarted = session
+        .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+        .await;
+    assert_eq!(restarted["kind"], "outline", "{restarted}");
+    let tree = daemon.tree();
+    let owned = tree.all();
     session.close(&fixture).await;
-    let later = daemon.tree().all();
     drop(daemon);
-    for id in owned.into_iter().chain(later) {
+    for id in owned {
         assert!(id.gone().await, "{id:?} survived the daemon");
     }
 }
 
-/// A `cargo check` that never finishes ends as a typed non-pass result, never hangs the daemon,
-/// and its cargo, rustc and build script processes die with the daemon.
+/// A `cargo check` whose build script never finishes, with project checks enabled and a 10 s
+/// ceiling: cargo and the build script demonstrably run, the check ends as `check timed out`
+/// (never clean, never a hang), every check process is reaped, and the daemon is the same.
 #[tokio::test]
-async fn a_stalled_cargo_check_is_bounded_and_leaves_no_orphan() {
-    let fixture = parity::Fixture::new(
+#[ignore = "requires the accepted AGENT_IDE_RUST_TOOLCHAIN_DIR, AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN inputs"]
+async fn a_stalled_cargo_check_times_out_and_leaves_no_orphan() {
+    let fixture = rust_fixture(
         &[
             (
                 "Cargo.toml",
@@ -227,24 +429,68 @@ async fn a_stalled_cargo_check_is_bounded_and_leaves_no_orphan() {
             ),
             ("src/lib.rs", "pub fn one() -> u8 { 1 }\n"),
         ],
-        providers(),
+        "module-rust-stall",
+        10,
     );
-    let mut daemon = parity::Daemon::start(&fixture, &[SHIPPED]).await;
+    let mut daemon = Daemon::start(&fixture, &[MODULE]).await;
     let daemon_pid = daemon.pid();
-    let mut session = parity::Session::start(&fixture).await;
-    let reply = session
-        .call(&fixture, "ide.context", json!({"kind":"problems"}))
+    let mut session = Session::start(&fixture).await;
+    let checking = session
+        .call(
+            &fixture,
+            "ide.context",
+            json!({"kind":"problems","language":"rust"}),
+        )
         .await;
     assert!(
-        reply.get("text").is_some(),
-        "the problems view answers: {reply}"
+        checking["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("rust: checking")),
+        "the check runs: {checking}"
     );
-    let tree = daemon.tree();
-    let owned = tree.all();
-    assert_eq!(daemon.pid(), daemon_pid);
+    // cargo and the stalled build script run as the daemon's confined check.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let running = loop {
+        let all = descendants(daemon_pid);
+        if all
+            .iter()
+            .any(|(_, command)| command.contains("build-script-build"))
+        {
+            break all;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the build script never ran: {all:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        running
+            .iter()
+            .any(|(_, command)| command.contains("/bin/cargo check")),
+        "cargo runs: {running:?}"
+    );
+    let check: Vec<ProcessIdentity> = running
+        .iter()
+        .filter(|(_, command)| {
+            command.contains("cargo")
+                || command.contains("build-script")
+                || command.contains("rustc")
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    let page = problems(&mut session, &fixture, Duration::from_secs(60), |text| {
+        text.starts_with("rust: check timed out")
+    })
+    .await;
+    assert!(page.starts_with("rust: check timed out"), "{page}");
+    for id in check {
+        assert!(id.gone().await, "{id:?} outlived its timed-out check");
+    }
+    assert_eq!(daemon.pid(), daemon_pid, "the daemon is the same process");
+    let owned = daemon.tree().all();
     session.close(&fixture).await;
     drop(daemon);
-    tokio::time::sleep(Duration::from_millis(100)).await;
     for id in owned {
         assert!(id.gone().await, "{id:?} survived the daemon");
     }
