@@ -2903,6 +2903,31 @@ fn provider_capability_required() -> ProcessError {
     ))
 }
 
+/// Launches a provider a bundled module was granted, as a child of the module inside the module's
+/// own process group (which the daemon's Execution owns, admits and tears down): the measured
+/// executable identity of `command` is rechecked at launch, the environment is exactly the
+/// command's, stdin/stdout/stderr are piped, and the child is killed when its handle drops.
+pub fn spawn_granted_provider(command: &ControlledCommand) -> Result<Child, ProcessError> {
+    if command.kind != CommandKind::Provider {
+        return Err(ProcessError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "only a granted provider launches here",
+        )));
+    }
+    if executable_identity(&command.program).map_err(ProcessError::Request)?
+        != command.program_identity
+    {
+        return Err(ProcessError::Request(RequestError::ExecutableUnavailable));
+    }
+    let mut process = build_command(command);
+    process
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    Ok(process.spawn()?)
+}
+
 /// Serializes provider revocation through physical spawn and records that exact direct child once.
 fn launch_child(
     command: &ControlledCommand,

@@ -61,14 +61,15 @@ pub fn analyzer_command(
         .then_some(command)
 }
 
-/// The offer an analyzer module receives: the declaration's accepted files as its provider grant
-/// and the language's settings value.
+/// The offer an analyzer module receives: the declaration's accepted files and admitted `roots`
+/// as its provider grant ([`ProviderGrant`]) and the language's settings value.
 pub fn analyzer_offer(
     executable: &ModuleExecutable,
     language: &str,
     instance: u64,
     worktree: &WorktreeRef,
     accepted: Vec<(PathBuf, String)>,
+    roots: Vec<PathBuf>,
     request_timeout: Duration,
     settings: Value,
 ) -> HelloOffer {
@@ -88,6 +89,7 @@ pub fn analyzer_offer(
                 "grant": ProviderGrant {
                     accepted,
                     request_timeout_ms: request_timeout.as_millis() as u64,
+                    roots,
                 },
                 "settings": settings,
             })),
