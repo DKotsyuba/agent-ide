@@ -197,13 +197,16 @@ impl Channel {
         if reply["id"].as_u64() != Some(id) {
             return Err(self.poison("pilot module answered out of order".to_owned()));
         }
-        if let Some(error) = reply.get("error") {
-            return Err(io::Error::other(format!(
+        // A reply carries exactly one of `result` (possibly null) and `error`; anything else,
+        // such as an echoed request, is malformed and must never acknowledge the call.
+        match (reply.get("error"), reply.get("result")) {
+            (Some(error), None) => Err(io::Error::other(format!(
                 "pilot module: {}",
                 error.as_str().unwrap_or("error")
-            )));
+            ))),
+            (None, Some(_)) => Ok(reply["result"].take()),
+            _ => Err(self.poison("pilot module sent a bad frame (malformed reply)".to_owned())),
         }
-        Ok(reply["result"].take())
     }
 
     /// Records the first fault and returns it as an error.
@@ -750,11 +753,14 @@ mod tests {
                 "pilot module sent a bad frame (oversized frame)",
             ),
             ("wrong-id", "pilot module answered out of order"),
+            ("echo", "pilot module sent a bad frame (malformed reply)"),
         ] {
             let mut channel = scripted(move |mut input, mut output| {
                 Box::pin(async move {
                     let request = read_frame(&mut input).await.unwrap();
-                    if kind == "wrong-id" {
+                    if kind == "echo" {
+                        write_frame(&mut output, &request).await.unwrap();
+                    } else if kind == "wrong-id" {
                         let id = request["id"].as_u64().unwrap() + 1;
                         write_frame(&mut output, &json!({"id": id, "result": 1}))
                             .await
@@ -799,20 +805,27 @@ mod tests {
         assert_eq!(error.to_string(), "pilot module call abandoned mid-flight");
     }
 
-    /// Measurement, not a contract: round trips of one framed call through real OS pipes to
-    /// `/bin/cat` (which echoes the request frame, a valid reply with the same id) for several
-    /// payload sizes; prints one JSON line per size with raw-sample percentiles in microseconds.
-    #[tokio::test]
-    #[ignore = "measurement of the pilot channel over OS pipes"]
-    async fn channel_round_trip_over_pipes() {
+    /// Measurement, not a contract: round trips of one framed call over a kernel socketpair to
+    /// an echo peer on another runtime thread that decodes each request frame and answers its
+    /// params as the result, for several payload sizes. It covers framing, JSON encode/decode on
+    /// both sides and kernel IPC, but no process boundary and no module dispatch. Prints one JSON
+    /// line per size; with `AGENT_IDE_PILOT_CHANNEL_OUT` set also writes every raw sample there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "measurement of the pilot channel over a socketpair"]
+    async fn channel_round_trip_over_socketpair() {
+        let mut raw = serde_json::Map::new();
         for size in [64usize, 4 * 1024, 64 * 1024, 1024 * 1024] {
-            let mut child = tokio::process::Command::new("/bin/cat")
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap();
-            let (input, output) = (child.stdout.take().unwrap(), child.stdin.take().unwrap());
+            let (core, peer) = tokio::net::UnixStream::pair().unwrap();
+            tokio::spawn(async move {
+                let (mut input, mut output) = peer.into_split();
+                while let Ok(mut request) = read_frame(&mut input).await {
+                    let reply = json!({"id": request["id"], "result": request["params"].take()});
+                    if write_frame(&mut output, &reply).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            let (input, output) = core.into_split();
             let mut channel = Channel::spawn(input, output).0;
             let payload = json!({"text": "x".repeat(size)});
             let budget = Duration::from_secs(5);
@@ -825,13 +838,18 @@ mod tests {
                 channel.call("echo", payload.clone(), budget).await.unwrap();
                 micros.push(started.elapsed().as_secs_f64() * 1e6);
             }
-            micros.sort_by(f64::total_cmp);
-            let at = |q: f64| micros[((micros.len() - 1) as f64 * q).round() as usize];
+            raw.insert(size.to_string(), json!(micros));
+            let mut sorted = micros.clone();
+            sorted.sort_by(f64::total_cmp);
+            let at = |q: f64| sorted[((sorted.len() - 1) as f64 * q).round() as usize];
             println!(
                 "{}",
-                json!({"payload_bytes": size, "n": micros.len(), "warmup": 100,
+                json!({"payload_bytes": size, "n": sorted.len(), "warmup": 100,
                        "p50_us": at(0.5), "p95_us": at(0.95), "max_us": at(1.0)})
             );
+        }
+        if let Ok(out) = std::env::var("AGENT_IDE_PILOT_CHANNEL_OUT") {
+            std::fs::write(out, serde_json::to_vec(&raw).unwrap()).unwrap();
         }
     }
 }
