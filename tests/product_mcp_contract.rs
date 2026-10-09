@@ -23847,11 +23847,15 @@ async fn pilot_timed(
 /// module it records raw samples of cold session start (stop/start then the first outline),
 /// warm per-call latency of `ide.outline` (documentSymbols) and `ide.symbol` (hover plus
 /// references), and the resident memory of the daemon and its provider process tree, and
-/// writes them as JSON to `AGENT_IDE_PILOT_MEASURE_OUT`. Run it on a release build.
+/// writes them as JSON to `AGENT_IDE_PILOT_MEASURE_OUT`. Run it on a release build. Without
+/// that variable it measures nothing and passes, so configured runs of every ignored test skip it.
 #[tokio::test]
 #[ignore = "measurement; requires AGENT_IDE_PYRIGHT, AGENT_IDE_NODE, AGENT_IDE_PYTHON and AGENT_IDE_PILOT_MEASURE_OUT"]
 async fn pilot_python_measure() {
-    let out = PathBuf::from(std::env::var("AGENT_IDE_PILOT_MEASURE_OUT").unwrap());
+    let Some(out) = std::env::var_os("AGENT_IDE_PILOT_MEASURE_OUT").map(PathBuf::from) else {
+        eprintln!("pilot_python_measure skipped: AGENT_IDE_PILOT_MEASURE_OUT is not set");
+        return;
+    };
     let fixture = pilot_fixture("pilot-measure-cache");
     let mut reaper = PilotReaper::default();
     let (cold_runs, warmup, calls) = (15, 20, 200);
