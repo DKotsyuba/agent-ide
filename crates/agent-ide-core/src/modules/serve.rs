@@ -73,12 +73,31 @@ impl Answer {
         }
     }
 
+    /// A dependency failure at `stage` with `cause` (a provider that exited or timed out).
+    pub fn unavailable(
+        stage: super::contract::Stage,
+        cause: super::contract::Cause,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            outcome: Outcome::Error(ModuleError {
+                code: ErrorCode::Unavailable,
+                message: message.into(),
+                unavailable: Some(super::contract::Unavailable { stage, cause }),
+            }),
+            readiness: Readiness::Unavailable,
+            coverage: Coverage::Unknown,
+            attachments: Vec::new(),
+        }
+    }
+
     /// A typed refusal.
     pub fn error(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             outcome: Outcome::Error(ModuleError {
                 code,
                 message: message.into(),
+                unavailable: None,
             }),
             readiness: if code == ErrorCode::Warming {
                 Readiness::Warming

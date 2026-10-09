@@ -512,6 +512,27 @@ pub struct ModuleError {
     pub code: ErrorCode,
     /// Sanitized detail for the core; never forwarded raw to an agent.
     pub message: String,
+    /// For [`ErrorCode::Unavailable`] only: where the module's dependency failed and why. The
+    /// core checks it and fills the module identity into its [`ModuleUnavailable`].
+    pub unavailable: Option<Unavailable>,
+}
+
+/// The typed stage and cause of an [`ErrorCode::Unavailable`] refusal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Unavailable {
+    /// Where it failed (`provider` for the module's language server).
+    pub stage: Stage,
+    /// Why.
+    pub cause: Cause,
+}
+
+impl ModuleError {
+    /// Whether the error is well formed: [`ErrorCode::Unavailable`] carries its stage and cause,
+    /// every other code carries none.
+    pub fn well_formed(&self) -> bool {
+        (self.code == ErrorCode::Unavailable) == self.unavailable.is_some()
+    }
 }
 
 /// Closed refusal kinds of [`ModuleError`].
@@ -530,6 +551,9 @@ pub enum ErrorCode {
     ToolMissing,
     /// The language computation failed for this input.
     Failed,
+    /// A dependency of the module (its provider) is unavailable; the error carries the typed
+    /// stage and cause, never text to parse.
+    Unavailable,
 }
 
 /// Exactly one of a result or a typed error.
@@ -802,6 +826,7 @@ mod tests {
                 outcome: Outcome::Error(ModuleError {
                     code: ErrorCode::Warming,
                     message: "indexing".into(),
+                    unavailable: None,
                 }),
                 body_attachment: Some(2),
                 readiness: Readiness::Warming,

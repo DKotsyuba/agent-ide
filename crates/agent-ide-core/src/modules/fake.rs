@@ -45,6 +45,10 @@ pub enum Fault {
     Stall,
     /// End the instance mid-request (the host sees the stream end).
     Exit,
+    /// Answer that the module's provider exited.
+    ProviderExit,
+    /// Answer that the module's provider timed out.
+    ProviderTimeout,
 }
 
 /// A module that answers every capability with a canned typed result after decoding its payload,
@@ -407,6 +411,16 @@ impl ModuleServer for FakeModule {
             return match fault {
                 Fault::Stall => std::future::pending().await,
                 Fault::Exit => Err(ServeError::Protocol("fake exit".into())),
+                Fault::ProviderExit => Ok(Answer::unavailable(
+                    super::contract::Stage::Provider,
+                    super::contract::Cause::Exited,
+                    "provider exited",
+                )),
+                Fault::ProviderTimeout => Ok(Answer::unavailable(
+                    super::contract::Stage::Provider,
+                    super::contract::Cause::Timeout,
+                    "provider timed out",
+                )),
             };
         }
         Ok(match self.answer(&request, &mut effects).await {
@@ -1084,6 +1098,62 @@ mod tests {
             assert_eq!(error.cause, cause, "{case}");
             assert!(channel.fault().is_some(), "{case}");
         }
+    }
+
+    /// A provider exit and a provider timeout inside a live module arrive as distinct typed
+    /// `unavailable` errors (stage `provider`, cause `exited` or `timeout`), never as text; the
+    /// instance stays usable. An `unavailable` error without its stage and cause is malformed.
+    #[tokio::test]
+    async fn provider_failures_are_typed_not_text() {
+        use super::super::contract::{Cause, ErrorCode, Stage, Unavailable};
+        let id = alpha();
+        for (fault, cause) in [
+            (Fault::ProviderExit, Cause::Exited),
+            (Fault::ProviderTimeout, Cause::Timeout),
+        ] {
+            let (mut channel, _) = in_memory(
+                FakeModule::new(id.clone(), "1.0").with_fault(Capability::Semantic, fault),
+                offer(id.clone(), "1.0", Role::Analyzer, 1),
+            )
+            .await
+            .unwrap();
+            let reply = channel
+                .call(
+                    sample_call(Capability::Semantic),
+                    Duration::from_secs(5),
+                    &mut NoEffects,
+                )
+                .await
+                .unwrap();
+            let Outcome::Error(error) = reply.outcome else {
+                panic!("typed error expected");
+            };
+            assert_eq!(error.code, ErrorCode::Unavailable);
+            assert_eq!(
+                error.unavailable,
+                Some(Unavailable {
+                    stage: Stage::Provider,
+                    cause
+                })
+            );
+            assert!(
+                channel
+                    .call(
+                        sample_call(Capability::Semantic),
+                        Duration::from_secs(5),
+                        &mut NoEffects
+                    )
+                    .await
+                    .is_ok(),
+                "the instance stays usable"
+            );
+        }
+        let untyped = super::super::contract::ModuleError {
+            code: ErrorCode::Unavailable,
+            message: "provider exited".into(),
+            unavailable: None,
+        };
+        assert!(!untyped.well_formed());
     }
 
     /// A late reply after an abandoned call can never settle the next request: the abandoned

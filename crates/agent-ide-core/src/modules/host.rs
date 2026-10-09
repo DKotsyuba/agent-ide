@@ -320,6 +320,9 @@ impl HostChannel {
                     if response.fence != *fence {
                         return Err((Stage::Request, Cause::WrongFence));
                     }
+                    if matches!(&response.outcome, Outcome::Error(error) if !error.well_formed()) {
+                        return Err((Stage::Decode, Cause::Malformed));
+                    }
                     let mut attachments = self
                         .attachments(fence.request_id, &response.attachments)
                         .await
