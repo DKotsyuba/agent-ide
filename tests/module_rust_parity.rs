@@ -160,6 +160,7 @@ fn record(fixture: &Fixture, tool: &str, arguments: &Value, reply: &Value) -> St
         if let Some(object) = body.as_object_mut() {
             object.remove("status");
         }
+        mask_refs(&mut body);
         entry.push_str(
             &body
                 .to_string()
@@ -167,6 +168,24 @@ fn record(fixture: &Fixture, tool: &str, arguments: &Value, reply: &Value) -> St
         );
     }
     entry
+}
+
+/// Masks the per-daemon opaque references (`source_ref`, `detail_ref` string values) anywhere in
+/// a structured reply; a null or missing reference keeps its shape, every other value stays.
+fn mask_refs(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, field) in object.iter_mut() {
+                if matches!(key.as_str(), "source_ref" | "detail_ref") && field.is_string() {
+                    *field = Value::String("<ref>".to_owned());
+                } else {
+                    mask_refs(field);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(mask_refs),
+        _ => {}
+    }
 }
 
 /// The `ide.test` selections: by referencing symbol, an integration binary, a failing test and a
@@ -1123,4 +1142,18 @@ async fn the_module_process_starts_rust_analyzer_within_hello() {
         );
         assert!(Instant::now() < deadline, "never ready");
     }
+}
+
+/// Opaque references are masked wherever a structured reply carries them; nulls and other
+/// values (hashes in business fields included) stay.
+#[test]
+fn references_are_masked_and_nothing_else() {
+    let mut reply = json!({"result":{"source_ref":"a".repeat(64) + "-2","outcome":"replaced",
+        "digest":"b".repeat(64)},"detail_ref":null,"items":[{"detail_ref":"c-1"}]});
+    mask_refs(&mut reply);
+    assert_eq!(
+        reply,
+        json!({"result":{"source_ref":"<ref>","outcome":"replaced","digest":"b".repeat(64)},
+            "detail_ref":null,"items":[{"detail_ref":"<ref>"}]})
+    );
 }
