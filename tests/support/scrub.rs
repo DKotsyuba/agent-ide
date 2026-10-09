@@ -8,14 +8,29 @@
 
 use std::path::Path;
 
-/// `text` with the fixture's identity masked: its base directory, short commit hashes after
-/// `git `, activation identifiers and the values of `source_ref`/`detail_ref` echoes.
-pub fn scrub(text: &str, base: &Path) -> String {
-    let text = text.replace(base.to_string_lossy().as_ref(), "<fixture>");
-    let text = mask_after(&text, "git ", 7, 12);
-    let text = mask_after(&text, "activation ", 8, 64);
-    let text = mask_quoted(&text, "\"source_ref\":\"");
-    mask_quoted(&text, "\"detail_ref\":\"")
+use serde_json::{Value, json};
+
+/// The transcript line of one call with only the generated identities normalized: the values of
+/// the request's own `source_ref`/`detail_ref` (a proof echoed from an earlier reply), the exact
+/// worktree and fixture prefixes (relative suffixes stay), and, for the activation card alone,
+/// the short commit hash and the activation identifier. Reply text of every other call, source
+/// literals included, stays byte for byte.
+pub fn line(tool: &str, arguments: &Value, reply: &Value, root: &Path, base: &Path) -> String {
+    let mut arguments = arguments.clone();
+    for key in ["source_ref", "detail_ref"] {
+        if let Some(value) = arguments.get_mut(key) {
+            *value = json!("<ref>");
+        }
+    }
+    let text = super::parity::line(tool, &arguments, reply)
+        .replace(root.to_string_lossy().as_ref(), "<root>")
+        .replace(base.to_string_lossy().as_ref(), "<fixture>");
+    if tool == "ide.start" {
+        let text = mask_after(&text, "git ", 7, 12);
+        mask_after(&text, "activation ", 8, 64)
+    } else {
+        text
+    }
 }
 
 /// Masks the hexadecimal run that directly follows each `marker` when it is `min..=max` long.
@@ -40,39 +55,74 @@ fn mask_after(text: &str, marker: &str, min: usize, max: usize) -> String {
     out
 }
 
-/// Masks the quoted value after each `opening` (`"source_ref":"` and the like).
-fn mask_quoted(text: &str, opening: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find(opening) {
-        let (head, tail) = rest.split_at(at + opening.len());
-        out.push_str(head);
-        match tail.find('"') {
-            Some(end) => {
-                out.push_str("<ref>");
-                rest = &tail[end..];
-            }
-            None => rest = tail,
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Only identities are masked; every other byte, number and word stays.
+    fn at(tool: &str, arguments: Value, text: &str, tag: &str) -> String {
+        let (root, base) = (format!("/tmp/{tag}/repo"), format!("/tmp/{tag}"));
+        line(
+            tool,
+            &arguments,
+            &json!({"state":"ok","kind":"k","code":null,"text":text.replace("@", &root)}),
+            Path::new(&root),
+            Path::new(&base),
+        )
+    }
+
+    /// The four generated identities normalize; relative suffixes and everything else stay.
     #[test]
-    fn scrubbing_masks_identities_and_nothing_else() {
-        let text = "git 5d7fd78 at /tmp/p-1/repo existing activation 25d98761ab \
-                    {\"source_ref\":\"1af9b318-8\",\"detail_ref\":\"x-2\",\"n\":7} git main 3 files";
-        let scrubbed = scrub(text, Path::new("/tmp/p-1"));
+    fn identities_normalize() {
+        let card = |hash: &str, id: &str| format!("git {hash} @/a.css activation {id}");
         assert_eq!(
-            scrubbed,
-            "git <id> at <fixture>/repo existing activation <id> \
-             {\"source_ref\":\"<ref>\",\"detail_ref\":\"<ref>\",\"n\":7} git main 3 files"
+            at("ide.start", json!({}), &card("5d7fd78", "25d98761ab"), "p1"),
+            at("ide.start", json!({}), &card("9f00aa1", "ffe01234ab"), "p2"),
+        );
+        let edit = |proof: &str, tag| {
+            at(
+                "ide.edit",
+                json!({"source_ref":proof,"lines":"1-1"}),
+                "@/a.css",
+                tag,
+            )
+        };
+        assert_eq!(edit("one", "p1"), edit("two", "p2"));
+        assert!(edit("one", "p1").contains("<root>/a.css"));
+    }
+
+    /// Content, operation, path and non-volatile names still differ, and source literals that look
+    /// like identities are never masked outside the activation card.
+    #[test]
+    fn real_differences_survive() {
+        let read = |text: &str| at("ide.read", json!({"symbol":"a"}), text, "p");
+        assert_ne!(read("git abcdef1"), read("git abcdef2"));
+        assert_ne!(read("activation deadbeef"), read("activation cafebabe"));
+        assert_ne!(
+            read("{\"source_ref\":\"alpha\"}"),
+            read("{\"source_ref\":\"beta\"}")
+        );
+        assert_ne!(read("x"), read("x "));
+        assert_ne!(
+            at("ide.read", json!({"symbol":"a"}), "x", "p"),
+            at("ide.symbol", json!({"symbol":"a"}), "x", "p")
+        );
+        assert_ne!(
+            at("ide.read", json!({"symbol":"a","name":"n1"}), "x", "p"),
+            at("ide.read", json!({"symbol":"a","name":"n2"}), "x", "p")
+        );
+        assert_ne!(
+            at(
+                "ide.edit",
+                json!({"source_ref":"s","lines":"1-1"}),
+                "x",
+                "p"
+            ),
+            at(
+                "ide.edit",
+                json!({"source_ref":"s","lines":"1-2"}),
+                "x",
+                "p"
+            )
         );
     }
 }
