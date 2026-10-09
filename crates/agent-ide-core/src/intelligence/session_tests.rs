@@ -1202,6 +1202,36 @@ async fn module_session_converts_product_answers() {
     );
     assert!(!failing.is_alive(), "a module fault retires the generation");
     assert!(failing.session.module_fault().is_some());
+
+    // A context answer in an encoding the core cannot convert in is ill-typed: the module's typed
+    // decode/malformed fault retires it, not a lexical reply from a live module.
+    let mut unknown = open(
+        FakeModule::new(ModuleId::bundled("alpha"), "1.0")
+            .with_fault(Capability::Semantic, Fault::UnknownEncoding),
+    )
+    .await;
+    let context = unknown
+        .session
+        .context(
+            &source,
+            text.as_bytes(),
+            ContextQuery::Symbol { byte_offset: 0 },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(context.mode, ContextMode::Lexical { .. }));
+    let fault = unknown.session.module_fault().expect("a typed fault");
+    assert_eq!(
+        (fault.stage, fault.cause),
+        (
+            crate::modules::contract::Stage::Decode,
+            crate::modules::contract::Cause::Malformed
+        )
+    );
+    assert!(
+        !unknown.is_alive(),
+        "the malformed answer retires the module"
+    );
 }
 
 /// Replaces the pilot session fence and fault tests: a module-hosted session applies the local

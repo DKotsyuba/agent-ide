@@ -49,6 +49,8 @@ pub enum Fault {
     ProviderExit,
     /// Answer that the module's provider timed out.
     ProviderTimeout,
+    /// Answer as usual, but name a position encoding no provider negotiates.
+    UnknownEncoding,
 }
 
 /// A module that answers every capability with a canned typed result after decoding its payload,
@@ -438,6 +440,14 @@ impl ModuleServer for FakeModule {
                     super::contract::Cause::Timeout,
                     "provider timed out",
                 )),
+                Fault::UnknownEncoding => {
+                    let mut value = self
+                        .answer(&request, &mut effects)
+                        .await
+                        .map_err(ServeError::Protocol)?;
+                    value["position_encoding"] = json!("utf-7");
+                    Ok(Answer::result(value))
+                }
             };
         }
         Ok(match self.answer(&request, &mut effects).await {
