@@ -713,7 +713,7 @@ async fn timed(
 }
 
 /// A measurement, not a contract (design §3.2.4): for the in-process path and the module it
-/// records the first outline of each of 15 files, warm `ide.outline` and `ide.symbol`
+/// records cold first outlines (a fresh session each), warm `ide.outline` and `ide.symbol`
 /// latencies once rust-analyzer is ready, and the resident memory of the daemon's process tree,
 /// written as JSON to `AGENT_IDE_MODULE_MEASURE_OUT`. Without that variable it measures nothing.
 #[tokio::test]
@@ -724,29 +724,8 @@ async fn rust_module_measure() {
         eprintln!("rust_module_measure skipped: AGENT_IDE_MODULE_MEASURE_OUT is not set");
         return;
     };
+    let fixture = rust_fixture(PARITY_FILES, "module-rust-measure", 300);
     let (cold_runs, warmup, samples) = (15, 20, 200);
-    // One session per daemon (a second front would replay the first one's call ids): "cold"
-    // is the first outline of each of `cold_runs` files the session has not outlined yet.
-    let cold_files: Vec<(String, String)> = (0..cold_runs)
-        .map(|index| {
-            (
-                format!("src/cold_{index}.rs"),
-                format!(
-                    "/// Cold file {index}.\npub fn cold_{index}() -> u32 {{\n    {index}\n}}\n"
-                ),
-            )
-        })
-        .collect();
-    let files: Vec<(&str, &str)> = PARITY_FILES
-        .iter()
-        .copied()
-        .chain(
-            cold_files
-                .iter()
-                .map(|(path, text)| (path.as_str(), text.as_str())),
-        )
-        .collect();
-    let fixture = rust_fixture(&files, "module-rust-measure", 300);
     let mut report = serde_json::Map::new();
     for (mode, env) in [("in_process", IN_PROCESS), ("module", MODULE)] {
         let mut daemon = Daemon::start(&fixture, &[env]).await;
@@ -754,13 +733,17 @@ async fn rust_module_measure() {
         let symbol = json!({"symbol":"src/lib.rs#Service/work"});
         let mut cold = Vec::new();
         let mut session = Session::start(&fixture).await;
-        for (path, _) in &cold_files {
+        for run in 0..cold_runs {
+            if run > 0 {
+                session.close(&fixture).await;
+                session = Session::start(&fixture).await;
+            }
             cold.push(
                 timed(
                     &mut session,
                     &fixture,
                     "ide.outline",
-                    json!({"path":path}),
+                    outline.clone(),
                     "outline",
                 )
                 .await,
@@ -768,7 +751,7 @@ async fn rust_module_measure() {
         }
         ready(&mut session, &fixture).await;
         let mut measured = serde_json::Map::new();
-        measured.insert("first_outline_per_file_ms".into(), json!(cold));
+        measured.insert("cold_outline_ms".into(), json!(cold));
         for (name, tool, arguments, kind) in [
             ("warm_outline_ms", "ide.outline", outline.clone(), "outline"),
             ("warm_symbol_ms", "ide.symbol", symbol.clone(), "symbol"),
@@ -799,7 +782,7 @@ async fn rust_module_measure() {
     }
     report.insert(
         "method".into(),
-        json!({"first_outline_files": cold_runs, "warmup": warmup, "calls": samples,
+        json!({"cold_runs": cold_runs, "warmup": warmup, "calls": samples,
                "clock": "wall time of one settled MCP tools/call round trip measured in the test process"}),
     );
     std::fs::write(
