@@ -1232,11 +1232,24 @@ pub(crate) mod testing {
         },
     ];
     /// Coverage of the beta stub.
-    const BETA_COVERAGE: &[NamespaceCoverage] = &[NamespaceCoverage {
-        namespace: ns::CLASS,
-        defines: false,
-        uses: true,
-    }];
+    const BETA_COVERAGE: &[NamespaceCoverage] = &[
+        NamespaceCoverage {
+            namespace: ns::CLASS,
+            defines: false,
+            uses: true,
+        },
+        NamespaceCoverage {
+            namespace: ns::FILE_REF,
+            defines: false,
+            uses: true,
+        },
+    ];
+    /// How the beta stub's file references reach files they do not spell.
+    static BETA_PROBE: super::names::FileProbe = super::names::FileProbe {
+        suffixes: &[".alpha", ".beta"],
+        index_suffixes: &["/index.alpha"],
+        swaps: &[(".a", ".alpha")],
+    };
     /// Coverage of the gamma stub.
     const GAMMA_COVERAGE: &[NamespaceCoverage] = &[NamespaceCoverage {
         namespace: ns::ELEMENT_ID,
@@ -1261,6 +1274,11 @@ pub(crate) mod testing {
                     .map(|rest| (ns::CLASS, Role::Use, Certainty::Exact, rest))
                     .or_else(|| {
                         token
+                            .strip_prefix("ref:")
+                            .map(|rest| (ns::FILE_REF, Role::Use, Certainty::Exact, rest))
+                    })
+                    .or_else(|| {
+                        token
                             .strip_prefix('~')
                             .map(|rest| (ns::CLASS, Role::Use, Certainty::Heuristic("tilde"), rest))
                     }),
@@ -1280,6 +1298,14 @@ pub(crate) mod testing {
                 _ => GAMMA_COVERAGE,
             }
         }
+        /// The beta stub probes `.alpha`/`.beta` endings; the others name files exactly.
+        fn file_probe(&self) -> &'static super::names::FileProbe {
+            if self.0 == "beta" {
+                &BETA_PROBE
+            } else {
+                &super::names::FileProbe::EXACT
+            }
+        }
         /// One fact per recognized token, positioned at the token's first byte.
         fn extract(&self, _file: &Path, source: &str, sink: &mut FactSink) -> FileVerdict {
             if source.starts_with("#!skip") {
@@ -1293,7 +1319,11 @@ pub(crate) mod testing {
                     let Some((namespace, role, certainty, rest)) = self.token(token) else {
                         continue;
                     };
-                    let (name, domain) = rest.split_once('/').unwrap_or((rest, ""));
+                    let (name, domain) = if namespace == ns::FILE_REF {
+                        (rest, "")
+                    } else {
+                        rest.split_once('/').unwrap_or((rest, ""))
+                    };
                     let fact = NameFact {
                         key: NameKey {
                             namespace,

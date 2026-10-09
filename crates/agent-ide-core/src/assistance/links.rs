@@ -305,6 +305,7 @@ impl Worker<'_> {
         }
         let (index, state) = self.name_index(job, worktree).await?;
         let own_file = file.to_path_buf();
+        let language = Lang::for_path(file);
         let (file, bytes) = (file.to_path_buf(), bytes.to_vec());
         let range = found.range;
         let children: Vec<LineRange> = found.children.iter().map(|child| child.range).collect();
@@ -344,8 +345,14 @@ impl Worker<'_> {
                     .iter()
                     .take(MAX_LINK_KEYS)
                     .map(|key| {
-                        let defines =
-                            index.proven_sites(key, Some(Role::Define), MAX_LINK_DEFINITIONS);
+                        let defines = match language {
+                            Some(language) => {
+                                index.proven_definitions(language, key, MAX_LINK_DEFINITIONS)
+                            }
+                            None => {
+                                index.proven_sites(key, Some(Role::Define), MAX_LINK_DEFINITIONS)
+                            }
+                        };
                         (key.clone(), defines)
                     })
                     .collect(),
@@ -523,6 +530,7 @@ impl Worker<'_> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
+        let language = Lang::for_path(file);
         let (index, _) = self.name_index(job, worktree).await?;
         with_names(index, move |index| {
             keys.iter()
@@ -531,11 +539,13 @@ impl Worker<'_> {
                     display: display(key),
                     label: key.namespace.label(),
                     define_word: key.namespace.define_word(),
-                    definition: index
-                        .proven_sites(key, Some(Role::Define), 1)
-                        .sites
-                        .first()
-                        .map(|shown| (shown.site.file.clone(), shown.site.fact.line)),
+                    definition: match language {
+                        Some(language) => index.proven_definitions(language, key, 1),
+                        None => index.proven_sites(key, Some(Role::Define), 1),
+                    }
+                    .sites
+                    .first()
+                    .map(|shown| (shown.site.file.clone(), shown.site.fact.line)),
                 })
                 .collect()
         })

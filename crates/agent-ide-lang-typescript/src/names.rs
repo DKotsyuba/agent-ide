@@ -30,8 +30,8 @@
 use std::{ops::Range, path::Path};
 
 use agent_ide_core::lang::names::{
-    Certainty, FactSink, FileVerdict, NameFact, NameFacts, NameKey, Namespace, NamespaceCoverage,
-    Role, ns, relative_reference,
+    Certainty, FactSink, FileProbe, FileVerdict, NameFact, NameFacts, NameKey, Namespace,
+    NamespaceCoverage, Resolution, Role, ns, relative_reference, resolve_file_ref,
 };
 
 /// Average line length past which a file counts as minified.
@@ -50,6 +50,38 @@ const CLASS_HELPERS: [&str; 7] = [
 const REGEX_KEYWORDS: [&str; 11] = [
     "return", "typeof", "case", "in", "of", "new", "delete", "void", "throw", "yield", "await",
 ];
+
+/// How a script's relative specifier reaches the file it means: the usual extensions in
+/// preference order, directory index files, and a `.js`-family ending written for the TypeScript
+/// source that emits it.
+static FILE_PROBE: FileProbe = FileProbe {
+    suffixes: &[
+        ".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs", ".json",
+    ],
+    index_suffixes: &[
+        "/index.ts",
+        "/index.tsx",
+        "/index.js",
+        "/index.jsx",
+        "/index.mts",
+        "/index.cts",
+        "/index.mjs",
+        "/index.cjs",
+    ],
+    swaps: &[
+        (".js", ".ts"),
+        (".js", ".tsx"),
+        (".jsx", ".tsx"),
+        (".mjs", ".mts"),
+        (".cjs", ".cts"),
+    ],
+};
+
+/// Whether a specifier (query and fragment already dropped) is a relative path: `.`, `..`, or one
+/// starting with `./` or `../`.
+fn relative_specifier(path: &str) -> bool {
+    path == "." || path == ".." || path.starts_with("./") || path.starts_with("../")
+}
 
 /// The TypeScript [`NameFacts`] provider.
 #[derive(Clone, Copy, Debug, Default)]
@@ -78,6 +110,27 @@ impl NameFacts for TsFacts {
     /// Class, element-id and file-reference uses.
     fn coverage(&self) -> &'static [NamespaceCoverage] {
         COVERAGE
+    }
+
+    /// Scripts reach files only through `./` and `../` specifiers (a bare specifier names a
+    /// package), probing the usual extensions and index files.
+    fn file_probe(&self) -> &'static FileProbe {
+        &FILE_PROBE
+    }
+
+    /// The default interpretation, for relative specifiers only.
+    fn resolve(
+        &self,
+        namespace: Namespace,
+        raw: &str,
+        from: &Path,
+        limit: usize,
+    ) -> Vec<Resolution> {
+        let path = raw.split(['?', '#']).next().unwrap_or("");
+        if !relative_specifier(path) {
+            return Vec::new();
+        }
+        resolve_file_ref(&FILE_PROBE, namespace, raw, from, limit)
     }
 
     /// `3`: file references and CSS-module members (`2`: JSX text is skipped, not lexed as code).
@@ -447,21 +500,24 @@ impl Facts<'_> {
         };
         let punct = |index: usize, byte: u8| matches!(tokens.get(index), Some(Token::Punct(found, _)) if *found == byte);
         let mut bindings: Vec<(String, String)> = Vec::new();
+        // A file that declares its own `require` (a shim, a parameter) proves nothing by calling it.
+        let require_declared = shadowed(tokens, self.source, "require", 0);
         let mut index = 0;
         while index < tokens.len() {
             match word(index) {
                 Some("import") if punct(index + 1, b'(') => {
-                    if let (Some(Token::Str(range)), true) =
-                        (tokens.get(index + 2), punct(index + 3, b')'))
+                    let member = index > 0 && punct(index - 1, b'.');
+                    if let (Some(Token::Str(range)), true, false) =
+                        (tokens.get(index + 2), punct(index + 3, b')'), member)
                     {
-                        self.specifier(range.clone());
+                        self.specifier(range.clone(), true);
                     }
                 }
                 Some("import") if !punct(index + 1, b'.') => {
                     if let Some(Token::Str(range)) = tokens.get(index + 1) {
-                        self.specifier(range.clone());
+                        self.specifier(range.clone(), true);
                     } else if let Some((from, range)) = self.clause(tokens, index + 1) {
-                        if let Some(key) = self.specifier(range) {
+                        if let Some(key) = self.specifier(range, true) {
                             if let Some(name) =
                                 default_binding(tokens, index + 1, from, self.source)
                             {
@@ -472,16 +528,19 @@ impl Facts<'_> {
                 }
                 Some("export") if punct(index + 1, b'{') || punct(index + 1, b'*') => {
                     if let Some((_, range)) = self.clause(tokens, index + 1) {
-                        self.specifier(range);
+                        self.specifier(range, true);
                     }
                 }
                 Some("require")
-                    if punct(index + 1, b'(') && !(index > 0 && punct(index - 1, b'.')) =>
+                    if punct(index + 1, b'(')
+                        && !(index > 0 && punct(index - 1, b'.'))
+                        && !require_declared =>
                 {
                     if let (Some(Token::Str(range)), true) =
                         (tokens.get(index + 2), punct(index + 3, b')'))
                     {
-                        let key = self.specifier(range.clone());
+                        // CommonJS takes `?` and `#` as filename characters: no URL metadata.
+                        let key = self.specifier(range.clone(), false);
                         let declared = index >= 3
                             && punct(index - 1, b'=')
                             && matches!(word(index - 3), Some("const" | "let" | "var" | "import"));
@@ -496,7 +555,7 @@ impl Facts<'_> {
             index += 1;
         }
         for (name, domain) in bindings {
-            if !shadowed(tokens, self.source, &name) {
+            if !shadowed(tokens, self.source, &name, 1) {
                 self.members(tokens, &name, &domain);
             }
         }
@@ -531,14 +590,18 @@ impl Facts<'_> {
     }
 
     /// Emits the file reference a static relative specifier spells (positioned at its content)
-    /// and returns its key.
-    fn specifier(&mut self, content: Range<usize>) -> Option<String> {
+    /// and returns its key; with `url` a static query or fragment is metadata, not file name.
+    fn specifier(&mut self, content: Range<usize>, url: bool) -> Option<String> {
         let text = &self.source[content.clone()];
         if text.contains('\\') {
             return None;
         }
-        let path = text.split(['?', '#']).next().unwrap_or("");
-        if !(path == "." || path == ".." || path.starts_with("./") || path.starts_with("../")) {
+        let path = if url {
+            text.split(['?', '#']).next().unwrap_or("")
+        } else {
+            text
+        };
+        if !relative_specifier(path) {
             return None;
         }
         let key = relative_reference(self.file, path)?;
@@ -734,12 +797,13 @@ fn default_binding(tokens: &[Token], start: usize, from: usize, source: &str) ->
     }
 }
 
-/// Whether the identifier `name` may mean something else than its CSS-module binding somewhere
-/// in the file: declared again, assigned, a parameter, or a destructuring target. Scope-blind on
-/// purpose: any such occurrence voids the binding for the whole file.
+/// Whether the identifier `name` may mean something else than its binding somewhere in the file:
+/// declared more than `allowed` times (the binding itself is one), assigned, a parameter, or a
+/// destructuring target. Scope-blind on purpose: any such occurrence voids the binding for the
+/// whole file.
 ///
 /// ponytail: no scope analysis; a real scope walk if shadowed bindings in one file turn out common.
-fn shadowed(tokens: &[Token], source: &str, name: &str) -> bool {
+fn shadowed(tokens: &[Token], source: &str, name: &str, allowed: usize) -> bool {
     let word_at = |index: usize| match tokens.get(index) {
         Some(Token::Word(range)) => Some(&source[range.clone()]),
         _ => None,
@@ -782,7 +846,7 @@ fn shadowed(tokens: &[Token], source: &str, name: &str) -> bool {
             return true;
         }
     }
-    if declarations > 1 {
+    if declarations > allowed {
         return true;
     }
     // Parameter lists: a parenthesized group followed by `=>`, or by `{` after a function-like
@@ -796,6 +860,9 @@ fn shadowed(tokens: &[Token], source: &str, name: &str) -> bool {
             continue;
         }
         let arrow = punct_at(close + 1, b'=') && punct_at(close + 2, b'>');
+        // A return annotation (`(a): T =>`, `f(a): T {`) follows the parameter list; a ternary
+        // branch `c ? (a) : b` does not count.
+        let annotated = punct_at(close + 1, b':') && open > 0 && !punct_at(open - 1, b'?');
         let body = punct_at(close + 1, b'{')
             && open > 0
             && !matches!(
@@ -805,7 +872,9 @@ fn shadowed(tokens: &[Token], source: &str, name: &str) -> bool {
             && (word_at(open - 1).is_some()
                 || punct_at(open - 1, b')')
                 || punct_at(open - 1, b'>'));
-        if (arrow || body) && (open + 1..close).any(|inner| word_at(inner) == Some(name)) {
+        if (arrow || body || annotated)
+            && (open + 1..close).any(|inner| word_at(inner) == Some(name))
+        {
             return true;
         }
     }
@@ -1076,5 +1145,81 @@ mod tests {
             &format!("{module}if (styles.on == 1) {{ use(styles.foo); }}"),
         );
         assert_eq!(rows.iter().filter(|row| row.0 == "class/v1").count(), 2);
+    }
+
+    /// Return annotations do not hide a parameter that shadows the binding; a ternary does not
+    /// count as a parameter list.
+    #[test]
+    fn typed_parameters_shadow_css_module_bindings() {
+        let module = "import styles from './a.module.css';\n";
+        for shadow in [
+            "function f(styles: Record<string, string>): string { return styles.foo; }",
+            "const f = (styles: S): string => styles.foo;",
+            "const f = async (styles): Promise<string> => styles.foo;",
+        ] {
+            let (_, rows) = facts("a.ts", &format!("{module}{shadow}\n"));
+            assert!(
+                rows.iter().all(|row| row.0 != "class/v1"),
+                "{shadow}: {rows:?}"
+            );
+        }
+        let (_, rows) = facts(
+            "a.ts",
+            &format!("{module}const v = on ? (styles.a) : styles.b;\n"),
+        );
+        assert_eq!(rows.iter().filter(|row| row.0 == "class/v1").count(), 2);
+    }
+
+    /// Ordinary calls prove nothing: a method named `import` or `require`, and a locally defined
+    /// `require`, give no file reference or module binding; CommonJS keeps `?` in the file name.
+    #[test]
+    fn only_the_loaders_prove_a_reference() {
+        for source in [
+            "const obj = { import(s) { return s; } }; obj.import('./plain.js');\n",
+            "obj.require('./plain.js');\n",
+            "const require = (s) => ({ foo: s }); const styles = require('./a.module.css'); styles.foo;\n",
+            "function f(require) { return require('./plain.js'); }\n",
+        ] {
+            let (_, rows) = facts("a.js", source);
+            assert!(rows.is_empty(), "{source}: {rows:?}");
+        }
+        let (_, rows) = facts("a.cjs", "const x = require('./plain.cjs?x');\n");
+        assert_eq!(rows, [file("plain.cjs?x", 1, 20)]);
+        let (_, rows) = facts("a.mjs", "import x from './plain.mjs?x';\n");
+        assert_eq!(rows, [file("plain.mjs", 1, 16)]);
+    }
+
+    /// The default resolution enumerates probe candidates for relative specifiers only.
+    #[test]
+    fn resolve_reaches_relative_specifiers_only() {
+        let from = Path::new("src/a.ts");
+        let names = |raw| -> Vec<String> {
+            TsFacts
+                .resolve(ns::FILE_REF, raw, from, 32)
+                .into_iter()
+                .map(|resolution| resolution.name)
+                .collect()
+        };
+        assert_eq!(names("./b")[..3], ["src/b", "src/b.ts", "src/b.tsx"]);
+        assert_eq!(names("./b.js")[..2], ["src/b.js", "src/b.ts"]);
+        assert!(names("react").is_empty() && names("@/x").is_empty() && names("/x").is_empty());
+        assert_eq!(TsFacts.resolve(ns::FILE_REF, "./b", from, 2).len(), 2);
+    }
+
+    /// Legacy certainty is untouched: a template without substitution is exact, one with a
+    /// substitution is a template-literal heuristic (as at 0.10.8, `template()` is unchanged).
+    #[test]
+    fn template_certainty_is_the_legacy_rule() {
+        let (_, rows) = facts(
+            "a.tsx",
+            "<a className={`btn`} /><b className={`x ${y}`} />\n",
+        );
+        assert_eq!(
+            rows,
+            [
+                class("btn", 1, 16, None),
+                class("x", 1, 39, Some("template literal")),
+            ]
+        );
     }
 }

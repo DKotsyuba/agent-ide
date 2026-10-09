@@ -378,6 +378,112 @@ pub fn relative_reference(from: &Path, reference: &str) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
+/// Static vocabulary with which a language's file references reach a file the reference does not
+/// spell exactly (`./button` for `button.tsx`). It is compiled descriptor data, not a language
+/// computation: the core applies it to its own file listing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileProbe {
+    /// Endings appended to a reference that names no file, in preference order (`.ts`).
+    pub suffixes: &'static [&'static str],
+    /// Endings appended to reach a directory's entry file, in preference order (`/index.ts`).
+    pub index_suffixes: &'static [&'static str],
+    /// `(written ending, ending on disk)` pairs tried in order (`.js` written for a `.ts` file).
+    pub swaps: &'static [(&'static str, &'static str)],
+}
+
+impl FileProbe {
+    /// A language whose references name their file exactly.
+    pub const EXACT: FileProbe = FileProbe {
+        suffixes: &[],
+        index_suffixes: &[],
+        swaps: &[],
+    };
+
+    /// Every worktree-relative path `reference` may reach, most certain first and without
+    /// duplicates: the reference itself (no reason), then swaps, suffixes and index files, each
+    /// with the label of the assumption that reaches it.
+    pub fn candidates(&self, reference: &str) -> Vec<(String, Option<&'static str>)> {
+        let swapped = self.swaps.iter().filter_map(|(written, disk)| {
+            reference
+                .strip_suffix(written)
+                .map(|stem| (format!("{stem}{disk}"), "extension swap"))
+        });
+        let suffixed = self
+            .suffixes
+            .iter()
+            .map(|suffix| (format!("{reference}{suffix}"), "extension probe"));
+        let indexed = self
+            .index_suffixes
+            .iter()
+            .map(|suffix| (format!("{reference}{suffix}"), "index probe"));
+        let mut found: Vec<(String, Option<&'static str>)> = vec![(reference.to_owned(), None)];
+        for (candidate, reason) in swapped.chain(suffixed).chain(indexed) {
+            if !found.iter().any(|(seen, _)| *seen == candidate) {
+                found.push((candidate, Some(reason)));
+            }
+        }
+        found
+    }
+
+    /// The file `reference` reaches under `exists` (which answers for one worktree-relative file
+    /// path): the first of its [`FileProbe::candidates`] that is a file, with the assumption that
+    /// reached it.
+    pub fn reach(
+        &self,
+        reference: &str,
+        exists: impl Fn(&str) -> bool,
+    ) -> Option<(String, Option<&'static str>)> {
+        self.candidates(reference)
+            .into_iter()
+            .find(|(candidate, _)| exists(candidate))
+    }
+}
+
+/// One answer of [`NameFacts::resolve`]: a key the raw reference may mean, with how sure the
+/// language is. The core checks existence and builds any edge itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Resolution {
+    /// Domain of the key (empty: worktree-global).
+    pub domain: String,
+    /// Normalized key.
+    pub name: String,
+    /// Exact, or the labelled assumption.
+    pub certainty: Certainty,
+}
+
+/// Most candidates one [`NameFacts::resolve`] returns.
+pub const MAX_RESOLUTIONS: usize = 32;
+
+/// The default [`NameFacts::resolve`]: `raw` (a URL or specifier, query and fragment dropped)
+/// joined to `from`'s directory and expanded by `probe`; nothing outside `file-ref/v1`, for a URL
+/// or for a path leaving the worktree.
+pub fn resolve_file_ref(
+    probe: &FileProbe,
+    namespace: Namespace,
+    raw: &str,
+    from: &Path,
+    limit: usize,
+) -> Vec<Resolution> {
+    if namespace != ns::FILE_REF {
+        return Vec::new();
+    }
+    let path = raw.split(['?', '#']).next().unwrap_or("");
+    relative_reference(from, path)
+        .map(|key| {
+            probe
+                .candidates(&key)
+                .into_iter()
+                .take(limit.min(MAX_RESOLUTIONS))
+                .map(|(name, reason)| Resolution {
+                    domain: String::new(),
+                    name,
+                    certainty: reason.map_or(Certainty::Exact, Certainty::Heuristic),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Cross-language name facts of one language. Stateless, synchronous and pure over its inputs.
 pub trait NameFacts: Send + Sync {
     /// The namespaces this language may define and/or use names in.
@@ -388,6 +494,26 @@ pub trait NameFacts: Send + Sync {
     /// answer differently for some input.
     fn revision(&self) -> &'static str {
         "1"
+    }
+
+    /// How this language's `file-ref/v1` references reach files they do not spell exactly;
+    /// exact-only by default.
+    fn file_probe(&self) -> &'static FileProbe {
+        &FileProbe::EXACT
+    }
+
+    /// The keys the reference `raw` written in `from` may mean in `namespace`, most certain first
+    /// and at most `limit` (never more than [`MAX_RESOLUTIONS`]); nothing for a reference the
+    /// language cannot interpret. The default interprets `file-ref/v1` lexically through
+    /// [`NameFacts::file_probe`]; no file is consulted and no edge is made here.
+    fn resolve(
+        &self,
+        namespace: Namespace,
+        raw: &str,
+        from: &Path,
+        limit: usize,
+    ) -> Vec<Resolution> {
+        resolve_file_ref(self.file_probe(), namespace, raw, from, limit)
     }
 
     /// Facts of one file. `file` is worktree-relative (for resolving relative references);
@@ -434,6 +560,84 @@ mod tests {
             Some("app.js".into())
         );
         assert_eq!(key("my file.css"), Some("src/ui/my file.css".into()));
+    }
+
+    /// An exact file wins; otherwise swaps, suffixes and index files are tried in that order and
+    /// the reason of the assumption comes back; a probe never reaches a directory or a miss.
+    #[test]
+    fn a_file_probe_reaches_files_in_order() {
+        const TS: FileProbe = FileProbe {
+            suffixes: &[".ts", ".js"],
+            index_suffixes: &["/index.ts"],
+            swaps: &[(".js", ".ts")],
+        };
+        let files = ["a.ts", "b.js", "b.ts", "c/index.ts", "d.js"];
+        let reach = |reference| TS.reach(reference, |path| files.contains(&path));
+        assert_eq!(reach("b.js"), Some(("b.js".into(), None)));
+        assert_eq!(reach("a"), Some(("a.ts".into(), Some("extension probe"))));
+        assert_eq!(reach("c"), Some(("c/index.ts".into(), Some("index probe"))));
+        assert_eq!(reach("a.js"), Some(("a.ts".into(), Some("extension swap"))));
+        assert_eq!(reach("d"), Some(("d.js".into(), Some("extension probe"))));
+        assert_eq!(reach("e"), None);
+        assert_eq!(FileProbe::EXACT.reach("a", |path| path == "a.ts"), None);
+        let names: Vec<String> = TS
+            .candidates("a")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["a", "a.ts", "a.js", "a/index.ts"]);
+    }
+
+    /// The default `resolve` turns a written reference into probe candidates inside the worktree
+    /// and nothing for other namespaces, escapes or URLs.
+    #[test]
+    fn resolve_enumerates_probe_candidates() {
+        struct Probing;
+        impl NameFacts for Probing {
+            fn coverage(&self) -> &'static [NamespaceCoverage] {
+                &[]
+            }
+            fn extract(&self, _: &Path, _: &str, _: &mut FactSink) -> FileVerdict {
+                FileVerdict::Indexed
+            }
+            fn file_probe(&self) -> &'static FileProbe {
+                &FileProbe {
+                    suffixes: &[".ts"],
+                    index_suffixes: &[],
+                    swaps: &[],
+                }
+            }
+        }
+        let from = Path::new("src/a.tsx");
+        let rows: Vec<(String, Certainty)> = Probing
+            .resolve(ns::FILE_REF, "./b?x#y", from, 32)
+            .into_iter()
+            .map(|r| (r.name, r.certainty))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("src/b".to_owned(), Certainty::Exact),
+                (
+                    "src/b.ts".to_owned(),
+                    Certainty::Heuristic("extension probe")
+                ),
+            ]
+        );
+        assert_eq!(Probing.resolve(ns::FILE_REF, "./b", from, 1).len(), 1);
+        assert!(Probing.resolve(ns::CLASS, "./b", from, 32).is_empty());
+        assert!(
+            Probing
+                .resolve(ns::FILE_REF, "../../b", from, 32)
+                .is_empty()
+        );
+        // A bare path is relative by default (an HTML URL); script languages override this.
+        assert_eq!(Probing.resolve(ns::FILE_REF, "pkg", from, 32).len(), 2);
+        assert!(
+            Probing
+                .resolve(ns::FILE_REF, "https://x/y", from, 32)
+                .is_empty()
+        );
     }
 
     /// A fact of `name` in `namespace` at line 1, column 1.
