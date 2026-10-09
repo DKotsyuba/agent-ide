@@ -499,7 +499,7 @@ pub fn read_authorized_resolution_input(
 }
 
 /// Opens a directory component while refusing symlinks and preserving raw Unix bytes.
-pub(super) fn open_directory(
+pub(crate) fn open_directory(
     parent: libc::c_int,
     component: &OsStr,
 ) -> Result<libc::c_int, ObservationError> {
@@ -568,7 +568,7 @@ pub(crate) fn valid_relative_path(path: &Path) -> bool {
 
 /// Opens an absolute root by walking every raw component from `/` without following any symlink.
 /// Empty/dot/parent components and missing roots fail before any descendant source is inspected.
-pub(super) fn open_root_directory(path: &Path) -> Result<File, ObservationError> {
+pub(crate) fn open_root_directory(path: &Path) -> Result<File, ObservationError> {
     let raw = path.as_os_str().as_bytes();
     if raw.first() != Some(&b'/') || raw.contains(&0) {
         return Err(ObservationError::InvalidPath);

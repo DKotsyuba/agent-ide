@@ -210,7 +210,7 @@ impl EffectRunner for CheckEffects<'_> {
             );
             let spec = match recipe::expand_staged(self.recipes, &effect, &admission) {
                 Ok((spec, staged)) => {
-                    if let Err(error) = recipe::stage(&staged) {
+                    if let Err(error) = recipe::stage(&self.request.cache_dir, &staged) {
                         return (
                             EffectOutcome::Refused {
                                 cause: Cause::Exited,

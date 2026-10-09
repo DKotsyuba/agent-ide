@@ -373,8 +373,8 @@ pub fn expand(
 /// A run's assets with the admitted cache paths they are staged at.
 pub type Staged = Vec<(PathBuf, &'static [u8])>;
 
-/// [`expand`] plus the recipe's assets with their admitted cache paths, to [`stage`] before the
-/// spawn; an asset whose parameter is not a cache-only path rule with one admitted value refuses.
+/// [`expand`] plus the recipe's assets with their admitted cache paths, to [`stage`] (in the
+/// admission's cache) before the spawn; an asset whose parameter is not a cache-only path rule with one admitted value refuses.
 pub fn expand_staged(
     recipes: &[EffectRecipe],
     effect: &EffectRequest,
@@ -590,33 +590,98 @@ pub fn expand_staged(
     ))
 }
 
-/// Stages a run's assets ([`expand_staged`]): each one written to a fresh private temporary file
-/// beside its target and renamed into place, so a symlink at the target is replaced, never
-/// followed.
-pub fn stage(assets: &[(PathBuf, &[u8])]) -> std::io::Result<()> {
-    use std::io::Write;
+/// Stages a run's assets ([`expand_staged`]) inside the private `cache_dir`: the cache root is
+/// opened component by component without following any symlink, every directory below it is
+/// created or opened through those handles (a symlinked component refuses), and each asset is
+/// written to a fresh temporary file in its final directory and renamed into place there (a
+/// symlink at the target is replaced, never followed). A target outside `cache_dir` refuses.
+pub fn stage(cache_dir: &Path, assets: &[(PathBuf, &[u8])]) -> std::io::Result<()> {
+    use std::{
+        ffi::{CString, OsStr},
+        fs::File,
+        io::Write,
+        os::unix::ffi::OsStrExt,
+        os::unix::io::{AsRawFd, FromRawFd},
+    };
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let refused =
+        |what: &str| std::io::Error::new(std::io::ErrorKind::PermissionDenied, what.to_owned());
+    if assets.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(cache_dir)?;
+    let root = std::fs::canonicalize(cache_dir)?;
     for (target, bytes) in assets {
-        let dir = target
-            .parent()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "asset path"))?;
-        std::fs::create_dir_all(dir)?;
-        let temporary = dir.join(format!(
+        let relative = target
+            .strip_prefix(cache_dir)
+            .map_err(|_| refused("asset outside the cache"))?;
+        let parts: Vec<&OsStr> = relative
+            .components()
+            .map(|part| match part {
+                Component::Normal(name) => Ok(name),
+                _ => Err(refused("asset path")),
+            })
+            .collect::<Result<_, _>>()?;
+        let Some((leaf, dirs)) = parts.split_last() else {
+            return Err(refused("asset path"));
+        };
+        let mut directory = crate::workspace::observation::open_root_directory(&root)
+            .map_err(|_| refused("cache root"))?;
+        for dir in dirs {
+            let name = CString::new(dir.as_bytes()).map_err(|_| refused("asset path"))?;
+            // SAFETY: `name` is NUL terminated and `directory` is an open directory descriptor.
+            let made = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
+            if made != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(error);
+                }
+            }
+            let next = crate::workspace::observation::open_directory(directory.as_raw_fd(), dir)
+                .map_err(|_| refused("symlinked or missing cache directory"))?;
+            // SAFETY: `open_directory` returned a new descriptor owned solely by this `File`.
+            directory = unsafe { File::from_raw_fd(next) };
+        }
+        let temporary = CString::new(format!(
             ".asset-{}-{}.tmp",
             std::process::id(),
             SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let written = (|| {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
-            file.write_all(bytes)?;
-            drop(file);
-            std::fs::rename(&temporary, target)
-        })();
+        ))
+        .expect("no NUL");
+        let leaf = CString::new(leaf.as_bytes()).map_err(|_| refused("asset path"))?;
+        // SAFETY: both names are NUL terminated; a successful descriptor is owned below.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                temporary.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o644 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the successful open returned one new owned descriptor.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let written = file.write_all(bytes).and_then(|()| {
+            // SAFETY: both names are NUL terminated and resolved relative to `directory`.
+            let renamed = unsafe {
+                libc::renameat(
+                    directory.as_raw_fd(),
+                    temporary.as_ptr(),
+                    directory.as_raw_fd(),
+                    leaf.as_ptr(),
+                )
+            };
+            if renamed == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
         if written.is_err() {
-            let _ = std::fs::remove_file(&temporary);
+            // SAFETY: removes the private temporary inside the anchored directory.
+            unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) };
         }
         written?;
     }
@@ -1357,13 +1422,25 @@ mod tests {
         let elsewhere = layout.base.join("elsewhere.js");
         std::fs::write(&elsewhere, "keep").unwrap();
         std::os::unix::fs::symlink(&elsewhere, &target).unwrap();
-        stage(&staged).unwrap();
+        stage(&layout.cache, &staged).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), ADAPTER.bytes);
         assert!(!std::fs::symlink_metadata(&target).unwrap().is_symlink());
         assert_eq!(
             std::fs::read_to_string(&elsewhere).unwrap(),
             "keep",
             "not followed"
+        );
+        let outside = layout.base.join("outside-dir");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, layout.cache.join("parent")).unwrap();
+        let nested = layout.cache.join("parent/adapter.js");
+        assert!(
+            stage(&layout.cache, &[(nested, ADAPTER.bytes)]).is_err(),
+            "a symlinked directory below the cache refuses"
+        );
+        assert!(
+            !outside.join("adapter.js").exists(),
+            "nothing written outside the cache"
         );
         const WRONG: EffectRecipe = EffectRecipe {
             assets: &[RecipeAsset {
