@@ -90,7 +90,11 @@ pub(super) fn incremental_dirs(entry: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for digest in real_subdirectories(entry) {
         for language in real_subdirectories(&digest) {
-            search(&language.join("target"), SEARCH_DEPTH, &mut found);
+            // A symlinked `target` is a caller's directory, never ours to search or empty.
+            let target = language.join("target");
+            if fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.is_dir()) {
+                search(&target, SEARCH_DEPTH, &mut found);
+            }
         }
     }
     found
