@@ -1473,3 +1473,40 @@ fn the_private_estimate_excludes_inodes_with_a_link_outside_the_family() {
         "the unpinned file is reclaimable"
     );
 }
+
+/// The session lock the sweep takes excludes a lock held the way a compiler process takes it: a
+/// POSIX `fcntl` read lock of another process on the same file.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_posix_lock_held_by_another_process_keeps_the_session() {
+    use std::io::{BufRead, Write};
+    let home = scratch("session-fcntl");
+    let lock = home.join("s-a-a1.lock");
+    fs::write(&lock, b"").unwrap();
+    // struct flock on Darwin: off_t start, off_t len, pid_t pid, short type, short whence.
+    let mut holder = std::process::Command::new("/usr/bin/perl")
+        .args([
+            "-MFcntl",
+            "-e",
+            r#"open(F, "+<", $ARGV[0]) or die; my $lock = pack("q q i s s", 0, 0, 0, F_RDLCK, 0); fcntl(F, F_SETLK, $lock) or die "lock: $!"; $| = 1; print "locked\n"; <STDIN>;"#,
+        ])
+        .arg(&lock)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(holder.stdout.as_mut().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(line, "locked\n");
+
+    assert!(
+        lock_session(&lock, true).is_none(),
+        "a compiler's lock is honoured"
+    );
+
+    holder.stdin.take().unwrap().write_all(b"\n").unwrap();
+    holder.wait().unwrap();
+    assert!(lock_session(&lock, true).is_some_and(|file| file.is_some()));
+}

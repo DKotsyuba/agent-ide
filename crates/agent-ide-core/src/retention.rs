@@ -492,7 +492,8 @@ pub struct Totals {
     pub bytes: u64,
     /// Sum of file lengths found, every link and clone counted.
     pub logical: u64,
-    /// Estimate of what the volume gets back at once if all entries went (APFS private bytes);
+    /// Estimate of what the volume gets back at once if all entries went (APFS private bytes of
+    /// inodes whose every hard link is inside the family);
     /// shown for reclaim only, never charged.
     pub private: u64,
     /// Budget in bytes, `0` for releases (no budget).

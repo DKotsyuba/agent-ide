@@ -3,8 +3,9 @@
 //!
 //! rustc keeps `incremental/<crate>-<hash>/s-<timestamp>-<random>-<svh>` (a finalized session) and
 //! `…-working` (one being written), each guarded by the sibling file `s-<timestamp>-<random>.lock`
-//! it `flock`s: exclusive while collecting or writing, shared while reading. `<timestamp>` and
-//! `<random>` are base-36, so recency is the decoded timestamp, never the directory's mtime. Only
+//! it locks (a POSIX `fcntl` lock on non-Linux Unix; the `flock` taken here excludes it on macOS,
+//! checked with a cross-process probe): exclusive while collecting or writing, shared while
+//! reading. `<timestamp>` and `<random>` are base-36, so recency is the decoded timestamp, never the directory's mtime. Only
 //! the newest finalized session of a crate is ever loaded; the rest are collected by rustc itself
 //! only when that crate is compiled again, which a retired crate never is.
 
