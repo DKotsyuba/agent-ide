@@ -142,6 +142,58 @@ pub struct TestCommandOptions {
     pub budget: Duration,
     /// Owner-scoped detail reference retaining the command's full output.
     pub detail_ref: String,
+    /// The command's environment, resolved beforehand ([`resolve_command`]).
+    pub resolution: CommandResolution,
+}
+
+/// How a test command starts inside its language environment, resolved before the run in
+/// process or by the language's module.
+#[derive(Clone, Debug, Default)]
+pub struct CommandResolution {
+    /// The resolver's command environment (argv prefix, PATH prefix, variables).
+    pub resolved: Option<crate::lang::environment::CommandEnv>,
+    /// The environment label the reply names.
+    pub environment_label: Option<String>,
+}
+
+/// Resolves `argv` from `cwd` in `root`: the building language's command environment, or for
+/// an explicit command the first language whose resolver claims its program, and the label of
+/// the environment it runs in.
+pub async fn resolve_command(
+    root: &std::path::Path,
+    cwd: &std::path::Path,
+    argv: &[String],
+    command_language: Option<Language>,
+) -> Result<CommandResolution, crate::modules::contract::ModuleUnavailable> {
+    let Some(program) = argv.first() else {
+        return Ok(CommandResolution::default());
+    };
+    let mut environment_language = command_language;
+    let mut resolved = None;
+    match command_language {
+        Some(language) => {
+            resolved = crate::modules::calls::command_env(language, root, cwd, program).await?;
+        }
+        None => {
+            for &language in crate::lang::registered() {
+                if let Some(env) =
+                    crate::modules::calls::command_env(language, root, cwd, program).await?
+                {
+                    resolved = Some(env);
+                    environment_language = Some(language);
+                    break;
+                }
+            }
+        }
+    }
+    let environment_label = match environment_language {
+        Some(language) => command_environment_label(root, cwd, language).await?,
+        None => None,
+    };
+    Ok(CommandResolution {
+        resolved,
+        environment_label,
+    })
 }
 
 /// Sends a best-effort process-group kill if daemon shutdown drops a running task.
@@ -169,6 +221,7 @@ impl Drop for KillOnDrop {
 
 impl TestRuns {
     /// Starts `argv` from `root` unless that worktree already has a live job.
+    #[cfg(test)]
     pub fn start(
         &self,
         root: PathBuf,
@@ -178,6 +231,13 @@ impl TestRuns {
         detail_ref: String,
         owner: &BindingRef,
     ) -> StartResult {
+        let resolved = argv
+            .first()
+            .and_then(|program| language.support().command_env(&root, &root, program));
+        let resolution = CommandResolution {
+            resolved,
+            environment_label: None,
+        };
         self.start_with_options(
             root.clone(),
             argv,
@@ -189,6 +249,7 @@ impl TestRuns {
                 command_language: Some(language),
                 budget,
                 detail_ref,
+                resolution,
             },
         )
     }
@@ -212,9 +273,10 @@ impl TestRuns {
             cwd,
             env,
             language,
-            command_language,
+            command_language: _,
             budget,
             detail_ref,
+            resolution,
         } = options;
         let mut state = match self.0.lock() {
             Ok(state) => state,
@@ -240,7 +302,7 @@ impl TestRuns {
             };
         };
         let lease = crate::retention::SettledLease::new(Some(lease));
-        let child = match spawn_command(&root, &cwd, &argv, &env, command_language) {
+        let child = match spawn_resolved(&root, &cwd, &argv, &env, resolution.resolved.as_ref()) {
             Ok(child) => child,
             Err(error) => {
                 lease.settled();
@@ -283,24 +345,10 @@ impl TestRuns {
                 retired: false,
             },
         );
-        let environment_language = command_language.or_else(|| {
-            argv.first().and_then(|program| {
-                crate::lang::registered()
-                    .iter()
-                    .find(|language| {
-                        language
-                            .support()
-                            .command_env(&root, &cwd, program)
-                            .is_some()
-                    })
-                    .copied()
-            })
-        });
-        let environment_label = environment_language
-            .and_then(|language| command_environment_label(&root, &cwd, language));
+        let environment_label = resolution.environment_label;
         let registry = self.0.clone();
         tokio::spawn(async move {
-            let mut result = run_child(language, budget, child).await;
+            let mut result = run_child(language, budget, child, &root).await;
             lease.settled();
             result.detail_ref = detail_ref;
             result.command = rerun_command;
@@ -701,7 +749,7 @@ async fn run(
     budget: Duration,
 ) -> RunResult {
     match spawn_command(root, root, argv, &[], Some(language)) {
-        Ok(child) => run_child(language, budget, child).await,
+        Ok(child) => run_child(language, budget, child, root).await,
         Err(error) => failed_run(budget, error.to_string()),
     }
 }
@@ -719,29 +767,31 @@ fn prepend_toolchain_path(
 
 /// Names the deepest cwd environment, or the resolver's primary root for rootless projects,
 /// only when alternatives or a stored selection make the choice relevant.
-fn command_environment_label(
+async fn command_environment_label(
     worktree: &std::path::Path,
     cwd: &std::path::Path,
     language: Language,
-) -> Option<String> {
-    let environments = language.support().environments(worktree);
-    let env = environments
+) -> Result<Option<String>, crate::modules::contract::ModuleUnavailable> {
+    let environments = crate::modules::calls::environments(language, worktree).await?;
+    let Some(env) = environments
         .iter()
         .filter(|env| cwd.starts_with(worktree.join(&env.root)))
         .max_by_key(|env| env.root.components().count())
-        .or_else(|| environments.first())?;
+        .or_else(|| environments.first())
+    else {
+        return Ok(None);
+    };
     let selected = crate::lang::environment::selections(worktree, language)
         .iter()
         .any(|selection| selection.root == env.root);
-    (env.candidates.len() > 1 || selected)
+    Ok((env.candidates.len() > 1 || selected)
         .then(|| env.chosen.as_ref().map(|chosen| chosen.label.clone()))
-        .flatten()
+        .flatten())
 }
 
-/// Spawns argv using the building language, or the first applicable resolver for an explicit
-/// command. The worktree and cwd are already admitted. Resolver variables override caller values
-/// and its prefix leads PATH. Stdin is closed, stdout/stderr captured and a private process group
-/// permits cancellation; empty argv and OS failures return errors without a child.
+/// [`spawn_resolved`] with the command environment resolved in process: the building language's,
+/// or the first applicable resolver's for an explicit command.
+#[cfg(test)]
 fn spawn_command(
     worktree: &std::path::Path,
     cwd: &std::path::Path,
@@ -749,14 +799,28 @@ fn spawn_command(
     env: &[(String, String)],
     language: Option<Language>,
 ) -> io::Result<tokio::process::Child> {
-    let Some((program, args)) = argv.split_first() else {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty argv"));
-    };
-    let resolved = match language {
+    let resolved = argv.first().and_then(|program| match language {
         Some(language) => language.support().command_env(worktree, cwd, program),
         None => crate::lang::registered()
             .iter()
             .find_map(|language| language.support().command_env(worktree, cwd, program)),
+    });
+    spawn_resolved(worktree, cwd, argv, env, resolved.as_ref())
+}
+
+/// Spawns argv in its resolved command environment. The worktree and cwd are already admitted.
+/// Resolver variables override caller values and its prefix leads PATH. Stdin is closed,
+/// stdout/stderr captured and a private process group permits cancellation; empty argv and OS
+/// failures return errors without a child.
+fn spawn_resolved(
+    _worktree: &std::path::Path,
+    cwd: &std::path::Path,
+    argv: &[String],
+    env: &[(String, String)],
+    resolved: Option<&crate::lang::environment::CommandEnv>,
+) -> io::Result<tokio::process::Child> {
+    let Some((program, args)) = argv.split_first() else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty argv"));
     };
     let mut prefix = resolved
         .as_ref()
@@ -768,7 +832,7 @@ fn spawn_command(
     command
         .args(&prefix[1..])
         .envs(env.iter().map(|(key, value)| (key, value)));
-    if let Some(resolved) = &resolved {
+    if let Some(resolved) = resolved {
         command.envs(resolved.vars.iter().map(|(key, value)| (key, value)));
         if let Some(bin) = &resolved.path_prefix {
             let caller_path = resolved
@@ -804,6 +868,7 @@ async fn run_child(
     language: Language,
     budget: Duration,
     mut child: tokio::process::Child,
+    root: &std::path::Path,
 ) -> RunResult {
     let started = tokio::time::Instant::now();
     let mut stopped = false;
@@ -852,10 +917,18 @@ async fn run_child(
     }
     let bytes = combined.lock().await.iter().copied().collect::<Vec<_>>();
     let output = String::from_utf8_lossy(&bytes).into_owned();
-    let mut report = language.support().parse_test_output(&output, "");
+    // A language module that cannot parse leaves the run with no counts, marked incomplete.
+    let parse =
+        |language: Language| crate::modules::calls::parse_test_output(language, root, &output, "");
+    let mut report = parse(language).await.unwrap_or_else(|_| TestReport {
+        incomplete: true,
+        ..TestReport::default()
+    });
     if report.passed == 0 && report.failed == 0 {
-        for candidate in crate::lang::registered() {
-            let parsed = candidate.support().parse_test_output(&output, "");
+        for &candidate in crate::lang::registered() {
+            let Ok(parsed) = parse(candidate).await else {
+                continue;
+            };
             if (report.incomplete && !parsed.incomplete)
                 || parsed.passed.saturating_add(parsed.failed)
                     > report.passed.saturating_add(report.failed)
@@ -1056,7 +1129,13 @@ mod runner_tests {
             None,
         )
         .unwrap();
-        let result = run_child(crate::lang::testing::ALPHA, Duration::from_secs(2), child).await;
+        let result = run_child(
+            crate::lang::testing::ALPHA,
+            Duration::from_secs(2),
+            child,
+            &std::env::temp_dir(),
+        )
+        .await;
         assert!(result.output.starts_with("from-env\n"), "{}", result.output);
         assert_eq!((result.report.passed, result.report.failed), (1, 0));
     }
@@ -1083,6 +1162,7 @@ mod runner_tests {
                 command_language: None,
                 budget: Duration::from_secs(10),
                 detail_ref: "rerun-detail".into(),
+                resolution: CommandResolution::default(),
             },
         );
         assert!(matches!(started, StartResult::Started(1)));
@@ -1358,8 +1438,13 @@ mod runner_tests {
                 language,
             )
             .unwrap();
-            let result =
-                run_child(crate::lang::testing::ALPHA, Duration::from_secs(2), child).await;
+            let result = run_child(
+                crate::lang::testing::ALPHA,
+                Duration::from_secs(2),
+                child,
+                &std::env::temp_dir(),
+            )
+            .await;
             assert!(
                 result.output.starts_with(&format!(
                     "resolved\n{}:/caller/bin\n",
