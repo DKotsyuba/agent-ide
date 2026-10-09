@@ -12,11 +12,13 @@
 //! - [`host`](crate::modules::host): the core-side channel of one instance.
 //! - [`fake`](crate::modules::fake): a fake module and fake host for conformance tests.
 //! - [`mode`](crate::modules::mode): the `AGENT_IDE_LANGUAGE_MODE` fallback switch.
+//! - [`recipe`](crate::modules::recipe): core expansion of effect recipes into run specifications.
 
 pub mod contract;
 pub mod fake;
 pub mod host;
 pub mod mode;
 pub mod payload;
+pub mod recipe;
 pub mod serve;
 pub mod wire;

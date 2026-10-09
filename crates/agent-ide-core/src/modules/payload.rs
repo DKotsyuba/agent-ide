@@ -711,29 +711,41 @@ pub enum EffectOutcome {
 pub enum Arg {
     /// A fixed token.
     Literal(&'static str),
-    /// The value of a named [`Param::Path`], [`Param::Token`] or [`Param::Scalar`].
+    /// The value of a named [`Param::Path`] (admitted), [`Param::Token`] or [`Param::Scalar`].
     Param(&'static str),
-    /// Every value of a named [`Param::Paths`], in order.
+    /// Every admitted value of a named [`Param::Paths`], in order.
     Each(&'static str),
     /// `--flag=<value>`-style concatenation of a literal prefix and a named parameter.
     Joined(&'static str, &'static str),
 }
 
-/// Where an admitted path may be; the core checks the canonical path (read denies always win).
+/// Where an admitted path may be. The core checks the path as given against its own resolution
+/// of each root; read denies always win.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PathRole {
-    /// Working directory; inside the worktree.
-    Cwd,
+    /// The instance's canonical worktree itself (`ModuleConfig::worktree`).
+    WorktreeRoot,
     /// Inside the canonical worktree.
     Worktree,
-    /// A file directly in the worktree or one of its canonical ancestors whose name is one of
-    /// these (manifests, configuration, toolchain files).
+    /// A file at one of these relative paths (subdirectories allowed, never `..` or absolute)
+    /// below a canonical ancestor of the worktree, the worktree itself excluded.
     AncestorFile(&'static [&'static str]),
     /// Under the real user home.
     HomeRelative,
     /// Under a root the admitted launcher configuration declares (toolchain and tool roots,
     /// accepted executables' installation prefixes).
     LauncherRoot,
+    /// The parent of the ancestor component named `stop_at` of a launcher root (for example the
+    /// directory holding a `toolchains` component).
+    LauncherRootAncestor {
+        /// Component name whose parent is admitted.
+        stop_at: &'static str,
+    },
+    /// Exactly one of these absolute paths.
+    Fixed(&'static [&'static str]),
+    /// Under a developer directory the core resolves itself (its platform tools selection,
+    /// standard install locations, or the launcher's override).
+    DeveloperDir,
     /// The private cache below the core's grant; the only writable root.
     Cache,
 }
@@ -743,11 +755,11 @@ pub enum PathRole {
 pub struct PathRule {
     /// The parameter name.
     pub param: &'static str,
-    /// Where it may be.
-    pub role: PathRole,
+    /// Where it may be: any one of these roles admits it.
+    pub roles: &'static [PathRole],
     /// Paths that do not exist are dropped instead of refusing the run.
     pub existing_only: bool,
-    /// Added to the run's read roots.
+    /// Added to the run's read roots, in rule order.
     pub read_root: bool,
 }
 
@@ -761,8 +773,8 @@ pub enum EnvRule {
         /// Value.
         value: &'static str,
     },
-    /// The value of a [`Param::Token`] or admitted [`Param::Path`]; absent when `optional` and
-    /// the parameter is missing.
+    /// The value of a [`Param::Token`], or of a [`Param::Path`] admitted by its [`PathRule`];
+    /// absent when `optional` and the parameter is missing.
     Param {
         /// Variable name.
         name: &'static str,
@@ -771,8 +783,18 @@ pub enum EnvRule {
         /// Whether the entry may be absent.
         optional: bool,
     },
+    /// `prefix` followed by an admitted path (for example `-Clinker=<path>`); absent when the
+    /// parameter is missing.
+    Joined {
+        /// Variable name.
+        name: &'static str,
+        /// Literal prefix.
+        prefix: &'static str,
+        /// Parameter name (a [`Param::Path`] with its own [`PathRule`]).
+        param: &'static str,
+    },
     /// Entries of a [`Param::Env`] whose names are `prefix` + one uppercase identifier +
-    /// `suffix` (for example `CARGO_TARGET_` … `_LINKER`); values are admitted paths.
+    /// `suffix`; each value is a path admitted under `roles`.
     Pattern {
         /// Name prefix.
         prefix: &'static str,
@@ -781,7 +803,17 @@ pub enum EnvRule {
         /// Parameter name.
         param: &'static str,
         /// How each value is admitted.
-        role: PathRole,
+        roles: &'static [PathRole],
+    },
+    /// A search path: the admitted paths of a [`Param::Paths`] followed by fixed entries, joined
+    /// with `:`.
+    SearchPath {
+        /// Variable name.
+        name: &'static str,
+        /// Parameter name (its own [`PathRule`] admits the entries).
+        param: &'static str,
+        /// Fixed trailing entries.
+        fixed: &'static [&'static str],
     },
     /// The real user home.
     Home {
@@ -790,11 +822,11 @@ pub enum EnvRule {
     },
 }
 
-/// Where a named executable comes from; the core alone resolves and pins it.
+/// Where a named executable comes from; the core alone resolves and measures it before a spawn.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SlotSource {
-    /// A program of the admitted launcher configuration (`project_checks`, provider declaration),
-    /// by its key.
+    /// A named program of the language's admitted launcher configuration, as its `describe`
+    /// answer names it ([`NamedProgram`]).
     Launcher(&'static str),
     /// A user-installed tool by name, looked up in the descriptor's home tool directories and
     /// the daemon's tool `PATH`.
@@ -926,8 +958,20 @@ pub struct LaunchDescription {
 pub struct ChecksDescription {
     /// Every declared path is absolute and normal.
     pub valid: bool,
-    /// Programs doctor probes, each with the interpreter that runs it.
-    pub programs: Vec<(PathBuf, Option<PathBuf>)>,
+    /// The section's named programs: what doctor probes and what recipe slots name.
+    pub programs: Vec<NamedProgram>,
+}
+
+/// One named program of a launcher section.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedProgram {
+    /// Slot name ([`SlotSource::Launcher`]).
+    pub name: String,
+    /// Absolute program path.
+    pub path: PathBuf,
+    /// The interpreter that runs it when it is not directly executable.
+    pub interpreter: Option<PathBuf>,
 }
 
 // ---- linkage/0 ----
@@ -1339,6 +1383,7 @@ mod tests {
         };
         assert_eq!(decode::<DescribeQuery>(encode(&query)), Ok(query));
         let config = crate::modules::contract::ModuleConfig {
+            worktree: Some("/w".into()),
             provider: None,
             checks: Some(serde_json::json!({})),
             env: BTreeMap::from([("AGENT_IDE_HOME".to_owned(), "/h".to_owned())]),

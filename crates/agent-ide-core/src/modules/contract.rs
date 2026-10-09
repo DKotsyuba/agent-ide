@@ -160,7 +160,9 @@ pub enum Capability {
     #[serde(rename = "linkage")]
     Linkage,
     /// Interpretation of the language's launcher configuration and presence before or outside
-    /// a session (launcher parse, doctor, check scheduling).
+    /// a session (launcher parse, doctor, check scheduling). Describe and validate are typed
+    /// requests after the transport `hello` and before any session; a dependency failure while
+    /// answering one is [`ErrorCode::Unavailable`] with its stage and cause.
     #[serde(rename = "describe")]
     Describe,
 }
@@ -278,6 +280,8 @@ pub struct HelloOffer {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleConfig {
+    /// The absolute canonical admitted root of this instance's scope.
+    pub worktree: Option<std::path::PathBuf>,
     /// The language's accepted provider declaration (executable, toolchain, trust, cache
     /// namespace and its raw option fields), when one is configured.
     pub provider: Option<Value>,
@@ -623,7 +627,8 @@ pub enum Control {
     Hello(HelloOffer),
     /// Module accepts it.
     HelloReply(HelloReply),
-    /// Module refuses it (incompatible identity, version, role or configuration) and exits.
+    /// Module refuses it and exits: only for a transport-level identity, version, role or
+    /// configuration-shape refusal, never for a language or dependency answer.
     HelloRefused {
         /// Sanitized reason.
         reason: String,
