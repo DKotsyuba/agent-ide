@@ -9,6 +9,7 @@ use agent_ide_core::lang::{Language, LanguageDescriptor};
 
 pub mod backend;
 pub mod checks;
+pub mod module;
 pub mod names;
 pub mod profile;
 pub mod support;

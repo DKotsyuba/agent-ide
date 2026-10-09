@@ -650,7 +650,7 @@ async fn serve_bundled_module(language: &str, role: &str) -> ExitCode {
     let served = match language {
         "python" => agent_ide_lang_python::module::serve(role).await,
         "rust" => serve_stdio(support, role).await,
-        "typescript" => serve_stdio(support, role).await,
+        "typescript" => agent_ide_lang_typescript::module::serve(role).await,
         "html" => serve_stdio(support, role).await,
         "css" => serve_stdio(support, role).await,
         _ => return ExitCode::from(2),

@@ -76,8 +76,10 @@ pub mod languages {
     pub const SHIPPED_MODULES: [&str; 3] = ["python", "html", "css"];
 
     /// Each language's effect recipes: the only processes its module may ask the core to run.
-    pub static RECIPES: [(&str, &[agent_ide_core::modules::payload::EffectRecipe]); 1] =
-        [("python", agent_ide_lang_python::module::RECIPES)];
+    pub static RECIPES: [(&str, &[agent_ide_core::modules::payload::EffectRecipe]); 2] = [
+        ("python", agent_ide_lang_python::module::RECIPES),
+        ("typescript", agent_ide_lang_typescript::module::RECIPES),
+    ];
 
     /// Each language's module environment: the only variables its cleared module process (and
     /// `hello.config.env`) receives from the daemon.

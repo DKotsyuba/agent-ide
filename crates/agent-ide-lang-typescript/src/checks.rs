@@ -59,6 +59,9 @@ pub struct TypeScriptChecker {
     tsc_cli: PathBuf,
     /// Maximum wall time for one confined CLI run.
     timeout: Duration,
+    /// Whether this checker writes the adapter and the temporary directory into the cache itself
+    /// (the in-process checker does; in module mode the core stages both before the run).
+    stages: bool,
 }
 
 impl TypeScriptChecker {
@@ -74,7 +77,16 @@ impl TypeScriptChecker {
             node,
             tsc_cli,
             timeout,
+            stages: true,
         }
+    }
+
+    /// The same checker without any cache write of its own: the run's host stages the adapter and
+    /// the temporary directory (module mode, where the core owns every write).
+    #[must_use]
+    pub fn without_staging(mut self) -> Self {
+        self.stages = false;
+        self
     }
 
     /// Describes one CLI run with writes restricted to `request.cache_dir`.
@@ -185,14 +197,14 @@ impl Checker for TypeScriptChecker {
                     generation,
                 );
             };
-            if fs::create_dir_all(request.cache_dir.join("tmp")).is_err() {
+            if self.stages && fs::create_dir_all(request.cache_dir.join("tmp")).is_err() {
                 return ProblemSnapshot::unavailable(
                     crate::LANGUAGE,
                     UnavailableReason::Fatal,
                     generation,
                 );
             }
-            if stage_adapter(&request.cache_dir).is_err() {
+            if self.stages && stage_adapter(&request.cache_dir).is_err() {
                 return ProblemSnapshot::unavailable(
                     crate::LANGUAGE,
                     UnavailableReason::Fatal,
