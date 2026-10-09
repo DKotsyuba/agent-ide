@@ -73,7 +73,7 @@ pub mod languages {
 
     /// Languages whose bundled module ships default-on in this release; the others compute in
     /// process. `AGENT_IDE_LANGUAGE_MODE=<id>=in_process` sends a shipped one back.
-    pub const SHIPPED_MODULES: [&str; 1] = ["python"];
+    pub const SHIPPED_MODULES: [&str; 3] = ["python", "html", "css"];
 
     /// Each language's effect recipes: the only processes its module may ask the core to run.
     pub static RECIPES: [(&str, &[agent_ide_core::modules::payload::EffectRecipe]); 1] =

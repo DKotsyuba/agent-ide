@@ -384,8 +384,9 @@ fn collect_git(root: &Path) -> Option<GitState> {
 /// up-to-date readiness/problem summary. Everything else — git state, layout, per-language file
 /// and line counts, and doc paths — comes from one walk of the tree done here.
 /// The card's `links:` line when a detected language states cross-language name facts: the
-/// namespaces those languages cover (ids without their version) and the languages, in
-/// registration order (`links: class, id facts from alpha, beta`).
+/// name namespaces those languages cover (ids without their version) and the languages, in
+/// registration order (`links: class, id facts from alpha, beta`). Path-keyed namespaces (file
+/// references) are relations between files, not names, and stay out of the line.
 pub fn links_line(languages: &[LanguageProject]) -> Option<String> {
     let mut namespaces: Vec<&str> = Vec::new();
     let mut ids: Vec<&str> = Vec::new();
@@ -394,7 +395,11 @@ pub fn links_line(languages: &[LanguageProject]) -> Option<String> {
             continue;
         };
         ids.push(project.language.name());
-        for coverage in names.coverage() {
+        for coverage in names
+            .coverage()
+            .iter()
+            .filter(|coverage| !coverage.namespace.path_keys())
+        {
             let id = coverage
                 .namespace
                 .id()
