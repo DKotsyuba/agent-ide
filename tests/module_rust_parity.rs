@@ -1144,6 +1144,43 @@ async fn the_module_process_starts_rust_analyzer_within_hello() {
         );
         assert!(Instant::now() < deadline, "never ready");
     }
+    // A symbol context answers like the in-process exchange: no wait for diagnostics a
+    // byte-offset query never asked for, well inside the core's module call budget.
+    let (_, lib) = PARITY_FILES
+        .iter()
+        .find(|(path, _)| *path == "src/lib.rs")
+        .unwrap();
+    let asked = Instant::now();
+    let reply = channel
+        .call(
+            Call {
+                capability: Capability::Semantic,
+                scope_key: "scope".into(),
+                revision_key: "revision".into(),
+                payload: encode(&SemanticQuery::Context {
+                    source: agent_ide_core::modules::payload::SourceRef {
+                        path: "src/lib.rs".into(),
+                        revision: "r1".into(),
+                        text: agent_ide_core::modules::payload::SourceText::Inline(
+                            (*lib).to_owned(),
+                        ),
+                    },
+                    byte_offset: Some(HELPER_CALL_OFFSET as u64),
+                }),
+                attachments: Vec::new(),
+            },
+            Duration::from_secs(30),
+            &mut NoEffects,
+        )
+        .await
+        .unwrap();
+    eprintln!("symbol context after {:?}", asked.elapsed());
+    assert!(matches!(reply.outcome, Outcome::Result(_)), "{reply:?}");
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "a symbol context waited {:?}",
+        asked.elapsed()
+    );
 }
 
 /// Opaque references are masked wherever a structured reply carries them; nulls and other
