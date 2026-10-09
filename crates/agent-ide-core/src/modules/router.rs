@@ -71,6 +71,30 @@ struct SlotState {
 /// One supervised slot.
 type Slot = Arc<SlotState>;
 
+/// One caller counted as waiting for a slot until dropped, so a cancelled caller never leaks its
+/// place in the bounded queue.
+struct Waiter<'a> {
+    /// The slot's waiter count.
+    count: &'a std::sync::atomic::AtomicU32,
+    /// Callers already waiting when this one entered.
+    ahead: u32,
+}
+
+impl<'a> Waiter<'a> {
+    /// Counts one more waiter on `count`.
+    fn enter(count: &'a std::sync::atomic::AtomicU32) -> Self {
+        let ahead = count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self { count, ahead }
+    }
+}
+
+impl Drop for Waiter<'_> {
+    /// Gives the place back.
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// The daemon's module routing state.
 pub struct ModuleHost {
     /// The pinned executable, `None` when it could not be measured (everything stays in process).
@@ -355,10 +379,8 @@ impl ModuleHost {
         // One deadline covers the wait for the instance and the call itself.
         let deadline = tokio::time::Instant::now() + budget;
         let slot = self.slot(language, worktree, role).await?;
-        let queued = slot
-            .waiting
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        let waited = if queued >= QUEUE_DEPTH {
+        let waiter = Waiter::enter(&slot.waiting);
+        let waited = if waiter.ahead >= QUEUE_DEPTH {
             Err(Stage::Admission)
         } else {
             tokio::select! {
@@ -368,8 +390,7 @@ impl ModuleHost {
                 _ = slot.stopping.cancelled() => Err(Stage::Request),
             }
         };
-        slot.waiting
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        drop(waiter);
         let mut supervisor = match waited {
             Ok(supervisor) => supervisor,
             Err(Stage::Admission) => {

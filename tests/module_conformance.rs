@@ -392,6 +392,19 @@ async fn waiters_are_bounded_and_a_stop_cancels_them() {
         (Stage::Admission, Cause::ResourceLimit),
         "{busy}"
     );
+    // Cancelled waiters give their places back: eight fresh callers wait again, none is busy.
+    for waiter in &waiters {
+        waiter.abort();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let waiters: Vec<_> = (0..8)
+        .map(|_| call(host.clone(), scratch.0.clone()))
+        .collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        waiters.iter().all(|waiter| !waiter.is_finished()),
+        "the full queue capacity is available again"
+    );
     let started = std::time::Instant::now();
     host.stop_all().await;
     assert!(
