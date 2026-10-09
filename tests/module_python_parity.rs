@@ -547,3 +547,38 @@ async fn python_module_measure() {
     )
     .unwrap();
 }
+
+/// The Pyright-hosting module shares the supervised slots' restart policy: after the initial
+/// start and three restarts within the window, the next call is refused `restart_exhausted`
+/// (typed, on the same daemon) instead of starting a fifth module.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT, AGENT_IDE_NODE and AGENT_IDE_PYTHON environments"]
+async fn python_analyzer_crash_loop_exhausts_the_restart_budget() {
+    let fixture = python_fixture("module-crash-loop-cache", None);
+    let mut daemon = Daemon::start(&fixture, &[]).await;
+    let daemon_pid = daemon.pid();
+    let mut session = Session::start(&fixture).await;
+    let usages = json!({"symbol":"helper.py#double"});
+    for attempt in 0..4 {
+        let reply = session.call(&fixture, "ide.symbol", usages.clone()).await;
+        assert_eq!(reply["kind"], "symbol", "attempt {attempt}: {reply}");
+        let module = provider_module(&mut daemon).expect("a Pyright module runs");
+        // SAFETY: the exact module identity captured as a child of this test's daemon.
+        unsafe { libc::kill(module.id.pid, libc::SIGKILL) };
+        assert!(module.id.gone().await);
+        // Let each backoff (250 ms, 1 s, 4 s) pass so the next start really happens.
+        tokio::time::sleep(Duration::from_millis([300, 1100, 4100, 0][attempt])).await;
+    }
+    let refused = session.call(&fixture, "ide.symbol", usages.clone()).await;
+    assert_eq!(refused["code"], "provider_unavailable", "{refused}");
+    assert!(
+        refused.to_string().contains("restart_exhausted"),
+        "the refusal names the exhausted budget: {refused}"
+    );
+    assert!(
+        provider_module(&mut daemon).is_none(),
+        "no fifth module started"
+    );
+    assert_eq!(daemon.pid(), daemon_pid, "same daemon");
+    session.close(&fixture).await;
+}

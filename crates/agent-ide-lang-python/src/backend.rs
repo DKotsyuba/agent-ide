@@ -170,8 +170,35 @@ struct PyrightLive {
     /// Pyright runs in the analyzer module, which resolved the interpreter and summarized a
     /// missing environment's import flood itself.
     in_module: bool,
+    /// The accepted inputs (module executable digest and settings) a module session started
+    /// with, against which its failures count.
+    module_inputs: Option<String>,
     /// Shared-resolver identity of that environment; a different identity at use restarts.
     environment: String,
+}
+
+/// Counts one failure of a Python analyzer module started with `inputs` against the shared
+/// restart policy (`exited` when no typed failure is known).
+fn record_module_failure(
+    worktree: &std::path::Path,
+    inputs: &str,
+    failure: Option<agent_ide_core::modules::contract::ModuleUnavailable>,
+) {
+    let failure = failure.unwrap_or(agent_ide_core::modules::contract::ModuleUnavailable {
+        module_id: agent_ide_core::modules::contract::ModuleId::bundled(crate::DESCRIPTOR.id),
+        module_version: env!("CARGO_PKG_VERSION").to_owned(),
+        role: agent_ide_core::modules::contract::Role::Analyzer,
+        stage: agent_ide_core::modules::contract::Stage::Request,
+        cause: agent_ide_core::modules::contract::Cause::Exited,
+        instance: None,
+        retry_after_ms: None,
+    });
+    agent_ide_core::modules::analyzer::record_failure(
+        crate::DESCRIPTOR.id,
+        worktree,
+        inputs,
+        &failure,
+    );
 }
 
 /// The identity of the module's environment resolutions of `worktree` (every project root's),
@@ -243,6 +270,13 @@ impl PyrightBackend {
         }) {
             return Ok(());
         }
+        // A module session that died counts against the shared restart policy.
+        if let Some(entry) = self.live.get(&binding)
+            && let Some(inputs) = &entry.module_inputs
+            && !entry.live.is_alive()
+        {
+            record_module_failure(worktree_path, inputs, entry.live.module_unavailable());
+        }
         self.release(host, &binding).await;
         let authority = host.authority(&binding).await?;
         let cache_namespace = host.cache_namespace(&binding, &authority, launch, &launch.trust)?;
@@ -265,6 +299,28 @@ impl PyrightBackend {
             trust: launch.trust.clone(),
             cache_namespace: cache_namespace.clone(),
         };
+        let module_inputs = module.as_ref().map(|executable| {
+            format!(
+                "{}:{}",
+                executable.digest.to_hex(),
+                serde_json::json!(settings)
+            )
+        });
+        if let Some(inputs) = &module_inputs
+            && let Err(failure) = agent_ide_core::modules::analyzer::start_permit(
+                crate::DESCRIPTOR.id,
+                worktree_path,
+                inputs,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+        {
+            job.set_stage_failure(
+                &FailureCode::ProviderUnavailable,
+                &format!("python: {failure}"),
+            );
+            return Err(FailureCode::ProviderUnavailable);
+        }
         let module_program = module.as_ref().map(|executable| AcceptedExecutable {
             path: executable.path.clone(),
             identity: "agent-ide-module".to_owned(),
@@ -435,20 +491,34 @@ impl PyrightBackend {
                         live,
                         interpreter,
                         in_module: module.is_some(),
+                        module_inputs,
                         environment,
                     },
                 );
                 Ok(())
             }
-            Err(_) => {
+            Err(error) => {
                 self.reap(host, &binding, child, view).await;
                 if job.cancelled() {
                     Err(FailureCode::Cancelled)
                 } else {
-                    job.set_stage_failure(
-                        &FailureCode::ProviderUnavailable,
-                        "python: initialize failed",
-                    );
+                    let typed = error
+                        .get_ref()
+                        .and_then(|inner| {
+                            inner.downcast_ref::<agent_ide_core::modules::contract::ModuleUnavailable>()
+                        })
+                        .cloned();
+                    let stage = match (&module_inputs, &typed) {
+                        (Some(inputs), _) => {
+                            record_module_failure(worktree_path, inputs, typed.clone());
+                            typed.map_or_else(
+                                || "python: initialize failed".to_owned(),
+                                |failure| format!("python: {failure}"),
+                            )
+                        }
+                        (None, _) => "python: initialize failed".to_owned(),
+                    };
+                    job.set_stage_failure(&FailureCode::ProviderUnavailable, &stage);
                     Err(FailureCode::ProviderUnavailable)
                 }
             }
@@ -482,6 +552,13 @@ impl PyrightBackend {
             // A module fault is a typed refusal naming it, never a quiet lexical answer; the
             // next call starts a fresh module.
             if let Some(fault) = entry.live.remote_fault().map(str::to_owned) {
+                if let Some(inputs) = &entry.module_inputs {
+                    record_module_failure(
+                        source.worktree().worktree_path(),
+                        inputs,
+                        entry.live.module_unavailable(),
+                    );
+                }
                 self.release(host, &binding).await;
                 job.set_stage_failure(
                     &FailureCode::ProviderUnavailable,
