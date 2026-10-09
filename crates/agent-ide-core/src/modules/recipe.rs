@@ -15,7 +15,8 @@ use std::{
 };
 
 use super::payload::{
-    Arg, EffectRecipe, EffectRequest, EnvRule, Param, PathRole, PathRule, SlotSource,
+    Arg, ChecksDescription, EffectRecipe, EffectRequest, EnvRule, Param, PathRole, PathRule,
+    SlotSource,
 };
 use crate::{checks::runner::RunSpec, execution::seatbelt::ReadDeny};
 
@@ -190,13 +191,12 @@ fn admit_rule(
         if !admission.admits_given(rule.roles, path) {
             return Err(Refusal::OutOfRule(rule.param.to_owned(), path.clone()));
         }
-        // A missing, denied or out-of-root-resolving optional file is simply not read; a required
-        // one refuses.
-        if rule.existing_only
-            && (admission.denied(path)
-                || std::fs::symlink_metadata(path).is_err()
-                || !admission.admits_target(rule.roles, path))
-        {
+        // An optional file is read exactly when today's in-process check reads it, and never
+        // when a deny matches it as given or as resolved; a required path refuses instead.
+        if rule.existing_only {
+            if !admission.denied(path) && optional_file(path, admission.read_denies) {
+                admitted.push(path.clone());
+            }
             continue;
         }
         if !admission.admits_target(rule.roles, path) {
@@ -210,6 +210,17 @@ fn admit_rule(
     Ok(Some(admitted))
 }
 
+/// Today's predicate for an optional auxiliary file (an ancestor manifest, a tool's ignore
+/// file): with no host denies, a regular file, a symlink to one included; with any deny, a
+/// regular file that is not itself a symlink and that no deny matches as given.
+fn optional_file(path: &Path, denies: &[ReadDeny]) -> bool {
+    if denies.is_empty() {
+        return path.is_file();
+    }
+    !denies.iter().any(|deny| deny.matches(path))
+        && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
 /// Whether `name` is `prefix` + an uppercase identifier + `suffix`.
 fn pattern_name(name: &str, prefix: &str, suffix: &str) -> bool {
     name.strip_prefix(prefix)
@@ -220,6 +231,57 @@ fn pattern_name(name: &str, prefix: &str, suffix: &str) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
         })
+}
+
+/// What a language's `describe` answer for its launcher section contributes to an [`Admission`]:
+/// its named programs as executable slots, its launcher roots and its developer-directory
+/// overrides. The core takes these from the answer and never parses a section itself; it may
+/// append its own platform developer directories.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Described {
+    /// Executable slots by name.
+    pub programs: Vec<(String, PathBuf)>,
+    /// [`PathRole::LauncherRoot`] roots.
+    pub launcher_roots: Vec<PathBuf>,
+    /// [`PathRole::DeveloperDir`] directories.
+    pub developer_dirs: Vec<PathBuf>,
+}
+
+impl Described {
+    /// The admission inputs of `description`.
+    pub fn new(description: &ChecksDescription) -> Self {
+        Self {
+            programs: description
+                .programs
+                .iter()
+                .map(|program| (program.name.clone(), program.path.clone()))
+                .collect(),
+            launcher_roots: description.launcher_roots.clone(),
+            developer_dirs: description.developer_dirs.clone(),
+        }
+    }
+
+    /// The admission of one run in `worktree` with the private `cache_dir`, the host
+    /// `read_denies`, the real `home` and the request's `timeout`.
+    pub fn admission<'a>(
+        &'a self,
+        worktree: &'a Path,
+        cache_dir: &'a Path,
+        read_denies: &'a [ReadDeny],
+        home: Option<&'a Path>,
+        timeout: Duration,
+    ) -> Admission<'a> {
+        Admission {
+            worktree,
+            cache_dir,
+            read_denies,
+            home,
+            launcher_roots: &self.launcher_roots,
+            developer_dirs: &self.developer_dirs,
+            programs: &self.programs,
+            timeout,
+        }
+    }
 }
 
 /// Expands `effect` with its recipe from `recipes` under `admission`.
@@ -289,12 +351,16 @@ pub fn expand(
             let name = match declared_slot.source {
                 SlotSource::Launcher(name) | SlotSource::HomeTool(name) => name,
             };
-            admission
+            let program = admission
                 .programs
                 .iter()
                 .find(|(resolved, _)| resolved == name)
                 .map(|(_, path)| path.clone())
-                .ok_or_else(|| Refusal::UnknownSlot(slot.clone()))?
+                .ok_or_else(|| Refusal::UnknownSlot(slot.clone()))?;
+            if admission.denied(&program) {
+                return Err(Refusal::Denied(recipe.program.to_owned(), program));
+            }
+            program
         }
         Some(Param::Path(_)) => single(recipe.program)?
             .map(PathBuf::from)
@@ -530,10 +596,11 @@ mod tests {
                 existing_only: false,
                 read_root: true,
             },
+            // The module names exactly the developer roots that exist, as today's resolver does.
             PathRule {
                 param: "developer",
                 roles: &[PathRole::DeveloperDir],
-                existing_only: true,
+                existing_only: false,
                 read_root: true,
             },
             PathRule {
@@ -736,16 +803,31 @@ mod tests {
     /// The expansion equals the hand-built run specification today's in-process check builds for
     /// the same inputs: program, arguments, environment order, read roots (existing ancestor
     /// files only), private cache, timeout ceiling and capture.
+    /// The admission comes from the module's `describe` answer for the section (Describe →
+    /// Admission → expansion): named programs, launcher roots, developer directories.
     #[test]
     fn expansion_equals_the_in_process_specification() {
         let layout = Layout::new("equal");
-        let programs = [("cargo".to_owned(), layout.toolchain.join("bin/cargo"))];
-        let roots = [layout.toolchain.clone()];
-        let dev = [layout.developer.clone()];
+        let described = Described::new(&ChecksDescription {
+            valid: true,
+            programs: vec![crate::modules::payload::NamedProgram {
+                name: "cargo".into(),
+                path: layout.toolchain.join("bin/cargo"),
+                interpreter: None,
+            }],
+            launcher_roots: vec![layout.toolchain.clone()],
+            developer_dirs: vec![layout.developer.clone()],
+        });
         let spec = expand(
             &[CHECK],
             &layout.effect(),
-            &layout.admission(&programs, &roots, &dev),
+            &described.admission(
+                &layout.worktree,
+                &layout.cache,
+                &[],
+                Some(&layout.home),
+                Duration::from_secs(1200),
+            ),
         )
         .unwrap();
         let clang = layout.developer.join("usr/bin/clang").display().to_string();
@@ -862,10 +944,11 @@ mod tests {
         ));
     }
 
-    /// Paths are admitted both as given and as they resolve: a symlink inside an admitted root
-    /// that leads outside it is refused, a symlinked optional ancestor file leading outside is not
-    /// read, and a read deny on the resolved target wins (environment values included). A cache
-    /// path that does not exist yet is still admitted through its existing parents.
+    /// A required path through a symlink inside its admitted root that leads outside it is
+    /// refused; an optional ancestor file follows today's rule (a symlink is read with no deny,
+    /// not read with any deny); a read deny on the given or resolved path wins (environment
+    /// values included). A cache path that does not exist yet is still admitted through its
+    /// existing parents.
     #[test]
     fn symlinks_cannot_leave_their_roots() {
         let layout = Layout::new("links");
@@ -901,10 +984,25 @@ mod tests {
         inside.params.remove("linker");
         let spec = expand(&[CHECK], &inside, &admission).unwrap();
         assert!(
+            spec.read_roots
+                .contains(&layout.base.join("outer/.cargo/config.toml")),
+            "with no deny a symlinked ancestor file is read, exactly as today"
+        );
+        let unrelated = [ReadDeny::Path(layout.base.join("unrelated"))];
+        let spec = expand(
+            &[CHECK],
+            &inside,
+            &Admission {
+                read_denies: &unrelated,
+                ..admission.clone()
+            },
+        )
+        .unwrap();
+        assert!(
             !spec
                 .read_roots
                 .contains(&layout.base.join("outer/.cargo/config.toml")),
-            "a symlinked ancestor file leading outside is not read"
+            "with any deny a symlinked ancestor file is not read, exactly as today"
         );
         let mut env = inside.clone();
         env.params.insert(
@@ -932,6 +1030,44 @@ mod tests {
                 Err(Refusal::Denied(name, _)) if name == "cargo_home"
             ),
             "a read deny wins"
+        );
+    }
+
+    /// An optional ancestor file is a file: a directory named like one is not read. A named
+    /// program the host denies is refused before any specification exists.
+    #[test]
+    fn optional_files_are_files_and_denied_programs_refuse() {
+        let layout = Layout::new("files");
+        std::fs::create_dir_all(layout.base.join("outer/.cargo/config.toml")).unwrap();
+        let programs = [("cargo".to_owned(), layout.toolchain.join("bin/cargo"))];
+        let roots = [layout.toolchain.clone()];
+        let dev = [layout.developer.clone()];
+        let admission = layout.admission(&programs, &roots, &dev);
+        let spec = expand(&[CHECK], &layout.effect(), &admission).unwrap();
+        assert!(
+            !spec
+                .read_roots
+                .contains(&layout.base.join("outer/.cargo/config.toml")),
+            "a directory named like an ancestor file is not read"
+        );
+        assert!(
+            spec.read_roots
+                .contains(&layout.base.join("outer/Cargo.toml"))
+        );
+        let denies = [ReadDeny::Path(layout.toolchain.join("bin/cargo"))];
+        assert!(
+            matches!(
+                expand(
+                    &[CHECK],
+                    &layout.effect(),
+                    &Admission {
+                        read_denies: &denies,
+                        ..admission.clone()
+                    }
+                ),
+                Err(Refusal::Denied(name, _)) if name == "cargo"
+            ),
+            "a denied named program is refused"
         );
     }
 

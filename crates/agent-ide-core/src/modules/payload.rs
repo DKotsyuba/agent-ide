@@ -757,7 +757,10 @@ pub struct PathRule {
     pub param: &'static str,
     /// Where it may be: any one of these roles admits it.
     pub roles: &'static [PathRole],
-    /// Paths that do not exist are dropped instead of refusing the run.
+    /// An optional file: read exactly when today's in-process check reads it (a regular file, a
+    /// symlink to one included; with any host deny, only a regular file that is not itself a
+    /// symlink) and never when a deny matches it as given or as resolved; otherwise it is simply
+    /// not read instead of refusing the run.
     pub existing_only: bool,
     /// Added to the run's read roots, in rule order.
     pub read_root: bool,
@@ -960,6 +963,12 @@ pub struct ChecksDescription {
     pub valid: bool,
     /// The section's named programs: what doctor probes and what recipe slots name.
     pub programs: Vec<NamedProgram>,
+    /// The roots the section declares ([`PathRole::LauncherRoot`]): toolchain and tool roots,
+    /// accepted executables' installation prefixes. The core never parses a section itself.
+    pub launcher_roots: Vec<PathBuf>,
+    /// Developer directories the section names as an override ([`PathRole::DeveloperDir`]);
+    /// the core adds its own platform resolution.
+    pub developer_dirs: Vec<PathBuf>,
 }
 
 /// One named program of a launcher section.

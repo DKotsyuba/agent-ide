@@ -365,6 +365,8 @@ impl FakeModule {
                     encode(&Ok::<ChecksDescription, String>(ChecksDescription {
                         valid: true,
                         programs: Vec::new(),
+                        launcher_roots: Vec::new(),
+                        developer_dirs: Vec::new(),
                     }))
                 }
                 DescribeQuery::Presence { .. } => json!(true),
