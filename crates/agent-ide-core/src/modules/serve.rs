@@ -279,6 +279,85 @@ pub trait ModuleServer: Send {
     ) -> impl Future<Output = Result<Answer, ServeError>> + Send + 'a;
 }
 
+/// Test seam `<kind>:<capability>:<flag file>`: the module misbehaves once on `capability` when it
+/// can remove the flag file. Kinds: `exit`, `stall`, `late` (answers after 3 s), `malformed`,
+/// `oversize`, `wrong-fence`, `truncate` (declares 4 attachment bytes, sends 2, exits),
+/// `stderr-flood` (1 MiB on stderr, then answers nothing and stalls) and `orphan` (leaves a
+/// TERM-resistant descendant in its group, then exits). Honoured only in `test-seams` builds.
+pub const FAULT_SEAM: &str = "AGENT_IDE_TEST_MODULE_FAULT";
+
+/// The one-time fault the seam selects for `capability`, consumed when its flag file is removed.
+fn fault_seam(capability: Capability) -> Option<String> {
+    let value = crate::test_seams::var(FAULT_SEAM)?;
+    let mut parts = value.splitn(3, ':');
+    let (kind, target, flag) = (parts.next()?, parts.next()?, parts.next()?);
+    let name = serde_json::to_value(capability).ok()?;
+    (name.as_str() == Some(target) && std::fs::remove_file(flag).is_ok()).then(|| kind.to_owned())
+}
+
+/// Acts out a seam-selected fault for the request `fence`.
+async fn act_fault(kind: &str, io: &mut ModuleIo, fence: &Fence) -> Result<(), ServeError> {
+    use tokio::io::AsyncWriteExt;
+    match kind {
+        "malformed" => {
+            let _ = io.output.write_all(b"\0\0\0\x06\0{not}").await;
+        }
+        "oversize" => {
+            let _ = io.output.write_all(&u32::MAX.to_be_bytes()).await;
+        }
+        "wrong-fence" | "late" | "truncate" => {
+            if kind == "late" {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+            let mut fence = fence.clone();
+            if kind == "wrong-fence" {
+                fence.request_id += 1;
+            }
+            let declared = if kind == "truncate" {
+                vec![AttachmentDecl {
+                    id: 1,
+                    length: 4,
+                    content_type: "application/octet-stream".into(),
+                }]
+            } else {
+                Vec::new()
+            };
+            let response = Control::Response(Response {
+                fence: fence.clone(),
+                outcome: Outcome::Result(Value::Null),
+                body_attachment: None,
+                readiness: Readiness::Ready,
+                coverage: Coverage::Complete,
+                attachments: declared,
+            });
+            write_control(&mut io.output, &response).await?;
+            if kind == "truncate" {
+                write_attachment(&mut io.output, fence.request_id, 1, b"ab").await?;
+                return Err(ServeError::Protocol("truncated by seam".into()));
+            }
+            return Ok(());
+        }
+        "stderr-flood" => {
+            let mut stderr = tokio::io::stderr();
+            let _ = stderr.write_all(&vec![b'x'; 1 << 20]).await;
+        }
+        "orphan" => {
+            let _ = std::process::Command::new("/bin/sh")
+                .args(["-c", "trap '' TERM; exec sleep 600"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            return Err(ServeError::Protocol("orphaned by seam".into()));
+        }
+        "exit" => return Err(ServeError::Protocol("exited by seam".into())),
+        _ => {}
+    }
+    let _ = io.output.flush().await;
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
 /// Serves one instance of `server` in `role` on `input`/`output` until the core shuts it down or
 /// closes the stream (`Ok`), or a fault ends it (`Err`).
 pub async fn serve<S: ModuleServer>(
@@ -349,6 +428,10 @@ pub async fn serve<S: ModuleServer>(
         }
         last_request = request.fence.request_id;
         let fence = request.fence.clone();
+        if let Some(kind) = fault_seam(request.capability) {
+            act_fault(&kind, &mut io, &fence).await?;
+            continue;
+        }
         let answer = if request.capability_version != 0 {
             Answer::error(ErrorCode::InvalidRequest, "unknown capability version")
         } else if supported.get(&request.capability) != Some(&Support::Supported) {

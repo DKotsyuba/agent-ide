@@ -16,6 +16,7 @@
 //! - [`runtime`](crate::modules::runtime): supervision of one instance slot.
 //! - [`launch`](crate::modules::launch): the Execution-admitted launcher of the pinned executable.
 //! - [`adapter`](crate::modules::adapter): the module-side server of a language's own support.
+//! - [`router`](crate::modules::router): daemon-side routing in process or to a module.
 //!
 //! # Growth beyond version 0: linters and debugging
 //!
@@ -44,6 +45,7 @@ pub mod launch;
 pub mod mode;
 pub mod payload;
 pub mod recipe;
+pub mod router;
 pub mod runtime;
 pub mod serve;
 pub mod wire;
