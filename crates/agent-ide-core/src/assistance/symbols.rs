@@ -144,8 +144,19 @@ impl Worker<'_> {
             let relative = directory
                 .strip_prefix(&root)
                 .map_err(|_| FailureCode::OutsideAllowedRoots)?;
-            let text = render::directory_outline(&root, relative)
-                .map_err(|_| FailureCode::SourceUnavailable)?;
+            let text = match render::directory_outline(&root, relative).await {
+                Ok(text) => text,
+                Err(error) => {
+                    return Err(
+                        match error.get_ref().and_then(|inner| {
+                            inner.downcast_ref::<crate::modules::contract::ModuleUnavailable>()
+                        }) {
+                            Some(failure) => module_failure(job, failure),
+                            None => FailureCode::SourceUnavailable,
+                        },
+                    );
+                }
+            };
             let (reply, page) =
                 ContextPageState::new(text, 0, false, ResultKind::Outline).next(&job.reference)?;
             self.shared.set_context_page(&job.reference, page);

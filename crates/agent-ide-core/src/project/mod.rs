@@ -142,9 +142,9 @@ pub struct ProjectCard {
     /// provider for that kind. Fields the block does not name stay `None` and fall back to the
     /// per-language merge as before.
     pub agent_commands: ProjectCommands,
-    /// Each detected language's resolved environments when the caller computed them (in
-    /// process or by the language's module); `None` resolves them in process while rendering.
-    pub environments: Option<Vec<(Language, Vec<crate::lang::environment::ResolvedEnv>)>>,
+    /// Each detected language's resolved environments, computed by the caller where the language
+    /// computes (in process or by its module); a language absent here renders its generic facts.
+    pub environments: Vec<(Language, Vec<crate::lang::environment::ResolvedEnv>)>,
 }
 
 /// Mutable state threaded through the recursive walk in [`scan_dir`].
@@ -456,7 +456,7 @@ pub fn collect(
         problems,
         truncated: state.truncated,
         agent_commands,
-        environments: None,
+        environments: Vec::new(),
     }
 }
 
@@ -755,14 +755,12 @@ fn render_environment(card: &ProjectCard) -> Option<String> {
     let mut facts = Vec::new();
     let mut lines = Vec::new();
     for summary in &card.languages {
-        let environments = match &card.environments {
-            Some(computed) => computed
-                .iter()
-                .find(|(language, _)| *language == summary.language)
-                .map(|(_, environments)| environments.clone())
-                .unwrap_or_default(),
-            None => summary.language.support().environments(&card.root),
-        };
+        let environments = card
+            .environments
+            .iter()
+            .find(|(language, _)| *language == summary.language)
+            .map(|(_, environments)| environments.clone())
+            .unwrap_or_default();
         if environments.is_empty() {
             facts.extend(
                 summary
@@ -1126,7 +1124,7 @@ mod tests {
             problems: None,
             truncated: false,
             agent_commands: crate::lang::ProjectCommands::default(),
-            environments: None,
+            environments: Vec::new(),
         };
         assert_eq!(
             render_servers(&card),
@@ -1457,7 +1455,8 @@ mod tests {
         let tree = TempTree::new("environments");
         tree.write("env.fixture", "one\ntwo\nbroken\nfour\nfive\n");
         let language = crate::lang::testing::ALPHA;
-        let card = collect(tree.path(), vec![alpha_project()], Vec::new(), None);
+        let mut card = collect(tree.path(), vec![alpha_project()], Vec::new(), None);
+        card.environments = vec![(language, language.support().environments(tree.path()))];
         assert_eq!(
             render_environment(&card).unwrap(),
             "environment: alpha one (1.2.3, discovered) · also two (1.2.3), broken (1.2.3, broken), four (1.2.3) +1 — choose: ide.start environment {\"alpha\":\"two\"}"

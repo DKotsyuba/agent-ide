@@ -460,7 +460,9 @@ fn keep_by_kind(symbol: &Symbol, kinds: &[SymbolKind]) -> Option<Symbol> {
 }
 
 /// Renders one bounded directory level, counting regular files recursively inside child folders.
-pub fn directory_outline(root: &Path, directory: &Path) -> std::io::Result<String> {
+/// File documentation is computed where each file's language computes; a module failure is
+/// returned as an error wrapping its [`ModuleUnavailable`](crate::modules::contract::ModuleUnavailable).
+pub async fn directory_outline(root: &Path, directory: &Path) -> std::io::Result<String> {
     use std::fs;
 
     let absolute = root.join(directory);
@@ -507,7 +509,9 @@ pub fn directory_outline(root: &Path, directory: &Path) -> std::io::Result<Strin
     }
     for (name, path) in files.iter().take(displayed) {
         let (line_count, prefix) = read_file_lines_and_prefix(path)?;
-        let doc = first_file_doc(path, &prefix);
+        let doc = first_file_doc(root, path, &prefix)
+            .await
+            .map_err(std::io::Error::other)?;
         out.push_str(&format!("  {name:<20} {line_count:>5}"));
         if let Some(doc) = doc {
             out.push_str("  ");
@@ -573,11 +577,19 @@ fn count_files(directory: &Path) -> std::io::Result<usize> {
 /// Extracts the first module documentation line of `path` in the language that owns its
 /// extension (see [`LanguageSupport::file_doc`](crate::lang::LanguageSupport::file_doc)); `None`
 /// for non-UTF-8 bytes, an unowned extension or a file without module documentation.
-fn first_file_doc(path: &Path, bytes: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    crate::lang::Language::for_path(path)?
-        .support()
-        .file_doc(text)
+async fn first_file_doc(
+    root: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<Option<String>, crate::modules::contract::ModuleUnavailable> {
+    let (Ok(text), Some(language)) = (
+        std::str::from_utf8(bytes),
+        crate::lang::Language::for_path(path),
+    ) else {
+        return Ok(None);
+    };
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    crate::modules::calls::file_doc(language, root, relative, text).await
 }
 
 /// Renders a symbol at its declaration line while its stored range keeps attached documentation.
@@ -919,8 +931,8 @@ mod tests {
     use crate::lang::SymbolPath;
     use std::path::PathBuf;
 
-    #[test]
-    fn directory_outline_lists_docs_and_counts_child_files() {
+    #[tokio::test]
+    async fn directory_outline_lists_docs_and_counts_child_files() {
         let root = std::env::temp_dir().join(format!(
             "outline-{}-{}",
             std::process::id(),
@@ -937,7 +949,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(root.join("src/sub/x"), "x\n").unwrap();
-        let text = directory_outline(&root, Path::new("src")).unwrap();
+        let text = directory_outline(&root, Path::new("src")).await.unwrap();
         assert_eq!(
             text,
             "src/  (1 files, 1 dirs)\n  dirs: sub/ 1\n  lib.alpha                2  Alpha module docs\n"

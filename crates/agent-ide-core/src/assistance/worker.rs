@@ -767,9 +767,10 @@ impl Shared {
     }
 
     /// Refreshes file-resolved identities and invalidates checks for changed languages.
-    fn refresh_environments(&self, worktree: &Path) {
+    async fn refresh_environments(&self, worktree: &Path) {
+        let observed = super::environment::observe(worktree).await;
         if let Ok(mut state) = self.environments.lock() {
-            let changed = state.refresh(worktree);
+            let changed = state.refresh(worktree, observed);
             if let Some(feed) = &self.project_feed {
                 for language in changed {
                     feed.environment_changed(worktree, language);
@@ -1333,7 +1334,7 @@ impl WorkerHandle {
     }
 
     /// Refreshes environment identities before plate rendering and returns due git/environment notices.
-    pub fn git_notice(&self, binding: &[u8; 32]) -> Option<String> {
+    pub async fn git_notice(&self, binding: &[u8; 32]) -> Option<String> {
         let mut lines = Vec::new();
         if let Some(root) = self
             .shared
@@ -1342,7 +1343,7 @@ impl WorkerHandle {
             .ok()
             .and_then(|state| state.root(binding))
         {
-            self.shared.refresh_environments(&root);
+            self.shared.refresh_environments(&root).await;
             if let Some(notice) = self.shared.environments.lock().ok()?.notice(&root, binding) {
                 lines.push(notice);
             }
@@ -1354,8 +1355,8 @@ impl WorkerHandle {
     }
 
     /// Consumes the exact delivered notice; a newer notice remains due for this binding.
-    pub fn consume_git_notice(&self, binding: &[u8; 32], line: &str) -> bool {
-        if self.git_notice(binding).as_deref() != Some(line) {
+    pub async fn consume_git_notice(&self, binding: &[u8; 32], line: &str) -> bool {
+        if self.git_notice(binding).await.as_deref() != Some(line) {
             return false;
         }
         if let Some(root) = self
@@ -3692,7 +3693,7 @@ impl<'a> Worker<'a> {
                 }
             }
         };
-        self.shared.refresh_environments(tree.worktree_path());
+        self.shared.refresh_environments(tree.worktree_path()).await;
         let choices = match validate_environment(
             job.parameters.get("environment"),
             tree.worktree_path(),
@@ -3956,7 +3957,8 @@ impl<'a> Worker<'a> {
                 })?;
         }
         self.shared
-            .refresh_environments(authority.worktree().worktree_path());
+            .refresh_environments(authority.worktree().worktree_path())
+            .await;
         // A plain directory has no Git state to capture, so no baseline run happens at all.
         let baseline = if plain_directory {
             None
@@ -4052,7 +4054,7 @@ impl<'a> Worker<'a> {
                     .collect();
                 let links = project_card::links_line(&languages);
                 let mut project = project_card::collect(&root, languages, servers, None);
-                project.environments = Some(environments);
+                project.environments = environments;
                 let clean_git = project.git.as_ref().and_then(|git| {
                     if git.clean {
                         git.last_commit
