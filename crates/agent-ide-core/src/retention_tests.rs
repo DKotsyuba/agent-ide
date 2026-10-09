@@ -1344,7 +1344,6 @@ fn the_incremental_tier_goes_before_any_whole_worktree_is_evicted() {
         ));
         (tier == Tier::Incremental).then(|| Trimmed {
             fate: Fate::Removed,
-            freed: 60,
             usage: Some(Usage {
                 own: 40,
                 ..Usage::default()
@@ -1410,4 +1409,39 @@ fn symlinked_target_incremental_and_session_directories_are_never_followed() {
     assert!(report.verdicts.is_empty(), "{report:?}");
     assert!(incremental.join("krate-1abc/s-a-a1-h1").exists());
     assert!(incremental.join("krate-1abc/s-b-b2-h2").exists());
+}
+
+/// A trim reports what the family charge actually drops by: a file of the removed `incremental`
+/// tier that a recent worktree still holds through a hard link stays charged and is not freed.
+#[test]
+fn a_trim_does_not_report_bytes_a_surviving_entry_still_holds_as_freed() {
+    let home = scratch("trim-shared");
+    let idle = rustc_cache(&home, "i", &["s-a-a1-h1", "s-b-b2-h2"]);
+    let recent = sharing_cache(&home, "r", 8 << 10);
+    let held =
+        idle.join("digest/lang/target/debug/incremental/krate-1abc/s-b-b2-h2/work-products.bin");
+    fs::hard_link(&held, recent.join("digest/lang/target/linked")).unwrap();
+    // The shared inode keeps the last mtime set: the idle cache goes last.
+    backdate(&recent, Duration::from_secs(60));
+    backdate(&idle, INCREMENTAL_IDLE + DAY);
+    let survivor = fs::metadata(&held).unwrap().blocks() * 512;
+    let tier_alone = measure_usage(&idle.join("digest/lang/target/debug/incremental"))
+        .0
+        .standalone();
+    let before = Sharing::new(scanned(&home).iter().map(|entry| &entry.usage)).charged();
+
+    let report = sweep_with(&home, true, SystemTime::now(), &nobody);
+
+    let trimmed = verdict(&report, &idle);
+    assert_eq!(
+        (trimmed.reason, trimmed.fate),
+        (Reason::Incremental, Fate::Removed)
+    );
+    let after = Sharing::new(scanned(&home).iter().map(|entry| &entry.usage)).charged();
+    assert_eq!(
+        trimmed.bytes,
+        before - after,
+        "freed is the drop of the family charge"
+    );
+    assert_eq!(trimmed.bytes + survivor, tier_alone, "{trimmed:?}");
 }

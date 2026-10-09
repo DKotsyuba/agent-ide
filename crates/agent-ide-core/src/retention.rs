@@ -1279,13 +1279,11 @@ enum Tier {
     Sessions,
 }
 
-/// The outcome of a partial claim: what happened, what it freed (charge) and the entry's usage
-/// afterwards (`None` when nothing changed).
+/// The outcome of a partial claim: what happened and the entry's usage afterwards (`None` when
+/// nothing changed). What it freed is the drop of the family charge, decided by [`select`].
 struct Trimmed {
     /// Outcome.
     fate: Fate,
-    /// Charged bytes freed.
-    freed: u64,
     /// The entry's measurement after the removal (dry run: with the removable parts left out).
     usage: Option<Usage>,
 }
@@ -1359,6 +1357,9 @@ fn select(
             let Some(trimmed) = trim(entry, tier) else {
                 continue;
             };
+            // What the trim frees is what the family charge drops by: bytes another entry still
+            // holds through a hard link or clone stay charged and are not freed.
+            let before = sharing.charged();
             if let (Fate::Removed | Fate::Paused, Some(usage)) = (trimmed.fate, trimmed.usage) {
                 sharing.release(&entry.usage);
                 sharing.add(&usage);
@@ -1369,7 +1370,7 @@ fn select(
                 kind: entry.kind,
                 path: entry.path.clone(),
                 worktree: entry.worktree.clone(),
-                bytes: trimmed.freed,
+                bytes: before.saturating_sub(sharing.charged()),
                 reason,
                 fate: trimmed.fate,
             });
@@ -1479,13 +1480,7 @@ fn trim_entry(
     if incremental.is_empty() || (tier == Tier::Sessions && sessions.is_empty()) {
         return None;
     }
-    let untouched = |fate| {
-        Some(Trimmed {
-            fate,
-            freed: 0,
-            usage: None,
-        })
-    };
+    let untouched = |fate| Some(Trimmed { fate, usage: None });
     let Some(held) = lock_entry(entry, locks, scan_started) else {
         return untouched(Fate::InUse);
     };
@@ -1535,10 +1530,8 @@ fn trim_entry(
     if !complete {
         return untouched(Fate::Unreadable);
     }
-    let freed = entry.bytes.saturating_sub(usage.standalone());
     Some(Trimmed {
         fate: Fate::Removed,
-        freed,
         usage: Some(usage),
     })
 }
