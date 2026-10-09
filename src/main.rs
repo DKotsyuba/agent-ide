@@ -50,6 +50,13 @@ async fn main() -> ExitCode {
             Err(_) => ExitCode::FAILURE,
         };
     }
+    // Bundled language modules (internal `bundled-module/0`): hidden, never listed, started only
+    // by the daemon's module host; stdout is the framed protocol.
+    if let [mode, language, role] = arguments.as_slice()
+        && mode == "module"
+    {
+        return serve_bundled_module(&language.to_string_lossy(), &role.to_string_lossy()).await;
+    }
     if is_version_request(&arguments) {
         println!("agent-ide {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
@@ -621,6 +628,33 @@ fn auto_managed_candidate(
             Err(error) => (ManagedHost::ClaudeCompatible, Err(error)),
         },
         None => (ManagedHost::Codex, std::env::current_dir()),
+    }
+}
+
+/// Serves the bundled module of `language` in `role` on stdin/stdout until the daemon's module
+/// host shuts it down. One arm per bundled module: each language's module task replaces its
+/// placeholder (every capability declared unsupported) with its own crate's server.
+async fn serve_bundled_module(language: &str, role: &str) -> ExitCode {
+    use agent_ide_core::modules::{
+        contract::{ModuleId, Role},
+        serve::{Unimplemented, serve_stdio},
+    };
+    let Some(role) = Role::parse(role) else {
+        return ExitCode::from(2);
+    };
+    let placeholder =
+        |language| Unimplemented::new(ModuleId::bundled(language), env!("CARGO_PKG_VERSION"));
+    let served = match language {
+        "python" => serve_stdio(placeholder("python"), role).await,
+        "rust" => serve_stdio(placeholder("rust"), role).await,
+        "typescript" => serve_stdio(placeholder("typescript"), role).await,
+        "html" => serve_stdio(placeholder("html"), role).await,
+        "css" => serve_stdio(placeholder("css"), role).await,
+        _ => return ExitCode::from(2),
+    };
+    match served {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::FAILURE,
     }
 }
 
