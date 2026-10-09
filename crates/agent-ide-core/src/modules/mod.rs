@@ -14,6 +14,8 @@
 //! - [`mode`](crate::modules::mode): the `AGENT_IDE_LANGUAGE_MODE` fallback switch.
 //! - [`recipe`](crate::modules::recipe): core expansion of effect recipes into run specifications.
 //! - [`runtime`](crate::modules::runtime): supervision of one instance slot.
+//! - [`launch`](crate::modules::launch): the Execution-admitted launcher of the pinned executable.
+//! - [`adapter`](crate::modules::adapter): the module-side server of a language's own support.
 //!
 //! # Growth beyond version 0: linters and debugging
 //!
@@ -38,6 +40,7 @@ pub mod adapter;
 pub mod contract;
 pub mod fake;
 pub mod host;
+pub mod launch;
 pub mod mode;
 pub mod payload;
 pub mod recipe;

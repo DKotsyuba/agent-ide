@@ -83,3 +83,7 @@ unimplemented = "deny"
 
 [lints]
 workspace = true
+
+# Executable digests (provider and module pinning) hash large debug binaries in tests.
+[profile.dev.package.blake3]
+opt-level = 3

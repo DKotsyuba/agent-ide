@@ -2674,7 +2674,7 @@ impl OwnedProtocolChild {
         if let Err(error) = request.consume_spawn_use(active_use) {
             return Err(settlement.error(ProcessError::Request(error)));
         }
-        Self::spawn_parts(request, settlement, output_cap)
+        Self::spawn_parts(&request.command, settlement, output_cap)
     }
 
     /// Starts one forwarder using its distinct process slot and exact registry-view authority.
@@ -2702,20 +2702,45 @@ impl OwnedProtocolChild {
         if let Err(error) = request.consume_spawn_use(active_use) {
             return Err(settlement.error(ProcessError::Request(error)));
         }
-        Self::spawn_parts(request, settlement, output_cap)
+        Self::spawn_parts(&request.command, settlement, output_cap)
+    }
+
+    /// Starts one sealed bundled-module process on the daemon's own authority, admitted by a
+    /// direct reservation: the daemon's own executable in hidden module mode, never a program a
+    /// peer named, so no host invocation is involved. `command` must be a job whose program
+    /// digest, measured at construction, equals `pinned`, the digest measured at daemon start.
+    pub fn spawn_module(
+        command: &ControlledCommand,
+        lease: AdmissionLease,
+        pinned: &blake3::Hash,
+        output_cap: usize,
+    ) -> Result<Self, ProcessError> {
+        let settlement = SpawnNeverStarted::ordinary(lease);
+        if command.kind != CommandKind::Job || !command.has_program_digest(pinned) {
+            return Err(settlement.error(ProcessError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "module executable is not the pinned daemon executable",
+            ))));
+        }
+        Self::spawn_parts(command, settlement, output_cap)
+    }
+
+    /// Whether the direct child already exited, observed without reaping it, so its process
+    /// group can still be torn down safely.
+    pub fn exited(&self) -> bool {
+        self.process.child.id().is_none_or(leader_exited_unreaped)
     }
 
     /// Launches one typed or direct reservation while retaining its target and exact child identity.
     fn spawn_parts(
-        request: &ValidatedExecutionRequest,
+        command: &ControlledCommand,
         settlement: SpawnNeverStarted,
         output_cap: usize,
     ) -> Result<Self, ProcessError> {
-        let (mut child, identity) =
-            match launch_child(&request.command, &settlement, output_cap, true) {
-                Ok(child) => child,
-                Err(error) => return Err(settlement.error(error)),
-            };
+        let (mut child, identity) = match launch_child(command, &settlement, output_cap, true) {
+            Ok(child) => child,
+            Err(error) => return Err(settlement.error(error)),
+        };
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = tokio::spawn(drain(

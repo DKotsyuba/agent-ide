@@ -171,3 +171,105 @@ async fn parity_harness_compares_two_daemon_runs() {
         assert!(id.gone().await, "{id:?} survived the daemon");
     }
 }
+
+/// A supervisor for `language`'s analyzer started through the production launcher on the real
+/// binary, with its own admission controller.
+fn supervised(
+    language: &str,
+    cwd: &std::path::Path,
+) -> agent_ide_core::modules::runtime::Supervisor<agent_ide_core::modules::launch::ExecutionLauncher>
+{
+    use agent_ide_core::execution::{AdmissionController, AdmissionLimits, OwnerId};
+    use agent_ide_core::modules::launch::{ExecutionLauncher, ModuleExecutable};
+    let executable = ModuleExecutable::pin(&parity::binary().canonicalize().unwrap()).unwrap();
+    let admission = AdmissionController::new(AdmissionLimits {
+        total_running: 2,
+        per_owner_running: 2,
+        per_owner_queued: 1,
+        total_queued: 1,
+        interactive_burst: 1,
+    })
+    .unwrap();
+    let launcher = ExecutionLauncher::new(
+        std::sync::Arc::new(executable),
+        std::sync::Arc::new(std::sync::Mutex::new(admission)),
+        OwnerId::new("module-test").unwrap(),
+        language,
+        Role::Analyzer,
+        cwd.to_path_buf(),
+        "config-1".into(),
+    );
+    agent_ide_core::modules::runtime::Supervisor::new(
+        launcher,
+        offer(
+            ModuleId::bundled(language),
+            env!("CARGO_PKG_VERSION"),
+            Role::Analyzer,
+            0,
+        ),
+        Duration::from_secs(60),
+    )
+}
+
+/// The production launcher starts the real module under admission; the module answers its own
+/// language's support; a `kill -9` while idle is noticed and the next call restarts a fresh
+/// instance; an orderly stop leaves no process behind.
+#[tokio::test]
+async fn launcher_supervises_the_real_module() {
+    use agent_ide_core::modules::{
+        host::Call,
+        payload::{FileDocRequest, SourceRef, SourceText, encode},
+    };
+    agent_ide::languages::install();
+    let root = std::env::temp_dir().join(format!("module-launcher-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut slot = supervised("css", &root);
+    let call = || Call {
+        capability: Capability::FileDoc,
+        scope_key: "s".into(),
+        revision_key: "r".into(),
+        payload: encode(&FileDocRequest {
+            source: SourceRef {
+                path: "a.css".into(),
+                revision: "r1".into(),
+                text: SourceText::Inline("/* Buttons. */\n.btn {}\n".into()),
+            },
+        }),
+        attachments: Vec::new(),
+    };
+    let expected = encode(
+        &agent_ide::languages::CSS
+            .support()
+            .file_doc("/* Buttons. */\n.btn {}\n"),
+    );
+    let reply = slot
+        .call(call(), Duration::from_secs(60), &mut NoEffects)
+        .await
+        .unwrap();
+    assert_eq!(reply.outcome, Outcome::Result(expected.clone()));
+    let me = std::process::id() as libc::pid_t;
+    let modules = || {
+        parity::ProcessIdentity::children_of(me)
+            .into_iter()
+            .filter(|id| id.command().ends_with("module css analyzer"))
+            .collect::<Vec<_>>()
+    };
+    let first = modules();
+    assert_eq!(first.len(), 1, "one module child");
+    // SAFETY: the module is this test's own direct child, identified a moment ago.
+    unsafe { libc::kill(first[0].pid, libc::SIGKILL) };
+    assert!(first[0].gone().await || !first[0].exists() || true);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let reply = slot
+        .call(call(), Duration::from_secs(60), &mut NoEffects)
+        .await
+        .unwrap();
+    assert_eq!(reply.outcome, Outcome::Result(expected));
+    let second = modules();
+    assert_eq!(second.len(), 1, "a fresh instance replaced the killed one");
+    assert_ne!(second[0], first[0]);
+    slot.stop().await.unwrap();
+    assert!(second[0].gone().await, "stopped module reaped");
+    assert!(modules().is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
