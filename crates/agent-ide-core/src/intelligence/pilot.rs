@@ -3,10 +3,10 @@
 //!
 //! Nothing here is a public format and nothing is frozen: the wire is a 4-byte big-endian length
 //! followed by one JSON object, every request is `{"id","method","params"}` and every reply
-//! `{"id","result"}` or `{"id","error"}`. The core side ([`Channel`]) owns budgets and fences: a
+//! `{"id","result"}` or `{"id","error"}`. The core side (`Channel`) owns budgets and fences: a
 //! module that exits, stalls past its budget, sends a malformed or oversized frame or answers out
 //! of order poisons its channel, and the owner replaces the instance on the next call. The module
-//! side ([`serve_analyzer`]) hosts an ordinary [`LiveSession`] against its own provider child and
+//! side (`serve_analyzer`) hosts an ordinary `LiveSession` against its own provider child and
 //! answers only read-only methods; every source fact in a reply is re-derived by the core from its
 //! own observation, so the module never presents source identity.
 
@@ -35,7 +35,7 @@ use crate::workspace::{
 
 /// Opt-in flag naming the one language whose analyzer and checker run out of process.
 pub const FLAG: &str = "AGENT_IDE_PILOT_MODULE";
-/// Optional per-call budget override in milliseconds (default [`DEFAULT_BUDGET`]).
+/// Optional per-call budget override in milliseconds (default 20 s).
 pub const BUDGET_ENV: &str = "AGENT_IDE_PILOT_BUDGET_MS";
 /// Test seam `<stall|malformed|oversize|widen>:<method>:<flag file>`: the module misbehaves once
 /// on `method`, when it can remove the flag file (`widen` is the checker's escaped write root on
@@ -51,7 +51,7 @@ pub fn enabled(language: &str) -> bool {
     std::env::var(FLAG).is_ok_and(|value| value == language)
 }
 
-/// The per-call budget: [`BUDGET_ENV`] clamped to 100 ms..60 s, else [`DEFAULT_BUDGET`].
+/// The per-call budget: [`BUDGET_ENV`] clamped to 100 ms..60 s, else 20 s.
 pub fn call_budget() -> Duration {
     std::env::var(BUDGET_ENV)
         .ok()
