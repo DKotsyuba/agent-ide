@@ -890,14 +890,43 @@ pub struct ResolveCandidate {
 }
 
 impl AnchorBatch {
-    /// Checks the batch against the request's `source` and its exact `text`: at most
-    /// [`MAX_ANCHORS_PER_FILE`] anchors, each in the request's file and revision with an ordered
-    /// in-bounds range on UTF-8 boundaries (an empty point range is allowed), in a declared
-    /// namespace, under that namespace's key rules ([`key_valid`]). The core still re-checks
-    /// every location against its own observation before showing it.
-    pub fn validate(&self, source: &SourceRef, text: &str) -> Result<(), String> {
+    /// Checks the batch against the request's `source`, its exact `text` and the module's
+    /// `declared` linkage coverage from `hello`: at most [`MAX_ANCHORS_PER_FILE`] anchors; no
+    /// anchor on a skipped file; every claimed coverage entry within the declaration; each anchor
+    /// in a compiled namespace ([`namespace_registered`]) and a role the declaration covers, in the
+    /// request's file and revision with an ordered in-bounds range on UTF-8 boundaries (an empty
+    /// point range is allowed), under that namespace's key rules ([`key_valid`]). The core still
+    /// re-checks every location against its own observation before showing it.
+    pub fn validate(
+        &self,
+        source: &SourceRef,
+        text: &str,
+        declared: &[LinkageCoverage],
+    ) -> Result<(), String> {
         if self.anchors.len() > MAX_ANCHORS_PER_FILE {
             return Err("too many anchors".to_owned());
+        }
+        if matches!(self.verdict, FileVerdict::Skipped(_)) && !self.anchors.is_empty() {
+            return Err("anchors on a skipped file".to_owned());
+        }
+        let declares = |namespace: &str, role: Option<AnchorRole>| {
+            declared.iter().any(|coverage| {
+                coverage.namespace == namespace
+                    && match role {
+                        Some(AnchorRole::Definition) => coverage.defines,
+                        Some(AnchorRole::Use) => coverage.uses,
+                        None => true,
+                    }
+            })
+        };
+        if let Some(claimed) = self.coverage.iter().find(|claimed| {
+            !declared.iter().any(|coverage| {
+                coverage.namespace == claimed.namespace
+                    && (coverage.defines || !claimed.defines)
+                    && (coverage.uses || !claimed.uses)
+            })
+        }) {
+            return Err(format!("undeclared coverage `{}`", claimed.namespace));
         }
         for anchor in &self.anchors {
             let location = &anchor.location;
@@ -908,12 +937,9 @@ impl AnchorBatch {
                 && end <= text.len() as u64
                 && text.is_char_boundary(start as usize)
                 && text.is_char_boundary(end as usize);
-            let covered = self
-                .coverage
-                .iter()
-                .any(|coverage| coverage.namespace == anchor.namespace);
             if !placed
-                || !covered
+                || !namespace_registered(&anchor.namespace)
+                || !declares(&anchor.namespace, Some(anchor.role))
                 || !key_valid(&anchor.namespace, &anchor.normalized_key, &anchor.domain)
             {
                 return Err(format!("invalid anchor `{}`", anchor.normalized_key));
@@ -921,6 +947,15 @@ impl AnchorBatch {
         }
         Ok(())
     }
+}
+
+/// Whether `namespace` is compiled registry data: a core name namespace or the file-reference
+/// namespace. A module cannot invent one.
+pub fn namespace_registered(namespace: &str) -> bool {
+    namespace == FILE_REF_NAMESPACE
+        || crate::lang::names::ns::ALL
+            .iter()
+            .any(|registered| registered.id() == namespace)
 }
 
 /// Namespace of file references: a scope-relative path key of at most [`MAX_FILE_REF_KEY`]

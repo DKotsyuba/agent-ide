@@ -683,26 +683,46 @@ mod tests {
                     let Field::Available(batch) = analysis.anchors else {
                         panic!("anchors expected");
                     };
-                    assert_eq!(batch.validate(&source, ".btn {}\n"), Ok(()));
+                    let declared = [class_coverage()];
+                    let check =
+                        |batch: &AnchorBatch| batch.validate(&source, ".btn {}\n", &declared);
+                    assert_eq!(check(&batch), Ok(()));
                     let mut moved = batch.clone();
                     moved.anchors[0].location.path = "b.txt".into();
-                    assert!(moved.validate(&source, ".btn {}\n").is_err());
+                    assert!(check(&moved).is_err());
                     let mut stale = batch.clone();
                     stale.anchors[0].location.revision = Some("r0".into());
-                    assert!(stale.validate(&source, ".btn {}\n").is_err());
+                    assert!(check(&stale).is_err());
                     let mut past = batch.clone();
                     past.anchors[0].location.end_byte = 99;
-                    assert!(past.validate(&source, ".btn {}\n").is_err());
+                    assert!(check(&past).is_err());
                     let mut undeclared = batch.clone();
                     undeclared.anchors[0].namespace = "id/v1".into();
-                    assert!(undeclared.validate(&source, ".btn {}\n").is_err());
+                    assert!(check(&undeclared).is_err(), "namespace not declared");
+                    let mut invented = batch.clone();
+                    invented.anchors[0].namespace = "invented/v1".into();
+                    invented.coverage = vec![LinkageCoverage {
+                        namespace: "invented/v1".into(),
+                        defines: true,
+                        uses: true,
+                    }];
+                    assert!(check(&invented).is_err(), "self-claimed coverage");
+                    let invented_declared = [invented.coverage[0].clone()];
+                    assert!(
+                        invented
+                            .validate(&source, ".btn {}\n", &invented_declared)
+                            .is_err(),
+                        "unregistered namespace even when declared"
+                    );
+                    let mut definition = batch.clone();
+                    definition.anchors[0].role = AnchorRole::Definition;
+                    assert!(check(&definition).is_err(), "declaration covers uses only");
+                    let mut skipped = batch.clone();
+                    skipped.verdict = FileVerdict::Skipped("minified".into());
+                    assert!(check(&skipped).is_err(), "no facts on a skipped file");
                     let mut point = batch;
                     point.anchors[0].location.end_byte = point.anchors[0].location.start_byte;
-                    assert_eq!(
-                        point.validate(&source, ".btn {}\n"),
-                        Ok(()),
-                        "point anchors stay valid"
-                    );
+                    assert_eq!(check(&point), Ok(()), "point anchors stay valid");
                 }
                 Capability::Rename => {
                     assert!(matches!(
