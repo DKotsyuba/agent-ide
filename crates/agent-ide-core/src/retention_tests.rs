@@ -1445,3 +1445,31 @@ fn a_trim_does_not_report_bytes_a_surviving_entry_still_holds_as_freed() {
     );
     assert_eq!(trimmed.bytes + survivor, tier_alone, "{trimmed:?}");
 }
+
+/// Private bytes count an inode only when every one of its links is inside the family: a link
+/// outside keeps the data allocated, so removing the cache reclaims nothing of it. The charge
+/// is unchanged.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_private_estimate_excludes_inodes_with_a_link_outside_the_family() {
+    let home = scratch("private-outside-link");
+    let cache = sharing_cache(&home, "p", 4096);
+    big_file(&cache.join("digest/lang/target/pinned"), 256 << 10);
+    big_file(&cache.join("digest/lang/target/free"), 256 << 10);
+    let outside = scratch("private-outside-elsewhere").join("keeper");
+    fs::hard_link(cache.join("digest/lang/target/pinned"), &outside).unwrap();
+    let entries = scanned(&home);
+    let sharing = Sharing::new(entries.iter().map(|entry| &entry.usage));
+    let pinned = fs::metadata(&outside).unwrap().blocks() * 512;
+    assert!(sharing.charged() >= pinned * 2);
+    assert!(
+        sharing.private() <= sharing.charged() - pinned,
+        "{} private vs {} charged",
+        sharing.private(),
+        sharing.charged()
+    );
+    assert!(
+        sharing.private() >= pinned,
+        "the unpinned file is reclaimable"
+    );
+}
