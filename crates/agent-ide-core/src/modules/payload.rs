@@ -303,6 +303,11 @@ pub enum SemanticQuery {
         /// The file.
         source: SourceRef,
     },
+    /// The hosted provider's status barrier: waits within the request's budget for the
+    /// provider's own readiness report (a provider without one is ready after its handshake) and
+    /// answers [`Readiness`](super::contract::Readiness): `ready`, `warming` (still loading at the
+    /// deadline) or `degraded` (it reported that the workspace failed to load).
+    Readiness {},
 }
 
 /// Provider hover.
