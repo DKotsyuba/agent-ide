@@ -794,9 +794,11 @@ async fn rust_analyzer_seam_faults_are_typed_and_restart() {
             failed_after < Duration::from_secs(30),
             "{fault} answered after {failed_after:?}"
         );
+        // The next demands retire the failed instance (reaping it and its rust-analyzer) and
+        // start a fresh one.
+        ready(&mut session, &fixture).await;
         assert!(first.id.gone().await, "{fault}: the failed module survived");
         assert!(server.gone().await, "{fault}: its rust-analyzer survived");
-        ready(&mut session, &fixture).await;
         let (second, _) = analyzer(&daemon.tree()).expect("a fresh analyzer module runs");
         assert_ne!(
             first.id, second.id,
