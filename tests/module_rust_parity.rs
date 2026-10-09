@@ -163,6 +163,7 @@ fn record(fixture: &Fixture, tool: &str, arguments: &Value, reply: &Value) -> St
             object.remove("status");
         }
         mask_refs(&mut body);
+        entry.push('\n');
         entry.push_str(
             &body
                 .to_string()
@@ -428,10 +429,24 @@ async fn rust_module_and_in_process_transcripts_are_equal() {
     let masked = |replies: &[String]| {
         replies
             .iter()
-            .map(|reply| mask_counters(&mask_seconds(reply)))
+            .map(|reply| mask_text_refs(&mask_counters(&mask_seconds(reply))))
             .collect::<Vec<_>>()
     };
-    parity::assert_parity(&masked(&local), &masked(&moduled));
+    let (local, moduled) = (masked(&local), masked(&moduled));
+    // Every differing pair at once (the shared assertion stops at the first).
+    let differing: Vec<String> = local
+        .iter()
+        .zip(&moduled)
+        .filter(|(left, right)| parity::normalized(left) != parity::normalized(right))
+        .map(|(left, right)| format!("--- in process ---\n{left}\n--- module ---\n{right}"))
+        .collect();
+    assert!(
+        differing.is_empty(),
+        "{} differing replies:\n{}",
+        differing.len(),
+        differing.join("\n")
+    );
+    parity::assert_parity(&local, &moduled);
     owned.extend(tree.all());
     drop(daemon);
     for id in owned {
@@ -982,6 +997,33 @@ async fn rust_analyzer_crash_loop_exhausts_the_restart_budget() {
     session.close(&fixture).await;
 }
 
+/// `text` with each opaque reference a reply names in prose (`source_ref <64 hex>-<n>`, also
+/// `detail_ref …`, whatever punctuation follows) written as `<ref>`; other hex runs stay.
+fn mask_text_refs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let next = ["source_ref ", "detail_ref "]
+            .iter()
+            .filter_map(|marker| rest.find(marker).map(|at| (at, marker.len())))
+            .min();
+        let Some((at, marker)) = next else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..at + marker]);
+        rest = &rest[at + marker..];
+        let hex = rest.bytes().take_while(u8::is_ascii_hexdigit).count();
+        if hex == 64 {
+            let suffix = rest[hex..].strip_prefix('-').map_or(0, |tail| {
+                1 + tail.bytes().take_while(u8::is_ascii_digit).count()
+            });
+            out.push_str("<ref>");
+            rest = &rest[hex + suffix..];
+        }
+    }
+}
+
 /// `text` with the per-daemon observation counters of a context reply masked (`source_sequence:`
 /// and `document_version:`): they count every observation of the run, and the readiness wait
 /// polls a variable number of times. Everything else stays byte-compared.
@@ -1486,4 +1528,19 @@ async fn a_failed_provider_exchange_answers_from_source_with_typed_attribution()
     session.close(&fixture).await;
     drop(daemon);
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// References a reply names in prose are masked whatever follows them; other hashes stay.
+#[test]
+fn prose_references_are_masked_and_nothing_else() {
+    let reference = "8ab2ae26df5f5c8e532fbd83009bdff27a57bf8b598b90102c30db448fdc6c75";
+    let other = "b".repeat(64);
+    assert_eq!(
+        mask_text_refs(&format!(
+            "edit: unchanged; source_ref {reference}-5; Next: use ide.edit with source_ref {reference}-5\ndigest {other}"
+        )),
+        format!(
+            "edit: unchanged; source_ref <ref>; Next: use ide.edit with source_ref <ref>\ndigest {other}"
+        )
+    );
 }
