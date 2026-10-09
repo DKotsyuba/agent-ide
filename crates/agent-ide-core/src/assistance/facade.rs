@@ -6047,7 +6047,10 @@ mod managed_claude_front_tests {
             activation_id: "anonymous".to_owned(),
             root: None,
         });
-        let (healed, request) = tokio::join!(front.recover_lost_daemon(front.current_pair().await), daemon.request());
+        let (healed, request) = tokio::join!(
+            front.recover_lost_daemon(front.current_pair().await),
+            daemon.request()
+        );
         assert!(healed);
         assert!(request.is_none(), "lease recovery must send nothing");
         assert!(

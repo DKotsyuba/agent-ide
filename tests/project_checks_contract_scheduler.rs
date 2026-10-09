@@ -9,13 +9,13 @@ use agent_ide::checks::{
 };
 use agent_ide::execution::seatbelt::ReadDeny;
 use agent_ide::retention::{Fate, Reason, Report, sweep_with};
-use support::Scratch;
 use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use support::Scratch;
 
 #[path = "support/scratch.rs"]
 mod support;
@@ -873,7 +873,12 @@ async fn scheduler_enforces_a_cooldown_of_max_debounce_and_previous_duration() {
     let checker = RecordingChecker::with_delay(agent_ide::languages::PYTHON, run_duration);
     let cache_root = scratch_dir("cooldown-cache");
     let worktree = scratch_worktree("cooldown-worktree", agent_ide::languages::PYTHON);
-    let scheduler = Scheduler::new(vec![Arc::new(checker.clone())], debounce, 2, cache_root.path());
+    let scheduler = Scheduler::new(
+        vec![Arc::new(checker.clone())],
+        debounce,
+        2,
+        cache_root.path(),
+    );
 
     // Settle just past the expected completion (debounce + 150ms delay), with only a small
     // margin, for the same reason as above: the cooldown budget this test exercises is measured
