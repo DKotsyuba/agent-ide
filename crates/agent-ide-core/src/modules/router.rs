@@ -40,6 +40,18 @@ pub const SHIPPED_SEAM: &str = "AGENT_IDE_TEST_MODULE_LANGUAGES";
 const STARTUP_BUDGET: Duration = Duration::from_secs(30);
 /// Default budget of one ordinary request.
 pub const REQUEST_BUDGET: Duration = Duration::from_secs(20);
+/// Test seam overriding [`REQUEST_BUDGET`] in milliseconds (100..=60000); honoured only in
+/// `test-seams` builds.
+pub const BUDGET_SEAM: &str = "AGENT_IDE_TEST_MODULE_BUDGET_MS";
+
+/// The ordinary request budget, or the seam's.
+fn request_budget() -> Duration {
+    crate::test_seams::var(BUDGET_SEAM)
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(REQUEST_BUDGET, |ms| {
+            Duration::from_millis(ms.clamp(100, 60_000))
+        })
+}
 
 /// One supervised slot.
 type Slot = Arc<tokio::sync::Mutex<Supervisor<ExecutionLauncher>>>;
@@ -58,11 +70,26 @@ pub struct ModuleHost {
     slots: tokio::sync::Mutex<HashMap<(String, PathBuf, Role), Slot>>,
 }
 
+/// Languages whose module ships default-on in this release, declared once by the root.
+static SHIPPED: std::sync::OnceLock<&'static [&'static str]> = std::sync::OnceLock::new();
+
+/// Declares the languages whose module ships default-on (root composition data); later calls
+/// keep the first declaration.
+pub fn ship(languages: &'static [&'static str]) {
+    let _ = SHIPPED.set(languages);
+}
+
 impl ModuleHost {
-    /// Routing for `shipped` languages with the daemon's `admission`, pinning the running
-    /// executable and reading the fallback switch once.
-    pub fn new(shipped: &[&str], admission: Arc<Mutex<AdmissionController>>) -> Self {
-        let mut shipped: BTreeSet<String> = shipped.iter().map(|id| (*id).to_owned()).collect();
+    /// Routing for the shipped languages ([`ship`]) with the daemon's `admission`, pinning the
+    /// running executable and reading the fallback switch once.
+    pub fn new(admission: Arc<Mutex<AdmissionController>>) -> Self {
+        let mut shipped: BTreeSet<String> = SHIPPED
+            .get()
+            .copied()
+            .unwrap_or_default()
+            .iter()
+            .map(|id| (*id).to_owned())
+            .collect();
         if let Some(seam) = crate::test_seams::var(SHIPPED_SEAM) {
             shipped.extend(
                 seam.split(',')
@@ -194,7 +221,7 @@ impl ModuleHost {
             attachments,
         };
         let reply = supervisor
-            .call(call, REQUEST_BUDGET, &mut NoEffects)
+            .call(call, request_budget(), &mut NoEffects)
             .await?;
         let failure = |cause| ModuleUnavailable {
             module_id: ModuleId::bundled(language.name()),

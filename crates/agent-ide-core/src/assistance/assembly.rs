@@ -448,6 +448,22 @@ impl ProductDispatcher {
     /// telemetry owner has started; otherwise the worker is unchanged from v0.2.
     pub fn with_launcher(launcher: LauncherConfig) -> Self {
         let mut dispatcher = Self::default();
+        // Language computations route in process or to each shipped module through one host
+        // sharing the daemon's admission; ignored fallback-switch entries are journaled once.
+        let modules = Arc::new(crate::modules::router::ModuleHost::new(
+            dispatcher.admission.clone(),
+        ));
+        for line in modules.ignored_lines() {
+            errorlog::record(
+                errorlog::Method::Daemon,
+                errorlog::Outcome::Refused,
+                errorlog::Fields {
+                    detail: Some(&line),
+                    ..Default::default()
+                },
+            );
+        }
+        crate::modules::calls::install(modules);
         if let Some(scope) = dispatcher.scope {
             let worker = WorkerHandle::new(
                 dispatcher.bindings.clone(),
