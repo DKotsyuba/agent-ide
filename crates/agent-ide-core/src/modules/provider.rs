@@ -1,22 +1,28 @@
 //! Module-side hosting of a language's provider: a [`LiveSession`] on the module's own provider
 //! child, answered as product DTOs. Wraps the language's [`SupportServer`] for everything else.
 //!
-//! The core sends exact sources with its revisions; the module synchronizes them under its own
-//! monotonic sequence and converts every provider position into a scope-relative UTF-8 byte
-//! range, reading a file the request did not carry from disk (its range then carries no
-//! revision and the core re-observes it). Provider failures answer the typed `unavailable`
-//! refusal at stage `provider`; the instance survives and restarts its provider on demand.
+//! The provider runs only from the one pinned launch specification the core granted in `hello`
+//! ([`ProviderGrant`]): the module re-measures every accepted file before it starts the child in
+//! its own process group, drains the child's stderr into a bounded buffer and starts it at most
+//! once per instance. A dead provider answers the typed `unavailable` refusal at stage
+//! `provider` from then on; recovery is the core supervisor's restart of the whole instance.
+//!
+//! No core identity is rebuilt here: the session's worktree and source bookkeeping are this
+//! module's own local keys (its working directory, a local sequence); the core's revision string
+//! is only echoed back in locations. Positions become scope-relative UTF-8 byte ranges, a file the
+//! request did not carry is read from disk (its range then carries no revision).
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
     io,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use async_lsp::lsp_types as lsp;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
@@ -47,38 +53,67 @@ use crate::{
     },
 };
 
-/// The core-supplied session parameters inside `hello.config.provider.session`.
-#[derive(Clone, Debug, Deserialize)]
+/// Retained provider stderr bytes (the most recent ones).
+const PROVIDER_STDERR: usize = 64 * 1024;
+
+/// The provider launch the core granted this instance (`hello.config.provider.grant`): the
+/// declaration's accepted executables and files with their digests. Only these may run or be
+/// loaded as the provider; the module computes the arguments and environment itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SessionParams {
-    /// Absolute worktree.
-    pub worktree: PathBuf,
-    /// Absolute repository root.
-    pub repository_root: PathBuf,
-    /// Raw Git common directory.
-    pub git_common_dir: PathBuf,
-    /// Positive lifecycle incarnation.
-    pub incarnation: u64,
-    /// Authority epoch.
-    pub epoch: u64,
-    /// The core's generation fences.
-    pub generation: [u64; 4],
+pub struct ProviderGrant {
+    /// Accepted executables and files (path, BLAKE3 hex).
+    pub accepted: Vec<(PathBuf, String)>,
     /// Per-request provider deadline.
     pub request_timeout_ms: u64,
 }
 
-/// What a language supplies to host its provider: from the hello configuration's `provider`
-/// value, the session settings and the command that starts the provider with piped stdio.
+/// How a language starts its provider from the granted files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderLaunchPlan {
+    /// The program; it must be one of the grant's accepted files.
+    pub program: PathBuf,
+    /// Exact arguments.
+    pub args: Vec<String>,
+    /// The complete environment; nothing else is inherited.
+    pub env: BTreeMap<String, String>,
+    /// Further files the program loads (a provider script); each must be accepted.
+    pub reads: Vec<PathBuf>,
+}
+
+impl ProviderGrant {
+    /// Re-measures the plan's program and every file it loads against the accepted digests; an
+    /// unaccepted or changed file refuses the launch.
+    fn verify(&self, plan: &ProviderLaunchPlan) -> io::Result<()> {
+        let denied = || io::Error::new(io::ErrorKind::PermissionDenied, "provider not accepted");
+        for path in std::iter::once(&plan.program).chain(&plan.reads) {
+            let (_, digest) = self
+                .accepted
+                .iter()
+                .find(|(accepted, _)| accepted == path)
+                .ok_or_else(denied)?;
+            let bytes = std::fs::read(path)
+                .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "provider file missing"))?;
+            if blake3::hash(&bytes).to_hex().as_str() != digest {
+                return Err(denied());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What a language supplies to host its provider: from the language-specific `settings` value
+/// of `hello.config.provider`, the session settings (profile) and the launch plan.
 pub trait ProviderBuilder: Send + 'static {
-    /// Builds settings and command; an error is a deterministic configuration refusal.
-    fn build(&self, provider: &Value) -> io::Result<(ProviderSettings, tokio::process::Command)>;
+    /// Builds both; an error is a deterministic configuration refusal.
+    fn plan(&self, settings: &Value) -> io::Result<(ProviderSettings, ProviderLaunchPlan)>;
 }
 
 /// A started provider.
 struct Hosted {
     /// The session.
     live: LiveSession,
-    /// The provider child, killed on drop.
+    /// The provider child, killed on drop; it shares the module's process group.
     _child: tokio::process::Child,
 }
 
@@ -86,50 +121,67 @@ struct Hosted {
 pub struct ProviderServer<B: ProviderBuilder> {
     /// The language's support adapter.
     support: SupportServer,
-    /// Starts the provider.
+    /// Builds the provider settings.
     builder: B,
-    /// The hello configuration's provider value.
-    provider: Value,
-    /// Its session parameters.
-    params: Option<SessionParams>,
+    /// The granted launch.
+    grant: Option<ProviderGrant>,
+    /// The language-specific settings value.
+    settings: Value,
     /// The hosted provider, started on first demand.
     hosted: Option<Hosted>,
-    /// Next source sequence.
+    /// The provider was started once and is gone; this instance never starts another.
+    spent: bool,
+    /// The provider's most recent stderr bytes (private diagnostics only).
+    stderr: Arc<Mutex<Vec<u8>>>,
+    /// Local source sequence.
     sequence: u64,
     /// Call hierarchy items by handle, valid for this instance.
     items: HashMap<String, lsp::CallHierarchyItem>,
+    /// This module's working directory (its local worktree key).
+    root: PathBuf,
 }
 
+/// Local session keys: they identify nothing outside this module.
+const LOCAL_EPOCH: u64 = 1;
+/// Local generation of the hosted session.
+const LOCAL_GENERATION: ViewGeneration = ViewGeneration {
+    backend: 1,
+    configuration: 1,
+    toolchain: 1,
+    view: 1,
+};
+
 impl<B: ProviderBuilder> ProviderServer<B> {
-    /// The server for `support`'s language with `builder`.
+    /// The server for `support`'s language with `builder`, rooted at the working directory.
     pub fn new(support: SupportServer, builder: B) -> Self {
         Self {
             support,
             builder,
-            provider: Value::Null,
-            params: None,
+            grant: None,
+            settings: Value::Null,
             hosted: None,
+            spent: false,
+            stderr: Arc::default(),
             sequence: 0,
             items: HashMap::new(),
+            root: std::env::current_dir()
+                .and_then(|dir| dir.canonicalize())
+                .unwrap_or_default(),
         }
     }
 
-    /// The worktree of this instance.
+    /// The module's local worktree key.
     fn worktree(&self) -> io::Result<WorktreeRef> {
-        let params = self
-            .params
-            .as_ref()
-            .ok_or_else(|| io::Error::other("no provider session configured"))?;
         WorktreeRef::from_discovery(
-            params.worktree.clone(),
-            params.repository_root.clone(),
-            params.git_common_dir.clone(),
-            params.incarnation,
+            self.root.clone(),
+            self.root.clone(),
+            self.root.join(".git"),
+            1,
         )
-        .map_err(|_| io::Error::other("invalid worktree"))
+        .map_err(|_| io::Error::other("module working directory is not absolute"))
     }
 
-    /// The live session, started when absent or dead.
+    /// The live session, started once from the grant; a spent provider is never replaced.
     async fn session(&mut self) -> io::Result<&mut Session> {
         if self
             .hosted
@@ -137,42 +189,65 @@ impl<B: ProviderBuilder> ProviderServer<B> {
             .is_some_and(|hosted| !hosted.live.is_alive())
         {
             self.hosted = None;
+            self.spent = true;
+        }
+        if self.spent {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "provider exited"));
         }
         if self.hosted.is_none() {
-            let params = self
-                .params
+            let grant = self
+                .grant
                 .clone()
-                .ok_or_else(|| io::Error::other("no provider session configured"))?;
-            let (settings, mut command) = self.builder.build(&self.provider)?;
-            let mut child = command
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no provider granted"))?;
+            let (settings, plan) = self.builder.plan(&self.settings)?;
+            grant.verify(&plan)?;
+            self.spent = true;
+            let mut child = tokio::process::Command::new(&plan.program)
+                .args(&plan.args)
+                .env_clear()
+                .envs(&plan.env)
+                .current_dir(&self.root)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()?;
-            let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            let (Some(stdin), Some(stdout), Some(mut stderr)) =
+                (child.stdin.take(), child.stdout.take(), child.stderr.take())
+            else {
                 return Err(io::Error::other("provider pipes missing"));
             };
-            let [backend, configuration, toolchain, view] = params.generation;
+            let retained = self.stderr.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buffer = [0u8; 8192];
+                while let Ok(read) = stderr.read(&mut buffer).await
+                    && read > 0
+                {
+                    let mut retained = retained
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    retained.extend_from_slice(&buffer[..read]);
+                    let excess = retained.len().saturating_sub(PROVIDER_STDERR);
+                    retained.drain(..excess);
+                }
+            });
             let live = LiveSession::open(
                 stdout,
                 stdin,
                 self.worktree()?,
-                params.epoch,
-                ViewGeneration {
-                    backend,
-                    configuration,
-                    toolchain,
-                    view,
-                },
+                LOCAL_EPOCH,
+                LOCAL_GENERATION,
                 settings,
-                Duration::from_millis(params.request_timeout_ms.clamp(1, 60_000)),
+                Duration::from_millis(grant.request_timeout_ms.clamp(1, 60_000)),
             )
             .await?;
+            self.spent = false;
             self.hosted = Some(Hosted {
                 live,
                 _child: child,
             });
+            // A started provider is spent once it dies: mark it now, clear above on death.
         }
         Ok(&mut self.hosted.as_mut().expect("started above").live.session)
     }
@@ -193,7 +268,8 @@ impl<B: ProviderBuilder> ProviderServer<B> {
         }
     }
 
-    /// The module-side observation of `source` under the next sequence.
+    /// The local session observation of `source` under the next local sequence; only the core's
+    /// revision string is carried, to be echoed back.
     fn observe(
         &mut self,
         source: &SourceRef,
@@ -201,16 +277,12 @@ impl<B: ProviderBuilder> ProviderServer<B> {
     ) -> io::Result<(SourceObservation, Vec<u8>)> {
         let text = Self::text(source, request)?;
         self.sequence += 1;
-        let params = self
-            .params
-            .as_ref()
-            .ok_or_else(|| io::Error::other("no session"))?;
         let bytes = text.clone().unwrap_or_default().into_bytes();
         let observation = SourceObservation::new(
             self.worktree()?,
-            params.epoch,
+            LOCAL_EPOCH,
             self.sequence,
-            ObservationRef::new(format!("module-{}", self.sequence))
+            ObservationRef::new(format!("local-{}", self.sequence))
                 .map_err(|_| io::Error::other("observation ref"))?,
             source.path.clone(),
             text.as_ref().map(|_| SourceBytes::from_bytes(&bytes)),
@@ -483,9 +555,8 @@ impl<B: ProviderBuilder> ProviderServer<B> {
 
     /// The worktree-relative path of a provider URI, if it is a file inside the worktree.
     fn relative(&self, uri: &lsp::Url) -> Option<PathBuf> {
-        let root = &self.params.as_ref()?.worktree;
         let path = uri.to_file_path().ok()?;
-        path.strip_prefix(root).ok().map(Path::to_path_buf)
+        path.strip_prefix(&self.root).ok().map(Path::to_path_buf)
     }
 
     /// Converts a provider location: inside the request source with its revision, elsewhere from
@@ -504,8 +575,7 @@ impl<B: ProviderBuilder> ProviderServer<B> {
                 Some(source.revision.clone()),
             )
         } else {
-            let root = &self.params.as_ref()?.worktree;
-            (std::fs::read_to_string(root.join(&path)).ok()?, None)
+            (std::fs::read_to_string(self.root.join(&path)).ok()?, None)
         };
         Some(Location {
             start_byte: byte_offset(&text, location.range.start, encoding) as u64,
@@ -568,13 +638,7 @@ impl<B: ProviderBuilder> ProviderServer<B> {
             .source
             .as_ref()
             .is_some_and(|binding| binding.sequence() == observation.sequence());
-        let uri = lsp::Url::from_file_path(
-            self.params
-                .as_ref()
-                .map(|params| params.worktree.join(&source.path))
-                .unwrap_or_default(),
-        )
-        .ok();
+        let uri = lsp::Url::from_file_path(self.root.join(&source.path)).ok();
         DiagnosticsEvidence {
             revision: bound.then(|| source.revision.clone()),
             readiness: match (bound, snapshot.readiness) {
@@ -707,20 +771,20 @@ impl<B: ProviderBuilder> ModuleServer for ProviderServer<B> {
         declaration
     }
 
-    /// Keeps the provider configuration and session parameters for the first demand.
+    /// Keeps the granted provider launch and the language settings for the first demand.
     fn hello(&mut self, offer: &HelloOffer) -> impl Future<Output = Result<(), String>> + Send {
         let provider = offer.config.provider.clone().unwrap_or(Value::Null);
-        let params = provider
-            .get("session")
+        let outcome = match provider
+            .get("grant")
             .cloned()
-            .map(serde_json::from_value::<SessionParams>);
-        let outcome = match params {
-            Some(Ok(params)) => {
-                self.params = Some(params);
-                self.provider = provider;
+            .map(serde_json::from_value::<ProviderGrant>)
+        {
+            Some(Ok(grant)) => {
+                self.grant = Some(grant);
+                self.settings = provider.get("settings").cloned().unwrap_or(Value::Null);
                 Ok(())
             }
-            Some(Err(error)) => Err(format!("invalid session parameters: {error}")),
+            Some(Err(error)) => Err(format!("invalid provider grant: {error}")),
             None => Ok(()),
         };
         async move { outcome }
@@ -748,12 +812,13 @@ impl<B: ProviderBuilder> ModuleServer for ProviderServer<B> {
                     .hosted
                     .as_ref()
                     .is_some_and(|hosted| hosted.live.is_alive());
-                if !alive {
-                    self.hosted = None;
+                if !alive && self.hosted.take().is_some() {
+                    self.spent = true;
                 }
                 let cause = match error.kind() {
                     io::ErrorKind::TimedOut => Cause::Timeout,
                     io::ErrorKind::NotFound => Cause::ToolMissing,
+                    io::ErrorKind::PermissionDenied => Cause::PolicyRefused,
                     _ if !alive => Cause::Exited,
                     _ => Cause::Malformed,
                 };
