@@ -79,37 +79,97 @@ fn plain_relative(relative: &str) -> bool {
             .all(|part| matches!(part, Component::Normal(_)))
 }
 
+/// `path` with its nearest existing ancestor resolved (symlinks followed) and the missing rest
+/// re-appended, so a not-yet-created cache path still resolves through its existing parents.
+fn resolved(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(mut canonical) = existing.canonicalize() {
+            for part in rest.iter().rev() {
+                canonical.push(part);
+            }
+            return canonical;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 impl Admission<'_> {
-    /// Whether `role` admits `path`.
-    fn admits(&self, role: PathRole, path: &Path) -> bool {
+    /// Whether `role` admits `path`; with `resolve`, every root is compared in its resolved form
+    /// (the check of a path's resolved target).
+    fn admits_as(&self, role: PathRole, path: &Path, resolve: bool) -> bool {
+        let root = |root: &Path| {
+            if resolve {
+                resolved(root)
+            } else {
+                root.to_path_buf()
+            }
+        };
         match role {
-            PathRole::WorktreeRoot => path == self.worktree,
-            PathRole::Worktree => path.starts_with(self.worktree),
-            PathRole::AncestorFile(names) => self.worktree.ancestors().skip(1).any(|ancestor| {
-                names
-                    .iter()
-                    .any(|name| plain_relative(name) && ancestor.join(name) == path)
-            }),
-            PathRole::HomeRelative => self.home.is_some_and(|home| path.starts_with(home)),
+            PathRole::WorktreeRoot => path == root(self.worktree),
+            PathRole::Worktree => path.starts_with(root(self.worktree)),
+            PathRole::AncestorFile(names) => {
+                root(self.worktree).ancestors().skip(1).any(|ancestor| {
+                    names
+                        .iter()
+                        .any(|name| plain_relative(name) && ancestor.join(name) == path)
+                })
+            }
+            PathRole::HomeRelative => self.home.is_some_and(|home| path.starts_with(root(home))),
             PathRole::LauncherRoot => self
                 .launcher_roots
                 .iter()
-                .any(|root| path.starts_with(root)),
-            PathRole::LauncherRootAncestor { stop_at } => self.launcher_roots.iter().any(|root| {
-                root.ancestors().any(|ancestor| {
-                    ancestor.file_name().is_some_and(|name| name == stop_at)
-                        && ancestor.parent() == Some(path)
+                .any(|launcher| path.starts_with(root(launcher))),
+            PathRole::LauncherRootAncestor { stop_at } => {
+                self.launcher_roots.iter().any(|launcher| {
+                    root(launcher).ancestors().any(|ancestor| {
+                        ancestor.file_name().is_some_and(|name| name == stop_at)
+                            && ancestor.parent() == Some(path)
+                    })
                 })
-            }),
-            PathRole::Fixed(paths) => paths.iter().any(|fixed| Path::new(fixed) == path),
-            PathRole::DeveloperDir => self.developer_dirs.iter().any(|dir| path.starts_with(dir)),
-            PathRole::Cache => path.starts_with(self.cache_dir),
+            }
+            PathRole::Fixed(paths) => paths.iter().any(|fixed| root(Path::new(fixed)) == path),
+            PathRole::DeveloperDir => self
+                .developer_dirs
+                .iter()
+                .any(|dir| path.starts_with(root(dir))),
+            PathRole::Cache => path.starts_with(root(self.cache_dir)),
         }
     }
 
-    /// Whether the host denies reading `path`.
+    /// Whether `roles` admit `path` both as given and as it resolves (a symlink cannot lead out
+    /// of its admitted roots); the given spelling is what the run uses, so an interpreter keeps
+    /// its invocation path.
+    fn admits(&self, roles: &[PathRole], path: &Path) -> bool {
+        self.admits_given(roles, path) && self.admits_target(roles, path)
+    }
+
+    /// Whether `roles` admit `path` as given.
+    fn admits_given(&self, roles: &[PathRole], path: &Path) -> bool {
+        normal(path) && roles.iter().any(|role| self.admits_as(*role, path, false))
+    }
+
+    /// Whether `roles` admit what `path` resolves to.
+    fn admits_target(&self, roles: &[PathRole], path: &Path) -> bool {
+        let target = resolved(path);
+        roles
+            .iter()
+            .any(|role| self.admits_as(*role, &target, true))
+    }
+
+    /// Whether the host denies reading `path`, as given or as it resolves.
     fn denied(&self, path: &Path) -> bool {
-        self.read_denies.iter().any(|deny| deny.matches(path))
+        let target = resolved(path);
+        self.read_denies
+            .iter()
+            .any(|deny| deny.matches(path) || deny.matches(&target))
     }
 }
 
@@ -127,16 +187,22 @@ fn admit_rule(
     };
     let mut admitted = Vec::with_capacity(values.len());
     for path in values {
-        if !normal(path) || !rule.roles.iter().any(|role| admission.admits(*role, path)) {
+        if !admission.admits_given(rule.roles, path) {
             return Err(Refusal::OutOfRule(rule.param.to_owned(), path.clone()));
         }
-        // A missing or denied optional file is simply not read; a required one refuses.
+        // A missing, denied or out-of-root-resolving optional file is simply not read; a required
+        // one refuses.
         if rule.existing_only
-            && (admission.denied(path) || std::fs::symlink_metadata(path).is_err())
+            && (admission.denied(path)
+                || std::fs::symlink_metadata(path).is_err()
+                || !admission.admits_target(rule.roles, path))
         {
             continue;
         }
-        if admission.denied(path) && rule.read_root {
+        if !admission.admits_target(rule.roles, path) {
+            return Err(Refusal::OutOfRule(rule.param.to_owned(), path.clone()));
+        }
+        if admission.denied(path) {
             return Err(Refusal::Denied(rule.param.to_owned(), path.clone()));
         }
         admitted.push(path.clone());
@@ -296,12 +362,14 @@ pub fn expand(
                         if !pattern_name(name, prefix, suffix) {
                             return Err(Refusal::BadEnvName(name.clone()));
                         }
-                        if !normal(path) || !roles.iter().any(|role| admission.admits(*role, path))
-                        {
+                        if !admission.admits(roles, path) {
                             return Err(Refusal::OutOfRule(
                                 (*param).to_owned(),
                                 path.to_path_buf(),
                             ));
+                        }
+                        if admission.denied(path) {
+                            return Err(Refusal::Denied((*param).to_owned(), path.to_path_buf()));
                         }
                         env.push((name.clone(), value.clone()));
                     }
@@ -792,6 +860,79 @@ mod tests {
             expand(&[CHECK], &traversal, &admission),
             Err(Refusal::OutOfRule(name, _)) if name == "ancestors"
         ));
+    }
+
+    /// Paths are admitted both as given and as they resolve: a symlink inside an admitted root
+    /// that leads outside it is refused, a symlinked optional ancestor file leading outside is not
+    /// read, and a read deny on the resolved target wins (environment values included). A cache
+    /// path that does not exist yet is still admitted through its existing parents.
+    #[test]
+    fn symlinks_cannot_leave_their_roots() {
+        let layout = Layout::new("links");
+        let outside = layout.base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("Cargo.toml"), "").unwrap();
+        std::os::unix::fs::symlink(&outside, layout.home.join(".cargo")).unwrap();
+        std::fs::create_dir_all(layout.base.join("outer/.cargo")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("Cargo.toml"),
+            layout.base.join("outer/.cargo/config.toml"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(layout.developer.join("usr/bin")).unwrap();
+        std::os::unix::fs::symlink(&outside, layout.developer.join("usr/bin/clang")).unwrap();
+        let programs = [("cargo".to_owned(), layout.toolchain.join("bin/cargo"))];
+        let roots = [layout.toolchain.clone()];
+        let dev = [layout.developer.clone()];
+        let admission = layout.admission(&programs, &roots, &dev);
+        assert!(
+            matches!(
+                expand(&[CHECK], &layout.effect(), &admission),
+                Err(Refusal::OutOfRule(name, _)) if name == "cargo_home"
+            ),
+            "a home symlink leading outside the home is refused"
+        );
+        let mut inside = layout.effect();
+        inside.params.insert(
+            "cargo_home".into(),
+            Param::Path(layout.toolchain.join("cargo-home")),
+        );
+        inside.params.remove("cc");
+        inside.params.remove("linker");
+        let spec = expand(&[CHECK], &inside, &admission).unwrap();
+        assert!(
+            !spec
+                .read_roots
+                .contains(&layout.base.join("outer/.cargo/config.toml")),
+            "a symlinked ancestor file leading outside is not read"
+        );
+        let mut env = inside.clone();
+        env.params.insert(
+            "linker".into(),
+            Param::Env(BTreeMap::from([(
+                "CARGO_TARGET_X_LINKER".into(),
+                layout.developer.join("usr/bin/clang").display().to_string(),
+            )])),
+        );
+        assert!(
+            matches!(
+                expand(&[CHECK], &env, &admission),
+                Err(Refusal::OutOfRule(name, _)) if name == "linker"
+            ),
+            "an environment value resolving outside its root is refused"
+        );
+        let denies = [ReadDeny::Path(layout.toolchain.join("cargo-home"))];
+        let denied = Admission {
+            read_denies: &denies,
+            ..admission.clone()
+        };
+        assert!(
+            matches!(
+                expand(&[CHECK], &inside, &denied),
+                Err(Refusal::Denied(name, _)) if name == "cargo_home"
+            ),
+            "a read deny wins"
+        );
     }
 
     /// No count ceiling: deep worktrees with 145 and 1,210 ancestor-file read roots expand whole
