@@ -7,9 +7,10 @@ pub mod freshness;
 #[allow(dead_code)]
 pub(crate) mod wire;
 
+/// Repository-level index of cross-language name facts, one per worktree incarnation.
+pub mod anchors;
 /// Exact-file and exact-symbol context with bounded lexical fallback.
 pub mod context;
-/// Repository-level index of cross-language name facts, one per worktree incarnation.
 pub mod names;
 /// M-011 phase-2b pilot: throw-away framed-stdio boundary to one external read-only module.
 #[doc(hidden)]

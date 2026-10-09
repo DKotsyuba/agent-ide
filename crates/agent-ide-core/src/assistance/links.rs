@@ -70,30 +70,46 @@ pub(super) fn bridged_files_present(root: &Path) -> bool {
     crate::lang::text::has_files_with(root, &extensions)
 }
 
-/// Facts `file`'s own language states on `range` of `bytes` (none without a provider).
-fn local_facts(file: &Path, bytes: &[u8], range: LineRange) -> Vec<crate::lang::names::NameFact> {
-    let (Some(names), Ok(source)) = (
-        Lang::for_path(file).and_then(Lang::names),
-        std::str::from_utf8(bytes),
-    ) else {
+/// Facts `file`'s own language states on `range` of `bytes` (none without a provider or when its
+/// module fails). A language that computes in its module is asked on a blocking-pool thread,
+/// every other one inline.
+async fn local_facts(
+    worktree: &Path,
+    file: &Path,
+    bytes: &[u8],
+    range: LineRange,
+) -> Vec<crate::lang::names::NameFact> {
+    let Some(language) = Lang::for_path(file) else {
         return Vec::new();
     };
-    let mut sink = crate::lang::names::FactSink::new();
-    names.extract(file, source, &mut sink);
-    sink.into_facts()
+    let (worktree, file, bytes) = (worktree.to_path_buf(), file.to_path_buf(), bytes.to_vec());
+    let facts = move || crate::intelligence::names::facts_of(&worktree, language, &file, &bytes);
+    let facts = if crate::intelligence::anchors::routed(language).is_some() {
+        tokio::task::spawn_blocking(facts).await.ok().flatten()
+    } else {
+        facts()
+    };
+    facts
+        .unwrap_or_default()
         .into_iter()
         .filter(|fact| range.start <= fact.line && fact.line <= range.end)
         .collect()
 }
 
 /// Whether `file`'s own language states a name fact on `range` of `bytes`.
-fn has_facts_in(file: &Path, bytes: &[u8], range: LineRange) -> bool {
-    !local_facts(file, bytes, range).is_empty()
+async fn has_facts_in(worktree: &Path, file: &Path, bytes: &[u8], range: LineRange) -> bool {
+    !local_facts(worktree, file, bytes, range).await.is_empty()
 }
 
 /// Keys `found` defines itself (its children's definitions excluded), from `bytes`.
-fn owned_keys(file: &Path, bytes: &[u8], found: &Symbol) -> BTreeSet<NameKey> {
-    local_facts(file, bytes, found.range)
+async fn owned_keys(
+    worktree: &Path,
+    file: &Path,
+    bytes: &[u8],
+    found: &Symbol,
+) -> BTreeSet<NameKey> {
+    local_facts(worktree, file, bytes, found.range)
+        .await
         .into_iter()
         .filter(|fact| fact.role == Role::Define)
         .filter(|fact| {
@@ -300,7 +316,7 @@ impl Worker<'_> {
     ) -> Result<(), FailureCode> {
         // The file's own facts decide first, from the observed bytes: a symbol without name facts
         // (most code) never touches the index, so its card costs nothing extra.
-        if !has_facts_in(file, bytes, found.range) {
+        if !has_facts_in(worktree.worktree_path(), file, bytes, found.range).await {
             return Ok(());
         }
         let (index, state) = self.name_index(job, worktree).await?;
@@ -486,7 +502,7 @@ impl Worker<'_> {
         bytes: &[u8],
         found: &Symbol,
     ) -> Result<Vec<(PathBuf, u32, Lang)>, FailureCode> {
-        let keys = owned_keys(file, bytes, found);
+        let keys = owned_keys(worktree.worktree_path(), file, bytes, found).await;
         if keys.is_empty() {
             return Ok(Vec::new());
         }
@@ -522,7 +538,8 @@ impl Worker<'_> {
         range: LineRange,
         limit: usize,
     ) -> Result<Vec<LinkTarget>, FailureCode> {
-        let keys: BTreeSet<NameKey> = local_facts(file, bytes, range)
+        let keys: BTreeSet<NameKey> = local_facts(worktree.worktree_path(), file, bytes, range)
+            .await
             .into_iter()
             .filter(|fact| fact.role == Role::Use)
             .map(|fact| fact.key)

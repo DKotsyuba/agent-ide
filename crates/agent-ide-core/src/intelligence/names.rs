@@ -64,6 +64,8 @@ pub const MAX_KNOWN_FILES: usize = 200_000;
 const WALK_MAX_DIRECTORIES: usize = 10_000;
 /// Skip reason of a file whose facts would pass [`MAX_FACTS_PER_WORKTREE`].
 const FACTS_CAP: &str = "facts cap";
+/// Skip reason of a file whose language module did not answer; never cached, retried every sweep.
+const MODULE_UNAVAILABLE: &str = "module unavailable";
 
 /// Directories no language walk enters: VCS internals, virtual environments, dependency installs
 /// and build output.
@@ -347,6 +349,9 @@ pub struct NameIndex {
     present: BTreeSet<Language>,
     /// Every file of the last listing (any language), the targets of file references.
     known: HashSet<PathBuf>,
+    /// Languages whose module failed to answer during the last sweep: their files are retried on
+    /// the next refresh and listed as unavailable until then.
+    faulted: BTreeSet<Language>,
     /// The unfinished sweep, if any.
     sweep: Option<Sweep>,
     /// Files the last refresh read (0 when nothing changed or everything came from the cache).
@@ -357,6 +362,8 @@ pub struct NameIndex {
     built: bool,
     /// Extractions shared with the other worktrees of the daemon.
     cache: Arc<Mutex<FactCache>>,
+    /// The module routing of anchors, if the daemon installed one.
+    source: Option<Arc<dyn super::anchors::AnchorSource>>,
 }
 
 impl NameIndex {
@@ -375,12 +382,21 @@ impl NameIndex {
             facts: 0,
             present: BTreeSet::new(),
             known: HashSet::new(),
+            faulted: BTreeSet::new(),
             sweep: None,
             reread: 0,
             reused: 0,
             built: false,
             cache,
+            source: super::anchors::installed(),
         }
+    }
+
+    /// Takes this index's anchors from `source` instead of the daemon's installed one.
+    #[must_use]
+    pub fn with_anchor_source(mut self, source: Arc<dyn super::anchors::AnchorSource>) -> Self {
+        self.source = Some(source);
+        self
     }
 
     /// Continues (or starts) a sweep until it finishes or `deadline` passes: lists candidates at
@@ -590,7 +606,13 @@ impl NameIndex {
         // A file known only by its Git blob was never read here: its bytes prove the facts when
         // they extract to the same facts.
         if entry.digest.is_none()
-            && let Some(extracted) = extract(entry.language, file, bytes)
+            && let Extraction::Done(extracted) = extract(
+                self.source.as_deref(),
+                self.worktree.worktree_path(),
+                entry.language,
+                file,
+                bytes,
+            )
             && extracted.facts == entry.extracted.facts
             && extracted.skipped == entry.extracted.skipped
         {
@@ -621,11 +643,12 @@ impl NameIndex {
             .iter()
             .copied()
             .filter(|language| {
-                !language.names().is_some_and(|names| {
-                    names.coverage().iter().any(|coverage| {
-                        coverage.namespace == namespace && (coverage.defines || coverage.uses)
+                self.faulted.contains(language)
+                    || !language.names().is_some_and(|names| {
+                        names.coverage().iter().any(|coverage| {
+                            coverage.namespace == namespace && (coverage.defines || coverage.uses)
+                        })
                     })
-                })
             })
             .collect()
     }
@@ -743,6 +766,7 @@ impl NameIndex {
             .unwrap_or_else(|| walk(root).into_iter().map(|path| (path, None)).collect());
         self.present.clear();
         self.known.clear();
+        self.faulted.clear();
         let mut candidates = Vec::new();
         for (path, blob) in listed {
             if self.known.len() < MAX_KNOWN_FILES {
@@ -777,11 +801,11 @@ impl NameIndex {
     fn visit(&mut self, path: &Path, language: Language, blob: Option<Box<str>>) {
         let content = blob.map(ContentKey::GitBlob);
         if let Some(content) = &content {
-            if self
-                .files
-                .get(path)
-                .is_some_and(|entry| entry.content == *content && entry.language == language)
-            {
+            if self.files.get(path).is_some_and(|entry| {
+                entry.content == *content
+                    && entry.language == language
+                    && entry.extracted.skipped != Some(MODULE_UNAVAILABLE)
+            }) {
                 return;
             }
             let key = CacheKey::of(language, path, content.clone());
@@ -799,6 +823,7 @@ impl NameIndex {
         if content.is_none()
             && self.files.get(path).is_some_and(|entry| {
                 entry.stamp == Some(stamp)
+                    && entry.extracted.skipped != Some(MODULE_UNAVAILABLE)
                     && entry.language == language
                     && matches!(entry.content, ContentKey::Digest(_))
             })
@@ -846,6 +871,7 @@ impl NameIndex {
         if let Some(entry) = self.files.get_mut(path)
             && entry.digest == Some(digest)
             && entry.language == language
+            && entry.extracted.skipped != Some(MODULE_UNAVAILABLE)
         {
             entry.stamp = stamp;
             if let Some(content) = content {
@@ -869,16 +895,27 @@ impl NameIndex {
                 self.reused += 1;
                 extracted
             }
-            None => {
-                let Some(extracted) = extract(language, path, bytes) else {
-                    return self.remove(path);
-                };
-                let extracted = Arc::new(extracted);
-                if let Ok(mut cache) = self.cache.lock() {
-                    cache.insert(key, extracted.clone());
+            None => match extract(
+                self.source.as_deref(),
+                self.worktree.worktree_path(),
+                language,
+                path,
+                bytes,
+            ) {
+                Extraction::NoProvider => return self.remove(path),
+                Extraction::Faulted => {
+                    // Not cached, so the next sweep asks the module again.
+                    self.faulted.insert(language);
+                    skipped(MODULE_UNAVAILABLE)
                 }
-                extracted
-            }
+                Extraction::Done(extracted) => {
+                    let extracted = Arc::new(extracted);
+                    if let Ok(mut cache) = self.cache.lock() {
+                        cache.insert(key, extracted.clone());
+                    }
+                    extracted
+                }
+            },
         };
         self.store(path, language, stamp, content, Some(digest), extracted);
     }
@@ -987,42 +1024,92 @@ impl NameIndexes {
     }
 }
 
-/// The extraction of `bytes` for `path` in `language`, facts sorted; `None` without a provider.
-fn extract(language: Language, path: &Path, bytes: &[u8]) -> Option<Extracted> {
-    let provider = language.names()?;
-    let Ok(source) = std::str::from_utf8(bytes) else {
-        return Some(Extracted {
+/// How one extraction ended.
+enum Extraction {
+    /// The language states no names.
+    NoProvider,
+    /// The language's module did not answer.
+    Faulted,
+    /// The facts (possibly none).
+    Done(Extracted),
+}
+
+/// The extraction of `bytes` for `path` in `language`, facts sorted: from the language's module
+/// when the installed [`AnchorSource`](super::anchors::AnchorSource) routes it there, else through
+/// the language's own [`NameFacts`](crate::lang::names::NameFacts). Both give equal facts.
+fn extract(
+    source: Option<&dyn super::anchors::AnchorSource>,
+    worktree: &Path,
+    language: Language,
+    path: &Path,
+    bytes: &[u8],
+) -> Extraction {
+    let Some(provider) = language.names() else {
+        return Extraction::NoProvider;
+    };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Extraction::Done(Extracted {
             facts: Box::new([]),
             skipped: Some("non-utf8"),
             capped: false,
         });
     };
-    let mut sink = FactSink::new();
-    let verdict = provider.extract(path, source, &mut sink);
-    let capped = sink.is_capped();
-    let mut facts = sink.into_facts();
-    Some(match verdict {
-        FileVerdict::Skipped(reason) => Extracted {
-            facts: Box::new([]),
-            skipped: Some(reason),
-            capped: false,
+    let (mut facts, skipped, capped) = match source.filter(|source| source.routes(language)) {
+        Some(module) => match module.anchors(worktree, language, path, text) {
+            Ok(batch) => {
+                let converted = super::anchors::facts_from_anchors(text, &batch);
+                (converted.facts, converted.skipped, converted.capped)
+            }
+            Err(_) => return Extraction::Faulted,
         },
-        FileVerdict::Indexed => {
-            facts.sort_by(|a, b| {
-                (a.line, a.column, a.key.namespace, &a.key.name).cmp(&(
-                    b.line,
-                    b.column,
-                    b.key.namespace,
-                    &b.key.name,
-                ))
-            });
-            Extracted {
-                facts: facts.into_boxed_slice(),
-                skipped: None,
-                capped,
+        None => {
+            let mut sink = FactSink::new();
+            let verdict = provider.extract(path, text, &mut sink);
+            let capped = sink.is_capped();
+            match verdict {
+                FileVerdict::Skipped(reason) => (Vec::new(), Some(reason), false),
+                FileVerdict::Indexed => (sink.into_facts(), None, capped),
             }
         }
+    };
+    if skipped.is_some() {
+        return Extraction::Done(Extracted {
+            facts: Box::new([]),
+            skipped,
+            capped: false,
+        });
+    }
+    facts.sort_by(|a, b| {
+        (a.line, a.column, a.key.namespace, &a.key.name).cmp(&(
+            b.line,
+            b.column,
+            b.key.namespace,
+            &b.key.name,
+        ))
+    });
+    Extraction::Done(Extracted {
+        facts: facts.into_boxed_slice(),
+        skipped: None,
+        capped,
     })
+}
+
+/// The facts of `bytes` as `path` in `language` for a caller outside the index (the symbol cards
+/// read the facts of the symbol they render from the bytes they observed): from the module or in
+/// process like the index's own extraction, sorted. Blocks while a module answers, so a routed
+/// language must be asked from a blocking-pool thread (see
+/// [`routed`](super::anchors::routed)). `None` without a provider or when the module fails.
+pub fn facts_of(
+    worktree: &Path,
+    language: Language,
+    path: &Path,
+    bytes: &[u8],
+) -> Option<Vec<NameFact>> {
+    let installed = super::anchors::installed();
+    match extract(installed.as_deref(), worktree, language, path, bytes) {
+        Extraction::Done(extracted) => Some(extracted.facts.into_vec()),
+        Extraction::NoProvider | Extraction::Faulted => None,
+    }
 }
 
 /// A factless extraction skipped for `reason`.
@@ -1896,5 +1983,62 @@ mod tests {
         let mut cache = FactCache::default();
         cache.insert(one.clone(), skipped("one"));
         assert!(cache.get(&one).is_some() && cache.get(&two).is_none());
+    }
+
+    /// A language computed in its module and one computed in process join exactly like two
+    /// in-process languages; a module that is down leaves its files skipped, lists the language
+    /// as unavailable (never as having no links) and is asked again on the next sweep.
+    #[test]
+    fn module_anchors_join_like_in_process_facts() {
+        use crate::intelligence::anchors::stub::ModuleStub;
+        let root = scratch("module-anchors");
+        write(
+            &root,
+            &[
+                ("a.alpha", "@btn @card/mod #main\n"),
+                ("b.beta", "use:btn é ~card ref:a.alpha\nuse:card/mod\n"),
+                ("c.gamma", "#main\n"),
+            ],
+        );
+        testing::install();
+        let reference = built(&root);
+        let stub = Arc::new(ModuleStub::new(&[BETA]));
+        let mut mixed = NameIndex::new(worktree(&root, 1)).with_anchor_source(stub.clone());
+        assert_eq!(mixed.refresh(far()), IndexState::Ready);
+        let keys = [
+            NameKey::global(ns::CLASS, "btn"),
+            NameKey::global(ns::CLASS, "card"),
+            NameKey::global(ns::ELEMENT_ID, "main"),
+            NameKey::global(ns::FILE_REF, "a.alpha"),
+            NameKey {
+                domain: "mod".into(),
+                ..NameKey::global(ns::CLASS, "card")
+            },
+        ];
+        for key in &keys {
+            assert_eq!(mixed.sites(key), reference.sites(key), "{key:?}");
+        }
+        assert_eq!(mixed.summary(), reference.summary());
+
+        // The module goes down: its files are skipped and disclosed, other languages still join.
+        stub.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        write(&root, &[("b.beta", "use:btn changed\n")]);
+        assert_eq!(mixed.refresh(far()), IndexState::Ready);
+        assert_eq!(mixed.skipped().get("module unavailable"), Some(&1));
+        assert!(mixed.uncovered(ns::CLASS).contains(&BETA));
+        assert_eq!(mixed.sites(&keys[2]), reference.sites(&keys[2]));
+        assert!(
+            mixed
+                .sites(&keys[0])
+                .iter()
+                .all(|site| site.language != BETA)
+        );
+
+        // It comes back: the unchanged file is read again and its facts return.
+        stub.down.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(mixed.refresh(far()), IndexState::Ready);
+        assert!(mixed.skipped().is_empty());
+        assert!(!mixed.uncovered(ns::CLASS).contains(&BETA));
+        assert_eq!(mixed.sites(&keys[0]).len(), 2);
     }
 }
