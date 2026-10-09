@@ -823,6 +823,30 @@ pub enum EnvRule {
         /// Variable name.
         name: &'static str,
     },
+    /// The expanded run's final read roots, in order, as a JSON array of paths (for a tool that
+    /// enforces them itself).
+    ReadRootsJson {
+        /// Variable name.
+        name: &'static str,
+    },
+    /// The host read denies of the run as a JSON array, serialized exactly as the core holds
+    /// them.
+    ReadDeniesJson {
+        /// Variable name.
+        name: &'static str,
+    },
+}
+
+/// A static file a recipe's run needs in the private cache (an embedded adapter script): before
+/// the spawn the core writes `bytes` at the admitted [`PathRole::Cache`] path of the [`Param::Path`]
+/// named `param` (a fresh temporary file renamed into place; nothing is followed).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecipeAsset {
+    /// The path parameter naming where it is staged (a rule whose roles are exactly
+    /// [`PathRole::Cache`]).
+    pub param: &'static str,
+    /// Exact bytes.
+    pub bytes: &'static [u8],
 }
 
 /// Where a named executable comes from; the core alone resolves and measures it before a spawn.
@@ -892,6 +916,8 @@ pub struct EffectRecipe {
     /// Capture ceiling per stream; the core keeps the class-specific existing caps (64 MiB for
     /// project checks) and marks truncation explicitly.
     pub capture_bytes: u64,
+    /// Static files staged in the private cache before the spawn.
+    pub assets: &'static [RecipeAsset],
 }
 
 // ---- describe ----

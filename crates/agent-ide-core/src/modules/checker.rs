@@ -104,7 +104,6 @@ impl ModuleChecker {
         let described = self.described(&request.worktree).await?;
         let mut effects = CheckEffects {
             recipes: recipe::declared(self.language.name()),
-            assets: recipe::declared_assets(self.language.name()),
             request,
             home: crate::userhome::user_home(),
             described,
@@ -173,8 +172,6 @@ impl Checker for ModuleChecker {
 struct CheckEffects<'a> {
     /// The language's declared recipes.
     recipes: &'static [crate::modules::payload::EffectRecipe],
-    /// The language's declared cache assets, staged before every run.
-    assets: &'static [recipe::CacheAsset],
     /// The check being served.
     request: &'a CheckRequest,
     /// The real user home.
@@ -206,17 +203,19 @@ impl EffectRunner for CheckEffects<'_> {
                 self.home.as_deref(),
                 self.timeout,
             );
-            if let Err(error) = recipe::stage_assets(&self.request.cache_dir, self.assets) {
-                return (
-                    EffectOutcome::Refused {
-                        cause: Cause::Exited,
-                        message: format!("staging cache assets: {}", error.kind()),
-                    },
-                    Vec::new(),
-                );
-            }
-            let spec = match recipe::expand(self.recipes, &effect, &admission) {
-                Ok(spec) => spec,
+            let spec = match recipe::expand_staged(self.recipes, &effect, &admission) {
+                Ok((spec, staged)) => {
+                    if let Err(error) = recipe::stage(&staged) {
+                        return (
+                            EffectOutcome::Refused {
+                                cause: Cause::Exited,
+                                message: format!("staging recipe assets: {}", error.kind()),
+                            },
+                            Vec::new(),
+                        );
+                    }
+                    spec
+                }
                 Err(refusal) => {
                     return (
                         EffectOutcome::Refused {
@@ -289,6 +288,7 @@ mod tests {
         class: RunClass::Background,
         timeout_ceiling_ms: 900_000,
         capture_bytes: 64 << 20,
+        assets: &[],
     }];
 
     /// Records every spec and answers a fixed failed run.
@@ -328,7 +328,6 @@ mod tests {
         };
         let mut effects = CheckEffects {
             recipes: RECIPES,
-            assets: &[],
             request: &request,
             home: None,
             described: &described,
