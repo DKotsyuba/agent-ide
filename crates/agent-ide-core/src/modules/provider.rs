@@ -38,6 +38,7 @@ use super::{
     serve::{Answer, Effects, Incoming, ModuleServer, ServeError},
 };
 use crate::{
+    execution::{CommandKind, ControlledCommand},
     intelligence::{
         context::{ContextMode, ContextQuery},
         freshness::{DiagnosticReadiness, Freshness, ViewGeneration},
@@ -66,6 +67,11 @@ pub struct ProviderGrant {
     pub accepted: Vec<(PathBuf, String)>,
     /// Per-request provider deadline.
     pub request_timeout_ms: u64,
+    /// Roots the core admits for the provider's own paths beside the worktree and the accepted
+    /// files' directories (a private cache namespace, toolchain and tool homes from the launcher
+    /// declaration).
+    #[serde(default)]
+    pub roots: Vec<PathBuf>,
 }
 
 /// How a language starts its provider from the granted files.
@@ -82,23 +88,65 @@ pub struct ProviderLaunchPlan {
 }
 
 impl ProviderGrant {
-    /// Re-measures the plan's program and every file it loads against the accepted digests; an
-    /// unaccepted or changed file refuses the launch.
-    fn verify(&self, plan: &ProviderLaunchPlan) -> io::Result<()> {
-        let denied = || io::Error::new(io::ErrorKind::PermissionDenied, "provider not accepted");
-        for path in std::iter::once(&plan.program).chain(&plan.reads) {
-            let (_, digest) = self
-                .accepted
+    /// Checks a plan before anything starts: the program and every file it loads must be
+    /// accepted with an unchanged digest, and every absolute path in its arguments and
+    /// environment (each `:`-separated part) must lie in `worktree`, a granted root or the
+    /// directory of an accepted file. Returns the Execution command, its executable measured.
+    fn admit(&self, worktree: &Path, plan: &ProviderLaunchPlan) -> io::Result<ControlledCommand> {
+        let denied = |what: &str| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("provider not accepted: {what}"),
+            )
+        };
+        let accepted = |path: &PathBuf| {
+            self.accepted
                 .iter()
                 .find(|(accepted, _)| accepted == path)
-                .ok_or_else(denied)?;
+                .map(|(_, digest)| digest.as_str())
+        };
+        for path in &plan.reads {
+            let digest = accepted(path).ok_or_else(|| denied("read"))?;
             let bytes = std::fs::read(path)
                 .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "provider file missing"))?;
             if blake3::hash(&bytes).to_hex().as_str() != digest {
-                return Err(denied());
+                return Err(denied("read changed"));
             }
         }
-        Ok(())
+        let inside = |part: &str| {
+            let path = Path::new(part);
+            !path.is_absolute()
+                || (path
+                    .components()
+                    .all(|part| !matches!(part, std::path::Component::ParentDir))
+                    && (path.starts_with(worktree)
+                        || self.roots.iter().any(|root| path.starts_with(root))
+                        || self.accepted.iter().any(|(file, _)| {
+                            file.parent().is_some_and(|dir| path.starts_with(dir))
+                        })))
+        };
+        for value in plan.args.iter().chain(plan.env.values()) {
+            if !value.split(':').all(inside) {
+                return Err(denied("path outside the grant"));
+            }
+        }
+        let digest = accepted(&plan.program).ok_or_else(|| denied("program"))?;
+        let digest = blake3::Hash::from_hex(digest).map_err(|_| denied("program digest"))?;
+        let command = ControlledCommand::from_validated_peer(
+            CommandKind::Provider,
+            plan.program.clone(),
+            plan.args.iter().map(std::ffi::OsString::from).collect(),
+            worktree.to_path_buf(),
+            plan.env
+                .iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+        )
+        .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "provider program unavailable"))?;
+        if !command.has_program_digest(&digest) {
+            return Err(denied("program changed"));
+        }
+        Ok(command)
     }
 }
 
@@ -211,18 +259,10 @@ impl<B: ProviderBuilder> ProviderServer<B> {
                 .clone()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no provider granted"))?;
             let (settings, plan) = self.builder.plan(&self.root, &self.settings)?;
-            grant.verify(&plan)?;
+            let command = grant.admit(&self.root, &plan)?;
             self.spent = true;
-            let mut child = tokio::process::Command::new(&plan.program)
-                .args(&plan.args)
-                .env_clear()
-                .envs(&plan.env)
-                .current_dir(&self.root)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()?;
+            let mut child = crate::execution::spawn_granted_provider(&command)
+                .map_err(|error| io::Error::other(format!("{error:?}")))?;
             let (Some(stdin), Some(stdout), Some(mut stderr)) =
                 (child.stdin.take(), child.stdout.take(), child.stderr.take())
             else {
@@ -844,5 +884,67 @@ impl<B: ProviderBuilder> ModuleServer for ProviderServer<B> {
                 Answer::unavailable(Stage::Provider, cause, "provider request failed")
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod grant_tests {
+    use super::*;
+
+    /// A plan starts only from accepted, unchanged files, with every absolute path of its
+    /// arguments and environment inside the worktree, a granted root or an accepted file's
+    /// directory; `..` never passes.
+    #[test]
+    fn provider_plans_are_admitted_against_the_grant() {
+        let program = PathBuf::from("/bin/sh");
+        let digest = blake3::hash(&std::fs::read(&program).unwrap())
+            .to_hex()
+            .to_string();
+        let grant = ProviderGrant {
+            accepted: vec![(program.clone(), digest)],
+            request_timeout_ms: 1000,
+            roots: vec![PathBuf::from("/private/var/cache-ns")],
+        };
+        let plan = |env: &[(&str, &str)]| ProviderLaunchPlan {
+            program: program.clone(),
+            args: vec!["--stdio".into()],
+            env: env
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
+            reads: Vec::new(),
+        };
+        let worktree = Path::new("/private/var/work");
+        assert!(
+            grant
+                .admit(
+                    worktree,
+                    &plan(&[
+                        ("PATH", "/bin:/private/var/work/bin"),
+                        ("TMPDIR", "/private/var/cache-ns/tmp")
+                    ])
+                )
+                .is_ok()
+        );
+        for outside in [
+            "/etc/ssh",
+            "/private/var/cache-ns/../root",
+            "/bin:/usr/local/secret",
+        ] {
+            assert_eq!(
+                grant
+                    .admit(worktree, &plan(&[("X", outside)]))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied,
+                "{outside}"
+            );
+        }
+        let mut other = plan(&[]);
+        other.program = PathBuf::from("/bin/ls");
+        assert!(
+            grant.admit(worktree, &other).is_err(),
+            "an unaccepted program"
+        );
     }
 }

@@ -12,9 +12,6 @@ pub mod anchors;
 /// Exact-file and exact-symbol context with bounded lexical fallback.
 pub mod context;
 pub mod names;
-/// M-011 phase-2b pilot: throw-away framed-stdio boundary to one external read-only module.
-#[doc(hidden)]
-pub mod pilot;
 /// The language-server seam: static server descriptions, per-worker backends and their host.
 pub mod server;
 /// Production async-lsp sessions over borrowed Execution-owned protocol pipes.

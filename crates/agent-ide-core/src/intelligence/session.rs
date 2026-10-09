@@ -367,9 +367,6 @@ pub struct Session {
     sequence: u64,
     /// Last allocated document version, retained after closing a missing document.
     version: i32,
-    /// M-011 pilot: the external module channel; when present every read-only request is
-    /// forwarded there and `server` is a closed socket.
-    remote: Option<Box<super::pilot::Channel>>,
     /// A bundled module hosting the provider; when present every request goes there and `server`
     /// is a closed socket.
     module: Option<Box<module_remote::ModuleRemote>>,
@@ -432,7 +429,6 @@ where
         deadline,
         sequence: 0,
         version: 0,
-        remote: None,
         module: None,
     };
     let driver_state = state.clone();
@@ -576,7 +572,6 @@ impl LiveSession {
             deadline: Instant::now() + Duration::from_secs(60 * 60 * 24 * 3650),
             sequence: 0,
             version: 0,
-            remote: None,
             module: None,
         };
         let mut live = Self { session, driver };
@@ -840,8 +835,8 @@ impl Session {
     /// and empty unversioned pushes leave readiness unknown; semantic context already computed by
     /// the caller is unaffected.
     pub(crate) async fn wait_for_matching_diagnostics(&self) {
-        // A pilot or bundled module already waited inside its own context exchange.
-        if self.remote.is_some() || self.module.is_some() {
+        // A bundled module already waited inside its own context exchange.
+        if self.module.is_some() {
             return;
         }
         let now = Instant::now();
@@ -871,9 +866,6 @@ impl Session {
     ) -> io::Result<ContextResult> {
         if self.module.is_some() {
             return self.module_context(observation, bytes, query).await;
-        }
-        if self.remote.is_some() {
-            return self.remote_context(observation, bytes, query).await;
         }
         if self.state.lock().expect("session lock").terminal {
             return Err(io::Error::other("LSP session is shut down"));
@@ -1013,11 +1005,6 @@ impl Session {
         if self.module.is_some() {
             return Err(io::Error::other("a module session answers module_outline"));
         }
-        if self.remote.is_some() {
-            return self
-                .remote_at("document_symbols", observation, bytes, None)
-                .await;
-        }
         let uri = self.sync_for_request(observation, bytes).await?;
         let reply = self
             .request::<request::DocumentSymbolRequest>(lsp::DocumentSymbolParams {
@@ -1058,11 +1045,6 @@ impl Session {
         if self.module.is_some() {
             return self.module_hover(observation, bytes, byte_offset).await;
         }
-        if self.remote.is_some() {
-            return self
-                .remote_at("hover", observation, bytes, Some(byte_offset))
-                .await;
-        }
         let params = self
             .position_params(observation, bytes, byte_offset)
             .await?;
@@ -1095,11 +1077,6 @@ impl Session {
                 .module_locations(observation, bytes, byte_offset, true)
                 .await;
         }
-        if self.remote.is_some() {
-            return self
-                .remote_at("definitions", observation, bytes, Some(byte_offset))
-                .await;
-        }
         let params = self
             .position_params(observation, bytes, byte_offset)
             .await?;
@@ -1123,11 +1100,6 @@ impl Session {
         if self.module.is_some() {
             return self
                 .module_locations(observation, bytes, byte_offset, false)
-                .await;
-        }
-        if self.remote.is_some() {
-            return self
-                .remote_at("references", observation, bytes, Some(byte_offset))
                 .await;
         }
         let params = self
@@ -1158,16 +1130,6 @@ impl Session {
                 .module_prepare_calls(observation, bytes, byte_offset)
                 .await;
         }
-        if self.remote.is_some() {
-            return self
-                .remote_at(
-                    "prepare_call_hierarchy",
-                    observation,
-                    bytes,
-                    Some(byte_offset),
-                )
-                .await;
-        }
         let params = self
             .position_params(observation, bytes, byte_offset)
             .await?;
@@ -1193,11 +1155,6 @@ impl Session {
                 .map(|(from, from_ranges)| lsp::CallHierarchyIncomingCall { from, from_ranges })
                 .collect());
         }
-        if self.remote.is_some() {
-            return self
-                .remote_typed("incoming_calls_for", serde_json::json!({"item": item}))
-                .await;
-        }
         Ok(self
             .request::<request::CallHierarchyIncomingCalls>(lsp::CallHierarchyIncomingCallsParams {
                 item,
@@ -1220,9 +1177,6 @@ impl Session {
                 .into_iter()
                 .map(|(to, from_ranges)| lsp::CallHierarchyOutgoingCall { to, from_ranges })
                 .collect());
-        }
-        if self.remote.is_some() {
-            return Err(io::Error::other("not available through the pilot module"));
         }
         Ok(self
             .request::<request::CallHierarchyOutgoingCalls>(lsp::CallHierarchyOutgoingCallsParams {
@@ -1252,11 +1206,6 @@ impl Session {
             };
             return self.incoming_calls_for(item).await;
         }
-        if self.remote.is_some() {
-            return self
-                .remote_at("incoming_calls", observation, bytes, Some(byte_offset))
-                .await;
-        }
         let Some(item) = self
             .prepare_call_hierarchy(observation, bytes, byte_offset)
             .await?
@@ -1285,11 +1234,6 @@ impl Session {
                 return Ok(Vec::new());
             };
             return self.outgoing_calls_for(item).await;
-        }
-        if self.remote.is_some() {
-            return self
-                .remote_at("outgoing_calls", observation, bytes, Some(byte_offset))
-                .await;
         }
         let params = self
             .position_params(observation, bytes, byte_offset)
@@ -1329,11 +1273,6 @@ impl Session {
         if self.module.is_some() {
             return self.module_workspace_symbols(query).await;
         }
-        if self.remote.is_some() {
-            return self
-                .remote_typed("workspace_symbols", serde_json::json!({"query": query}))
-                .await;
-        }
         self.refill_budget();
         let reply = self
             .request::<request::WorkspaceSymbolRequest>(lsp::WorkspaceSymbolParams {
@@ -1367,8 +1306,7 @@ impl Session {
     }
 
     /// Asks the provider for a project-wide rename of the symbol at a byte offset; nothing is
-    /// written here, the caller applies the returned edit. A pilot module session (M-011) is
-    /// read-only and refuses.
+    /// written here, the caller applies the returned edit.
     pub async fn rename(
         &mut self,
         observation: &SourceObservation,
@@ -1380,9 +1318,6 @@ impl Session {
             return self
                 .module_rename(observation, bytes, byte_offset, new_name)
                 .await;
-        }
-        if self.remote.is_some() {
-            return Err(io::Error::other("the pilot module is read-only"));
         }
         let params = self
             .position_params(observation, bytes, byte_offset)
@@ -1605,7 +1540,6 @@ impl Session {
     }
 
     /// Fences new context immediately, then completes bounded shutdown/exit; caller still owns reap.
-    /// A pilot module session (M-011) succeeds only when the module acknowledges `shutdown`.
     pub async fn shutdown(&mut self) -> io::Result<()> {
         {
             let mut state = self.state.lock().expect("session lock");
@@ -1618,15 +1552,6 @@ impl Session {
         // A bundled module is asked to exit; only the owner's reap proves it stopped.
         if let Some(module) = self.module.as_mut() {
             module.shutdown().await;
-            return Ok(());
-        }
-        // M-011 pilot: the module acknowledges `shutdown` before it stops its provider; without
-        // that acknowledgement the stop is unconfirmed and only the caller's reap proves it.
-        if let Some(remote) = self.remote.as_mut() {
-            remote
-                .call("shutdown", serde_json::json!({}), Duration::from_secs(1))
-                .await?;
-            self.state.lock().expect("session lock").shutdown_complete = true;
             return Ok(());
         }
         let mut guard = RequestGuard {
@@ -1651,252 +1576,18 @@ impl Session {
 }
 
 impl LiveSession {
-    /// M-011 pilot: opens a session whose provider runs inside an external module process
-    /// reached over `input`/`output` (the module's stdout/stdin; the caller owns and reaps the
-    /// process). The module receives `provider` opaquely in its `hello` and answers with the
-    /// capabilities of its own provider session; every later read-only request is forwarded
-    /// under [`super::pilot::call_budget`], and any module fault retires this session.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn open_remote<R, W>(
-        input: R,
-        output: W,
-        worktree: WorktreeRef,
-        epoch: u64,
-        generation: ViewGeneration,
-        settings: ProviderSettings,
-        request_timeout: Duration,
-        provider: serde_json::Value,
-    ) -> io::Result<Self>
-    where
-        R: AsyncRead + Unpin + Send + 'static,
-        W: AsyncWrite + Unpin + Send + Sync + 'static,
-    {
-        if epoch == 0 || request_timeout.is_zero() || request_timeout > Duration::from_secs(60) {
-            return Err(context::invalid(
-                "invalid session authority epoch or request deadline",
-            ));
-        }
-        let (channel, driver) = super::pilot::Channel::spawn(input, output);
-        let hello = super::pilot::AnalyzerHello {
-            worktree: super::pilot::WireWorktree::of(&worktree),
-            epoch,
-            generation: [
-                generation.backend,
-                generation.configuration,
-                generation.toolchain,
-                generation.view,
-            ],
-            request_timeout_ms: request_timeout.as_millis() as u64,
-            provider,
-        };
-        let session = Session {
-            server: ServerSocket::new_closed(),
-            worktree,
-            epoch,
-            generation,
-            state: fresh_state(&settings, generation),
-            capabilities: None,
-            settings,
-            budget: OutboundBudget::default(),
-            options: SessionOptions {
-                request_timeout: super::pilot::call_budget(),
-                lifetime: Duration::from_secs(300),
-            },
-            deadline: Instant::now() + Duration::from_secs(60 * 60 * 24 * 3650),
-            sequence: 0,
-            version: 0,
-            remote: Some(Box::new(channel)),
-            module: None,
-        };
-        let mut live = Self { session, driver };
-        // The module starts its provider and initializes it inside `hello`: a startup budget,
-        // not the per-call one.
-        let budget = request_timeout.max(live.session.options.request_timeout);
-        let reply = match live.session.remote.as_mut() {
-            Some(remote) => remote.call("hello", serde_json::json!(hello), budget).await,
-            None => Err(io::Error::other("remote session")),
-        };
-        let capabilities = reply.and_then(|reply| {
-            Ok(ProviderCapabilities {
-                advertised: super::pilot::decode(reply["advertised"].clone())?,
-                position_encoding: super::pilot::decode(reply["position_encoding"].clone())?,
-                server_info: super::pilot::decode(reply["server_info"].clone())?,
-            })
-        });
-        match capabilities.and_then(|capabilities| {
-            live.session
-                .settings
-                .validate_server(capabilities.server_info.as_ref())?;
-            Ok(capabilities)
-        }) {
-            Ok(capabilities) => {
-                live.session.capabilities = Some(capabilities);
-                Ok(live)
-            }
-            Err(error) => {
-                live.driver.abort();
-                Err(error)
-            }
-        }
+    /// The typed failure that retired this session's bundled module (its channel or its
+    /// provider), if any.
+    pub fn module_unavailable(&self) -> Option<crate::modules::contract::ModuleUnavailable> {
+        self.session.module_fault()
     }
-}
 
-impl LiveSession {
-    /// M-011 pilot: the fault that retired this session's module channel, if any.
+    /// The typed `module_unavailable` that retired this session's bundled module, if any.
     pub fn remote_fault(&self) -> Option<&str> {
         self.session
-            .remote
+            .module
             .as_ref()
-            .and_then(|remote| remote.fault())
-    }
-}
-
-impl Session {
-    /// Forwards one request to the pilot module; a module fault retires this generation.
-    async fn remote_call(
-        &mut self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> io::Result<serde_json::Value> {
-        let budget = self.options.request_timeout;
-        let remote = self
-            .remote
-            .as_mut()
-            .ok_or_else(|| io::Error::other("not a pilot session"))?;
-        let result = remote.call(method, params, budget).await;
-        if remote.fault().is_some() {
-            self.state.lock().expect("session lock").invalidate();
-        }
-        result
-    }
-
-    /// [`Session::remote_call`] decoding the result; an ill-typed reply also retires the session.
-    async fn remote_typed<T: serde::de::DeserializeOwned>(
-        &mut self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> io::Result<T> {
-        let value = self.remote_call(method, params).await?;
-        super::pilot::decode(value).inspect_err(|error| self.remote_retire(error))
-    }
-
-    /// Retires this session for a well-framed reply it cannot accept: the generation goes
-    /// inactive and the channel is poisoned with `error`, so the owner sees a module fault.
-    fn remote_retire(&mut self, error: &io::Error) {
-        self.state.lock().expect("session lock").invalidate();
-        if let Some(remote) = self.remote.as_mut() {
-            remote.poison(error.to_string());
-        }
-    }
-
-    /// Applies the local fences of `sync_for_request` (shut down, worktree, epoch, sequence,
-    /// exact UTF-8 bytes, live generation) before any byte leaves the core.
-    fn remote_source(
-        &mut self,
-        observation: &SourceObservation,
-        bytes: &[u8],
-    ) -> io::Result<super::pilot::WireSource> {
-        if self.state.lock().expect("session lock").terminal {
-            return Err(io::Error::other("LSP session is shut down"));
-        }
-        if observation.worktree() != &self.worktree
-            || observation.authority_epoch() != self.epoch
-            || observation.sequence() < self.sequence
-        {
-            return Err(context::invalid(
-                "source does not match the current provider view",
-            ));
-        }
-        self.sequence = observation.sequence();
-        let text = context::observed_text(observation, bytes)?;
-        if !self.state.lock().expect("session lock").active {
-            return Err(io::Error::other("provider generation unavailable"));
-        }
-        Ok(super::pilot::WireSource::of(observation, text))
-    }
-
-    /// Forwards one source-scoped request, optionally at a byte offset.
-    async fn remote_at<T: serde::de::DeserializeOwned>(
-        &mut self,
-        method: &str,
-        observation: &SourceObservation,
-        bytes: &[u8],
-        byte_offset: Option<usize>,
-    ) -> io::Result<T> {
-        let source = self.remote_source(observation, bytes)?;
-        self.remote_typed(
-            method,
-            serde_json::json!({"source": source, "byte_offset": byte_offset}),
-        )
-        .await
-    }
-
-    /// The remote form of [`Session::context`]: the core builds the result over its own
-    /// observation and overlays only the module's provider evidence, and binds the module's
-    /// diagnostics to that observation only when the module saw the same sequence.
-    async fn remote_context(
-        &mut self,
-        observation: &SourceObservation,
-        bytes: &[u8],
-        query: ContextQuery,
-    ) -> io::Result<ContextResult> {
-        if self.state.lock().expect("session lock").terminal {
-            return Err(io::Error::other("LSP session is shut down"));
-        }
-        let mut result =
-            context::lexical_context(observation, bytes, query, "semantic operations unavailable")?;
-        let source = match self.remote_source(observation, bytes) {
-            Ok(source) => source,
-            Err(error) if error.to_string() == "provider generation unavailable" => {
-                result.mode = ContextMode::Lexical {
-                    reason: "provider generation unavailable".into(),
-                };
-                return Ok(result);
-            }
-            Err(error) => return Err(error),
-        };
-        let byte_offset = match query {
-            ContextQuery::Symbol { byte_offset } => Some(byte_offset),
-            ContextQuery::File => None,
-        };
-        let reply = self
-            .remote_call(
-                "context",
-                serde_json::json!({"source": source, "byte_offset": byte_offset}),
-            )
-            .await
-            .and_then(|mut reply| {
-                Ok((
-                    super::pilot::decode::<super::pilot::WireContext>(reply["context"].take())?,
-                    super::pilot::decode::<super::pilot::WireDiagnostics>(
-                        reply["diagnostics"].take(),
-                    )?,
-                ))
-            });
-        let reply = reply.and_then(|(evidence, diagnostics)| {
-            evidence.apply(&mut result, self.generation)?;
-            Ok(diagnostics)
-        });
-        if let Err(error) = &reply
-            && error.kind() == io::ErrorKind::InvalidData
-        {
-            self.remote_retire(error);
-        }
-        let mut state = self.state.lock().expect("session lock");
-        match reply {
-            Ok(diagnostics) => diagnostics.apply(&mut state.diagnostics, observation),
-            Err(error) => {
-                state.diagnostics.source = None;
-                state.diagnostics.document_version = None;
-                state.diagnostics.freshness = Freshness::Unknown;
-                state.diagnostics.readiness = DiagnosticReadiness::Unknown;
-                state.diagnostics.diagnostics.clear();
-                result.mode = ContextMode::Lexical {
-                    reason: context::prefix(&error.to_string(), 256).into(),
-                };
-            }
-        }
-        Ok(result)
+            .and_then(|module| module.fault.as_deref())
     }
 }
 

@@ -16,15 +16,14 @@ use std::{
 };
 
 use super::{
-    adapter::effect_argv,
     contract::{Capability, ModuleUnavailable},
     mode::Mode,
     payload::{
-        AnalysisScopeRequest, AnalyzeSource, CheckSelectionAnswer, CommandEnvAnswer, DetectAnswer,
-        EffectRequest, EnvironmentsAnswer, Field, FileDocRequest, FormatPlanRequest,
-        InsertSiteAnswer, InsertSiteRequest, ProjectQuery, SelectionAnswer, SourceAnalysis,
-        SourceField, SourceRef, SourceText, SyntaxQuery, TestFacts, TestParseRequest,
-        TestPlanQuery, TestToolchainAnswer, encode,
+        AnalysisScopeRequest, AnalyzeSource, AnchorBatch, CheckSelectionAnswer, CommandEnvAnswer,
+        DetectAnswer, EffectRequest, EnvironmentsAnswer, Field, FileDocRequest, FileVerdict,
+        FormatPlanRequest, InsertSiteAnswer, InsertSiteRequest, ProjectQuery, SelectionAnswer,
+        SourceAnalysis, SourceField, SourceRef, SourceText, SyntaxQuery, TestFacts,
+        TestParseRequest, TestPlanQuery, TestToolchainAnswer, encode,
     },
     router::ModuleHost,
     wire::Attachment,
@@ -72,10 +71,12 @@ pub fn modes_line(languages: &[Language]) -> Option<String> {
     HOST.get()?.modes_line(languages)
 }
 
-/// The pinned module executable when `language` computes in its module (a backend then starts
-/// its provider inside that module); `None` keeps it in process.
-pub fn module_executable(language: Language) -> Option<Arc<super::launch::ModuleExecutable>> {
-    module(language)?.executable()
+/// Where a backend starts `language`'s provider: `None` in process; in module mode the pinned
+/// module executable, or the typed refusal when it cannot be pinned (never a silent fallback).
+pub fn module_executable(
+    language: Language,
+) -> Option<Routed<Arc<super::launch::ModuleExecutable>>> {
+    Some(module(language)?.executable(language))
 }
 
 /// Where `language` computes in this process.
@@ -141,6 +142,58 @@ async fn analyze(
         attachments,
     )
     .await
+}
+
+/// The linkage anchors of `path` with `text`: `Ok(None)` when `language` computes in process
+/// (the caller extracts its name facts itself); in module mode one `analyze_source` anchors
+/// batch, validated against the request's source and the coverage the module declared in its
+/// `hello` (a language that computes none, or not yet, answers an empty skipped batch). A module
+/// fault or an invalid batch is the typed failure. Async: a synchronous caller blocks on it from
+/// a blocking thread, never a runtime worker.
+pub async fn anchors(
+    language: Language,
+    worktree: &Path,
+    path: &Path,
+    text: &str,
+) -> Routed<Option<AnchorBatch>> {
+    let Some(host) = module(language) else {
+        return Ok(None);
+    };
+    let analysis = analyze(
+        host,
+        language,
+        worktree,
+        path,
+        Some(text),
+        vec![SourceField::Anchors],
+    )
+    .await?;
+    let skipped = |reason: &str| AnchorBatch {
+        verdict: FileVerdict::Skipped(reason.to_owned()),
+        capped: false,
+        rejected: 0,
+        coverage: Vec::new(),
+        anchors: Vec::new(),
+    };
+    let batch = match analysis.anchors {
+        Field::Available(batch) => batch,
+        Field::Warming => return Ok(Some(skipped("warming"))),
+        Field::Unsupported | Field::NotRequested => return Ok(Some(skipped("unsupported"))),
+    };
+    let declared = host.linkage(language, worktree).await.unwrap_or_default();
+    let (source, _) = source(path, text);
+    batch
+        .validate(&source, text, &declared)
+        .map_err(|_| ModuleUnavailable {
+            module_id: super::contract::ModuleId::bundled(language.name()),
+            module_version: env!("CARGO_PKG_VERSION").to_owned(),
+            role: super::contract::Role::Analyzer,
+            stage: super::contract::Stage::Decode,
+            cause: super::contract::Cause::Malformed,
+            instance: None,
+            retry_after_ms: None,
+        })?;
+    Ok(Some(batch))
 }
 
 /// `value` when computed; an unsupported or warming field answers `default` (the language does
@@ -520,22 +573,87 @@ pub async fn parse_test_output(
     }
 }
 
-/// The argv of a module's `argv` recipe answer; another recipe is refused as malformed.
-fn argv_of(language: Language, effect: Option<EffectRequest>) -> Routed<Option<Vec<String>>> {
-    match effect {
-        None => Ok(None),
-        Some(effect) => effect_argv(&effect)
-            .map(Some)
-            .ok_or_else(|| ModuleUnavailable {
-                module_id: super::contract::ModuleId::bundled(language.name()),
-                module_version: env!("CARGO_PKG_VERSION").to_owned(),
-                role: super::contract::Role::Analyzer,
-                stage: super::contract::Stage::Decode,
-                cause: super::contract::Cause::PolicyRefused,
-                instance: None,
-                retry_after_ms: None,
-            }),
+/// PATH for formatters, probes and the home tools a recipe names: the registered languages' home
+/// tool directories (see
+/// [`LanguageDescriptor::home_tool_dirs`](crate::lang::LanguageDescriptor::home_tool_dirs)), the
+/// daemon's own configured PATH, then the system directories — never the agent's shell
+/// environment.
+pub fn tool_path() -> String {
+    let mut parts = vec![];
+    if let Some(home) = crate::userhome::user_home() {
+        for language in crate::lang::registered() {
+            for dir in language.descriptor().home_tool_dirs {
+                parts.push(format!("{}/{dir}", home.display()));
+            }
+        }
     }
+    if let Some(path) = std::env::var_os("PATH") {
+        parts.push(path.to_string_lossy().into_owned());
+    }
+    parts.extend(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"].map(String::from));
+    parts.join(":")
+}
+
+/// One candidate-on-stdin run (a formatter or a syntax probe): the in-process language's
+/// argument vector, or the run specification the core expanded from a module's request of one of
+/// the language's declared recipes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StdinRun {
+    /// Run as the in-process path always has (formatter PATH, daemon environment).
+    Argv(Vec<String>),
+    /// Run exactly this core-built specification.
+    Spec(crate::checks::runner::RunSpec),
+}
+
+/// Expands a module's formatter or probe request under the core's interactive admission: the
+/// worktree, the real home, the language's declared install roots and the home tools its recipes
+/// name, resolved on [`tool_path`]. A request outside the declared recipes (the generic `argv`
+/// one included) is refused, never run.
+fn stdin_run(
+    language: Language,
+    worktree: &Path,
+    effect: Option<EffectRequest>,
+) -> Routed<Option<StdinRun>> {
+    let Some(effect) = effect else {
+        return Ok(None);
+    };
+    let recipes = super::recipe::declared(language.name());
+    let path = tool_path();
+    let programs: Vec<(String, PathBuf)> = recipes
+        .iter()
+        .flat_map(|recipe| recipe.executables.iter())
+        .filter_map(|slot| match slot.source {
+            super::payload::SlotSource::HomeTool(name) => Some((
+                name.to_owned(),
+                crate::execution::job::executable_on(name, worktree, &path)?,
+            )),
+            super::payload::SlotSource::Launcher(_) => None,
+        })
+        .collect();
+    let roots = super::recipe::declared_roots(language.name());
+    let home = crate::userhome::user_home();
+    let scratch = std::env::temp_dir().join("agent-ide-interactive");
+    let admission = super::recipe::Admission {
+        worktree,
+        cache_dir: &scratch,
+        read_denies: &[],
+        home: home.as_deref(),
+        launcher_roots: &roots,
+        developer_dirs: &[],
+        programs: &programs,
+        timeout: std::time::Duration::from_secs(10),
+    };
+    super::recipe::expand(recipes, &effect, &admission)
+        .map(|spec| Some(StdinRun::Spec(spec)))
+        .map_err(|_| ModuleUnavailable {
+            module_id: super::contract::ModuleId::bundled(language.name()),
+            module_version: env!("CARGO_PKG_VERSION").to_owned(),
+            role: super::contract::Role::Analyzer,
+            stage: super::contract::Stage::Decode,
+            cause: super::contract::Cause::PolicyRefused,
+            instance: None,
+            retry_after_ms: None,
+        })
 }
 
 /// `LanguageSupport::format_stdin_command`.
@@ -544,9 +662,12 @@ pub async fn format_stdin_command(
     worktree: &Path,
     project: &LanguageProject,
     file: &Path,
-) -> Routed<Option<Vec<String>>> {
+) -> Routed<Option<StdinRun>> {
     match module(language) {
-        None => Ok(language.support().format_stdin_command(project, file)),
+        None => Ok(language
+            .support()
+            .format_stdin_command(project, file)
+            .map(StdinRun::Argv)),
         Some(host) => {
             let effect: Option<EffectRequest> = host
                 .request(
@@ -560,7 +681,7 @@ pub async fn format_stdin_command(
                     Vec::new(),
                 )
                 .await?;
-            argv_of(language, effect)
+            stdin_run(language, worktree, effect)
         }
     }
 }
@@ -573,11 +694,12 @@ pub async fn syntax_probe_command(
     root: &Path,
     file: &Path,
     configured: Option<&ProbePrograms>,
-) -> Routed<Option<Vec<String>>> {
+) -> Routed<Option<StdinRun>> {
     match module(language) {
         None => Ok(language
             .support()
-            .syntax_probe_command(project, root, file, configured)),
+            .syntax_probe_command(project, root, file, configured)
+            .map(StdinRun::Argv)),
         Some(host) => {
             let effect: Option<EffectRequest> = host
                 .request(
@@ -593,7 +715,7 @@ pub async fn syntax_probe_command(
                     Vec::new(),
                 )
                 .await?;
-            argv_of(language, effect)
+            stdin_run(language, worktree, effect)
         }
     }
 }

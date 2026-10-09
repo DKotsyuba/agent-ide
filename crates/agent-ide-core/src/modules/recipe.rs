@@ -311,6 +311,117 @@ pub fn declared(id: &str) -> &'static [EffectRecipe] {
         .map_or(&[], |(_, recipes)| recipes)
 }
 
+/// A static file a language's recipes need in the private cache (an embedded adapter script),
+/// compiled into its descriptor. The core stages it before any of the language's effects run;
+/// the module names the staged path ([`asset_path`]) as a [`Param::Path`] under
+/// [`PathRole::Cache`].
+#[derive(Clone, Copy, Debug)]
+pub struct CacheAsset {
+    /// File name (a plain name, no separators).
+    pub name: &'static str,
+    /// Exact bytes.
+    pub bytes: &'static [u8],
+    /// Unix permission bits of the staged file.
+    pub mode: u32,
+}
+
+/// Cache assets of each language, declared by the root.
+static ASSETS: std::sync::RwLock<Vec<(&'static str, &'static [CacheAsset])>> =
+    std::sync::RwLock::new(Vec::new());
+
+/// Declares languages' cache assets (root composition data); a language already declared keeps
+/// its first declaration.
+pub fn declare_assets(assets: &'static [(&'static str, &'static [CacheAsset])]) {
+    let mut declared = ASSETS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (language, assets) in assets {
+        if !declared.iter().any(|(known, _)| known == language) {
+            declared.push((language, assets));
+        }
+    }
+}
+
+/// The declared cache assets of the language `id`.
+pub fn declared_assets(id: &str) -> &'static [CacheAsset] {
+    ASSETS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(language, _)| *language == id)
+        .map_or(&[], |(_, assets)| assets)
+}
+
+/// Where `asset` is staged below the private `cache_dir`: content-addressed, so a changed asset
+/// never reuses a stale file (`<cache>/assets/<blake3 prefix>/<name>`).
+pub fn asset_path(cache_dir: &Path, asset: &CacheAsset) -> PathBuf {
+    let digest = blake3::hash(asset.bytes).to_hex();
+    cache_dir
+        .join("assets")
+        .join(&digest.as_str()[..32])
+        .join(asset.name)
+}
+
+/// Stages every asset into `cache_dir` unless a regular file with its exact bytes and mode is
+/// already there: written to a
+/// private temporary file beside the target, given its mode, then renamed into place.
+pub fn stage_assets(cache_dir: &Path, assets: &[CacheAsset]) -> std::io::Result<()> {
+    use std::{io::Write, os::unix::fs::PermissionsExt};
+    for asset in assets {
+        if asset.name.is_empty() || asset.name.contains('/') || asset.name.starts_with('.') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "asset name",
+            ));
+        }
+        let target = asset_path(cache_dir, asset);
+        let current = std::fs::symlink_metadata(&target).is_ok_and(|metadata| {
+            metadata.is_file() && metadata.permissions().mode() & 0o7777 == asset.mode
+        }) && std::fs::read(&target).is_ok_and(|bytes| bytes == asset.bytes);
+        if current {
+            continue;
+        }
+        let dir = target.parent().expect("an asset directory");
+        std::fs::create_dir_all(dir)?;
+        let temporary = dir.join(format!(".{}.{}.tmp", asset.name, std::process::id()));
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(asset.bytes)?;
+        file.set_permissions(std::fs::Permissions::from_mode(asset.mode))?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &target)?;
+    }
+    Ok(())
+}
+
+/// Install roots each language's interactive recipes may name as launcher roots (static
+/// descriptor data, for example the standard interpreter prefixes), declared by the root.
+static ROOTS: std::sync::RwLock<Vec<(&'static str, &'static [&'static str])>> =
+    std::sync::RwLock::new(Vec::new());
+
+/// Declares languages' static install roots; a language already declared keeps its first
+/// declaration.
+pub fn declare_roots(roots: &'static [(&'static str, &'static [&'static str])]) {
+    let mut declared = ROOTS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (language, roots) in roots {
+        if !declared.iter().any(|(known, _)| known == language) {
+            declared.push((language, roots));
+        }
+    }
+}
+
+/// The declared static install roots of the language `id`.
+pub fn declared_roots(id: &str) -> Vec<PathBuf> {
+    ROOTS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(language, _)| *language == id)
+        .flat_map(|(_, roots)| roots.iter().map(PathBuf::from))
+        .collect()
+}
+
 /// Expands `effect` with its recipe from `recipes` under `admission`.
 pub fn expand(
     recipes: &[EffectRecipe],
@@ -1154,5 +1265,44 @@ mod tests {
             assert_eq!(spec.read_roots, roots, "{depth} levels");
             assert!(spec.read_roots.len() > 128);
         }
+    }
+
+    /// Assets are staged content-addressed with their exact bytes and mode, restaged when the
+    /// staged copy differs, and a name with a separator is refused.
+    #[test]
+    fn staged_assets_are_content_addressed_and_exact() {
+        use std::os::unix::fs::PermissionsExt;
+        let layout = Layout::new("assets");
+        const ASSET: CacheAsset = CacheAsset {
+            name: "adapter.js",
+            bytes: b"module.exports = 1;\n",
+            mode: 0o644,
+        };
+        stage_assets(&layout.cache, &[ASSET]).unwrap();
+        let path = asset_path(&layout.cache, &ASSET);
+        assert!(path.starts_with(layout.cache.join("assets")));
+        assert_eq!(std::fs::read(&path).unwrap(), ASSET.bytes);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        std::fs::write(&path, "tampered").unwrap();
+        stage_assets(&layout.cache, &[ASSET]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), ASSET.bytes);
+        let executable = CacheAsset {
+            mode: 0o755,
+            ..ASSET
+        };
+        stage_assets(&layout.cache, &[executable]).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "same bytes, new mode: restaged with the declared mode"
+        );
+        let bad = CacheAsset {
+            name: "../x",
+            ..ASSET
+        };
+        assert!(stage_assets(&layout.cache, &[bad]).is_err());
     }
 }

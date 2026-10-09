@@ -6,7 +6,7 @@
 
 ### Added
 
-- Experimental, opt-in and read-only: with `AGENT_IDE_PILOT_MODULE=python` in the daemon's environment, Python analysis and the Python project check run in an external module process (the installed `agent-ide` binary in a hidden mode) instead of inside the daemon. Answers are the same as in-process; `rename` is refused in this mode; a killed, stalled or malformed module gives a typed refusal and is restarted while the daemon keeps serving; every confined check run the module asks for must match exactly what the core itself would run. Without the variable nothing changes. This is a learning pilot: its wire format is not public and may change or go away.
+- Python runs as a bundled language module: the daemon starts the installed `agent-ide` binary in a hidden `module python <role>` mode, admitted, measured and supervised like any owned child, and Python analysis (Pyright now runs inside the module), its language facts, formatter and syntax-probe plans, test selection and parsing, and the Python project check all compute there; every process a check needs is a fixed recipe the daemon admits and runs itself. Answers are the same as in-process. A killed, stalled or malformed module gives a typed `module_unavailable` refusal naming it and is restarted (within a restart budget) while the daemon keeps serving. `AGENT_IDE_LANGUAGE_MODE=python=in_process` in the daemon's environment sends Python back in process; `agent-ide doctor`, the `ide.start` card and the error log name which path serves. The earlier `AGENT_IDE_PILOT_MODULE` pilot is replaced by this and no longer read.
 
 ### Removed
 

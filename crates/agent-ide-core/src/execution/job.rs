@@ -20,8 +20,6 @@ pub const MAX_JOB_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 const TERM_GRACE: Duration = Duration::from_secs(1);
 /// Ceiling of the exit wait after the kill, and of the output drain after the exit.
 const REAP_DEADLINE: Duration = Duration::from_secs(5);
-/// Longest single wait Execution accepts; longer timeouts wait in slices.
-const WAIT_SLICE: Duration = Duration::from_secs(60);
 
 /// What a completed job produced.
 #[derive(Debug, Default)]
@@ -70,7 +68,7 @@ pub async fn run_job(
     timeout: Duration,
 ) -> io::Result<JobOutput> {
     let lease = admit(admission, owner, class)?;
-    let mut child = OwnedChild::spawn_job(command, lease, output_cap)
+    let child = OwnedChild::spawn_job(command, lease, output_cap)
         .map_err(|error| settle(admission, error))?;
     // The job is owned by its own task so that dropping the caller (`cancelled` resolves) still
     // kills and reaps it and releases the slot.
@@ -78,29 +76,13 @@ pub async fn run_job(
     let admission = admission.clone();
     let task = tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + timeout;
-        let finished = loop {
-            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if left.is_zero() {
-                break false;
-            }
-            tokio::select! {
-                waited = child.wait(left.min(WAIT_SLICE)) => {
-                    if waited.is_ok() {
-                        break true;
-                    }
-                }
-                _ = &mut cancelled => break false,
-            }
-        };
-        let completed = if finished {
-            // The direct child is gone; a surviving group member would only hold the output
-            // pipes open, so the group is swept exactly as a confined check's always was.
-            let _ = super::signal_group(child.process.identity.pid, libc::SIGKILL);
-            child.reap(REAP_DEADLINE, REAP_DEADLINE).await
-        } else {
-            child.cancel_and_reap(TERM_GRACE, REAP_DEADLINE).await
-        }
-        .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        let finished = until_exit(child.process.identity.pid, deadline, &mut cancelled).await;
+        // The group is torn down and the leader reaped only now, while its exited-but-unreaped
+        // leader still proves the group is this job's own: never a later signal to a reused id.
+        let completed = child
+            .cancel_and_reap(TERM_GRACE, REAP_DEADLINE)
+            .await
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
         admission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -119,6 +101,31 @@ pub async fn run_job(
         })
     });
     task.await.map_err(io::Error::other)?
+}
+
+/// How often a job's leader is checked for an exit that leaves it unreaped.
+const EXIT_POLL: Duration = Duration::from_millis(10);
+
+/// Waits until the job leader `pid` has exited (left unreaped, so its group id stays owned) —
+/// `true` — or `deadline` passes or `cancelled` resolves — `false`.
+// ponytail: polls waitid(WNOWAIT) every 10 ms; a kqueue EVFILT_PROC wait if latency matters.
+async fn until_exit(
+    pid: u32,
+    deadline: tokio::time::Instant,
+    cancelled: &mut (impl std::future::Future + Unpin),
+) -> bool {
+    loop {
+        if super::leader_exited_unreaped(pid) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(EXIT_POLL) => {}
+            _ = &mut *cancelled => return false,
+        }
+    }
 }
 
 /// One immediately granted slot of `owner` in `class`; a request that would queue is busy.
@@ -151,8 +158,8 @@ pub struct StreamedJob {
     target: super::SpawnTarget,
     /// The controller the slot belongs to.
     admission: Arc<Mutex<AdmissionController>>,
-    /// Whether the direct child has exited (and was reaped by the wait).
-    exited: Option<std::process::ExitStatus>,
+    /// Whether the direct child has exited (still unreaped).
+    exited: bool,
 }
 
 impl StreamedJob {
@@ -195,40 +202,32 @@ impl StreamedJob {
                 lease: settlement.lease,
                 target: settlement.target,
                 admission: admission.clone(),
-                exited: None,
+                exited: false,
             },
             stdout,
             stderr,
         ))
     }
 
-    /// Waits up to `budget` for the direct child to exit; `None` when it is still running.
-    pub async fn wait(&mut self, budget: Duration) -> Option<std::process::ExitStatus> {
+    /// Waits up to `budget` for the direct child to exit, leaving it unreaped; `false` while it
+    /// still runs.
+    pub async fn wait(&mut self, budget: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + budget;
-        while self.exited.is_none() {
-            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if left.is_zero() {
-                break;
-            }
-            match tokio::time::timeout(left.min(WAIT_SLICE), self.process.child.wait()).await {
-                Ok(Ok(status)) => self.exited = Some(status),
-                Ok(Err(_)) => break,
-                Err(_) => {}
-            }
-        }
+        self.exited = until_exit(
+            self.process.identity.pid,
+            deadline,
+            &mut std::future::pending::<()>(),
+        )
+        .await;
         self.exited
     }
 
-    /// Kills the group (TERM, grace, KILL) when the child still runs, or sweeps it after an exit,
-    /// reaps and releases the slot.
-    pub async fn finish(mut self) -> io::Result<()> {
-        if self.exited.is_some() {
-            let _ = super::signal_group(self.process.identity.pid, libc::SIGKILL);
-        } else {
-            super::cancel_owned(&mut self.process, TERM_GRACE, REAP_DEADLINE)
-                .await
-                .map_err(|error| io::Error::other(format!("{error:?}")))?;
-        }
+    /// Tears the group down (TERM, grace, KILL) while the leader — exited or still running — is
+    /// unreaped, then reaps it and releases the slot; returns the leader's exit status.
+    pub async fn finish(mut self) -> io::Result<std::process::ExitStatus> {
+        let status = super::cancel_owned(&mut self.process, TERM_GRACE, REAP_DEADLINE)
+            .await
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
         let proof = super::DirectChildReap {
             lease: self.lease,
             target: self.target,
@@ -238,7 +237,7 @@ impl StreamedJob {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .release_reaped(proof)
-            .map(|_| ())
+            .map(|_| status)
             .map_err(|error| io::Error::other(format!("{error:?}")))
     }
 }
@@ -403,16 +402,11 @@ mod tests {
             &shell("echo streamed"),
         )
         .unwrap();
-        assert_eq!(
-            job.wait(Duration::from_secs(10))
-                .await
-                .and_then(|status| status.code()),
-            Some(0)
-        );
+        assert!(job.wait(Duration::from_secs(10)).await);
         let mut text = String::new();
         stdout.read_to_string(&mut text).await.unwrap();
         assert_eq!(text, "streamed\n");
-        job.finish().await.unwrap();
+        assert_eq!(job.finish().await.unwrap().code(), Some(0));
         let (mut job, _stdout, _stderr) = StreamedJob::start(
             &admission,
             owner(),
@@ -420,7 +414,7 @@ mod tests {
             &shell("sleep 30 & echo $! ; wait"),
         )
         .unwrap();
-        assert!(job.wait(Duration::from_millis(300)).await.is_none());
+        assert!(!job.wait(Duration::from_millis(300)).await);
         let started = std::time::Instant::now();
         job.finish().await.unwrap();
         assert!(started.elapsed() < Duration::from_secs(8));
@@ -448,5 +442,58 @@ mod tests {
             panic!("a full controller starts nothing");
         };
         assert_eq!(busy.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    /// A job whose leader exits normally while a TERM-resistant descendant lives on has its
+    /// whole group torn down before the leader is reaped, for an ordinary and a streamed job:
+    /// the leader's status is kept and the descendant does not survive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_finished_leader_takes_its_resistant_descendant_along() {
+        use tokio::io::AsyncReadExt;
+        let admission = admission();
+        let owner = || OwnerId::new("descendant-test").unwrap();
+        let script = "(trap '' TERM; exec sleep 30) >/dev/null 2>&1 & echo $!; exit 4";
+        let gone = |pid: libc::pid_t| async move {
+            for _ in 0..200 {
+                // SAFETY: signal 0 only checks that the recorded descendant still exists.
+                if unsafe { libc::kill(pid, 0) } != 0 {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            false
+        };
+        let output = run_job(
+            &admission,
+            owner(),
+            AdmissionClass::Background,
+            &shell(script),
+            1024,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.status, Some(4));
+        let pid: libc::pid_t = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(gone(pid).await, "the job's descendant survived");
+        let (mut job, mut stdout, _stderr) = StreamedJob::start(
+            &admission,
+            owner(),
+            AdmissionClass::Background,
+            &shell(script),
+        )
+        .unwrap();
+        assert!(job.wait(Duration::from_secs(10)).await);
+        let mut text = String::new();
+        stdout.read_to_string(&mut text).await.unwrap();
+        assert_eq!(job.finish().await.unwrap().code(), Some(4));
+        assert!(
+            gone(text.trim().parse().unwrap()).await,
+            "the streamed job's descendant survived"
+        );
+        assert_eq!(admission.lock().unwrap().running_count(), 0);
     }
 }

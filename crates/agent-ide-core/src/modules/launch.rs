@@ -25,14 +25,37 @@ use crate::execution::{
     OwnedProtocolChild, OwnerId, measured_executable_digest,
 };
 
-/// Environment variables a module receives from the daemon, when set; nothing else is inherited.
-pub const MODULE_ENV: [&str; 5] = [
-    "HOME",
-    "PATH",
-    "TMPDIR",
-    crate::userhome::HOME_OVERRIDE_ENV,
-    "AGENT_IDE_RUST_TOOLCHAIN_DIR",
-];
+/// Environment variable names each language's module receives, declared by the root.
+static DECLARED_ENV: std::sync::RwLock<Vec<(&'static str, &'static [&'static str])>> =
+    std::sync::RwLock::new(Vec::new());
+
+/// Declares the environment variable names languages' modules receive (root composition data);
+/// a language already declared keeps its first declaration.
+pub fn declare_env(names: &'static [(&'static str, &'static [&'static str])]) {
+    let mut declared = DECLARED_ENV
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (language, names) in names {
+        if !declared.iter().any(|(known, _)| known == language) {
+            declared.push((language, names));
+        }
+    }
+}
+
+/// The environment `language`'s module receives — in its cleared process environment and in
+/// `hello.config.env` — : each name its descriptor declares that the daemon has set. Nothing else
+/// is inherited; the real user home travels as `hello.config.home`.
+pub fn module_env(language: &str) -> BTreeMap<String, String> {
+    DECLARED_ENV
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(declared, _)| *declared == language)
+        .flat_map(|(_, names)| names.iter())
+        .filter_map(|name| Some(((*name).to_owned(), std::env::var(name).ok()?)))
+        .collect()
+}
+
 /// Retained stderr bytes per instance.
 const STDERR_CAPTURE: usize = super::runtime::STDERR_CAPTURE;
 /// How long a stopping module may take to exit on its own before its group is signalled.
@@ -91,7 +114,7 @@ pub struct ExecutionLauncher {
 
 impl ExecutionLauncher {
     /// A launcher for `language`'s `role` instance in `cwd`, accounted to `owner`, receiving only
-    /// the [`MODULE_ENV`] variables the daemon has.
+    /// its declared environment ([`module_env`]).
     pub fn new(
         executable: Arc<ModuleExecutable>,
         admission: Arc<Mutex<AdmissionController>>,
@@ -101,9 +124,9 @@ impl ExecutionLauncher {
         cwd: PathBuf,
         config: String,
     ) -> Self {
-        let env = MODULE_ENV
-            .iter()
-            .filter_map(|key| Some((OsString::from(key), std::env::var_os(key)?)))
+        let env = module_env(language)
+            .into_iter()
+            .map(|(key, value)| (OsString::from(key), OsString::from(value)))
             .collect();
         Self {
             executable,
@@ -205,5 +228,27 @@ impl Launcher for ExecutionLauncher {
     /// The executable digest and the configuration fingerprint.
     fn inputs(&self) -> String {
         format!("{}:{}", self.executable.digest.to_hex(), self.config)
+    }
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    /// A module receives exactly the variables its language declares that the daemon has set;
+    /// an undeclared language receives none.
+    #[test]
+    fn modules_receive_only_their_declared_environment() {
+        declare_env(&[(
+            "env-test-language",
+            &["HOME", "AGENT_IDE_NEVER_SET_FOR_TESTS"],
+        )]);
+        let env = module_env("env-test-language");
+        assert_eq!(
+            env.keys().collect::<Vec<_>>(),
+            ["HOME"],
+            "declared and set only"
+        );
+        assert!(module_env("env-test-undeclared").is_empty());
     }
 }

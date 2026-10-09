@@ -70,7 +70,14 @@ pub struct SupportServer {
     language: Language,
     /// The module's package version.
     version: String,
+    /// Turns the language's formatter or syntax-probe argument vector into a request of one of
+    /// its declared recipes; without it (or when it answers `None`) the plan is the generic
+    /// `argv` request, which the core refuses to run.
+    plans: Option<EffectPlans>,
 }
+
+/// Turns a formatter or probe argument vector into a request of the language's recipes.
+pub type EffectPlans = fn(&[String]) -> Option<EffectRequest>;
 
 impl SupportServer {
     /// The adapter for `language` at `version`.
@@ -78,7 +85,22 @@ impl SupportServer {
         Self {
             language,
             version: version.to_owned(),
+            plans: None,
         }
+    }
+
+    /// The adapter whose formatter and syntax-probe plans become requests of the language's
+    /// declared recipes through `plans`.
+    pub fn with_effect_plans(mut self, plans: EffectPlans) -> Self {
+        self.plans = Some(plans);
+        self
+    }
+
+    /// The effect request of one formatter or probe argument vector.
+    fn plan(&self, argv: &[String]) -> EffectRequest {
+        self.plans
+            .and_then(|plans| plans(argv))
+            .unwrap_or_else(|| argv_effect(argv))
     }
 
     /// The served language.
@@ -256,7 +278,7 @@ impl SupportServer {
                 } => encode(
                     &support
                         .syntax_probe_command(&project, &root, &file, configured.as_ref())
-                        .map(|argv| argv_effect(&argv)),
+                        .map(|argv| self.plan(&argv)),
                 ),
             },
             Capability::FormatPlan => {
@@ -264,7 +286,7 @@ impl SupportServer {
                 encode(
                     &support
                         .format_stdin_command(&query.project, &query.file)
-                        .map(|argv| argv_effect(&argv)),
+                        .map(|argv| self.plan(&argv)),
                 )
             }
             Capability::TestPlan => match decode::<TestPlanQuery>(payload)? {

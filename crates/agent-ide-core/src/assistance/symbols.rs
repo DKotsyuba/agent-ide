@@ -3650,28 +3650,53 @@ fn push_block(out: &mut String, content: &str) {
     }
 }
 
-/// Runs `argv` from `root` with `input` on stdin as an Execution-owned interactive job of the
-/// worktree — admitted, measured, its group torn down and reaped — with the daemon's environment
-/// and formatter `PATH`. `None` when it cannot start, is refused as busy, overflows the capture
+/// Runs `run` (the in-process argument vector from `root` with the daemon's environment and
+/// formatter `PATH`, or a module recipe's core-built specification exactly) with `input` on stdin
+/// as an Execution-owned interactive job of the worktree — admitted, measured, its group torn
+/// down and reaped. `None` when it cannot start, is refused as busy, overflows the capture
 /// ceiling or does not finish within `timeout`.
 async fn run_stdin(
     admission: &std::sync::Arc<std::sync::Mutex<crate::execution::AdmissionController>>,
-    argv: &[String],
+    run: &crate::modules::calls::StdinRun,
     root: &Path,
     input: &str,
     timeout: Duration,
 ) -> Option<crate::execution::job::JobOutput> {
     use std::ffi::OsString;
-    let (program, args) = argv.split_first()?;
-    let path = formatter_path();
-    let program = crate::execution::job::executable_on(program, root, &path)?;
-    let mut env: std::collections::BTreeMap<OsString, OsString> = std::env::vars_os().collect();
-    env.insert("PATH".into(), path.into());
+    let (program, args, cwd, env, timeout) = match run {
+        crate::modules::calls::StdinRun::Argv(argv) => {
+            let (program, args) = argv.split_first()?;
+            let path = crate::modules::calls::tool_path();
+            let program = crate::execution::job::executable_on(program, root, &path)?;
+            let mut env: std::collections::BTreeMap<OsString, OsString> =
+                std::env::vars_os().collect();
+            env.insert("PATH".into(), path.into());
+            (
+                program,
+                args.iter().map(OsString::from).collect(),
+                root.to_path_buf(),
+                env,
+                timeout,
+            )
+        }
+        // A module's recipe, expanded by the core: exactly its program, arguments, working
+        // directory and environment.
+        crate::modules::calls::StdinRun::Spec(spec) => (
+            spec.program.clone(),
+            spec.args.clone(),
+            spec.cwd.clone(),
+            spec.env
+                .iter()
+                .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+                .collect(),
+            timeout.min(spec.timeout),
+        ),
+    };
     let command = crate::execution::ControlledCommand::from_validated_peer(
         crate::execution::CommandKind::Job,
         program,
-        args.iter().map(OsString::from).collect(),
-        root.to_path_buf(),
+        args,
+        cwd,
         env,
     )
     .ok()?
@@ -4623,26 +4648,6 @@ fn landing_note(
         note.push_str(&format!("; +{hidden} more"));
     }
     note
-}
-
-/// PATH for formatters: the registered languages' home tool directories (see
-/// [`LanguageDescriptor::home_tool_dirs`](crate::lang::LanguageDescriptor::home_tool_dirs)), the
-/// daemon's own configured PATH, then the system directories — never the agent's shell
-/// environment.
-fn formatter_path() -> String {
-    let mut parts = vec![];
-    if let Ok(home) = std::env::var("HOME") {
-        for language in crate::lang::registered() {
-            for dir in language.descriptor().home_tool_dirs {
-                parts.push(format!("{home}/{dir}"));
-            }
-        }
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        parts.push(path.to_string_lossy().into_owned());
-    }
-    parts.extend(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"].map(String::from));
-    parts.join(":")
 }
 
 /// History entries kept on one symbol card.

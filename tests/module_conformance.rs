@@ -353,3 +353,114 @@ async fn large_check_output_lands_through_the_module() {
     assert!(no_modules_left().await);
     assert_eq!(admission.lock().unwrap().running_count(), 0);
 }
+
+/// One call in flight and at most eight waiting per instance: a further call is refused at once
+/// as `resource_limit`, a waiting call's deadline covers its wait, and a stop cancels the
+/// in-flight call and every waiter at once instead of queueing behind them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn waiters_are_bounded_and_a_stop_cancels_them() {
+    let _serial = SERIAL.lock().await;
+    let scratch = Scratch::new("queue");
+    let flag = scratch.0.join("flag");
+    std::fs::write(&flag, "").unwrap();
+    let host = Arc::new(host_with(
+        admission(),
+        vec![(
+            FAULT_SEAM.to_owned(),
+            format!("stall:file_doc:{}", flag.display()),
+        )],
+        Duration::from_secs(30),
+    ));
+    let call = |host: Arc<ModuleHost>, root: PathBuf| {
+        tokio::spawn(async move { file_doc(&host, &root).await })
+    };
+    let stalled = call(host.clone(), scratch.0.clone());
+    for _ in 0..250 {
+        if !flag.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!flag.exists(), "the first call is in flight and stalls");
+    let waiters: Vec<_> = (0..8)
+        .map(|_| call(host.clone(), scratch.0.clone()))
+        .collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let busy = file_doc(&host, &scratch.0).await.unwrap_err();
+    assert_eq!(
+        (busy.stage, busy.cause),
+        (Stage::Admission, Cause::ResourceLimit),
+        "{busy}"
+    );
+    // Cancelled waiters give their places back: eight fresh callers wait again, none is busy.
+    for waiter in &waiters {
+        waiter.abort();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let waiters: Vec<_> = (0..8)
+        .map(|_| call(host.clone(), scratch.0.clone()))
+        .collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        waiters.iter().all(|waiter| !waiter.is_finished()),
+        "the full queue capacity is available again"
+    );
+    let started = std::time::Instant::now();
+    host.stop_all().await;
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the stop did not queue behind the calls"
+    );
+    for task in std::iter::once(stalled).chain(waiters) {
+        let error = task.await.unwrap().unwrap_err();
+        assert_eq!(error.cause, Cause::Exited, "{error}");
+    }
+    assert!(no_modules_left().await);
+}
+
+/// Linkage anchors computed by a real module: validated against the request's source and the
+/// coverage the module declared in its `hello`, the same facts the language extracts in
+/// process (namespace, key and role for each).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anchors_cross_the_module_validated() {
+    let _serial = SERIAL.lock().await;
+    let scratch = Scratch::new("anchors");
+    let host = Arc::new(host_with(admission(), Vec::new(), Duration::from_secs(30)));
+    agent_ide_core::modules::calls::install(host.clone());
+    let text = ".btn { color: red }\n#main .card:hover { margin: 0 }\n";
+    let batch = agent_ide_core::modules::calls::anchors(
+        agent_ide::languages::CSS,
+        &scratch.0,
+        Path::new("a.css"),
+        text,
+    )
+    .await
+    .unwrap()
+    .expect("css computes in its module here");
+    let mut sink = agent_ide_core::lang::names::FactSink::new();
+    agent_ide::languages::CSS
+        .names()
+        .unwrap()
+        .extract(Path::new("a.css"), text, &mut sink);
+    let expected: Vec<(String, String)> = sink
+        .into_facts()
+        .into_iter()
+        .map(|fact| {
+            (
+                fact.key.namespace.id().to_owned(),
+                fact.key.name.to_string(),
+            )
+        })
+        .collect();
+    assert!(!expected.is_empty());
+    assert_eq!(
+        batch
+            .anchors
+            .iter()
+            .map(|anchor| (anchor.namespace.clone(), anchor.normalized_key.clone()))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    host.stop_all().await;
+    assert!(no_modules_left().await);
+}
