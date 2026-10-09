@@ -872,16 +872,12 @@ impl<B: ProviderBuilder> ModuleServer for ProviderServer<B> {
     fn declaration(&self) -> Declaration {
         let mut declaration = self.support.declaration();
         for decl in &mut declaration.capabilities {
-            let calls = self
-                .support
-                .language()
-                .server()
-                .is_some_and(|server| server.call_hierarchy());
+            // Call hierarchy answers whatever the hosted provider advertises, exactly as an
+            // in-process session asks it (outgoing calls included where incoming are not shown).
             if matches!(
                 decl.capability,
-                Capability::Outline | Capability::Semantic | Capability::Rename
-            ) || (decl.capability == Capability::Calls && calls)
-            {
+                Capability::Outline | Capability::Semantic | Capability::Calls | Capability::Rename
+            ) {
                 *decl = CapabilityDecl::v0(decl.capability, Support::Supported);
             }
         }
