@@ -606,7 +606,8 @@ pub enum StdinRun {
 }
 
 /// Expands a module's formatter or probe request under the core's interactive admission: the
-/// worktree, the real home, the language's declared install roots and the home tools its recipes
+/// worktree, the real home, the language's declared install roots, the environments the worktree
+/// accepts and the home tools its recipes
 /// name, resolved on [`tool_path`]. A request outside the declared recipes (the generic `argv`
 /// one included) is refused, never run.
 fn stdin_run(
@@ -630,7 +631,8 @@ fn stdin_run(
             super::payload::SlotSource::Launcher(_) => None,
         })
         .collect();
-    let roots = super::recipe::declared_roots(language.name());
+    let mut roots = super::recipe::declared_roots(language.name());
+    roots.extend(super::recipe::environment_roots(language.name(), worktree));
     let developer_dirs = super::recipe::platform_developer_dirs();
     let home = crate::userhome::user_home();
     let scratch = std::env::temp_dir().join("agent-ide-interactive");

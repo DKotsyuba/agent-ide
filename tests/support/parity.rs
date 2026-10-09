@@ -523,7 +523,15 @@ impl Session {
             )
             .await;
         self.hook(fixture, "PostToolUse", &call).await;
-        reply["result"]["structuredContent"].clone()
+        let mut structured = reply["result"]["structuredContent"].clone();
+        // An error reply carries its message as content text only; keep it comparable.
+        if let Some(object) = structured.as_object_mut()
+            && !object.contains_key("text")
+            && let Some(text) = reply["result"]["content"][0]["text"].as_str()
+        {
+            object.insert("text".to_owned(), Value::String(text.to_owned()));
+        }
+        structured
     }
 
     /// Stops the activation and closes the front.
@@ -595,7 +603,9 @@ pub async fn transcript(
 /// Masks only per-daemon tokens and keeps every other byte, whitespace included: a source-ref
 /// digest (a hex run over 64 characters, with `-`/`,` separators), a numeric timing (`12ms`,
 /// `3.5ms`, optionally wrapped in punctuation such as `(12ms)` or `12ms,`) and the generated
-/// 64-hex id right after a word naming the activation. Short hex runs and paths stay.
+/// 64-hex id right after a word naming the activation in an `ide.start` reply (the only reply that
+/// reports the generated activation; the same words in source text stay). Short hex runs and paths
+/// stay.
 pub fn normalized(text: &str) -> String {
     /// Whether `word` is one volatile token.
     fn volatile(word: &str) -> bool {
@@ -616,6 +626,7 @@ pub fn normalized(text: &str) -> String {
         let core = word.trim_matches(|c: char| matches!(c, '(' | ')' | ',' | ';' | ':' | '.'));
         core.len() == 64 && core.chars().all(|c| c.is_ascii_hexdigit())
     }
+    let start = text.starts_with("ide.start ");
     let mut out = String::with_capacity(text.len());
     let mut word = String::new();
     let mut previous = String::new();
@@ -625,8 +636,8 @@ pub fn normalized(text: &str) -> String {
                 out.push(c);
                 continue;
             }
-            // The activation id a daemon generates follows its marker word.
-            let activation = previous.contains("activation") && generated_id(&word);
+            // The activation id a daemon generates follows its marker word in its start reply.
+            let activation = start && previous.contains("activation") && generated_id(&word);
             out.push_str(if activation {
                 "<activation>"
             } else if volatile(&word) {

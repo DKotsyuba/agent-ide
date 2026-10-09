@@ -364,6 +364,39 @@ pub fn declared_roots(id: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// A language's own host-side resolution of the environments a worktree has accepted (stored
+/// selections, configuration pins, discovered environments): the roots a run of them reads.
+pub type EnvironmentRoots = fn(&Path) -> Vec<PathBuf>;
+
+/// Each language's [`EnvironmentRoots`], declared by the root.
+static ENVIRONMENTS: std::sync::RwLock<Vec<(&'static str, EnvironmentRoots)>> =
+    std::sync::RwLock::new(Vec::new());
+
+/// Declares languages' environment resolutions; a language already declared keeps its first.
+pub fn declare_environment_roots(roots: &'static [(&'static str, EnvironmentRoots)]) {
+    let mut declared = ENVIRONMENTS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (language, roots) in roots {
+        if !declared.iter().any(|(known, _)| known == language) {
+            declared.push((language, *roots));
+        }
+    }
+}
+
+/// The roots of the environments `worktree` accepts for the language `id`, resolved now by the
+/// host (never taken from a module's answer); admitted as launcher roots, so a selected
+/// environment outside the static install roots runs as it does in process.
+pub fn environment_roots(id: &str, worktree: &Path) -> Vec<PathBuf> {
+    let resolve = ENVIRONMENTS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(language, _)| *language == id)
+        .map(|(_, resolve)| *resolve);
+    resolve.map_or_else(Vec::new, |resolve| resolve(worktree))
+}
+
 /// Expands `effect` with its recipe from `recipes` under `admission`.
 pub fn expand(
     recipes: &[EffectRecipe],

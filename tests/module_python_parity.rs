@@ -201,7 +201,7 @@ async fn python_module_matches_in_process_answers() {
     let module = module.expect("a module hosts Pyright");
     assert!(
         matches!(module.children.as_slice(), [(_, command)]
-            if command.contains("pyright-langserver") && command.ends_with("--stdio")),
+            if command.contains("langserver") && command.ends_with("--stdio")),
         "the analyzer module owns one Pyright process: {module:?}"
     );
     assert!(!direct, "no language server is a direct daemon child");
@@ -237,7 +237,6 @@ async fn python_analyzer_faults_are_typed_and_restart() {
     let usages = json!({"symbol":"helper.py#double"});
     for fault in ["stall", "malformed", "kill", "kill-idle"] {
         let flag = fixture.base.join(format!("module-fault-{fault}"));
-        std::fs::write(&flag, "").unwrap();
         let seam = match fault {
             "malformed" => format!("malformed:semantic:{}", flag.display()),
             _ => format!("stall:semantic:{}", flag.display()),
@@ -252,6 +251,9 @@ async fn python_analyzer_faults_are_typed_and_restart() {
             .await;
         assert_eq!(warm["state"], "complete", "{fault}: {warm}");
         let first = provider_module(&mut daemon).expect("the Pyright module runs");
+        // Armed only now: the warm-up's own semantic requests (its readiness query included)
+        // must not consume the one-time fault meant for the call below.
+        std::fs::write(&flag, "").unwrap();
         let started = Instant::now();
         let failed = match fault {
             "kill" => {
