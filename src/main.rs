@@ -40,6 +40,16 @@ use tokio::sync::Mutex;
 async fn main() -> ExitCode {
     agent_ide::languages::install();
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    // M-011 phase-2b pilot: the hidden external-module mode (stdout is its framed protocol); it
+    // is never listed and runs only when the daemon's opt-in flag spawns it.
+    if let [mode, role] = arguments.as_slice()
+        && mode == "module-pilot"
+    {
+        return match agent_ide_lang_python::pilot::run_module(&role.to_string_lossy()).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
     if is_version_request(&arguments) {
         println!("agent-ide {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;

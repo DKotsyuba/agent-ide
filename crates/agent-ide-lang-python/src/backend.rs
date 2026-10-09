@@ -218,6 +218,21 @@ impl PyrightBackend {
             .options::<PyrightLaunchOptions>()
             .and_then(|options| options.node.as_ref())
             .ok_or(FailureCode::ExecutionProfile)?;
+        let extra_paths = crate::support::import_roots(source.worktree().worktree_path());
+        // M-011 pilot: the same accepted identities, handed to the external analyzer module.
+        let pilot = crate::pilot::enabled().then(|| crate::pilot::ProviderParams {
+            binary: launch.executable.path.clone(),
+            script_digest: launch.executable.blake3.clone(),
+            version: launch.executable.identity.clone(),
+            node: node.path.clone(),
+            node_digest: node.blake3.clone(),
+            node_identity: node.identity.clone(),
+            trust: launch.trust.clone(),
+            cache_namespace: cache_namespace.clone(),
+            interpreter: interpreter.clone(),
+            environment: environment.clone(),
+            extra_paths: extra_paths.clone(),
+        });
         let profile = PyrightProfile::new(PyrightProfileIdentity {
             binary: launch.executable.path.clone(),
             accepted_script_digest: blake3::Hash::from_hex(&launch.executable.blake3)
@@ -232,19 +247,30 @@ impl PyrightBackend {
         })
         .map_err(|_| FailureCode::ExecutionProfile)?
         .with_interpreter(interpreter.clone(), environment.clone())
-        .with_extra_paths(crate::support::import_roots(
-            source.worktree().worktree_path(),
-        ));
+        .with_extra_paths(extra_paths);
         let worktree = PyrightWorktree::new(
             authority.worktree().clone(),
             server::execution_authority(&authority)?,
         )
         .map_err(|_| FailureCode::WorkspaceAuthority)?;
-        let command = profile
-            .command(&worktree)
-            .map_err(|_| FailureCode::ExecutionProfile)?;
+        let (command, program) = match &pilot {
+            Some(params) => {
+                let module =
+                    crate::pilot::module_executable().ok_or(FailureCode::ExecutionProfile)?;
+                let command =
+                    crate::pilot::analyzer_command(module, &worktree, &params.cache_namespace)
+                        .ok_or(FailureCode::ExecutionProfile)?;
+                (command, module)
+            }
+            None => (
+                profile
+                    .command(&worktree)
+                    .map_err(|_| FailureCode::ExecutionProfile)?,
+                node,
+            ),
+        };
         let request = host
-            .execution_request(&*job, &authority, command, node)
+            .execution_request(&*job, &authority, command, program)
             .await?;
         let active = host.active(&binding)?;
         let generation = host.next_generation()?;
@@ -308,20 +334,41 @@ impl PyrightBackend {
         };
         let opened = match child.take_pipes() {
             Some((stdin, stdout)) => {
-                let open = LiveSession::open(
-                    stdout,
-                    stdin,
-                    source.worktree().clone(),
-                    source.authority_epoch(),
-                    ViewGeneration {
-                        backend: generation,
-                        configuration: 1,
-                        toolchain: 1,
-                        view: generation,
-                    },
-                    ProviderSettings::new(profile),
-                    Duration::from_secs(30),
-                );
+                let generation = ViewGeneration {
+                    backend: generation,
+                    configuration: 1,
+                    toolchain: 1,
+                    view: generation,
+                };
+                let open = async {
+                    match pilot {
+                        Some(params) => {
+                            LiveSession::open_remote(
+                                stdout,
+                                stdin,
+                                source.worktree().clone(),
+                                source.authority_epoch(),
+                                generation,
+                                ProviderSettings::new(profile),
+                                Duration::from_secs(30),
+                                serde_json::json!(params),
+                            )
+                            .await
+                        }
+                        None => {
+                            LiveSession::open(
+                                stdout,
+                                stdin,
+                                source.worktree().clone(),
+                                source.authority_epoch(),
+                                generation,
+                                ProviderSettings::new(profile),
+                                Duration::from_secs(30),
+                            )
+                            .await
+                        }
+                    }
+                };
                 tokio::pin!(open);
                 tokio::select! { result = &mut open => result, _ = job.cancel().changed() => Err(std::io::Error::other("cancelled")), }
             }
@@ -380,6 +427,16 @@ impl PyrightBackend {
             let entry = self.live.get_mut(&binding).ok_or(FailureCode::Internal)?;
             let (result, diagnostics) =
                 server::exchange_context(&mut entry.live, job, source, bytes, query, true).await;
+            // M-011 pilot: a module fault is a typed refusal naming it, never a quiet lexical
+            // answer; the next call starts a fresh module.
+            if let Some(fault) = entry.live.remote_fault().map(str::to_owned) {
+                self.release(host, &binding).await;
+                job.set_stage_failure(
+                    &FailureCode::ProviderUnavailable,
+                    &format!("python: {fault}"),
+                );
+                return Err(FailureCode::ProviderUnavailable);
+            }
             (result, diagnostics, entry.interpreter.is_none())
         };
         let context = match result {
