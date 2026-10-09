@@ -1185,3 +1185,88 @@ async fn module_session_converts_product_answers() {
     assert!(!failing.is_alive(), "a module fault retires the generation");
     assert!(failing.session.module_fault().is_some());
 }
+
+/// Replaces the pilot session fence and fault tests: a module-hosted session applies the local
+/// source fences before any byte reaches the module (another worktree, another epoch, bytes that
+/// do not match the observation, a stale sequence are refused; the valid request answers), and a
+/// module's typed dependency failure retires the session as a fault its owner turns into a typed
+/// refusal naming the module.
+#[tokio::test]
+async fn module_session_fences_sources_and_reports_its_fault() {
+    use crate::modules::{
+        contract::{Capability, ModuleId, Role},
+        fake::{FakeModule, Fault, in_memory, offer},
+    };
+    crate::lang::testing::install();
+    let generation = ViewGeneration {
+        backend: 1,
+        configuration: 2,
+        toolchain: 3,
+        view: 4,
+    };
+    let open = |module: FakeModule| async move {
+        let (channel, _) = in_memory(
+            module,
+            offer(ModuleId::bundled("alpha"), "1.0", Role::Analyzer, 1),
+        )
+        .await
+        .unwrap();
+        LiveSession::open_module(
+            channel,
+            true,
+            tree(),
+            1,
+            generation,
+            plain_settings(),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    };
+    let mut live = open(FakeModule::new(ModuleId::bundled("alpha"), "1.0")).await;
+    let other_tree =
+        WorktreeRef::from_discovery("/tmp/other".into(), "/tmp/other".into(), ".git".into(), 1)
+            .unwrap();
+    let foreign = |worktree: WorktreeRef, epoch: u64| {
+        SourceObservation::new(
+            worktree,
+            epoch,
+            5,
+            ObservationRef::new("source-5").unwrap(),
+            "main.txt".into(),
+            Some(SourceBytes::from_bytes(b"a")),
+            SourceRevision::new("revision-5").unwrap(),
+            SourceCoverage::Complete,
+            ObservedState::Present,
+        )
+        .unwrap()
+    };
+    let session = &mut live.session;
+    for observation in [foreign(other_tree, 1), foreign(tree(), 2)] {
+        let error = session.hover(&observation, b"a", 0).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+    assert!(session.hover(&observation("a", 2), b"b", 0).await.is_err());
+    assert!(session.hover(&observation("a", 3), b"a", 0).await.is_ok());
+    let error = session
+        .hover(&observation("a", 2), b"a", 0)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "stale sequence");
+    assert!(live.remote_fault().is_none());
+
+    let mut live = open(
+        FakeModule::new(ModuleId::bundled("alpha"), "1.0")
+            .with_fault(Capability::Semantic, Fault::ProviderExit),
+    )
+    .await;
+    assert!(
+        live.session
+            .hover(&observation("a", 2), b"a", 0)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        live.remote_fault(),
+        Some("module_unavailable (bundled.alpha:provider:exited)")
+    );
+}
