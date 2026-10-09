@@ -32,6 +32,9 @@ pub const LANGUAGE_MODE: &str = "AGENT_IDE_LANGUAGE_MODE";
 const ATTACHMENT: &str = "parity-host-channel";
 /// Distinguishes fixture trees of concurrently running tests.
 static NEXT: AtomicUsize = AtomicUsize::new(0);
+/// Next tool call id, shared by every front of the test process: a daemon refuses a call id it
+/// already processed as a replay, so two fronts on one daemon must never reuse one.
+static CALL: AtomicUsize = AtomicUsize::new(100);
 
 /// The shipping binary under test.
 pub fn binary() -> PathBuf {
@@ -390,8 +393,6 @@ pub struct Session {
     input: ChildStdin,
     /// Its stdout.
     output: BufReader<ChildStdout>,
-    /// Next call id.
-    next: usize,
 }
 
 impl Session {
@@ -412,7 +413,6 @@ impl Session {
             input: child.stdin.take().unwrap(),
             output: BufReader::new(child.stdout.take().unwrap()),
             child,
-            next: 100,
         };
         let initialized = session
             .exchange(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
@@ -512,12 +512,12 @@ impl Session {
 
     /// One correlated tool call without settling.
     async fn call_once(&mut self, fixture: &Fixture, tool: &str, arguments: Value) -> Value {
-        self.next += 1;
-        let call = format!("call-{}", self.next);
+        let id = CALL.fetch_add(1, Ordering::Relaxed) + 1;
+        let call = format!("call-{id}");
         self.hook(fixture, "PreToolUse", &call).await;
         let reply = self
             .exchange(
-                json!({"jsonrpc":"2.0","id":self.next,"method":"tools/call","params":{
+                json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
                 "name":tool,"arguments":arguments,"_meta":{"threadId":"parity","callId":call,
                 "x-codex-turn-metadata":{},"codex/sandbox-state-meta":fixture.state()}}}),
             )

@@ -1098,6 +1098,41 @@ async fn live_session_outlives_requests_and_waits_for_readiness_per_request() {
     let _ = tokio::time::timeout(Duration::from_secs(2), peer_task).await;
 }
 
+/// A module receives a new opaque revision for every new core observation, unchanged bytes
+/// included (so its provider re-synchronizes and drops held diagnostics as an in-process session
+/// does on a new source binding), the same one for the same observation, and never more than the
+/// wire's 128 bytes.
+#[test]
+fn every_core_observation_is_a_new_module_revision() {
+    use super::module_remote::wire_revision;
+    let text = "a = 1\n";
+    let rebound = |sequence: u64, reference: &str, revision: &str| {
+        SourceObservation::new(
+            tree(),
+            1,
+            sequence,
+            ObservationRef::new(reference).unwrap(),
+            "main.txt".into(),
+            Some(SourceBytes::from_bytes(text.as_bytes())),
+            SourceRevision::new(revision).unwrap(),
+            SourceCoverage::Complete,
+            ObservedState::Present,
+        )
+        .unwrap()
+    };
+    let first = wire_revision(&rebound(1, "source-1", "same"));
+    assert_eq!(first, wire_revision(&rebound(1, "source-1", "same")));
+    assert_ne!(first, wire_revision(&rebound(2, "source-2", "same")));
+    assert_ne!(first, wire_revision(&rebound(1, "source-other", "same")));
+    assert!(first.starts_with("same@"));
+    let long = "r".repeat(128);
+    assert!(wire_revision(&rebound(3, "source-3", &long)).len() <= 128);
+    assert_ne!(
+        wire_revision(&rebound(3, "source-3", &long)),
+        wire_revision(&rebound(3, "source-3", &"s".repeat(128)))
+    );
+}
+
 /// A module-hosted session sends the core's exact source with its revision and turns the module's
 /// product answers back into provider types with positions in the provider's reported encoding
 /// over the exact text (a UTF-16 provider converts a non-ASCII line in UTF-16 units); context is
