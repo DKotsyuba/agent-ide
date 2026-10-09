@@ -202,6 +202,9 @@ pub struct ProviderServer<B: ProviderBuilder> {
     stderr: Arc<Mutex<Vec<u8>>>,
     /// Local source sequence.
     sequence: u64,
+    /// The last observed source (path, revision, text): an unchanged source keeps its sequence,
+    /// so the provider document is not re-synchronized for every request.
+    observed: Option<(PathBuf, String, Option<String>)>,
     /// Call hierarchy items by handle, valid for this instance.
     items: HashMap<String, lsp::CallHierarchyItem>,
     /// This module's working directory (its local worktree key).
@@ -231,6 +234,7 @@ impl<B: ProviderBuilder> ProviderServer<B> {
             start_failure: None,
             stderr: Arc::default(),
             sequence: 0,
+            observed: None,
             items: HashMap::new(),
             root: std::env::current_dir()
                 .and_then(|dir| dir.canonicalize())
@@ -343,15 +347,19 @@ impl<B: ProviderBuilder> ProviderServer<B> {
         }
     }
 
-    /// The local session observation of `source` under the next local sequence; only the core's
-    /// revision string is carried, to be echoed back.
+    /// The local session observation of `source`, under the next local sequence unless it is the
+    /// source last observed; only the core's revision string is carried, to be echoed back.
     fn observe(
         &mut self,
         source: &SourceRef,
         request: &Incoming,
     ) -> io::Result<(SourceObservation, Vec<u8>)> {
         let text = Self::text(source, request)?;
-        self.sequence += 1;
+        let current = (source.path.clone(), source.revision.clone(), text.clone());
+        if self.observed.as_ref() != Some(&current) {
+            self.sequence += 1;
+            self.observed = Some(current);
+        }
         let bytes = text.clone().unwrap_or_default().into_bytes();
         let observation = SourceObservation::new(
             self.worktree()?,
