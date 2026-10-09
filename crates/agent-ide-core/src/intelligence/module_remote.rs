@@ -327,6 +327,19 @@ impl Session {
         };
         // Every reply carries the hosted provider's readiness: it is this session's barrier.
         self.record_module_readiness(reply.readiness);
+        // A semantic answer the module marks as covering only part of the workspace (its
+        // provider still loading) is never taken as a complete answer.
+        if matches!(
+            capability,
+            Capability::Semantic | Capability::Calls | Capability::Rename
+        ) && reply.coverage != crate::modules::contract::Coverage::Complete
+            && matches!(reply.outcome, Outcome::Result(_))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "provider answered for part of the workspace only",
+            ));
+        }
         let remote = self.module.as_mut().expect("a module session");
         match reply.outcome {
             Outcome::Result(value) => match decode(value) {
