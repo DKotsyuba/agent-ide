@@ -12,7 +12,7 @@ mod parity;
 
 use std::time::{Duration, Instant};
 
-use parity::{Daemon, Fixture, ProcessIdentity, ProcessTree, Session, line};
+use parity::{Daemon, Fixture, ProcessIdentity, ProcessTree, Session};
 use serde_json::{Value, json};
 
 /// The fallback switch for the in-process side.
@@ -150,6 +150,25 @@ fn semantic() -> Vec<(&'static str, Value)> {
     ]
 }
 
+/// One transcript entry: the harness line with the fixture root written as `<root>`, followed for
+/// an edit (whose reply carries no text) by its structured reply. An edit's `status` plate is
+/// left out: it carries whatever check result happens to be due at that moment.
+fn record(fixture: &Fixture, tool: &str, arguments: &Value, reply: &Value) -> String {
+    let mut entry = parity::line_for(fixture, tool, arguments, reply);
+    if tool == "ide.edit" {
+        let mut body = reply.clone();
+        if let Some(object) = body.as_object_mut() {
+            object.remove("status");
+        }
+        entry.push_str(
+            &body
+                .to_string()
+                .replace(&fixture.root.display().to_string(), "<root>"),
+        );
+    }
+    entry
+}
+
 /// The `ide.test` selections: by referencing symbol, an integration binary, a failing test and a
 /// name pattern.
 fn test_runs() -> Vec<Value> {
@@ -166,7 +185,7 @@ fn test_runs() -> Vec<Value> {
 async fn test_run(session: &mut Session, fixture: &Fixture, arguments: Value) -> Vec<String> {
     let started = session.call(fixture, "ide.test", arguments.clone()).await;
     let text = started["text"].as_str().unwrap_or_default().to_owned();
-    let mut lines = vec![line("ide.test", &arguments, &started)];
+    let mut lines = vec![record(fixture, "ide.test", &arguments, &started)];
     let Some(id) = text
         .strip_prefix("tests #")
         .and_then(|rest| rest.split(':').next())
@@ -180,7 +199,7 @@ async fn test_run(session: &mut Session, fixture: &Fixture, arguments: Value) ->
         let reply = session.call(fixture, "ide.test", status.clone()).await;
         let text = reply["text"].as_str().unwrap_or_default();
         if !text.contains(": running") && !text.contains(": started") {
-            lines.push(line("ide.test", &status, &reply));
+            lines.push(record(fixture, "ide.test", &status, &reply));
             return lines;
         }
         assert!(
@@ -303,12 +322,12 @@ async fn run(fixture: &Fixture, env: &[(&str, &str)]) -> (Vec<String>, ProcessTr
     let mut replies = Vec::new();
     for (tool, arguments) in before_ready() {
         let reply = session.call(fixture, tool, arguments.clone()).await;
-        replies.push(line(tool, &arguments, &reply));
+        replies.push(record(fixture, tool, &arguments, &reply));
     }
     ready(&mut session, fixture).await;
     for (tool, arguments) in semantic() {
         let reply = session.call(fixture, tool, arguments.clone()).await;
-        replies.push(line(tool, &arguments, &reply));
+        replies.push(record(fixture, tool, &arguments, &reply));
     }
     for arguments in test_runs() {
         replies.extend(test_run(&mut session, fixture, arguments).await);
@@ -319,10 +338,13 @@ async fn run(fixture: &Fixture, env: &[(&str, &str)]) -> (Vec<String>, ProcessTr
         })
         .await,
     );
+    let read = json!({"path":"src/orphan.rs","lines":"1-3"});
+    let observed = session.call(fixture, "ide.read", read.clone()).await;
+    replies.push(record(fixture, "ide.read", &read, &observed));
     let orphan = json!({"operation_id":"p-orphan","op":"replace","path":"src/orphan.rs",
-        "lines":"2-2","content":"    2"});
+        "lines":"2-2","content":"    2","source_ref":observed["detail_ref"]});
     let reply = session.call(fixture, "ide.edit", orphan.clone()).await;
-    replies.push(line("ide.edit", &orphan, &reply));
+    replies.push(record(fixture, "ide.edit", &orphan, &reply));
     let tree = daemon.tree();
     session.close(fixture).await;
     (replies, tree, daemon)
@@ -378,7 +400,7 @@ async fn rust_module_and_in_process_transcripts_are_equal() {
     let masked = |replies: &[String]| {
         replies
             .iter()
-            .map(|reply| mask_seconds(reply))
+            .map(|reply| mask_counters(&mask_seconds(reply)))
             .collect::<Vec<_>>()
     };
     parity::assert_parity(&masked(&local), &masked(&moduled));
@@ -904,9 +926,11 @@ async fn rust_analyzer_crash_loop_exhausts_the_restart_budget() {
         // Let each backoff (250 ms, 1 s, 4 s) pass so the next start really happens.
         tokio::time::sleep(Duration::from_millis([300, 1100, 4100, 0][attempt])).await;
     }
+    // The symbol card names a module's typed failure (context answers lexically instead).
+    let usages = json!({"symbol":"src/lib.rs#Service/work"});
     let mut refused = Value::Null;
     for _ in 0..3 {
-        refused = session.call(&fixture, "ide.context", context.clone()).await;
+        refused = session.call(&fixture, "ide.symbol", usages.clone()).await;
         if refused.to_string().contains("restart_exhausted") {
             break;
         }
@@ -926,6 +950,24 @@ async fn rust_analyzer_crash_loop_exhausts_the_restart_budget() {
     );
     assert_eq!(daemon.pid(), daemon_pid, "same daemon");
     session.close(&fixture).await;
+}
+
+/// `text` with the per-daemon observation counters of a context reply masked (`source_sequence:`
+/// and `document_version:`): they count every observation of the run, and the readiness wait
+/// polls a variable number of times. Everything else stays byte-compared.
+fn mask_counters(text: &str) -> String {
+    text.split('\n')
+        .map(|line| {
+            if line.starts_with("source_sequence: ") {
+                "source_sequence: <n>".to_owned()
+            } else if line.starts_with("document_version: Some(") {
+                "document_version: Some(<n>)".to_owned()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Only the elapsed slot of test result lines is masked; budgets and other text stay.
