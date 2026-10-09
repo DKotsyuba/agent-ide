@@ -17126,7 +17126,9 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
     fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"slow-fixture-provider"),"settings":"gopls_defaults","toolchain":"/usr/bin/true","cargo_version":null,"rustc_version":null,"trust":"fixture-disabled","cache_namespace":"slow-fixture-cache"}]));
-    let mut daemon = fixture.daemon().await;
+    let mut daemon = fixture
+        .daemon_with_home(Some(&provider_home(&fixture)))
+        .await;
     let mut actor = ProductActor::new(&fixture, "cancel-root").await;
     let started = actor
         .call(
@@ -17137,7 +17139,7 @@ async fn configured_product_stop_reaps_a_provider_that_never_becomes_ready() {
         .await;
     let started = actor.settle(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
-    let cache_namespaces = std::fs::read_dir(fixture.runtime.join("cache"))
+    let cache_namespaces = std::fs::read_dir(provider_cache(&fixture))
         .unwrap()
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -17470,7 +17472,9 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
     fixture.write_config(json!([{"executable":accepted_program(program.to_str().unwrap(),"rust-analyzer signal fixture"),"settings":"rust_cache_priming_disabled_v1","toolchain":"stable","cargo":accepted_program("/usr/bin/true","cargo 1.98.1"),"cargo_version":"cargo 1.98.1","rustc":accepted_program("/usr/bin/true","rustc 1.98.1"),"rustc_version":"rustc 1.98.1","trust":"fixture-disabled","cache_namespace":"signal-rust-cache"}]));
-    let mut daemon = fixture.daemon().await;
+    let mut daemon = fixture
+        .daemon_with_home(Some(&provider_home(&fixture)))
+        .await;
     let mut actor = ProductActor::new(&fixture, "signal-rust-root").await;
     let started = actor
         .call(
@@ -17501,7 +17505,7 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
     .await
     .unwrap();
     let provider_pid: libc::pid_t = std::fs::read_to_string(&process).unwrap().parse().unwrap();
-    let namespaces = std::fs::read_dir(fixture.runtime.join("cache"))
+    let namespaces = std::fs::read_dir(provider_cache(&fixture))
         .unwrap()
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -17594,7 +17598,9 @@ async fn configured_product_isolates_go_across_two_divergent_worktree_actors() {
     child_target["candidate"] = json!(child_root);
     config["targets"].as_array_mut().unwrap().push(child_target);
     std::fs::write(&fixture.config, config.to_string()).unwrap();
-    let mut daemon = fixture.daemon().await;
+    let mut daemon = fixture
+        .daemon_with_home(Some(&provider_home(&fixture)))
+        .await;
     let mut root = ProductActor::new(&fixture, "root-view").await;
     let mut child_state = fixture.state();
     child_state["sandboxCwd"] = json!(child_root);
@@ -17684,7 +17690,7 @@ async fn configured_product_isolates_go_across_two_divergent_worktree_actors() {
         .filter(|entry| entry.file_name().to_string_lossy().starts_with("g-"))
         .count();
     assert_eq!(sockets, 1);
-    let cache_root = fixture.runtime.join("cache");
+    let cache_root = provider_cache(&fixture);
     let worktree_namespaces_before = std::fs::read_dir(&cache_root)
         .unwrap()
         .filter_map(Result::ok)
@@ -20037,7 +20043,9 @@ async fn configured_product_claude_returns_context_diff_and_feedback() {
         }
     ]);
     let fixture = ProductFixture::new(providers);
-    let mut daemon = fixture.daemon().await;
+    let mut daemon = fixture
+        .daemon_with_home(Some(&provider_home(&fixture)))
+        .await;
     let mut actor = ProductActor::new(&fixture, "claude-context").await;
 
     let pending = actor
@@ -20142,7 +20150,7 @@ async fn configured_product_claude_returns_context_diff_and_feedback() {
     );
     assert!(diff_text.contains("return \"bad\""), "{diff_text}");
 
-    let mut retained = std::fs::read_dir(fixture.runtime.join("cache"))
+    let mut retained = std::fs::read_dir(provider_cache(&fixture))
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect::<Vec<_>>();
@@ -20152,7 +20160,7 @@ async fn configured_product_claude_returns_context_diff_and_feedback() {
     assert_eq!(retained.len(), 3, "{retained:?}");
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
-    let mut after_stop = std::fs::read_dir(fixture.runtime.join("cache"))
+    let mut after_stop = std::fs::read_dir(provider_cache(&fixture))
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect::<Vec<_>>();
@@ -20164,6 +20172,21 @@ async fn configured_product_claude_returns_context_diff_and_feedback() {
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
+}
+
+/// A private daemon home for `fixture`: the provider cache namespaces live below it, in
+/// `.agent-ide/providers`, so a test sees exactly its own daemon's namespaces.
+fn provider_home(fixture: &ProductFixture) -> PathBuf {
+    let home = fixture.base.join("provider-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    home
+}
+
+/// The directory holding the provider cache namespaces of the daemon started with
+/// [`provider_home`].
+fn provider_cache(fixture: &ProductFixture) -> PathBuf {
+    provider_home(fixture).join(".agent-ide/providers")
 }
 
 /// Enables project checks with a fake Rust toolchain whose `cargo` replays a fixed JSON stream.
@@ -22143,7 +22166,9 @@ async fn configured_product_environment_repeat_start_keeps_own_cache_and_binding
         )
         .unwrap();
     }
-    let mut daemon = fixture.daemon().await;
+    let mut daemon = fixture
+        .daemon_with_home(Some(&provider_home(&fixture)))
+        .await;
     let mut actor = ProductActor::new(&fixture, "repeat-environment").await;
     let first = actor
         .call(
@@ -22161,7 +22186,7 @@ async fn configured_product_environment_repeat_start_keeps_own_cache_and_binding
         .next()
         .unwrap()
         .to_owned();
-    let mut namespaces = std::fs::read_dir(fixture.runtime.join("cache"))
+    let mut namespaces = std::fs::read_dir(provider_cache(&fixture))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect::<Vec<_>>();
@@ -22216,7 +22241,7 @@ async fn configured_product_environment_repeat_start_keeps_own_cache_and_binding
             .await;
         let run = actor.settle(&fixture, run).await;
         assert_eq!(run["kind"], "test", "{run}");
-        let mut actual = std::fs::read_dir(fixture.runtime.join("cache"))
+        let mut actual = std::fs::read_dir(provider_cache(&fixture))
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect::<Vec<_>>();
