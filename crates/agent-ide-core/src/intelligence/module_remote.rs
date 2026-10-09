@@ -84,19 +84,25 @@ fn source_ref(observation: &SourceObservation, text: &str) -> (SourceRef, Vec<At
     )
 }
 
-/// The UTF-8 position of byte `offset` in `text` (clamped to a char boundary at or before it).
-fn position(text: &str, offset: u64) -> lsp::Position {
+/// The position of byte `offset` in `text` (clamped to a char boundary at or before it) in the
+/// provider's negotiated `encoding`.
+fn position(text: &str, offset: u64, encoding: &lsp::PositionEncodingKind) -> lsp::Position {
     let mut offset = (offset as usize).min(text.len());
     while !text.is_char_boundary(offset) {
         offset -= 1;
     }
-    let before = &text[..offset];
-    let line = before.matches('\n').count() as u32;
-    let start = before.rfind('\n').map_or(0, |at| at + 1);
-    lsp::Position {
-        line,
-        character: (offset - start) as u32,
-    }
+    context::position(text, offset, encoding).unwrap_or_default()
+}
+
+/// The provider encoding a module reports, if it is one the core converts.
+fn encoding_of(name: &str) -> Option<lsp::PositionEncodingKind> {
+    [
+        lsp::PositionEncodingKind::UTF8,
+        lsp::PositionEncodingKind::UTF16,
+        lsp::PositionEncodingKind::UTF32,
+    ]
+    .into_iter()
+    .find(|encoding| encoding.as_str() == name)
 }
 
 /// The request's own source, against which a module's ranges are checked.
@@ -467,8 +473,8 @@ impl Session {
         Some(lsp::Location {
             uri,
             range: lsp::Range {
-                start: position(&text, location.start_byte),
-                end: position(&text, location.end_byte),
+                start: position(&text, location.start_byte, &self.module_encoding()),
+                end: position(&text, location.end_byte, &self.module_encoding()),
             },
         })
     }
@@ -749,6 +755,7 @@ impl Session {
                 context::invalid(&format!("rename proposal refused: {refusal:?}"))
             })?;
         let mut changes = HashMap::new();
+        let encoding = self.module_encoding();
         for FileEdit {
             path, replacements, ..
         } in &proposal.files
@@ -762,8 +769,8 @@ impl Session {
                     .iter()
                     .map(|replacement| lsp::TextEdit {
                         range: lsp::Range {
-                            start: position(text, replacement.start_byte),
-                            end: position(text, replacement.end_byte),
+                            start: position(text, replacement.start_byte, &encoding),
+                            end: position(text, replacement.end_byte, &encoding),
                         },
                         new_text: replacement.new_text.clone(),
                     })
@@ -811,7 +818,17 @@ impl Session {
                 }),
                 attachments,
             )
-            .await;
+            .await
+            .and_then(|evidence: ContextEvidence| {
+                let encoding = encoding_of(&evidence.position_encoding).ok_or_else(|| {
+                    context::invalid("module reported an unsupported position encoding")
+                })?;
+                // Every later conversion, of this reply first, uses the provider's encoding.
+                if let Some(capabilities) = &mut self.capabilities {
+                    capabilities.position_encoding = encoding;
+                }
+                Ok(evidence)
+            });
         let own = Some(Own {
             path: observation.path(),
             revision: observation.source_revision().as_str(),
@@ -835,7 +852,7 @@ impl Session {
                 match &evidence.lexical {
                     None => {
                         result.mode = ContextMode::Semantic;
-                        result.position_encoding = lsp::PositionEncodingKind::UTF8;
+                        result.position_encoding = self.module_encoding();
                         result.lexical_matches.clear();
                     }
                     Some(reason) => {
@@ -861,6 +878,15 @@ impl Session {
         Ok(result)
     }
 
+    /// The provider's position encoding as the module last reported it (UTF-8 until then).
+    fn module_encoding(&self) -> lsp::PositionEncodingKind {
+        self.capabilities
+            .as_ref()
+            .map_or(lsp::PositionEncodingKind::UTF8, |capabilities| {
+                capabilities.position_encoding.clone()
+            })
+    }
+
     /// Stores the module's diagnostics evidence, bound to `observation` only for its revision.
     fn module_bind_diagnostics(
         &mut self,
@@ -869,14 +895,15 @@ impl Session {
         text: &str,
     ) {
         let bound = evidence.revision.as_deref() == Some(observation.source_revision().as_str());
+        let encoding = self.module_encoding();
         let diagnostics: Vec<lsp::Diagnostic> = if bound {
             evidence
                 .diagnostics
                 .iter()
                 .map(|diagnostic| lsp::Diagnostic {
                     range: lsp::Range {
-                        start: position(text, diagnostic.location.start_byte),
-                        end: position(text, diagnostic.location.end_byte),
+                        start: position(text, diagnostic.location.start_byte, &encoding),
+                        end: position(text, diagnostic.location.end_byte, &encoding),
                     },
                     severity: diagnostic
                         .severity
@@ -900,7 +927,11 @@ impl Session {
         let snapshot = &mut state.diagnostics;
         snapshot.source = bound
             .then(|| crate::intelligence::freshness::SourceBinding::from_observation(observation));
-        snapshot.document_version = None;
+        snapshot.document_version = if bound {
+            evidence.document_version
+        } else {
+            None
+        };
         snapshot.readiness = match (bound, evidence.readiness.as_str()) {
             (true, "clean") => DiagnosticReadiness::Clean,
             (true, "reported") => DiagnosticReadiness::Reported,

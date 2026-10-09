@@ -95,6 +95,11 @@ pub mod languages {
         &agent_ide_lang_python::module::INTERPRETER_PREFIXES,
     )];
 
+    /// Each language's host-side resolution of a worktree's accepted environments (Python's
+    /// selected, pinned or discovered environments and their installation prefixes).
+    pub static ENVIRONMENT_ROOTS: [(&str, agent_ide_core::modules::recipe::EnvironmentRoots); 1] =
+        [("python", agent_ide_lang_python::environment::accepted_roots)];
+
     /// Registers every bundled language for this process. Idempotent; call it before parsing a
     /// launcher configuration or mapping any path to a language.
     pub fn install() {
@@ -104,6 +109,7 @@ pub mod languages {
         agent_ide_core::modules::recipe::declare(&RECIPES);
         agent_ide_core::modules::launch::declare_env(&MODULE_ENV);
         agent_ide_core::modules::recipe::declare_roots(&INSTALL_ROOTS);
+        agent_ide_core::modules::recipe::declare_environment_roots(&ENVIRONMENT_ROOTS);
     }
 }
 

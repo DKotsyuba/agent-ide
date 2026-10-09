@@ -227,11 +227,18 @@ impl FakeModule {
                 SemanticQuery::Context { source, .. } => encode(&ContextEvidence {
                     lexical: None,
                     document_version: Some(1),
+                    // A UTF-16 provider; one reference spans the source's first line.
+                    position_encoding: "utf-16".into(),
                     definitions: Some(vec![located(&source, 0, 1)]),
-                    references: Some(Vec::new()),
+                    references: Some(vec![located(
+                        &source,
+                        0,
+                        text_of(&source, request)?.find('\n').unwrap_or(0) as u64,
+                    )]),
                     truncated: false,
                     diagnostics: DiagnosticsEvidence {
                         revision: Some(source.revision.clone()),
+                        document_version: Some(1),
                         readiness: "clean".into(),
                         freshness: "current".into(),
                         diagnostics: Vec::new(),
@@ -250,6 +257,7 @@ impl FakeModule {
                 SemanticQuery::Readiness {} => encode(&super::contract::Readiness::Ready),
                 SemanticQuery::Diagnostics { source } => encode(&DiagnosticsEvidence {
                     revision: Some(source.revision),
+                    document_version: Some(1),
                     readiness: "clean".into(),
                     freshness: "current".into(),
                     diagnostics: Vec::new(),

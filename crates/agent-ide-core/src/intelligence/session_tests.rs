@@ -1099,7 +1099,8 @@ async fn live_session_outlives_requests_and_waits_for_readiness_per_request() {
 }
 
 /// A module-hosted session sends the core's exact source with its revision and turns the module's
-/// product answers back into provider types with UTF-8 positions over the exact text; context is
+/// product answers back into provider types with positions in the provider's reported encoding
+/// over the exact text (a UTF-16 provider converts a non-ASCII line in UTF-16 units); context is
 /// built over the core's own observation and binds diagnostics only for the same revision; a
 /// module that exits mid-request retires the generation.
 #[tokio::test]
@@ -1164,7 +1165,24 @@ async fn module_session_converts_product_answers() {
     assert_eq!(context.mode, ContextMode::Semantic);
     assert_eq!(context.generation, Some(generation));
     assert_eq!(context.text, text, "source text stays the core's own");
+    assert_eq!(
+        context.position_encoding,
+        lsp::PositionEncodingKind::UTF16,
+        "the provider's own encoding is reported"
+    );
+    let references = context.references.expect("references");
+    assert_eq!(
+        references[0].range.end.character, 7,
+        "the non-ASCII line converts in UTF-16 units, not its 8 bytes"
+    );
+    let definitions = live
+        .session
+        .definitions(&source, text.as_bytes(), 0)
+        .await
+        .unwrap();
+    assert_eq!(definitions[0].range.end.character, 1);
     let diagnostics = live.session.diagnostics();
+    assert_eq!(diagnostics.document_version, Some(1), "an exact count");
     assert_eq!(diagnostics.readiness, DiagnosticReadiness::Clean);
     assert!(diagnostics.source.is_some());
     assert!(live.is_alive());

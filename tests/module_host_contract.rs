@@ -147,12 +147,29 @@ fn parity_normalizer_masks_only_volatile_tokens() {
         normalized(&format!("ref {two}\n"))
     );
     assert_eq!(normalized("x\n"), "x\n");
-    // The generated activation id is masked only after its marker; other ids, short hex runs
-    // (a commit prefix) and paths still differ.
+    // The generated activation id is masked only after its marker in an `ide.start` reply; the
+    // same words in a read source body, other ids, short hex runs (a commit prefix) and paths
+    // still differ.
     let (first, second) = ("a".repeat(64), "b".repeat(64));
     assert_eq!(
-        normalized(&format!("activation {first} ready\n")),
-        normalized(&format!("activation {second} ready\n"))
+        normalized(&format!(
+            "ide.start {{}} -> x\nexisting activation {first}; ready\n"
+        )),
+        normalized(&format!(
+            "ide.start {{}} -> x\nexisting activation {second}; ready\n"
+        ))
+    );
+    assert_ne!(
+        normalized(&format!(
+            "ide.read {{}} -> x\nkey = \"activation {first}\"\n"
+        )),
+        normalized(&format!(
+            "ide.read {{}} -> x\nkey = \"activation {second}\"\n"
+        ))
+    );
+    assert_ne!(
+        normalized(&format!("ide.read {{}} -> x\nactivation {first}\n")),
+        normalized(&format!("ide.read {{}} -> x\nactivation {second}\n"))
     );
     assert_ne!(
         normalized(&format!("op {first}\n")),

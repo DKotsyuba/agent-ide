@@ -108,12 +108,16 @@ impl ModuleChecker {
 
     /// Runs one check, or the typed failure of its module.
     async fn run(&self, request: &CheckRequest) -> Result<ProblemSnapshot, ModuleUnavailable> {
-        let described = self.described(&request.worktree).await?;
+        let mut described = self.described(&request.worktree).await?.clone();
+        described.launcher_roots.extend(recipe::environment_roots(
+            self.language.name(),
+            &request.worktree,
+        ));
         let mut effects = CheckEffects {
             recipes: recipe::declared(self.language.name()),
             request,
             home: crate::userhome::user_home(),
-            described,
+            described: &described,
             timeout: self.timeout,
             runner: self.runner.as_ref(),
         };
