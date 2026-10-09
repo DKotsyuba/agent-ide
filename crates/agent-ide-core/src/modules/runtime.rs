@@ -121,7 +121,7 @@ pub struct Spawned<P> {
     /// The module's stdout (protocol only).
     pub stdout: Box<dyn AsyncRead + Send + Unpin>,
     /// The module's stdin.
-    pub stdin: Box<dyn AsyncWrite + Send + Unpin>,
+    pub stdin: Box<dyn AsyncWrite + Send + Sync + Unpin>,
     /// The module's stderr, drained into the instance's [`StderrTail`].
     pub stderr: Option<Box<dyn AsyncRead + Send + Unpin>>,
     /// The handle the launcher reaps.

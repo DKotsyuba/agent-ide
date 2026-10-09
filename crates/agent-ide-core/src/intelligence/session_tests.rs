@@ -269,6 +269,7 @@ async fn unversioned_diagnostics_require_unchanged_initial_open() {
         sequence: 1,
         version: 2,
         remote: None,
+        module: None,
     };
     assert_eq!(
         session
@@ -1278,4 +1279,92 @@ async fn remote_context_checks_generation_and_diagnostic_binding() {
             "and is a module fault its owner turns into a typed refusal"
         );
     }
+}
+
+/// A module-hosted session sends the core's exact source with its revision and turns the module's
+/// product answers back into provider types with UTF-8 positions over the exact text; context is
+/// built over the core's own observation and binds diagnostics only for the same revision; a
+/// module that exits mid-request retires the generation.
+#[tokio::test]
+async fn module_session_converts_product_answers() {
+    use crate::modules::{
+        contract::{Capability, ModuleId, Role},
+        fake::{FakeModule, Fault, in_memory, offer},
+    };
+    crate::lang::testing::install();
+    let generation = ViewGeneration {
+        backend: 1,
+        configuration: 2,
+        toolchain: 3,
+        view: 4,
+    };
+    let open = |module: FakeModule| async move {
+        let (channel, _) = in_memory(
+            module,
+            offer(ModuleId::bundled("alpha"), "1.0", Role::Analyzer, 1),
+        )
+        .await
+        .unwrap();
+        LiveSession::open_module(
+            channel,
+            true,
+            tree(),
+            1,
+            generation,
+            plain_settings(),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    };
+    let mut live = open(FakeModule::new(ModuleId::bundled("alpha"), "1.0")).await;
+    let text = "a = \"é\"\nworld\n";
+    let source = observation(text, 1);
+    let definitions = live
+        .session
+        .definitions(&source, text.as_bytes(), 0)
+        .await
+        .unwrap();
+    assert_eq!(definitions.len(), 1);
+    assert!(definitions[0].uri.path().ends_with("/main.go"));
+    assert_eq!(definitions[0].range.end.character, 1, "UTF-8 units");
+    assert_eq!(
+        live.session
+            .hover(&source, text.as_bytes(), 0)
+            .await
+            .unwrap(),
+        Some("fake".to_owned())
+    );
+    let source = observation(text, 2);
+    let context = live
+        .session
+        .context(
+            &source,
+            text.as_bytes(),
+            ContextQuery::Symbol { byte_offset: 0 },
+        )
+        .await
+        .unwrap();
+    assert_eq!(context.mode, ContextMode::Semantic);
+    assert_eq!(context.generation, Some(generation));
+    assert_eq!(context.text, text, "source text stays the core's own");
+    let diagnostics = live.session.diagnostics();
+    assert_eq!(diagnostics.readiness, DiagnosticReadiness::Clean);
+    assert!(diagnostics.source.is_some());
+    assert!(live.is_alive());
+
+    let mut failing = open(
+        FakeModule::new(ModuleId::bundled("alpha"), "1.0")
+            .with_fault(Capability::Semantic, Fault::Exit),
+    )
+    .await;
+    let source = observation(text, 1);
+    assert!(
+        failing
+            .session
+            .definitions(&source, text.as_bytes(), 0)
+            .await
+            .is_err()
+    );
+    assert!(!failing.is_alive(), "a module fault retires the generation");
+    assert!(failing.session.module_fault().is_some());
 }

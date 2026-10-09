@@ -370,6 +370,9 @@ pub struct Session {
     /// M-011 pilot: the external module channel; when present every read-only request is
     /// forwarded there and `server` is a closed socket.
     remote: Option<Box<super::pilot::Channel>>,
+    /// A bundled module hosting the provider; when present every request goes there and `server`
+    /// is a closed socket.
+    module: Option<Box<module_remote::ModuleRemote>>,
 }
 
 /// Drives initialize/initialized, a caller operation and bounded transport cleanup.
@@ -430,6 +433,7 @@ where
         sequence: 0,
         version: 0,
         remote: None,
+        module: None,
     };
     let driver_state = state.clone();
     let driver = async move {
@@ -573,6 +577,7 @@ impl LiveSession {
             sequence: 0,
             version: 0,
             remote: None,
+            module: None,
         };
         let mut live = Self { session, driver };
         if let Err(error) = live.session.handshake().await {
@@ -835,8 +840,8 @@ impl Session {
     /// and empty unversioned pushes leave readiness unknown; semantic context already computed by
     /// the caller is unaffected.
     pub(crate) async fn wait_for_matching_diagnostics(&self) {
-        // A pilot module already waited inside its own context exchange.
-        if self.remote.is_some() {
+        // A pilot or bundled module already waited inside its own context exchange.
+        if self.remote.is_some() || self.module.is_some() {
             return;
         }
         let now = Instant::now();
@@ -864,6 +869,9 @@ impl Session {
         bytes: &[u8],
         query: ContextQuery,
     ) -> io::Result<ContextResult> {
+        if self.module.is_some() {
+            return self.module_context(observation, bytes, query).await;
+        }
         if self.remote.is_some() {
             return self.remote_context(observation, bytes, query).await;
         }
@@ -1002,6 +1010,9 @@ impl Session {
         observation: &SourceObservation,
         bytes: &[u8],
     ) -> io::Result<Vec<lsp::DocumentSymbol>> {
+        if self.module.is_some() {
+            return Err(io::Error::other("a module session answers module_outline"));
+        }
         if self.remote.is_some() {
             return self
                 .remote_at("document_symbols", observation, bytes, None)
@@ -1044,6 +1055,9 @@ impl Session {
         bytes: &[u8],
         byte_offset: usize,
     ) -> io::Result<Option<String>> {
+        if self.module.is_some() {
+            return self.module_hover(observation, bytes, byte_offset).await;
+        }
         if self.remote.is_some() {
             return self
                 .remote_at("hover", observation, bytes, Some(byte_offset))
@@ -1076,6 +1090,11 @@ impl Session {
         bytes: &[u8],
         byte_offset: usize,
     ) -> io::Result<Vec<lsp::Location>> {
+        if self.module.is_some() {
+            return self
+                .module_locations(observation, bytes, byte_offset, true)
+                .await;
+        }
         if self.remote.is_some() {
             return self
                 .remote_at("definitions", observation, bytes, Some(byte_offset))
@@ -1101,6 +1120,11 @@ impl Session {
         bytes: &[u8],
         byte_offset: usize,
     ) -> io::Result<Vec<lsp::Location>> {
+        if self.module.is_some() {
+            return self
+                .module_locations(observation, bytes, byte_offset, false)
+                .await;
+        }
         if self.remote.is_some() {
             return self
                 .remote_at("references", observation, bytes, Some(byte_offset))
@@ -1129,6 +1153,11 @@ impl Session {
         bytes: &[u8],
         byte_offset: usize,
     ) -> io::Result<Vec<lsp::CallHierarchyItem>> {
+        if self.module.is_some() {
+            return self
+                .module_prepare_calls(observation, bytes, byte_offset)
+                .await;
+        }
         if self.remote.is_some() {
             return self
                 .remote_at(
@@ -1156,6 +1185,14 @@ impl Session {
         &mut self,
         item: lsp::CallHierarchyItem,
     ) -> io::Result<Vec<lsp::CallHierarchyIncomingCall>> {
+        if self.module.is_some() {
+            return Ok(self
+                .module_calls_for(item, true)
+                .await?
+                .into_iter()
+                .map(|(from, from_ranges)| lsp::CallHierarchyIncomingCall { from, from_ranges })
+                .collect());
+        }
         if self.remote.is_some() {
             return self
                 .remote_typed("incoming_calls_for", serde_json::json!({"item": item}))
@@ -1176,6 +1213,14 @@ impl Session {
         &mut self,
         item: lsp::CallHierarchyItem,
     ) -> io::Result<Vec<lsp::CallHierarchyOutgoingCall>> {
+        if self.module.is_some() {
+            return Ok(self
+                .module_calls_for(item, false)
+                .await?
+                .into_iter()
+                .map(|(to, from_ranges)| lsp::CallHierarchyOutgoingCall { to, from_ranges })
+                .collect());
+        }
         if self.remote.is_some() {
             return Err(io::Error::other("not available through the pilot module"));
         }
@@ -1196,6 +1241,17 @@ impl Session {
         bytes: &[u8],
         byte_offset: usize,
     ) -> io::Result<Vec<lsp::CallHierarchyIncomingCall>> {
+        if self.module.is_some() {
+            let Some(item) = self
+                .module_prepare_calls(observation, bytes, byte_offset)
+                .await?
+                .into_iter()
+                .next()
+            else {
+                return Ok(Vec::new());
+            };
+            return self.incoming_calls_for(item).await;
+        }
         if self.remote.is_some() {
             return self
                 .remote_at("incoming_calls", observation, bytes, Some(byte_offset))
@@ -1219,6 +1275,17 @@ impl Session {
         bytes: &[u8],
         byte_offset: usize,
     ) -> io::Result<Vec<lsp::CallHierarchyOutgoingCall>> {
+        if self.module.is_some() {
+            let Some(item) = self
+                .module_prepare_calls(observation, bytes, byte_offset)
+                .await?
+                .into_iter()
+                .next()
+            else {
+                return Ok(Vec::new());
+            };
+            return self.outgoing_calls_for(item).await;
+        }
         if self.remote.is_some() {
             return self
                 .remote_at("outgoing_calls", observation, bytes, Some(byte_offset))
@@ -1258,6 +1325,9 @@ impl Session {
     ) -> io::Result<Vec<lsp::SymbolInformation>> {
         if !self.state.lock().expect("session lock").active {
             return Err(io::Error::other("provider generation unavailable"));
+        }
+        if self.module.is_some() {
+            return self.module_workspace_symbols(query).await;
         }
         if self.remote.is_some() {
             return self
@@ -1306,6 +1376,11 @@ impl Session {
         byte_offset: usize,
         new_name: &str,
     ) -> io::Result<Option<lsp::WorkspaceEdit>> {
+        if self.module.is_some() {
+            return self
+                .module_rename(observation, bytes, byte_offset, new_name)
+                .await;
+        }
         if self.remote.is_some() {
             return Err(io::Error::other("the pilot module is read-only"));
         }
@@ -1540,6 +1615,11 @@ impl Session {
             state.terminal = true;
             state.invalidate();
         }
+        // A bundled module is asked to exit; only the owner's reap proves it stopped.
+        if let Some(module) = self.module.as_mut() {
+            module.shutdown().await;
+            return Ok(());
+        }
         // M-011 pilot: the module acknowledges `shutdown` before it stops its provider; without
         // that acknowledgement the stop is unconfirmed and only the caller's reap proves it.
         if let Some(remote) = self.remote.as_mut() {
@@ -1626,6 +1706,7 @@ impl LiveSession {
             sequence: 0,
             version: 0,
             remote: Some(Box::new(channel)),
+            module: None,
         };
         let mut live = Self { session, driver };
         // The module starts its provider and initializes it inside `hello`: a startup budget,
@@ -2084,6 +2165,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedInput<R> {
         }
     }
 }
+
+/// Sessions whose provider is hosted by a bundled module.
+#[path = "module_remote.rs"]
+mod module_remote;
 
 #[cfg(test)]
 #[path = "session_tests.rs"]

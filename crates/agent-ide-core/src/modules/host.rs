@@ -93,9 +93,11 @@ pub struct Reply {
 /// Core side of one instance.
 pub struct HostChannel {
     /// To the module.
-    writer: Box<dyn AsyncWrite + Send + Unpin>,
+    writer: Box<dyn AsyncWrite + Send + Sync + Unpin>,
     /// Frames (or the terminal read error) from the reader task, in arrival order.
     frames: mpsc::Receiver<Result<Frame, WireError>>,
+    /// The reader task; it ends when the module's output ends.
+    reader: Option<tokio::task::JoinHandle<()>>,
     /// The accepted offer.
     offer: HelloOffer,
     /// Last request id sent.
@@ -137,10 +139,10 @@ impl HostChannel {
     ) -> Result<(Self, HelloReply), ModuleUnavailable>
     where
         R: AsyncRead + Send + Unpin + 'static,
-        W: AsyncWrite + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Sync + Unpin + 'static,
     {
         let (sender, frames) = mpsc::channel(16);
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             let mut input = input;
             loop {
                 let frame = read_frame(&mut input).await;
@@ -153,6 +155,7 @@ impl HostChannel {
         let mut channel = Self {
             writer: Box::new(output),
             frames,
+            reader: Some(reader),
             offer,
             last_request: 0,
             in_flight: false,
@@ -178,6 +181,11 @@ impl HostChannel {
             Ok(Err(cause)) => Err(channel.poison(Stage::Hello, cause)),
             Err(_) => Err(channel.poison(Stage::Hello, Cause::Timeout)),
         }
+    }
+
+    /// Takes the reader task once: it finishes when the module's output ends (its liveness).
+    pub fn take_reader(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.reader.take()
     }
 
     /// The accepted offer.

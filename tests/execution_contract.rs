@@ -663,17 +663,19 @@ async fn captured_streams_are_bounded_but_drained() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// A leader that already exited still has its group torn down: a TERM-resistant descendant left
-/// in the owned group is killed after the grace, before the leader's reap releases its PID.
-#[tokio::test]
-async fn cancellation_signals_the_group_after_the_leader_exited() {
+/// Starts a leader whose TERM-resistant descendant stays in the owned group, cancels it with a
+/// short grace and checks the group was torn down: TERM, then KILL for the surviving descendant,
+/// and only then the leader's reap. `leader_exits_first` lets the leader exit before the
+/// cancellation (dead at entry); otherwise the leader is alive and dies on TERM.
+async fn group_teardown_case(leader_exits_first: bool) {
     let root = worktree();
     let marker = root.join("descendant.pid");
     let script = format!(
-        "(trap '' TERM; echo $$ > '{}'.tmp; mv '{}'.tmp '{}'; exec sleep 600) </dev/null >/dev/null 2>&1 & exit 0",
+        "(trap '' TERM; echo $$ > '{}'.tmp; mv '{}'.tmp '{}'; exec sleep 600) </dev/null >/dev/null 2>&1 & {}",
         marker.display(),
         marker.display(),
-        marker.display()
+        marker.display(),
+        if leader_exits_first { "exit 0" } else { "wait" }
     );
     let request = request(&root, &script);
     let mut admission = AdmissionController::new(AdmissionLimits {
@@ -700,8 +702,10 @@ async fn cancellation_signals_the_group_after_the_leader_exited() {
     })
     .await
     .expect("the descendant started");
-    // Let the leader exit; it stays an unreaped zombie until the reap below.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    if leader_exits_first {
+        // The leader exits; it stays an unreaped zombie until the reap below.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     // SAFETY: signal 0 only checks that the descendant exists.
     assert_eq!(unsafe { libc::kill(descendant, 0) }, 0, "descendant alive");
     let result = child
@@ -710,9 +714,10 @@ async fn cancellation_signals_the_group_after_the_leader_exited() {
         .unwrap();
     let cancellation = result.evidence.cancellation().expect("group signalled");
     assert!(cancellation.term_requested && cancellation.kill_requested);
-    assert!(
+    assert_eq!(
         result.evidence.status().success(),
-        "the leader itself exited 0"
+        leader_exits_first,
+        "an exited leader keeps its own status; a live one died on TERM"
     );
     let gone = tokio::time::timeout(Duration::from_secs(5), async {
         // SAFETY: signal 0 only checks existence of the former descendant.
@@ -729,6 +734,19 @@ async fn cancellation_signals_the_group_after_the_leader_exited() {
             .is_empty()
     );
     fs::remove_dir_all(root).unwrap();
+}
+
+/// A leader that already exited still has its group torn down before its reap.
+#[tokio::test]
+async fn cancellation_signals_the_group_after_the_leader_exited() {
+    group_teardown_case(true).await;
+}
+
+/// A live leader that dies on TERM is not reaped before the group decision: its TERM-resistant
+/// descendant is killed after the grace.
+#[tokio::test]
+async fn cancellation_kills_a_resistant_group_when_the_leader_dies_on_term() {
+    group_teardown_case(false).await;
 }
 
 /// Separates cancellation request acknowledgement from direct-child reaping evidence.

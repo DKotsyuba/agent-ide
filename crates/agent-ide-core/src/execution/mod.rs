@@ -2979,38 +2979,23 @@ async fn cancel_owned(
         term_requested: false,
         kill_requested: false,
     });
-    if leader_exited_unreaped(pid) {
-        // The leader already exited but stays unreaped, so its PID still pins the group id:
-        // tear down surviving group members before the reap that would release it.
-        evidence.term_requested |= signal_group(pid, libc::SIGTERM).is_ok();
-        process.cancellation = Some(evidence);
-        let deadline_at = Instant::now() + grace;
-        while group_alive(pid) && Instant::now() < deadline_at {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        if group_alive(pid) {
-            evidence.kill_requested |= signal_group(pid, libc::SIGKILL).is_ok();
-            process.cancellation = Some(evidence);
-        }
-        return timeout(deadline, process.child.wait())
-            .await
-            .map_err(|_| ProcessError::ReapTimedOut)?
-            .map_err(ProcessError::Io);
-    }
+    // The leader stays unreaped until the group teardown decision, whether it was alive at entry
+    // or exits on TERM: its PID pins the group id, so the group may still be signalled safely.
     evidence.term_requested |= signal_group(pid, libc::SIGTERM).is_ok();
     process.cancellation = Some(evidence);
-    match timeout(grace, process.child.wait()).await {
-        Ok(status) => status.map_err(ProcessError::Io),
-        Err(_) => {
-            evidence.kill_requested |= signal_group(pid, libc::SIGKILL).is_ok();
-            process.cancellation = Some(evidence);
-            process.child.start_kill()?;
-            timeout(deadline, process.child.wait())
-                .await
-                .map_err(|_| ProcessError::ReapTimedOut)?
-                .map_err(ProcessError::Io)
-        }
+    let grace_end = Instant::now() + grace;
+    while group_running(pid) && Instant::now() < grace_end {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    if group_running(pid) {
+        evidence.kill_requested |= signal_group(pid, libc::SIGKILL).is_ok();
+        process.cancellation = Some(evidence);
+        let _ = process.child.start_kill();
+    }
+    timeout(deadline, process.child.wait())
+        .await
+        .map_err(|_| ProcessError::ReapTimedOut)?
+        .map_err(ProcessError::Io)
 }
 
 /// Reads a private random launch generation before an OS child can exist.
@@ -3180,13 +3165,44 @@ fn leader_exited_unreaped(pid: u32) -> bool {
     }
 }
 
-/// Whether any member of the owned process group led by `pid` still exists.
-fn group_alive(pid: u32) -> bool {
-    #[cfg(unix)]
+/// Whether any member of the owned process group led by `pid` is still running; an exited but
+/// unreaped member (the leader included) does not count.
+fn group_running(pid: u32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let mut pids = vec![0 as libc::pid_t; 4096];
+        let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+        // SAFETY: `pids` is writable for `bytes` bytes; the call only lists kernel PIDs.
+        let listed =
+            unsafe { libc::proc_listpgrppids(pid as libc::pid_t, pids.as_mut_ptr().cast(), bytes) };
+        if listed < 0 {
+            return false;
+        }
+        pids.iter()
+            .take(listed as usize)
+            .filter(|member| **member > 0)
+            .any(|member| {
+                // SAFETY: an all-zero `proc_bsdinfo` is a valid plain-data value to fill.
+                let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+                let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+                // SAFETY: `info` is writable for `size` bytes; the call only reads process data.
+                let written = unsafe {
+                    libc::proc_pidinfo(
+                        *member,
+                        libc::PROC_PIDTBSDINFO,
+                        0,
+                        (&mut info as *mut libc::proc_bsdinfo).cast(),
+                        size,
+                    )
+                };
+                written == size && info.pbi_status != libc::SZOMB
+            })
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         // SAFETY: signal 0 only checks existence and permission; nothing is delivered.
         let result = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
-        result == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        result == 0 && !leader_exited_unreaped(pid)
     }
     #[cfg(not(unix))]
     {
