@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.10.8 — 2026-10-09
+
 ### Added
 
 - Experimental, opt-in and read-only: with `AGENT_IDE_PILOT_MODULE=python` in the daemon's environment, Python analysis and the Python project check run in an external module process (the installed `agent-ide` binary in a hidden mode) instead of inside the daemon. Answers are the same as in-process; `rename` is refused in this mode; a killed, stalled or malformed module gives a typed refusal and is restarted while the daemon keeps serving; every confined check run the module asks for must match exactly what the core itself would run. Without the variable nothing changes. This is a learning pilot: its wire format is not public and may change or go away.
