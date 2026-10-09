@@ -640,14 +640,27 @@ impl Worker<'_> {
         let text = render::symbol_card_text(&card);
         // The card's first line is its heading; the block keeps the rows under its own.
         let rows = text.split_once('\n').map_or("", |(_, rows)| rows);
+        // The card's own marker line, matched as a whole line: a usage row's snippet may end in
+        // the same words.
         let cut = format!(
-            "  … {} more\n",
+            "  … {} more",
             card.usages.len().saturating_sub(render::MAX_USAGE_LINES)
         );
-        let rows = match hidden.as_deref().and_then(|text| text.split_once('\n')) {
-            Some((_, more)) => rows.replace(&cut, more),
-            None => rows.to_owned(),
-        };
+        let mut rows_out = String::new();
+        let mut spliced = false;
+        for line in rows.lines() {
+            match hidden.as_deref().and_then(|text| text.split_once('\n')) {
+                Some((_, more)) if !spliced && line == cut => {
+                    rows_out.push_str(more);
+                    spliced = true;
+                }
+                _ => {
+                    rows_out.push_str(line);
+                    rows_out.push('\n');
+                }
+            }
+        }
+        let rows = rows_out;
         if rows.is_empty() {
             return String::new();
         }

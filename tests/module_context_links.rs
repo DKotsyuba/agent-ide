@@ -297,3 +297,45 @@ async fn a_downed_html_module_is_disclosed_and_the_block_recovers() {
     }
     session.close(&fixture).await;
 }
+
+/// A usage whose source line ends in the card's own marker words is a row like any other: the
+/// block splices the hidden rows at the real marker line only.
+#[tokio::test]
+async fn a_snippet_that_looks_like_the_cut_marker_stays_intact() {
+    const FILES: usize = 31;
+    let mut files: Vec<(String, String)> = (0..FILES)
+        .map(|n| {
+            let tail = if n == 0 { "  … 1 more" } else { "" };
+            (
+                format!("pages/p{n:02}.html"),
+                format!("<p class=\"wide\">x</p>{tail}\n"),
+            )
+        })
+        .collect();
+    files.push(("wide.css".to_owned(), ".wide { margin: 0; }\n".to_owned()));
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let fixture = Fixture::new(&refs, json!([]));
+    let _daemon = Daemon::start(&fixture, &[]).await;
+    let mut session = Session::start(&fixture).await;
+    let started = std::time::Instant::now();
+    let text = loop {
+        let reply = session
+            .call(&fixture, "ide.context", json!({"path":"wide.css"}))
+            .await;
+        let text = reply["text"].as_str().unwrap_or_default().to_owned();
+        if !text.contains("unavailable for:")
+            || started.elapsed() > std::time::Duration::from_secs(40)
+        {
+            break text;
+        }
+    };
+    assert!(
+        text.contains("pages/p00.html:1  [html] <p class=\"wide\">x</p>  … 1 more\n"),
+        "{text}"
+    );
+    assert_eq!(text.matches(".html:1  [html] <p").count(), FILES, "{text}");
+    session.close(&fixture).await;
+}
