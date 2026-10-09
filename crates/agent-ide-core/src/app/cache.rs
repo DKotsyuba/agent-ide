@@ -145,7 +145,10 @@ pub fn discard_empty_namespace_directory(path: &Path) -> bool {
 }
 
 /// Rejects cache roots and namespaces that are not private real directories owned by this user.
-fn validate_private_directory(path: &Path, metadata: &fs::Metadata) -> Result<(), AppError> {
+pub(crate) fn validate_private_directory(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), AppError> {
     if metadata.file_type().is_symlink()
         || !metadata.is_dir()
         || metadata.uid() != effective_uid()

@@ -590,9 +590,12 @@ pub fn expand_staged(
     ))
 }
 
-/// Stages a run's assets ([`expand_staged`]) inside the private `cache_dir`: the admitted cache
-/// path is opened component by component from `/` without following any symlink (a cache path
-/// through a symlink, or a cache entry replaced by one, refuses), every directory below it is
+/// Stages a run's assets ([`expand_staged`]) inside the private `cache_dir`, which must already
+/// exist as a private directory of this user (the core's cache-root policy: owner only, no
+/// symlink) (a missing or invalid
+/// cache refuses and changes nothing on disk): the admitted cache path is opened component by
+/// component from `/` without following any symlink (a cache path through a symlink, or a cache
+/// entry replaced by one, refuses), every directory below it is
 /// created or opened through those handles (a symlinked component refuses), and each asset is
 /// written to a fresh temporary file in its final directory and renamed into place there (a
 /// symlink at the target is replaced, never followed). A target outside `cache_dir` refuses.
@@ -610,10 +613,14 @@ pub fn stage(cache_dir: &Path, assets: &[(PathBuf, &[u8])]) -> std::io::Result<(
     if assets.is_empty() {
         return Ok(());
     }
-    std::fs::create_dir_all(cache_dir)?;
-    // The admitted cache path itself is walked without following any symlink: a cache entry
-    // replaced by a link (or a path through one) refuses instead of being resolved elsewhere.
-    let root = cache_dir;
+    // The admitted cache directory must already exist as this user's private directory (the
+    // core's cache-root policy); it is opened once from / without following any symlink (a
+    // cache entry replaced by a link, or a path through one, refuses) and that one validated
+    // handle anchors every write: nothing is created outside it.
+    let cache = crate::workspace::observation::open_root_directory(cache_dir)
+        .map_err(|_| refused("cache directory missing or not reachable without symlinks"))?;
+    crate::app::cache::validate_private_directory(cache_dir, &cache.metadata()?)
+        .map_err(|_| refused("cache directory is not private to this user"))?;
     for (target, bytes) in assets {
         let relative = target
             .strip_prefix(cache_dir)
@@ -628,8 +635,7 @@ pub fn stage(cache_dir: &Path, assets: &[(PathBuf, &[u8])]) -> std::io::Result<(
         let Some((leaf, dirs)) = parts.split_last() else {
             return Err(refused("asset path"));
         };
-        let mut directory = crate::workspace::observation::open_root_directory(root)
-            .map_err(|_| refused("cache root"))?;
+        let mut directory = cache.try_clone()?;
         for dir in dirs {
             let name = CString::new(dir.as_bytes()).map_err(|_| refused("asset path"))?;
             // SAFETY: `name` is NUL terminated and `directory` is an open directory descriptor.
@@ -1422,6 +1428,11 @@ mod tests {
             serde_json::to_string(&denies).unwrap()
         );
         std::fs::create_dir_all(&layout.cache).unwrap();
+        std::fs::set_permissions(
+            &layout.cache,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let elsewhere = layout.base.join("elsewhere.js");
         std::fs::write(&elsewhere, "keep").unwrap();
         std::os::unix::fs::symlink(&elsewhere, &target).unwrap();
@@ -1445,7 +1456,21 @@ mod tests {
             !outside.join("adapter.js").exists(),
             "nothing written outside the cache"
         );
+        std::fs::set_permissions(
+            &layout.cache,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::remove_file(&target).unwrap();
+        assert!(
+            stage(&layout.cache, &staged).is_err() && !target.exists(),
+            "a cache others can read or write is not private: refused"
+        );
         std::fs::remove_dir_all(&layout.cache).unwrap();
+        assert!(
+            stage(&layout.cache, &staged).is_err() && !layout.cache.exists(),
+            "a missing cache refuses and is not created"
+        );
         std::os::unix::fs::symlink(&outside, &layout.cache).unwrap();
         assert!(
             stage(&layout.cache, &staged).is_err(),
