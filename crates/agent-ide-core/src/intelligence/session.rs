@@ -1678,9 +1678,16 @@ impl Session {
         params: serde_json::Value,
     ) -> io::Result<T> {
         let value = self.remote_call(method, params).await?;
-        super::pilot::decode(value).inspect_err(|_| {
-            self.state.lock().expect("session lock").invalidate();
-        })
+        super::pilot::decode(value).inspect_err(|error| self.remote_retire(error))
+    }
+
+    /// Retires this session for a well-framed reply it cannot accept: the generation goes
+    /// inactive and the channel is poisoned with `error`, so the owner sees a module fault.
+    fn remote_retire(&mut self, error: &io::Error) {
+        self.state.lock().expect("session lock").invalidate();
+        if let Some(remote) = self.remote.as_mut() {
+            remote.poison(error.to_string());
+        }
     }
 
     /// Applies the local fences of `sync_for_request` (shut down, worktree, epoch, sequence,
@@ -1771,13 +1778,15 @@ impl Session {
             evidence.apply(&mut result, self.generation)?;
             Ok(diagnostics)
         });
+        if let Err(error) = &reply
+            && error.kind() == io::ErrorKind::InvalidData
+        {
+            self.remote_retire(error);
+        }
         let mut state = self.state.lock().expect("session lock");
         match reply {
             Ok(diagnostics) => diagnostics.apply(&mut state.diagnostics, observation),
             Err(error) => {
-                if error.kind() == io::ErrorKind::InvalidData {
-                    state.invalidate();
-                }
                 state.diagnostics.source = None;
                 state.diagnostics.document_version = None;
                 state.diagnostics.freshness = Freshness::Unknown;
