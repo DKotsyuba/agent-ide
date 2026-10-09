@@ -17541,7 +17541,7 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
 
     std::fs::write(
         fixture.root.join("src/lib.rs"),
-        "pub fn value() -> i32 { \"bad\" }\npub fn caller() -> i32 { value() }\n",
+        "pub fn value() -> i32 { 7 }\npub fn caller() -> i32 { value() }\nmod missing_module;\n",
     )
     .unwrap();
     let offset = std::fs::read_to_string(fixture.root.join("src/lib.rs"))
@@ -19486,7 +19486,7 @@ async fn configured_product_claude_returns_context_diff_and_feedback() {
 
     std::fs::write(
         fixture.root.join("src/lib.rs"),
-        "pub fn value() -> i32 { \"bad\" }\npub fn caller() -> i32 { value() }\n",
+        "pub fn value() -> i32 { 7 }\npub fn caller() -> i32 { value() }\nmod missing_module;\n",
     )
     .unwrap();
     let offset = std::fs::read_to_string(fixture.root.join("src/lib.rs"))
@@ -19503,7 +19503,7 @@ async fn configured_product_claude_returns_context_diff_and_feedback() {
     assert_eq!(context["kind"], "context", "{context}");
     let context_text = context["text"].as_str().unwrap();
     assert!(context_text.contains("mode: semantic"), "{context_text}");
-    assert!(context_text.contains("\"bad\""), "{context_text}");
+    assert!(context_text.contains("missing_module"), "{context_text}");
     assert!(
         context_text.contains("diagnostic_count: 1"),
         "{context_text}"
@@ -19551,7 +19551,7 @@ async fn configured_product_claude_returns_context_diff_and_feedback() {
         diff_text.contains("tracked_path: \"src/lib.rs\""),
         "{diff_text}"
     );
-    assert!(diff_text.contains("\"bad\""), "{diff_text}");
+    assert!(diff_text.contains("missing_module"), "{diff_text}");
 
     let mut retained = std::fs::read_dir(provider_cache(&fixture))
         .unwrap()
