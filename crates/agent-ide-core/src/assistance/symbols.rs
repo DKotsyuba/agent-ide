@@ -2347,7 +2347,7 @@ pub(super) fn module_failure(
 
 /// The typed language-module failure a job's stage names (`<language>: module_unavailable (…)`,
 /// as a backend records it), if its failure was one.
-fn module_stage(job: &Job) -> Option<String> {
+pub(super) fn module_stage(job: &Job) -> Option<String> {
     module_stage_of(job.failure_detail.as_deref()?)
 }
 

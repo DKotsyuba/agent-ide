@@ -629,9 +629,11 @@ impl Worker<'_> {
             .span_links(job, worktree, file, bytes, lines, Vec::new(), &mut card)
             .await
         {
+            // A language module's typed failure keeps naming the module.
+            let cause = super::symbols::module_stage(job).unwrap_or_else(|| format!("{code:?}"));
             job.failure_detail = None;
             return format!(
-                "related_links: unavailable ({code:?}); ide.symbol on a symbol lists its links\n"
+                "related_links: unavailable ({cause}); ide.symbol on a symbol lists its links\n"
             );
         }
         // Rows the card cut after its ceiling stay in the block: the reply's ordinary paging
