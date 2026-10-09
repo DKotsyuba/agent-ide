@@ -286,6 +286,22 @@ fn parity_normalizer_masks_only_volatile_tokens() {
     );
 }
 
+/// Two fronts opened back to back on one daemon never reuse a tool call id: the second front's
+/// calls answer instead of being refused as a replay of the first's.
+#[tokio::test]
+async fn parity_fronts_on_one_daemon_use_distinct_call_ids() {
+    let fixture = parity::Fixture::new(&[("style.css", ".btn { color: red; }\n")], json!([]));
+    let _daemon = parity::Daemon::start(&fixture, &[]).await;
+    for front in 0..2 {
+        let mut session = parity::Session::start(&fixture).await;
+        let reply = session
+            .call(&fixture, "ide.outline", json!({"path":"style.css"}))
+            .await;
+        assert_eq!(reply["kind"], "outline", "front {front}: {reply}");
+        session.close(&fixture).await;
+    }
+}
+
 /// The parity harness runs the same calls on two fresh daemons, with and without the fallback
 /// switch, and finds them equal; CSS runs as a module by default exactly when it ships as one.
 #[tokio::test]
