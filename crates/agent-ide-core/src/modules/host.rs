@@ -347,8 +347,17 @@ impl HostChannel {
                     if effect.call < previous {
                         return Err((Stage::Effect, Cause::Malformed));
                     }
+                    let mut parts = self
+                        .attachments(fence.request_id, &effect.attachments)
+                        .await
+                        .map_err(|cause| (Stage::Effect, cause))?;
+                    let request: EffectRequest =
+                        unspill(effect.effect, effect.body_attachment, &mut parts)
+                            .ok()
+                            .and_then(|value| serde_json::from_value(value).ok())
+                            .ok_or((Stage::Effect, Cause::Malformed))?;
                     if effect.call > previous {
-                        let (outcome, output) = effects.run(fence, effect.effect).await;
+                        let (outcome, output) = effects.run(fence, request).await;
                         latest = Some((effect.call, outcome, output));
                     }
                     let Some((call, outcome, output)) = &latest else {

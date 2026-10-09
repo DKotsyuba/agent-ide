@@ -208,13 +208,21 @@ impl Effects<'_> {
     ) -> Result<(EffectOutcome, Vec<Attachment>), ServeError> {
         self.next += 1;
         let call = self.next;
+        let mut attachments = Vec::new();
+        let (effect, body_attachment) = spill(
+            serde_json::to_value(&effect)
+                .map_err(|error| ServeError::Protocol(error.to_string()))?,
+            &mut attachments,
+        );
         let message = Control::Effect(EffectCall {
             fence: self.fence.clone(),
             call,
             effect,
+            body_attachment,
+            attachments: attachments.iter().map(Attachment::decl).collect(),
         });
         self.io
-            .write_message(&message, self.fence.request_id, &[])
+            .write_message(&message, self.fence.request_id, &attachments)
             .await?;
         match self.io.read_message().await? {
             (Control::EffectReply(reply), attachments)

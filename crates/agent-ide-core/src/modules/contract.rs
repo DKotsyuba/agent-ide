@@ -159,11 +159,15 @@ pub enum Capability {
     /// `linkage/0`: anchors and core-routed resolve.
     #[serde(rename = "linkage")]
     Linkage,
+    /// Interpretation of the language's launcher configuration and presence before or outside
+    /// a session (launcher parse, doctor, check scheduling).
+    #[serde(rename = "describe")]
+    Describe,
 }
 
 impl Capability {
     /// Every capability, in declaration order.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Project,
         Self::AnalyzeSource,
         Self::Outline,
@@ -180,6 +184,7 @@ impl Capability {
         Self::CheckParse,
         Self::AnalysisScope,
         Self::Linkage,
+        Self::Describe,
     ];
 }
 
@@ -264,9 +269,24 @@ pub struct HelloOffer {
     pub limits: Limits,
     /// Capabilities the core needs declared (supported or not).
     pub requested_caps: Vec<Capability>,
-    /// Selected configuration for this scope (provider settings, environment selections), opaque
-    /// to the transport. Never a grant or a credential.
-    pub config: Value,
+    /// The language's admitted configuration for this instance. Never a grant or a credential.
+    pub config: ModuleConfig,
+}
+
+/// What a module instance learns about its configuration in `hello`; its process environment is
+/// otherwise cleared (only the same `env` entries are set).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleConfig {
+    /// The language's accepted provider declaration (executable, toolchain, trust, cache
+    /// namespace and its raw option fields), when one is configured.
+    pub provider: Option<Value>,
+    /// The language's `project_checks` launcher section, when configured.
+    pub checks: Option<Value>,
+    /// The descriptor's module environment names with the daemon's values.
+    pub env: std::collections::BTreeMap<String, String>,
+    /// The real user home the daemon resolved.
+    pub home: Option<std::path::PathBuf>,
 }
 
 /// The module's answer to [`HelloOffer`].
@@ -548,8 +568,13 @@ pub struct EffectCall {
     pub fence: Fence,
     /// Module-local call number within the request; a repeat returns the earlier outcome.
     pub call: u32,
-    /// The recipe and its typed parameters.
-    pub effect: super::payload::EffectRequest,
+    /// The recipe and its typed parameters; `null` when spilled.
+    pub effect: Value,
+    /// When set, the effect is this `application/json` attachment (see [`MAX_INLINE_BODY`]):
+    /// parameter lists such as a deep worktree's ancestor files are never cut to fit a frame.
+    pub body_attachment: Option<u32>,
+    /// Attachments that follow this frame.
+    pub attachments: Vec<AttachmentDecl>,
 }
 
 /// The core's answer to an [`EffectCall`].
@@ -719,7 +744,7 @@ mod tests {
             role: Role::Analyzer,
             limits: Limits::default(),
             requested_caps: caps,
-            config: json!({}),
+            config: ModuleConfig::default(),
         }
     }
 

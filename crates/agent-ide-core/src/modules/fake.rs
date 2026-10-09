@@ -12,18 +12,19 @@ use serde_json::{Value, json};
 use super::{
     contract::{
         Capability, CapabilityDecl, Declaration, ErrorCode, HelloOffer, HelloReply, Limits,
-        ModuleId, ModuleUnavailable, PROTOCOL, Role, Support, VERSION,
+        ModuleConfig, ModuleId, ModuleUnavailable, PROTOCOL, Role, Support, VERSION,
     },
     host::{Call, EffectRunner, HostChannel},
     payload::{
         AnalysisScopeRequest, AnalyzeSource, Anchor, AnchorBatch, AnchorCertainty, AnchorRole,
-        CallItem, CallsQuery, CheckParseRequest, CheckPlanRequest, ContextEvidence,
-        DiagnosticsEvidence, EditProposal, EffectOutcome, EffectRequest, Field, FileDocRequest,
-        FileEdit, FileVerdict, FormatPlanRequest, Hover, InsertSiteRequest, LinkageCoverage,
-        LinkageQuery, Location, OutlineRequest, ProjectQuery, RenameAnswer, RenameRequest,
-        Replacement, ResolveAnswer, ResolveCandidate, ResolveRequest, SemanticQuery,
-        SourceAnalysis, SourceField, SourceRef, SourceText, SyntaxQuery, TestFacts,
-        TestParseRequest, TestPlanQuery, decode, encode,
+        CallItem, CallsQuery, CheckParseRequest, CheckPlanRequest, ChecksDescription,
+        ContextEvidence, DescribeQuery, DiagnosticsEvidence, EditProposal, EffectOutcome,
+        EffectRequest, Field, FileDocRequest, FileEdit, FileVerdict, FormatPlanRequest, Hover,
+        InsertSiteRequest, LaunchDescription, LinkageCoverage, LinkageQuery, Location,
+        OutlineRequest, Param, ProjectQuery, RenameAnswer, RenameRequest, Replacement,
+        ResolveAnswer, ResolveCandidate, ResolveRequest, SemanticQuery, SourceAnalysis,
+        SourceField, SourceRef, SourceText, SyntaxQuery, TestFacts, TestParseRequest,
+        TestPlanQuery, decode, encode,
     },
     serve::{Answer, Effects, Incoming, ModuleServer, ServeError, serve},
     wire::Attachment,
@@ -307,7 +308,7 @@ impl FakeModule {
             Capability::CheckPlan => {
                 let query: CheckPlanRequest = decode(payload)?;
                 let (outcome, output) = effects
-                    .run(sample_effect("check"))
+                    .run(check_effect(&query.config))
                     .await
                     .map_err(|error| error.to_string())?;
                 let EffectOutcome::Completed { .. } = outcome else {
@@ -346,6 +347,24 @@ impl FakeModule {
                 let _: AnalysisScopeRequest = decode(payload)?;
                 json!(null)
             }
+            Capability::Describe => match decode::<DescribeQuery>(payload)? {
+                DescribeQuery::Provider { .. } => {
+                    encode(&Ok::<LaunchDescription, String>(LaunchDescription {
+                        valid: true,
+                        executables: Vec::new(),
+                        toolchain_programs: Vec::new(),
+                        probe_programs: None,
+                    }))
+                }
+                DescribeQuery::VerifyProvider { .. } => encode(&Ok::<(), String>(())),
+                DescribeQuery::Checks { .. } => {
+                    encode(&Ok::<ChecksDescription, String>(ChecksDescription {
+                        valid: true,
+                        programs: Vec::new(),
+                    }))
+                }
+                DescribeQuery::Presence { .. } => json!(true),
+            },
             Capability::Linkage => match decode::<LinkageQuery>(payload)? {
                 LinkageQuery::Anchors { .. } => encode(&AnchorBatch {
                     verdict: FileVerdict::Skipped("minified".into()),
@@ -397,6 +416,18 @@ impl ModuleServer for FakeModule {
     }
 }
 
+/// The fake's check recipe: with `{"roots": n}` in its configuration, `n` ancestor files.
+fn check_effect(config: &Value) -> EffectRequest {
+    let mut effect = sample_effect("check");
+    if let Some(count) = config["roots"].as_u64() {
+        let roots = (0..count)
+            .map(|n| PathBuf::from(format!("/deep/{n:05}/Cargo.toml")))
+            .collect();
+        effect.params.insert("roots".into(), Param::Paths(roots));
+    }
+    effect
+}
+
 /// A recipe request with no parameters.
 fn sample_effect(recipe: &str) -> EffectRequest {
     EffectRequest {
@@ -412,6 +443,8 @@ pub struct FakeEffects {
     pub stdout: Vec<u8>,
     /// Effects run so far.
     pub runs: u32,
+    /// The latest effect requested.
+    pub last: Option<EffectRequest>,
 }
 
 impl EffectRunner for FakeEffects {
@@ -419,9 +452,10 @@ impl EffectRunner for FakeEffects {
     fn run<'a>(
         &'a mut self,
         _fence: &'a super::contract::Fence,
-        _effect: EffectRequest,
+        effect: EffectRequest,
     ) -> BoxFuture<'a, (EffectOutcome, Vec<Attachment>)> {
         self.runs += 1;
+        self.last = Some(effect);
         let runs = self.runs;
         let stdout = self.stdout.clone();
         Box::pin(async move {
@@ -455,7 +489,7 @@ pub fn offer(module_id: ModuleId, package_version: &str, role: Role, instance: u
         role,
         limits: Limits::default(),
         requested_caps: Capability::ALL.to_vec(),
-        config: json!({}),
+        config: ModuleConfig::default(),
     }
 }
 
@@ -615,6 +649,9 @@ pub fn sample_call(capability: Capability) -> Call {
             worktree: "/w".into(),
             path: "a.txt".into(),
         }),
+        Capability::Describe => encode(&DescribeQuery::Checks {
+            section: json!({"timeout_ms": 1000}),
+        }),
         Capability::Linkage => encode(&LinkageQuery::Resolve(ResolveRequest {
             namespace: "file-ref/v1".into(),
             raw_key: "./a.style".into(),
@@ -655,6 +692,7 @@ mod tests {
         let mut effects = FakeEffects {
             stdout: vec![7; MAX_CHUNK * 3 + 1],
             runs: 0,
+            last: None,
         };
         for capability in Capability::ALL {
             let reply = channel
@@ -1104,6 +1142,43 @@ mod tests {
             .unwrap();
         assert!(reply.attachments.is_empty(), "the spilled body is consumed");
         assert_eq!(reply.outcome, Outcome::Result(json!(paths)));
+    }
+
+    /// An effect carrying 30,000 ancestor files, well over the 512 KiB inline limit and any small
+    /// fixed count, reaches the core's effect runner unchanged: parameter lists spill into a JSON
+    /// attachment instead of being cut.
+    #[tokio::test]
+    async fn large_effect_parameter_lists_reach_the_core_whole() {
+        let id = alpha();
+        let (mut channel, _) = in_memory(
+            FakeModule::new(id.clone(), "1.0"),
+            offer(id, "1.0", Role::Checker, 1),
+        )
+        .await
+        .unwrap();
+        let mut call = sample_call(Capability::CheckPlan);
+        call.payload["config"] = json!({"roots": 30_000});
+        let mut effects = FakeEffects {
+            stdout: b"{}".to_vec(),
+            runs: 0,
+            last: None,
+        };
+        let reply = channel
+            .call(call, Duration::from_secs(20), &mut effects)
+            .await
+            .unwrap();
+        assert!(
+            matches!(reply.outcome, Outcome::Result(_)),
+            "{:?}",
+            reply.outcome
+        );
+        let last = effects.last.expect("the effect ran");
+        assert!(encode(&last).to_string().len() > crate::modules::contract::MAX_INLINE_BODY);
+        assert_eq!(last, check_effect(&json!({"roots": 30_000})));
+        let Some(Param::Paths(roots)) = last.params.get("roots") else {
+            panic!("roots expected");
+        };
+        assert_eq!(roots.len(), 30_000);
     }
 
     /// Large attachments travel as raw chunks in both directions without JSON number arrays.

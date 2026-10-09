@@ -646,16 +646,24 @@ pub struct AnalysisScopeRequest {
 
 // ---- effects ----
 
-/// One typed recipe parameter; never shell text.
+/// One typed recipe parameter; never shell text. The module computes the values; the core admits
+/// each one against the rule its recipe declares and alone builds the run specification. No
+/// parameter carries a count ceiling of its own: the encoded message body is the only bound, so
+/// nothing today's in-process path accepts is refused for its length.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Param {
-    /// A path the core canonicalizes and checks against its policy.
+    /// A path the core canonicalizes and admits under the recipe's [`PathRule`].
     Path(PathBuf),
-    /// The name of a pinned executable slot of the descriptor.
+    /// Paths admitted one by one under the recipe's [`PathRule`] (read roots, ancestor
+    /// configuration files).
+    Paths(Vec<PathBuf>),
+    /// The name of an [`ExecutableSlot`] of the descriptor; the core alone resolves it.
     Executable(String),
-    /// A literal argument token.
+    /// A literal argument or environment value.
     Token(String),
+    /// Environment entries whose names must match the recipe's [`EnvRule::Pattern`].
+    Env(BTreeMap<String, String>),
     /// A bounded scalar.
     Scalar(u64),
 }
@@ -703,22 +711,103 @@ pub enum EffectOutcome {
 pub enum Arg {
     /// A fixed token.
     Literal(&'static str),
-    /// The value of a named parameter.
+    /// The value of a named [`Param::Path`], [`Param::Token`] or [`Param::Scalar`].
     Param(&'static str),
+    /// Every value of a named [`Param::Paths`], in order.
+    Each(&'static str),
+    /// `--flag=<value>`-style concatenation of a literal prefix and a named parameter.
+    Joined(&'static str, &'static str),
 }
 
-/// How a path parameter is admitted.
+/// Where an admitted path may be; the core checks the canonical path (read denies always win).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PathRole {
-    /// Working directory; must be inside the worktree.
+    /// Working directory; inside the worktree.
     Cwd,
-    /// Read root added to the confinement.
-    Read,
-    /// Private cache below the core's grant; the only writable root.
+    /// Inside the canonical worktree.
+    Worktree,
+    /// A file directly in the worktree or one of its canonical ancestors whose name is one of
+    /// these (manifests, configuration, toolchain files).
+    AncestorFile(&'static [&'static str]),
+    /// Under the real user home.
+    HomeRelative,
+    /// Under a root the admitted launcher configuration declares (toolchain and tool roots,
+    /// accepted executables' installation prefixes).
+    LauncherRoot,
+    /// The private cache below the core's grant; the only writable root.
     Cache,
-    /// An executable the core verifies (inside the admitted worktree or environment roots) before
-    /// it may run; pinned launcher programs use [`Param::Executable`] slots instead.
-    Program,
+}
+
+/// How one path parameter is admitted and used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PathRule {
+    /// The parameter name.
+    pub param: &'static str,
+    /// Where it may be.
+    pub role: PathRole,
+    /// Paths that do not exist are dropped instead of refusing the run.
+    pub existing_only: bool,
+    /// Added to the run's read roots.
+    pub read_root: bool,
+}
+
+/// One environment entry of a run; nothing else reaches the process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnvRule {
+    /// A literal value.
+    Literal {
+        /// Variable name.
+        name: &'static str,
+        /// Value.
+        value: &'static str,
+    },
+    /// The value of a [`Param::Token`] or admitted [`Param::Path`]; absent when `optional` and
+    /// the parameter is missing.
+    Param {
+        /// Variable name.
+        name: &'static str,
+        /// Parameter name.
+        param: &'static str,
+        /// Whether the entry may be absent.
+        optional: bool,
+    },
+    /// Entries of a [`Param::Env`] whose names are `prefix` + one uppercase identifier +
+    /// `suffix` (for example `CARGO_TARGET_` … `_LINKER`); values are admitted paths.
+    Pattern {
+        /// Name prefix.
+        prefix: &'static str,
+        /// Name suffix.
+        suffix: &'static str,
+        /// Parameter name.
+        param: &'static str,
+        /// How each value is admitted.
+        role: PathRole,
+    },
+    /// The real user home.
+    Home {
+        /// Variable name.
+        name: &'static str,
+    },
+}
+
+/// Where a named executable comes from; the core alone resolves and pins it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SlotSource {
+    /// A program of the admitted launcher configuration (`project_checks`, provider declaration),
+    /// by its key.
+    Launcher(&'static str),
+    /// A user-installed tool by name, looked up in the descriptor's home tool directories and
+    /// the daemon's tool `PATH`.
+    HomeTool(&'static str),
+}
+
+/// One named executable a recipe may run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutableSlot {
+    /// Slot name a [`Param::Executable`] names.
+    pub name: &'static str,
+    /// Where it comes from.
+    pub source: SlotSource,
 }
 
 /// What a run reads on stdin.
@@ -739,29 +828,106 @@ pub enum RunClass {
     Background,
 }
 
-/// A finite effect recipe, compiled into the root's language descriptor. The core expands it into
-/// a confined run specification; modules only choose a recipe id and its typed parameters.
+/// A finite effect recipe, compiled into the root's language descriptor as data. The module
+/// chooses a recipe id and computes its typed parameters; the core admits every parameter against
+/// the declared rules and expands the confined run specification itself.
 #[derive(Clone, Copy, Debug)]
 pub struct EffectRecipe {
     /// Id the module names.
     pub id: &'static str,
-    /// Parameter whose value runs: a [`Param::Executable`] slot or a [`PathRole::Program`] path.
+    /// Parameter whose value runs: a [`Param::Executable`] slot the core resolves, or a
+    /// [`Param::Path`] admitted under its [`PathRule`] (a project environment's tool) whose bytes
+    /// the core measures before the spawn.
     pub program: &'static str,
     /// Argument template.
     pub args: &'static [Arg],
-    /// Environment variables the run may receive, each from a parameter of the same name.
-    pub env: &'static [&'static str],
-    /// Path parameters and how each is admitted.
-    pub paths: &'static [(&'static str, PathRole)],
+    /// Environment entries.
+    pub env: &'static [EnvRule],
+    /// Path parameters and their admission.
+    pub paths: &'static [PathRule],
+    /// The executable slots this recipe may name.
+    pub executables: &'static [ExecutableSlot],
     /// What stdin carries.
     pub stdin: Stdin,
     /// Admission class.
     pub class: RunClass,
-    /// Wall-clock ceiling; the core clamps it to the parent operation's deadline.
-    pub timeout_ms: u64,
+    /// Ceiling of the run's wall clock; the effective timeout is the smaller of this and the
+    /// request's own (project checks declare at least 900 s).
+    pub timeout_ceiling_ms: u64,
     /// Capture ceiling per stream; the core keeps the class-specific existing caps (64 MiB for
     /// project checks) and marks truncation explicitly.
     pub capture_bytes: u64,
+}
+
+// ---- describe ----
+
+/// `describe`: the language's interpretation of its launcher configuration and presence, asked in
+/// the module's role with a bounded budget wherever it runs before or outside a session
+/// (launcher parse, doctor, check scheduling). Static descriptor data (ids, settings keys, option
+/// field names, cache directory names, marker file names) stays compiled in the core.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DescribeQuery {
+    /// Decode and validate one provider declaration (its option fields included) and name the
+    /// executables startup verifies and the programs doctor probes; answers
+    /// `Result<LaunchDescription, String>`.
+    Provider {
+        /// The raw declaration object from the launcher configuration.
+        declaration: Value,
+    },
+    /// Further startup verification of one declaration after its executables were verified;
+    /// answers `Result<(), String>`.
+    VerifyProvider {
+        /// The raw declaration object.
+        declaration: Value,
+    },
+    /// Decode and validate the language's `project_checks` section and name the programs doctor
+    /// probes; answers `Result<ChecksDescription, String>`.
+    Checks {
+        /// The raw section.
+        section: Value,
+    },
+    /// Whether `worktree` is a project of the language for project checks; answers `bool`.
+    Presence {
+        /// Absolute worktree.
+        worktree: PathBuf,
+    },
+}
+
+/// One accepted executable as the launcher declares it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredExecutable {
+    /// Absolute path.
+    pub path: PathBuf,
+    /// Accepted identity.
+    pub identity: String,
+    /// Accepted BLAKE3 digest.
+    pub blake3: String,
+}
+
+/// A validated provider declaration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchDescription {
+    /// The server-specific declaration rules hold.
+    pub valid: bool,
+    /// Additional executables startup verifies beside the server executable.
+    pub executables: Vec<DeclaredExecutable>,
+    /// Programs doctor probes, each with the interpreter that runs it.
+    pub toolchain_programs: Vec<(PathBuf, Option<PathBuf>)>,
+    /// The declaration's syntax-probe programs, if any.
+    pub probe_programs: Option<ProbePrograms>,
+}
+
+/// A validated `project_checks` section.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChecksDescription {
+    /// Every declared path is absolute and normal.
+    pub valid: bool,
+    /// Programs doctor probes, each with the interpreter that runs it.
+    pub programs: Vec<(PathBuf, Option<PathBuf>)>,
 }
 
 // ---- linkage/0 ----
@@ -1143,6 +1309,45 @@ mod tests {
         }
         let outcome = serde_json::json!({"refused": {"cause": "timeout", "message": "", "x": 1}});
         assert!(decode::<EffectOutcome>(outcome).is_err());
+    }
+
+    /// Recipe parameters carry no count ceiling of their own (a deep worktree's ancestor files
+    /// exceed any small fixed bound); describe queries and the hello configuration round-trip and
+    /// refuse unknown fields.
+    #[test]
+    fn recipe_parameters_and_describe_round_trip() {
+        let roots: Vec<PathBuf> = (0..300)
+            .map(|n| PathBuf::from(format!("/a/{n}/Cargo.toml")))
+            .collect();
+        let effect = EffectRequest {
+            recipe: "check".into(),
+            params: BTreeMap::from([
+                ("roots".to_owned(), Param::Paths(roots)),
+                (
+                    "linkers".to_owned(),
+                    Param::Env(BTreeMap::from([(
+                        "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER".to_owned(),
+                        "/usr/bin/cc".to_owned(),
+                    )])),
+                ),
+                ("cargo".to_owned(), Param::Executable("cargo".into())),
+            ]),
+        };
+        assert_eq!(decode::<EffectRequest>(encode(&effect)), Ok(effect));
+        let query = DescribeQuery::Provider {
+            declaration: serde_json::json!({"settings": "x"}),
+        };
+        assert_eq!(decode::<DescribeQuery>(encode(&query)), Ok(query));
+        let config = crate::modules::contract::ModuleConfig {
+            provider: None,
+            checks: Some(serde_json::json!({})),
+            env: BTreeMap::from([("AGENT_IDE_HOME".to_owned(), "/h".to_owned())]),
+            home: Some("/h".into()),
+        };
+        let mut value = encode(&config);
+        assert_eq!(decode(value.clone()), Ok(config));
+        value["credentials"] = Value::Bool(true);
+        assert!(decode::<crate::modules::contract::ModuleConfig>(value).is_err());
     }
 
     /// File references allow long paths with spaces; other namespaces keep the name rules.
