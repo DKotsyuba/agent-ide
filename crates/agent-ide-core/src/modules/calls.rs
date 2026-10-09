@@ -4,8 +4,10 @@
 //!
 //! Without an installed host (unit tests, tools that never start a daemon) every language computes
 //! in process, exactly as before. A module failure is the typed [`ModuleUnavailable`] the caller
-//! maps onto its existing refusal; it never falls back in process silently. Per-file test facts
-//! are memoized per module build (they depend on the path alone).
+//! maps onto its existing refusal; it never falls back in process silently. A complete
+//! `analyze_source` answer is cached by language, worktree, path, exact source revision and
+//! requested fields for the daemon's one pinned module build; a warming or unsupported field is
+//! never cached as a fact.
 //!
 //! [`LanguageSupport`]: crate::lang::LanguageSupport
 
@@ -114,7 +116,30 @@ fn source(path: &Path, text: &str) -> (SourceRef, Vec<Attachment>) {
     )
 }
 
-/// One `analyze_source` batch for `fields` of `path` (`text` absent for path-only facts).
+/// The cache key of one `analyze_source` batch: language, worktree, path, source revision and
+/// requested fields (the module build is the daemon's one pinned executable).
+type AnalysisKey = (String, PathBuf, PathBuf, String, Vec<SourceField>);
+
+/// Complete `analyze_source` answers (bounded; cleared when full).
+fn analyses() -> &'static Mutex<HashMap<AnalysisKey, SourceAnalysis>> {
+    static CACHE: OnceLock<Mutex<HashMap<AnalysisKey, SourceAnalysis>>> = OnceLock::new();
+    CACHE.get_or_init(Mutex::default)
+}
+
+/// Whether `analysis` computed every requested field: only such an answer is a cacheable fact (a
+/// warming field may compute later, an unsupported one is not this source's fact).
+fn complete(analysis: &SourceAnalysis, fields: &[SourceField]) -> bool {
+    fields.iter().all(|field| match field {
+        SourceField::Outline => matches!(analysis.outline, Field::Available(_)),
+        SourceField::FileDoc => matches!(analysis.file_doc, Field::Available(_)),
+        SourceField::Syntax => matches!(analysis.syntax, Field::Available(_)),
+        SourceField::Tests => matches!(analysis.tests, Field::Available(_)),
+        SourceField::Anchors => matches!(analysis.anchors, Field::Available(_)),
+    })
+}
+
+/// One `analyze_source` batch for `fields` of `path` (`text` absent for path-only facts), from
+/// the cache when an identical batch of the same source revision was answered completely.
 async fn analyze(
     host: &ModuleHost,
     language: Language,
@@ -134,14 +159,42 @@ async fn analyze(
             Vec::new(),
         ),
     };
-    host.request(
-        language,
-        worktree,
-        Capability::AnalyzeSource,
-        encode(&AnalyzeSource { source, fields }),
-        attachments,
-    )
-    .await
+    let key = (
+        language.name().to_owned(),
+        worktree.to_path_buf(),
+        path.to_path_buf(),
+        source.revision.clone(),
+        fields.clone(),
+    );
+    if let Some(analysis) = analyses()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
+        return Ok(analysis.clone());
+    }
+    let analysis: SourceAnalysis = host
+        .request(
+            language,
+            worktree,
+            Capability::AnalyzeSource,
+            encode(&AnalyzeSource {
+                source,
+                fields: fields.clone(),
+            }),
+            attachments,
+        )
+        .await?;
+    if complete(&analysis, &fields) {
+        let mut cache = analyses()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert(key, analysis.clone());
+    }
+    Ok(analysis)
 }
 
 /// The linkage anchors of `path` with `text`: `Ok(None)` when `language` computes in process
@@ -410,12 +463,6 @@ pub async fn syntax_verdict(
     }
 }
 
-/// Memoized test facts by module build, language and path.
-fn test_facts_memo() -> &'static Mutex<HashMap<(String, PathBuf), TestFacts>> {
-    static MEMO: OnceLock<Mutex<HashMap<(String, PathBuf), TestFacts>>> = OnceLock::new();
-    MEMO.get_or_init(Mutex::default)
-}
-
 /// The test facts of `path` (`is_test_file`, `test_binary`).
 pub async fn test_facts(language: Language, worktree: &Path, path: &Path) -> Routed<TestFacts> {
     let Some(host) = module(language) else {
@@ -425,15 +472,7 @@ pub async fn test_facts(language: Language, worktree: &Path, path: &Path) -> Rou
             test_binary: support.test_binary(path),
         });
     };
-    let key = (language.name().to_owned(), path.to_path_buf());
-    if let Some(facts) = test_facts_memo()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&key)
-    {
-        return Ok(facts.clone());
-    }
-    let facts = field(
+    Ok(field(
         analyze(
             host,
             language,
@@ -448,15 +487,7 @@ pub async fn test_facts(language: Language, worktree: &Path, path: &Path) -> Rou
             is_test_file: false,
             test_binary: None,
         },
-    );
-    let mut memo = test_facts_memo()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if memo.len() >= 4096 {
-        memo.clear();
-    }
-    memo.insert(key, facts.clone());
-    Ok(facts)
+    ))
 }
 
 /// `LanguageSupport::insert_site`.
@@ -747,5 +778,38 @@ pub async fn not_analysed(
             )
             .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only an answer that computed every requested field is a cacheable fact: a warming or
+    /// unsupported field (whose in-process default the caller substitutes) never is.
+    #[test]
+    fn only_complete_analyses_are_cached() {
+        let analysis = |tests: Field<TestFacts>| SourceAnalysis {
+            outline: Field::NotRequested,
+            file_doc: Field::NotRequested,
+            syntax: Field::NotRequested,
+            tests,
+            anchors: Field::NotRequested,
+        };
+        let facts = TestFacts {
+            is_test_file: true,
+            test_binary: None,
+        };
+        let fields = [SourceField::Tests];
+        assert!(complete(&analysis(Field::Available(facts)), &fields));
+        assert!(!complete(&analysis(Field::Warming), &fields));
+        assert!(!complete(&analysis(Field::Unsupported), &fields));
+        assert!(!complete(
+            &analysis(Field::Available(TestFacts {
+                is_test_file: false,
+                test_binary: None,
+            })),
+            &[SourceField::Tests, SourceField::Syntax]
+        ));
     }
 }
