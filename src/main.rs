@@ -635,21 +635,22 @@ fn auto_managed_candidate(
 /// host shuts it down. One arm per bundled module: each language's module task replaces its
 /// placeholder (every capability declared unsupported) with its own crate's server.
 async fn serve_bundled_module(language: &str, role: &str) -> ExitCode {
-    use agent_ide_core::modules::{
-        contract::{ModuleId, Role},
-        serve::{Unimplemented, serve_stdio},
-    };
-    let Some(role) = Role::parse(role) else {
+    use agent_ide_core::modules::{adapter::SupportServer, contract::Role, serve::serve_stdio};
+    let (Some(role), Some(registered)) = (
+        Role::parse(role),
+        agent_ide::lang::Language::by_id(language),
+    ) else {
         return ExitCode::from(2);
     };
-    let placeholder =
-        |language| Unimplemented::new(ModuleId::bundled(language), env!("CARGO_PKG_VERSION"));
+    // The language's own support served through the module transport; a language's module
+    // task wraps it with its provider and checks.
+    let support = SupportServer::new(registered, env!("CARGO_PKG_VERSION"));
     let served = match language {
-        "python" => serve_stdio(placeholder("python"), role).await,
-        "rust" => serve_stdio(placeholder("rust"), role).await,
-        "typescript" => serve_stdio(placeholder("typescript"), role).await,
-        "html" => serve_stdio(placeholder("html"), role).await,
-        "css" => serve_stdio(placeholder("css"), role).await,
+        "python" => serve_stdio(support, role).await,
+        "rust" => serve_stdio(support, role).await,
+        "typescript" => serve_stdio(support, role).await,
+        "html" => serve_stdio(support, role).await,
+        "css" => serve_stdio(support, role).await,
         _ => return ExitCode::from(2),
     };
     match served {

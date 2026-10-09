@@ -34,6 +34,7 @@
 //!   stream that cannot be one); launching or attaching to a debuggee is a core-admitted effect
 //!   recipe, never a module spawn, and the debug adapter runs under a provider grant.
 
+pub mod adapter;
 pub mod contract;
 pub mod fake;
 pub mod host;

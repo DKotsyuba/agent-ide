@@ -27,9 +27,9 @@ fn module_process(language: &str, role: &str) -> tokio::process::Child {
         .unwrap()
 }
 
-/// Every bundled language's hidden mode answers `hello` for its own module id and role, declares
-/// every capability unsupported until its module task fills it in, answers a call with a typed
-/// `unsupported` error, and exits cleanly on `shutdown`.
+/// Every bundled language's hidden mode answers `hello` for its own module id and role, serves its
+/// own support while provider capabilities (the normalized outline) answer a typed `unsupported`
+/// error until its module task adds its provider, and exits cleanly on `shutdown`.
 #[tokio::test]
 async fn hidden_module_mode_serves_the_placeholder_contract() {
     agent_ide::languages::install();
