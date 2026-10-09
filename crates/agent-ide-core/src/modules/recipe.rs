@@ -311,6 +311,27 @@ pub fn declared(id: &str) -> &'static [EffectRecipe] {
         .map_or(&[], |(_, recipes)| recipes)
 }
 
+/// The platform developer directories the core resolves itself for [`PathRole::DeveloperDir`]:
+/// the selected developer directory (the target of `/private/var/db/xcode_select_link`, what
+/// `xcode-select -p` reports, and the link itself), the Command Line Tools and the default Xcode
+/// developer directory — each only when it exists.
+pub fn platform_developer_dirs() -> Vec<PathBuf> {
+    let link = Path::new("/private/var/db/xcode_select_link");
+    let mut dirs: Vec<PathBuf> = std::fs::canonicalize(link)
+        .ok()
+        .into_iter()
+        .chain([
+            link.to_path_buf(),
+            PathBuf::from("/Library/Developer/CommandLineTools"),
+            PathBuf::from("/Applications/Xcode.app/Contents/Developer"),
+        ])
+        .filter(|dir| dir.exists())
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    dirs.retain(|dir| seen.insert(dir.clone()));
+    dirs
+}
+
 /// Install roots each language's interactive recipes may name as launcher roots (static
 /// descriptor data, for example the standard interpreter prefixes), declared by the root.
 static ROOTS: std::sync::RwLock<Vec<(&'static str, &'static [&'static str])>> =

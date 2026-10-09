@@ -631,6 +631,7 @@ fn stdin_run(
         })
         .collect();
     let roots = super::recipe::declared_roots(language.name());
+    let developer_dirs = super::recipe::platform_developer_dirs();
     let home = crate::userhome::user_home();
     let scratch = std::env::temp_dir().join("agent-ide-interactive");
     let admission = super::recipe::Admission {
@@ -639,7 +640,7 @@ fn stdin_run(
         read_denies: &[],
         home: home.as_deref(),
         launcher_roots: &roots,
-        developer_dirs: &[],
+        developer_dirs: &developer_dirs,
         programs: &programs,
         timeout: std::time::Duration::from_secs(10),
     };

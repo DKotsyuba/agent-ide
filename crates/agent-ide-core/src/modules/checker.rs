@@ -92,9 +92,16 @@ impl ModuleChecker {
                         &mut super::host::NoEffects,
                     )
                     .await?;
-                Ok(description
+                let mut described = description
                     .map(|description| Described::new(&description))
-                    .unwrap_or_default())
+                    .unwrap_or_default();
+                // The section's overrides first, then the core's own platform resolution.
+                for dir in recipe::platform_developer_dirs() {
+                    if !described.developer_dirs.contains(&dir) {
+                        described.developer_dirs.push(dir);
+                    }
+                }
+                Ok(described)
             })
             .await
     }
@@ -194,8 +201,6 @@ impl EffectRunner for CheckEffects<'_> {
         effect: EffectRequest,
     ) -> BoxFuture<'a, (EffectOutcome, Vec<Attachment>)> {
         Box::pin(async move {
-            // ponytail: developer directories are the section's overrides only; append the
-            // core's own platform resolution when a module's recipe names `DeveloperDir`.
             let admission = self.described.admission(
                 &self.request.worktree,
                 &self.request.cache_dir,
