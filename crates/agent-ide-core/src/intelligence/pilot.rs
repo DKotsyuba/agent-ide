@@ -372,8 +372,9 @@ impl WireContext {
     }
 
     /// Overlays the provider parts onto `result`, a core-built lexical result over the core's own
-    /// observation. A module generation other than the core's `generation` is refused as
-    /// invalid data (the caller retires the session) and leaves `result` unchanged.
+    /// observation. A module generation other than the core's `generation`, or semantic evidence
+    /// without one, is refused as invalid data (the caller retires the session) and leaves
+    /// `result` unchanged.
     pub(crate) fn apply(
         self,
         result: &mut ContextResult,
@@ -385,7 +386,11 @@ impl WireContext {
             generation.toolchain,
             generation.view,
         ];
-        if self.generation.is_some_and(|echoed| echoed != expected) {
+        // Semantic evidence must carry exactly the core's generation; only lexical evidence
+        // (a module that never synchronized the document) may omit it.
+        if self.generation.is_some_and(|echoed| echoed != expected)
+            || (self.lexical.is_none() && self.generation.is_none())
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "pilot module answered for another generation",
