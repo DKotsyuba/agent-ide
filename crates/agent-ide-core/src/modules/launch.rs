@@ -168,7 +168,10 @@ impl Launcher for ExecutionLauncher {
             &self.executable.digest,
             STDERR_CAPTURE,
         )
-        .map_err(|_| (Stage::Spawn, Cause::Exited))?;
+        .map_err(|error| {
+            crate::execution::job::settle(&self.admission, error);
+            (Stage::Spawn, Cause::Exited)
+        })?;
         let Some((stdin, stdout)) = child.take_pipes() else {
             return Err((Stage::Spawn, Cause::Exited));
         };

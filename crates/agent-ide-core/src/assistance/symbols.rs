@@ -3161,8 +3161,16 @@ impl Worker<'_> {
         else {
             return candidate;
         };
-        match run_stdin(&argv, &root, &candidate, Duration::from_secs(10)).await {
-            Some(output) if output.status.success() && !output.stdout.is_empty() => {
+        match run_stdin(
+            &self.admission,
+            &argv,
+            &root,
+            &candidate,
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            Some(output) if output.status == Some(0) && !output.stdout.is_empty() => {
                 String::from_utf8(output.stdout).unwrap_or(candidate)
             }
             _ => candidate,
@@ -3235,7 +3243,15 @@ impl Worker<'_> {
             };
             return (lang::SyntaxVerdict::Unchecked, Some(why));
         };
-        let Some(output) = run_stdin(&argv, &root, source, Duration::from_secs(10)).await else {
+        let Some(output) = run_stdin(
+            &self.admission,
+            &argv,
+            &root,
+            source,
+            Duration::from_secs(10),
+        )
+        .await
+        else {
             return (
                 lang::SyntaxVerdict::Unchecked,
                 Some("the probe did not start or finish in time"),
@@ -3248,7 +3264,7 @@ impl Worker<'_> {
             .unwrap_or_default()
             .to_owned();
         (
-            lang::SyntaxVerdict::from_probe(output.status.success(), &first),
+            lang::SyntaxVerdict::from_probe(output.status == Some(0), &first),
             None,
         )
     }
@@ -3634,39 +3650,91 @@ fn push_block(out: &mut String, content: &str) {
     }
 }
 
-/// Runs one bounded stdin probe — the project's formatter or a language's syntax checker —
-/// writing `input` to its stdin and waiting at most `timeout`; `None` when it cannot start or
-/// does not finish in time (a late child is killed on drop). Runs from `root` with the daemon's
-/// formatter PATH; stderr is kept so a checker's own error line can be read as the probe's head.
+/// Runs `argv` from `root` with `input` on stdin as an Execution-owned interactive job of the
+/// worktree — admitted, measured, its group torn down and reaped — with the daemon's environment
+/// and formatter `PATH`. `None` when it cannot start, is refused as busy, overflows the capture
+/// ceiling or does not finish within `timeout`.
 async fn run_stdin(
+    admission: &std::sync::Arc<std::sync::Mutex<crate::execution::AdmissionController>>,
     argv: &[String],
     root: &Path,
     input: &str,
     timeout: Duration,
-) -> Option<std::process::Output> {
+) -> Option<crate::execution::job::JobOutput> {
+    use std::ffi::OsString;
     let (program, args) = argv.split_first()?;
-    let mut command = tokio::process::Command::new(program);
-    command
-        .args(args)
-        .current_dir(root)
-        .env("PATH", formatter_path())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let Ok(mut child) = command.spawn() else {
-        return None;
+    let path = formatter_path();
+    let program = executable_on(program, root, &path)?;
+    let mut env: std::collections::BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+    env.insert("PATH".into(), path.into());
+    let command = crate::execution::ControlledCommand::from_validated_peer(
+        crate::execution::CommandKind::Job,
+        program,
+        args.iter().map(OsString::from).collect(),
+        root.to_path_buf(),
+        env,
+    )
+    .ok()?
+    .with_private_stdin(private_input(input).ok()?);
+    let owner = crate::execution::OwnerId::new(format!(
+        "edit:{}",
+        blake3::hash(root.as_os_str().as_encoded_bytes()).to_hex()
+    ))
+    .ok()?;
+    let output = crate::execution::job::run_job(
+        admission,
+        owner,
+        crate::execution::AdmissionClass::Interactive,
+        &command,
+        crate::execution::job::MAX_JOB_CAPTURE_BYTES,
+        timeout,
+    )
+    .await
+    .ok()?;
+    (!output.timed_out && !output.truncated).then_some(output)
+}
+
+/// `program` as an absolute executable: a path (relative to `root`) as given, a bare name looked
+/// up on `path` like the shell would.
+fn executable_on(program: &str, root: &Path, path: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let runnable = |candidate: &Path| {
+        std::fs::metadata(candidate)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
     };
-    let mut stdin = child.stdin.take()?;
-    let input = input.as_bytes().to_vec();
-    let writer = tokio::spawn(async move {
-        use tokio::io::AsyncWriteExt;
-        let _ = stdin.write_all(&input).await;
-        let _ = stdin.shutdown().await;
-    });
-    let output = tokio::time::timeout(timeout, child.wait_with_output()).await;
-    writer.abort();
-    output.ok()?.ok()
+    if program.contains('/') {
+        let candidate = root.join(program);
+        return runnable(&candidate).then_some(candidate);
+    }
+    path.split(':')
+        .filter(|dir| Path::new(dir).is_absolute())
+        .map(|dir| Path::new(dir).join(program))
+        .find(|candidate| runnable(candidate))
+}
+
+/// A private, already-unlinked file holding `input`, positioned at its start.
+fn private_input(input: &str) -> std::io::Result<std::fs::File> {
+    use std::{
+        io::{Seek, Write},
+        os::unix::fs::OpenOptionsExt,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        ".agent-ide-stdin-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    let _ = std::fs::remove_file(&path);
+    file.write_all(input.as_bytes())?;
+    file.rewind()?;
+    Ok(file)
 }
 
 // ---------------------------------------------------------------------------------------------

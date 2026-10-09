@@ -456,6 +456,67 @@ pub async fn run_confined(
     run_prepared(command, timeout, max_output_bytes).await
 }
 
+/// [`run_confined`] (with a `policy`) or [`run_unconfined`] (without) as an Execution-owned job of
+/// `owner` in the background admission class of the daemon's controller: admitted before the
+/// spawn, launched from a measured executable, its group swept and reaped before the slot is
+/// released.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_admitted(
+    admission: &std::sync::Arc<std::sync::Mutex<super::AdmissionController>>,
+    owner: super::OwnerId,
+    program: &Path,
+    args: &[OsString],
+    cwd: &Path,
+    env: &[(String, String)],
+    policy: Option<&SeatbeltPolicy>,
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> io::Result<ConfinedOutput> {
+    let mut _profile_remover = None;
+    let (launcher, argv) = match policy {
+        Some(policy) => {
+            let profile = render_profile(policy)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            let profile_path = write_profile(&profile)?;
+            let mut argv = vec![
+                OsString::from("-f"),
+                profile_path.clone().into_os_string(),
+                program.as_os_str().to_owned(),
+            ];
+            argv.extend(args.iter().cloned());
+            _profile_remover = Some(ProfileFileRemover { path: profile_path });
+            (PathBuf::from(SANDBOX_EXEC), argv)
+        }
+        None => (program.to_path_buf(), args.to_vec()),
+    };
+    let command = super::ControlledCommand::from_validated_peer(
+        super::CommandKind::Job,
+        launcher,
+        argv,
+        cwd.to_path_buf(),
+        env.iter()
+            .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+            .collect(),
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::NotFound, format!("{error:?}")))?;
+    let output = super::job::run_job(
+        admission,
+        owner,
+        super::AdmissionClass::Background,
+        &command,
+        max_output_bytes,
+        timeout,
+    )
+    .await?;
+    Ok(ConfinedOutput {
+        status: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        timed_out: output.timed_out,
+        truncated: output.truncated,
+    })
+}
+
 /// Runs one check program with no Seatbelt profile of ours, in its own process group.
 ///
 /// Same child contract as [`run_confined`] — cleared environment rebuilt from `env` alone, piped

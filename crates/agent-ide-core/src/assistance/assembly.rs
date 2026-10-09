@@ -474,6 +474,7 @@ impl ProductDispatcher {
             let telemetry = worker.telemetry_slot();
             let feed = ProjectProblemFeed::from_launcher(
                 &launcher,
+                dispatcher.admission.clone(),
                 Arc::new(move |snapshot: &crate::checks::ProblemSnapshot| {
                     adapters::log_project_check(snapshot);
                     if let Some(telemetry) = telemetry.lock().ok().and_then(|slot| slot.clone()) {

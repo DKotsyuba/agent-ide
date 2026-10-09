@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use super::host_binding::HostKind;
 use super::launcher::{LauncherConfig, admit_worktree};
-use crate::checks::runner::{NestedSandboxFallbackRunner, SeatbeltRunner};
+use crate::checks::runner::NestedSandboxFallbackRunner;
 use crate::checks::scheduler::{CompletionHook, Scheduler};
 use crate::checks::{
     CheckState, Checker, Language, MAX_PROBLEMS, Problem, ProblemSnapshot, Recheck, Severity,
@@ -229,16 +229,21 @@ impl ProjectProblemFeed {
     /// Project checks are enabled only with nonempty `allowed_roots`, a `project_checks` section
     /// and at least one configured language (EYES-r1 §1); otherwise `None` leaves v0.2 behaviour
     /// unchanged. Checkers run through the Seatbelt runner (with its one-time nested-sandbox
-    /// fallback for a daemon the host itself confines) with the configured timeout, the
+    /// fallback for a daemon the host itself confines) as Execution-owned jobs of `admission`,
+    /// with the configured timeout, the
     /// scheduler uses the configured debounce and the cache root `$HOME/.agent-ide/checks`
     /// (created `0700` best-effort); the daemon's retention task removes unused caches.
     /// `on_complete` observes every completed check run. Returns `None` when `HOME` is unset.
-    pub fn from_launcher(launcher: &LauncherConfig, on_complete: CompletionHook) -> Option<Self> {
+    pub fn from_launcher(
+        launcher: &LauncherConfig,
+        admission: Arc<std::sync::Mutex<crate::execution::AdmissionController>>,
+        on_complete: CompletionHook,
+    ) -> Option<Self> {
         let checks = launcher.project_checks()?;
         if launcher.allowed_roots().is_empty() {
             return None;
         }
-        let runner = Arc::new(NestedSandboxFallbackRunner::new(Arc::new(SeatbeltRunner)));
+        let runner = Arc::new(NestedSandboxFallbackRunner::admitted(admission));
         let checkers: Vec<Arc<dyn Checker>> = checks
             .sections()
             .map(|(language, config)| {

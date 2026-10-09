@@ -2929,7 +2929,14 @@ fn launch_child(
         )
         .into());
     }
-    validate_output_cap(output_cap)?;
+    validate_output_cap(
+        output_cap,
+        if command.kind == CommandKind::Job && !protocol {
+            job::MAX_JOB_CAPTURE_BYTES
+        } else {
+            MAX_CAPTURED_PROCESS_BYTES
+        },
+    )?;
     if executable_identity(&command.program).map_err(ProcessError::Request)?
         != command.program_identity
     {
@@ -2941,6 +2948,8 @@ fn launch_child(
         process.stdin(Stdio::from(file.try_clone()?));
     } else if protocol {
         process.stdin(Stdio::piped());
+    } else if command.kind == CommandKind::Job {
+        process.stdin(Stdio::null());
     }
     configure_process_group(&mut process);
     let generation = launch_generation()?;
@@ -3007,8 +3016,8 @@ fn launch_generation() -> Result<[u8; 32], ProcessError> {
 }
 
 /// Refuses over-limit capture policy before an OS child can be created; zero retains no bytes.
-fn validate_output_cap(cap: usize) -> Result<(), ProcessError> {
-    if cap > MAX_CAPTURED_PROCESS_BYTES {
+fn validate_output_cap(cap: usize, limit: usize) -> Result<(), ProcessError> {
+    if cap > limit {
         Err(ProcessError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
             "process capture cap exceeds limit",
@@ -3512,6 +3521,7 @@ pub async fn run_inherited_child(
     }
 }
 
+pub mod job;
 pub mod seatbelt;
 
 #[cfg(test)]
