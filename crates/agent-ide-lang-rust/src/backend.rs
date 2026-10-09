@@ -367,8 +367,12 @@ impl RustBackend {
     ) -> Result<(), FailureCode> {
         let binding = job.binding().clone();
         let worktree_path = source.worktree().worktree_path();
-        if let Some(entry) = self.live.get(&binding) {
+        if let Some(entry) = self.live.get_mut(&binding) {
             if entry.live.is_alive() {
+                // A demand on a module analyzer that has not loaded yet waits for it.
+                if entry.module_inputs.is_some() {
+                    entry.waited = entry.live.wait_ready(Duration::ZERO).await.is_err();
+                }
                 return Ok(());
             }
             // A module session that died counts against the shared restart policy. A call that
@@ -540,6 +544,8 @@ impl RustBackend {
         };
         match opened {
             Ok(live) => {
+                // A freshly started module analyzer loads before it answers.
+                let waited = module_inputs.is_some();
                 self.live.insert(
                     binding,
                     RustLive {
@@ -547,7 +553,7 @@ impl RustBackend {
                         view,
                         live,
                         module_inputs,
-                        waited: false,
+                        waited,
                     },
                 );
                 Ok(())
