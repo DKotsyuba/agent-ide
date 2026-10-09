@@ -1325,7 +1325,7 @@ async fn module_session_converts_product_answers() {
         .await
         .unwrap();
     assert_eq!(definitions.len(), 1);
-    assert!(definitions[0].uri.path().ends_with("/main.go"));
+    assert!(definitions[0].uri.path().ends_with("/main.txt"));
     assert_eq!(definitions[0].range.end.character, 1, "UTF-8 units");
     assert_eq!(
         live.session
