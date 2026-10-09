@@ -516,14 +516,11 @@ impl Facts<'_> {
                 Some("import") if !punct(index + 1, b'.') => {
                     if let Some(Token::Str(range)) = tokens.get(index + 1) {
                         self.specifier(range.clone(), true);
-                    } else if let Some((from, range)) = self.clause(tokens, index + 1) {
-                        if let Some(key) = self.specifier(range, true) {
-                            if let Some(name) =
-                                default_binding(tokens, index + 1, from, self.source)
-                            {
-                                bindings.extend(css_module(&key).map(|domain| (name, domain)));
-                            }
-                        }
+                    } else if let Some((from, range)) = self.clause(tokens, index + 1)
+                        && let Some(key) = self.specifier(range, true)
+                        && let Some(name) = default_binding(tokens, index + 1, from, self.source)
+                    {
+                        bindings.extend(css_module(&key).map(|domain| (name, domain)));
                     }
                 }
                 Some("export") if punct(index + 1, b'{') || punct(index + 1, b'*') => {
