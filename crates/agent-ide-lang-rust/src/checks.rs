@@ -81,6 +81,39 @@ impl RustChecker {
         developer_dir: Option<PathBuf>,
     ) -> Self {
         let primary_developer_dir = resolve_primary_developer_dir(developer_dir);
+        Self::with_primary_developer_dir(
+            runner,
+            toolchain_dir,
+            cargo_home,
+            timeout,
+            primary_developer_dir,
+        )
+    }
+
+    /// A checker for planning and parsing only: the primary developer directory is the section's
+    /// override or a fixed standard location, never the answer of a process, because a module
+    /// starts no process of its own (the core runs every effect).
+    pub(crate) fn for_planning(
+        runner: Arc<dyn ConfinedRunner>,
+        toolchain_dir: PathBuf,
+        cargo_home: Option<PathBuf>,
+        timeout: Duration,
+        developer_dir: Option<PathBuf>,
+    ) -> Self {
+        let primary = developer_dir
+            .filter(|dir| dir.is_dir())
+            .or_else(standard_developer_dir);
+        Self::with_primary_developer_dir(runner, toolchain_dir, cargo_home, timeout, primary)
+    }
+
+    /// Builds the checker around an already resolved primary developer directory.
+    fn with_primary_developer_dir(
+        runner: Arc<dyn ConfinedRunner>,
+        toolchain_dir: PathBuf,
+        cargo_home: Option<PathBuf>,
+        timeout: Duration,
+        primary_developer_dir: Option<PathBuf>,
+    ) -> Self {
         let linker_env = resolve_linker_env(primary_developer_dir.as_deref(), &toolchain_dir);
         Self {
             runner,
@@ -476,7 +509,12 @@ fn xcode_select_developer_dir() -> Option<PathBuf> {
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|stdout| PathBuf::from(stdout.trim()))
         .filter(|path| path.is_dir())
-        .or_else(|| existing_dir("/Applications/Xcode.app/Contents/Developer"))
+        .or_else(standard_developer_dir)
+}
+
+/// The first standard Apple developer directory that exists, without asking any process.
+fn standard_developer_dir() -> Option<PathBuf> {
+    existing_dir("/Applications/Xcode.app/Contents/Developer")
         .or_else(|| existing_dir("/Library/Developer/CommandLineTools"))
 }
 

@@ -383,11 +383,21 @@ fn describe_checks(section: Value) -> Result<ChecksDescription, String> {
     })
 }
 
-/// Maps one run outcome and its output attachments (stdout first, stderr second) to a snapshot.
+/// The bytes of attachment `id`, empty when the run captured none.
+fn stream(attachments: &[Attachment], id: u32) -> Vec<u8> {
+    attachments
+        .iter()
+        .find(|attachment| attachment.id == id)
+        .map(|attachment| attachment.bytes.clone())
+        .unwrap_or_default()
+}
+
+/// Maps one run outcome and its captured `stdout`/`stderr` bytes to a snapshot.
 fn interpret(
     request: &CheckRequest,
     outcome: &EffectOutcome,
-    attachments: &[Attachment],
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
     duration_ms: u64,
 ) -> ProblemSnapshot {
     match outcome {
@@ -396,25 +406,17 @@ fn interpret(
             timed_out,
             truncated,
             ..
-        } => {
-            let bytes = |position: usize| {
-                attachments
-                    .get(position)
-                    .map(|attachment| attachment.bytes.clone())
-                    .unwrap_or_default()
-            };
-            map_run_output(
-                request,
-                &RunOutput {
-                    status: *status,
-                    stdout: bytes(0),
-                    stderr: bytes(1),
-                    timed_out: *timed_out,
-                    truncated: *truncated,
-                },
-                duration_ms,
-            )
-        }
+        } => map_run_output(
+            request,
+            &RunOutput {
+                status: *status,
+                stdout,
+                stderr,
+                timed_out: *timed_out,
+                truncated: *truncated,
+            },
+            duration_ms,
+        ),
         EffectOutcome::Refused { cause, message } => {
             let reason = match cause {
                 Cause::ToolMissing => UnavailableReason::ToolMissing,
@@ -447,7 +449,7 @@ fn reply(value: &impl Serialize) -> Answer {
 
 /// The checker for `config`, planning and parsing only.
 fn checker_for(config: &ProjectRustChecksConfig, timeout: Duration) -> RustChecker {
-    RustChecker::new(
+    RustChecker::for_planning(
         std::sync::Arc::new(NoProcess),
         config.toolchain_dir().to_path_buf(),
         config.cargo_home().map(Path::to_path_buf),
@@ -586,7 +588,8 @@ async fn check_plan(incoming: &Incoming, effects: &mut Effects<'_>) -> Result<An
     Ok(reply(&interpret(
         &query.request,
         &outcome,
-        &attachments,
+        stream(&attachments, 1),
+        stream(&attachments, 2),
         started.elapsed().as_millis() as u64,
     )))
 }
@@ -623,8 +626,13 @@ impl<S: ModuleServer> RustModule<S> {
         ) else {
             return Answer::error(ErrorCode::InvalidRequest, "output attachment missing");
         };
-        let attachments = [stdout.clone(), stderr.clone()];
-        reply(&interpret(&query.request, &query.outcome, &attachments, 0))
+        reply(&interpret(
+            &query.request,
+            &query.outcome,
+            stdout.bytes.clone(),
+            stderr.bytes.clone(),
+            0,
+        ))
     }
 }
 
@@ -998,6 +1006,23 @@ mod tests {
         assert_eq!(snapshot.input_generation, 9);
         assert_eq!(effects.runs, 1);
         assert_eq!(effects.last.unwrap().recipe, "cargo_check");
+    }
+
+    /// Output streams are found by attachment id, not by position: a lone stderr or a reversed
+    /// pair keeps each stream's bytes.
+    #[test]
+    fn streams_are_looked_up_by_attachment_id() {
+        let attachment = |id: u32, bytes: &[u8]| Attachment {
+            id,
+            content_type: "text/plain; charset=utf-8".into(),
+            bytes: bytes.to_vec(),
+        };
+        let reversed = [attachment(2, b"err"), attachment(1, b"out")];
+        assert_eq!(stream(&reversed, 1), b"out");
+        assert_eq!(stream(&reversed, 2), b"err");
+        let stderr_only = [attachment(2, b"err")];
+        assert!(stream(&stderr_only, 1).is_empty());
+        assert_eq!(stream(&stderr_only, 2), b"err");
     }
 
     /// Without the pinned cargo the check is `tool_missing` before any effect is asked for.
