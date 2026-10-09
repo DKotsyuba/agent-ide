@@ -41,6 +41,8 @@ pub(super) struct FileRec {
     alloc: u64,
     /// APFS private bytes of the inode, when the volume reports them.
     private: Option<u64>,
+    /// Hard links the inode has in total, inside the family or not.
+    links: u64,
 }
 
 /// The sharing-relevant measurement of one entry's tree.
@@ -84,6 +86,7 @@ impl Usage {
             inode: (dev, ino),
             alloc,
             private: attributes.map(|(_, private)| private),
+            links: metadata.nlink(),
         });
     }
 
@@ -170,7 +173,8 @@ impl Sharing {
     /// Builds the view of a family from the measurements of all its entries.
     pub(super) fn new<'a>(usages: impl Iterator<Item = &'a Usage>) -> Self {
         let mut view = Self::default();
-        let mut inodes: HashMap<(u64, u64), u64> = HashMap::new();
+        // Per inode: private bytes, links in total and links seen in the family.
+        let mut inodes: HashMap<(u64, u64), (u64, u64, u64)> = HashMap::new();
         for usage in usages {
             view.own = view.own.saturating_add(usage.own);
             view.logical = view.logical.saturating_add(usage.logical);
@@ -181,14 +185,20 @@ impl Sharing {
                 group.1 += 1;
             }
             for file in &usage.files {
-                inodes.insert(file.inode, file.private.unwrap_or(0));
+                let inode =
+                    inodes
+                        .entry(file.inode)
+                        .or_insert((file.private.unwrap_or(0), file.links, 0));
+                inode.2 += 1;
             }
         }
-        view.private = view.private.saturating_add(
-            inodes
-                .values()
-                .fold(0, |sum, bytes| sum.saturating_add(*bytes)),
-        );
+        // An inode with a link outside the family stays allocated when the family's links go, so
+        // its private bytes are not reclaimable by removing the family.
+        let reclaimable = inodes
+            .values()
+            .filter(|(_, links, seen)| seen >= links)
+            .fold(0u64, |sum, (private, ..)| sum.saturating_add(*private));
+        view.private = view.private.saturating_add(reclaimable);
         view.charged = view
             .groups
             .values()
