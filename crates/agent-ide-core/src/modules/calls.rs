@@ -710,30 +710,52 @@ pub async fn test_run(
     let Ok(run) = run else {
         return Ok(Err(run.unwrap_err()));
     };
-    let tool = slot_tool(super::recipe::declared(language.name()), &run.effect);
-    // A declared home tool the core cannot find on its tool path is not installed: the run
-    // fails to start exactly as the in-process command would, naming the program.
+    let (command, start) = plan_admitted(language, worktree, &run.effect, budget)?;
+    Ok(Ok(PlannedRun {
+        tests: run.tests,
+        command,
+        start,
+    }))
+}
+
+/// How a module's test-run request starts, and the command it shows: only a declared recipe of
+/// class `test` is considered (anything else is refused before any other check); a declared home
+/// tool that is not installed fails to start exactly as the in-process command would, naming the
+/// program; otherwise the core-admitted expansion.
+fn plan_admitted(
+    language: Language,
+    worktree: &Path,
+    effect: &EffectRequest,
+    budget: std::time::Duration,
+) -> Routed<(Vec<String>, PlannedStart)> {
+    let tests: Vec<super::payload::EffectRecipe> = super::recipe::declared(language.name())
+        .iter()
+        .filter(|recipe| recipe.class == super::payload::RunClass::Test)
+        .copied()
+        .collect();
+    if !tests.iter().any(|recipe| recipe.id == effect.recipe) {
+        return Err(policy_refused(language));
+    }
+    let tool = slot_tool(&tests, effect);
     if let Some((name, Some(program))) = tool
         && crate::execution::job::executable_on(program, worktree, &tool_path()).is_none()
     {
-        return Ok(Ok(PlannedRun {
-            tests: run.tests,
-            command: vec![name.to_owned()],
-            start: PlannedStart::MissingTool(name.to_owned()),
-        }));
+        return Ok((
+            vec![name.to_owned()],
+            PlannedStart::MissingTool(name.to_owned()),
+        ));
     }
     let spec = admitted(
         language,
         worktree,
-        &run.effect,
+        effect,
         super::payload::RunClass::Test,
         budget,
     )?;
-    Ok(Ok(PlannedRun {
-        tests: run.tests,
-        command: shown_command(tool.map(|(name, _)| name), &spec),
-        start: PlannedStart::Admitted(spec),
-    }))
+    Ok((
+        shown_command(tool.map(|(name, _)| name), &spec),
+        PlannedStart::Admitted(spec),
+    ))
 }
 
 /// The executable slot a request's program stands for: the slot its program names, or else the
@@ -897,15 +919,7 @@ fn admitted(
     class: super::payload::RunClass,
     timeout: std::time::Duration,
 ) -> Routed<crate::checks::runner::RunSpec> {
-    let refused = || ModuleUnavailable {
-        module_id: super::contract::ModuleId::bundled(language.name()),
-        module_version: env!("CARGO_PKG_VERSION").to_owned(),
-        role: super::contract::Role::Analyzer,
-        stage: super::contract::Stage::Decode,
-        cause: super::contract::Cause::PolicyRefused,
-        instance: None,
-        retry_after_ms: None,
-    };
+    let refused = || policy_refused(language);
     if !super::recipe::declared(language.name())
         .iter()
         .any(|recipe| recipe.id == effect.recipe && recipe.class == class)
@@ -941,6 +955,19 @@ fn admitted(
         timeout,
     };
     super::recipe::expand(recipes, effect, &admission).map_err(|_| refused())
+}
+
+/// The typed refusal of a module request outside the language's declared recipes.
+fn policy_refused(language: Language) -> ModuleUnavailable {
+    ModuleUnavailable {
+        module_id: super::contract::ModuleId::bundled(language.name()),
+        module_version: env!("CARGO_PKG_VERSION").to_owned(),
+        role: super::contract::Role::Analyzer,
+        stage: super::contract::Stage::Decode,
+        cause: super::contract::Cause::PolicyRefused,
+        instance: None,
+        retry_after_ms: None,
+    }
 }
 
 /// `LanguageSupport::format_stdin_command`.
@@ -1131,7 +1158,8 @@ mod tests {
     }
 
     /// A module-planned test run may name only a declared recipe of class `test`, and a
-    /// formatter or probe only an interactive one: anything else is refused before expansion.
+    /// formatter or probe only an interactive one: anything else is refused before expansion, and
+    /// before a missing tool could be reported for it.
     #[test]
     fn effects_are_admitted_only_from_their_own_class() {
         use super::super::payload::{
@@ -1155,9 +1183,23 @@ mod tests {
                 assets: &[],
             }
         }
-        static RECIPES: [EffectRecipe; 2] = [
+        static RECIPES: [EffectRecipe; 4] = [
             recipe("fmt", RunClass::Interactive),
+            EffectRecipe {
+                executables: &[ExecutableSlot {
+                    name: "tool",
+                    source: SlotSource::HomeTool("agent-ide-no-such-tool"),
+                }],
+                ..recipe("fmt-absent", RunClass::Interactive)
+            },
             recipe("run", RunClass::Test),
+            EffectRecipe {
+                executables: &[ExecutableSlot {
+                    name: "tool",
+                    source: SlotSource::HomeTool("agent-ide-no-such-tool"),
+                }],
+                ..recipe("absent", RunClass::Test)
+            },
         ];
         static DECLARED: [(&str, &[EffectRecipe]); 1] = [("gamma", &RECIPES)];
         crate::lang::testing::install();
@@ -1173,6 +1215,13 @@ mod tests {
             let refused = admitted(gamma, &worktree, &request(id), class, second).unwrap_err();
             assert_eq!(refused.cause, super::super::contract::Cause::PolicyRefused);
         }
+        // A test-run request naming the interactive recipe is refused even though its home tool
+        // is not installed (never reported as a missing runner); the test recipe's missing tool is.
+        let refused = plan_admitted(gamma, &worktree, &request("fmt-absent"), second).unwrap_err();
+        assert_eq!(refused.cause, super::super::contract::Cause::PolicyRefused);
+        let (command, start) = plan_admitted(gamma, &worktree, &request("absent"), second).unwrap();
+        assert_eq!(command, ["tool"]);
+        assert_eq!(start, PlannedStart::MissingTool("tool".into()));
         let spec = admitted(gamma, &worktree, &request("run"), RunClass::Test, second).unwrap();
         assert!(spec.program.ends_with("sh"));
         assert!(
