@@ -341,7 +341,7 @@ impl TestRuns {
     /// inherited, no language command environment), within the smaller of `budget` and the
     /// spec's timeout, retaining at most its capture ceiling of output. It is an Execution-owned
     /// job like every test run and, as today, not read-confined (design §2.6: tests may execute
-    /// project code as currently authorized). The rerun line is the program and its arguments.
+    /// project code as currently authorized). The rerun line shows `command`.
     #[allow(
         clippy::too_many_arguments,
         reason = "the run's own facts, as start_with_options carries them in its options"
@@ -350,6 +350,7 @@ impl TestRuns {
         &self,
         root: PathBuf,
         spec: crate::checks::runner::RunSpec,
+        command: Vec<String>,
         owner: &BindingRef,
         language: Language,
         budget: Duration,
@@ -394,10 +395,7 @@ impl TestRuns {
             budget: budget.min(spec.timeout),
             cap: spec.max_output_bytes.min(MAX_OUTPUT),
             detail_ref,
-            rerun_command: std::iter::once(spec.program.as_os_str())
-                .chain(spec.args.iter().map(std::ffi::OsString::as_os_str))
-                .map(|part| part.to_string_lossy().into_owned())
-                .collect(),
+            rerun_command: command,
             rerun_dir: spec
                 .cwd
                 .strip_prefix(&root)
@@ -1243,10 +1241,12 @@ mod runner_tests {
             }
             panic!("run {id} did not settle");
         };
-        let start = |spec| {
+        let start = |spec: crate::checks::runner::RunSpec| {
+            let command = vec![spec.program.display().to_string()];
             runs.start_admitted(
                 root.clone(),
                 spec,
+                command,
                 &owner,
                 crate::lang::testing::ALPHA,
                 Duration::from_secs(10),

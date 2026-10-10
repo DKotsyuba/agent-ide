@@ -649,17 +649,29 @@ pub async fn insert_site(
     }
 }
 
-/// A selected test run: the tests it runs, its argument vector (program first), and for a
-/// module-planned run the specification the core expanded and admitted from one of the
-/// language's declared test recipes, which is exactly what runs.
+/// A selected test run: the tests it runs, its argument vector (program first), and how it
+/// starts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannedRun {
     /// The selected tests.
     pub tests: Vec<crate::lang::TestId>,
     /// Argv, program first.
     pub command: Vec<String>,
-    /// The admitted run of a module-planned selection; `None` in process.
-    pub spec: Option<crate::checks::runner::RunSpec>,
+    /// How the run starts.
+    pub start: PlannedStart,
+}
+
+/// How a selected test run starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlannedStart {
+    /// In process: the language's own argument vector in its command environment.
+    InProcess,
+    /// Module-planned: exactly the specification the core expanded and admitted from one of the
+    /// language's declared test recipes.
+    Admitted(crate::checks::runner::RunSpec),
+    /// Module-planned through a home tool that is not installed (as in process, the run
+    /// cannot start and the reply names the missing program).
+    MissingTool(String),
 }
 
 /// The run of `LanguageSupport::test_selection` within `budget`: in process the language's own
@@ -680,7 +692,7 @@ pub async fn test_run(
             .map(|selection| PlannedRun {
                 tests: selection.tests,
                 command: selection.command,
-                spec: None,
+                start: PlannedStart::InProcess,
             }));
     };
     let run: super::payload::RunAnswer = host
@@ -698,21 +710,94 @@ pub async fn test_run(
     let Ok(run) = run else {
         return Ok(Err(run.unwrap_err()));
     };
+    let (command, start) = plan_admitted(language, worktree, &run.effect, budget)?;
+    Ok(Ok(PlannedRun {
+        tests: run.tests,
+        command,
+        start,
+    }))
+}
+
+/// How a module's test-run request starts, and the command it shows: only a declared recipe of
+/// class `test` is considered (anything else is refused before any other check); a declared home
+/// tool that is not installed fails to start exactly as the in-process command would, naming the
+/// program; otherwise the core-admitted expansion.
+fn plan_admitted(
+    language: Language,
+    worktree: &Path,
+    effect: &EffectRequest,
+    budget: std::time::Duration,
+) -> Routed<(Vec<String>, PlannedStart)> {
+    let tests: Vec<super::payload::EffectRecipe> = super::recipe::declared(language.name())
+        .iter()
+        .filter(|recipe| recipe.class == super::payload::RunClass::Test)
+        .copied()
+        .collect();
+    if !tests.iter().any(|recipe| recipe.id == effect.recipe) {
+        return Err(policy_refused(language));
+    }
+    let tool = slot_tool(&tests, effect);
+    if let Some((name, Some(program))) = tool
+        && crate::execution::job::executable_on(program, worktree, &tool_path()).is_none()
+    {
+        return Ok((
+            vec![name.to_owned()],
+            PlannedStart::MissingTool(name.to_owned()),
+        ));
+    }
     let spec = admitted(
         language,
         worktree,
-        &run.effect,
+        effect,
         super::payload::RunClass::Test,
         budget,
     )?;
-    Ok(Ok(PlannedRun {
-        tests: run.tests,
-        command: std::iter::once(spec.program.as_os_str())
-            .chain(spec.args.iter().map(std::ffi::OsString::as_os_str))
-            .map(|part| part.to_string_lossy().into_owned())
-            .collect(),
-        spec: Some(spec),
-    }))
+    Ok((
+        shown_command(tool.map(|(name, _)| name), &spec),
+        PlannedStart::Admitted(spec),
+    ))
+}
+
+/// The executable slot a request's program stands for: the slot its program names, or else the
+/// recipe's single declared slot (a pinned path program such as a toolchain's own `cargo`); the
+/// slot's name is the word the in-process command prints, and a home tool's program is looked up
+/// on the tool path. `None` for a path program of a recipe without exactly one slot, or an
+/// unknown recipe.
+fn slot_tool(
+    recipes: &[super::payload::EffectRecipe],
+    effect: &EffectRequest,
+) -> Option<(&'static str, Option<&'static str>)> {
+    let recipe = recipes.iter().find(|recipe| recipe.id == effect.recipe)?;
+    let declared = match effect.params.get(recipe.program) {
+        Some(super::payload::Param::Executable(slot)) => recipe
+            .executables
+            .iter()
+            .find(|declared| declared.name == slot)?,
+        _ => match recipe.executables {
+            [single] => return Some((single.name, None)),
+            _ => return None,
+        },
+    };
+    Some(match declared.source {
+        super::payload::SlotSource::HomeTool(program) => (declared.name, Some(program)),
+        super::payload::SlotSource::Launcher(_) => (declared.name, None),
+    })
+}
+
+/// The command a module-planned run shows (its started and rerun lines): a slot program by its
+/// slot's name, the word the in-process command prints (`pytest`, not its resolved path), a path
+/// program as admitted, then the expanded arguments. What runs is still the resolved program.
+fn shown_command(tool: Option<&str>, spec: &crate::checks::runner::RunSpec) -> Vec<String> {
+    std::iter::once(tool.map_or_else(
+        || spec.program.to_string_lossy().into_owned(),
+        str::to_owned,
+    ))
+    .chain(
+        spec.args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned()),
+    )
+    .collect()
 }
 
 /// `LanguageSupport::test_id` of one outline path.
@@ -849,15 +934,7 @@ fn admitted_with(
     timeout: std::time::Duration,
     configured: &[&Path],
 ) -> Routed<crate::checks::runner::RunSpec> {
-    let refused = || ModuleUnavailable {
-        module_id: super::contract::ModuleId::bundled(language.name()),
-        module_version: env!("CARGO_PKG_VERSION").to_owned(),
-        role: super::contract::Role::Analyzer,
-        stage: super::contract::Stage::Decode,
-        cause: super::contract::Cause::PolicyRefused,
-        instance: None,
-        retry_after_ms: None,
-    };
+    let refused = || policy_refused(language);
     if !super::recipe::declared(language.name())
         .iter()
         .any(|recipe| recipe.id == effect.recipe && recipe.class == class)
@@ -895,6 +972,19 @@ fn admitted_with(
         timeout,
     };
     super::recipe::expand(recipes, effect, &admission).map_err(|_| refused())
+}
+
+/// The typed refusal of a module request outside the language's declared recipes.
+fn policy_refused(language: Language) -> ModuleUnavailable {
+    ModuleUnavailable {
+        module_id: super::contract::ModuleId::bundled(language.name()),
+        module_version: env!("CARGO_PKG_VERSION").to_owned(),
+        role: super::contract::Role::Analyzer,
+        stage: super::contract::Stage::Decode,
+        cause: super::contract::Cause::PolicyRefused,
+        instance: None,
+        retry_after_ms: None,
+    }
 }
 
 /// `LanguageSupport::format_stdin_command`.
@@ -1000,8 +1090,101 @@ pub async fn not_analysed(
 mod tests {
     use super::*;
 
+    /// A module-planned run shows a slot program by its slot's name (the word the in-process
+    /// command prints, whatever binary it resolves to), a pinned path program of a one-slot
+    /// recipe by that slot's name, any other path program as admitted, and the expanded
+    /// arguments.
+    #[test]
+    fn planned_runs_show_the_in_process_command() {
+        use super::super::payload::{
+            EffectRecipe, ExecutableSlot, Param, RunClass, SlotSource, Stdin,
+        };
+        static RECIPES: [EffectRecipe; 1] = [EffectRecipe {
+            id: "run",
+            program: "tool",
+            args: &[],
+            env: &[],
+            paths: &[],
+            executables: &[ExecutableSlot {
+                name: "pytest",
+                source: SlotSource::HomeTool("pytest3"),
+            }],
+            stdin: Stdin::Null,
+            class: RunClass::Test,
+            timeout_ceiling_ms: 1000,
+            capture_bytes: 1024,
+            assets: &[],
+        }];
+        let effect = EffectRequest {
+            recipe: "run".into(),
+            params: [("tool".to_owned(), Param::Executable("pytest".into()))].into(),
+        };
+        let spec = crate::checks::runner::RunSpec {
+            program: "/opt/homebrew/bin/pytest".into(),
+            args: vec!["tests/a.py".into(), "--no-header".into()],
+            cwd: "/w".into(),
+            env: Vec::new(),
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
+            read_denies: Vec::new(),
+            timeout: std::time::Duration::from_secs(1),
+            max_output_bytes: 1,
+        };
+        let tool = slot_tool(&RECIPES, &effect);
+        assert_eq!(tool, Some(("pytest", Some("pytest3"))));
+        assert_eq!(
+            shown_command(tool.map(|(name, _)| name), &spec),
+            ["pytest", "tests/a.py", "--no-header"]
+        );
+        assert_eq!(
+            shown_command(None, &spec),
+            ["/opt/homebrew/bin/pytest", "tests/a.py", "--no-header"]
+        );
+        // A pinned path program of a recipe with one slot shows that slot's name; with several
+        // slots a path program shows as admitted.
+        static PINNED: [EffectRecipe; 2] = [
+            EffectRecipe {
+                id: "pinned",
+                program: "toolchain_cargo",
+                executables: &[ExecutableSlot {
+                    name: "cargo",
+                    source: SlotSource::Launcher("cargo"),
+                }],
+                ..RECIPES[0]
+            },
+            EffectRecipe {
+                id: "interpreter",
+                program: "interpreter",
+                executables: &[
+                    ExecutableSlot {
+                        name: "uv",
+                        source: SlotSource::HomeTool("uv"),
+                    },
+                    ExecutableSlot {
+                        name: "pytest",
+                        source: SlotSource::HomeTool("pytest"),
+                    },
+                ],
+                ..RECIPES[0]
+            },
+        ];
+        let path_request = |recipe: &str, param: &str| EffectRequest {
+            recipe: recipe.into(),
+            params: [(param.to_owned(), Param::Path("/tc/bin/cargo".into()))].into(),
+        };
+        assert_eq!(
+            slot_tool(&PINNED, &path_request("pinned", "toolchain_cargo")),
+            Some(("cargo", None))
+        );
+        assert_eq!(
+            slot_tool(&PINNED, &path_request("interpreter", "interpreter")),
+            None
+        );
+    }
+
     /// A module-planned test run may name only a declared recipe of class `test`, and a
-    /// formatter or probe only an interactive one: anything else is refused before expansion.
+    /// formatter or probe only an interactive one: anything else is refused before expansion, and
+    /// before a missing tool could be reported for it.
     #[test]
     fn effects_are_admitted_only_from_their_own_class() {
         use super::super::payload::{
@@ -1025,9 +1208,23 @@ mod tests {
                 assets: &[],
             }
         }
-        static RECIPES: [EffectRecipe; 2] = [
+        static RECIPES: [EffectRecipe; 4] = [
             recipe("fmt", RunClass::Interactive),
+            EffectRecipe {
+                executables: &[ExecutableSlot {
+                    name: "tool",
+                    source: SlotSource::HomeTool("agent-ide-no-such-tool"),
+                }],
+                ..recipe("fmt-absent", RunClass::Interactive)
+            },
             recipe("run", RunClass::Test),
+            EffectRecipe {
+                executables: &[ExecutableSlot {
+                    name: "tool",
+                    source: SlotSource::HomeTool("agent-ide-no-such-tool"),
+                }],
+                ..recipe("absent", RunClass::Test)
+            },
         ];
         static DECLARED: [(&str, &[EffectRecipe]); 1] = [("gamma", &RECIPES)];
         crate::lang::testing::install();
@@ -1043,6 +1240,13 @@ mod tests {
             let refused = admitted(gamma, &worktree, &request(id), class, second).unwrap_err();
             assert_eq!(refused.cause, super::super::contract::Cause::PolicyRefused);
         }
+        // A test-run request naming the interactive recipe is refused even though its home tool
+        // is not installed (never reported as a missing runner); the test recipe's missing tool is.
+        let refused = plan_admitted(gamma, &worktree, &request("fmt-absent"), second).unwrap_err();
+        assert_eq!(refused.cause, super::super::contract::Cause::PolicyRefused);
+        let (command, start) = plan_admitted(gamma, &worktree, &request("absent"), second).unwrap();
+        assert_eq!(command, ["tool"]);
+        assert_eq!(start, PlannedStart::MissingTool("tool".into()));
         let spec = admitted(gamma, &worktree, &request("run"), RunClass::Test, second).unwrap();
         assert!(spec.program.ends_with("sh"));
         assert!(

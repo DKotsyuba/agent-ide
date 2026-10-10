@@ -2755,7 +2755,7 @@ impl<'a> Worker<'a> {
                 } else {
                     format!("{} tests selected", selection.tests.len())
                 });
-                (selection.command, language, count, selection.spec)
+                (selection.command, language, count, Some(selection.start))
             } else {
                 return Ok((
                     PeerReply::Error {
@@ -2785,13 +2785,14 @@ impl<'a> Worker<'a> {
                     // A module-planned run is exactly the specification the core admitted from
                     // the language's declared test recipe: its program, arguments, directory
                     // and complete environment, with no command environment of the language.
-                    Some(spec) => {
+                    Some(crate::modules::calls::PlannedStart::Admitted(spec)) => {
                         let label = super::tests::command_environment_label(&root, &root, language)
                             .await
                             .map_err(|failure| symbols::module_failure(job, &failure))?;
                         self.shared.test_runs.start_admitted(
                             root.clone(),
                             spec,
+                            argv.clone(),
                             &binding,
                             language,
                             budget,
@@ -2799,7 +2800,13 @@ impl<'a> Worker<'a> {
                             label,
                         )
                     }
-                    None => {
+                    Some(crate::modules::calls::PlannedStart::MissingTool(_)) => {
+                        StartResult::Failed {
+                            error: "program not found".to_owned(),
+                            not_found: true,
+                        }
+                    }
+                    Some(crate::modules::calls::PlannedStart::InProcess) | None => {
                         let resolution = super::tests::resolve_command(
                             &root,
                             if explicit_command {
@@ -7395,7 +7402,7 @@ async fn test_selection(
             Vec<String>,
             crate::lang::Language,
             Option<String>,
-            Option<crate::checks::runner::RunSpec>,
+            Option<crate::modules::calls::PlannedStart>,
         ),
         crate::lang::LangError,
     >,
@@ -7423,7 +7430,12 @@ async fn test_selection(
         };
     let count = (!selection.tests.is_empty())
         .then_some(format!("{} tests selected", selection.tests.len()));
-    Ok(Ok((selection.command, *language, count, selection.spec)))
+    Ok(Ok((
+        selection.command,
+        *language,
+        count,
+        Some(selection.start),
+    )))
 }
 
 /// Formats an argv vector for the compact test status line without shell interpretation.
