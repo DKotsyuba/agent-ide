@@ -13494,8 +13494,8 @@ mod stop_retry_tests {
         while worker
             .shared
             .test_runs
-            .status_line(&fixture.root)
-            .is_some_and(|line| line.contains("running"))
+            .get(&fixture.root, 1, &binding)
+            .is_some_and(|status| status.result.is_none())
         {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
