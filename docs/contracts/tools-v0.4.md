@@ -78,7 +78,19 @@ test-finished tests #3: 3 passed, 1 failed, 12 s
 </agent-ide>
 ```
 
+Test runs no longer ride this block (OUTBOX-r3 §4): a settled run arrives once as a `test-finished` fact, see [Delivered results](#delivered-results).
+
 When the worktree's checked-out branch or detached commit changed outside the IDE (another process ran `git checkout`/`switch`), the plate of the first call that probes HEAD afterwards leads with one line, delivered once. HEAD is probed when the session starts and then by a completed call at most once per 30 s, so the line can trail the switch by up to 30 s of calls: `git: HEAD moved 4e2e2e2 → 9daac64 (claude/a → claude/b) outside Agent IDE; earlier indexed answers may be stale`. A commit on the same branch is not reported. It is a notice only: nothing is invalidated or restarted.
+
+### Delivered results
+
+Long work delivers its own result ([session outbox](session-outbox-v1.md)). A call that leaves without its answer — a `pending` reply, a `tests #N: started` line, an edit with `diagnostics: pending` — later receives one fact in the same `<agent-ide>` block, after the plate lines: `test-finished tests #3: …`, `edit-checked edit op-7: …`, `job-ready ide.symbol src/a.rs#Foo: …`, each with `result:`/`full output: ide.inspect <ref>` when more text is kept. The first carrier takes it, exactly once: the next terminal `ide.*` reply, the next native `PostToolUse` hook, the hold of an ending turn (the `Stop` hook continues the turn and asks for the final answer to be restated), or, for an interactive Claude session that went idle, one wake message. Source text rides only replies and `ide.inspect`; a hook names the result and its reference. `ide.stop` lists what no carrier took. After a daemon restart, an actor's first call says once which of its requests may have been lost (`lost-after-restart restart: …`).
+
+`ide.inspect` has three forms:
+
+- `{"detail_ref": R, "page"?: N}` — one result or page, as before; reading a job by its reference delivers its fact.
+- `{"detail_refs": [R1, …, R8]}` — up to eight references answered in order, one `== R ==` section each.
+- `{}` — every undelivered fact of the session (source answers re-proved against the current files; an answer whose definition file changed reads `discarded: <path> changed; repeat <tool> <target>`), or, when nothing is due, the work still in flight and the last delivered summaries. `{"wait_ms": N}` (at most 240 000) waits until a fact is due first; it is for an agent with nothing else to do, never a polling loop.
 
 ### Ceilings and pages
 

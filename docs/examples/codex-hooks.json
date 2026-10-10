@@ -23,6 +23,28 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/ABSOLUTE/PATH/agent-ide' codex-hook --managed",
+            "timeout": 330
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/ABSOLUTE/PATH/agent-ide' codex-hook --managed",
+            "timeout": 1
+          }
+        ]
+      }
     ]
   }
 }

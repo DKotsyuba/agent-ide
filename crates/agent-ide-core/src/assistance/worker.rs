@@ -44,6 +44,7 @@ mod batch_targets;
 mod batch_tests;
 #[path = "delivery.rs"]
 mod delivery;
+pub(crate) use delivery::{owed_fact, settled_run};
 #[path = "index_state.rs"]
 mod index_state;
 #[path = "inspection.rs"]
@@ -60,6 +61,8 @@ pub(super) mod snapshots;
 mod symbols;
 #[path = "takeover.rs"]
 mod takeover;
+#[path = "turn.rs"]
+mod turn;
 
 use self::symbols::Located;
 
@@ -571,6 +574,9 @@ struct Ledger {
     /// Pending `job-ready` registrations (OUTBOX §3.2) by result reference, with the epoch the
     /// fact is fenced at; taken by the job's settlement or by a read through its own reference.
     deferred: BTreeMap<String, (super::outbox::DeferSpec, super::outbox::JobEpoch)>,
+    /// The session state each job started from (OUTBOX §3.1), by result reference, recorded when
+    /// the job first executes; only references still in `details` are kept.
+    started: BTreeMap<String, super::outbox::JobEpoch>,
 }
 impl Default for Ledger {
     /// Creates empty finite bookkeeping; no file or process work occurs.
@@ -589,6 +595,7 @@ impl Default for Ledger {
             handing_over: BTreeSet::new(),
             read_memory: BTreeMap::new(),
             deferred: BTreeMap::new(),
+            started: BTreeMap::new(),
         }
     }
 }
@@ -703,6 +710,8 @@ struct Shared {
     failed: tokio::sync::watch::Sender<bool>,
     /// Per-session outbox of deferred facts (OUTBOX-r3); shared with the test-run settle hook.
     outbox: Arc<super::session_outbox::Outbox>,
+    /// The one seam to host wake routes (OUTBOX-r3 §8.4); the Claude registry route by default.
+    waker: Arc<dyn super::wake::SessionWaker>,
 }
 
 /// Most queued-job call ids [`Shared::requests`] and [`Shared::degraded`] keep; past it the oldest
@@ -851,7 +860,14 @@ impl Shared {
             if !matches!(detail.reply, PeerReply::Pending { .. }) {
                 let owner = detail.binding.clone();
                 let final_reply = detail.reply.clone();
-                settled = Some((owner, final_reply, ledger.deferred.remove(reference)));
+                // A deferral made before the job started is fenced at the job's own start.
+                let deferred = ledger.deferred.remove(reference).map(|(spec, epoch)| {
+                    (
+                        spec,
+                        ledger.started.get(reference).copied().unwrap_or(epoch),
+                    )
+                });
+                settled = Some((owner, final_reply, deferred));
             }
         }
         if let Some((owner, final_reply, deferred)) = settled {
@@ -1332,6 +1348,7 @@ impl WorkerHandle {
                 degraded: Mutex::default(),
                 degraded_references: Mutex::default(),
                 outbox: Arc::default(),
+                waker: Arc::new(super::wake::HostWaker::default()),
             }),
             inspect,
             receiver: Mutex::new(Some(receiver)),
@@ -3389,6 +3406,7 @@ impl<'a> Worker<'a> {
             .ok()
             .and_then(|ledger| ledger.native_epoch.get(&binding).copied())
             .unwrap_or(0);
+        self.shared.note_job_started(&job.reference, &binding);
         // Mutating tools are refused before they reach edit preparation or process admission when
         // this activation is read-only. Every edit form shares the same tool and refusal path.
         let reader_refusal = if matches!(job.tool, AssistanceTool::Edit | AssistanceTool::Test)
@@ -10246,6 +10264,7 @@ mod stop_retry_tests {
                 degraded: Mutex::default(),
                 degraded_references: Mutex::default(),
                 outbox: Arc::default(),
+                waker: Arc::new(crate::assistance::wake::HostWaker::default()),
             }),
             workspace,
             observations: WorkspaceStore::new(store),

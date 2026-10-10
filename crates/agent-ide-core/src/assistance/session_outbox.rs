@@ -25,6 +25,10 @@ const MAX_EDIT_RECORDS: usize = 128;
 const LABEL_PATHS: usize = 3;
 /// Most bytes of one `ide.stop` flush (OUTBOX §11).
 pub const STOP_FLUSH_BYTES: usize = 2048;
+/// Most turn ends one session blocks in a row without a tool call in between. Claude 2.1.294
+/// overrides the 9th consecutive Stop block and ends the turn with an empty answer; a tool call
+/// resets its count (probe Q1).
+pub const MAX_HOLDS_IN_ROW: u8 = 7;
 
 /// What the host last told the daemon about the agent's turn (OUTBOX §9).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -104,6 +108,8 @@ struct Session {
     agent: AgentState,
     /// True once a wake was attempted in the current idle period.
     woken: bool,
+    /// Turn ends blocked since the agent last worked (a hook or MCP call).
+    holds_in_row: u8,
     /// The host session identifier the hooks named (Claude `session_id`, Codex thread).
     host_session: Option<String>,
 }
@@ -122,6 +128,7 @@ impl Session {
             edits: VecDeque::new(),
             agent: AgentState::Working,
             woken: false,
+            holds_in_row: 0,
             host_session: None,
         }
     }
@@ -364,8 +371,25 @@ impl Outbox {
         self.with_session(binding, |session| {
             if agent == AgentState::Working {
                 session.woken = false;
+                session.holds_in_row = 0;
             }
             session.agent = agent;
+        });
+        self.changed.notify_waiters();
+    }
+
+    /// Whether one more turn end of the session may be blocked: fewer than [`MAX_HOLDS_IN_ROW`]
+    /// were blocked since the agent last worked.
+    pub fn may_hold(&self, binding: &BindingRef) -> bool {
+        self.with_session(binding, |session| session.holds_in_row < MAX_HOLDS_IN_ROW)
+            .unwrap_or(false)
+    }
+
+    /// Records one blocked turn end: the agent works on, and the blocks in a row grow.
+    pub fn note_hold(&self, binding: &BindingRef) {
+        self.with_session(binding, |session| {
+            session.holds_in_row = session.holds_in_row.saturating_add(1);
+            session.agent = AgentState::Working;
         });
         self.changed.notify_waiters();
     }
@@ -399,6 +423,12 @@ impl Outbox {
             session.host_session.clone()
         })
         .flatten()
+    }
+
+    /// Gives back a wake claimed by [`Self::claim_wake`] that sent nothing, so the idle period
+    /// keeps its one attempt.
+    pub fn unclaim_wake(&self, binding: &BindingRef) {
+        self.with_session(binding, |session| session.woken = false);
     }
 
     /// Registers in-flight work under `key` that may produce a holding fact for `owner` by `until`,

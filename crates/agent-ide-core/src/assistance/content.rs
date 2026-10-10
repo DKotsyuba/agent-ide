@@ -1736,7 +1736,8 @@ mod tests {
                     detail_ref: "diagnostic-detail".into(),
                 },
                 "pending",
-                "ide.inspect",
+                // OUTBOX-r3 §8.7: the check arrives by itself; no polling call is named.
+                "arrives by itself as an edit-checked fact",
             ),
         ];
         for (diagnostics, state, next_tool) in cases {

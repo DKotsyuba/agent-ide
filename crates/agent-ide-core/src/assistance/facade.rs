@@ -1967,6 +1967,9 @@ pub async fn submit_hook_event(
             HookPhase::PostFailure => "post_failure",
             HookPhase::PermissionDenied => "permission_denied",
             HookPhase::PostBatch => "post_batch",
+            HookPhase::Stop => "stop",
+            HookPhase::SubagentStop => "subagent_stop",
+            HookPhase::Compaction => "compaction",
         },
         "actor_id": event.actor_id(),
         "call_id": event.optional_call_id(),
@@ -1992,8 +1995,17 @@ pub async fn submit_hook_event(
     match submit_hook_if_running(
         runtime_dir,
         request,
-        HookTransportLimits::new(128 * 1024, MAX_HOOK_BYTES, Duration::from_secs(1))
-            .expect("fixed Assistance hook limits are valid"),
+        // A held Stop waits for the daemon's hold (OUTBOX-r3 §8.3); every other hook stays short.
+        HookTransportLimits::new(
+            128 * 1024,
+            MAX_HOOK_BYTES,
+            if event.phase().holds() {
+                super::outbox::HOLD_HOOK_DEADLINE
+            } else {
+                Duration::from_secs(1)
+            },
+        )
+        .expect("fixed Assistance hook limits are valid"),
     )
     .await
     {
@@ -2015,7 +2027,9 @@ pub async fn submit_hook_event(
 /// Encodes one bounded post-hook delta in the model-context schema required by its explicit host.
 ///
 /// Pre-hooks, empty/oversized text, invalid JSON serialization, and a `PermissionDenied` outcome
-/// all produce no output. Both current host contracts use `hookSpecificOutput`, but the event name
+/// all produce no output. A held `Stop`/`SubagentStop` renders the host's turn-continuation shape
+/// `{"decision":"block","reason":…}` with the text as its reason (OUTBOX-r3 §8.3); a compaction
+/// event renders nothing. Both current host contracts use `hookSpecificOutput`, but the event name
 /// is selected from the validated host event rather than copied from arbitrary input.
 pub fn render_hook_context(event: &HookEvent, text: &str) -> Option<String> {
     if text.is_empty() || text.len() > MAX_FEEDBACK_BYTES {
@@ -2027,6 +2041,11 @@ pub fn render_hook_context(event: &HookEvent, text: &str) -> Option<String> {
         HookPhase::PostFailure => "PostToolUseFailure",
         HookPhase::PermissionDenied => return None,
         HookPhase::PostBatch => "PostToolBatch",
+        // OUTBOX-r3 §8.3: a held turn end continues with the facts as the block reason.
+        HookPhase::Stop | HookPhase::SubagentStop => {
+            return serde_json::to_string(&json!({"decision": "block", "reason": text})).ok();
+        }
+        HookPhase::Compaction => return None,
     };
     serde_json::to_string(&json!({
         "hookSpecificOutput": {
@@ -2413,6 +2432,9 @@ struct ManagedConnection {
     /// Each actor's last admitted start parameters on a current managed Claude daemon, keyed by
     /// the daemon's private actor tag, oldest first, at most [`MAX_REMEMBERED_ACTORS`].
     remembered: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+    /// Requested work each remembered actor was relayed without its result (OUTBOX-r3 §10),
+    /// reported to the new daemon when the actor is re-activated after a replacement.
+    unresolved: Arc<super::unresolved::Unresolved>,
     /// Set once the bounded memory above evicted an actor that may still be active: from then on
     /// the session may hold actors it no longer remembers, so no actor is assumed gone.
     // ponytail: sticky for the rest of the session once more than 32 actors have been remembered
@@ -2450,6 +2472,7 @@ impl ManagedConnection {
             candidate: Arc::new(Mutex::new(None)),
             last_activation: Arc::new(Mutex::new(None)),
             remembered: Arc::new(std::sync::Mutex::new(Vec::new())),
+            unresolved: Arc::default(),
             memory_overflowed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lifecycle: Arc::new(Mutex::new(())),
             recovery_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2520,6 +2543,7 @@ impl ManagedConnection {
 
     /// Forgets one actor's remembered start.
     fn forget(&self, tag: &str) {
+        self.unresolved.forget(tag);
         self.remembered
             .lock()
             .expect("remembered starts mutex")
@@ -3330,6 +3354,16 @@ impl StdioFacade {
             if let Some(expected) = expected {
                 meta["claudecode/actor"] = json!(expected);
             }
+            // OUTBOX-r3 §10: what this actor was relayed unresolved before the replacement; the
+            // new daemon queues one `lost-after-restart` fact for it. Older daemons ignore it.
+            let lost = self
+                .reconnect
+                .as_ref()
+                .map(|reconnect| reconnect.unresolved.subjects(expected.unwrap_or_default()))
+                .unwrap_or_default();
+            if !lost.is_empty() {
+                meta["claudecode/lost"] = json!(lost);
+            }
             host.host_meta = Some(meta);
             let FacadeOutcome::Reply(reply, _) = self
                 .facade
@@ -3348,7 +3382,12 @@ impl StdioFacade {
                 PeerReply::Complete {
                     kind: ResultKind::Activation,
                     ..
-                } => return true,
+                } => {
+                    if let Some(reconnect) = &self.reconnect {
+                        reconnect.unresolved.forget(expected.unwrap_or_default());
+                    }
+                    return true;
+                }
                 // Still activating, or its pre-hook not there yet: one more bounded attempt.
                 PeerReply::Pending { .. }
                 | PeerReply::Unavailable {
@@ -3454,6 +3493,7 @@ impl StdioFacade {
     async fn forget_remembered_activation(&self) {
         if let Some(reconnect) = &self.reconnect {
             *reconnect.last_activation.lock().await = None;
+            reconnect.unresolved.forget("");
             reconnect.mark_activated();
         }
     }
@@ -3762,6 +3802,19 @@ impl StdioFacade {
         };
         if tool == AssistanceTool::Stop && expected.is_none() && may_have_applied {
             self.forget_remembered_activation().await;
+        }
+        // OUTBOX-r3 §10: remember what this reply leaves owed and forget what it resolves.
+        if tool != AssistanceTool::Stop
+            && let Some(reconnect) = &self.reconnect
+            && let FacadeOutcome::Reply(reply, status) = &outcome
+        {
+            reconnect.unresolved.observe(
+                tag.as_deref().unwrap_or_default(),
+                tool,
+                &stage_parameters,
+                reply,
+                status.as_deref(),
+            );
         }
         crate::telemetry::adapters::log_front_outcome(
             tool,
