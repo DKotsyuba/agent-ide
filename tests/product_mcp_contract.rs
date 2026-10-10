@@ -13227,7 +13227,10 @@ async fn configured_product_provider_ensure_panic_fails_the_daemon_crash_only_an
 /// same runtime directory, inspecting the old `detail_ref` answers a settled typed reply at once
 /// (never `pending`), and the replacement serves new calls.
 ///
-/// The parked job is never executed by the failed daemon and never replayed by the replacement.
+/// Two jobs wait on the server: a symbol read of an address the lexical outline does not hold
+/// parks and answers `pending`, and `ide.symbol` answers at once with an `approximate:` card
+/// (symbol-graph-item r2 §4) while its job keeps waiting for the precise answer under the card's
+/// `detail_ref`. Neither job is executed by the failed daemon or replayed by the replacement.
 #[cfg(feature = "test-seams")]
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_NODE environment"]
@@ -13286,12 +13289,30 @@ async fn configured_product_pending_call_and_old_reference_survive_a_crash_only_
         .call(&fixture, "ide.start", json!({"activation_id":"pending-1"}))
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
-    // The server never becomes ready, so this call parks and answers `pending`.
+    // The server never becomes ready. `server_only` is not in the lexical outline, so its read
+    // parks on the server and answers `pending`.
     let parked = actor
-        .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#value"}))
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"symbol":"src/lib.rs#server_only"}),
+        )
         .await;
     assert_eq!(parked["state"], "pending", "{parked}");
     let reference = parked["detail_ref"].as_str().unwrap().to_owned();
+    // `ide.symbol` answers at once from source; its precise job keeps waiting on the server.
+    let approximate = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#value"}))
+        .await;
+    assert_eq!(approximate["state"], "complete", "{approximate}");
+    assert!(
+        approximate["text"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("approximate: rust-analyzer is still indexing;"),
+        "{approximate}"
+    );
+    let approximate_reference = approximate["detail_ref"].as_str().unwrap().to_owned();
     std::fs::write(&flag, b"").unwrap();
     let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
         .await
@@ -13312,28 +13333,39 @@ async fn configured_product_pending_call_and_old_reference_survive_a_crash_only_
             &[("AGENT_IDE_TEST_FAULT", &fault)],
         )
         .await;
-    let old = tokio::time::timeout(
-        Duration::from_secs(20),
-        actor.call(&fixture, "ide.inspect", json!({"detail_ref":reference})),
-    )
-    .await
-    .expect("an old reference must not hang the agent");
-    assert_ne!(
-        old["state"], "pending",
-        "the parked job died with the failed daemon and is not replayed: {old}"
-    );
+    for reference in [&reference, &approximate_reference] {
+        let old = tokio::time::timeout(
+            Duration::from_secs(20),
+            actor.call(&fixture, "ide.inspect", json!({"detail_ref":reference})),
+        )
+        .await
+        .expect("an old reference must not hang the agent");
+        assert_ne!(
+            old["state"], "pending",
+            "the parked job died with the failed daemon and is not replayed: {old}"
+        );
+        assert!(
+            !old["text"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("approximate: "),
+            "the approximate card died with the failed daemon: {old}"
+        );
+    }
     let started = actor
         .call(&fixture, "ide.start", json!({"activation_id":"pending-2"}))
         .await;
     let started = actor.settle(&fixture, started).await;
     assert_eq!(started["kind"], "activation", "{started}");
-    // With a live activation on the replacement the old reference is still not a result: it is
-    // refused as the typed `invalid_detail` error, and a fresh read answers.
-    let stale = actor
-        .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
-        .await;
-    assert_eq!(stale["state"], "error", "{stale}");
-    assert_eq!(stale["code"], "invalid_detail", "{stale}");
+    // With a live activation on the replacement the old references are still not results: they
+    // are refused as the typed `invalid_detail` error, and a fresh read answers.
+    for reference in [&reference, &approximate_reference] {
+        let stale = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
+            .await;
+        assert_eq!(stale["state"], "error", "{stale}");
+        assert_eq!(stale["code"], "invalid_detail", "{stale}");
+    }
     let read = actor
         .call(
             &fixture,
