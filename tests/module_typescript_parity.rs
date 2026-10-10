@@ -745,3 +745,268 @@ async fn typescript_project_resolution_matches_in_process_answers() {
         }
     }
 }
+
+/// The `module typescript analyzer` child that owns the bridge.
+fn bridge_module(daemon: &mut Daemon) -> Option<Node> {
+    daemon.tree().children.into_iter().find(|node| {
+        node.command.ends_with("module typescript analyzer")
+            && node
+                .children
+                .iter()
+                .any(|(_, command)| command.contains("cli.mjs"))
+    })
+}
+
+/// `kill -9` of the bridge-hosting module while idle: neither it nor its bridge survives, the next
+/// semantic call is answered (a fresh module on the same daemon) or refused with the typed module
+/// failure, and the daemon never restarts.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER environments"]
+async fn a_killed_typescript_module_is_replaced_and_leaves_nothing() {
+    let fixture = fixture(json!([typescript_provider()]));
+    let mut daemon = Daemon::start(&fixture, &[]).await;
+    let daemon_pid = daemon.pid();
+    let mut session = Session::start(&fixture).await;
+    let text = std::fs::read_to_string(fixture.root.join("src/a.ts")).unwrap();
+    let at = text.find("greet_ts").unwrap() + 2;
+    let request = json!({"path":"src/a.ts","byte_offset":at});
+    let warm = session.call(&fixture, "ide.context", request.clone()).await;
+    assert!(
+        warm["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("mode: semantic"),
+        "{warm}"
+    );
+    let first = bridge_module(&mut daemon).expect("a module owns the bridge");
+    // SAFETY: `first.id` is the exact module identity captured as a child of this test's daemon.
+    unsafe { libc::kill(first.id.pid, libc::SIGKILL) };
+    assert!(first.id.gone().await, "the killed module is reaped");
+    let started = std::time::Instant::now();
+    let mut after;
+    loop {
+        after = session.call(&fixture, "ide.context", request.clone()).await;
+        if after["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("mode: semantic")
+            || started.elapsed() > std::time::Duration::from_secs(40)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(
+        after["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("mode: semantic"),
+        "a fresh module answered: {after}"
+    );
+    let second = bridge_module(&mut daemon).expect("a fresh module owns a bridge");
+    assert_ne!(first.id, second.id);
+    assert_eq!(daemon.pid(), daemon_pid, "the daemon never restarted");
+    let owned = daemon.tree().all();
+    session.close(&fixture).await;
+    drop(daemon);
+    for id in owned.into_iter().chain(std::iter::once(first.id)) {
+        assert!(id.gone().await, "{id:?} survived its daemon");
+    }
+}
+
+/// The module fault seam (`agent_ide_core::modules::serve::FAULT_SEAM`).
+const FAULT_SEAM: &str = "AGENT_IDE_TEST_MODULE_FAULT";
+/// The module request budget seam (`agent_ide_core::modules::router::BUDGET_SEAM`).
+const BUDGET_SEAM: &str = "AGENT_IDE_TEST_MODULE_BUDGET_MS";
+
+/// A stall past the module budget, a malformed reply and a `kill -9` in the middle of a call to
+/// the bridge-hosting module each answer that call with the typed `provider_unavailable`, and the
+/// next call starts a fresh module and answers semantically on the same daemon. Neither the failed
+/// module nor its bridge survives.
+#[tokio::test]
+#[ignore = "requires the accepted Node, bridge and tsserver environments and a test-seams build"]
+async fn typescript_analyzer_faults_are_typed_and_restart() {
+    for fault in ["stall", "malformed", "kill"] {
+        let fixture = fixture(json!([typescript_provider()]));
+        let flag = fixture.base.join(format!("module-fault-{fault}"));
+        std::fs::write(&flag, "").unwrap();
+        let seam = match fault {
+            "malformed" => format!("malformed:semantic:{}", flag.display()),
+            _ => format!("stall:semantic:{}", flag.display()),
+        };
+        let budget = if fault == "stall" { "3000" } else { "20000" };
+        let mut daemon =
+            Daemon::start(&fixture, &[(FAULT_SEAM, &seam), (BUDGET_SEAM, budget)]).await;
+        let daemon_pid = daemon.pid();
+        let mut session = Session::start(&fixture).await;
+        let text = std::fs::read_to_string(fixture.root.join("src/a.ts")).unwrap();
+        let at = text.find("greet_ts").unwrap() + 2;
+        let request = json!({"path":"src/a.ts","byte_offset":at});
+        let usages = json!({"symbol":"src/a.ts#greet_ts"});
+        let warm = session
+            .call(&fixture, "ide.outline", json!({"path":"src/a.ts"}))
+            .await;
+        assert_eq!(warm["state"], "complete", "{fault}: {warm}");
+        let first = bridge_module(&mut daemon).expect("a module owns the bridge");
+        let started = std::time::Instant::now();
+        let failed = if fault == "kill" {
+            let id = first.id;
+            let killer = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                if id.exists() {
+                    // SAFETY: `id` is the exact module identity captured as a child of this
+                    // test's daemon a moment ago.
+                    unsafe { libc::kill(id.pid, libc::SIGKILL) };
+                }
+            });
+            let reply = session.call(&fixture, "ide.symbol", usages.clone()).await;
+            killer.await.unwrap();
+            reply
+        } else {
+            session.call(&fixture, "ide.symbol", usages.clone()).await
+        };
+        let failed_after = started.elapsed();
+        assert_eq!(failed["code"], "provider_unavailable", "{fault}: {failed}");
+        match fault {
+            "stall" => assert!(
+                failed_after >= std::time::Duration::from_millis(3000)
+                    && failed_after < std::time::Duration::from_secs(15),
+                "stall answered after {failed_after:?}"
+            ),
+            _ => assert!(
+                failed_after < std::time::Duration::from_secs(10),
+                "{fault} answered after {failed_after:?}"
+            ),
+        }
+        let restarted = std::time::Instant::now();
+        let mut recovered;
+        loop {
+            recovered = session.call(&fixture, "ide.context", request.clone()).await;
+            if recovered["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("mode: semantic")
+                || restarted.elapsed() > std::time::Duration::from_secs(30)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        assert!(
+            recovered["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("mode: semantic"),
+            "{fault}: a fresh module answers semantically: {recovered}"
+        );
+        let second = bridge_module(&mut daemon).expect("a fresh module owns a bridge");
+        assert_ne!(
+            first.id, second.id,
+            "{fault}: the failed module was replaced"
+        );
+        assert!(first.id.gone().await, "{fault}: the failed module survived");
+        for (id, _) in &first.children {
+            assert!(
+                id.gone().await,
+                "{fault}: the failed module's bridge survived"
+            );
+        }
+        assert_eq!(daemon.pid(), daemon_pid, "{fault}: same daemon");
+        session.close(&fixture).await;
+        drop(daemon);
+    }
+}
+
+/// A stall past the budget, a malformed reply and a `kill -9` of the checker module each leave
+/// TypeScript's check `unavailable` naming `module_unavailable (bundled.typescript:…)`, and after
+/// an edit the next check starts a fresh module and lands, on the same daemon.
+#[tokio::test]
+#[ignore = "requires the accepted Node, bridge and tsserver environments and a test-seams build"]
+async fn typescript_checker_faults_are_typed_and_restart() {
+    for (fault, expected) in [
+        (
+            "stall",
+            "module_unavailable (bundled.typescript:request:timeout)",
+        ),
+        (
+            "malformed",
+            "module_unavailable (bundled.typescript:request:malformed)",
+        ),
+        (
+            "kill",
+            "module_unavailable (bundled.typescript:request:exited)",
+        ),
+    ] {
+        let fixture = node_fixture(false);
+        let flag = fixture.base.join(format!("module-check-{fault}"));
+        std::fs::write(&flag, "").unwrap();
+        let seam = match fault {
+            "malformed" => format!("malformed:check_plan:{}", flag.display()),
+            _ => format!("stall:check_plan:{}", flag.display()),
+        };
+        let mut daemon =
+            Daemon::start(&fixture, &[(FAULT_SEAM, &seam), (BUDGET_SEAM, "3000")]).await;
+        let daemon_pid = daemon.pid();
+        let mut session = Session::start(&fixture).await;
+        if fault == "kill" {
+            let mut first = None;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while first.is_none() && std::time::Instant::now() < deadline {
+                first = daemon.tree().module("typescript", "checker").cloned();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            let first = first.expect("the stalled checker module runs");
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            assert!(!flag.exists(), "the stall seam fired before the kill");
+            // SAFETY: `first` is the exact module identity captured as a child of this test's
+            // daemon a moment ago.
+            unsafe { libc::kill(first.id.pid, libc::SIGKILL) };
+        }
+        let failed = problems_page(&mut session, &fixture, |text| text.contains(expected)).await;
+        assert!(
+            failed.contains(expected),
+            "{fault}: the check names the fault:\n{failed}"
+        );
+        std::fs::write(
+            fixture.root.join("src/index.js"),
+            format!("export function edited_{fault}() {{\n  /** @type {{number}} */\n  const n = 'x';\n  return n;\n}}\n"),
+        )
+        .unwrap();
+        let landed = problems_page(&mut session, &fixture, |text| {
+            text.contains("typescript: ready")
+        })
+        .await;
+        assert!(
+            landed.contains("typescript: ready"),
+            "{fault}: the next check lands:\n{landed}"
+        );
+        assert_eq!(daemon.pid(), daemon_pid, "{fault}: same daemon");
+        session.close(&fixture).await;
+        drop(daemon);
+    }
+}
+
+/// Polls TypeScript's problems page until `done` holds (or 40 s pass).
+async fn problems_page(
+    session: &mut Session,
+    fixture: &Fixture,
+    done: impl Fn(&str) -> bool,
+) -> String {
+    let mut text = String::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+    while std::time::Instant::now() < deadline {
+        let reply = session
+            .call(
+                fixture,
+                "ide.context",
+                json!({"kind":"problems","language":"typescript"}),
+            )
+            .await;
+        text = reply["text"].as_str().unwrap_or_default().to_owned();
+        if done(&text) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    text
+}
