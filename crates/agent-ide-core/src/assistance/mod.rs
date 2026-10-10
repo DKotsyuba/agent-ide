@@ -40,6 +40,9 @@ pub mod worker;
 /// Defines the per-session outbox of deferred facts and its producer/carrier seam (OUTBOX-r3).
 pub mod outbox;
 
+/// Stores each session's undelivered facts, change counters and agent state (OUTBOX-r3 §5-§9).
+pub mod session_outbox;
+
 /// Tracks environment resolution changes across worktree bindings.
 mod environment;
 

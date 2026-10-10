@@ -38,6 +38,11 @@ pub const MAX_DETAIL_REF_BYTES: usize = 128;
 pub const MAX_UNDELIVERED: usize = 32;
 /// Delivered fact summaries one session keeps for `ide.inspect {}` recovery (OUTBOX §6).
 pub const MAX_HISTORY: usize = 16;
+/// Longest wait one `ide.inspect` may ask for, in milliseconds; larger values are clamped
+/// (OUTBOX §8.5). It stays under the Codex 300 s default tool timeout.
+pub const MAX_WAIT_MS: u64 = 240_000;
+/// Most references one `ide.inspect {"detail_refs": …}` call names (OUTBOX §8.5).
+pub const MAX_DETAIL_REFS: usize = 8;
 
 /// The closed set of fact kinds (OUTBOX §2). Adding a kind is a contract revision.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
