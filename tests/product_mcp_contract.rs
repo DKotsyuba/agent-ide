@@ -1982,6 +1982,11 @@ async fn binary_codex_hooks_print_emits_only_the_managed_fragment() {
                     "type": "command", "command": command, "timeout": 1}]}],
                 "PostToolUse": [{"matcher": ".*", "hooks": [{
                     "type": "command", "command": command, "timeout": 1}]}],
+                // OUTBOX-r3 §16: the turn-end hold and the compaction signal.
+                "Stop": [{"hooks": [{
+                    "type": "command", "command": command, "timeout": 330}]}],
+                "PreCompact": [{"hooks": [{
+                    "type": "command", "command": command, "timeout": 1}]}],
             }
         })
     );
@@ -21314,6 +21319,120 @@ async fn outbox_inspect_waits_lists_and_batches() {
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
+}
+
+/// Runs one Claude `Stop` hook for `actor` through the real hook command, allowing a held turn
+/// end up to `wait`; returns its stdout and how long it took.
+async fn claude_stop_hook(
+    fixture: &ProductFixture,
+    actor: &ProductActor,
+    wait: Duration,
+) -> (String, Duration) {
+    let started = tokio::time::Instant::now();
+    let mut child = claude_hook_process(&fixture.runtime, Some(actor.attachment));
+    let payload = json!({"hook_event_name":"Stop",actor.actor_field:actor.actor,
+        "stop_hook_active":false,"last_assistant_message":"done"});
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(payload.to_string().as_bytes())
+        .await
+        .unwrap();
+    input.shutdown().await.unwrap();
+    drop(input);
+    let output = tokio::time::timeout(wait, child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success() && output.stderr.is_empty());
+    (String::from_utf8(output.stdout).unwrap(), started.elapsed())
+}
+
+/// OUTBOX-r3 §8.3: a Claude turn end with nothing requested releases at once; one with its own
+/// test still running is held in the hook until the run settles and continues the turn with the
+/// `test-finished` fact and the restate sentence, exactly once across five concurrent holds,
+/// while the short hook lane keeps pairing tool calls; the next turn end releases.
+#[tokio::test]
+async fn outbox_claude_stop_hold_delivers_once_and_hooks_stay_free() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "outbox-hold").await;
+    let started = actor
+        .call_claude(&fixture, "ide.start", json!({"activation_id":"outbox"}))
+        .await;
+    let (started, _) = actor.settle_claude(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let (released, took) = claude_stop_hook(&fixture, &actor, Duration::from_secs(10)).await;
+    assert_eq!(released, "", "nothing requested: the turn ends");
+    assert!(took < Duration::from_secs(3), "{took:?}");
+
+    let run = actor
+        .call_claude(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c","sleep 8; echo held"]}),
+        )
+        .await;
+    assert!(
+        run["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("tests #1: started")),
+        "{run}"
+    );
+    let holds = futures_join5(
+        claude_stop_hook(&fixture, &actor, Duration::from_secs(60)),
+        claude_stop_hook(&fixture, &actor, Duration::from_secs(60)),
+        claude_stop_hook(&fixture, &actor, Duration::from_secs(60)),
+        claude_stop_hook(&fixture, &actor, Duration::from_secs(60)),
+        claude_stop_hook(&fixture, &actor, Duration::from_secs(60)),
+        async {
+            // While five holds wait, a native tool's Pre/Post pair still rides the hook lane.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let pre = actor
+                .claude_lifecycle_output(&fixture, "PreToolUse", "native-during-hold")
+                .await;
+            let post = actor
+                .claude_lifecycle_output(&fixture, "PostToolUse", "native-during-hold")
+                .await;
+            assert!(pre.status.success() && post.status.success());
+        },
+    )
+    .await;
+    let blocked = holds
+        .iter()
+        .filter(|(output, _)| !output.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(blocked.len(), 1, "{holds:?}");
+    let block: Value = serde_json::from_str(blocked[0].0.trim()).unwrap();
+    assert_eq!(block["decision"], "block", "{block}");
+    let reason = block["reason"].as_str().unwrap();
+    assert!(
+        reason.starts_with("<agent-ide>\ntest-finished tests #1: "),
+        "{reason}"
+    );
+    assert!(
+        reason.ends_with("then restate your complete final answer."),
+        "{reason}"
+    );
+    let (again, _) = claude_stop_hook(&fixture, &actor, Duration::from_secs(10)).await;
+    assert_eq!(again, "", "a fact is never held twice");
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Awaits five same-typed futures and one unit future concurrently, returning the five outputs.
+async fn futures_join5<T>(
+    a: impl std::future::Future<Output = T>,
+    b: impl std::future::Future<Output = T>,
+    c: impl std::future::Future<Output = T>,
+    d: impl std::future::Future<Output = T>,
+    e: impl std::future::Future<Output = T>,
+    side: impl std::future::Future<Output = ()>,
+) -> Vec<T> {
+    let (a, b, c, d, e, ()) = tokio::join!(a, b, c, d, e, side);
+    vec![a, b, c, d, e]
 }
 
 /// OUTBOX-r3 §8.2: a Claude `ide.*` reply carries a finished run's `test-finished` fact once, at

@@ -1870,8 +1870,10 @@ fn shell_single_quote(path: &Path) -> String {
 
 /// Builds the exact managed Codex `hooks.json` fragment from T29B §6 for one executable path.
 ///
-/// Both handlers use one catch-all matcher, one second timeout, and no async execution, so the
-/// pre-observation arrives before the post and the post feedback stays immediate.
+/// The tool handlers use one catch-all matcher, one second timeout, and no async execution, so the
+/// pre-observation arrives before the post and the post feedback stays immediate. `Stop` may be
+/// held by the daemon while requested results settle, so it allows 330 s (OUTBOX-r3 §8.3, §16);
+/// `PreCompact` raises the session's compaction counter (§9.1).
 fn managed_hooks_fragment(executable: &Path) -> serde_json::Value {
     let command = format!("{} codex-hook --managed", shell_single_quote(executable));
     let handler = serde_json::json!({
@@ -1882,6 +1884,8 @@ fn managed_hooks_fragment(executable: &Path) -> serde_json::Value {
         "hooks": {
             "PreToolUse": [handler],
             "PostToolUse": [handler],
+            "Stop": [{"hooks": [{"type": "command", "command": command, "timeout": 330}]}],
+            "PreCompact": [{"hooks": [{"type": "command", "command": command, "timeout": 1}]}],
         }
     })
 }
@@ -4324,6 +4328,16 @@ mod tests {
                         "timeout": 1
                     }]}],
                     "PostToolUse": [{"matcher": ".*", "hooks": [{
+                        "type": "command",
+                        "command": "'/operator tools/a'\\''b/agent-ide' codex-hook --managed",
+                        "timeout": 1
+                    }]}],
+                    "Stop": [{"hooks": [{
+                        "type": "command",
+                        "command": "'/operator tools/a'\\''b/agent-ide' codex-hook --managed",
+                        "timeout": 330
+                    }]}],
+                    "PreCompact": [{"hooks": [{
                         "type": "command",
                         "command": "'/operator tools/a'\\''b/agent-ide' codex-hook --managed",
                         "timeout": 1

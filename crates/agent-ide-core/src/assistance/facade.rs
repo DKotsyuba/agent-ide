@@ -1924,6 +1924,9 @@ pub async fn submit_hook_event(
             HookPhase::PostFailure => "post_failure",
             HookPhase::PermissionDenied => "permission_denied",
             HookPhase::PostBatch => "post_batch",
+            HookPhase::Stop => "stop",
+            HookPhase::SubagentStop => "subagent_stop",
+            HookPhase::Compaction => "compaction",
         },
         "actor_id": event.actor_id(),
         "call_id": event.optional_call_id(),
@@ -1949,8 +1952,17 @@ pub async fn submit_hook_event(
     match submit_hook_if_running(
         runtime_dir,
         request,
-        HookTransportLimits::new(128 * 1024, MAX_HOOK_BYTES, Duration::from_secs(1))
-            .expect("fixed Assistance hook limits are valid"),
+        // A held Stop waits for the daemon's hold (OUTBOX-r3 §8.3); every other hook stays short.
+        HookTransportLimits::new(
+            128 * 1024,
+            MAX_HOOK_BYTES,
+            if event.phase().holds() {
+                super::outbox::HOLD_HOOK_DEADLINE
+            } else {
+                Duration::from_secs(1)
+            },
+        )
+        .expect("fixed Assistance hook limits are valid"),
     )
     .await
     {
@@ -1972,7 +1984,9 @@ pub async fn submit_hook_event(
 /// Encodes one bounded post-hook delta in the model-context schema required by its explicit host.
 ///
 /// Pre-hooks, empty/oversized text, invalid JSON serialization, and a `PermissionDenied` outcome
-/// all produce no output. Both current host contracts use `hookSpecificOutput`, but the event name
+/// all produce no output. A held `Stop`/`SubagentStop` renders the host's turn-continuation shape
+/// `{"decision":"block","reason":…}` with the text as its reason (OUTBOX-r3 §8.3); a compaction
+/// event renders nothing. Both current host contracts use `hookSpecificOutput`, but the event name
 /// is selected from the validated host event rather than copied from arbitrary input.
 pub fn render_hook_context(event: &HookEvent, text: &str) -> Option<String> {
     if text.is_empty() || text.len() > MAX_FEEDBACK_BYTES {
@@ -1984,6 +1998,11 @@ pub fn render_hook_context(event: &HookEvent, text: &str) -> Option<String> {
         HookPhase::PostFailure => "PostToolUseFailure",
         HookPhase::PermissionDenied => return None,
         HookPhase::PostBatch => "PostToolBatch",
+        // OUTBOX-r3 §8.3: a held turn end continues with the facts as the block reason.
+        HookPhase::Stop | HookPhase::SubagentStop => {
+            return serde_json::to_string(&json!({"decision": "block", "reason": text})).ok();
+        }
+        HookPhase::Compaction => return None,
     };
     serde_json::to_string(&json!({
         "hookSpecificOutput": {

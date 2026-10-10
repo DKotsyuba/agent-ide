@@ -898,4 +898,106 @@ mod worker_tests {
             plate
         );
     }
+
+    /// OUTBOX §8.3 boundary: a turn end with a ready holding fact blocks once with the facts and
+    /// the restate sentence; the next turn end, with nothing left and nothing in flight, releases
+    /// at once and leaves the session idle.
+    #[tokio::test]
+    async fn a_hold_blocks_once_with_a_ready_fact_and_releases_without_one() {
+        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
+        let owner = bind(&bindings, "owner");
+        let handle = handle(bindings);
+        handle.shared.outbox.open(&owner);
+        assert!(finished(&handle.shared, &owner, "tests #1"));
+        let reason = handle
+            .hold_turn(&owner, false, Some("owner"))
+            .await
+            .expect("a ready holding fact blocks");
+        assert!(
+            reason.starts_with("<agent-ide>\ntest-finished tests #1: 1 passed, 1 failed"),
+            "{reason}"
+        );
+        assert!(
+            reason.ends_with(&format!("</agent-ide>\n{}", super::super::turn::RESTATE)),
+            "{reason}"
+        );
+        let started = tokio::time::Instant::now();
+        assert_eq!(handle.hold_turn(&owner, false, Some("owner")).await, None);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(
+            handle.shared.outbox.agent_state(&owner),
+            Some(super::super::super::session_outbox::AgentState::Idle)
+        );
+    }
+
+    /// A turn end with holding work in flight waits for its fact and blocks with it; work that
+    /// never settles releases at its budget end without a block.
+    #[tokio::test]
+    async fn a_hold_waits_for_in_flight_work_and_releases_at_its_deadline() {
+        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
+        let owner = bind(&bindings, "owner");
+        let handle = Arc::new(handle(bindings));
+        handle.shared.outbox.open(&owner);
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        assert!(
+            handle
+                .shared
+                .outbox
+                .begin_holding("tests #1", &owner, "tests #1", until)
+        );
+        let settle = {
+            let handle = handle.clone();
+            let owner = owner.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = handle.shared.outbox.take_holding("tests #1");
+                assert!(finished(&handle.shared, &owner, "tests #1"));
+            })
+        };
+        let reason = handle.hold_turn(&owner, false, None).await;
+        settle.await.unwrap();
+        assert!(reason.is_some_and(|reason| reason.contains("test-finished tests #1")));
+        let short = tokio::time::Instant::now() + Duration::from_millis(200);
+        assert!(
+            handle
+                .shared
+                .outbox
+                .begin_holding("tests #2", &owner, "tests #2", short)
+        );
+        let started = tokio::time::Instant::now();
+        assert_eq!(handle.hold_turn(&owner, false, None).await, None);
+        assert!(started.elapsed() >= Duration::from_millis(150));
+    }
+
+    /// A Claude subagent's turn end whose session the registry does not prove interactive (a
+    /// headless run) releases at once and keeps the fact for another carrier (OUTBOX §8.3 rule 6).
+    #[tokio::test]
+    async fn a_headless_subagent_stop_releases() {
+        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
+        let owner = bind(&bindings, "owner");
+        let handle = handle(bindings);
+        handle.shared.outbox.open(&owner);
+        assert!(finished(&handle.shared, &owner, "tests #1"));
+        assert_eq!(
+            handle
+                .hold_turn(&owner, true, Some("no-registry-session"))
+                .await,
+            None
+        );
+        assert!(handle.shared.outbox.has_undelivered(&owner, true));
+    }
+
+    /// A compaction raises the compaction counter of the session's channel (OUTBOX §9.1).
+    #[test]
+    fn compaction_raises_the_context_epoch() {
+        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
+        let owner = bind(&bindings, "owner");
+        let handle = handle(bindings);
+        handle.shared.outbox.open(&owner);
+        assert_eq!(handle.outbox().context_epoch(&owner), None);
+        handle.note_compaction(&owner);
+        assert_eq!(handle.outbox().context_epoch(&owner), Some(1));
+        handle.note_compaction(&owner);
+        assert_eq!(handle.outbox().context_epoch(&owner), Some(2));
+    }
 }

@@ -583,6 +583,9 @@ impl ProductDispatcher {
             "post_failure" => "PostToolUseFailure",
             "permission_denied" => "PermissionDenied",
             "post_batch" => "PostToolBatch",
+            "stop" => "Stop",
+            "subagent_stop" => "SubagentStop",
+            "compaction" => "PreCompact",
             _ => return Err(HostBindingCause::UnsupportedHookPhase),
         };
         let event = (|| {
@@ -692,6 +695,28 @@ impl ProductDispatcher {
                     return Ok(PeerReply::Feedback { text: block });
                 }
                 Ok(PeerReply::HookSettled {})
+            }
+            // OUTBOX-r3 §8.3, §9.1: a turn end may be held for requested results; a compaction
+            // raises the session's compaction counter. Neither pairs with a call.
+            BindingStatus::TurnObserved(binding) => {
+                let Some(worker) = &self.worker else {
+                    return Ok(PeerReply::HookObserved {});
+                };
+                if event.phase() == HookPhase::Compaction {
+                    worker.note_compaction(&binding);
+                    return Ok(PeerReply::HookObserved {});
+                }
+                match worker
+                    .hold_turn(
+                        &binding,
+                        event.phase() == HookPhase::SubagentStop,
+                        event.session_id(),
+                    )
+                    .await
+                {
+                    Some(text) => Ok(PeerReply::Feedback { text }),
+                    None => Ok(PeerReply::NativeHookObserved {}),
+                }
             }
             BindingStatus::NativeObserved(binding) => {
                 if let Some(worker) = &self.worker {

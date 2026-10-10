@@ -279,6 +279,7 @@ pub fn project_hook_payload(host_kind: HostKind, payload: &[u8]) -> Option<Vec<u
             "agent_id",
             "tool_use_id",
             "tool_name",
+            "source",
         ]
         .into_iter()
         .chain((host_kind == HostKind::Claude).then_some("agent_type"))
@@ -327,7 +328,10 @@ pub async fn run(runtime_dir: &Path, attachment: Option<String>, host_kind: Host
 ///
 /// `None` reads stdin itself for legacy hooks; managed Claude supplies already-read bytes so its
 /// worktree can be resolved first. Returns whether a valid event reached the daemon. Invalid
-/// input, transport failures, and expiry fail open with `false`.
+/// input, transport failures, and expiry fail open with `false`. A parsed `Stop`/`SubagentStop`
+/// may wait for the daemon's bounded hold until
+/// [`HOLD_HOOK_DEADLINE`](super::outbox::HOLD_HOOK_DEADLINE) after parsing, past `deadline`
+/// (OUTBOX-r3 §8.3); reading and parsing always stay inside `deadline`.
 pub async fn run_with_payload(
     runtime_dir: &Path,
     attachment: Option<String>,
@@ -338,7 +342,7 @@ pub async fn run_with_payload(
     let fallback_attachment = attachment.clone();
     let valid_boundary = Arc::new(AtomicBool::new(false));
     let valid_for_hook = Arc::clone(&valid_boundary);
-    let hook = tokio::time::timeout_at(deadline, async {
+    let parsed = tokio::time::timeout_at(deadline, async {
         let attachment = attachment?;
         TrustedTransport::from_host_ingress("hook", "hook", attachment.clone())?;
         let payload = if let Some(payload) = payload {
@@ -360,14 +364,31 @@ pub async fn run_with_payload(
         }
         .ok()?;
         valid_for_hook.store(true, Ordering::Release);
-        let correlation = event.optional_call_id().unwrap_or("post-tool-batch");
-        let host = TrustedTransport::from_host_ingress(correlation, correlation, attachment)?;
-        let outcome = submit_hook_event(runtime_dir, &host, &event).await;
-        Some((event, outcome))
+        Some((event, attachment))
     })
     .await
     .ok()
     .flatten();
+    let hook = match parsed {
+        Some((event, attachment)) => {
+            let submit_deadline = if event.phase().holds() {
+                deadline.max(tokio::time::Instant::now() + super::outbox::HOLD_HOOK_DEADLINE)
+            } else {
+                deadline
+            };
+            tokio::time::timeout_at(submit_deadline, async {
+                let correlation = event.optional_call_id().unwrap_or("post-tool-batch");
+                let host =
+                    TrustedTransport::from_host_ingress(correlation, correlation, attachment)?;
+                let outcome = submit_hook_event(runtime_dir, &host, &event).await;
+                Some((event, outcome))
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+        None => None,
+    };
     let unavailable = matches!(hook, Some((_, HookIngressOutcome::Unavailable)))
         || (hook.is_none() && valid_boundary.load(Ordering::Acquire));
     let submitted = matches!(
@@ -394,22 +415,43 @@ pub async fn run_with_payload(
 /// is discovered solely from the payload identity (root session `session_id`, actor
 /// `agent_id.unwrap_or(session_id)`) against the fixed private rendezvous records, so a missing,
 /// ambiguous, stale, contended, or unusable route exits successfully with no output exactly like a
-/// malformed, oversized, or late payload does. Only `PreToolUse` and `PostToolUse` are accepted;
-/// every other phase exits silently. The single 250 ms deadline starts before stdin is read and
-/// covers reading, parsing, discovery, connect and reply; root resolution and the blocking
-/// filesystem discovery run on a detached thread reporting through a oneshot, so the deadline
-/// abandons the lookup without joining it and the process still exits at the boundary even when
-/// the filesystem itself stalls. Never retries, starts a daemon, runs Git, or sends the legacy
-/// fallback marker.
+/// malformed, oversized, or late payload does. `PreToolUse`, `PostToolUse`, `Stop`,
+/// `SubagentStop` and `PreCompact` are accepted; every other phase exits silently. The single
+/// 250 ms deadline starts before stdin is read and covers reading, parsing, discovery, connect and
+/// reply — except that a `Stop`/`SubagentStop`, once parsed, may wait for the daemon's bounded
+/// hold up to [`HOLD_HOOK_DEADLINE`](super::outbox::HOLD_HOOK_DEADLINE) (OUTBOX-r3 §8.3). Root
+/// resolution and the blocking filesystem discovery run on a detached thread reporting through a
+/// oneshot, so the deadline abandons the lookup without joining it and the process still exits at
+/// the boundary even when the filesystem itself stalls. Never retries, starts a daemon, runs Git,
+/// or sends the legacy fallback marker.
 pub async fn run_managed() {
-    let deadline = tokio::time::Instant::now() + TOTAL_DEADLINE;
-    let hook = tokio::time::timeout_at(deadline, async {
+    let mut deadline = tokio::time::Instant::now() + TOTAL_DEADLINE;
+    let read_deadline = deadline;
+    let parsed = tokio::time::timeout_at(read_deadline, async {
         let payload = read_projected_stdin(HostKind::Codex).await?;
         if payload.len() > MAX_INPUT_BYTES as usize {
             return None;
         }
-        let event = parse_hook_event(&payload).ok()?;
-        if !matches!(event.phase(), HookPhase::Pre | HookPhase::Post) {
+        parse_hook_event(&payload).ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(event) = parsed else {
+        return;
+    };
+    if event.phase().holds() {
+        deadline = tokio::time::Instant::now() + super::outbox::HOLD_HOOK_DEADLINE;
+    }
+    let hook = tokio::time::timeout_at(deadline, async {
+        if !matches!(
+            event.phase(),
+            HookPhase::Pre
+                | HookPhase::Post
+                | HookPhase::Stop
+                | HookPhase::SubagentStop
+                | HookPhase::Compaction
+        ) {
             return None;
         }
         let identity = CodexRouteIdentity::new(event.session_id()?, event.actor_id()).ok()?;
