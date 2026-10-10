@@ -73,17 +73,19 @@ pub mod languages {
 
     /// Languages whose bundled module ships default-on in this release; the others compute in
     /// process. `AGENT_IDE_LANGUAGE_MODE=<id>=in_process` sends a shipped one back.
-    pub const SHIPPED_MODULES: [&str; 4] = ["python", "typescript", "html", "css"];
+    pub const SHIPPED_MODULES: [&str; 5] = ["python", "rust", "typescript", "html", "css"];
 
     /// Each language's effect recipes: the only processes its module may ask the core to run.
-    pub static RECIPES: [(&str, &[agent_ide_core::modules::payload::EffectRecipe]); 2] = [
+    pub static RECIPES: [(&str, &[agent_ide_core::modules::payload::EffectRecipe]); 3] = [
         ("python", agent_ide_lang_python::module::RECIPES),
         ("typescript", agent_ide_lang_typescript::module::RECIPES),
+        ("rust", agent_ide_lang_rust::module::RECIPES),
     ];
 
     /// Each language's module environment: the only variables its cleared module process (and
     /// `hello.config.env`) receives from the daemon.
-    pub static MODULE_ENV: [(&str, &[&str]); 1] = [("rust", &["AGENT_IDE_RUST_TOOLCHAIN_DIR"])];
+    pub static MODULE_ENV: [(&str, &[&str]); 1] =
+        [("rust", &agent_ide_lang_rust::module::MODULE_ENV)];
 
     /// Each language's static install roots its interactive recipes may name (Python's standard
     /// interpreter prefixes).
@@ -99,9 +101,12 @@ pub mod languages {
     ];
 
     /// Each language's host-side resolution of a worktree's accepted environments (Python's
-    /// selected, pinned or discovered environments and their installation prefixes).
-    pub static ENVIRONMENT_ROOTS: [(&str, agent_ide_core::modules::recipe::EnvironmentRoots); 1] =
-        [("python", agent_ide_lang_python::environment::accepted_roots)];
+    /// selected, pinned or discovered environments and their installation prefixes; Rust's pinned
+    /// test toolchain).
+    pub static ENVIRONMENT_ROOTS: [(&str, agent_ide_core::modules::recipe::EnvironmentRoots); 2] = [
+        ("python", agent_ide_lang_python::environment::accepted_roots),
+        ("rust", agent_ide_lang_rust::module::toolchain_roots),
+    ];
 
     /// Registers every bundled language for this process. Idempotent; call it before parsing a
     /// launcher configuration or mapping any path to a language.

@@ -6,6 +6,8 @@
 
 use std::{any::Any, collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
+use agent_ide_core::modules::launch::ModuleExecutable;
+
 use serde::Deserialize;
 
 use agent_ide_core::{
@@ -28,8 +30,8 @@ use agent_ide_core::{
 };
 
 use crate::profile::{
-    RustProfile, RustProfileError, RustProfileIdentity, RustProtocolChild, RustView,
-    RustViewAdmission, RustViews, RustWorktree,
+    RustCompatibilityKey, RustProfile, RustProfileError, RustProfileIdentity, RustProtocolChild,
+    RustView, RustViewAdmission, RustViews, RustWorktree,
 };
 
 /// rust-analyzer declaration fields beyond the common ones.
@@ -160,6 +162,181 @@ impl LanguageServer for RustServer {
     }
 }
 
+/// How one binding's analyzer starts.
+enum Start {
+    /// rust-analyzer as a direct daemon child, from the measured in-process profile.
+    InProcess(RustProfile),
+    /// rust-analyzer inside the Rust module, which builds its profile from the granted settings.
+    Module {
+        /// The pinned module executable.
+        executable: Arc<ModuleExecutable>,
+        /// The declaration's settings in the allocated namespace.
+        settings: crate::module::RustProviderSettings,
+        /// The accepted inputs (module digest and settings) the restart policy is keyed by.
+        inputs: String,
+    },
+}
+
+/// The measured in-process analyzer profile of `launch` in `cache_namespace`.
+fn profile_of(launch: &ProviderLaunch, cache_namespace: &str) -> Result<RustProfile, FailureCode> {
+    let options = launch
+        .options::<RustLaunchOptions>()
+        .ok_or(FailureCode::ExecutionProfile)?;
+    RustProfile::new(RustProfileIdentity {
+        binary: launch.executable.path.clone(),
+        rust_analyzer_version: launch.executable.identity.clone(),
+        cargo: options
+            .cargo
+            .as_ref()
+            .ok_or(FailureCode::ExecutionProfile)?
+            .path
+            .clone(),
+        cargo_home: options.cargo_home.clone(),
+        cargo_version: options
+            .cargo_version
+            .clone()
+            .ok_or(FailureCode::ExecutionProfile)?,
+        rustc: options
+            .rustc
+            .as_ref()
+            .ok_or(FailureCode::ExecutionProfile)?
+            .path
+            .clone(),
+        rustc_version: options
+            .rustc_version
+            .clone()
+            .ok_or(FailureCode::ExecutionProfile)?,
+        rustup_toolchain: launch.toolchain.clone(),
+        configuration: RustServer.effective_configuration().into(),
+        trust: launch.trust.clone(),
+        transport: "stdio-v1".into(),
+        cache_namespace: cache_namespace.to_owned(),
+    })
+    .map_err(|_| FailureCode::ExecutionProfile)
+}
+
+/// Roots the core admits for the paths of the module-started analyzer's environment beside the
+/// worktree and the accepted files' directories: the private namespace, the declared Cargo home,
+/// the user home (its `.cargo`) and the system tool directories.
+pub(crate) fn provider_roots(settings: &crate::module::RustProviderSettings) -> Vec<PathBuf> {
+    let mut roots = vec![PathBuf::from(&settings.cache_namespace)];
+    roots.extend(settings.cargo_home.clone());
+    roots.extend(agent_ide_core::userhome::user_home());
+    roots.extend(["/usr/bin", "/bin"].map(PathBuf::from));
+    roots
+}
+
+/// Counts one failure of a Rust analyzer module started with `inputs` against the shared restart
+/// policy (`exited` when no typed failure is known).
+fn record_module_failure(
+    worktree: &std::path::Path,
+    inputs: &str,
+    failure: Option<agent_ide_core::modules::contract::ModuleUnavailable>,
+) {
+    agent_ide_core::modules::analyzer::record_failure(
+        crate::DESCRIPTOR.id,
+        worktree,
+        inputs,
+        &module_failure(failure),
+    );
+}
+
+/// The typed failure of a module session that could not open: the module's own when it gave
+/// one, else a `hello` failure (`timeout` when the exchange ran out of time, `exited` otherwise).
+fn hello_failure(error: &std::io::Error) -> agent_ide_core::modules::contract::ModuleUnavailable {
+    use agent_ide_core::modules::contract::{Cause, ModuleUnavailable, Stage};
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ModuleUnavailable>())
+        .cloned()
+        .unwrap_or_else(|| ModuleUnavailable {
+            stage: Stage::Hello,
+            cause: if error.kind() == std::io::ErrorKind::TimedOut {
+                Cause::Timeout
+            } else {
+                Cause::Exited
+            },
+            ..module_failure(None)
+        })
+}
+
+/// The Rust analyzer module's typed failure, `request`/`exited` when none was observed.
+fn module_failure(
+    failure: Option<agent_ide_core::modules::contract::ModuleUnavailable>,
+) -> agent_ide_core::modules::contract::ModuleUnavailable {
+    use agent_ide_core::modules::contract::{Cause, ModuleId, ModuleUnavailable, Role, Stage};
+    failure.unwrap_or(ModuleUnavailable {
+        module_id: ModuleId::bundled(crate::DESCRIPTOR.id),
+        module_version: env!("CARGO_PKG_VERSION").to_owned(),
+        role: Role::Analyzer,
+        stage: Stage::Request,
+        cause: Cause::Exited,
+        instance: None,
+        retry_after_ms: None,
+    })
+}
+
+/// Opens the analyzer session on the started child's pipes: directly on rust-analyzer, or on the
+/// Rust module that hosts it (`hello` grants only the declaration's accepted files, the admitted
+/// roots and the settings; the daemon keeps only the static session shape).
+async fn open_live(
+    start: &Start,
+    launch: &ProviderLaunch,
+    stdout: tokio::process::ChildStdout,
+    stdin: tokio::process::ChildStdin,
+    source: &SourceObservation,
+    generation: ViewGeneration,
+) -> std::io::Result<LiveSession> {
+    let (executable, settings) = match start {
+        Start::InProcess(profile) => {
+            return LiveSession::open(
+                stdout,
+                stdin,
+                source.worktree().clone(),
+                source.authority_epoch(),
+                generation,
+                ProviderSettings::new(profile.clone()),
+                Duration::from_secs(30),
+            )
+            .await;
+        }
+        Start::Module {
+            executable,
+            settings,
+            ..
+        } => (executable, settings),
+    };
+    let options = launch
+        .options::<RustLaunchOptions>()
+        .ok_or_else(|| std::io::Error::other("rust provider declaration"))?;
+    let accepted = std::iter::once(&launch.executable)
+        .chain(options.cargo.iter())
+        .chain(options.rustc.iter())
+        .map(|file| (file.path.clone(), file.blake3.clone()))
+        .collect();
+    let offer = agent_ide_core::modules::analyzer::analyzer_offer(
+        executable,
+        crate::DESCRIPTOR.id,
+        generation.view,
+        source.worktree(),
+        accepted,
+        provider_roots(settings),
+        Duration::from_secs(30),
+        serde_json::to_value(settings).map_err(std::io::Error::other)?,
+    );
+    agent_ide_core::modules::analyzer::open_session(
+        stdout,
+        stdin,
+        offer,
+        source.worktree().clone(),
+        source.authority_epoch(),
+        generation,
+        ProviderSettings::new(crate::profile::RustModuleSession),
+        agent_ide_core::modules::router::budget_or(Duration::from_secs(30)),
+    )
+    .await
+}
+
 /// Names the failed initialize stage on the job's failure reply: a handshake that exhausted its
 /// 30-second bound reports the timeout; any other initialize failure (a server that exited or
 /// answered invalidly before readiness) reports the failed initialize. Closed stage words only.
@@ -182,6 +359,9 @@ struct RustLive {
     view: RustView,
     /// Transport driver and synchronized document state.
     live: LiveSession,
+    /// The accepted inputs of a module-hosted session and its worktree, against which its
+    /// failures count.
+    module_inputs: Option<(String, PathBuf)>,
 }
 
 /// Exclusive Rust generations and every binding's retained analyzer session.
@@ -210,56 +390,104 @@ impl RustBackend {
         source: &SourceObservation,
     ) -> Result<(), FailureCode> {
         let binding = job.binding().clone();
+        let worktree_path = source.worktree().worktree_path();
         if let Some(entry) = self.live.get(&binding) {
             if entry.live.is_alive() {
                 return Ok(());
             }
-            self.release(host, &binding).await;
+            // A module that died — while a call waited for its analyzer to load, or idle — counts
+            // against the shared restart policy, and the demand that finds it dead is settled with
+            // its typed fault (never silently answered by a restarted one); the next demand
+            // restarts it within the policy.
+            if entry.module_inputs.is_some() {
+                let failure = module_failure(entry.live.module_unavailable());
+                self.release(host, &binding, true).await;
+                job.set_stage_failure(
+                    &FailureCode::ProviderUnavailable,
+                    &format!("rust: {failure}"),
+                );
+                return Err(FailureCode::ProviderUnavailable);
+            }
+            self.release(host, &binding, true).await;
         }
+        // In module mode the Rust module is the process the core admits; it plans, verifies and
+        // starts rust-analyzer from the granted files. An unpinnable module is a typed refusal,
+        // never a silent in-process fallback.
+        let module = match agent_ide_core::modules::calls::module_executable(crate::LANGUAGE) {
+            None => None,
+            Some(Ok(executable)) => Some(executable),
+            Some(Err(failure)) => {
+                job.set_stage_failure(
+                    &FailureCode::ProviderUnavailable,
+                    &format!("rust: {failure}"),
+                );
+                return Err(FailureCode::ProviderUnavailable);
+            }
+        };
         let authority = host.authority(&binding).await?;
         let cache_namespace = host.cache_namespace(&binding, &authority, launch, &launch.trust)?;
-        let options = launch
-            .options::<RustLaunchOptions>()
-            .ok_or(FailureCode::ExecutionProfile)?;
-        let profile = RustProfile::new(RustProfileIdentity {
-            binary: launch.executable.path.clone(),
-            rust_analyzer_version: launch.executable.identity.clone(),
-            cargo: options
-                .cargo
-                .as_ref()
-                .ok_or(FailureCode::ExecutionProfile)?
-                .path
-                .clone(),
-            cargo_home: options.cargo_home.clone(),
-            cargo_version: options
-                .cargo_version
-                .clone()
-                .ok_or(FailureCode::ExecutionProfile)?,
-            rustc: options
-                .rustc
-                .as_ref()
-                .ok_or(FailureCode::ExecutionProfile)?
-                .path
-                .clone(),
-            rustc_version: options
-                .rustc_version
-                .clone()
-                .ok_or(FailureCode::ExecutionProfile)?,
-            rustup_toolchain: launch.toolchain.clone(),
-            configuration: RustServer.effective_configuration().into(),
-            trust: launch.trust.clone(),
-            transport: "stdio-v1".into(),
-            cache_namespace,
-        })
-        .map_err(|_| FailureCode::ExecutionProfile)?;
         let scoped = server::execution_authority(&authority)?;
         let worktree = RustWorktree::new(authority.worktree().clone(), scoped)
             .map_err(|_| FailureCode::WorkspaceAuthority)?;
-        let command = profile
-            .command(&worktree)
-            .map_err(|_| FailureCode::ExecutionProfile)?;
+        let start = match module {
+            None => Start::InProcess(profile_of(launch, &cache_namespace)?),
+            Some(executable) => {
+                let settings =
+                    crate::module::RustProviderSettings::from_launch(launch, &cache_namespace)
+                        .ok_or(FailureCode::ExecutionProfile)?;
+                let inputs = format!(
+                    "{}:{}",
+                    executable.digest.to_hex(),
+                    serde_json::json!(settings)
+                );
+                if let Err(failure) = agent_ide_core::modules::analyzer::start_permit(
+                    crate::DESCRIPTOR.id,
+                    worktree_path,
+                    &inputs,
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                )
+                .await
+                {
+                    job.set_stage_failure(
+                        &FailureCode::ProviderUnavailable,
+                        &format!("rust: {failure}"),
+                    );
+                    return Err(FailureCode::ProviderUnavailable);
+                }
+                Start::Module {
+                    executable,
+                    settings,
+                    inputs,
+                }
+            }
+        };
+        let (command, program, key) = match &start {
+            Start::InProcess(profile) => (
+                profile
+                    .command(&worktree)
+                    .map_err(|_| FailureCode::ExecutionProfile)?,
+                launch.executable.clone(),
+                profile.compatibility_key(&worktree),
+            ),
+            Start::Module {
+                executable, inputs, ..
+            } => (
+                agent_ide_core::modules::analyzer::analyzer_command(
+                    executable,
+                    crate::DESCRIPTOR.id,
+                    authority.worktree(),
+                )
+                .ok_or(FailureCode::ExecutionProfile)?,
+                AcceptedExecutable {
+                    path: executable.path.clone(),
+                    identity: "agent-ide-module".to_owned(),
+                    blake3: executable.digest.to_hex().to_string(),
+                },
+                RustCompatibilityKey::module(inputs, &worktree),
+            ),
+        };
         let request = host
-            .execution_request(&*job, &authority, command, &launch.executable)
+            .execution_request(&*job, &authority, command, &program)
             .await?;
         let active = host.active(&binding)?;
         // The shared controller guard is confined to this block: it is a `std` mutex, so it must
@@ -269,8 +497,8 @@ impl RustBackend {
             let mut admission = admission
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match self.views.request(
-                &profile,
+            match self.views.request_keyed(
+                key,
                 &worktree,
                 host.registry(),
                 &mut admission,
@@ -315,15 +543,7 @@ impl RustBackend {
         };
         let opened = match child.take_pipes() {
             Some((stdin, stdout)) => {
-                let open = LiveSession::open(
-                    stdout,
-                    stdin,
-                    source.worktree().clone(),
-                    source.authority_epoch(),
-                    generation,
-                    ProviderSettings::new(profile),
-                    Duration::from_secs(30),
-                );
+                let open = open_live(&start, launch, stdout, stdin, source, generation);
                 tokio::pin!(open);
                 // Stop or shutdown must be able to interrupt a handshake the server never answers.
                 tokio::select! {
@@ -333,19 +553,42 @@ impl RustBackend {
             }
             None => Err(std::io::Error::other("protocol pipes already taken")),
         };
+        let module_inputs = match start {
+            Start::Module { inputs, .. } => Some((inputs, worktree_path.to_path_buf())),
+            Start::InProcess(_) => None,
+        };
         match opened {
             Ok(live) => {
-                self.live.insert(binding, RustLive { child, view, live });
+                self.live.insert(
+                    binding,
+                    RustLive {
+                        child,
+                        view,
+                        live,
+                        module_inputs,
+                    },
+                );
                 Ok(())
             }
             Err(error) => {
                 self.reap(host, &binding, child, view).await;
                 if job.cancelled() {
-                    Err(FailureCode::Cancelled)
-                } else {
-                    initialize_stage(job, &error);
-                    Err(FailureCode::ProviderUnavailable)
+                    return Err(FailureCode::Cancelled);
                 }
+                match &module_inputs {
+                    // The module's typed failure names the stage and cause and counts against the
+                    // restart policy.
+                    Some((inputs, _)) => {
+                        let failure = hello_failure(&error);
+                        record_module_failure(worktree_path, inputs, Some(failure.clone()));
+                        job.set_stage_failure(
+                            &FailureCode::ProviderUnavailable,
+                            &format!("rust: {failure}"),
+                        );
+                    }
+                    None => initialize_stage(job, &error),
+                }
+                Err(FailureCode::ProviderUnavailable)
             }
         }
     }
@@ -431,14 +674,23 @@ impl RustBackend {
             Ok(context) => Ok(context),
             Err(_) => {
                 // A failed or cancelled exchange retires the session; the next request starts a
-                // fresh one.
-                self.release(host, &binding).await;
+                // fresh one. A module's typed fault names it (`module_unavailable (…)`) and
+                // counts against the restart policy.
+                let fault = self
+                    .live
+                    .get(&binding)
+                    .filter(|entry| entry.module_inputs.is_some())
+                    .map(|entry| module_failure(entry.live.module_unavailable()).to_string());
+                self.release(host, &binding, !job.cancelled()).await;
                 if job.cancelled() {
                     Err(FailureCode::Cancelled)
                 } else {
                     job.set_stage_failure(
                         &FailureCode::ProviderUnavailable,
-                        "rust: request failed",
+                        &fault.map_or_else(
+                            || "rust: request failed".to_owned(),
+                            |fault| format!("rust: {fault}"),
+                        ),
                     );
                     Err(FailureCode::ProviderUnavailable)
                 }
@@ -453,9 +705,23 @@ impl RustBackend {
         result
     }
 
-    /// Shuts down and reaps `binding`'s Rust session, if any.
-    async fn release(&mut self, host: &mut dyn ProviderHost, binding: &BindingRef) {
-        if let Some(RustLive { child, view, live }) = self.live.remove(binding) {
+    /// Shuts down and reaps `binding`'s Rust session, if any. A module session that died
+    /// (not a controlled stop or a cancellation, `count` false) counts once against the shared
+    /// restart policy, whichever path retires it.
+    async fn release(&mut self, host: &mut dyn ProviderHost, binding: &BindingRef, count: bool) {
+        if let Some(RustLive {
+            child,
+            view,
+            live,
+            module_inputs,
+        }) = self.live.remove(binding)
+        {
+            if count
+                && !live.is_alive()
+                && let Some((inputs, worktree)) = &module_inputs
+            {
+                record_module_failure(worktree, inputs, live.module_unavailable());
+            }
             let _ = live.shutdown().await;
             self.reap(host, binding, child, view).await;
         }
@@ -528,7 +794,7 @@ impl ServerBackend for RustBackend {
         host: &'a mut dyn ProviderHost,
         binding: &'a BindingRef,
     ) -> BoxFuture<'a, ()> {
-        Box::pin(self.release(host, binding))
+        Box::pin(self.release(host, binding, true))
     }
 
     /// Bindings with a retained analyzer session.

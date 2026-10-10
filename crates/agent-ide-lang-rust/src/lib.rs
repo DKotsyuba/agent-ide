@@ -10,6 +10,7 @@ pub mod backend;
 pub mod checks;
 mod home;
 pub(crate) mod lexical;
+pub mod module;
 mod module_graph;
 pub mod profile;
 pub mod support;

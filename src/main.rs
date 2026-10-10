@@ -649,7 +649,7 @@ async fn serve_bundled_module(language: &str, role: &str) -> ExitCode {
     let support = SupportServer::new(registered, env!("CARGO_PKG_VERSION"));
     let served = match language {
         "python" => agent_ide_lang_python::module::serve(role).await,
-        "rust" => serve_stdio(support, role).await,
+        "rust" => agent_ide_lang_rust::module::serve(role).await,
         "typescript" => agent_ide_lang_typescript::module::serve(role).await,
         "html" => serve_stdio(support, role).await,
         "css" => serve_stdio(support, role).await,

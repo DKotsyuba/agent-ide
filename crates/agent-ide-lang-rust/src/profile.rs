@@ -259,6 +259,19 @@ impl RustProfile {
         ])
     }
 
+    /// The analyzer's complete cleared environment as text, for a launch the module plans itself.
+    pub(crate) fn launch_environment(&self) -> std::collections::BTreeMap<String, String> {
+        self.environment()
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect()
+    }
+
     /// Produces the exclusive backend identity, including the canonical worktree incarnation.
     pub fn compatibility_key(&self, worktree: &RustWorktree) -> RustCompatibilityKey {
         let mut identity = String::new();
@@ -423,21 +436,73 @@ impl agent_ide_core::intelligence::session::SessionProfile for RustProfile {
         &self,
         params: serde_json::Value,
     ) -> Result<agent_ide_core::intelligence::session::ProviderStatus, serde_json::Error> {
-        use agent_ide_core::intelligence::session::ProviderStatus;
-        let status: RustStatus = serde_json::from_value(params)?;
-        Ok(match (status.quiescent, status.health) {
-            (true, RustHealth::Ok | RustHealth::Warning) => ProviderStatus::Ready,
-            (true, RustHealth::Error) => ProviderStatus::Failed,
-            (false, _) => ProviderStatus::Busy,
-        })
+        rust_status(params)
     }
 
     /// Opens `.rs` files as `rust`; everything else stays `plaintext`.
     fn language_id(&self, path: &Path) -> &'static str {
-        match path.extension().and_then(|extension| extension.to_str()) {
-            Some("rs") => "rust",
-            _ => "plaintext",
-        }
+        rust_language_id(path)
+    }
+}
+
+/// Quiescent with health `ok` or `warning` is ready, quiescent with `error` failed, anything not
+/// quiescent still busy; params that are not the accepted status shape fail decoding.
+fn rust_status(
+    params: serde_json::Value,
+) -> Result<agent_ide_core::intelligence::session::ProviderStatus, serde_json::Error> {
+    use agent_ide_core::intelligence::session::ProviderStatus;
+    let status: RustStatus = serde_json::from_value(params)?;
+    Ok(match (status.quiescent, status.health) {
+        (true, RustHealth::Ok | RustHealth::Warning) => ProviderStatus::Ready,
+        (true, RustHealth::Error) => ProviderStatus::Failed,
+        (false, _) => ProviderStatus::Busy,
+    })
+}
+
+/// Opens `.rs` files as `rust`; everything else stays `plaintext`.
+fn rust_language_id(path: &Path) -> &'static str {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("rs") => "rust",
+        _ => "plaintext",
+    }
+}
+
+/// The daemon's side of a session whose rust-analyzer runs in the Rust module: only the static
+/// session shape (readiness method, language ids). The module builds the real [`RustProfile`]
+/// (measured executables, home and Cargo home, linked projects, initialize options and the
+/// accepted server identity) from the settings the core grants it, so nothing of that is
+/// computed in the daemon.
+#[derive(Debug)]
+pub struct RustModuleSession;
+
+impl agent_ide_core::intelligence::session::SessionProfile for RustModuleSession {
+    /// Never sent: the module configures its own server.
+    fn workspace_configuration(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
+
+    /// Never consulted: the module checks the server identity it started.
+    fn accepts_server(&self, _info: Option<&async_lsp::lsp_types::ServerInfo>) -> bool {
+        false
+    }
+
+    /// Readiness arrives as `experimental/serverStatus`, as in process.
+    fn status_method(&self) -> Option<&'static str> {
+        Some(RUST_STATUS_METHOD)
+    }
+
+    /// Quiescent with health `ok` or `warning` is ready, quiescent with `error` failed, anything
+    /// not quiescent still busy; params that are not the accepted status shape fail decoding.
+    fn status(
+        &self,
+        params: serde_json::Value,
+    ) -> Result<agent_ide_core::intelligence::session::ProviderStatus, serde_json::Error> {
+        rust_status(params)
+    }
+
+    /// Opens `.rs` files as `rust`; everything else stays `plaintext`.
+    fn language_id(&self, path: &Path) -> &'static str {
+        rust_language_id(path)
     }
 }
 
@@ -449,6 +514,17 @@ impl RustCompatibilityKey {
     /// Returns the stable opaque backend identity passed to Execution's lease registry.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The identity of a module-hosted analyzer: its accepted `inputs` (module digest and granted
+    /// settings) and the canonical worktree incarnation.
+    pub fn module(inputs: &str, worktree: &RustWorktree) -> Self {
+        let identity = format!(
+            "module\0{inputs}\0{}\0{}\0",
+            worktree.worktree.id(),
+            worktree.worktree.incarnation()
+        );
+        Self(blake3::hash(identity.as_bytes()).to_hex().to_string())
     }
 }
 
@@ -582,6 +658,19 @@ impl RustViews {
         class: AdmissionClass,
     ) -> RustViewAdmission {
         let key = profile.compatibility_key(worktree);
+        self.request_keyed(key, worktree, registry, admission, owner, class)
+    }
+
+    /// [`Self::request`] for an already computed compatibility `key`.
+    pub fn request_keyed(
+        &mut self,
+        key: RustCompatibilityKey,
+        worktree: &RustWorktree,
+        registry: &mut ProviderLeaseRegistry,
+        admission: &mut AdmissionController,
+        owner: OwnerId,
+        class: AdmissionClass,
+    ) -> RustViewAdmission {
         match registry.request(
             admission,
             owner,

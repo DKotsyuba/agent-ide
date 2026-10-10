@@ -63,11 +63,12 @@ async fn hidden_module_mode_serves_the_placeholder_contract() {
             )
             .await
             .unwrap();
-        // A module that hosts its provider (Python's Pyright, TypeScript's bridge) and was granted none answers the
-        // provider capability with its typed dependency failure, whatever tools the machine
-        // has; the others do not host one yet and answer `unsupported`.
+        // A module that hosts its provider (Python's Pyright, Rust's rust-analyzer, TypeScript's
+        // bridge) and was granted none answers the provider capability with its typed dependency
+        // failure, whatever tools the machine has; the others do not host one yet and answer
+        // `unsupported`.
         match language {
-            "python" | "typescript" => assert!(
+            "python" | "rust" | "typescript" => assert!(
                 matches!(
                     answer.outcome,
                     Outcome::Error(ref error) if error.code == ErrorCode::Unavailable
