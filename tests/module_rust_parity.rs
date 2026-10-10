@@ -735,15 +735,14 @@ async fn rust_module_measure() {
             }
             measured.insert(name.into(), json!(values));
         }
-        let tree = daemon.tree();
+        // Every process of the daemon's tree at any depth (a module's rust-analyzer and its
+        // proc-macro server are third-level descendants), so both modes are counted alike.
+        let _ = daemon.tree();
         let mut memory = vec![
             json!({"process":"daemon","rss_kib":rss_kib(ProcessIdentity::of(daemon.pid()).unwrap().0)}),
         ];
-        for node in &tree.children {
-            memory.push(json!({"process":node.command,"rss_kib":rss_kib(node.id)}));
-            for (id, command) in &node.children {
-                memory.push(json!({"process":format!("  {command}"),"rss_kib":rss_kib(*id)}));
-            }
+        for (id, command) in descendants(daemon.pid()) {
+            memory.push(json!({"process":command,"rss_kib":rss_kib(id)}));
         }
         measured.insert("rss".into(), json!(memory));
         report.insert(mode.into(), Value::Object(measured));
@@ -968,13 +967,27 @@ async fn rust_analyzer_crash_loop_exhausts_the_restart_budget() {
 }
 
 /// One transcript entry with the Rust masks ([`mask_counters`], [`mask_run_variance`]) applied to
-/// its generated metadata rows only ([`parity::metadata_rows`]): the call line with its arguments
-/// and every returned source row stay byte-for-byte.
+/// generated rows only: the shared harness's metadata rows ([`parity::metadata_rows`]), a context
+/// reply's header rows before its source body, the start card's `modules:` row and a recorded
+/// edit's structured-fields row ([`edit_entry`]). The call line with its arguments and every
+/// returned source row stay byte-for-byte.
 fn masked_entry(entry: &str) -> String {
-    parity::metadata_rows(entry, entry.starts_with("ide.context "))
+    let context = entry.starts_with("ide.context ");
+    let start = entry.starts_with("ide.start ");
+    let edit = entry.starts_with("ide.edit ");
+    let mut header = context;
+    parity::metadata_rows(entry, context)
         .enumerate()
         .map(|(index, (row, metadata))| {
-            if index == 0 || !metadata {
+            let in_header = header && index > 0;
+            if context && row.trim_end_matches(['\r', '\n']).is_empty() {
+                header = false;
+            }
+            let generated = metadata
+                || in_header
+                || (start && row.starts_with("modules: "))
+                || (edit && row.starts_with("{\""));
+            if index == 0 || !generated {
                 row.to_owned()
             } else {
                 mask_run_variance(&mask_counters(row))
@@ -1568,6 +1581,26 @@ fn returned_source_is_never_masked() {
         masked_entry(&read("modules: rust module")),
         masked_entry(&read("modules: rust in process (fallback)")),
         "a numbered source row stays compared"
+    );
+    let card = |mode: &str| {
+        format!(
+            "ide.start {{}} -> \"complete\" \"activation\" null\nproject: repo\nmodules: rust {mode}\n"
+        )
+    };
+    assert_eq!(
+        masked_entry(&card("module")),
+        masked_entry(&card("in process (fallback)")),
+        "the start card's serving-path row is masked"
+    );
+    let edit = |seconds: &str| {
+        format!(
+            "ide.edit {{\"op\":\"replace\"}} -> \"edit\" null null\nedit: inserted; diagnostics: current_reported (project check {seconds}s: 0 new errors)\n{{\"diagnostics\":{{\"delta\":\"project check {seconds}s: 0 new errors\"}}}}"
+        )
+    };
+    assert_eq!(
+        masked_entry(&edit("0.0")),
+        masked_entry(&edit("0.1")),
+        "an edit's check duration is masked in its text and structured row"
     );
 }
 
