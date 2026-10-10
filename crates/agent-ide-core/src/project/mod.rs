@@ -936,18 +936,39 @@ fn render_servers(card: &ProjectCard) -> String {
     format!("servers: {}", parts.join(" · "))
 }
 
-/// The `not started` state `ide.start` prints for one language while its server is down: only a
-/// language whose lexical outline is exact
-/// ([`outline_while_loading`](crate::lang::LanguageSupport::outline_while_loading)) may
-/// claim outline/read/edit already answer from source; every other language's tools all wait
-/// for the server.
+/// The `not started` state `ide.start` prints for one language whose server has no session for
+/// the worktree yet (start-index-state r2 §2). Servers start lazily, on the first `ide.symbol` or
+/// `ide.graph` call of the language. Only a language whose lexical outline is exact
+/// ([`outline_while_loading`](crate::lang::LanguageSupport::outline_while_loading)) claims that
+/// outline, read and edit answer from source and that symbol and graph answer approximately at
+/// once; every other language's first answer follows as a fact.
 pub fn not_started_state(language: Language) -> &'static str {
     if language.support().outline_while_loading() {
-        "not started; ide.outline, ide.read and ide.edit answer from source now; ide.symbol and \
-         ide.graph wait for the server, which starts on their first use"
+        "not started; outline, read and edit answer from source; the first symbol or graph call \
+         starts it and answers approximately at once"
     } else {
-        "not started; starts on first use"
+        "not started; the first symbol or graph call starts it and its answer follows as a fact"
     }
+}
+
+/// The `warming` state of a language whose server session is loading the worktree
+/// (start-index-state r2 §2): approximate answers for a language with an exact lexical outline,
+/// answers that follow as facts for every other language.
+pub fn warming_state(language: Language) -> &'static str {
+    if language.support().outline_while_loading() {
+        "warming; symbol and graph answer approximately until ready"
+    } else {
+        "warming; symbol and graph answers follow as facts until ready"
+    }
+}
+
+/// The state of a language whose server session answers semantic requests now.
+pub const READY_STATE: &str = "ready";
+
+/// The state of a language whose last session for the worktree failed; `cause` is a closed
+/// phrase (`workspace failed to load`, `transport gone`).
+pub fn unavailable_state(cause: &str) -> String {
+    format!("unavailable ({cause})")
 }
 
 #[cfg(test)]
@@ -1138,9 +1159,57 @@ mod tests {
         };
         assert_eq!(
             render_servers(&card),
-            "servers: alpha not started; starts on first use · beta not started; starts on \
-             first use"
+            "servers: alpha not started; the first symbol or graph call starts it and its answer \
+             follows as a fact · beta not started; the first symbol or graph call starts it and \
+             its answer follows as a fact"
         );
+    }
+
+    /// Every servers-line state reads exactly as start-index-state r2 §2 fixes it: the lazy-start
+    /// and warming wording by whether the language's lexical outline is exact, `ready`, and the
+    /// closed unavailable causes.
+    #[test]
+    fn servers_line_states_use_the_contract_wording() {
+        crate::lang::testing::install();
+        let exact = crate::lang::testing::EPSILON;
+        let other = crate::lang::testing::ALPHA;
+        assert_eq!(
+            not_started_state(exact),
+            "not started; outline, read and edit answer from source; the first symbol or graph \
+             call starts it and answers approximately at once"
+        );
+        assert_eq!(
+            warming_state(exact),
+            "warming; symbol and graph answer approximately until ready"
+        );
+        assert_eq!(
+            warming_state(other),
+            "warming; symbol and graph answers follow as facts until ready"
+        );
+        assert_eq!(READY_STATE, "ready");
+        assert_eq!(
+            unavailable_state("workspace failed to load"),
+            "unavailable (workspace failed to load)"
+        );
+        for state in [
+            not_started_state(exact),
+            not_started_state(other),
+            warming_state(exact),
+            warming_state(other),
+        ] {
+            assert!(
+                ![
+                    "poll",
+                    "every few seconds",
+                    "in a few seconds",
+                    "until it completes",
+                    "again every"
+                ]
+                .iter()
+                .any(|banned| state.contains(banned)),
+                "{state}"
+            );
+        }
     }
 
     #[test]

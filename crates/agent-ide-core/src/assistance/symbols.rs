@@ -5,6 +5,7 @@
 //! renders the compact text the contract specifies. Results are retained with the source
 //! observation so a later `ide.edit` may name them as `source_ref`.
 
+use super::navigation::{classify_constructions, collapse_named, constructs};
 use super::*;
 use crate::assistance::batch;
 use crate::intelligence::server::ProviderJob as _;
@@ -48,7 +49,7 @@ impl Worker<'_> {
                 .ok_or_else(|| missing_symbol(job, lexical))?
         } else {
             let name = symbol.name().ok_or(FailureCode::UnknownSymbol)?;
-            match outline.named(name).as_slice() {
+            match collapse_named(outline.named(name)).as_slice() {
                 [found] => (*found).clone(),
                 [] => return Err(missing_symbol(job, lexical)),
                 _ => return Err(FailureCode::UnknownSymbol),
@@ -825,7 +826,9 @@ impl Worker<'_> {
             Some(_) => outline.find(&symbol).cloned(),
             None => {
                 let name = symbol.name().unwrap_or_default();
-                let candidates = outline.named(name);
+                // A declaration and its impl blocks share one address: one definition, which
+                // resolves here instead of an ambiguity naming a single symbol.
+                let candidates = collapse_named(outline.named(name));
                 match candidates.len() {
                     1 => Some(candidates[0].clone()),
                     0 => None,
@@ -835,7 +838,6 @@ impl Worker<'_> {
                             .map(|candidate| candidate.path.to_string())
                             .collect::<Vec<_>>();
                         candidates.sort();
-                        candidates.dedup();
                         return self.ambiguous(job, &binding, &requested, candidates).await;
                     }
                 }
@@ -970,6 +972,14 @@ impl Worker<'_> {
                         references,
                     )
                     .await;
+                // Usages of a struct, enum or class say which rows build a value of it.
+                if constructs(found.kind) {
+                    classify_constructions(
+                        &mut card.usages,
+                        &found.name,
+                        found.kind == lang::SymbolKind::Enum,
+                    );
+                }
                 // Some servers answer references with an empty list when nothing names the symbol
                 // explicitly (a constructor is only ever called through its class); that zero
                 // must be reported, not silently omitted.
@@ -1016,23 +1026,25 @@ impl Worker<'_> {
                         {
                             Err(_) => {
                                 faulted = true;
-                                Err("prepare call hierarchy request failed")
+                                Err("prepare call hierarchy request failed".to_owned())
                             }
                             Ok(items) => match items.into_iter().next() {
                                 Some(item) => {
                                     live.session.incoming_calls_for(item).await.map_err(|_| {
                                         faulted = true;
-                                        "incoming calls request failed"
+                                        "incoming calls request failed".to_owned()
                                     })
                                 }
                                 None => Ok(Vec::new()),
                             },
                         },
-                        Err(FailureCode::ProviderLoading) => Err(
-                            "callers are not available yet because the language server is still indexing; repeat ide.symbol later",
-                        ),
+                        // start-index-state r2 §3: a fact, never a request to repeat.
+                        Err(FailureCode::ProviderLoading) => Err(format!(
+                            "{} still indexing",
+                            server_name.unwrap_or("the language server")
+                        )),
                         Err(FailureCode::ProviderUnavailable) => {
-                            Err("the language server could not load the workspace")
+                            Err("the language server could not load the workspace".to_owned())
                         }
                         Err(other) => return Err(other),
                     };
@@ -1125,6 +1137,11 @@ impl Worker<'_> {
 
     /// `ide.graph {symbol, direction, depth}`: bounded breadth-first call hierarchy; the
     /// `{symbols}` form answers each root through this same path (`batch_symbols`).
+    ///
+    /// A call-hierarchy request that fails is recorded on the node it was made for and the reply
+    /// says `unavailable (<cause>)` there (see [`render::call_graph_text`]); the session is marked
+    /// faulted and the call journaled as degraded. A failed request never yields a normal graph
+    /// with missing edges, and the walk continues with the other nodes.
     pub(super) async fn graph(
         &mut self,
         job: &mut Job,
@@ -1159,7 +1176,7 @@ impl Worker<'_> {
         let found = match symbol.file() {
             Some(_) => outline.find(&symbol).cloned(),
             None => {
-                let candidates = outline.named(symbol.name().unwrap_or_default());
+                let candidates = collapse_named(outline.named(symbol.name().unwrap_or_default()));
                 match candidates.len() {
                     1 => Some(candidates[0].clone()),
                     0 => None,
@@ -1351,26 +1368,38 @@ impl Worker<'_> {
             let source = observed_text(&source_observed, &source_bytes)?;
             let offset = name_offset(source, &symbol)?;
             let live = self.live_session_for(job, &source_observed).await?;
-            let mut faulted = false;
-            let related_items = match edge_direction {
-                render::GraphDirection::Callers => live
-                    .session
-                    .incoming_calls(&source_observed, &source_bytes, offset)
-                    .await
-                    .map(|calls| calls.into_iter().map(|call| call.from).collect::<Vec<_>>()),
-                render::GraphDirection::Callees => live
-                    .session
-                    .outgoing_calls(&source_observed, &source_bytes, offset)
-                    .await
-                    .map(|calls| calls.into_iter().map(|call| call.to).collect::<Vec<_>>()),
-            }
-            .unwrap_or_else(|_| {
-                faulted = true;
-                Vec::new()
-            });
-            if faulted {
-                self.providers.note_session_fault();
-            }
+            let (request, answered) = match edge_direction {
+                render::GraphDirection::Callers => (
+                    "incoming calls",
+                    live.session
+                        .incoming_calls(&source_observed, &source_bytes, offset)
+                        .await
+                        .map(|calls| calls.into_iter().map(|call| call.from).collect::<Vec<_>>()),
+                ),
+                render::GraphDirection::Callees => (
+                    "outgoing calls",
+                    live.session
+                        .outgoing_calls(&source_observed, &source_bytes, offset)
+                        .await
+                        .map(|calls| calls.into_iter().map(|call| call.to).collect::<Vec<_>>()),
+                ),
+            };
+            // A failed request is reported on its node, never rendered as "no calls" (0.10.8
+            // answered `1 nodes, 0 edges` for a root whose request had failed).
+            let related_items = match answered {
+                Ok(items) => items,
+                Err(error) => {
+                    self.providers.note_session_fault();
+                    self.shared.mark_degraded(&job.reference);
+                    let language = Lang::for_path(&relative).unwrap_or(outline.language);
+                    graph.note_fault(
+                        parent,
+                        edge_direction,
+                        request_failed(request, &error, language),
+                    );
+                    Vec::new()
+                }
+            };
             for item in related_items {
                 let (node, item_file, item_symbol) =
                     match self.graph_node(job, &worktree_root, item.clone()).await {
@@ -1750,8 +1779,9 @@ impl Worker<'_> {
     /// language opens it — and a mixed worktree searches every language session before deciding
     /// uniqueness, so a name two languages share is ambiguous. The search asks the provider's workspace symbols first; a provider whose
     /// workspace search stays empty or cannot answer (some servers never list unopened project
-    /// files) falls back to scanning the bounded file list of that language's outlines. Only
-    /// when no session produced any answer at all is the name reported provider-unavailable.
+    /// files) falls back to scanning the bounded file list of that language's outlines. When no
+    /// session produced any answer at all the name is reported `provider_loading` if a server is
+    /// still loading, else provider-unavailable.
     pub(super) async fn locate_by_name(
         &mut self,
         job: &mut Job,
@@ -1773,6 +1803,8 @@ impl Worker<'_> {
         let mut matches: Vec<(std::path::PathBuf, String, bool)> = Vec::new();
         // True once at least one language produced a definite empty-or-nonempty answer.
         let mut answered = false;
+        // True when a language's server was still loading its workspace.
+        let mut loading = false;
         for language_files in files.values() {
             let Some(anchor) = language_files.first() else {
                 continue;
@@ -1793,7 +1825,10 @@ impl Worker<'_> {
             )?;
             let live = match self.live_session_for(job, &anchor_source).await {
                 Ok(live) => live,
-                Err(_) => continue,
+                Err(code) => {
+                    loading |= code == FailureCode::ProviderLoading;
+                    continue;
+                }
             };
             // Workspace symbol search is exact-name and answers in one round trip.
             let workspace_hits: Vec<(std::path::PathBuf, Option<String>)> =
@@ -1887,6 +1922,11 @@ impl Worker<'_> {
         // Every language was searched: a name several languages share is ambiguous.
         deduplicate_symbol_candidates(&mut matches);
         if !answered {
+            // A server that is still loading answers later: the call waits for it (or answers
+            // early, see `answer_while_loading`) instead of refusing as unavailable.
+            if loading {
+                return Err(FailureCode::ProviderLoading);
+            }
             job.set_stage_failure(
                 &FailureCode::ProviderUnavailable,
                 "symbols: no language server answered the workspace search",
@@ -2154,7 +2194,7 @@ fn scan_observation(
 }
 
 /// Returns whether `bytes` contains `name` as a complete ASCII identifier word.
-fn contains_bare_name(bytes: &[u8], name: &[u8]) -> bool {
+pub(super) fn contains_bare_name(bytes: &[u8], name: &[u8]) -> bool {
     bytes
         .windows(name.len())
         .enumerate()
@@ -4800,7 +4840,7 @@ const MAX_HISTORY_CHARS: usize = 100;
 /// Anything that goes wrong — the file is untracked, the directory is not a checkout, the child
 /// fails or exceeds the three-second budget — yields an empty list: history is an opt-in garnish
 /// and must never fail the card.
-async fn history_lines(worktree: &Path, file: &Path, range: LineRange) -> Vec<String> {
+pub(super) async fn history_lines(worktree: &Path, file: &Path, range: LineRange) -> Vec<String> {
     // Absolute program path, like every other git call of the daemon; `core.fsmonitor` is forced
     // off because a repository-configured fsmonitor hook would otherwise run unconfined here.
     let mut command = tokio::process::Command::new("/usr/bin/git");

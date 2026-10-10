@@ -59,7 +59,7 @@ async fn read_items_answer_files_symbols_and_ranges_in_one_reply() {
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
 
-    let (read, text) = settled_read(
+    let (read, text) = read_text(
         &mut actor,
         &fixture,
         json!({"items":[
@@ -116,7 +116,7 @@ async fn read_items_answer_files_symbols_and_ranges_in_one_reply() {
     let edit = actor.settle(&fixture, edit).await;
     assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
 
-    let (cut, text) = settled_read(
+    let (cut, text) = read_text(
         &mut actor,
         &fixture,
         json!({"items":[{"path":"tail.md"},{"path":"big.md"},{"path":"notes.md"}]}),
@@ -187,7 +187,7 @@ async fn legacy_batch_reads_gain_only_the_summary_line() {
         )
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
-    let (_, ranges) = settled_read(
+    let (_, ranges) = read_text(
         &mut actor,
         &fixture,
         json!({"path":"notes.md","ranges":["1-1","2-2"]}),
@@ -200,7 +200,7 @@ async fn legacy_batch_reads_gain_only_the_summary_line() {
             && ranges.contains("2\tbody"),
         "{ranges}"
     );
-    let (_, single) = settled_read(&mut actor, &fixture, json!({"path":"notes.md"})).await;
+    let (_, single) = read_text(&mut actor, &fixture, json!({"path":"notes.md"})).await;
     assert!(
         !single.starts_with("read:") && single.contains("1\t# title"),
         "single forms are unchanged: {single}"
@@ -252,10 +252,10 @@ async fn read_items_answer_unchanged_for_identical_bytes_until_change_force_comp
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     let items = json!({"items":[{"path":"a.md"},{"path":"b.md"}]});
 
-    let (first, text) = settled_read(&mut actor, &fixture, items.clone()).await;
+    let (first, text) = read_text(&mut actor, &fixture, items.clone()).await;
     assert_eq!(read_counts(&text), (2, 0), "{text}");
     let first_ref = first["detail_ref"].as_str().unwrap().to_owned();
-    let (second, text) = settled_read(&mut actor, &fixture, items.clone()).await;
+    let (second, text) = read_text(&mut actor, &fixture, items.clone()).await;
     assert_eq!(read_counts(&text), (0, 2), "{text}");
     assert!(
         text.contains(&format!(
@@ -280,7 +280,7 @@ async fn read_items_answer_unchanged_for_identical_bytes_until_change_force_comp
     let edit = actor.settle(&fixture, edit).await;
     assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
 
-    let (_, text) = settled_read(&mut actor, &fixture, items.clone()).await;
+    let (_, text) = read_text(&mut actor, &fixture, items.clone()).await;
     assert_eq!(
         read_counts(&text),
         (1, 1),
@@ -289,12 +289,12 @@ async fn read_items_answer_unchanged_for_identical_bytes_until_change_force_comp
     assert!(text.contains("a.md changed"), "{text}");
     let mut forced = items.clone();
     forced["force"] = json!(true);
-    let (_, text) = settled_read(&mut actor, &fixture, forced).await;
+    let (_, text) = read_text(&mut actor, &fixture, forced).await;
     assert_eq!(read_counts(&text), (2, 0), "force returns the text: {text}");
     std::fs::write(&epoch, "2").unwrap();
-    let (_, text) = settled_read(&mut actor, &fixture, items.clone()).await;
+    let (_, text) = read_text(&mut actor, &fixture, items.clone()).await;
     assert_eq!(read_counts(&text), (2, 0), "a compaction resets: {text}");
-    let (_, text) = settled_read(&mut actor, &fixture, items.clone()).await;
+    let (_, text) = read_text(&mut actor, &fixture, items.clone()).await;
     assert_eq!(read_counts(&text), (0, 2), "{text}");
     actor.call(&fixture, "ide.stop", json!({})).await;
     let started = actor
@@ -305,7 +305,7 @@ async fn read_items_answer_unchanged_for_identical_bytes_until_change_force_comp
         )
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
-    let (_, text) = settled_read(&mut actor, &fixture, items.clone()).await;
+    let (_, text) = read_text(&mut actor, &fixture, items.clone()).await;
     assert_eq!(read_counts(&text), (2, 0), "ide.stop resets: {text}");
 
     actor.call(&fixture, "ide.stop", json!({})).await;
@@ -339,7 +339,7 @@ async fn read_items_never_answer_unchanged_without_a_compaction_signal() {
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     let items = json!({"items":[{"path":"a.md"},{"path":"b.md"}]});
     for _ in 0..2 {
-        let (_, text) = settled_read(&mut actor, &fixture, items.clone()).await;
+        let (_, text) = read_text(&mut actor, &fixture, items.clone()).await;
         assert_eq!(read_counts(&text), (2, 0), "{text}");
     }
     actor.call(&fixture, "ide.stop", json!({})).await;
@@ -348,20 +348,94 @@ async fn read_items_never_answer_unchanged_without_a_compaction_signal() {
     daemon.wait().await.unwrap();
 }
 
-/// Settles one call and returns its structured reply and compact text.
+/// [`batch_call_with_text`] with a due status plate stripped from the text (T28B): the plate
+/// rides the structured `status` field, never the reply text under test.
+async fn call_text(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    name: &str,
+    arguments: Value,
+) -> (Value, String) {
+    let (reply, text) = batch_call_with_text(actor, fixture, name, arguments).await;
+    (reply, batch_without_status_plate(&text).to_owned())
+}
+
+/// [`batch_settle_with_text`] with a due status plate stripped from the settled text.
+async fn settle_text(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    reply: (Value, String),
+) -> (Value, String) {
+    let (reply, text) = batch_settle_with_text(actor, fixture, reply).await;
+    (reply, batch_without_status_plate(&text).to_owned())
+}
+
+/// One settled `ide.read` with its compact text, any due status plate stripped.
+async fn read_text(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    arguments: Value,
+) -> (Value, String) {
+    let reply = call_text(actor, fixture, "ide.read", arguments).await;
+    settle_text(actor, fixture, reply).await
+}
+
+/// Settles one call and returns its structured reply and compact text; an answer given while a
+/// server loads (a single form's `approximate:` text, or a several-symbol summary counting
+/// approximate or pending entries) is followed through its `detail_ref` to the precise one.
 async fn settled_call(
     actor: &mut ProductActor,
     fixture: &ProductFixture,
     tool: &str,
     arguments: Value,
 ) -> (Value, String) {
-    let reply = batch_call_with_text(actor, fixture, tool, arguments).await;
-    batch_settle_with_text(actor, fixture, reply).await
+    let reply = call_text(actor, fixture, tool, arguments).await;
+    settle_early_answer(actor, fixture, reply).await
+}
+
+/// Whether `text` is an answer given while a server loads: a single form's `approximate:` text,
+/// or a several-symbol summary line counting approximate or pending entries.
+fn early_answer(text: &str) -> bool {
+    let summary = text.lines().next().unwrap_or_default();
+    text.starts_with("approximate: ")
+        || ((summary.starts_with("symbols: ") || summary.starts_with("graph: "))
+            && !(summary.contains(" 0 approximate, 0 pending,")))
+}
+
+/// Follows `reply` through `ide.inspect` of its `detail_ref` while it is `pending` or an
+/// [`early_answer`], bounded like every product settle.
+async fn settle_early_answer(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    reply: (Value, String),
+) -> (Value, String) {
+    let mut reply = settle_text(actor, fixture, reply).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+    while early_answer(&reply.1) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no precise answer: {}",
+            reply.1
+        );
+        let reference = reply.0["detail_ref"].as_str().unwrap().to_owned();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let next = call_text(
+            actor,
+            fixture,
+            "ide.inspect",
+            json!({"detail_ref":reference}),
+        )
+        .await;
+        reply = settle_text(actor, fixture, next).await;
+    }
+    reply
 }
 
 /// `ide.symbol {symbols}` and `ide.graph {symbols}` answer every entry in ONE reply, in request
 /// order behind one summary line; a failed entry fails only itself, and each answered block is
-/// exactly the single form's reply text.
+/// exactly the single form's reply text. On the cold worktree the first several-symbol call
+/// answers at once, never `pending`, with each loading entry approximate or pending, and its
+/// `detail_ref` settles to the precise entries (batch-api-v1 §4).
 #[tokio::test]
 async fn symbol_and_graph_answer_several_symbols_in_one_reply() {
     let fixture = symbol_test_fixture();
@@ -383,6 +457,22 @@ async fn symbol_and_graph_answer_several_symbols_in_one_reply() {
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
 
+    let symbols = json!({"symbols":["src/lib.rs#value","src/lib.rs#missing","src/lib.rs#caller"],"callers":1});
+    let asked = std::time::Instant::now();
+    let cold = call_text(&mut actor, &fixture, "ide.symbol", symbols.clone()).await;
+    assert_ne!(cold.0["state"], "pending", "{}", cold.1);
+    assert!(
+        asked.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        asked.elapsed()
+    );
+    assert!(cold.1.starts_with("symbols: 3 — "), "{}", cold.1);
+    let (_, settled) = settle_early_answer(&mut actor, &fixture, cold).await;
+    assert!(
+        settled.starts_with("symbols: 3 — 2 cards, 0 approximate, 0 pending, 1 failed\n"),
+        "{settled}"
+    );
+
     let (single, single_text) = settled_call(
         &mut actor,
         &fixture,
@@ -391,13 +481,7 @@ async fn symbol_and_graph_answer_several_symbols_in_one_reply() {
     )
     .await;
     assert_eq!(single["kind"], "symbol", "{single}");
-    let (batch, text) = settled_call(
-        &mut actor,
-        &fixture,
-        "ide.symbol",
-        json!({"symbols":["src/lib.rs#value","src/lib.rs#missing","src/lib.rs#caller"],"callers":1}),
-    )
-    .await;
+    let (batch, text) = settled_call(&mut actor, &fixture, "ide.symbol", symbols).await;
     assert_eq!(batch["kind"], "symbol", "{batch} {text}");
     assert!(
         text.starts_with("symbols: 3 — 2 cards, 0 approximate, 0 pending, 1 failed\n"),
@@ -618,7 +702,7 @@ fn edit_arguments(operation_id: &str, source_ref: &str) -> Value {
 
 /// Reads [`EDIT_FILES`] in one items call and returns the reply's `source_ref`.
 async fn read_edit_files(actor: &mut ProductActor, fixture: &ProductFixture) -> String {
-    let (read, text) = settled_read(
+    let (read, text) = read_text(
         actor,
         fixture,
         json!({"items": EDIT_FILES.iter().map(|name| json!({"path": name})).collect::<Vec<_>>()}),
@@ -637,8 +721,8 @@ async fn settled_edit(
     fixture: &ProductFixture,
     arguments: Value,
 ) -> (Value, String) {
-    let reply = batch_call_with_text(actor, fixture, "ide.edit", arguments).await;
-    batch_settle_with_text(actor, fixture, reply).await
+    let reply = call_text(actor, fixture, "ide.edit", arguments).await;
+    settle_text(actor, fixture, reply).await
 }
 
 /// Asserts every [`EDIT_FILES`] file holds exactly `expected(name)`.
@@ -958,7 +1042,7 @@ async fn multi_file_edit_runs_one_project_check_and_reports_each_file() {
         }
     };
     let before = settle(1).await;
-    let (read, _) = settled_read(
+    let (read, _) = read_text(
         &mut actor,
         &fixture,
         json!({"items":[{"path":"src/lib.rs"},{"path":"src/a.rs"},{"path":"src/b.rs"}]}),
@@ -1028,14 +1112,14 @@ async fn slow_multi_file_edit_check_arrives_as_one_edit_checked_fact() {
         )
         .await;
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
-    let (read, _) = settled_read(
+    let (read, _) = read_text(
         &mut actor,
         &fixture,
         json!({"items":[{"path":"src/lib.rs"},{"path":"src/a.rs"}]}),
     )
     .await;
     let source_ref = read["detail_ref"].as_str().unwrap().to_owned();
-    let (edit, text) = batch_call_with_text(
+    let (edit, text) = call_text(
         &mut actor,
         &fixture,
         "ide.edit",
@@ -1061,7 +1145,7 @@ async fn slow_multi_file_edit_check_arrives_as_one_edit_checked_fact() {
     let checked = actor
         .call(&fixture, "ide.inspect", json!({"wait_ms":60000}))
         .await;
-    let checked_text = checked["text"].as_str().unwrap_or_default();
+    let checked_text = batch_without_status_plate(checked["text"].as_str().unwrap_or_default());
     assert!(
         checked_text.starts_with("edit-checked edit slow-batch: 2 files"),
         "{checked}"
@@ -1074,7 +1158,7 @@ async fn slow_multi_file_edit_check_arrives_as_one_edit_checked_fact() {
     assert!(
         again["text"]
             .as_str()
-            .is_some_and(|text| text.starts_with("nothing ready yet")),
+            .is_some_and(|text| batch_without_status_plate(text).starts_with("nothing ready yet")),
         "the fact is handed over once: {again}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;

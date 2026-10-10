@@ -932,12 +932,14 @@ pub(crate) mod testing {
                 })
                 .expect("a test language")
         }
-        /// Detects marker-based environment fixtures and a root `fmt.toml` project whose only
-        /// command is the stdin formatter below, so core tests can exercise a formatting edit
-        /// without a real toolchain.
+        /// Detects marker-based environment fixtures, a root `fmt.toml` project whose only
+        /// command is the stdin formatter below (so core tests can exercise a formatting edit
+        /// without a real toolchain), and an epsilon project marked by a root `epsilon.toml` (so
+        /// the start card lists the fixture server's language).
         fn detect(&self, root: &Path) -> Option<LanguageProject> {
             ((self.0 == "gamma" && root.join("fmt.toml").exists())
-                || (self.0 == "alpha" && root.join("env.fixture").exists()))
+                || (self.0 == "alpha" && root.join("env.fixture").exists())
+                || (self.0 == "epsilon" && root.join("epsilon.toml").exists()))
             .then(|| LanguageProject {
                 language: self.language(),
                 manifests: vec![PathBuf::from("fmt.toml")],
@@ -1047,7 +1049,9 @@ pub(crate) mod testing {
         /// An outline with no symbols, except for epsilon: it keeps each top-level server symbol
         /// the way epsilon's source outline reads a `sym <name>` … `end` block (kind `Other`,
         /// signature `sym <name>`, the lines of its range), as the opt-in contract of
-        /// [`LanguageSupport::outline_while_loading`] requires.
+        /// [`LanguageSupport::outline_while_loading`] requires. A server `STRUCT` symbol becomes
+        /// kind `Struct` and an `OBJECT` symbol kind `Impl` (the scripted `structImpl` session's
+        /// declaration and its impl block, which share one address).
         fn normalize(
             &self,
             file: &Path,
@@ -1065,7 +1069,11 @@ pub(crate) mod testing {
                                 Some(file.to_path_buf()),
                                 vec![symbol.name.clone()],
                             ),
-                            kind: SymbolKind::Other,
+                            kind: match symbol.kind {
+                                lsp::SymbolKind::STRUCT => SymbolKind::Struct,
+                                lsp::SymbolKind::OBJECT => SymbolKind::Impl,
+                                _ => SymbolKind::Other,
+                            },
                             signature: format!("sym {}", symbol.name),
                             name: symbol.name,
                             range,
@@ -1477,7 +1485,10 @@ pub(crate) mod testing {
     /// document symbols (one function, `a`), an empty reference list and an empty workspace-symbol
     /// list, and fails every call-hierarchy request with an error reply, so tests can drive the
     /// worker's real exchange-failure paths. `failing` additionally names requests
-    /// (`"documentSymbol"`, `"references"`, `"workspaceSymbol"`) that fail with an error reply.
+    /// (`"documentSymbol"`, `"references"`, `"workspaceSymbol"`) that fail with an error reply,
+    /// `"structImpl"` makes document symbols answer a struct `a` and its impl block `a` instead
+    /// of the function (see [`fixture_struct_impl_symbols`]), and `"loading"` opens a session
+    /// that never reports readiness, so it stays loading (a warming server).
     ///
     /// The latest call for a binding wins, but only for the next session opened for it: a session
     /// that already exists keeps its script until it is released.
@@ -1492,10 +1503,19 @@ pub(crate) mod testing {
     }
 
     /// Profile of the scripted fixture session: accepts any server, opens `.epsilon` as `epsilon`.
+    /// `loading` names a readiness notification the scripted server never sends, so the session
+    /// stays loading.
     #[derive(Debug)]
-    struct FixtureProfile;
+    struct FixtureProfile {
+        /// Whether the session waits for a readiness notification that never comes.
+        loading: bool,
+    }
 
     impl crate::intelligence::session::SessionProfile for FixtureProfile {
+        /// `fixture/status` for a loading session (never sent), else none: usable at once.
+        fn status_method(&self) -> Option<&'static str> {
+            self.loading.then_some("fixture/status")
+        }
         /// An empty configuration object.
         fn workspace_configuration(&self) -> serde_json::Value {
             serde_json::json!({})
@@ -1525,6 +1545,19 @@ pub(crate) mod testing {
             selection_range: lsp::Range::new(lsp::Position::new(0, 4), lsp::Position::new(0, 5)),
             children: None,
         }]
+    }
+
+    /// The document symbols of a scripted `structImpl` session: a struct `a` over both lines of
+    /// `sym a\nend\n` and an impl block `a` over the same lines, which normalize to one address
+    /// with kinds `Struct` and `Impl`, the shape a language server gives a type and its impl block.
+    #[allow(deprecated)]
+    pub(crate) fn fixture_struct_impl_symbols() -> Vec<async_lsp::lsp_types::DocumentSymbol> {
+        use async_lsp::lsp_types as lsp;
+        let mut declaration = fixture_document_symbols().remove(0);
+        declaration.kind = lsp::SymbolKind::STRUCT;
+        let mut implementation = declaration.clone();
+        implementation.kind = lsp::SymbolKind::OBJECT;
+        vec![declaration, implementation]
     }
 
     /// Opens a live session against a scripted in-process language server (see
@@ -1571,7 +1604,11 @@ pub(crate) mod testing {
                     ));
                 }
                 Ok(Some(lsp::DocumentSymbolResponse::Nested(
-                    fixture_document_symbols(),
+                    if failing.contains(&"structImpl") {
+                        fixture_struct_impl_symbols()
+                    } else {
+                        fixture_document_symbols()
+                    },
                 )))
             });
             router.request::<request::References, _>(move |_, _| async move {
@@ -1606,7 +1643,9 @@ pub(crate) mod testing {
             source.worktree().clone(),
             source.authority_epoch(),
             crate::intelligence::freshness::ViewGeneration::default(),
-            crate::intelligence::session::ProviderSettings::new(FixtureProfile),
+            crate::intelligence::session::ProviderSettings::new(FixtureProfile {
+                loading: failing.contains(&"loading"),
+            }),
             std::time::Duration::from_secs(5),
         )
         .await
