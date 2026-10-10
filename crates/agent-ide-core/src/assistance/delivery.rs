@@ -1298,6 +1298,28 @@ mod worker_tests {
         assert_eq!(handle.outbox().context_epoch(&owner), Some(2));
     }
 
+    /// Probe Q1: Claude overrides a ninth consecutive Stop block, so a session's turn ends are
+    /// blocked at most seven times in a row; any tool call or hook resets the count.
+    #[tokio::test]
+    async fn turn_ends_are_blocked_at_most_seven_times_in_a_row() {
+        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
+        let owner = bind(&bindings, "owner");
+        let handle = handle(bindings);
+        handle.shared.outbox.open(&owner);
+        for round in 1..=7 {
+            assert!(finished(&handle.shared, &owner, &format!("tests #{round}")));
+            assert!(
+                handle.hold_turn(&owner, false, None).await.is_some(),
+                "block {round}"
+            );
+        }
+        assert!(finished(&handle.shared, &owner, "tests #8"));
+        assert_eq!(handle.hold_turn(&owner, false, None).await, None);
+        assert!(handle.shared.outbox.has_undelivered(&owner, true));
+        handle.note_activity(&owner);
+        assert!(handle.hold_turn(&owner, false, None).await.is_some());
+    }
+
     /// OUTBOX §11: the stop flush lists every undelivered fact once; afterwards no producer,
     /// hold or wake reaches the stopped session.
     #[tokio::test]

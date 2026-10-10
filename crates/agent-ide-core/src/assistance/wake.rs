@@ -81,9 +81,19 @@ pub(crate) fn registry_entry(
 /// only such a session may hold a `SubagentStop` (OUTBOX §8.3 rule 6), because a headless
 /// session's background subagent outliving its parent's result breaks agent runners.
 pub(crate) fn interactive_claude_session(registry: &Path, session_id: &str) -> bool {
-    registry_entry(registry, session_id).is_some_and(|entry| {
-        entry.get("kind").and_then(serde_json::Value::as_str) == Some("interactive")
-    })
+    registry_entry(registry, session_id).is_some_and(|entry| driven_interactively(&entry))
+}
+
+/// Whether a registry descriptor names a session a person drives: kind `interactive` and an
+/// entry point other than the headless SDK ones. Claude 2.1.294 registers a headless
+/// `claude --print` session (agent-run's) as kind `interactive` with entry point `sdk-cli`
+/// (probe Q3), so the kind alone does not prove a person.
+// ponytail: a deny-list of `sdk*` entry points; switch to an allow-list if Claude adds other
+// headless entry points.
+fn driven_interactively(entry: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let field = |name: &str| entry.get(name).and_then(serde_json::Value::as_str);
+    field("kind") == Some("interactive")
+        && !field("entrypoint").is_some_and(|entrypoint| entrypoint.starts_with("sdk"))
 }
 
 /// The host session one wake addresses.
@@ -179,7 +189,7 @@ struct Inbox {
 fn resolve_inbox(registry: &Path, session_id: &str) -> Option<Inbox> {
     let entry = registry_entry(registry, session_id)?;
     let field = |name: &str| entry.get(name).and_then(serde_json::Value::as_str);
-    if field("kind") != Some("interactive") || field("status") != Some("idle") {
+    if !driven_interactively(&entry) || field("status") != Some("idle") {
         return None;
     }
     let pid = entry.get("pid")?.as_i64().filter(|pid| *pid > 0)?;
@@ -385,9 +395,9 @@ mod tests {
     }
 
     impl FakeInbox {
-        /// Builds the registry for session `session` with `kind` and `state`, and serves one
-        /// connection answering `status` to the frame it receives, returning the received text.
-        fn new(tag: &str, kind: &str, state: &str) -> (Self, PathBuf) {
+        /// Builds the registry for session `session` with `kind`, `entrypoint` and `state`, and
+        /// returns the inbox with the socket path [`Self::serve`] listens on.
+        fn new(tag: &str, kind: &str, entrypoint: &str, state: &str) -> (Self, PathBuf) {
             let directory = PathBuf::from(format!(
                 "/private/tmp/m026-wake-{}-{tag}",
                 std::process::id()
@@ -398,7 +408,7 @@ mod tests {
             let pid = std::process::id();
             std::fs::write(
                 directory.join(format!("{pid}.json")),
-                serde_json::json!({"pid":pid,"sessionId":"session","kind":kind,"status":state,
+                serde_json::json!({"pid":pid,"sessionId":"session","kind":kind,"entrypoint":entrypoint,"status":state,
                     "messagingSocketPath":socket})
                 .to_string(),
             )
@@ -465,7 +475,7 @@ mod tests {
             ("denied", Some("denied"), WakeOutcome::Refused),
             ("silent", None, WakeOutcome::Ambiguous),
         ] {
-            let (inbox, socket) = FakeInbox::new(tag, "interactive", "idle");
+            let (inbox, socket) = FakeInbox::new(tag, "interactive", "cli", "idle");
             let served = FakeInbox::serve(socket, status);
             let waker = HostWaker::with_registry(inbox.directory.clone());
             assert_eq!(waker.wake(&target(), "facts").await, expected, "{tag}");
@@ -482,14 +492,15 @@ mod tests {
         }
     }
 
-    /// Only a descriptor naming the session with kind `interactive` proves an interactive session.
+    /// Only a descriptor naming the session with kind `interactive` and a non-SDK entry point proves
+    /// an interactive session.
     #[test]
     fn registry_proves_interactive_sessions_only() {
         let registry = PathBuf::from(format!("/private/tmp/m026-registry-{}", std::process::id()));
         std::fs::create_dir_all(&registry).unwrap();
         std::fs::write(
             registry.join("100.json"),
-            r#"{"pid":100,"sessionId":"live","kind":"interactive","status":"idle"}"#,
+            r#"{"pid":100,"sessionId":"live","kind":"interactive","entrypoint":"cli","status":"idle"}"#,
         )
         .unwrap();
         std::fs::write(
@@ -497,9 +508,15 @@ mod tests {
             r#"{"pid":200,"sessionId":"headless","kind":"sdk","status":"busy"}"#,
         )
         .unwrap();
+        std::fs::write(
+            registry.join("400.json"),
+            r#"{"pid":400,"sessionId":"print","kind":"interactive","entrypoint":"sdk-cli","status":"idle"}"#,
+        )
+        .unwrap();
         std::fs::write(registry.join("300.json"), "not json").unwrap();
         assert!(interactive_claude_session(&registry, "live"));
         assert!(!interactive_claude_session(&registry, "headless"));
+        assert!(!interactive_claude_session(&registry, "print"));
         assert!(!interactive_claude_session(&registry, "absent"));
         assert_eq!(
             registry_entry(&registry, "live").and_then(|entry| entry.get("status").cloned()),
@@ -511,11 +528,15 @@ mod tests {
     /// Busy, headless, subagent and Codex targets are never written to.
     #[tokio::test]
     async fn only_idle_interactive_main_sessions_are_woken() {
-        let (busy, _) = FakeInbox::new("busy", "interactive", "busy");
+        let (busy, _) = FakeInbox::new("busy", "interactive", "cli", "busy");
         let waker = HostWaker::with_registry(busy.directory.clone());
         assert_eq!(waker.wake(&target(), "x").await, WakeOutcome::Unavailable);
-        let (headless, _) = FakeInbox::new("headless", "sdk", "idle");
+        let (headless, _) = FakeInbox::new("headless", "sdk", "cli", "idle");
         let waker = HostWaker::with_registry(headless.directory.clone());
+        assert_eq!(waker.wake(&target(), "x").await, WakeOutcome::Unavailable);
+        // A headless `claude --print` session registers as interactive with an `sdk-cli` entry.
+        let (print, _) = FakeInbox::new("print", "interactive", "sdk-cli", "idle");
+        let waker = HostWaker::with_registry(print.directory.clone());
         assert_eq!(waker.wake(&target(), "x").await, WakeOutcome::Unavailable);
         let subagent = WakeTarget {
             actor_is_main: false,

@@ -29,7 +29,9 @@ impl WorkerHandle {
     /// idle wake. With an undelivered holding fact the turn is blocked at once; with holding work
     /// in flight the hold waits until the first holding fact or the earlier of [`HOLD_CAP`] and the
     /// work's budget end; otherwise it releases. A released session is idle; a blocked one keeps
-    /// working. The hold never blocks without a fact, and a fact is never handed over twice.
+    /// working. The hold never blocks without a fact, never blocks more than
+    /// [`MAX_HOLDS_IN_ROW`](crate::assistance::session_outbox::MAX_HOLDS_IN_ROW) turn ends in a
+    /// row without a tool call, and never hands a fact over twice.
     pub async fn hold_turn(
         &self,
         binding: &BindingRef,
@@ -50,7 +52,12 @@ impl WorkerHandle {
                 })
             })
         };
-        if subagent && (binding.host() != HostKind::Claude || !interactive()) {
+        // A subagent of a session no registry proves interactive, or a session whose turn ends
+        // were already blocked MAX_HOLDS_IN_ROW times without a tool call (Claude would override
+        // the next blocks and end the turn with an empty answer), ends its turn now.
+        if subagent && (binding.host() != HostKind::Claude || !interactive())
+            || !outbox.may_hold(binding)
+        {
             outbox.set_agent_state(binding, AgentState::Idle);
             return None;
         }
@@ -70,7 +77,7 @@ impl WorkerHandle {
                 |_| true,
             )
         {
-            outbox.set_agent_state(binding, AgentState::Working);
+            outbox.note_hold(binding);
             return Some(format!("{block}\n{RESTATE}"));
         }
         outbox.set_agent_state(binding, AgentState::Idle);
