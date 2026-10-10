@@ -4304,6 +4304,9 @@ impl<'a> Worker<'a> {
             text.push_str("\n\n");
             text.push_str(&card);
         }
+        // The call-signature block always ends the reply, after the card and its servers line.
+        text.push_str("\n\n");
+        text.push_str(super::signature_card::signature_block());
         Ok((
             PeerReply::Complete {
                 kind: ResultKind::Activation,

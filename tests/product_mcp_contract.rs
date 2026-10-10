@@ -14445,6 +14445,29 @@ async fn configured_product_activation_reply_includes_the_project_card() {
         text.contains("\nservers: rust not started; outline, read and edit answer from source; the first symbol or graph call starts it and answers approximately at once · typescript not started; the first symbol or graph call starts it and its answer follows as a fact"),
         "{text}"
     );
+    // start-index-state §1: the call-signature block ends the reply, after the card and its
+    // servers line, within 2 KiB, with one example per batch form and the required stop.
+    let (card, signature) = text
+        .split_once("\n\ncall forms (")
+        .unwrap_or_else(|| panic!("no signature block: {text}"));
+    assert!(card.contains("\nservers: "), "{text}");
+    assert!(!card.contains("ide.read {\"items\""), "{text}");
+    let signature = format!("call forms ({signature}");
+    assert!(signature.len() <= 2048, "{} bytes", signature.len());
+    for form in [
+        "ide.read {\"items\"",
+        "ide.outline {\"paths\"",
+        "ide.symbol {\"symbols\"",
+        "ide.graph {\"symbols\"",
+        "ide.test {\"targets\"",
+        "ide.edit {\"operation_id\"",
+        "ide.inspect {\"wait_ms\"",
+    ] {
+        assert!(signature.contains(form), "{form}: {signature}");
+    }
+    assert!(signature.contains("\"files\":["), "{signature}");
+    assert!(text.ends_with("End the task with ide.stop."), "{text}");
+    assert!(!signature.contains("poll"), "{signature}");
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     actor.mcp.close().await;

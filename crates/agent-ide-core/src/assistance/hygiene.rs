@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use super::{
     facade::{SERVER_INSTRUCTIONS, StdioFacade, tool_schemas},
+    signature_card::signature_block,
     test_fact::{running_line, started_line, still_running_line},
 };
 
@@ -127,6 +128,15 @@ fn surfaces() -> Vec<Surface> {
             text: line,
         });
     }
+    surfaces.push(Surface {
+        name: "ide.start signature block".to_owned(),
+        tier: Tier::ReplyText,
+        text: signature_block().to_owned(),
+    });
+    // The reply template holds every fixed reply sentence, including the loading, takeover and
+    // pending texts of the availability and outbox modules.
+    surfaces.push(file_surface("assets/mcp/reply.jinja", Tier::ReplyText));
+    surfaces.push(file_surface("skills/agent-ide/SKILL.md", Tier::Teaching));
     surfaces.push(file_surface("agents/ide-reviewer.md", Tier::Teaching));
     surfaces.push(file_surface(
         "skills/agent-ide/agents/openai.yaml",
