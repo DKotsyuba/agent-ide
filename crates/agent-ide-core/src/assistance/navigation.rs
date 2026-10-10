@@ -125,7 +125,7 @@ pub(super) fn is_construction_site(line: &str, name: &str, enum_type: bool) -> b
 
 /// Skips one leading generic argument list, `<…>` or `::<…>` with balanced angle brackets, and
 /// the spaces after it; returns `text` unchanged when it starts with neither or is unbalanced.
-fn skip_generics(text: &str) -> &str {
+pub(super) fn skip_generics(text: &str) -> &str {
     let open = if text.starts_with("::<") {
         2
     } else if text.starts_with('<') {

@@ -4,6 +4,7 @@
 
 ### Added
 
+- `ide.symbol` and `ide.graph` never leave the agent waiting on a loading server. For a language whose source outline is exact (Rust) they answer at once with an answer labelled `approximate:` (definition from the source outline, usages and depth-1 callers as name matches marked `~`); for other languages, or a bare name the scan cannot resolve to one definition, they answer `pending` at once. The same job keeps running for up to 10 minutes (at most 4 per session) and its precise answer is registered with the session outbox, to arrive as a fact. A cold Rust worktree's first `ide.symbol` now answers in about 0.5 s instead of `pending` after 8 s. A bare name whose servers are all loading answers `provider_loading` instead of `provider_unavailable`, and the remaining `provider_loading` replies no longer ask to repeat the call.
 - The `ide.start` card's servers line reports each server language's session for the worktree as it is: `ready`, `warming; …`, `not started; …` or `unavailable (<cause>)`. Servers still start lazily, on the first `ide.symbol` or `ide.graph` call of the language; the start launches nothing.
 - `ide.symbol` usages of a struct, enum or class tag the rows that build a value of it (`Name {`, `Name(`, `Name::new(`, `new Name(`, an enum variant) as `construction ~`, list them first and count them on the usages line (`…; 9 constructions`). The rule is lexical and marked as a heuristic.
 

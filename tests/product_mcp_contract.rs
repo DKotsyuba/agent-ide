@@ -420,6 +420,11 @@ fn assert_compact_envelope(reply: &Value) {
         Some(rest) => rest.split_once('\n').map_or("", |(_, rest)| rest),
         None => text,
     };
+    // An approximate symbol or graph answer (a loading server) leads with its own label line.
+    let body = match body.strip_prefix("approximate: ") {
+        Some(rest) => rest.split_once('\n').map_or("", |(_, rest)| rest),
+        None => body,
+    };
     match (state, kind) {
         ("error", _) if structured["code"] == "conflict" => assert!(
             text.starts_with("error: conflict") || text.starts_with("refused: read_only ("),
@@ -3256,7 +3261,12 @@ impl ProductActor {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
         let mut polls = 0;
         let mut delay = PRODUCT_SETTLE_INITIAL_DELAY;
-        while reply["result"]["structuredContent"]["state"] == "pending" {
+        // An approximate answer (a loading server) is followed to its precise one, as `pending`.
+        while reply["result"]["structuredContent"]["state"] == "pending"
+            || reply["result"]["structuredContent"]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("approximate: "))
+        {
             assert!(
                 tokio::time::Instant::now() < deadline && polls < PRODUCT_SETTLE_MAX_POLLS,
                 "product operation did not settle: {reply}"
@@ -3284,7 +3294,12 @@ impl ProductActor {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
         let mut polls = 0;
         let mut delay = PRODUCT_SETTLE_INITIAL_DELAY;
-        while reply["state"] == "pending" {
+        // An approximate answer (a loading server) is followed to its precise one, as `pending`.
+        while reply["state"] == "pending"
+            || reply["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("approximate: "))
+        {
             assert!(
                 tokio::time::Instant::now() < deadline && polls < PRODUCT_SETTLE_MAX_POLLS,
                 "product operation did not settle"
@@ -9581,6 +9596,54 @@ async fn configured_product_symbol_card_answers_requested_callees() {
         "an answered zero must be stated, not omitted: {idle_text}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// The first `ide.symbol` and `ide.graph` calls on a cold Rust worktree never answer `pending`
+/// (symbol-graph-item r2 §4): while the real rust-analyzer indexes they answer at once with an
+/// `approximate:` answer whose `detail_ref` later settles to the precise one; a server that is
+/// already ready answers precisely. The first answer arrives well inside the inline window.
+#[tokio::test]
+async fn configured_product_cold_rust_symbol_and_graph_never_answer_pending() {
+    let fixture = graph_test_fixture();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "cold-approximate").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"cold-approximate"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    for (tool, arguments, precise) in [
+        ("ide.symbol", json!({"symbol":"src/lib.rs#c"}), "symbol: c"),
+        (
+            "ide.graph",
+            json!({"symbol":"src/lib.rs#c","direction":"callers","depth":1}),
+            "graph: callers of src/lib.rs#c",
+        ),
+    ] {
+        let asked = std::time::Instant::now();
+        let first = actor.call(&fixture, tool, arguments).await;
+        let elapsed = asked.elapsed();
+        assert_ne!(first["state"], "pending", "{tool}: {first}");
+        assert!(elapsed < Duration::from_secs(8), "{tool}: {elapsed:?}");
+        let text = first["text"].as_str().unwrap_or_default().to_owned();
+        if text.starts_with("approximate: ") {
+            assert!(
+                text.contains("the precise answer follows as a fact"),
+                "{text}"
+            );
+        }
+        let settled = actor.settle(&fixture, first).await;
+        let settled = settled["text"].as_str().unwrap_or_default();
+        assert!(settled.starts_with(precise), "{tool}: {settled}");
+    }
+    let stop = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stop).await["kind"], "stop");
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();

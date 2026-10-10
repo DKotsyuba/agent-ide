@@ -1304,7 +1304,7 @@ mod tests {
         for note in [
             "unavailable (prepare call hierarchy request failed)",
             "unavailable (incoming calls request failed)",
-            "unavailable (callers are not available yet because the language server is still indexing; repeat ide.symbol later)",
+            "unavailable (fake-server still indexing)",
         ] {
             card.callers_note = Some(note.to_owned());
             assert!(

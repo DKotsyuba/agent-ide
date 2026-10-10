@@ -384,3 +384,260 @@ async fn a_live_writer_is_never_taken_over() {
         BindingStatus::Validated(_)
     ));
 }
+
+/// A symbol or graph job of `actor` with a live waiter, as `submit` queues it: the job, the
+/// waiter's receiver, and the job's retained `pending` result planted in the ledger.
+fn waiting_job(
+    worker: &Worker<'_>,
+    actor: &str,
+    call: &str,
+    tool: AssistanceTool,
+    parameters: Value,
+) -> (Job, oneshot::Receiver<PeerReply>, watch::Sender<bool>) {
+    let invocation = production_call(worker, actor, call);
+    let reference = format!("waiting-{call}");
+    worker.shared.ledger.lock().unwrap().details.insert(
+        reference.clone(),
+        Detail {
+            binding: invocation.binding_ref().clone(),
+            reply: PeerReply::Pending {
+                detail_ref: reference.clone(),
+            },
+            selection: (tool, selection(&parameters)),
+            authority: None,
+            source: None,
+            native_epoch: 0,
+            line_movement: None,
+            diff_page: None,
+            diff_page_fresh: false,
+            context_page: None,
+            context_page_fresh: false,
+            diff_provenance: None,
+            extra_sources: Vec::new(),
+        },
+    );
+    let (send, wait) = oneshot::channel();
+    let (cancel_sender, cancel) = watch::channel(false);
+    let job = Job {
+        reference,
+        invocation,
+        tool,
+        parameters,
+        target: provider_target(&worker.runtime),
+        deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+        cancel,
+        stop_reply: Some(send),
+        native_epoch: 0,
+        failure_detail: None,
+        format_note: None,
+        check_scheduled: false,
+        park_until: None,
+        stage: None,
+        session_binding: None,
+    };
+    (job, wait, cancel_sender)
+}
+
+/// The deferrals the test recorder holds for `reference`, as `(approximate_given, fence paths)`.
+fn deferrals_of(reference: &str) -> Vec<(bool, Vec<String>)> {
+    super::super::approximate::test_recorder()
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            crate::assistance::outbox::OutboxCall::Defer {
+                reference: deferred,
+                spec,
+                accepted: true,
+            } if deferred == reference => Some((
+                spec.approximate_given,
+                spec.fence_paths
+                    .into_iter()
+                    .map(|fence| fence.path)
+                    .collect(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An epsilon worktree with `a` defined in `a.epsilon` and used in `b.epsilon`, and a worker
+/// with the fixture provider; the returned reader binding's server is loading until a test arms
+/// a scripted session for it.
+async fn loading_fixture(actor: &str) -> (Fixture, Store) {
+    let fixture = Fixture::new();
+    epsilon_source(&fixture);
+    std::fs::write(fixture.root.join("a.epsilon"), "sym a\nend\n").unwrap();
+    std::fs::write(fixture.root.join("b.epsilon"), "sym user\na(1)\nend\n").unwrap();
+    git_commit(&fixture.root, &format!("loading source for {actor}"));
+    let store = fixture.store();
+    (fixture, store)
+}
+
+/// While the server loads, `ide.symbol` answers its waiter at once with a labelled approximate
+/// card (lexical usages marked `~`), registers the precise follow-up (`approximate_given`,
+/// fenced by the definition file) and keeps running; once the server answers, the same job
+/// settles with the precise card. No text tells the agent to poll, wait or repeat.
+#[tokio::test]
+async fn a_loading_symbol_answers_approximately_then_precisely() {
+    use crate::lang::testing::fixture_serve_session;
+    let (fixture, store) = loading_fixture("ap").await;
+    let workspace = DurableWorkspace::open(&store).await.unwrap();
+    let mut worker = worker(&store, workspace, fixture.root.clone());
+    worker.observations.install_schema().await.unwrap();
+    let reader = provider_start(&mut worker, "ap-reader", "ap-start", true, None)
+        .await
+        .unwrap();
+    let (mut job, mut wait, _cancel) = waiting_job(
+        &worker,
+        "ap-reader",
+        "ap-1",
+        AssistanceTool::Symbol,
+        serde_json::json!({"symbol":"a.epsilon#a","callers":0}),
+    );
+    worker.perform(&mut job).await;
+    let early = wait.try_recv().expect("the waiter is answered at once");
+    let text = complete_text(&early);
+    assert!(text.starts_with("approximate: "), "{text}");
+    assert!(
+        text.contains("the precise answer follows as a fact"),
+        "{text}"
+    );
+    assert!(text.contains("b.epsilon:2  ~ a(1)"), "{text}");
+    for banned in [
+        "poll",
+        "every few seconds",
+        "in a few seconds",
+        "until it completes",
+        "again every",
+        "repeat",
+    ] {
+        assert!(!text.contains(banned), "{banned}: {text}");
+    }
+    assert!(job.park_until.is_some(), "the job keeps running");
+    assert!(
+        job.deadline > tokio::time::Instant::now() + Duration::from_secs(9 * 60),
+        "the precise budget is ten minutes"
+    );
+    assert_eq!(
+        deferrals_of(&job.reference),
+        vec![(true, vec!["a.epsilon".to_owned()])]
+    );
+
+    // A retry while still loading only keeps waiting.
+    job.park_until = None;
+    worker.perform(&mut job).await;
+    assert!(job.park_until.is_some());
+
+    // The server answers: the same job settles with the precise card.
+    fixture_serve_session(&reader, &[]);
+    job.park_until = None;
+    worker.perform(&mut job).await;
+    assert!(job.park_until.is_none(), "settled");
+    let settled = worker
+        .shared
+        .ledger
+        .lock()
+        .unwrap()
+        .details
+        .get(&job.reference)
+        .map(|detail| detail.reply.clone())
+        .unwrap();
+    let precise = complete_text(&settled);
+    assert!(precise.starts_with("symbol: a"), "{precise}");
+    assert!(!precise.contains("approximate"), "{precise}");
+    assert_eq!(deferrals_of(&job.reference).len(), 1, "registered once");
+}
+
+/// While the server loads, `ide.graph` answers at once with an approximate depth-1 graph.
+#[tokio::test]
+async fn a_loading_graph_answers_approximately() {
+    let (fixture, store) = loading_fixture("ag").await;
+    let workspace = DurableWorkspace::open(&store).await.unwrap();
+    let mut worker = worker(&store, workspace, fixture.root.clone());
+    worker.observations.install_schema().await.unwrap();
+    provider_start(&mut worker, "ag-reader", "ag-start", true, None)
+        .await
+        .unwrap();
+    let (mut job, mut wait, _cancel) = waiting_job(
+        &worker,
+        "ag-reader",
+        "ag-1",
+        AssistanceTool::Graph,
+        serde_json::json!({"symbol":"a.epsilon#a","direction":"both","depth":2}),
+    );
+    worker.perform(&mut job).await;
+    let early = wait.try_recv().expect("the waiter is answered at once");
+    let text = complete_text(&early);
+    assert!(
+        text.contains(
+            "\ngraph: callers of a.epsilon#a (approximate, depth 1 of 2, 1 nodes, 0 edges)\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("callees: follows with the precise answer"),
+        "{text}"
+    );
+    assert_eq!(deferrals_of(&job.reference).len(), 1);
+}
+
+/// A bare name the lexical scan cannot resolve to one definition answers `pending` at once and
+/// registers a non-approximate deferral; once the session has four jobs waiting for their
+/// precise answer, a fifth approximate answer says the precise one is not scheduled.
+#[tokio::test]
+async fn unresolvable_names_answer_pending_and_the_session_cap_holds() {
+    let (fixture, store) = loading_fixture("cap").await;
+    std::fs::write(fixture.root.join("c.epsilon"), "sym a\nend\n").unwrap();
+    git_commit(&fixture.root, "a second a");
+    let workspace = DurableWorkspace::open(&store).await.unwrap();
+    let mut worker = worker(&store, workspace, fixture.root.clone());
+    worker.observations.install_schema().await.unwrap();
+    provider_start(&mut worker, "cap-reader", "cap-start", true, None)
+        .await
+        .unwrap();
+    let (mut ambiguous, mut wait, _cancel) = waiting_job(
+        &worker,
+        "cap-reader",
+        "cap-0",
+        AssistanceTool::Symbol,
+        serde_json::json!({"symbol":"a"}),
+    );
+    worker.perform(&mut ambiguous).await;
+    assert!(
+        matches!(wait.try_recv(), Ok(PeerReply::Pending { .. })),
+        "an unresolvable bare name answers pending at once"
+    );
+    assert_eq!(
+        deferrals_of(&ambiguous.reference),
+        vec![(false, Vec::new())]
+    );
+    let mut keep = Vec::new();
+    for index in 1..=3 {
+        let (mut job, mut wait, cancel) = waiting_job(
+            &worker,
+            "cap-reader",
+            &format!("cap-{index}"),
+            AssistanceTool::Symbol,
+            serde_json::json!({"symbol":"b.epsilon#user"}),
+        );
+        worker.perform(&mut job).await;
+        assert!(matches!(wait.try_recv(), Ok(PeerReply::Complete { .. })));
+        keep.push((job, cancel));
+    }
+    let (mut fifth, mut wait, _cancel) = waiting_job(
+        &worker,
+        "cap-reader",
+        "cap-5",
+        AssistanceTool::Symbol,
+        serde_json::json!({"symbol":"b.epsilon#user"}),
+    );
+    worker.perform(&mut fifth).await;
+    let early = wait.try_recv().expect("answered at once");
+    assert!(
+        complete_text(&early)
+            .contains("precise answer not scheduled: 4 already pending for this session"),
+        "{}",
+        complete_text(&early)
+    );
+    assert!(deferrals_of(&fifth.reference).is_empty());
+}

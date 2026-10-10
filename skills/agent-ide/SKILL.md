@@ -152,7 +152,8 @@ trait impls keep the server's label as the segment, paths and generics as writte
 (`impl fmt::Display for Foo/fmt`) — copy it from `ide.outline`. When `Type/name` names both a
 field of the type and a method of one of its blocks, it resolves to the method; edit the
 field through its type. A `provider_loading` error means the language server is still loading
-the workspace: repeat the same call in a few seconds.
+the workspace and the call was not answered; continue with other work (`ide.symbol` and
+`ide.graph` answer at once meanwhile).
 While it loads — and when it is unavailable (its workspace failed to load) or its
 documentSymbols request failed — `ide.outline`, `ide.read {symbol}` and symbol edits of a
 Rust file may already answer from the lexical outline (the reply says `outline: from
@@ -163,11 +164,13 @@ exchange did — the outline is exact, so do not repeat the call). A TypeScript 
 module resolution the server cannot verify answers the same way (`… project resolution
 unverified: <cause> …`). A file the lexical outline cannot reproduce exactly, and an address
 it does not contain, wait for the server while it loads (a symbol edit answers
-`provider_loading` at once instead — repeat it in a few seconds) and answer
-`provider_unavailable` when it failed. `ide.symbol` waits while the server loads; when it is
-unavailable it answers the definition-only card (signature, doc, definition from the outline)
-with `unavailable (<server> workspace failed to load)` notes for usages and callers.
-`ide.graph` and rename always wait for the server. A `provider_unavailable` refusal on these
+`provider_loading` at once instead) and answer
+`provider_unavailable` when it failed. While the server loads, `ide.symbol` and `ide.graph`
+answer at once: approximately for Rust (an `approximate:` first line, name matches marked `~`),
+`pending` otherwise; the precise answer arrives by itself as a fact. When the server is
+unavailable `ide.symbol` answers the definition-only card (signature, doc, definition from the
+outline) with `unavailable (<server> workspace failed to load)` notes for usages and callers.
+Rename always waits for the server. A `provider_unavailable` refusal on these
 paths names its stage and what still works: a stage ending `outline and read answer from
 source` (Rust) means `ide.outline` and `ide.read` still work while usages and callers do
 not; a stage ending `use native reads` (other languages, and a Rust file the lexical outline

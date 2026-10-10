@@ -1014,23 +1014,25 @@ impl Worker<'_> {
                         {
                             Err(_) => {
                                 faulted = true;
-                                Err("prepare call hierarchy request failed")
+                                Err("prepare call hierarchy request failed".to_owned())
                             }
                             Ok(items) => match items.into_iter().next() {
                                 Some(item) => {
                                     live.session.incoming_calls_for(item).await.map_err(|_| {
                                         faulted = true;
-                                        "incoming calls request failed"
+                                        "incoming calls request failed".to_owned()
                                     })
                                 }
                                 None => Ok(Vec::new()),
                             },
                         },
-                        Err(FailureCode::ProviderLoading) => Err(
-                            "callers are not available yet because the language server is still indexing; repeat ide.symbol later",
-                        ),
+                        // start-index-state r2 §3: a fact, never a request to repeat.
+                        Err(FailureCode::ProviderLoading) => Err(format!(
+                            "{} still indexing",
+                            server_name.unwrap_or("the language server")
+                        )),
                         Err(FailureCode::ProviderUnavailable) => {
-                            Err("the language server could not load the workspace")
+                            Err("the language server could not load the workspace".to_owned())
                         }
                         Err(other) => return Err(other),
                     };
@@ -1761,8 +1763,9 @@ impl Worker<'_> {
     /// language opens it — and a mixed worktree searches every language session before deciding
     /// uniqueness, so a name two languages share is ambiguous. The search asks the provider's workspace symbols first; a provider whose
     /// workspace search stays empty or cannot answer (some servers never list unopened project
-    /// files) falls back to scanning the bounded file list of that language's outlines. Only
-    /// when no session produced any answer at all is the name reported provider-unavailable.
+    /// files) falls back to scanning the bounded file list of that language's outlines. When no
+    /// session produced any answer at all the name is reported `provider_loading` if a server is
+    /// still loading, else provider-unavailable.
     pub(super) async fn locate_by_name(
         &mut self,
         job: &mut Job,
@@ -1784,6 +1787,8 @@ impl Worker<'_> {
         let mut matches: Vec<(std::path::PathBuf, String, bool)> = Vec::new();
         // True once at least one language produced a definite empty-or-nonempty answer.
         let mut answered = false;
+        // True when a language's server was still loading its workspace.
+        let mut loading = false;
         for language_files in files.values() {
             let Some(anchor) = language_files.first() else {
                 continue;
@@ -1804,7 +1809,10 @@ impl Worker<'_> {
             )?;
             let live = match self.live_session_for(job, &anchor_source).await {
                 Ok(live) => live,
-                Err(_) => continue,
+                Err(code) => {
+                    loading |= code == FailureCode::ProviderLoading;
+                    continue;
+                }
             };
             // Workspace symbol search is exact-name and answers in one round trip.
             let workspace_hits: Vec<(std::path::PathBuf, Option<String>)> =
@@ -1898,6 +1906,11 @@ impl Worker<'_> {
         // Every language was searched: a name several languages share is ambiguous.
         deduplicate_symbol_candidates(&mut matches);
         if !answered {
+            // A server that is still loading answers later: the call waits for it (or answers
+            // early, see `answer_while_loading`) instead of refusing as unavailable.
+            if loading {
+                return Err(FailureCode::ProviderLoading);
+            }
             job.set_stage_failure(
                 &FailureCode::ProviderUnavailable,
                 "symbols: no language server answered the workspace search",
@@ -2165,7 +2178,7 @@ fn scan_observation(
 }
 
 /// Returns whether `bytes` contains `name` as a complete ASCII identifier word.
-fn contains_bare_name(bytes: &[u8], name: &[u8]) -> bool {
+pub(super) fn contains_bare_name(bytes: &[u8], name: &[u8]) -> bool {
     bytes
         .windows(name.len())
         .enumerate()
@@ -4790,7 +4803,7 @@ const MAX_HISTORY_CHARS: usize = 100;
 /// Anything that goes wrong — the file is untracked, the directory is not a checkout, the child
 /// fails or exceeds the three-second budget — yields an empty list: history is an opt-in garnish
 /// and must never fail the card.
-async fn history_lines(worktree: &Path, file: &Path, range: LineRange) -> Vec<String> {
+pub(super) async fn history_lines(worktree: &Path, file: &Path, range: LineRange) -> Vec<String> {
     // Absolute program path, like every other git call of the daemon; `core.fsmonitor` is forced
     // off because a repository-configured fsmonitor hook would otherwise run unconfined here.
     let mut command = tokio::process::Command::new("/usr/bin/git");

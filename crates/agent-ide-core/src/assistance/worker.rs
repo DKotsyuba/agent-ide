@@ -34,6 +34,8 @@ use crate::{
         store::WorkspaceStore,
     },
 };
+#[path = "approximate.rs"]
+mod approximate;
 #[path = "index_state.rs"]
 mod index_state;
 #[path = "links.rs"]
@@ -1584,6 +1586,7 @@ impl WorkerHandle {
                     names: Default::default(),
                     telemetry,
                     activity: BTreeMap::new(),
+                    deferred_precise: BTreeMap::new(),
                 }
                 .run(receiver)
                 .await
@@ -2474,6 +2477,10 @@ struct Worker<'a> {
     /// Wall-clock milliseconds of each active binding's last completed job, keyed by binding
     /// fingerprint, so a refused activation can name the holder's last observed activity.
     activity: BTreeMap<[u8; 32], u64>,
+    /// Symbol and graph jobs that answered their caller early (approximately, or `pending`) and
+    /// keep running for the precise answer, by job reference, with their owning binding; at most
+    /// [`approximate::MAX_DEFERRED_PER_SESSION`] per binding (symbol-graph-item r2 §5).
+    deferred_precise: BTreeMap<String, BindingRef>,
 }
 
 impl<'a> Worker<'a> {
@@ -3341,6 +3348,13 @@ impl<'a> Worker<'a> {
                 }
             }
         };
+        // A symbol or graph call that meets a loading server answers its caller at once and
+        // keeps running for the precise answer (symbol-graph-item r2 §4-§5).
+        if matches!(job.tool, AssistanceTool::Symbol | AssistanceTool::Graph)
+            && (job.park_until.is_some() || matches!(result, Err(FailureCode::ProviderLoading)))
+        {
+            self.answer_while_loading(job).await;
+        }
         if job.park_until.is_some() {
             return;
         }
@@ -4811,7 +4825,7 @@ impl<'a> Worker<'a> {
             Err(FailureCode::ProviderLoading) => (
                 lexical(
                     job,
-                    "semantic provider is still loading the workspace; repeat the call in a few seconds",
+                    "semantic provider is still loading the workspace; this context is lexical, without semantic facts",
                 )?,
                 None,
             ),
@@ -10099,6 +10113,7 @@ mod stop_retry_tests {
             names: Default::default(),
             telemetry: None,
             activity: BTreeMap::new(),
+            deferred_precise: BTreeMap::new(),
         }
     }
 
