@@ -475,10 +475,10 @@ impl ProductDispatcher {
             let feed = ProjectProblemFeed::from_launcher(
                 &launcher,
                 dispatcher.admission.clone(),
-                Arc::new(move |snapshot: &crate::checks::ProblemSnapshot| {
-                    adapters::log_project_check(snapshot);
+                Arc::new(move |event: &crate::checks::scheduler::CompletionEvent| {
+                    adapters::log_project_check(&event.snapshot);
                     if let Some(telemetry) = telemetry.lock().ok().and_then(|slot| slot.clone()) {
-                        adapters::project_check(&telemetry, snapshot);
+                        adapters::project_check(&telemetry, &event.snapshot);
                     }
                 }),
             );

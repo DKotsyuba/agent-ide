@@ -99,9 +99,64 @@ struct Inner {
 
 /// Observer of completed check runs, installed through [`Scheduler::with_completion_hook`].
 ///
-/// Called synchronously after the policy-fenced publication lock is released. It must return promptly and must
-/// not call back into the scheduler.
-pub type CompletionHook = Arc<dyn Fn(&ProblemSnapshot) + Send + Sync>;
+/// Called synchronously after the policy-fenced publication lock is released, once per completion
+/// the scheduler accepted under the then-current policy generation: views that became the retained
+/// current snapshot, transient completions it deliberately suppressed while retaining an earlier
+/// usable view, and completions whose input generation already predates the retained view. It must
+/// return promptly and must not call back into the scheduler.
+pub type CompletionHook = Arc<dyn Fn(&CompletionEvent) + Send + Sync>;
+
+/// One accepted check completion together with the worktree and policy context it was accepted under.
+///
+/// Carries everything a durable publication of the authoritative accepted view needs: the exact
+/// worktree and repository the snapshot belongs to, the policy generation and digest that fenced
+/// its acceptance, the completed snapshot itself, and what the publication guard did with it.
+/// Input generation alone is not a publication revision; a consumer that publishes this view must
+/// assign its own durable monotonic revision and must never let a suppressed or outdated
+/// completion replace a retained good view.
+#[derive(Clone, Debug)]
+pub struct CompletionEvent {
+    /// Canonical worktree path the completed check ran against.
+    pub worktree: PathBuf,
+    /// Repository identity the scheduler shares with sibling worktrees of the same repository.
+    pub repository_key: String,
+    /// Policy generation that fenced this completion; a completion stored under it is current.
+    pub policy_generation: u64,
+    /// Stable digest partitioning persistent caches by the exclusion set in force at acceptance.
+    pub policy_digest: String,
+    /// The completed run's snapshot, exactly as the checker produced it after denial filtering.
+    pub snapshot: ProblemSnapshot,
+    /// What the scheduler's publication guard did with this completion.
+    pub disposition: CompletionDisposition,
+}
+
+/// What the scheduler's publication guard did with one accepted completion.
+#[derive(Clone, Debug)]
+pub enum CompletionDisposition {
+    /// The completion's snapshot became the worktree's retained current view.
+    Stored,
+    /// A transient `Fatal`/`Timeout` completion (EYES-r2 §5): the carried earlier snapshot stays
+    /// the retained current view, and this completion must not replace it anywhere downstream.
+    TransientSuppressed {
+        /// The retained `Ready`/`Partial` snapshot that remains authoritative.
+        retained: ProblemSnapshot,
+    },
+    /// The completion's input generation predates the retained view's; the retained view stays.
+    Outdated,
+}
+
+/// Outcome of one attempted publication of a completed snapshot under the scheduler's
+/// publication lock; the hook-facing subset is [`CompletionDisposition`].
+enum Publication {
+    /// The worktree's policy generation changed; nothing was stored and the completion is stale.
+    StalePolicy,
+    /// The snapshot became the pair's retained current view.
+    Stored,
+    /// A transient completion was suppressed; the carried snapshot remains authoritative.
+    Suppressed(ProblemSnapshot),
+    /// The completion's input generation predates the retained view's; nothing changed.
+    Outdated,
+}
 
 /// Mutable scheduler state, guarded by [`Inner::state`].
 ///
@@ -781,7 +836,8 @@ impl Inner {
     /// the cache directory (cloning a sibling's cache subdirectory on the worktree's first check
     /// of a seeding language when possible), acquires the shared concurrency permit, dispatches the configured [`Checker`],
     /// stores the resulting snapshot only if its policy generation is current (and subject to
-    /// the Fatal/Timeout guard), then reports accepted completion to [`CompletionHook`],
+    /// the Fatal/Timeout guard), then reports the accepted completion — stored,
+    /// transient-suppressed with the retained view, or outdated — to [`CompletionHook`],
     /// records this completion's timing for the next iteration's cooldown, and records a seeding
     /// language's cache completion for sibling worktrees. If the pair was marked dirty while this run was
     /// in flight, one more iteration follows with the latest `input_generation`; the [`Checker`]
@@ -800,7 +856,10 @@ impl Inner {
                 let generation = inner.current_generation(&worktree);
                 let snapshot =
                     ProblemSnapshot::unavailable(language, UnavailableReason::Disabled, generation);
-                if !inner.store_snapshot(&worktree, snapshot, policy_generation) {
+                if matches!(
+                    inner.store_snapshot(&worktree, snapshot, policy_generation),
+                    Publication::StalePolicy
+                ) {
                     return;
                 }
                 inner.mark_run_ineligible(&worktree, language, policy_generation);
@@ -845,7 +904,10 @@ impl Inner {
                         ..Default::default()
                     },
                 );
-                if inner.store_snapshot(&worktree, snapshot, policy_generation) {
+                if !matches!(
+                    inner.store_snapshot(&worktree, snapshot, policy_generation),
+                    Publication::StalePolicy
+                ) {
                     inner.mark_run_ineligible(&worktree, language, policy_generation);
                     inner.finish_run(&worktree, language, false, policy_generation);
                 }
@@ -922,9 +984,15 @@ impl Inner {
                 before_publish();
             }
             let completed_state = snapshot.state.clone();
-            if !inner.store_snapshot(&worktree, snapshot.clone(), policy_generation) {
-                return;
-            }
+            let disposition =
+                match inner.store_snapshot(&worktree, snapshot.clone(), policy_generation) {
+                    Publication::StalePolicy => return,
+                    Publication::Stored => CompletionDisposition::Stored,
+                    Publication::Suppressed(retained) => {
+                        CompletionDisposition::TransientSuppressed { retained }
+                    }
+                    Publication::Outdated => CompletionDisposition::Outdated,
+                };
             inner.record_completion(
                 &worktree,
                 language,
@@ -945,7 +1013,14 @@ impl Inner {
                 );
             }
             if let Some(hook) = &inner.on_complete {
-                hook(&snapshot);
+                hook(&CompletionEvent {
+                    worktree: worktree.clone(),
+                    repository_key: inner.repository_key(&worktree),
+                    policy_generation,
+                    policy_digest: policy_digest.clone(),
+                    snapshot,
+                    disposition,
+                });
             }
             if !inner.finish_run(&worktree, language, true, policy_generation) {
                 return;
@@ -1023,11 +1098,13 @@ impl Inner {
     }
 
     /// Stores `snapshot` as the latest result for its `(worktree, language)` pair only while
-    /// `policy_generation` still matches under this publication lock. Returns `false` for a
-    /// stale policy and `true` for a current completion, including transient suppression. A
-    /// newer completion (by `input_generation`) is retained; a transient `Fatal`/`Timeout`
-    /// failure (EYES-r2 §5) does not overwrite an existing usable `Ready`/`Partial` result.
-    /// Every other `Unavailable` reason still replaces the stored
+    /// `policy_generation` still matches under this publication lock. Returns
+    /// [`Publication::StalePolicy`] for a stale policy and a current completion's disposition
+    /// otherwise. A newer completion (by `input_generation`) is retained; a transient
+    /// `Fatal`/`Timeout` failure (EYES-r2 §5) does not overwrite an existing usable
+    /// `Ready`/`Partial` result and reports the retained snapshot instead; a completion whose
+    /// input generation already predates the retained view changes nothing and reports
+    /// [`Publication::Outdated`]. Every other `Unavailable` reason still replaces the stored
     /// result, since those describe a durable condition (disabled, outside roots, tool/env
     /// missing, or T12B's `NoFiles`, a project misconfiguration that stays true run after run)
     /// rather than one bad run.
@@ -1036,7 +1113,7 @@ impl Inner {
         worktree: &Path,
         snapshot: ProblemSnapshot,
         policy_generation: u64,
-    ) -> bool {
+    ) -> Publication {
         let mut state = self.lock_state();
         let Some(lang) = state
             .worktrees
@@ -1044,25 +1121,39 @@ impl Inner {
             .filter(|wt| wt.policy_generation == policy_generation)
             .and_then(|wt| wt.languages.get_mut(&snapshot.language))
         else {
-            return false;
+            return Publication::StalePolicy;
         };
         if is_transient_failure(&snapshot.state)
-            && matches!(
-                lang.latest_snapshot
-                    .as_ref()
-                    .map(|existing| &existing.state),
-                Some(CheckState::Ready) | Some(CheckState::Partial)
-            )
+            && lang.latest_snapshot.as_ref().is_some_and(|existing| {
+                matches!(existing.state, CheckState::Ready | CheckState::Partial)
+            })
         {
-            return true;
+            // EYES-r2 §5: one bad run never discards a usable earlier result; the completion is
+            // reported as suppressed together with the snapshot that remains authoritative.
+            let retained = lang
+                .latest_snapshot
+                .clone()
+                .expect("is_some_and checked a present snapshot");
+            return Publication::Suppressed(retained);
         }
         if lang.latest_snapshot.is_none()
             || snapshot.input_generation >= lang.last_stored_generation
         {
             lang.last_stored_generation = snapshot.input_generation;
             lang.latest_snapshot = Some(snapshot);
+            return Publication::Stored;
         }
-        true
+        Publication::Outdated
+    }
+
+    /// Returns the repository identity shared by `worktree`'s sibling worktrees, or the empty
+    /// string when the scheduler has no state for the worktree.
+    fn repository_key(&self, worktree: &Path) -> String {
+        self.lock_state()
+            .worktrees
+            .get(worktree)
+            .map(|state| state.repository_key.clone())
+            .unwrap_or_default()
     }
 
     /// Records `duration` as the wall-clock time `(worktree, language)`'s most recently
@@ -1489,10 +1580,47 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod deny_tests {
     use super::*;
-    use crate::checks::{FakeChecker, Problem, Severity};
+    use crate::checks::{BoxFuture, FakeChecker, Problem, Severity};
     use crate::execution::seatbelt::CredentialGlob;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Scripted [`Checker`] substitute returning one snapshot per call in order, then repeating
+    /// the last; test-only, never wired into production paths.
+    struct SequenceChecker {
+        /// Language reported by [`Checker::language`].
+        language: Language,
+        /// Snapshots returned in call order; the last repeats once exhausted.
+        snapshots: Vec<ProblemSnapshot>,
+        /// Index of the next snapshot to return.
+        next: AtomicUsize,
+    }
+
+    impl SequenceChecker {
+        /// Builds the substitute for `snapshots`.
+        fn new(language: Language, snapshots: Vec<ProblemSnapshot>) -> Self {
+            Self {
+                language,
+                snapshots,
+                next: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Checker for SequenceChecker {
+        fn language(&self) -> Language {
+            self.language
+        }
+
+        fn check(&self, _request: CheckRequest) -> BoxFuture<'_, ProblemSnapshot> {
+            let index = self
+                .next
+                .fetch_add(1, Ordering::SeqCst)
+                .min(self.snapshots.len() - 1);
+            let snapshot = self.snapshots[index].clone();
+            Box::pin(async move { snapshot })
+        }
+    }
 
     /// A durable missing-environment result expires after five minutes, using the supplied clock.
     #[test]
@@ -1977,6 +2105,77 @@ mod deny_tests {
             }],
         );
         assert_eq!(scheduler.inner.fingerprint_value(&root).await, None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A transient Fatal completion after a Ready one is reported to the hook as suppressed
+    /// together with the retained snapshot, and the scheduler keeps the Ready view current
+    /// (EYES-r2 §5 publication seam for durable view publication).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transient_completion_reports_suppressed_with_retained_view() {
+        crate::lang::testing::install();
+        let language = crate::lang::testing::ALPHA;
+        let root = std::env::temp_dir().join(format!(
+            "agent-ide-transient-suppress-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        std::fs::write(root.join("alpha.toml"), "").unwrap();
+        let ready = ProblemSnapshot::from_problems(language, CheckState::Ready, Vec::new(), 1, 5);
+        let fatal = ProblemSnapshot::unavailable(language, UnavailableReason::Fatal, 2);
+        let checker = Arc::new(SequenceChecker::new(language, vec![ready.clone(), fatal]));
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&events);
+        let scheduler = Scheduler::new(
+            vec![checker],
+            Duration::from_millis(1),
+            1,
+            root.join("cache"),
+        )
+        .with_fingerprint(Arc::new(|_| None))
+        .with_completion_hook(Arc::new(move |event: &CompletionEvent| {
+            seen.lock()
+                .expect("event log not poisoned")
+                .push(event.clone());
+        }));
+        scheduler.activate("the-repository", &root);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while events.lock().expect("event log not poisoned").is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        scheduler.trigger("the-repository", &root);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while events.lock().expect("event log not poisoned").len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        scheduler.shutdown().await;
+        let events = events.lock().expect("event log not poisoned").clone();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0].disposition,
+            CompletionDisposition::Stored
+        ));
+        assert_eq!(events[0].snapshot, ready);
+        assert_eq!(events[0].worktree, root);
+        assert_eq!(events[0].repository_key, "the-repository");
+        match &events[1].disposition {
+            CompletionDisposition::TransientSuppressed { retained } => {
+                assert_eq!(retained, &ready);
+            }
+            other => panic!("expected the transient completion to be suppressed, got {other:?}"),
+        }
+        assert_eq!(
+            events[1].snapshot.state,
+            CheckState::Unavailable(UnavailableReason::Fatal)
+        );
+        assert_eq!(scheduler.latest(&root), vec![ready]);
         let _ = std::fs::remove_dir_all(root);
     }
 
