@@ -1048,3 +1048,82 @@ mod faults {
         text
     }
 }
+
+/// A project whose test runner is `runner` (a `devDependencies` entry), with a fake `npx` first
+/// on the daemon's `PATH` that prints the runner's own summary line for whatever it is asked to
+/// run, and the test replies of one daemon with `env`.
+async fn runner_transcript(runner: &str, summary: &str, env: &[(&str, &str)]) -> Vec<String> {
+    let fixture = Fixture::new(
+        &[
+            (
+                "package.json",
+                &format!(
+                    "{{\"name\":\"ui\",\"private\":true,\"devDependencies\":{{\"{runner}\":\"1.0.0\"}}}}\n"
+                ),
+            ),
+            ("src/a.test.ts", "test('adds', () => {});\n"),
+            ("src/plain.ts", "export const x = 1;\n"),
+        ],
+        json!([]),
+    );
+    let tools = fixture.base.join("fake-bin");
+    std::fs::create_dir_all(&tools).unwrap();
+    let script = tools.join("npx");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\necho \"$@\"\necho '{summary}'\n"),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        tools.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut daemon_env = vec![("PATH", path.as_str())];
+    daemon_env.extend_from_slice(env);
+    let _daemon = Daemon::start(&fixture, &daemon_env).await;
+    let mut session = Session::start(&fixture).await;
+    let mut replies = Vec::new();
+    for arguments in [
+        json!({"path":"src/a.test.ts"}),
+        json!({"pattern":"adds"}),
+        json!({"path":"src"}),
+        json!({"path":"src/plain.ts"}),
+    ] {
+        let (reply, _) = run_tests(&mut session, &fixture, arguments.clone()).await;
+        replies.push(line_for(&fixture, "ide.test", &arguments, &reply));
+    }
+    session.close(&fixture).await;
+    replies
+}
+
+/// Vitest and Jest runs planned by the module become the declared test recipes and report exactly
+/// what the in-process runs report (file selection, named pattern, directory, a file with no
+/// tests), with the runner's own summary parsed.
+#[tokio::test]
+async fn typescript_test_runners_match_in_process_answers() {
+    for (runner, summary, rerun) in [
+        (
+            "vitest",
+            "Tests  1 passed (1)",
+            "npx vitest run src/a.test.ts",
+        ),
+        (
+            "jest",
+            "Tests:       1 passed, 1 total",
+            "npx jest src/a.test.ts",
+        ),
+    ] {
+        let in_process = runner_transcript(runner, summary, &[IN_PROCESS]).await;
+        let moduled = runner_transcript(runner, summary, &[]).await;
+        parity::assert_parity(&in_process, &moduled);
+        let all = moduled.join("\n");
+        assert!(all.contains("1 passed, 0 failed"), "{runner}:\n{all}");
+        assert!(all.contains(rerun), "{runner} reruns `{rerun}`:\n{all}");
+        assert!(all.contains("no tests in src/plain.ts"), "{runner}:\n{all}");
+    }
+}
