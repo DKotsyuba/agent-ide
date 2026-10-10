@@ -123,8 +123,12 @@ Further rules:
   test lines, signature block, descriptions, instructions, skill. Each owner writes its own text;
   this rule only rejects text that invites polling.
 - **Guard.** One test, `reply_surfaces_never_invite_polling`, applies the table to the real
-  surfaces. A module's new wording passes it before integration; M-024 re-runs it on the integrated
-  candidate.
+  surfaces — the test lines, the `ide.stop` reply, every state of the start card's servers line,
+  the batch read and edit reply lines, the several-target test lines, the signature block,
+  `reply.jinja`, the descriptions, the instructions and the skill — and rejects a seconds count
+  on a line about a running, pending or still-active job (a started line's budget and a finished
+  run's duration are allowed). A module's new wording passes it before integration; M-024 re-runs
+  it on the integrated candidate.
 
 ## 3. Compatibility checks
 
