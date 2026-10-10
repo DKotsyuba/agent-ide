@@ -286,9 +286,9 @@ async fn typescript_module_matches_in_process_answers_with_the_bridge() {
         .unwrap();
     }
     for path in ["src/a.ts", "src/panel.tsx", "src/c.js", "src/card.jsx"] {
-        let context = format!("ide.context {{\"byte_offset\":");
+        let context = "ide.context {\"byte_offset\":";
         let reply = moduled.iter().find(|reply| {
-            reply.starts_with(&context) && reply.lines().next().is_some_and(|l| l.contains(path))
+            reply.starts_with(context) && reply.lines().next().is_some_and(|l| l.contains(path))
         });
         assert!(
             reply.is_some_and(|reply| reply.contains("mode: semantic")),
@@ -296,9 +296,9 @@ async fn typescript_module_matches_in_process_answers_with_the_bridge() {
         );
     }
     for path in ["src/e.mts", "src/f.cts", "src/g.mjs", "src/h.cjs"] {
-        let context = format!("ide.context {{\"byte_offset\":");
+        let context = "ide.context {\"byte_offset\":";
         let reply = moduled.iter().find(|reply| {
-            reply.starts_with(&context) && reply.lines().next().is_some_and(|l| l.contains(path))
+            reply.starts_with(context) && reply.lines().next().is_some_and(|l| l.contains(path))
         });
         assert!(
             reply.is_some_and(|reply| !reply.contains("mode: semantic")),
