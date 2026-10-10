@@ -10,8 +10,8 @@
 //!   ordinary `pending` reply.
 //!
 //! The same job then keeps running in precise mode, re-checking the server every 300 ms for up to
-//! [`PRECISE_BUDGET`], and is registered with the session outbox, which turns its final reply or
-//! failure into one `job-ready` fact. At most [`MAX_DEFERRED_PER_SESSION`] such jobs run per
+//! [`PRECISE_BUDGET`], and is registered with the session outbox (the worker's shared state),
+//! which turns its final reply or failure into one `job-ready` fact. At most [`MAX_DEFERRED_PER_SESSION`] such jobs run per
 //! session; beyond that the approximate answer says the precise answer is not scheduled and the
 //! job ends at its next retry, while a non-exact language keeps the 0.10.8 wait.
 
@@ -161,9 +161,7 @@ impl Worker<'_> {
             fence_paths: fence,
             approximate_given,
         };
-        if let Some(outbox) = deferral_outbox() {
-            outbox.defer(&job.reference, spec);
-        }
+        SessionOutbox::defer(&*self.shared, &job.reference, spec);
     }
 
     /// How many jobs of `binding` answered early and still wait for their precise answer; jobs
@@ -509,31 +507,6 @@ impl Worker<'_> {
         }
         callers
     }
-}
-
-/// The session outbox the precise follow-up is registered with.
-///
-/// ponytail: the worker-backed outbox (session-outbox-v1-m025) is not on this branch yet, so
-/// production registers nothing here and tests record into one process-wide `RecordingOutbox`
-/// (each test filters by its own job references); switch to the worker's outbox when it lands.
-#[cfg(test)]
-fn deferral_outbox() -> Option<&'static dyn SessionOutbox> {
-    Some(test_recorder())
-}
-
-/// The process-wide recorder the test build registers precise follow-ups with.
-#[cfg(test)]
-pub(super) fn test_recorder() -> &'static crate::assistance::outbox::RecordingOutbox {
-    static RECORDER: std::sync::LazyLock<crate::assistance::outbox::RecordingOutbox> =
-        std::sync::LazyLock::new(Default::default);
-    &RECORDER
-}
-
-/// The session outbox the precise follow-up is registered with; none until the worker-backed
-/// outbox lands (see the test variant).
-#[cfg(not(test))]
-fn deferral_outbox() -> Option<&'static dyn SessionOutbox> {
-    None
 }
 
 /// `requested` cut to the outbox's target bound on a character boundary.

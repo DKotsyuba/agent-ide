@@ -438,25 +438,26 @@ fn waiting_job(
     (job, wait, cancel_sender)
 }
 
-/// The deferrals the test recorder holds for `reference`, as `(approximate_given, fence paths)`.
-fn deferrals_of(reference: &str) -> Vec<(bool, Vec<String>)> {
-    super::super::approximate::test_recorder()
-        .calls()
-        .into_iter()
-        .filter_map(|call| match call {
-            crate::assistance::outbox::OutboxCall::Defer {
-                reference: deferred,
-                spec,
-                accepted: true,
-            } if deferred == reference => Some((
+/// The deferral the worker's session outbox holds for `reference`, as `(approximate_given, fence
+/// paths)`; empty when none is registered (or the job already settled into its fact).
+fn deferrals_of(worker: &Worker<'_>, reference: &str) -> Vec<(bool, Vec<String>)> {
+    worker
+        .shared
+        .ledger
+        .lock()
+        .unwrap()
+        .deferred
+        .get(reference)
+        .map(|(spec, _)| {
+            (
                 spec.approximate_given,
                 spec.fence_paths
-                    .into_iter()
-                    .map(|fence| fence.path)
+                    .iter()
+                    .map(|fence| fence.path.clone())
                     .collect(),
-            )),
-            _ => None,
+            )
         })
+        .into_iter()
         .collect()
 }
 
@@ -519,7 +520,7 @@ async fn a_loading_symbol_answers_approximately_then_precisely() {
         "the precise budget is ten minutes"
     );
     assert_eq!(
-        deferrals_of(&job.reference),
+        deferrals_of(&worker, &job.reference),
         vec![(true, vec!["a.epsilon".to_owned()])]
     );
 
@@ -545,7 +546,10 @@ async fn a_loading_symbol_answers_approximately_then_precisely() {
     let precise = complete_text(&settled);
     assert!(precise.starts_with("symbol: a"), "{precise}");
     assert!(!precise.contains("approximate"), "{precise}");
-    assert_eq!(deferrals_of(&job.reference).len(), 1, "registered once");
+    // The settled job became its one job-ready fact; it never holds a turn (an answer was given).
+    assert!(deferrals_of(&worker, &job.reference).is_empty(), "consumed");
+    assert!(worker.shared.outbox.has_undelivered(&reader, false));
+    assert!(!worker.shared.outbox.has_undelivered(&reader, true));
 }
 
 /// While the server loads, `ide.graph` answers at once with an approximate depth-1 graph.
@@ -578,7 +582,7 @@ async fn a_loading_graph_answers_approximately() {
         text.contains("callees: follows with the precise answer"),
         "{text}"
     );
-    assert_eq!(deferrals_of(&job.reference).len(), 1);
+    assert_eq!(deferrals_of(&worker, &job.reference).len(), 1);
 }
 
 /// A bare name the lexical scan cannot resolve to one definition answers `pending` at once and
@@ -608,7 +612,7 @@ async fn unresolvable_names_answer_pending_and_the_session_cap_holds() {
         "an unresolvable bare name answers pending at once"
     );
     assert_eq!(
-        deferrals_of(&ambiguous.reference),
+        deferrals_of(&worker, &ambiguous.reference),
         vec![(false, Vec::new())]
     );
     let mut keep = Vec::new();
@@ -639,5 +643,5 @@ async fn unresolvable_names_answer_pending_and_the_session_cap_holds() {
         "{}",
         complete_text(&early)
     );
-    assert!(deferrals_of(&fifth.reference).is_empty());
+    assert!(deferrals_of(&worker, &fifth.reference).is_empty());
 }
