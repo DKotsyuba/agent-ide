@@ -512,6 +512,14 @@ rust: 3 errors (+2), 5 warnings | python: environment not found
   marked delivered only when it was attached whole — a plate that cannot fit stays due for the
   next terminal reply, exactly like the hook-carried case.
 
+Delivery notes since [OUTBOX-r3](session-outbox-v1.md) (§4, §8.2): the plate stays the ambient
+part of the block, and its rules above are unchanged. Requested results (`test-finished`,
+`edit-checked`, `job-ready`, `lost-after-restart`) follow the plate lines inside the same
+`<agent-ide>` block, on every host's terminal `ide.*` replies (Claude's included), on the paired
+native `PostToolUse`, on the `Stop` hold and in `ide.inspect {}`. Each is handed over once, in
+4096 bytes at most, and committed only when its carrier took it whole. Test runs no longer add a
+plate line on any carrier.
+
 ## 7. `ide.context` with `kind: "problems"`
 
 Parameters: `{"kind": "problems", "language": "rust" | "python" | "typescript" (optional), "offset": u32 (optional)}`.

@@ -65,6 +65,26 @@ hook key cache `/private/tmp/ai-k-…`) and the persistent check caches under
 macOS and Claude; phase 2 adds warm LSP, a launchd per-user service, subagent attach, TypeScript
 checks, and the Codex active block.
 
+## Session outbox and delivery (OUTBOX-r3)
+
+[OUTBOX-r3](contracts/session-outbox-v1.md) makes long work deliver its own result, so no agent
+polls. All of it lives in Assistance (`crates/agent-ide-core/src/assistance/`):
+
+- `outbox.rs` is the producer seam: `SessionOutbox` (`push`, `defer`, `forget`, `context_epoch`,
+  and the carriers' `reserve`/`commit`/`release`), the `FactDraft` kinds and budgets, and a
+  test-only `RecordingOutbox` that peer modules test against.
+- `session_outbox.rs` is the in-memory store: undelivered facts per session (32, failures first),
+  coalescing, staleness fencing against edits and native writes, the agent's turn state
+  (working, ending, idle), holding work in flight, and the history `ide.inspect {}` lists. It
+  dies with the daemon.
+- `worker/delivery.rs` turns settled jobs, test runs and slow edit checks into facts and pushes
+  them. The carriers take facts in one hand-off each: reply piggyback (`assembly.rs`), the paired
+  native `PostToolUse` hook, the `Stop`/`SubagentStop` hold (`worker/turn.rs`, its own daemon
+  lane, at most 300 s and 7 holds in a row), `ide.inspect` (`worker/inspection.rs`) and the idle
+  wake (`wake.rs`, the only seam to a host wake route; today the Claude session-registry inbox).
+- `unresolved.rs` is the MCP front's memory of what each actor was owed, reported as one
+  `lost-after-restart` fact after a daemon replacement.
+
 ## Crates (v0.5)
 
 The repository is a Cargo workspace: one language-independent core, one crate per language, and
