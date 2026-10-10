@@ -9,11 +9,17 @@ pub mod facade;
 /// Projects validated peer replies into compact model text and unchanged structured results.
 pub(crate) mod content;
 
+/// Batch request forms (batch-api-v1): caps, item parsing, summary lines and follow-up calls.
+pub(crate) mod batch;
+
 /// Connects bounded daemon host correlation to closed peer-boundary outcomes.
 pub mod assembly;
 
 /// Correlates exact Codex and Claude host identity from native hooks and MCP call metadata.
 pub mod host_binding;
+
+/// Carrier liveness evidence and the stale-writer takeover rule.
+pub(crate) mod carriers;
 
 /// Exposes the bounded fail-open native Codex and Claude hook command modes.
 pub mod codex_hook;

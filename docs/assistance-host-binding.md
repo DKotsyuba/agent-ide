@@ -374,6 +374,38 @@ so silence counts as delivered and is never retried. Subagents, headless session
 no wake: Codex Desktop does not hand its thread pipe to the managed MCP, so the Codex cover is
 the `Stop` hold and `ide.inspect {"wait_ms": N}`.
 
+### Stale writer takeover
+
+The shared Claude daemon outlives every session, so a session that ends without `ide.stop` (a
+finished or crashed agent) used to keep its writer activation until the daemon itself stopped,
+and every later writer start on that worktree was refused `worktree_held_by_another_actor`. A
+writer start that collides with another actor's writer now weighs the holder's liveness
+(`assistance/carriers.rs`, `assistance/takeover.rs`; contract
+[start-index-state](contracts/start-index-state-v1.md) §4):
+
+- **Evidence.** The daemon reads the kernel's peer process id of every call connection
+  (`LOCAL_PEERPID` on macOS, `SO_PEERCRED` on Linux) and of every long-lived client lease, and
+  notes when a lease reaches EOF. The process that carried a binding's latest validated call is
+  its *carrier*: the session's MCP front, a child of the host session. The guard also keeps when
+  each bound actor last sent a hook and whether a tool call is in flight (a pre-hook without its
+  post, a call still settling). A process id is liveness evidence only, never identity or
+  authority; a reused id can only make a gone holder look alive.
+- **Session ended.** The carrier's last lease closed and nothing arrived from the holder later
+  than 5 s after that: the start takes the writer over at once. Queued work of the gone session
+  is cancelled exactly as `ide.stop` cancels it.
+- **Inactive.** The holder has no tool call and no IDE work in flight (queued or pending job,
+  running test, unsettled edit, uncertain cleanup) and sent nothing for 30 minutes.
+- **Anything else is a live holder** and keeps its writer; the refusal names the holder and says
+  that the slot frees when that session ends or after 30 minutes without activity.
+
+A takeover runs the existing handover machinery: the holder is fenced against new work, revoked
+durably, its sessions and retained results are released, and the start re-runs. The reply says
+`took over the writer from actor <actor> (activation <id>, last activity <time>; its session
+ended | inactive for <m> min)`, and the journal records `takeover: actor <actor>
+(session_ended|inactive)`. The displaced actor's next call is refused with the closed cause
+`(taken_over)` and the reason; a fresh `ide.start` (read-only while the other actor writes)
+works again. Managed Codex is unaffected: each Codex front owns a private daemon and store.
+
 ### Lost replies (0.10.3)
 
 Once the request frame began to be written, a write or read failure, a malformed or explicitly
@@ -434,7 +466,7 @@ Closed daemon outcomes are:
 
 | Outcome | Meaning |
 | --- | --- |
-| `{"state":"unavailable","reason":"host_binding"}` | No validated exact invocation. The compact text names one closed cause in parentheses (T15B): `(invalid_metadata)`, `(missing_field)`, `(invalid_field)`, `(invalid_attachment)`, `(unsupported_hook_phase)`, `(missing_invocation)`, `(outside_allowed_roots)`, `(hooks_not_delivered)`, `(missing_pre)`, `(replay)`, `(mismatch)`, `(inactive_binding)`, `(never_activated)`, `(recovery_needed)`, `(capacity_exceeded)`, `(host_unrecognized)`, or `(project_moved: bound to <path>, asked <path>)`; the refusal follows with the cause and next step. The same tag is the journal `detail`. The structured reply keeps its historical fields. |
+| `{"state":"unavailable","reason":"host_binding"}` | No validated exact invocation. The compact text names one closed cause in parentheses (T15B): `(invalid_metadata)`, `(missing_field)`, `(invalid_field)`, `(invalid_attachment)`, `(unsupported_hook_phase)`, `(missing_invocation)`, `(outside_allowed_roots)`, `(hooks_not_delivered)`, `(missing_pre)`, `(replay)`, `(mismatch)`, `(inactive_binding)`, `(taken_over)`, `(never_activated)`, `(recovery_needed)`, `(capacity_exceeded)`, `(host_unrecognized)`, or `(project_moved: bound to <path>, asked <path>)`; the refusal follows with the cause and next step. The same tag is the journal `detail`. The structured reply keeps its historical fields. |
 | `{"state":"unavailable","reason":"workspace_activation"}` | Host invocation and current binding are proven; Workspace activation is not connected. |
 | `{"state":"hook_observed"}` | One pre-hook was retained; no authority or delivery claim. |
 | `{"state":"hook_settled"}` | One exact post-hook settled a validated invocation. |

@@ -249,6 +249,10 @@ pub struct MethodDispatch {
     opaque_attachment: String,
     method: AssistanceMethod,
     params_json: OpaqueJson,
+    /// Kernel-reported process id of the peer that sent this request on the daemon's socket
+    /// (the MCP front's process), set only by the daemon's accept path and never sent on the
+    /// wire. Liveness evidence for a stale-writer takeover, never identity or authority.
+    carrier: Option<u32>,
 }
 
 impl std::fmt::Debug for MethodDispatch {
@@ -280,7 +284,22 @@ impl MethodDispatch {
             opaque_attachment,
             method,
             params_json,
+            carrier: None,
         })
+    }
+
+    /// Returns this request with the kernel-reported peer process id `pid` of the connection it
+    /// arrived on (`None` when the platform could not report it). Only the daemon's accept path
+    /// calls this; a client never sets it.
+    pub fn with_carrier(mut self, pid: Option<u32>) -> Self {
+        self.carrier = pid;
+        self
+    }
+
+    /// Returns the peer process id the daemon observed for this request, if any (see
+    /// [`Self::with_carrier`]).
+    pub fn carrier(&self) -> Option<u32> {
+        self.carrier
     }
 
     /// Returns the client-supplied transport request ID for bounded reply correlation.
@@ -333,6 +352,14 @@ pub struct AssistanceDispatchUnavailable;
 
 /// Allows Assistance to receive exactly one bounded dispatch while retaining all host/tool semantics.
 pub trait AssistanceDispatcher: Send + Sync {
+    /// Notes that process `pid` opened a long-lived client lease on this daemon (an MCP front
+    /// attaching). Liveness evidence only; the default dispatcher ignores it.
+    fn carrier_opened(&self, _pid: u32) {}
+
+    /// Notes that a client lease of process `pid` reached EOF (the front exited or detached).
+    /// Liveness evidence only; the default dispatcher ignores it.
+    fn carrier_closed(&self, _pid: u32) {}
+
     /// Registers one host-selected Claude candidate on an existing repository daemon.
     /// The returned opaque attachment selects only this candidate; activation still proves Git
     /// identity and durable authority. Other dispatchers reject registration by default.

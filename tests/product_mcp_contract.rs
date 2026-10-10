@@ -420,6 +420,11 @@ fn assert_compact_envelope(reply: &Value) {
         Some(rest) => rest.split_once('\n').map_or("", |(_, rest)| rest),
         None => text,
     };
+    // An approximate symbol or graph answer (a loading server) leads with its own label line.
+    let body = match body.strip_prefix("approximate: ") {
+        Some(rest) => rest.split_once('\n').map_or("", |(_, rest)| rest),
+        None => body,
+    };
     match (state, kind) {
         ("error", _) if structured["code"] == "conflict" => assert!(
             text.starts_with("error: conflict") || text.starts_with("refused: read_only ("),
@@ -435,14 +440,19 @@ fn assert_compact_envelope(reply: &Value) {
         // A card or an ambiguity list; a later page continues one of them.
         ("complete", Some("symbol")) => assert!(
             body.starts_with("symbol: ")
+                || body.starts_with("symbols: ")
                 || body.starts_with("ambiguous_symbol: ")
                 || (text.starts_with("page ") && !text.starts_with("page 1;")),
             "{reply}"
         ),
         ("complete", Some("graph")) => assert!(body.starts_with("graph: "), "{reply}"),
+        // A multi-file edit (batch-api-v1 §7) opens with its outcome line.
+        ("complete", Some("edit_batch")) => assert!(body.starts_with("edit: "), "{reply}"),
         // OUTBOX-r3 §8.5: consolidated `ide.inspect` text is plain, with no header of its own.
         ("complete", Some("inspect")) => assert!(!body.is_empty(), "{reply}"),
         // `<file>  (<n> lines, <lang>)` outline header.
+        // A several-file outline (batch-api-v1 §3) opens with its summary line.
+        ("complete", Some("outline")) if body.starts_with("outline: ") => {}
         ("complete", Some("outline")) => {
             let header = body.lines().next().unwrap_or_default();
             let (file, details) = header.split_once("  (").expect("outline file header");
@@ -457,7 +467,9 @@ fn assert_compact_envelope(reply: &Value) {
             let header = body.lines().next().unwrap_or_default();
             // A batch may open with a per-item refusal line instead of a block, and an empty
             // file's block says so instead of naming lines.
-            if !(header.starts_with("no such ")
+            // A batch read opens with its summary line (batch-api-v1 §2).
+            if !(header.starts_with("read: ")
+                || header.starts_with("no such ")
                 || header.starts_with("not a readable text file")
                 || header.contains(" has no code symbols; ")
                 || header.ends_with("  (empty file)"))
@@ -3276,7 +3288,12 @@ impl ProductActor {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
         let mut polls = 0;
         let mut delay = PRODUCT_SETTLE_INITIAL_DELAY;
-        while reply["result"]["structuredContent"]["state"] == "pending" {
+        // An approximate answer (a loading server) is followed to its precise one, as `pending`.
+        while reply["result"]["structuredContent"]["state"] == "pending"
+            || reply["result"]["structuredContent"]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("approximate: "))
+        {
             assert!(
                 tokio::time::Instant::now() < deadline && polls < PRODUCT_SETTLE_MAX_POLLS,
                 "product operation did not settle: {reply}"
@@ -3304,7 +3321,12 @@ impl ProductActor {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
         let mut polls = 0;
         let mut delay = PRODUCT_SETTLE_INITIAL_DELAY;
-        while reply["state"] == "pending" {
+        // An approximate answer (a loading server) is followed to its precise one, as `pending`.
+        while reply["state"] == "pending"
+            || reply["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("approximate: "))
+        {
             assert!(
                 tokio::time::Instant::now() < deadline && polls < PRODUCT_SETTLE_MAX_POLLS,
                 "product operation did not settle"
@@ -9651,6 +9673,54 @@ async fn configured_product_symbol_card_answers_requested_callees() {
     daemon.wait().await.unwrap();
 }
 
+/// The first `ide.symbol` and `ide.graph` calls on a cold Rust worktree never answer `pending`
+/// (symbol-graph-item r2 §4): while the real rust-analyzer indexes they answer at once with an
+/// `approximate:` answer whose `detail_ref` later settles to the precise one; a server that is
+/// already ready answers precisely. The first answer arrives well inside the inline window.
+#[tokio::test]
+async fn configured_product_cold_rust_symbol_and_graph_never_answer_pending() {
+    let fixture = graph_test_fixture();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "cold-approximate").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"cold-approximate"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    for (tool, arguments, precise) in [
+        ("ide.symbol", json!({"symbol":"src/lib.rs#c"}), "symbol: c"),
+        (
+            "ide.graph",
+            json!({"symbol":"src/lib.rs#c","direction":"callers","depth":1}),
+            "graph: callers of src/lib.rs#c",
+        ),
+    ] {
+        let asked = std::time::Instant::now();
+        let first = actor.call(&fixture, tool, arguments).await;
+        let elapsed = asked.elapsed();
+        assert_ne!(first["state"], "pending", "{tool}: {first}");
+        assert!(elapsed < Duration::from_secs(8), "{tool}: {elapsed:?}");
+        let text = first["text"].as_str().unwrap_or_default().to_owned();
+        if text.starts_with("approximate: ") {
+            assert!(
+                text.contains("the precise answer follows as a fact"),
+                "{text}"
+            );
+        }
+        let settled = actor.settle(&fixture, first).await;
+        let settled = settled["text"].as_str().unwrap_or_default();
+        assert!(settled.starts_with(precise), "{tool}: {settled}");
+    }
+    let stop = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(actor.settle(&fixture, stop).await["kind"], "stop");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// T163 (extra item): the callees section answers exactly like `ide.graph {direction:"callees"}`
 /// even when the card's other sections (usages, and callers at its default depth) already ran
 /// their own live-session round trips first — the card must not reuse a now-stale position for
@@ -11122,7 +11192,8 @@ async fn configured_product_batch_ranges_read_then_edit_by_those_lines_without_r
     assert_eq!(
         batch_without_status_plate(&read_text),
         format!(
-            "src/batch.rs  (lines 5–7)\n5\tpub fn alpha() -> i32 {{\n6\t    helper(1)\n7\t}}\n\
+            "read: 2 items in 1 files — 2 delivered, 0 unchanged, 0 not included, 0 failed\n\
+             src/batch.rs  (lines 5–7)\n5\tpub fn alpha() -> i32 {{\n6\t    helper(1)\n7\t}}\n\
              src/batch.rs  (lines 9–11)\n 9\tpub fn beta() -> i32 {{\n10\t    helper(2)\n11\t}}\n\
              source_ref: {source_ref}\n"
         ),
@@ -11215,7 +11286,10 @@ async fn configured_product_batch_read_budget_footer_duplicate_and_unknown_symbo
     // The delivered block renders with the same numbered gutter as every read.
     let huge_a_end = 383usize;
     let width = huge_a_end.to_string().len();
-    let mut expected = format!("src/big.rs#huge_a  (lines 1–{huge_a_end})\n");
+    let mut expected = format!(
+        "read: 3 items in 1 files — 1 delivered, 0 unchanged, 1 not included, 1 failed\n\
+         src/big.rs#huge_a  (lines 1–{huge_a_end})\n"
+    );
     for number in 1..=huge_a_end {
         expected.push_str(&format!("{number:>width$}\t{}\n", lines[number - 1]));
     }
@@ -14397,7 +14471,7 @@ async fn configured_product_activation_reply_includes_the_project_card() {
     assert!(text.contains("\nlayout: src/ 1"), "{text}");
     assert!(text.contains("\ndocs: README.md"), "{text}");
     assert!(
-        text.contains("\nservers: rust not started; ide.outline, ide.read and ide.edit answer from source now; ide.symbol and ide.graph wait for the server, which starts on their first use · typescript not started; starts on first use"),
+        text.contains("\nservers: rust not started; outline, read and edit answer from source; the first symbol or graph call starts it and answers approximately at once · typescript not started; the first symbol or graph call starts it and its answer follows as a fact"),
         "{text}"
     );
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
@@ -21583,6 +21657,79 @@ async fn outbox_managed_claude_restart_reports_lost_results_once_per_actor() {
     mcp.close().await;
 }
 
+/// Runs one Claude-path call for `actor` with its native Pre/Post hooks and returns the raw
+/// model text.
+async fn claude_raw_call(
+    fixture: &ProductFixture,
+    actor: &mut ProductActor,
+    name: &str,
+    arguments: Value,
+) -> String {
+    actor.next += 1;
+    let call = format!("call-{}", actor.next);
+    actor.claude_lifecycle(fixture, "PreToolUse", &call).await;
+    let reply = actor
+        .mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
+            "name":name,"arguments":arguments,"_meta":{"claudecode/toolUseId":call}}}),
+        )
+        .await;
+    let _ = actor
+        .claude_lifecycle_output(fixture, "PostToolUse", &call)
+        .await;
+    assert_claude_envelope(&reply).to_owned()
+}
+
+/// OUTBOX-r3 §9.1 meets batch-api-v1 §2: a `PreCompact` hook raises the session's context
+/// epoch through the real hook path, so a read the agent received before the compaction is sent
+/// in full again instead of "unchanged since your read".
+#[tokio::test]
+async fn outbox_compaction_clears_the_unchanged_read_memory() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "outbox-compaction").await;
+    let started = actor
+        .call_claude(&fixture, "ide.start", json!({"activation_id":"compaction"}))
+        .await;
+    let (started, _) = actor.settle_claude(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let items = json!({"items":[{"path":"src/lib.rs"}]});
+    let first = claude_raw_call(&fixture, &mut actor, "ide.read", items.clone()).await;
+    assert!(!first.contains("unchanged since your read"), "{first}");
+    let again = claude_raw_call(&fixture, &mut actor, "ide.read", items.clone()).await;
+    assert!(again.contains("unchanged since your read"), "{again}");
+    let mut child = claude_hook_process(&fixture.runtime, Some(actor.attachment));
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(
+            json!({"hook_event_name":"PreCompact",actor.actor_field:actor.actor,
+                "trigger":"manual"})
+            .to_string()
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    input.shutdown().await.unwrap();
+    drop(input);
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success() && output.stdout.is_empty());
+    let after = claude_raw_call(&fixture, &mut actor, "ide.read", items).await;
+    assert!(!after.contains("unchanged since your read"), "{after}");
+    assert!(
+        after.contains("1 delivered, 0 unchanged") && after.contains("pub fn value()"),
+        "the compacted session gets the full text again: {after}"
+    );
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// OUTBOX-r3 §11: `ide.stop` lists the facts no carrier handed over, once.
 #[tokio::test]
 async fn outbox_claude_stop_flushes_undelivered_facts() {
@@ -22884,6 +23031,124 @@ async fn managed_claude_stopped_actor_is_never_recovered() {
     mcp.close().await;
 }
 
+/// Runs one hook-paired managed Claude call of root actor `session` and returns its compact text;
+/// a `pending` reply is followed through hook-paired `ide.inspect` calls until it settles (at
+/// most 30 s).
+async fn claude_settled_text(
+    mcp: &mut Mcp,
+    project: &Path,
+    next: &mut usize,
+    session: &str,
+    name: &str,
+    arguments: Value,
+) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let (mut name, mut arguments) = (name.to_owned(), arguments);
+    loop {
+        *next += 1;
+        let call = format!("managed-claude-{next}");
+        let pre = managed_claude_hook(
+            Some(project),
+            managed_claude_event("PreToolUse", session, None, &call),
+        )
+        .await;
+        assert!(pre.status.success(), "managed pre-hook failed");
+        let reply = mcp
+            .exchange(
+                json!({"jsonrpc":"2.0","id":*next,"method":"tools/call","params":{
+                    "name":name,"arguments":arguments,"_meta":{"claudecode/toolUseId":call}
+                }}),
+            )
+            .await;
+        let post = managed_claude_hook(
+            Some(project),
+            managed_claude_event("PostToolUse", session, None, &call),
+        )
+        .await;
+        assert!(post.status.success());
+        let text = assert_claude_envelope(&reply).to_owned();
+        let fields = claude_fields(&text);
+        if fields["state"] != "pending" {
+            return text;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "did not settle: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        name = "ide.inspect".to_owned();
+        arguments = json!({"detail_ref": fields["detail_ref"]});
+    }
+}
+
+/// A writer whose Claude session ended without `ide.stop` (its MCP front exited) is taken over by
+/// the next session's `ide.start` on the same worktree, while a live writer is never displaced
+/// (start-index-state r2 §4). A third front keeps the shared daemon alive throughout, as a lead
+/// agent's session does.
+#[tokio::test]
+async fn managed_claude_writer_of_an_ended_session_is_taken_over() {
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let keeper = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let mut gone = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let mut next_session = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let mut next = 10;
+    let started = claude_settled_text(
+        &mut gone,
+        &fixture.root,
+        &mut next,
+        "gone-session",
+        "ide.start",
+        json!({}),
+    )
+    .await;
+    assert!(started.contains("mode: writer"), "{started}");
+
+    // While the first session's front is attached and it was just heard from, the writer stays.
+    let refused = claude_settled_text(
+        &mut next_session,
+        &fixture.root,
+        &mut next,
+        "next-session",
+        "ide.start",
+        json!({}),
+    )
+    .await;
+    assert!(
+        refused.starts_with(
+            "error: conflict (start:worktree_held_by_another_actor: actor gone-session"
+        ) && refused.contains("another agent's live session holds the only writer slot"),
+        "{refused}"
+    );
+
+    // The first session ends without ide.stop: its front exits and its lease closes.
+    gone.close().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let taken = loop {
+        let text = claude_settled_text(
+            &mut next_session,
+            &fixture.root,
+            &mut next,
+            "next-session",
+            "ide.start",
+            json!({}),
+        )
+        .await;
+        if !text.starts_with("error: conflict") || tokio::time::Instant::now() >= deadline {
+            break text;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        taken.contains("mode: writer; took over the writer from actor gone-session (activation ")
+            && taken.contains("; its session ended); "),
+        "{taken}"
+    );
+    next_session.close().await;
+    keeper.close().await;
+}
+
 /// A daemon without this release's actor capabilities (the 0.10.2 contract) still serves a current
 /// managed Claude front: start, read and stop all work, and stop is never preceded by anything
 /// that could consume its pre-hook.
@@ -23276,3 +23541,6 @@ async fn failed_stop_is_retried_by_the_daemon_without_another_call() {
     .expect("the daemon's own retry must revoke the grant without another call");
     actor.mcp.close().await;
 }
+
+/// Batch forms (batch-api-v1) against the real daemon, sharing this file's fixtures.
+mod batch_api;

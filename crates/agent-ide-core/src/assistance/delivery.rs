@@ -35,8 +35,9 @@ use crate::changes::edit::EditResult;
 /// draining and the settle hook itself.
 const RUN_SETTLE_SLACK: Duration = Duration::from_secs(5);
 /// How long before the caller's inline window ends an edit still awaiting its project check is
-/// answered with `diagnostics: pending` (OUTBOX §8.6), leaving room for the reply to travel.
-const EARLY_EDIT_REPLY_MARGIN: Duration = Duration::from_millis(1500);
+/// answered with `diagnostics: pending` (OUTBOX §8.6), leaving room for the reply to travel. The
+/// multi-file edit (`batch_edit`) answers early by the same margin.
+pub(super) const EARLY_EDIT_REPLY_MARGIN: Duration = Duration::from_millis(1500);
 /// Most diagnostic `new:` lines one `edit-checked` fact carries (OUTBOX §3.3).
 const MAX_NEW_LINES: usize = 8;
 /// How long a holding fact waits before an idle session is woken, so an imminent hook takes it
@@ -398,9 +399,13 @@ impl Worker<'_> {
     /// its settlement pushes one `edit-checked` fact ([`Shared::job_settled`]). The write is
     /// counted for staleness before the registration, so the fact never labels its own edit.
     pub(super) fn reply_edit_early(&self, job: &mut Job, stage: &JobStage) {
+        // A multi-file edit answers early through its own path (`batch_edit`).
         let JobStage::EditAwaitingCheck {
             result, deadline, ..
-        } = stage;
+        } = stage
+        else {
+            return;
+        };
         let started = job.deadline.checked_sub(Duration::from_millis(
             self.shared.launcher.limits.operation_ms,
         ));

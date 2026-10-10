@@ -92,6 +92,15 @@ pub enum HostBindingCause {
         /// Bounded requested root exactly as the model named it.
         asked: String,
     },
+    /// Another actor's `ide.start` took this session's activation over as a stale writer
+    /// (start-index-state r2 §4c). The tag stays `taken_over`; `reason` is the fixed phrase the
+    /// reply text adds (`after this session's IDE connection closed` or `after <m> min without
+    /// activity`), never host data.
+    TakenOver {
+        /// Why the activation was taken over, as [`super::host_binding::TakeoverReason::displaced`]
+        /// words it.
+        reason: String,
+    },
 }
 
 impl HostBindingCause {
@@ -112,6 +121,9 @@ impl HostBindingCause {
             super::host_binding::BindingUnavailable::InactiveBinding => Self::InactiveBinding,
             super::host_binding::BindingUnavailable::NeverActivated => Self::NeverActivated,
             super::host_binding::BindingUnavailable::CapacityExceeded => Self::CapacityExceeded,
+            super::host_binding::BindingUnavailable::TakenOver(reason) => Self::TakenOver {
+                reason: reason.displaced(),
+            },
         })
     }
 
@@ -159,6 +171,7 @@ impl HostBindingCause {
             Self::OtherRepository { bound, asked } => {
                 format!("other_repository: bound to {bound}, asked {asked}")
             }
+            Self::TakenOver { .. } => "taken_over".to_owned(),
         }
     }
 }
@@ -313,6 +326,9 @@ pub enum ResultKind {
     /// The session's delivered facts or several references, gathered by one `ide.inspect` call
     /// (`{}` or `detail_refs`, OUTBOX-r3 §8.5); plain text with no continuation of its own.
     Inspect,
+    /// The per-file outcome of a multi-file `ide.edit {files}` (batch-api-v1 §7); its text opens
+    /// with `edit: applied …` or `edit: partial …`.
+    EditBatch,
 }
 
 /// Serde's skip test for a zero count.

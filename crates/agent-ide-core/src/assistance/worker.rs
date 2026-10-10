@@ -34,19 +34,33 @@ use crate::{
         store::WorkspaceStore,
     },
 };
+#[path = "approximate.rs"]
+mod approximate;
+#[path = "batch_edit.rs"]
+mod batch_edit;
+#[path = "batch_targets.rs"]
+mod batch_targets;
+#[path = "batch_tests.rs"]
+mod batch_tests;
 #[path = "delivery.rs"]
 mod delivery;
 pub(crate) use delivery::{owed_fact, settled_run};
+#[path = "index_state.rs"]
+mod index_state;
 #[path = "inspection.rs"]
 mod inspection;
 #[path = "links.rs"]
 mod links;
+#[path = "navigation.rs"]
+mod navigation;
 #[path = "providers.rs"]
 mod providers;
 #[path = "snapshots.rs"]
 pub(super) mod snapshots;
 #[path = "symbols.rs"]
 mod symbols;
+#[path = "takeover.rs"]
+mod takeover;
 #[path = "turn.rs"]
 mod turn;
 
@@ -124,6 +138,8 @@ struct Job {
 }
 
 /// Resumable state for operations that have already performed an externally visible edit.
+// One stage lives per parked job, so the variant size difference costs nothing measurable.
+#[allow(clippy::large_enum_variant)]
 enum JobStage {
     /// The edit is settled; only its target project-check snapshot and reply remain.
     EditAwaitingCheck {
@@ -150,6 +166,9 @@ enum JobStage {
         /// Last time a matching check may affect the edit reply.
         deadline: tokio::time::Instant,
     },
+    /// A multi-file edit (`ide.edit {files}`) has written; only its one project check and the
+    /// per-file reply remain.
+    EditBatchAwaitingCheck(Box<batch_edit::BatchCheck>),
 }
 
 /// A retained outcome requiring exact binding ownership and fresh durable authorization on access.
@@ -549,6 +568,9 @@ struct Ledger {
     /// Bindings whose activation is being handed to another worktree: ingress refuses their new
     /// work until the handover settles, so nothing can queue against the old root meanwhile.
     handing_over: BTreeSet<BindingRef>,
+    /// Per active binding, the blocks `ide.read {items}` delivered, for the unchanged answer.
+    /// Cleared at the same points `feedback` is cleared.
+    read_memory: BTreeMap<BindingRef, super::batch::ReadMemory>,
     /// Pending `job-ready` registrations (OUTBOX §3.2) by result reference, with the epoch the
     /// fact is fenced at; taken by the job's settlement or by a read through its own reference.
     deferred: BTreeMap<String, (super::outbox::DeferSpec, super::outbox::JobEpoch)>,
@@ -568,6 +590,7 @@ impl Default for Ledger {
             feedback: BTreeMap::new(),
             delivered: BTreeMap::new(),
             handing_over: BTreeSet::new(),
+            read_memory: BTreeMap::new(),
             deferred: BTreeMap::new(),
         }
     }
@@ -1674,6 +1697,8 @@ impl WorkerHandle {
                     names: Default::default(),
                     telemetry,
                     activity: BTreeMap::new(),
+                    deferred_precise: BTreeMap::new(),
+                    symbol_batches: BTreeMap::new(),
                 }
                 .run(receiver)
                 .await
@@ -1850,6 +1875,7 @@ impl WorkerHandle {
             ledger.last_activity.remove(&binding);
             ledger.feedback.remove(&binding);
             ledger.delivered.remove(&binding);
+            ledger.read_memory.remove(&binding);
             let live = ledger.details.keys().cloned().collect::<BTreeSet<_>>();
             ledger
                 .deferred
@@ -2582,12 +2608,20 @@ struct Worker<'a> {
     /// Wall-clock milliseconds of each active binding's last completed job, keyed by binding
     /// fingerprint, so a refused activation can name the holder's last observed activity.
     activity: BTreeMap<[u8; 32], u64>,
+    /// Symbol and graph jobs that answered their caller early (approximately, or `pending`) and
+    /// keep running for the precise answer, by job reference, with their owning binding; at most
+    /// [`approximate::MAX_DEFERRED_PER_SESSION`] per binding (symbol-graph-item r2 §5).
+    deferred_precise: BTreeMap<String, BindingRef>,
+    /// Several-symbol jobs that answered their caller early, by job reference, with their entries
+    /// kept across attempts while the approximate and deferred ones re-run in precise mode
+    /// (batch-api-v1 §4); only references still in `deferred_precise` are kept.
+    symbol_batches: BTreeMap<String, batch_targets::SymbolBatch>,
 }
 
 impl<'a> Worker<'a> {
     /// Handles an explicit test start or a status request for a run the caller's own actor and
     /// channel started in this worktree; an unknown run id returns `invalid_detail` with the
-    /// `test:unknown_run` stage.
+    /// `test:unknown_run` stage. The `{targets}` form runs as one run in `batch_tests`.
     /// Runs inside the queued job. The `symbol` branch resolves references through the live
     /// language server before selecting tests, so its caller already holds a `pending` reply (see
     /// [`WorkerHandle::submit`]) and reads the started/no-tests line through `ide.inspect`; the other
@@ -2597,6 +2631,9 @@ impl<'a> Worker<'a> {
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        if job.parameters.get("targets").is_some() {
+            return self.batch_tests(job).await;
+        }
         let binding = job.invocation.binding_ref().clone();
         let authority = self.authority(&binding).await?;
         self.shared.active(&binding)?;
@@ -3259,6 +3296,9 @@ impl<'a> Worker<'a> {
                     note: None,
                     operation: edit_operation(&job.parameters),
                 },
+                Some(JobStage::EditBatchAwaitingCheck(check)) => {
+                    check.unknown_reply(&job.reference)
+                }
                 None => PeerReply::Error {
                     code: FailureCode::Internal,
                     detail: Some(crate::telemetry::adapters::default_stage(
@@ -3300,7 +3340,10 @@ impl<'a> Worker<'a> {
                             .as_str()?
                             .split_once('#')
                             .map(|(path, _)| path)
-                    })?;
+                    })
+                    // A multi-file edit names its first file; the operation's receipt keeps
+                    // every file's state for the retry that reconciles it.
+                    .or_else(|| job.parameters.get("files")?.get(0)?.get("path")?.as_str())?;
                 EditResult::new(
                     operation.to_owned(),
                     path.to_owned(),
@@ -3462,6 +3505,15 @@ impl<'a> Worker<'a> {
                 }
             }
         };
+        // A symbol or graph call that meets a loading server answers its caller at once and
+        // keeps running for the precise answer (symbol-graph-item r2 §4-§5); the `{symbols}`
+        // form answers early per entry by itself (`batch_symbols`).
+        if matches!(job.tool, AssistanceTool::Symbol | AssistanceTool::Graph)
+            && job.parameters.get("symbols").is_none()
+            && (job.park_until.is_some() || matches!(result, Err(FailureCode::ProviderLoading)))
+        {
+            self.answer_while_loading(job).await;
+        }
         if job.park_until.is_some() {
             return;
         }
@@ -3999,6 +4051,21 @@ impl<'a> Worker<'a> {
                 }
             }
         }
+        // Another actor's writer left behind by a gone or long-inactive session is taken over
+        // instead of refusing this start (start-index-state r2 §4); a live holder keeps it.
+        let mut took_over = String::new();
+        if matches!(
+            activation,
+            Err(crate::workspace::durable::DurableError::Authority(
+                crate::workspace::authority::AuthorityError::WorktreeOwned
+            ))
+        ) && let Some((moved, line)) = self
+            .take_over_stale_writer(job, &requested_tree, &requested_operation, read_only)
+            .await?
+        {
+            activation = moved;
+            took_over = format!("{line}; ");
+        }
         let receipt = match activation {
             Ok(receipt) => receipt,
             Err(
@@ -4219,26 +4286,15 @@ impl<'a> Worker<'a> {
                 languages.clear();
                 environments.clear();
             }
-            let modes = crate::modules::calls::modes_line(
-                &languages
-                    .iter()
-                    .map(|project| project.language)
-                    .collect::<Vec<_>>(),
-            );
+            let detected = languages
+                .iter()
+                .map(|project| project.language)
+                .collect::<Vec<_>>();
+            let modes = crate::modules::calls::modes_line(&detected);
+            // Servers start lazily (first symbol or graph call); the card reports each server
+            // language's session as it is now, starting nothing (start-index-state r2 §2).
+            let servers = self.server_states(&binding, &detected).await;
             let walk = tokio::task::spawn_blocking(move || {
-                // The daemon does not probe language servers at start; every detected language's
-                // server state is the honest "not started" until a later tool observes otherwise,
-                // and it names what already works from source so a heavy user does not wait for
-                // semantic tools that only the server can answer. Only languages that have a
-                // server get a server state.
-                let servers = languages
-                    .iter()
-                    .filter(|project| project.language.server().is_some())
-                    .map(|project| CardServerState {
-                        language: project.language,
-                        state: project_card::not_started_state(project.language).to_owned(),
-                    })
-                    .collect();
                 let links = project_card::links_line(&languages);
                 let mut project = project_card::collect(&root, languages, servers, None);
                 project.environments = environments;
@@ -4290,7 +4346,7 @@ impl<'a> Worker<'a> {
             )
         } else {
             format!(
-                "activated: epoch {}; mode: writer; {reused}baseline: {baseline}",
+                "activated: epoch {}; mode: writer; {took_over}{reused}baseline: {baseline}",
                 authority.epoch(),
             )
         };
@@ -4432,44 +4488,11 @@ impl<'a> Worker<'a> {
                 reason,
             })
         };
-        if self.uncertain.contains(holder) {
-            return busy("an unsettled operation");
-        }
-        if self.unsettled_edits.contains_key(holder) {
-            return busy("an edit with outcome_unknown");
-        }
-        if self
-            .shared
-            .test_runs
-            .uncollected(&holder.fingerprint())
-            .iter()
-            .any(|(_, _, running)| *running)
-        {
-            return busy("a running test");
-        }
         let Ok(mut ledger) = self.shared.ledger.lock() else {
             return busy("an unavailable ledger");
         };
-        {
-            if let Some(job) = ledger
-                .queue
-                .iter()
-                .find(|job| job.invocation.binding_ref() == holder)
-            {
-                return busy(if job.tool == AssistanceTool::Edit || job.stage.is_some() {
-                    "a pending edit"
-                } else {
-                    "queued work"
-                });
-            }
-            for (reference, detail) in &ledger.details {
-                if &detail.binding != holder {
-                    continue;
-                }
-                if matches!(detail.reply, PeerReply::Pending { .. }) && reference != current {
-                    return busy("a pending job");
-                }
-            }
+        if let Some(reason) = self.pending_work(&ledger, holder, current) {
+            return busy(reason);
         }
         // The idle verdict and the fence are one critical section: work the old binding submits
         // while the handover settles is refused at ingress instead of racing the move.
@@ -4965,7 +4988,7 @@ impl<'a> Worker<'a> {
             Err(FailureCode::ProviderLoading) => (
                 lexical(
                     job,
-                    "semantic provider is still loading the workspace; repeat the call in a few seconds",
+                    "semantic provider is still loading the workspace; this context is lexical, without semantic facts",
                 )?,
                 None,
             ),
@@ -5274,9 +5297,16 @@ impl<'a> Worker<'a> {
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        if let Some(JobStage::EditBatchAwaitingCheck(check)) = job
+            .stage
+            .take_if(|stage| matches!(stage, JobStage::EditBatchAwaitingCheck(_)))
+        {
+            return self.finish_batch_check(job, *check).await;
+        }
         if let Some(stage @ JobStage::EditAwaitingCheck { .. }) = job.stage.take() {
             let deadline = match &stage {
                 JobStage::EditAwaitingCheck { deadline, .. } => *deadline,
+                JobStage::EditBatchAwaitingCheck(check) => check.deadline,
             };
             let diagnostics = if *job.cancel.borrow() || tokio::time::Instant::now() >= deadline {
                 Some(EditDiagnostics::Unknown {})
@@ -5297,7 +5327,10 @@ impl<'a> Worker<'a> {
                 authority,
                 path,
                 ..
-            } = stage;
+            } = stage
+            else {
+                return Err(FailureCode::Internal);
+            };
             debug_assert_eq!(result.path, path);
             let source = result
                 .outcome
@@ -5320,6 +5353,9 @@ impl<'a> Worker<'a> {
                 Some(authority),
                 source,
             ));
+        }
+        if job.parameters.get("files").is_some() {
+            return self.edit_files(job).await;
         }
         if job.parameters.get("changes").is_some() {
             return self.edit_changes(job).await;
@@ -5582,6 +5618,7 @@ impl<'a> Worker<'a> {
                 None if tokio::time::Instant::now()
                     < match &stage {
                         JobStage::EditAwaitingCheck { deadline, .. } => *deadline,
+                        JobStage::EditBatchAwaitingCheck(check) => check.deadline,
                     } =>
                 {
                     job.stage = Some(stage);
@@ -5692,6 +5729,8 @@ impl<'a> Worker<'a> {
     /// Returns the matching generation's diagnostics without waiting; absence means the job parks.
     /// Missing feed state preserves the provider fallback, while a completed non-ready snapshot
     /// and a matching ready snapshot map to the same states used by the former bounded wait.
+    /// A multi-file stage has no single file of its own and yields its fallback-free `Unknown`;
+    /// its per-file stages are asked one by one instead.
     fn check_diagnostics(&self, stage: &JobStage) -> Option<EditDiagnostics> {
         use crate::checks::{CheckState, Severity};
         let JobStage::EditAwaitingCheck {
@@ -5702,7 +5741,10 @@ impl<'a> Worker<'a> {
             preexisting,
             language,
             ..
-        } = stage;
+        } = stage
+        else {
+            return Some(EditDiagnostics::Unknown {});
+        };
         let Some(feed) = self.shared.project_feed.as_ref() else {
             return Some(fallback.clone());
         };
@@ -5990,6 +6032,7 @@ impl<'a> Worker<'a> {
         if let Ok(mut ledger) = self.shared.ledger.lock() {
             ledger.feedback.remove(binding);
             ledger.delivered.remove(binding);
+            ledger.read_memory.remove(binding);
         }
     }
 
@@ -6665,6 +6708,12 @@ fn admitted_edit_source(
                 kind: ResultKind::Context | ResultKind::Read,
                 ..
             } => true,
+            // A multi-file edit retains only the post-write observations of the files it wrote.
+            PeerReply::Complete {
+                kind: ResultKind::EditBatch,
+                detail_ref,
+                ..
+            } => detail_ref.as_deref() == Some(reference),
             PeerReply::Edit { result, .. } => {
                 result.source_ref.as_deref() == Some(reference) && result.outcome.has_post_source()
             }
@@ -7706,6 +7755,7 @@ fn test_result_text(
             report.failures.len() - MAX_LISTED_FAILURES
         ));
     }
+    push_target_lines(&mut text, result);
     text.push_str(&format!("\n  rerun: {}", rerun_text(result)));
     if owns_detail {
         text.push_str(&format!(
@@ -7714,6 +7764,14 @@ fn test_result_text(
         ));
     }
     text
+}
+
+/// Appends a several-target run's per-target lines (batch-api-v1 §6), each bounded like a
+/// failure line; a single-target run has none.
+fn push_target_lines(text: &mut String, result: &super::tests::RunResult) {
+    for line in &result.targets {
+        text.push_str(&format!("\n  {}", test_text_line(line, 240)));
+    }
 }
 
 /// Renders one summary-less run: exit code, chosen environment, bounded output tail, rerun, and —
@@ -7728,6 +7786,7 @@ fn command_result_text(id: u64, result: &super::tests::RunResult, owns_detail: b
     if let Some(label) = &result.environment_label {
         text.push_str(&format!(" · env {label}"));
     }
+    push_target_lines(&mut text, result);
     let tail = super::tests::output_tail(&result.output);
     if !tail.is_empty() {
         text.push_str("\n  output (tail):\n");
@@ -7766,6 +7825,7 @@ mod tool_reply_fix_tests {
             command: vec!["echo".into(), "hello".into()],
             rerun_dir: None,
             environment_label: None,
+            targets: Vec::new(),
         }
     }
 
@@ -8003,6 +8063,10 @@ mod stop_retry_tests {
         intelligence::freshness::{CacheIdentity, CacheLifecycle},
     };
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    /// Availability and navigation tests (stale writer takeover, servers line, approximate and
+    /// faulted symbol/graph answers), kept in their own file beside these fixtures.
+    mod availability;
 
     /// Separates disposable fixture roots within the current process.
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -9372,15 +9436,15 @@ mod stop_retry_tests {
     }
 
     /// Runs one `tool` job of `actor` against the scripted fixture session through the production
-    /// tool path, then settles the session's health as `perform` does. Returns the tool's outcome
-    /// and how many sessions are marked failed afterwards.
+    /// tool path, then settles the session's health as `perform` does. Returns the tool's reply
+    /// (or failure code) and how many sessions are marked failed afterwards.
     async fn scripted_tool(
         worker: &mut Worker<'_>,
         actor: &str,
         call: &str,
         tool: AssistanceTool,
         parameters: Value,
-    ) -> (Result<(), FailureCode>, usize) {
+    ) -> (Result<PeerReply, FailureCode>, usize) {
         let invocation = production_call(worker, actor, call);
         let (cancel_sender, cancel) = watch::channel(false);
         let _keep = cancel_sender;
@@ -9406,7 +9470,7 @@ mod stop_retry_tests {
             AssistanceTool::Graph => worker.graph(&mut job).await,
             _ => worker.symbol(&mut job).await,
         }
-        .map(|_| ());
+        .map(|(reply, _, _)| reply);
         assert!(job.park_until.is_none(), "{call} parked: {outcome:?}");
         worker.settle_session_health(&job).await;
         (outcome, worker.test_failed_sessions())
@@ -10270,6 +10334,8 @@ mod stop_retry_tests {
             names: Default::default(),
             telemetry: None,
             activity: BTreeMap::new(),
+            deferred_precise: BTreeMap::new(),
+            symbol_batches: BTreeMap::new(),
         }
     }
 

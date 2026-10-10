@@ -1323,6 +1323,15 @@ async fn serve_accepted_connection(
             .ok()
             .and_then(Result::ok)
             .flatten()
+            .map(|guard| {
+                // The lease holder's process stays a live carrier until this lease reaches EOF.
+                let carrier = peer_pid(stream.as_raw_fd())
+                    .and_then(|pid| dispatcher.clone().map(|owner| (pid, owner)));
+                if let Some((pid, owner)) = &carrier {
+                    owner.carrier_opened(*pid);
+                }
+                (guard, carrier)
+            })
         }
         Some(2..=5) => {
             // Served Assistance calls prove a live client session and restart the idle countdown.
@@ -1381,8 +1390,11 @@ async fn serve_accepted_connection(
         }
         _ => None,
     };
-    if let Some(guard) = identified {
+    if let Some((guard, carrier)) = identified {
         hold_lease_until_eof(stream).await;
+        if let Some((pid, owner)) = carrier {
+            owner.carrier_closed(pid);
+        }
         drop(guard);
     }
 }
@@ -1715,7 +1727,8 @@ async fn serve_assistance_request(
                 )
                 .ok_or_else(|| invalid_transport("invalid method parameters"))?,
             )
-            .ok_or_else(|| invalid_transport("invalid method correlation"))?;
+            .ok_or_else(|| invalid_transport("invalid method correlation"))?
+            .with_carrier(peer_pid(stream.as_raw_fd()));
             let budget = method_dispatch_budget(
                 required_string(object, "dispatch_method")?,
                 required_value(object, "params_json")?,
@@ -2149,6 +2162,48 @@ fn peer_uid(fd: RawFd) -> io::Result<libc::uid_t> {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { credentials.assume_init().uid })
+}
+
+/// Reads a connected Unix peer's process id (`SO_PEERCRED`): liveness evidence for a
+/// stale-writer takeover, never identity. `None` when the kernel does not report it.
+#[cfg(target_os = "linux")]
+fn peer_pid(fd: RawFd) -> Option<u32> {
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    (result == 0 && length as usize == std::mem::size_of::<libc::ucred>())
+        .then(|| unsafe { credentials.assume_init().pid })
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+}
+
+/// Reads a connected Unix peer's process id (`LOCAL_PEERPID`): liveness evidence for a
+/// stale-writer takeover, never identity. `None` when the kernel does not report it.
+#[cfg(target_os = "macos")]
+fn peer_pid(fd: RawFd) -> Option<u32> {
+    let mut pid: libc::pid_t = 0;
+    let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut length,
+        )
+    };
+    (result == 0 && length as usize == std::mem::size_of::<libc::pid_t>())
+        .then_some(pid)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
 }
 
 /// Reads a connected Unix peer's UID using macOS's `getpeereid` primitive.

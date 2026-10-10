@@ -927,27 +927,68 @@ fn render_docs(card: &ProjectCard, shown: usize) -> String {
     line
 }
 
+/// Longest servers line in bytes (start-index-state r3 §1).
+const SERVERS_LINE_MAX: usize = 360;
+
+/// Renders `servers: <language> <state>[ · …]` within [`SERVERS_LINE_MAX`] bytes.
+///
+/// When the full line is too long, languages from the last one backwards keep only their state's
+/// head (the text before its first `;`, such as `not started` or `warming`) until it fits; the
+/// first languages keep their whole state for as long as the budget allows.
+///
+/// ponytail: a card with so many languages that even the state heads overflow drops languages
+/// from the end; no product language set comes near that (about 14 languages).
 fn render_servers(card: &ProjectCard) -> String {
-    let parts: Vec<String> = card
+    let mut parts: Vec<String> = card
         .servers
         .iter()
         .map(|server| format!("{} {}", server.language, server.state))
         .collect();
-    format!("servers: {}", parts.join(" · "))
+    let line = |parts: &[String]| format!("servers: {}", parts.join(" · "));
+    for (index, server) in card.servers.iter().enumerate().rev() {
+        if line(&parts).len() <= SERVERS_LINE_MAX {
+            break;
+        }
+        let head = server.state.split(';').next().unwrap_or_default();
+        parts[index] = format!("{} {head}", server.language);
+    }
+    while line(&parts).len() > SERVERS_LINE_MAX && parts.pop().is_some() {}
+    line(&parts)
 }
 
-/// The `not started` state `ide.start` prints for one language while its server is down: only a
-/// language whose lexical outline is exact
-/// ([`outline_while_loading`](crate::lang::LanguageSupport::outline_while_loading)) may
-/// claim outline/read/edit already answer from source; every other language's tools all wait
-/// for the server.
+/// The `not started` state `ide.start` prints for one language whose server has no session for
+/// the worktree yet (start-index-state r2 §2). Servers start lazily, on the first `ide.symbol` or
+/// `ide.graph` call of the language. Only a language whose lexical outline is exact
+/// ([`outline_while_loading`](crate::lang::LanguageSupport::outline_while_loading)) claims that
+/// outline, read and edit answer from source and that symbol and graph answer approximately at
+/// once; every other language's first answer follows as a fact.
 pub fn not_started_state(language: Language) -> &'static str {
     if language.support().outline_while_loading() {
-        "not started; ide.outline, ide.read and ide.edit answer from source now; ide.symbol and \
-         ide.graph wait for the server, which starts on their first use"
+        "not started; outline, read and edit answer from source; the first symbol or graph call \
+         starts it and answers approximately at once"
     } else {
-        "not started; starts on first use"
+        "not started; the first symbol or graph call starts it and its answer follows as a fact"
     }
+}
+
+/// The `warming` state of a language whose server session is loading the worktree
+/// (start-index-state r2 §2): approximate answers for a language with an exact lexical outline,
+/// answers that follow as facts for every other language.
+pub fn warming_state(language: Language) -> &'static str {
+    if language.support().outline_while_loading() {
+        "warming; symbol and graph answer approximately until ready"
+    } else {
+        "warming; symbol and graph answers follow as facts until ready"
+    }
+}
+
+/// The state of a language whose server session answers semantic requests now.
+pub const READY_STATE: &str = "ready";
+
+/// The state of a language whose last session for the worktree failed; `cause` is a closed
+/// phrase (`workspace failed to load`, `transport gone`).
+pub fn unavailable_state(cause: &str) -> String {
+    format!("unavailable ({cause})")
 }
 
 #[cfg(test)]
@@ -1138,9 +1179,97 @@ mod tests {
         };
         assert_eq!(
             render_servers(&card),
-            "servers: alpha not started; starts on first use · beta not started; starts on \
-             first use"
+            "servers: alpha not started; the first symbol or graph call starts it and its answer \
+             follows as a fact · beta not started; the first symbol or graph call starts it and \
+             its answer follows as a fact"
         );
+    }
+
+    /// A card with five languages, every one not started, keeps its servers line within the
+    /// 360-byte budget of start-index-state r3 §1: later languages keep only their state head,
+    /// every language is still named, and the first keeps its whole state.
+    #[test]
+    fn servers_line_stays_within_its_byte_budget() {
+        crate::lang::testing::install();
+        use crate::lang::testing::{ALPHA, BETA, DELTA, EPSILON, GAMMA};
+        let languages = [EPSILON, ALPHA, BETA, GAMMA, DELTA];
+        let card = ProjectCard {
+            root: PathBuf::from("/repo"),
+            name: "repo".to_owned(),
+            git: None,
+            languages: Vec::new(),
+            layout: Vec::new(),
+            docs: Vec::new(),
+            servers: languages
+                .iter()
+                .map(|language| ServerState {
+                    language: *language,
+                    state: not_started_state(*language).to_owned(),
+                })
+                .collect(),
+            problems: None,
+            truncated: false,
+            agent_commands: crate::lang::ProjectCommands::default(),
+            environments: Vec::new(),
+            modes: None,
+        };
+        let line = render_servers(&card);
+        assert!(line.len() <= 360, "{} bytes: {line}", line.len());
+        assert!(
+            line.starts_with(&format!("servers: epsilon {}", not_started_state(EPSILON))),
+            "{line}"
+        );
+        assert!(line.ends_with(" · delta not started"), "{line}");
+        for language in languages {
+            assert!(line.contains(&format!("{language} not started")), "{line}");
+        }
+    }
+
+    /// Every servers-line state reads exactly as start-index-state r2 §2 fixes it: the lazy-start
+    /// and warming wording by whether the language's lexical outline is exact, `ready`, and the
+    /// closed unavailable causes.
+    #[test]
+    fn servers_line_states_use_the_contract_wording() {
+        crate::lang::testing::install();
+        let exact = crate::lang::testing::EPSILON;
+        let other = crate::lang::testing::ALPHA;
+        assert_eq!(
+            not_started_state(exact),
+            "not started; outline, read and edit answer from source; the first symbol or graph \
+             call starts it and answers approximately at once"
+        );
+        assert_eq!(
+            warming_state(exact),
+            "warming; symbol and graph answer approximately until ready"
+        );
+        assert_eq!(
+            warming_state(other),
+            "warming; symbol and graph answers follow as facts until ready"
+        );
+        assert_eq!(READY_STATE, "ready");
+        assert_eq!(
+            unavailable_state("workspace failed to load"),
+            "unavailable (workspace failed to load)"
+        );
+        for state in [
+            not_started_state(exact),
+            not_started_state(other),
+            warming_state(exact),
+            warming_state(other),
+        ] {
+            assert!(
+                ![
+                    "poll",
+                    "every few seconds",
+                    "in a few seconds",
+                    "until it completes",
+                    "again every"
+                ]
+                .iter()
+                .any(|banned| state.contains(banned)),
+                "{state}"
+            );
+        }
     }
 
     #[test]
