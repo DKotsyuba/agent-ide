@@ -341,6 +341,92 @@ async fn read_items_never_answer_unchanged_without_a_compaction_signal() {
     daemon.wait().await.unwrap();
 }
 
+/// Settles one call and returns its structured reply and compact text.
+async fn settled_call(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    tool: &str,
+    arguments: Value,
+) -> (Value, String) {
+    let reply = batch_call_with_text(actor, fixture, tool, arguments).await;
+    batch_settle_with_text(actor, fixture, reply).await
+}
+
+/// `ide.symbol {symbols}` and `ide.graph {symbols}` answer every entry in ONE reply, in request
+/// order behind one summary line; a failed entry fails only itself, and each answered block is
+/// exactly the single form's reply text.
+#[tokio::test]
+async fn symbol_and_graph_answer_several_symbols_in_one_reply() {
+    let fixture = symbol_test_fixture();
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub fn value() -> i32 {\n    7\n}\npub fn caller() -> i32 {\n    value()\n}\npub fn top() -> i32 {\n    caller()\n}\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "src/lib.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "symbols fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "batch-symbols").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"batch-symbols"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    let (single, single_text) = settled_call(
+        &mut actor,
+        &fixture,
+        "ide.symbol",
+        json!({"symbol":"src/lib.rs#caller","callers":1}),
+    )
+    .await;
+    assert_eq!(single["kind"], "symbol", "{single}");
+    let (batch, text) = settled_call(
+        &mut actor,
+        &fixture,
+        "ide.symbol",
+        json!({"symbols":["src/lib.rs#value","src/lib.rs#missing","src/lib.rs#caller"],"callers":1}),
+    )
+    .await;
+    assert_eq!(batch["kind"], "symbol", "{batch} {text}");
+    assert!(
+        text.starts_with("symbols: 3 — 2 cards, 0 approximate, 0 pending, 1 failed\n"),
+        "{text}"
+    );
+    let missing = text
+        .find("error: unknown_symbol")
+        .expect("failed entry in place");
+    let caller = text.find(single_text.trim_end()).unwrap_or_else(|| {
+        panic!("the caller block equals the single form's text:\n{single_text}\n---\n{text}")
+    });
+    assert!(
+        text.find("value").unwrap() < missing && missing < caller,
+        "{text}"
+    );
+
+    let (graph, text) = settled_call(
+        &mut actor,
+        &fixture,
+        "ide.graph",
+        json!({"symbols":["src/lib.rs#value","src/lib.rs#caller"],"direction":"callers","depth":1}),
+    )
+    .await;
+    assert_eq!(graph["kind"], "graph", "{graph} {text}");
+    assert!(
+        text.starts_with("graph: 2 roots (callers, depth 1) — "),
+        "{text}"
+    );
+    assert!(text.contains("caller") && text.contains("top"), "{text}");
+
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// The three text files every multi-file edit test edits, with their committed content.
 const EDIT_FILES: [&str; 3] = ["a.md", "b.md", "c.md"];
 

@@ -36,15 +36,53 @@ const ITEM_SHAPE: &str = "an array of 1 to 32 items, each exactly one of {\"symb
 ///
 /// `parameters` is the raw argument value before validation; a non-object yields `None`. The
 /// returned key decides the argument ceiling ([`MAX_BATCH_PARAMETER_BYTES`]) and is the field an
-/// over-limit refusal names. Only `ide.read`'s `items`, `symbols` and `ranges` are batch keys in
-/// this revision of the tool surface.
+/// over-limit refusal names: `ide.read`'s `items`, `symbols` and `ranges`, and the `symbols` of
+/// `ide.symbol` and `ide.graph`.
 pub(crate) fn batch_key(tool: AssistanceTool, parameters: &Value) -> Option<&'static str> {
     let object = parameters.as_object()?;
     let keys: &[&'static str] = match tool {
         AssistanceTool::Read => &["items", "symbols", "ranges"],
+        AssistanceTool::Symbol | AssistanceTool::Graph => &["symbols"],
         _ => &[],
     };
     keys.iter().copied().find(|key| object.contains_key(*key))
+}
+
+/// Most entries `ide.symbol {symbols}` and `ide.graph {symbols}` accept.
+pub(crate) const MAX_SYMBOL_ENTRIES: usize = 8;
+
+/// Validates one `ide.symbol {symbols, …}` or `ide.graph {symbols, …}` request object.
+///
+/// `symbols` replaces `symbol` (never beside it) and holds 1 to [`MAX_SYMBOL_ENTRIES`] symbol
+/// paths or bare names; every other field keeps its single-form meaning. Each entry is validated
+/// as the single form with the same options would be, so both forms refuse the same values.
+pub(crate) fn validate_symbols(
+    tool: AssistanceTool,
+    object: &Map<String, Value>,
+) -> Result<(), ParameterError> {
+    if object.contains_key("symbol") {
+        return Err(invalid_field(
+            "symbols",
+            FieldRule::OneOf("used instead of \"symbol\", never beside it"),
+        ));
+    }
+    let entries = object
+        .get("symbols")
+        .and_then(Value::as_array)
+        .filter(|entries| (1..=MAX_SYMBOL_ENTRIES).contains(&entries.len()))
+        .ok_or_else(|| {
+            invalid_field(
+                "symbols",
+                FieldRule::OneOf("an array of 1 to 8 symbol paths or bare names"),
+            )
+        })?;
+    for entry in entries {
+        let mut single = object.clone();
+        single.remove("symbols");
+        single.insert("symbol".to_owned(), entry.clone());
+        super::facade::validate_call(tool, Value::Object(single))?;
+    }
+    Ok(())
 }
 
 /// Validates one `ide.read {items, force?}` request object.
@@ -1283,6 +1321,48 @@ mod tests {
                 "{banned}"
             );
         }
+    }
+
+    #[test]
+    fn symbol_and_graph_entries_validate_like_their_single_forms() {
+        use crate::assistance::facade::validate_call;
+        for tool in [AssistanceTool::Symbol, AssistanceTool::Graph] {
+            assert!(
+                validate_call(tool, json!({"symbols":["src/a.rs#A","Name"]})).is_ok(),
+                "{tool:?}"
+            );
+            for bad in [
+                json!({"symbols":[]}),
+                json!({ "symbols": vec!["a"; 9] }),
+                json!({"symbols":["a", ""]}),
+                json!({"symbols":["a"], "symbol":"b"}),
+                json!({"symbols":"a"}),
+            ] {
+                assert!(validate_call(tool, bad.clone()).is_err(), "{tool:?} {bad}");
+            }
+        }
+        assert!(
+            validate_call(
+                AssistanceTool::Symbol,
+                json!({"symbols":["a","b"],"callers":2,"usages":false})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_call(AssistanceTool::Symbol, json!({"symbols":["a"],"callers":4})).is_err()
+        );
+        assert!(
+            validate_call(
+                AssistanceTool::Graph,
+                json!({"symbols":["a","b"],"direction":"both","depth":3})
+            )
+            .is_ok()
+        );
+        assert!(validate_call(AssistanceTool::Graph, json!({"symbols":["a"],"depth":0})).is_err());
+        assert!(
+            validate_call(AssistanceTool::Symbol, json!({"usages":true})).is_err(),
+            "the single form still needs its symbol"
+        );
     }
 
     #[test]

@@ -304,15 +304,23 @@
           "minLength": 1,
           "type": "string"
         },
+        "symbols": {
+          "description": "Several roots in ONE call instead of `symbol`: up to 8 symbol paths or bare names, one section per root in request order behind one summary line, each exactly as `symbol` would answer it with the same options; a failed root fails only itself.",
+          "items": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "type": "array"
+        },
         "tests": {
           "default": false,
           "description": "Show test symbols as nodes (marked `[test]`) instead of collapsing them into one `+N tests` line per parent.",
           "type": "boolean"
         }
       },
-      "required": [
-        "symbol"
-      ],
       "type": "object"
     },
     "name": "ide.graph"
@@ -555,15 +563,23 @@
           "minLength": 1,
           "type": "string"
         },
+        "symbols": {
+          "description": "Several cards in ONE call instead of `symbol`: up to 8 symbol paths or bare names, answered in request order behind one summary line, each exactly as `symbol` would answer it with the same options; a failed entry fails only itself.",
+          "items": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "type": "array"
+        },
         "usages": {
           "default": true,
           "description": "Include usages (src/tests split, with source lines).",
           "type": "boolean"
         }
       },
-      "required": [
-        "symbol"
-      ],
       "type": "object"
     },
     "name": "ide.symbol"

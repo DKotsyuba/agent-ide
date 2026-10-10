@@ -180,6 +180,8 @@ Errors: `no_such_file` (the requested path does not exist in the worktree; fix t
 
 Input: `{symbol, usages?: true, callers?: 0..3, callees?: 0..3, history?: true}`. The descriptions spell out `0–3` because some hosts omit the JSON schema maximum. Defaults: usages, callers 1, callees 0; `history` is opt-in (boolean) and shows the last 3 commits touching the definition.
 
+Several symbols in one call ([batch API v1](batch-api-v1.md) §4–§5): `ide.symbol {symbols: [...], …}` and `ide.graph {symbols: [...], …}` take 1–8 entries instead of `symbol`, with the single form's options for all of them. The reply opens with `symbols: <n> — <k> cards, <a> approximate, <p> pending, <f> failed` (or `graph: <n> roots (<direction>, depth <d>) — <k> graphs, <a> approximate, <p> pending, <u> unavailable, <f> failed`), then each entry's block in request order, exactly the single form's reply text; a failed entry shows the single form's error and fails only itself. Whole blocks are delivered while they fit and the rest are named with the exact call. While a server is still loading, the whole call waits for it as the single form does.
+
 Output:
 
 ```text

@@ -36,6 +36,8 @@ use crate::{
 };
 #[path = "batch_edit.rs"]
 mod batch_edit;
+#[path = "batch_targets.rs"]
+mod batch_targets;
 #[path = "links.rs"]
 mod links;
 #[path = "providers.rs"]

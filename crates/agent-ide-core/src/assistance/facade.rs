@@ -326,9 +326,9 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Symbol,
             json!({
                 "type": "object", "additionalProperties": false,
-                "required": ["symbol"],
                 "properties": {
                     "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`, or a bare name to search the project."},
+                    "symbols": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_SYMBOL_ENTRIES, "items": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "description": "Several cards in ONE call instead of `symbol`: up to 8 symbol paths or bare names, answered in request order behind one summary line, each exactly as `symbol` would answer it with the same options; a failed entry fails only itself."},
                     "usages": {"type": "boolean", "default": true, "description": "Include usages (src/tests split, with source lines)."},
                     "callers": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1, "description": "Callers to list, 0–3 (0 = none); use ide.graph for deeper trees."},
                     "callees": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0, "description": "Callees to list, 0–3 (0 = none)."},
@@ -340,9 +340,9 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Graph,
             json!({
                 "type": "object", "additionalProperties": false,
-                "required": ["symbol"],
                 "properties": {
                     "symbol": {"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES, "description":"Symbol path `file#Owner/name`, or a bare name to search the project."},
+                    "symbols": {"type":"array", "minItems":1, "maxItems":super::batch::MAX_SYMBOL_ENTRIES, "items":{"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES}, "description":"Several roots in ONE call instead of `symbol`: up to 8 symbol paths or bare names, one section per root in request order behind one summary line, each exactly as `symbol` would answer it with the same options; a failed root fails only itself."},
                     "direction": {"type":"string", "enum":["callers", "callees", "both"], "default":"callers", "description":"`callers`: who calls it (blast radius); `callees`: what it calls; `both`."},
                     "depth": {"type":"integer", "minimum":1, "maximum":3, "default":2, "description":"Levels to expand; 2 is usually enough."},
                     "tests": {"type":"boolean", "default":false, "description":"Show test symbols as nodes (marked `[test]`) instead of collapsing them into one `+N tests` line per parent."}
@@ -707,8 +707,10 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
         AssistanceTool::Read => &[
             "symbol", "path", "lines", "symbols", "ranges", "items", "force",
         ],
-        AssistanceTool::Symbol => &["symbol", "usages", "callers", "callees", "history"],
-        AssistanceTool::Graph => &["symbol", "direction", "depth", "tests"],
+        AssistanceTool::Symbol => &[
+            "symbol", "usages", "callers", "callees", "history", "symbols",
+        ],
+        AssistanceTool::Graph => &["symbol", "direction", "depth", "tests", "symbols"],
         AssistanceTool::Test => &[
             "symbol", "path", "pattern", "command", "cwd", "env", "status", "budget_s",
         ],
@@ -880,6 +882,9 @@ pub fn validate_call(
                 }
                 _ => return Err(ParameterError::ReadTarget),
             }
+        }
+        AssistanceTool::Symbol | AssistanceTool::Graph if object.contains_key("symbols") => {
+            super::batch::validate_symbols(tool, object)?;
         }
         AssistanceTool::Symbol => {
             required_string(object, "symbol", MAX_SYMBOL_PATH_BYTES)?;

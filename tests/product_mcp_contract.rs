@@ -435,6 +435,7 @@ fn assert_compact_envelope(reply: &Value) {
         // A card or an ambiguity list; a later page continues one of them.
         ("complete", Some("symbol")) => assert!(
             body.starts_with("symbol: ")
+                || body.starts_with("symbols: ")
                 || body.starts_with("ambiguous_symbol: ")
                 || (text.starts_with("page ") && !text.starts_with("page 1;")),
             "{reply}"

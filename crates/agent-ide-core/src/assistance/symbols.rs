@@ -735,11 +735,15 @@ impl Worker<'_> {
         std::fs::read_to_string(seam).ok()?.trim().parse().ok()
     }
 
-    /// `ide.symbol {symbol, usages?, callers?, callees?, history?}`: the symbol card.
+    /// `ide.symbol {symbol, usages?, callers?, callees?, history?}`: the symbol card; the
+    /// `{symbols}` form answers each entry through this same path (`batch_symbols`).
     pub(super) async fn symbol(
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        if job.parameters.get("symbols").is_some() {
+            return self.batch_symbols(job).await;
+        }
         let binding = job.invocation.binding_ref().clone();
         let requested = job.parameters["symbol"]
             .as_str()
@@ -1112,11 +1116,15 @@ impl Worker<'_> {
         Ok((reply, Some(authority), Some(observed)))
     }
 
-    /// `ide.graph {symbol, direction, depth}`: bounded breadth-first call hierarchy.
+    /// `ide.graph {symbol, direction, depth}`: bounded breadth-first call hierarchy; the
+    /// `{symbols}` form answers each root through this same path (`batch_symbols`).
     pub(super) async fn graph(
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        if job.parameters.get("symbols").is_some() {
+            return self.batch_symbols(job).await;
+        }
         let binding = job.invocation.binding_ref().clone();
         let requested = job.parameters["symbol"]
             .as_str()
