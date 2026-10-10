@@ -17773,11 +17773,12 @@ async fn configured_product_sigterm_reaps_in_flight_rust_only_provider() {
 }
 
 /// A real background Context job that finishes while its own caller only ever saw `Pending`
-/// leaves a genuinely undelivered new fact: the first eligible native-edit hook must deliver it
-/// once, and a second must not resurrect it. This drives the actual product Worker/dispatcher
-/// entry path end to end (real daemon, real Pyright, real hook binary) — `ide.inspect` is never
-/// called for this detail, so nothing but the job's own completion and the hook can be the source
-/// of delivery.
+/// leaves one undelivered `job-ready` fact (OUTBOX-r3): the first eligible native-edit hook
+/// delivers it once, without source text, and a second must not resurrect it. This drives the
+/// actual product Worker/dispatcher entry path end to end (real daemon, real Pyright, real hook
+/// binary). `ide.inspect` is called only after both hooks, so nothing but the job's own
+/// completion and the hook can be the source of delivery; it then reads the full answer back
+/// through the fact's reference.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT and AGENT_IDE_NODE environment"]
 async fn configured_product_pending_context_job_completes_and_native_hook_delivers_its_feedback_once()
@@ -17876,7 +17877,28 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
     let additional = first["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap();
-    assert!(additional.contains("Provider reported"), "{additional}");
+    // OUTBOX-r3 §2, §8.2: the job's result arrives once as its `job-ready` fact. A context answer
+    // is source text, so the hook names the result and its reference only. The native edit
+    // lifecycle that carries it ran after the job started, so the fact says files changed since.
+    assert_eq!(
+        additional.matches("job-ready ide.context app.py: ").count(),
+        1,
+        "{additional}"
+    );
+    assert!(
+        additional.contains("job-ready ide.context app.py: ready (files changed since)"),
+        "{additional}"
+    );
+    assert!(
+        !additional.contains("def value") && !additional.contains("return"),
+        "no source text on a hook: {additional}"
+    );
+    let reference = additional
+        .split("result: ide.inspect ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("the fact names its reference")
+        .to_owned();
 
     actor
         .lifecycle(&fixture, "PreToolUse", "native-edit-2")
@@ -17889,6 +17911,18 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
         second.stdout.is_empty(),
         "the already-delivered fact must not resurrect on a second hook: {:?}",
         String::from_utf8_lossy(&second.stdout)
+    );
+
+    // The reference reads the full answer back, with the provider's diagnostic.
+    let full = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
+        .await;
+    assert_eq!(full["state"], "complete", "{full}");
+    assert_eq!(full["kind"], "context", "{full}");
+    let text = full["text"].as_str().unwrap();
+    assert!(
+        text.contains("Provider reported 1 diagnostics") && text.contains("reportReturnType"),
+        "{full}"
     );
 
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
