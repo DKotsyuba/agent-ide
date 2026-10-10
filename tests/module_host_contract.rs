@@ -129,52 +129,181 @@ async fn hidden_module_mode_refuses_mismatches() {
     }
 }
 
-/// The normalizer masks only digests and numeric timings: real words ending in `ms`, other
-/// words and whitespace differences still compare unequal.
+/// The harness masks only values a reply generated, by slot: the references of its own
+/// structured form and the fixture root (by value, in metadata rows only), and the `ide.start`
+/// card's ids and timings and an `ide.test` duration. Source text a reply returns stays exact: timings, long hex runs, activation-looking
+/// ids and reference-looking lines in an `ide.read`/`ide.context` body still differ, as do other
+/// words, whitespace, short hex runs and paths.
 #[test]
 fn parity_normalizer_masks_only_volatile_tokens() {
-    use parity::normalized;
-    assert_ne!(normalized("return items"), normalized("return params"));
-    assert_ne!(normalized("a  b"), normalized("a b"));
-    assert_ne!(normalized("    x = 1\n"), normalized("  x = 1\n"));
-    assert_eq!(
-        normalized("took 12ms (3.5ms)."),
-        normalized("took 340ms (9ms).")
-    );
-    let (one, two) = ("a".repeat(65), "b".repeat(65));
-    assert_eq!(
-        normalized(&format!("ref {one}\n")),
-        normalized(&format!("ref {two}\n"))
-    );
+    use parity::{line, normalized};
+    let read = |text: &str| {
+        normalized(&line(
+            "ide.read",
+            &json!({"path":"a.py"}),
+            &json!({"state":"complete","kind":"read","code":null,"text":text,"detail_ref":"r-1"}),
+        ))
+    };
+    let context = |text: &str| {
+        normalized(&line(
+            "ide.context",
+            &json!({"path":"a.py"}),
+            &json!({"state":"complete","kind":"context","code":null,"text":text,"detail_ref":"r-1"}),
+        ))
+    };
+    let (long_a, long_b) = ("a".repeat(65), "b".repeat(65));
+    let (id_a, id_b) = ("a".repeat(64), "b".repeat(64));
+    // Preservation: every masked shape inside returned source still differs.
+    let bodies: [&dyn Fn(&str) -> String; 2] = [&read, &context];
+    for body in bodies {
+        assert_ne!(body("1\tdelay = 12ms\n"), body("1\tdelay = 13ms\n"));
+        assert_ne!(body("took 12ms (3.5ms)."), body("took 340ms (9ms)."));
+        assert_ne!(
+            body(&format!("1\t{long_a}\n")),
+            body(&format!("1\t{long_b}\n"))
+        );
+        assert_ne!(
+            body(&format!("key = \"activation {id_a}\"\n")),
+            body(&format!("key = \"activation {id_b}\"\n"))
+        );
+        assert_ne!(
+            body(&format!("activation {id_a}\n")),
+            body(&format!("activation {id_b}\n"))
+        );
+        assert_ne!(
+            body(&format!("source_ref: {long_a}\n")),
+            body(&format!("source_ref: {long_b}\n"))
+        );
+        assert_ne!(
+            body("tests #1: 1 passed, 0 failed, 0 s"),
+            body("tests #1: 1 passed, 0 failed, 1 s")
+        );
+        assert_ne!(body("return items"), body("return params"));
+        assert_ne!(body("a  b"), body("a b"));
+        assert_ne!(body("    x = 1\n"), body("  x = 1\n"));
+        assert_ne!(body("git 1a2b3c4\n"), body("git 5d6e7f8\n"));
+        assert_ne!(body("at /tmp/a/x\n"), body("at /tmp/b/x\n"));
+    }
     assert_eq!(normalized("x\n"), "x\n");
-    // The generated activation id is masked only after its marker; other ids, short hex runs
-    // (a commit prefix) and paths still differ.
-    let (first, second) = ("a".repeat(64), "b".repeat(64));
+    assert_eq!(normalized("took 12ms\n"), "took 12ms\n");
+    // A reference the reply generated is masked wherever its text repeats it, by value only.
+    let reply = |reference: &str| {
+        line(
+            "ide.read",
+            &json!({"path":"a.py"}),
+            &json!({"state":"complete","kind":"read","code":null,
+                "text":format!("1\tx = 1\nsource_ref: {reference}\n"),"detail_ref":reference}),
+        )
+    };
+    assert_eq!(reply(&format!("{long_a}-3")), reply(&format!("{long_b}-4")));
+    let edit = |reference: &str| {
+        line(
+            "ide.edit",
+            &json!({"path":"a.py"}),
+            &json!({"state":"edit","kind":null,"code":null,"result":{"source_ref":reference},
+                "text":format!("edit: replaced; path a.py; source_ref {reference}; diagnostics: unknown")}),
+        )
+    };
+    assert_eq!(edit("e-1"), edit("e-2"));
+    // ... but never inside a returned source row, even when that row holds the very value.
+    let source = |row: &str| {
+        line(
+            "ide.read",
+            &json!({"path":"a.py"}),
+            &json!({"state":"complete","kind":"read","code":null,
+                "text":format!("{row}\nsource_ref: {long_a}-3\n"),"detail_ref":format!("{long_a}-3")}),
+        )
+    };
+    assert_ne!(source(&format!("1\t{long_a}-3")), source("1\t<ref>"));
+    let body = |text: &str| {
+        line(
+            "ide.context",
+            &json!({"path":"a.py"}),
+            &json!({"state":"complete","kind":"context","code":null,
+                "text":format!("path: a.py\n\n{text}"),"detail_ref":"c-1"}),
+        )
+    };
+    assert_ne!(body("x = 'c-1'\n"), body("x = '<ref>'\n"));
+    // The fixture root is masked in metadata rows (two fixtures compare equal there) and kept in
+    // returned source rows.
+    let (one, two) = (
+        parity::Fixture::new(&[("a.py", "x = 1\n")], json!([])),
+        parity::Fixture::new(&[("a.py", "x = 1\n")], json!([])),
+    );
+    let rooted = |fixture: &parity::Fixture, header: &str, text: &str| {
+        parity::line_for(
+            fixture,
+            "ide.context",
+            &json!({"path":"a.py"}),
+            &json!({"state":"complete","kind":"context","code":null,
+                "text":format!("path: a.py\n{header}\n\n{text}")}),
+        )
+    };
+    let at =
+        |fixture: &parity::Fixture| format!("definitions: file://{}/a.py", fixture.root.display());
     assert_eq!(
-        normalized(&format!("activation {first} ready\n")),
-        normalized(&format!("activation {second} ready\n"))
+        rooted(&one, &at(&one), "x\n"),
+        rooted(&two, &at(&two), "x\n")
+    );
+    let path = format!("p = '{}'\n", one.root.display());
+    assert_ne!(
+        rooted(&one, "definitions: null", &path),
+        rooted(&one, "definitions: null", "p = '<root>'\n")
+    );
+    // The `ide.start` card is generated metadata: its ids, digests and timings are masked.
+    assert_eq!(
+        normalized(&format!(
+            "ide.start {{}} -> x\nexisting activation {id_a}; ready (12ms)\n"
+        )),
+        normalized(&format!(
+            "ide.start {{}} -> x\nexisting activation {id_b}; ready (9ms)\n"
+        ))
     );
     assert_ne!(
-        normalized(&format!("op {first}\n")),
-        normalized(&format!("op {second}\n"))
+        normalized(&format!("ide.start {{}} -> x\nop {id_a}\n")),
+        normalized(&format!("ide.start {{}} -> x\nop {id_b}\n"))
     );
-    assert_ne!(normalized("git 1a2b3c4\n"), normalized("git 5d6e7f8\n"));
-    assert_ne!(normalized("at /tmp/a/x\n"), normalized("at /tmp/b/x\n"));
+    // An `ide.test` reply's run duration is masked; its counts are not.
+    let test = |row: &str| normalized(&format!("ide.test {{}} -> x\n{row}"));
+    assert_eq!(
+        test("tests #1: 1 passed, 0 failed, 0 s · env .venv"),
+        test("tests #1: 1 passed, 0 failed, 3 s · env .venv")
+    );
+    assert_ne!(
+        test("tests #1: 1 passed, 0 failed, 0 s"),
+        test("tests #1: 2 passed, 0 failed, 0 s")
+    );
     // A request's echoed references are masked by value only; the request still differs by
     // its other fields.
     let reply = json!({"state":"complete","kind":"edit","code":null,"text":"ok"});
     assert_eq!(
-        parity::line("ide.edit", &json!({"source_ref":"r1","path":"a"}), &reply),
-        parity::line("ide.edit", &json!({"source_ref":"r2","path":"a"}), &reply)
+        line("ide.edit", &json!({"source_ref":"r1","path":"a"}), &reply),
+        line("ide.edit", &json!({"source_ref":"r2","path":"a"}), &reply)
     );
     assert_ne!(
-        parity::line("ide.edit", &json!({"source_ref":"r1","path":"a"}), &reply),
-        parity::line("ide.edit", &json!({"source_ref":"r1","path":"b"}), &reply)
+        line("ide.edit", &json!({"source_ref":"r1","path":"a"}), &reply),
+        line("ide.edit", &json!({"source_ref":"r1","path":"b"}), &reply)
     );
 }
 
+/// Two fronts opened back to back on one daemon never reuse a tool call id: the second front's
+/// calls answer instead of being refused as a replay of the first's.
+#[tokio::test]
+async fn parity_fronts_on_one_daemon_use_distinct_call_ids() {
+    let fixture = parity::Fixture::new(&[("style.css", ".btn { color: red; }\n")], json!([]));
+    let _daemon = parity::Daemon::start(&fixture, &[]).await;
+    for front in 0..2 {
+        let mut session = parity::Session::start(&fixture).await;
+        let reply = session
+            .call(&fixture, "ide.outline", json!({"path":"style.css"}))
+            .await;
+        assert_eq!(reply["kind"], "outline", "front {front}: {reply}");
+        session.close(&fixture).await;
+    }
+}
+
 /// The parity harness runs the same calls on two fresh daemons, with and without the fallback
-/// switch, and finds them equal; CSS runs as a module only by default.
+/// switch, and finds them equal; CSS runs as a module by default exactly when it ships as one.
 #[tokio::test]
 async fn parity_harness_compares_two_daemon_runs() {
     let fixture = parity::Fixture::new(
@@ -201,9 +330,10 @@ async fn parity_harness_compares_two_daemon_runs() {
     assert!(in_process.tree.module("css", "analyzer").is_none());
     drop(in_process.daemon);
     let default = parity::transcript(&fixture, &[], &calls).await;
-    assert!(
+    assert_eq!(
         default.tree.module("css", "analyzer").is_some(),
-        "css ships as a module by default"
+        agent_ide::languages::SHIPPED_MODULES.contains(&"css"),
+        "css runs as a module by default exactly when it ships as one"
     );
     assert!(
         in_process.replies[0].contains(".btn"),

@@ -857,7 +857,7 @@ impl Worker<'_> {
             if callees_depth > 0 {
                 card.callees_note = Some(format!("unavailable ({language} has no call hierarchy)"));
             }
-        } else if matches!(lexical.as_ref(), Some(Lexical::Unavailable))
+        } else if let Some(Lexical::Unavailable { module }) = lexical.as_ref()
             && let Some(server) = self.session_server(observed.path())
         {
             // The outline above came from source because the registered server's workspace
@@ -868,8 +868,7 @@ impl Worker<'_> {
             // language with name facts shows index-backed usages instead (below).
             // A language module's typed failure is named as such; a real workspace-load failure
             // keeps its phrase.
-            let why = module_stage(job)
-                .unwrap_or_else(|| format!("{} workspace failed to load", server.name()));
+            let why = unavailable_why(module.as_deref(), job, server.name());
             if want_usages && outline.language.names().is_none() {
                 card.usages_note = Some(format!("unavailable ({why})"));
             }
@@ -924,10 +923,10 @@ impl Worker<'_> {
                         Ok(found) => references = Some(found),
                         // This branch runs only after the outline's documentSymbols exchange
                         // failed, which already marked the session failed.
-                        Err(_) if exchange => {
-                            degraded = Some("references request failed".to_owned());
+                        Err(error) if exchange => {
+                            degraded = Some(request_failed("references", &error, outline.language));
                         }
-                        Err(_) => {
+                        Err(error) => {
                             self.providers.note_session_fault();
                             // The ready session failed this exchange; the stage names the request
                             // so the refusal's reply can say what still answers and how to
@@ -936,7 +935,8 @@ impl Worker<'_> {
                                 job.set_stage_failure(
                                     &FailureCode::ProviderUnavailable,
                                     &format!(
-                                        "{name}: references request failed{}",
+                                        "{name}: {}{}",
+                                        request_failed("references", &error, outline.language),
                                         super::providers::session_fallback_clause(
                                             outline.language.support().outline_while_loading()
                                         )
@@ -1577,10 +1577,7 @@ impl Worker<'_> {
                     .source_outline(job, language, &worktree_root, observed.path(), &source)
                     .await?
                 {
-                    Some(outline) => {
-                        job.failure_detail = None;
-                        Ok((outline, worktree_root, Some(Lexical::Unavailable)))
-                    }
+                    Some(outline) => Ok((outline, worktree_root, Some(source_answered(job)))),
                     None => {
                         // The stage `live_session_for` named promises a source outline this file
                         // does not have: say native reads instead, keeping the server's cause.
@@ -1634,14 +1631,24 @@ impl Worker<'_> {
             Err(other) => return Err(other),
         };
         if live.session.is_module() {
-            // The module normalizes its provider's symbols with the language's own rules.
+            // The module normalizes its provider's symbols with the language's own rules; a
+            // failed exchange falls back to the source outline exactly as in process below, its
+            // footer naming the cause (a module's typed failure included).
             return match live.session.module_outline(observed, bytes).await {
                 Ok(outline) => Ok((outline, worktree_root, None)),
                 Err(error) => {
                     self.providers.note_session_fault();
+                    let cause = exchange_cause(&error);
+                    if support.outline_while_loading()
+                        && let Some(outline) = self
+                            .source_outline(job, language, &worktree_root, observed.path(), &source)
+                            .await?
+                    {
+                        return Ok((outline, worktree_root, Some(Lexical::Exchange { cause })));
+                    }
                     job.set_stage_failure(
                         &FailureCode::ProviderUnavailable,
-                        &format!("{}: {}", server.name(), exchange_cause(&error)),
+                        &format!("{}: {cause}", server.name()),
                     );
                     Err(FailureCode::ProviderUnavailable)
                 }
@@ -1709,7 +1716,7 @@ impl Worker<'_> {
         let server = self.session_server(path)?;
         let state = match why {
             Lexical::Loading => "still indexing".to_owned(),
-            Lexical::Unavailable => "unavailable".to_owned(),
+            Lexical::Unavailable { .. } => "unavailable".to_owned(),
             Lexical::Exchange { cause } => format!("request failed: {cause}"),
             Lexical::Unverified { cause } => format!("project resolution unverified: {cause}"),
         };
@@ -2317,7 +2324,11 @@ pub(super) enum Lexical {
     /// The registered server has not finished loading its workspace yet.
     Loading,
     /// The registered server failed or is absent; it will not answer this call.
-    Unavailable,
+    Unavailable {
+        /// A language module's typed failure (`<language>: module_unavailable (…)`), kept from
+        /// the stage the source-outline success clears, so the card names it.
+        module: Option<String>,
+    },
     /// The registered session passed readiness but its documentSymbols exchange failed; the
     /// bounded cause names why in the outline footer.
     Exchange {
@@ -2351,6 +2362,24 @@ pub(super) fn module_stage(job: &Job) -> Option<String> {
     module_stage_of(job.failure_detail.as_deref()?)
 }
 
+/// The source outline answered for an unavailable server: the call succeeds, so the failure
+/// detail is cleared (it must not leak into a later refusal of this job), keeping a module's
+/// typed stage for the card's notes.
+pub(super) fn source_answered(job: &mut Job) -> Lexical {
+    let module = module_stage(job);
+    job.failure_detail = None;
+    Lexical::Unavailable { module }
+}
+
+/// Why a card's live sections are missing while its server is unavailable: the module's typed
+/// failure the outline kept, else one the job names now, else the server's failed workspace load.
+pub(super) fn unavailable_why(module: Option<&str>, job: &Job, server: &str) -> String {
+    module
+        .map(str::to_owned)
+        .or_else(|| module_stage(job))
+        .unwrap_or_else(|| format!("{server} workspace failed to load"))
+}
+
 /// [`module_stage`] of one failure detail (`<default stage> (<stage>)`).
 fn module_stage_of(detail: &str) -> Option<String> {
     let (_, stage) = detail.split_once(" (")?;
@@ -2376,6 +2405,48 @@ fn module_failures_name_their_stage() {
     );
 }
 
+/// `<request> request failed`, naming the attributed request failure of `language`'s own
+/// module (exactly the core's closed `module_failed (bundled.<language>:provider:failed)`) when
+/// its module-hosted provider failed it; any other error, an in-process provider's message
+/// included, keeps the bare wording.
+fn request_failed(request: &str, error: &std::io::Error, language: Language) -> String {
+    let attributed = crate::intelligence::session::module_remote::module_failed(
+        &crate::modules::contract::ModuleId::bundled(language.name()),
+    );
+    if error.to_string() == attributed {
+        format!("{request} request failed: {attributed}")
+    } else {
+        format!("{request} request failed")
+    }
+}
+
+/// A module's attributed request failure is named on the card; an in-process one, or a provider
+/// message that merely starts like one, is not.
+#[test]
+fn module_request_failures_are_named() {
+    crate::lang::testing::install();
+    let alpha = crate::lang::testing::ALPHA;
+    let module = std::io::Error::other(crate::intelligence::session::module_remote::module_failed(
+        &crate::modules::contract::ModuleId::bundled(alpha.name()),
+    ));
+    assert_eq!(
+        request_failed("references", &module, alpha),
+        "references request failed: module_failed (bundled.alpha:provider:failed)"
+    );
+    for other in [
+        "content modified",
+        "module_failed (bundled.alpha:provider:failed) /etc/passwd",
+        "module_failed (bundled.alpha:provider:\x1b[31mx)",
+        "module_failed (bundled.beta:provider:failed)",
+    ] {
+        assert_eq!(
+            request_failed("references", &std::io::Error::other(other), alpha),
+            "references request failed",
+            "{other}"
+        );
+    }
+}
+
 /// The bounded first line of a failed documentSymbols exchange, for the outline footer.
 fn exchange_cause(error: &std::io::Error) -> String {
     crate::intelligence::context::prefix(
@@ -2398,7 +2469,9 @@ fn exchange_cause(error: &std::io::Error) -> String {
 pub(super) fn missing_symbol(job: &mut Job, lexical: Option<Lexical>) -> FailureCode {
     match lexical {
         None | Some(Lexical::Unverified { .. }) => FailureCode::UnknownSymbol,
-        Some(Lexical::Unavailable | Lexical::Exchange { .. }) => FailureCode::ProviderUnavailable,
+        Some(Lexical::Unavailable { .. } | Lexical::Exchange { .. }) => {
+            FailureCode::ProviderUnavailable
+        }
         Some(Lexical::Loading) => {
             super::providers::park_while_loading(job);
             FailureCode::ProviderLoading

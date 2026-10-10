@@ -1098,8 +1098,44 @@ async fn live_session_outlives_requests_and_waits_for_readiness_per_request() {
     let _ = tokio::time::timeout(Duration::from_secs(2), peer_task).await;
 }
 
+/// A module receives a new opaque revision for every new core observation, unchanged bytes
+/// included (so its provider re-synchronizes and drops held diagnostics as an in-process session
+/// does on a new source binding), the same one for the same observation, and never more than the
+/// wire's 128 bytes.
+#[test]
+fn every_core_observation_is_a_new_module_revision() {
+    use super::module_remote::wire_revision;
+    let text = "a = 1\n";
+    let rebound = |sequence: u64, reference: &str, revision: &str| {
+        SourceObservation::new(
+            tree(),
+            1,
+            sequence,
+            ObservationRef::new(reference).unwrap(),
+            "main.txt".into(),
+            Some(SourceBytes::from_bytes(text.as_bytes())),
+            SourceRevision::new(revision).unwrap(),
+            SourceCoverage::Complete,
+            ObservedState::Present,
+        )
+        .unwrap()
+    };
+    let first = wire_revision(&rebound(1, "source-1", "same"));
+    assert_eq!(first, wire_revision(&rebound(1, "source-1", "same")));
+    assert_ne!(first, wire_revision(&rebound(2, "source-2", "same")));
+    assert_ne!(first, wire_revision(&rebound(1, "source-other", "same")));
+    assert!(first.starts_with("same@"));
+    let long = "r".repeat(128);
+    assert!(wire_revision(&rebound(3, "source-3", &long)).len() <= 128);
+    assert_ne!(
+        wire_revision(&rebound(3, "source-3", &long)),
+        wire_revision(&rebound(3, "source-3", &"s".repeat(128)))
+    );
+}
+
 /// A module-hosted session sends the core's exact source with its revision and turns the module's
-/// product answers back into provider types with UTF-8 positions over the exact text; context is
+/// product answers back into provider types with positions in the provider's reported encoding
+/// over the exact text (a UTF-16 provider converts a non-ASCII line in UTF-16 units); context is
 /// built over the core's own observation and binds diagnostics only for the same revision; a
 /// module that exits mid-request retires the generation.
 #[tokio::test]
@@ -1164,7 +1200,24 @@ async fn module_session_converts_product_answers() {
     assert_eq!(context.mode, ContextMode::Semantic);
     assert_eq!(context.generation, Some(generation));
     assert_eq!(context.text, text, "source text stays the core's own");
+    assert_eq!(
+        context.position_encoding,
+        lsp::PositionEncodingKind::UTF16,
+        "the provider's own encoding is reported"
+    );
+    let references = context.references.expect("references");
+    assert_eq!(
+        references[0].range.end.character, 7,
+        "the non-ASCII line converts in UTF-16 units, not its 8 bytes"
+    );
+    let definitions = live
+        .session
+        .definitions(&source, text.as_bytes(), 0)
+        .await
+        .unwrap();
+    assert_eq!(definitions[0].range.end.character, 1);
     let diagnostics = live.session.diagnostics();
+    assert_eq!(diagnostics.document_version, Some(1), "an exact count");
     assert_eq!(diagnostics.readiness, DiagnosticReadiness::Clean);
     assert!(diagnostics.source.is_some());
     assert!(live.is_alive());
@@ -1184,6 +1237,64 @@ async fn module_session_converts_product_answers() {
     );
     assert!(!failing.is_alive(), "a module fault retires the generation");
     assert!(failing.session.module_fault().is_some());
+
+    // A context answer in an encoding the core cannot convert in is ill-typed: the module's typed
+    // decode/malformed fault retires it, not a lexical reply from a live module.
+    let mut unknown = open(
+        FakeModule::new(ModuleId::bundled("alpha"), "1.0")
+            .with_fault(Capability::Semantic, Fault::UnknownEncoding),
+    )
+    .await;
+    let context = unknown
+        .session
+        .context(
+            &source,
+            text.as_bytes(),
+            ContextQuery::Symbol { byte_offset: 0 },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(context.mode, ContextMode::Lexical { .. }));
+    let fault = unknown.session.module_fault().expect("a typed fault");
+    assert_eq!(
+        (fault.stage, fault.cause),
+        (
+            crate::modules::contract::Stage::Decode,
+            crate::modules::contract::Cause::Malformed
+        )
+    );
+    assert!(
+        !unknown.is_alive(),
+        "the malformed answer retires the module"
+    );
+
+    // A live provider that failed one request fails that request only, attributed to the module:
+    // no fault, the module stays live and its next request answers.
+    let mut failed = open(
+        FakeModule::new(ModuleId::bundled("alpha"), "1.0")
+            .with_fault(Capability::Semantic, Fault::RequestFailed),
+    )
+    .await;
+    let error = failed
+        .session
+        .definitions(&source, text.as_bytes(), 0)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "module_failed (bundled.alpha:provider:failed)"
+    );
+    assert!(failed.session.module_fault().is_none());
+    assert!(failed.is_alive(), "the module keeps serving");
+    assert_eq!(
+        failed
+            .session
+            .definitions(&source, text.as_bytes(), 0)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 /// Replaces the pilot session fence and fault tests: a module-hosted session applies the local
@@ -1462,4 +1573,87 @@ async fn partial_module_answers_are_not_complete() {
             .is_ok()
     );
     assert!(live.session.provider_readiness().is_ready());
+}
+
+/// The readiness barrier of a warming provider (answered warming, partial) is loading on a live
+/// module, then ready; a module that refuses the barrier is retired with its typed `request`
+/// fault, never released as a silent gone.
+#[tokio::test]
+async fn a_warming_readiness_barrier_is_loading_not_gone() {
+    use crate::modules::{
+        contract::{Cause, Coverage, Declaration, ErrorCode, ModuleId, Readiness, Role, Stage},
+        fake::{FakeModule, in_memory, offer},
+        serve::{Answer, Effects, Incoming, ModuleServer, ServeError},
+    };
+    /// Answers like the fake, first warming and partial (or refusing), then ready.
+    struct Barrier(FakeModule, Option<bool>);
+    impl ModuleServer for Barrier {
+        fn declaration(&self) -> Declaration {
+            self.0.declaration()
+        }
+        async fn call<'a>(
+            &'a mut self,
+            request: Incoming,
+            effects: Effects<'a>,
+        ) -> Result<Answer, ServeError> {
+            let mut answer = self.0.call(request, effects).await?;
+            match self.1.take() {
+                Some(true) => {
+                    answer = Answer::result(crate::modules::payload::encode(&Readiness::Warming));
+                    answer.readiness = Readiness::Warming;
+                    answer.coverage = Coverage::Partial;
+                }
+                Some(false) => answer = Answer::error(ErrorCode::InvalidRequest, "no barrier"),
+                None => {}
+            }
+            Ok(answer)
+        }
+    }
+    crate::lang::testing::install();
+    let open = |warming: bool| async move {
+        let (channel, _) = in_memory(
+            Barrier(
+                FakeModule::new(ModuleId::bundled("alpha"), "1.0"),
+                Some(warming),
+            ),
+            offer(ModuleId::bundled("alpha"), "1.0", Role::Analyzer, 1),
+        )
+        .await
+        .unwrap();
+        LiveSession::open_module(
+            channel,
+            true,
+            tree(),
+            1,
+            ViewGeneration {
+                backend: 1,
+                configuration: 1,
+                toolchain: 1,
+                view: 1,
+            },
+            status_settings(),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    };
+    let mut live = open(true).await;
+    assert_eq!(
+        live.wait_ready(Duration::from_millis(100)).await,
+        Err(ReadinessError::Loading)
+    );
+    assert!(live.is_alive(), "a warming module stays live");
+    assert!(live.module_unavailable().is_none());
+    assert_eq!(live.wait_ready(Duration::from_millis(100)).await, Ok(()));
+
+    let mut live = open(false).await;
+    assert_eq!(
+        live.wait_ready(Duration::from_millis(100)).await,
+        Err(ReadinessError::Gone)
+    );
+    let fault = live.module_unavailable().expect("a typed barrier fault");
+    assert_eq!(
+        (fault.stage, fault.cause),
+        (Stage::Request, Cause::Malformed)
+    );
+    assert!(!live.is_alive());
 }

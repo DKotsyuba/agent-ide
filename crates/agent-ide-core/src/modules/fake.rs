@@ -49,6 +49,10 @@ pub enum Fault {
     ProviderExit,
     /// Answer that the module's provider timed out.
     ProviderTimeout,
+    /// Answer as usual, but name a position encoding no provider negotiates.
+    UnknownEncoding,
+    /// Answer that the live provider failed this one request.
+    RequestFailed,
 }
 
 /// A module that answers every capability with a canned typed result after decoding its payload,
@@ -227,11 +231,18 @@ impl FakeModule {
                 SemanticQuery::Context { source, .. } => encode(&ContextEvidence {
                     lexical: None,
                     document_version: Some(1),
+                    // A UTF-16 provider; one reference spans the source's first line.
+                    position_encoding: "utf-16".into(),
                     definitions: Some(vec![located(&source, 0, 1)]),
-                    references: Some(Vec::new()),
+                    references: Some(vec![located(
+                        &source,
+                        0,
+                        text_of(&source, request)?.find('\n').unwrap_or(0) as u64,
+                    )]),
                     truncated: false,
                     diagnostics: DiagnosticsEvidence {
                         revision: Some(source.revision.clone()),
+                        document_version: Some(1),
                         readiness: "clean".into(),
                         freshness: "current".into(),
                         diagnostics: Vec::new(),
@@ -250,6 +261,7 @@ impl FakeModule {
                 SemanticQuery::Readiness {} => encode(&super::contract::Readiness::Ready),
                 SemanticQuery::Diagnostics { source } => encode(&DiagnosticsEvidence {
                     revision: Some(source.revision),
+                    document_version: Some(1),
                     readiness: "clean".into(),
                     freshness: "current".into(),
                     diagnostics: Vec::new(),
@@ -430,6 +442,17 @@ impl ModuleServer for FakeModule {
                     super::contract::Cause::Timeout,
                     "provider timed out",
                 )),
+                Fault::RequestFailed => {
+                    Ok(Answer::error(ErrorCode::Failed, "provider request failed"))
+                }
+                Fault::UnknownEncoding => {
+                    let mut value = self
+                        .answer(&request, &mut effects)
+                        .await
+                        .map_err(ServeError::Protocol)?;
+                    value["position_encoding"] = json!("utf-7");
+                    Ok(Answer::result(value))
+                }
             };
         }
         Ok(match self.answer(&request, &mut effects).await {

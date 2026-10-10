@@ -32,6 +32,9 @@ pub const LANGUAGE_MODE: &str = "AGENT_IDE_LANGUAGE_MODE";
 const ATTACHMENT: &str = "parity-host-channel";
 /// Distinguishes fixture trees of concurrently running tests.
 static NEXT: AtomicUsize = AtomicUsize::new(0);
+/// Next tool call id, shared by every front of the test process: a daemon refuses a call id it
+/// already processed as a replay, so two fronts on one daemon must never reuse one.
+static CALL: AtomicUsize = AtomicUsize::new(100);
 
 /// The shipping binary under test.
 pub fn binary() -> PathBuf {
@@ -390,8 +393,6 @@ pub struct Session {
     input: ChildStdin,
     /// Its stdout.
     output: BufReader<ChildStdout>,
-    /// Next call id.
-    next: usize,
 }
 
 impl Session {
@@ -412,7 +413,6 @@ impl Session {
             input: child.stdin.take().unwrap(),
             output: BufReader::new(child.stdout.take().unwrap()),
             child,
-            next: 100,
         };
         let initialized = session
             .exchange(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
@@ -512,18 +512,26 @@ impl Session {
 
     /// One correlated tool call without settling.
     async fn call_once(&mut self, fixture: &Fixture, tool: &str, arguments: Value) -> Value {
-        self.next += 1;
-        let call = format!("call-{}", self.next);
+        let id = CALL.fetch_add(1, Ordering::Relaxed) + 1;
+        let call = format!("call-{id}");
         self.hook(fixture, "PreToolUse", &call).await;
         let reply = self
             .exchange(
-                json!({"jsonrpc":"2.0","id":self.next,"method":"tools/call","params":{
+                json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
                 "name":tool,"arguments":arguments,"_meta":{"threadId":"parity","callId":call,
                 "x-codex-turn-metadata":{},"codex/sandbox-state-meta":fixture.state()}}}),
             )
             .await;
         self.hook(fixture, "PostToolUse", &call).await;
-        reply["result"]["structuredContent"].clone()
+        let mut structured = reply["result"]["structuredContent"].clone();
+        // An error reply carries its message as content text only; keep it comparable.
+        if let Some(object) = structured.as_object_mut()
+            && !object.contains_key("text")
+            && let Some(text) = reply["result"]["content"][0]["text"].as_str()
+        {
+            object.insert("text".to_owned(), Value::String(text.to_owned()));
+        }
+        structured
     }
 
     /// Stops the activation and closes the front.
@@ -534,9 +542,44 @@ impl Session {
     }
 }
 
-/// One settled reply rendered as `tool args -> state kind code` plus its text.
+/// One settled reply rendered as `tool args -> state kind code` plus its text. The per-daemon
+/// references the reply itself generated (every `source_ref`/`detail_ref` value of its structured
+/// form) are written as `<ref>` in the reply's metadata rows ([`metadata_rows`]), and the ones a
+/// request echoes are masked in its arguments; no other byte changes, and source rows the reply
+/// returns stay exact.
 pub fn line(tool: &str, arguments: &Value, reply: &Value) -> String {
-    // A request echoes per-daemon references it was given; only their values are masked.
+    masked_line(tool, arguments, reply, None)
+}
+
+/// [`line`] with the fixture's own root (a private temporary path) also written as `<root>` in
+/// the reply's metadata rows, keeping every relative suffix.
+pub fn line_for(fixture: &Fixture, tool: &str, arguments: &Value, reply: &Value) -> String {
+    let root = fixture.root.display().to_string();
+    masked_line(tool, arguments, reply, Some(&root))
+}
+
+/// [`line`], masking `root` too when given.
+fn masked_line(tool: &str, arguments: &Value, reply: &Value, root: Option<&str>) -> String {
+    /// Collects every string under a `source_ref`/`detail_ref` key of `value`.
+    fn references(value: &Value, found: &mut Vec<String>) {
+        match value {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    match value {
+                        Value::String(reference)
+                            if matches!(key.as_str(), "source_ref" | "detail_ref")
+                                && !reference.is_empty() =>
+                        {
+                            found.push(reference.clone());
+                        }
+                        _ => references(value, found),
+                    }
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| references(item, found)),
+            _ => {}
+        }
+    }
     let mut arguments = arguments.clone();
     if let Some(object) = arguments.as_object_mut() {
         for key in ["source_ref", "detail_ref"] {
@@ -545,19 +588,50 @@ pub fn line(tool: &str, arguments: &Value, reply: &Value) -> String {
             }
         }
     }
+    let mut masks: Vec<(String, &str)> = Vec::new();
+    let mut generated = Vec::new();
+    references(reply, &mut generated);
+    masks.extend(generated.into_iter().map(|reference| (reference, "<ref>")));
+    masks.extend(root.map(|root| (root.to_owned(), "<root>")));
+    // Longest first, so a value that contains another is masked whole.
+    masks.sort_by_key(|(value, _)| std::cmp::Reverse(value.len()));
+    let text = reply["text"].as_str().unwrap_or_default();
+    let context = reply["kind"] == "context";
+    let text: String = metadata_rows(text, context)
+        .map(|(row, metadata)| {
+            if metadata {
+                masks.iter().fold(row.to_owned(), |row, (value, mask)| {
+                    row.replace(value.as_str(), mask)
+                })
+            } else {
+                row.to_owned()
+            }
+        })
+        .collect();
     format!(
-        "{tool} {arguments} -> {} {} {}\n{}",
-        reply["state"],
-        reply["kind"],
-        reply["code"],
-        reply["text"].as_str().unwrap_or_default()
+        "{tool} {arguments} -> {} {} {}\n{text}",
+        reply["state"], reply["kind"], reply["code"],
     )
 }
 
-/// [`line`] with the fixture's own root (a private temporary path) written as `<root>`, keeping
-/// every relative suffix.
-pub fn line_for(fixture: &Fixture, tool: &str, arguments: &Value, reply: &Value) -> String {
-    line(tool, arguments, reply).replace(&fixture.root.display().to_string(), "<root>")
+/// Each row of a reply `text` (with its line end) and whether it is generated metadata rather
+/// than returned source: a numbered source row (`  12\tcode`) is source, and so is every row of
+/// an `ide.context` reply after its header (the first empty row); every other row is metadata.
+pub fn metadata_rows(text: &str, context: bool) -> impl Iterator<Item = (&str, bool)> {
+    let mut body = false;
+    text.split_inclusive('\n').map(move |row| {
+        let numbered = row
+            .trim_start_matches(' ')
+            .split_once('\t')
+            .is_some_and(|(number, _)| {
+                !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
+            });
+        let source = body || numbered;
+        if context && row.trim_end_matches(['\r', '\n']).is_empty() {
+            body = true;
+        }
+        (row, !source)
+    })
 }
 
 /// The replies of one daemon run and the process tree seen before `ide.stop`.
@@ -592,11 +666,32 @@ pub async fn transcript(
     }
 }
 
-/// Masks only per-daemon tokens and keeps every other byte, whitespace included: a source-ref
-/// digest (a hex run over 64 characters, with `-`/`,` separators), a numeric timing (`12ms`,
-/// `3.5ms`, optionally wrapped in punctuation such as `(12ms)` or `12ms,`) and the generated
-/// 64-hex id right after a word naming the activation. Short hex runs and paths stay.
+/// Masks the per-run values of the two generated reply kinds that carry them, by slot, and keeps
+/// every other byte (whitespace included) of every other reply, so source text an `ide.read`,
+/// `ide.context` or `ide.symbol` returns is compared exactly:
+/// - an `ide.start` reply is generated metadata only: a hex run over 64 characters (with `-`/`,`
+///   separators), a numeric timing (`12ms`, `(3.5ms)`) and the 64-hex id after a word naming the
+///   activation are masked; short hex runs and paths stay;
+/// - an `ide.test` reply's settled `tests #N: …, S s` line has its whole-second duration `S` masked.
+///
+/// References a reply generated are already masked by value in [`line`].
 pub fn normalized(text: &str) -> String {
+    if text.starts_with("ide.start ") {
+        start_card(text)
+    } else if text.starts_with("ide.test ") {
+        text.split_inclusive('\n')
+            .map(|row| match row.strip_prefix("tests #") {
+                Some(_) => test_duration(row),
+                None => row.to_owned(),
+            })
+            .collect()
+    } else {
+        text.to_owned()
+    }
+}
+
+/// [`normalized`] for an `ide.start` reply.
+fn start_card(text: &str) -> String {
     /// Whether `word` is one volatile token.
     fn volatile(word: &str) -> bool {
         let digest = word.len() > 64
@@ -642,6 +737,18 @@ pub fn normalized(text: &str) -> String {
     }
     out.pop();
     out
+}
+
+/// One settled `tests #N: …` row with the whole seconds of its `, S s` duration masked.
+fn test_duration(row: &str) -> String {
+    for (at, _) in row.match_indices(", ") {
+        let rest = &row[at + 2..];
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits > 0 && rest[digits..].starts_with(" s") {
+            return format!("{}, <secs>{}", &row[..at], &rest[digits..]);
+        }
+    }
+    row.to_owned()
 }
 
 /// Asserts both transcripts have the same calls and equal normalized replies.

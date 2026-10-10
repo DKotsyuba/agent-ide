@@ -52,9 +52,33 @@ impl ModuleRemote {
     }
 }
 
+/// The opaque revision a module receives for `observation`: its source revision plus a digest of
+/// the core observation (sequence and reference) that read it. Each new core observation is a new
+/// revision even for unchanged bytes, so the module's provider re-synchronizes the document and
+/// drops its held diagnostics exactly as an in-process session does on every new
+/// [`SourceBinding`](super::super::freshness::SourceBinding).
+pub(super) fn wire_revision(observation: &SourceObservation) -> String {
+    let revision = observation.source_revision().as_str();
+    let seen = blake3::hash(
+        format!(
+            "{}\0{}",
+            observation.sequence(),
+            observation.reference().as_str()
+        )
+        .as_bytes(),
+    );
+    // The wire allows 128 bytes; a revision too long for the suffix is named by its digest.
+    let revision = if revision.len() > 128 - 17 {
+        blake3::hash(revision.as_bytes()).to_hex().to_string()
+    } else {
+        revision.to_owned()
+    };
+    format!("{revision}@{}", &seen.to_hex()[..16])
+}
+
 /// One source as the module receives it.
 fn source_ref(observation: &SourceObservation, text: &str) -> (SourceRef, Vec<Attachment>) {
-    let revision = observation.source_revision().as_str().to_owned();
+    let revision = wire_revision(observation);
     if text.len() <= crate::modules::payload::MAX_INLINE_SOURCE {
         let text = if observation.bytes().is_some() {
             SourceText::Inline(text.to_owned())
@@ -84,19 +108,25 @@ fn source_ref(observation: &SourceObservation, text: &str) -> (SourceRef, Vec<At
     )
 }
 
-/// The UTF-8 position of byte `offset` in `text` (clamped to a char boundary at or before it).
-fn position(text: &str, offset: u64) -> lsp::Position {
+/// The position of byte `offset` in `text` (clamped to a char boundary at or before it) in the
+/// provider's negotiated `encoding`.
+fn position(text: &str, offset: u64, encoding: &lsp::PositionEncodingKind) -> lsp::Position {
     let mut offset = (offset as usize).min(text.len());
     while !text.is_char_boundary(offset) {
         offset -= 1;
     }
-    let before = &text[..offset];
-    let line = before.matches('\n').count() as u32;
-    let start = before.rfind('\n').map_or(0, |at| at + 1);
-    lsp::Position {
-        line,
-        character: (offset - start) as u32,
-    }
+    context::position(text, offset, encoding).unwrap_or_default()
+}
+
+/// The provider encoding a module reports, if it is one the core converts.
+fn encoding_of(name: &str) -> Option<lsp::PositionEncodingKind> {
+    [
+        lsp::PositionEncodingKind::UTF8,
+        lsp::PositionEncodingKind::UTF16,
+        lsp::PositionEncodingKind::UTF32,
+    ]
+    .into_iter()
+    .find(|encoding| encoding.as_str() == name)
 }
 
 /// The request's own source, against which a module's ranges are checked.
@@ -199,6 +229,13 @@ impl LiveSession {
     }
 }
 
+/// The error text of a request a module's live provider failed (`ErrorCode::Failed`):
+/// `module_failed (<module>:provider:failed)`. A closed code, never the module's own message, and
+/// never a `module_unavailable`: the module is not retired.
+pub(crate) fn module_failed(module_id: &crate::modules::contract::ModuleId) -> String {
+    format!("module_failed ({module_id}:provider:failed)")
+}
+
 impl Session {
     /// Whether this session's provider is hosted by a bundled module.
     pub fn is_module(&self) -> bool {
@@ -262,16 +299,21 @@ impl Session {
     }
 
     /// The hosted provider's status barrier within `budget`: ready, still loading, or a
-    /// workspace that failed to load; a module fault is a gone transport.
+    /// workspace that failed to load. Anything else retires the module typed (a fault it already
+    /// recorded, else this barrier's own `request` fault), never a silent gone on a live module.
     pub(super) async fn module_readiness(
         &mut self,
         budget: std::time::Duration,
     ) -> Result<(), super::ReadinessError> {
         use super::ReadinessError;
-        // The module waits within the budget; the margin carries its answer back.
+        // The module waits exactly `budget` (as an in-process wait does); the margin carries its
+        // answer back.
         let answer: io::Result<crate::modules::contract::Readiness> = self
             .module_call_within(
-                budget + std::time::Duration::from_millis(500),
+                budget
+                    + std::time::Duration::from_millis(
+                        crate::modules::provider::READINESS_MARGIN_MS,
+                    ),
                 Capability::Semantic,
                 encode(&SemanticQuery::Readiness {}),
                 Vec::new(),
@@ -287,6 +329,26 @@ impl Session {
                 Err(ReadinessError::WorkspaceError)
             }
             Ok(crate::modules::contract::Readiness::Unavailable) | Err(_) => {
+                if self.module_fault().is_none() {
+                    let cause = match answer {
+                        Ok(_) => crate::modules::contract::Cause::Exited,
+                        Err(_) => crate::modules::contract::Cause::Malformed,
+                    };
+                    let remote = self.module.as_mut().expect("a module session");
+                    let offer = remote.channel.offer();
+                    let typed = crate::modules::contract::ModuleUnavailable {
+                        module_id: offer.module_id.clone(),
+                        module_version: offer.package_version.clone(),
+                        role: offer.role,
+                        stage: crate::modules::contract::Stage::Request,
+                        cause,
+                        instance: Some(offer.instance),
+                        retry_after_ms: None,
+                    };
+                    remote.fault = Some(typed.to_string());
+                    remote.unavailable = Some(typed);
+                    self.state.lock().expect("session lock").invalidate();
+                }
                 Err(ReadinessError::Gone)
             }
         }
@@ -300,6 +362,9 @@ impl Session {
         payload: serde_json::Value,
         attachments: Vec<Attachment>,
     ) -> io::Result<T> {
+        // The readiness barrier reports how far the provider is: its coverage is that state,
+        // never a partial answer to hold back.
+        let barrier = payload == encode(&SemanticQuery::Readiness {});
         let remote = self
             .module
             .as_mut()
@@ -329,10 +394,12 @@ impl Session {
         self.record_module_readiness(reply.readiness);
         // A semantic answer the module marks as covering only part of the workspace (its
         // provider still loading) is never taken as a complete answer.
-        if matches!(
-            capability,
-            Capability::Semantic | Capability::Calls | Capability::Rename
-        ) && reply.coverage != crate::modules::contract::Coverage::Complete
+        if !barrier
+            && matches!(
+                capability,
+                Capability::Semantic | Capability::Calls | Capability::Rename
+            )
+            && reply.coverage != crate::modules::contract::Coverage::Complete
             && matches!(reply.outcome, Outcome::Result(_))
         {
             return Err(io::Error::new(
@@ -344,26 +411,8 @@ impl Session {
         match reply.outcome {
             Outcome::Result(value) => match decode(value) {
                 Ok(value) => Ok(value),
-                Err(_) => {
-                    // A well-framed but ill-typed result is the module's typed fault.
-                    let offer = remote.channel.offer();
-                    let typed = crate::modules::contract::ModuleUnavailable {
-                        module_id: offer.module_id.clone(),
-                        module_version: offer.package_version.clone(),
-                        role: offer.role,
-                        stage: crate::modules::contract::Stage::Decode,
-                        cause: crate::modules::contract::Cause::Malformed,
-                        instance: Some(offer.instance),
-                        retry_after_ms: None,
-                    };
-                    remote.fault = Some(typed.to_string());
-                    remote.unavailable = Some(typed);
-                    self.state.lock().expect("session lock").invalidate();
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "module reply ill-typed",
-                    ))
-                }
+                // A well-framed but ill-typed result is the module's typed fault.
+                Err(_) => Err(self.retire_malformed("module reply ill-typed")),
             },
             Outcome::Error(error) => Err(io::Error::other(match error.unavailable {
                 Some(unavailable) => {
@@ -384,9 +433,34 @@ impl Session {
                     self.state.lock().expect("session lock").invalidate();
                     fault
                 }
+                // A live provider failed this one request: attributed to the module, which keeps
+                // serving (no fault recorded, the generation stays live).
+                None if error.code == crate::modules::contract::ErrorCode::Failed => {
+                    module_failed(&remote.channel.offer().module_id)
+                }
                 None => format!("module refused: {:?}", error.code),
             })),
         }
+    }
+
+    /// Retires this session's module with the typed `decode`/`malformed` fault for a well-framed
+    /// answer the core cannot use, and returns the request's error naming `what`.
+    fn retire_malformed(&mut self, what: &str) -> io::Error {
+        let remote = self.module.as_mut().expect("a module session");
+        let offer = remote.channel.offer();
+        let typed = crate::modules::contract::ModuleUnavailable {
+            module_id: offer.module_id.clone(),
+            module_version: offer.package_version.clone(),
+            role: offer.role,
+            stage: crate::modules::contract::Stage::Decode,
+            cause: crate::modules::contract::Cause::Malformed,
+            instance: Some(offer.instance),
+            retry_after_ms: None,
+        };
+        remote.fault = Some(typed.to_string());
+        remote.unavailable = Some(typed);
+        self.state.lock().expect("session lock").invalidate();
+        io::Error::new(io::ErrorKind::InvalidData, what.to_owned())
     }
 
     /// A file's exact text for location conversion: the request's own text for its file, else a
@@ -437,8 +511,8 @@ impl Session {
         Some(lsp::Location {
             uri,
             range: lsp::Range {
-                start: position(&text, location.start_byte),
-                end: position(&text, location.end_byte),
+                start: position(&text, location.start_byte, &self.module_encoding()),
+                end: position(&text, location.end_byte, &self.module_encoding()),
             },
         })
     }
@@ -506,9 +580,10 @@ impl Session {
         let found: Option<Vec<Location>> = self
             .module_call(Capability::Semantic, encode(&query), attachments)
             .await?;
+        let revision = wire_revision(observation);
         let own = Some(Own {
             path: observation.path(),
-            revision: observation.source_revision().as_str(),
+            revision: &revision,
             text: text.as_str(),
         });
         Ok(found
@@ -571,9 +646,10 @@ impl Session {
                 attachments,
             )
             .await?;
+        let revision = wire_revision(observation);
         let own = Some(Own {
             path: observation.path(),
-            revision: observation.source_revision().as_str(),
+            revision: &revision,
             text: text.as_str(),
         });
         Ok(items
@@ -719,6 +795,7 @@ impl Session {
                 context::invalid(&format!("rename proposal refused: {refusal:?}"))
             })?;
         let mut changes = HashMap::new();
+        let encoding = self.module_encoding();
         for FileEdit {
             path, replacements, ..
         } in &proposal.files
@@ -732,8 +809,8 @@ impl Session {
                     .iter()
                     .map(|replacement| lsp::TextEdit {
                         range: lsp::Range {
-                            start: position(text, replacement.start_byte),
-                            end: position(text, replacement.end_byte),
+                            start: position(text, replacement.start_byte, &encoding),
+                            end: position(text, replacement.end_byte, &encoding),
                         },
                         new_text: replacement.new_text.clone(),
                     })
@@ -772,8 +849,8 @@ impl Session {
             ContextQuery::Symbol { byte_offset } => Some(byte_offset as u64),
             ContextQuery::File => None,
         };
-        let reply: io::Result<ContextEvidence> = self
-            .module_call(
+        let reply: io::Result<ContextEvidence> = match self
+            .module_call::<ContextEvidence>(
                 Capability::Semantic,
                 encode(&SemanticQuery::Context {
                     source,
@@ -781,10 +858,26 @@ impl Session {
                 }),
                 attachments,
             )
-            .await;
+            .await
+        {
+            Ok(evidence) => match encoding_of(&evidence.position_encoding) {
+                Some(encoding) => {
+                    // Every later conversion, of this reply first, uses the provider's encoding.
+                    if let Some(capabilities) = &mut self.capabilities {
+                        capabilities.position_encoding = encoding;
+                    }
+                    Ok(evidence)
+                }
+                // An encoding the core cannot convert in is an ill-typed answer: the module's
+                // typed fault, never a silent lexical reply from a live module.
+                None => Err(self.retire_malformed("module reported an unknown position encoding")),
+            },
+            Err(error) => Err(error),
+        };
+        let revision = wire_revision(observation);
         let own = Some(Own {
             path: observation.path(),
-            revision: observation.source_revision().as_str(),
+            revision: &revision,
             text: text.as_str(),
         });
         match reply {
@@ -805,7 +898,7 @@ impl Session {
                 match &evidence.lexical {
                     None => {
                         result.mode = ContextMode::Semantic;
-                        result.position_encoding = lsp::PositionEncodingKind::UTF8;
+                        result.position_encoding = self.module_encoding();
                         result.lexical_matches.clear();
                     }
                     Some(reason) => {
@@ -831,6 +924,15 @@ impl Session {
         Ok(result)
     }
 
+    /// The provider's position encoding as the module last reported it (UTF-8 until then).
+    fn module_encoding(&self) -> lsp::PositionEncodingKind {
+        self.capabilities
+            .as_ref()
+            .map_or(lsp::PositionEncodingKind::UTF8, |capabilities| {
+                capabilities.position_encoding.clone()
+            })
+    }
+
     /// Stores the module's diagnostics evidence, bound to `observation` only for its revision.
     fn module_bind_diagnostics(
         &mut self,
@@ -838,15 +940,16 @@ impl Session {
         observation: &SourceObservation,
         text: &str,
     ) {
-        let bound = evidence.revision.as_deref() == Some(observation.source_revision().as_str());
+        let bound = evidence.revision.as_deref() == Some(wire_revision(observation).as_str());
+        let encoding = self.module_encoding();
         let diagnostics: Vec<lsp::Diagnostic> = if bound {
             evidence
                 .diagnostics
                 .iter()
                 .map(|diagnostic| lsp::Diagnostic {
                     range: lsp::Range {
-                        start: position(text, diagnostic.location.start_byte),
-                        end: position(text, diagnostic.location.end_byte),
+                        start: position(text, diagnostic.location.start_byte, &encoding),
+                        end: position(text, diagnostic.location.end_byte, &encoding),
                     },
                     severity: diagnostic
                         .severity
@@ -870,7 +973,11 @@ impl Session {
         let snapshot = &mut state.diagnostics;
         snapshot.source = bound
             .then(|| crate::intelligence::freshness::SourceBinding::from_observation(observation));
-        snapshot.document_version = None;
+        snapshot.document_version = if bound {
+            evidence.document_version
+        } else {
+            None
+        };
         snapshot.readiness = match (bound, evidence.readiness.as_str()) {
             (true, "clean") => DiagnosticReadiness::Clean,
             (true, "reported") => DiagnosticReadiness::Reported,

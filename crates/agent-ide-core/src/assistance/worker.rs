@@ -12154,12 +12154,34 @@ mod stop_retry_tests {
         assert!(job.park_until.is_none(), "an edit is never parked");
 
         job.tool = AssistanceTool::Read;
-        let code =
-            super::symbols::missing_symbol(&mut job, Some(super::symbols::Lexical::Unavailable));
+        let code = super::symbols::missing_symbol(
+            &mut job,
+            Some(super::symbols::Lexical::Unavailable { module: None }),
+        );
         assert_eq!(code, FailureCode::ProviderUnavailable);
         assert!(
             job.park_until.is_none(),
             "an unavailable server is never waited for"
+        );
+
+        // A source outline answering for a module that failed clears the call's failure detail
+        // but keeps the module's typed stage for the card's notes.
+        job.failure_detail = Some(
+            "ide.read:provider_unavailable (alpha: module_unavailable (bundled.alpha:request:timeout))"
+                .to_owned(),
+        );
+        let lexical = super::symbols::source_answered(&mut job);
+        assert!(job.failure_detail.is_none());
+        let super::symbols::Lexical::Unavailable { module } = &lexical else {
+            panic!("the source outline answered for an unavailable server");
+        };
+        assert_eq!(
+            super::symbols::unavailable_why(module.as_deref(), &job, "alpha-server"),
+            "alpha: module_unavailable (bundled.alpha:request:timeout)"
+        );
+        assert_eq!(
+            super::symbols::unavailable_why(None, &job, "alpha-server"),
+            "alpha-server workspace failed to load"
         );
     }
 
