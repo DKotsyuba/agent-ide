@@ -34,6 +34,8 @@ use crate::{
         store::WorkspaceStore,
     },
 };
+#[path = "delivery.rs"]
+mod delivery;
 #[path = "links.rs"]
 mod links;
 #[path = "providers.rs"]
@@ -542,6 +544,9 @@ struct Ledger {
     /// Bindings whose activation is being handed to another worktree: ingress refuses their new
     /// work until the handover settles, so nothing can queue against the old root meanwhile.
     handing_over: BTreeSet<BindingRef>,
+    /// Pending `job-ready` registrations (OUTBOX §3.2) by result reference, with the epoch the
+    /// fact is fenced at; taken by the job's settlement or by a read through its own reference.
+    deferred: BTreeMap<String, (super::outbox::DeferSpec, super::outbox::JobEpoch)>,
 }
 impl Default for Ledger {
     /// Creates empty finite bookkeeping; no file or process work occurs.
@@ -558,6 +563,7 @@ impl Default for Ledger {
             feedback: BTreeMap::new(),
             delivered: BTreeMap::new(),
             handing_over: BTreeSet::new(),
+            deferred: BTreeMap::new(),
         }
     }
 }
@@ -670,6 +676,8 @@ struct Shared {
     /// unwind abandoned is never trusted again, so the application layer reads this flag, answers
     /// `restarting`, and exits keeping the runtime store; see [`Shared::mark_failed`].
     failed: tokio::sync::watch::Sender<bool>,
+    /// Per-session outbox of deferred facts (OUTBOX-r3); shared with the test-run settle hook.
+    outbox: Arc<super::session_outbox::Outbox>,
 }
 
 /// Most queued-job call ids [`Shared::requests`] and [`Shared::degraded`] keep; past it the oldest
@@ -788,6 +796,9 @@ impl Shared {
             .map_err(|_| FailureCode::Cancelled)
     }
     /// Stores a bounded result after its owner has performed current liveness/authority checks.
+    ///
+    /// A settled result whose reference was deferred (OUTBOX §3.2) becomes its `job-ready` fact,
+    /// and a written edit advances the owner's edit counter used for staleness labels.
     fn complete(
         &self,
         reference: &str,
@@ -803,6 +814,7 @@ impl Shared {
                 code: FailureCode::Internal,
                 detail: None,
             });
+        let mut settled = None;
         if let Ok(mut ledger) = self.ledger.lock()
             && let Some(detail) = ledger.details.get_mut(reference)
         {
@@ -811,6 +823,14 @@ impl Shared {
             detail.source = source;
             detail.native_epoch = native_epoch;
             detail.line_movement = reply_line_movement(&detail.reply);
+            if !matches!(detail.reply, PeerReply::Pending { .. }) {
+                let owner = detail.binding.clone();
+                let final_reply = detail.reply.clone();
+                settled = Some((owner, final_reply, ledger.deferred.remove(reference)));
+            }
+        }
+        if let Some((owner, final_reply, deferred)) = settled {
+            self.job_settled(reference, &owner, &final_reply, deferred);
         }
     }
     /// Answers one settled run's terminal text and, for the owning binding, hands the run's
@@ -830,6 +850,10 @@ impl Shared {
             .expect("a settled run always carries its result");
         let owns_detail = status.owner == binding.fingerprint();
         let text = test_result_text(id, result, owns_detail, status.explicit_command);
+        // The settled run reached this caller through its own handle: its pushed fact is
+        // delivered, never repeated by a later carrier (OUTBOX §6).
+        self.outbox
+            .mark_subject_read(binding, &delivery::test_subject(id));
         // Paged once: after paging the run keeps only its bounded runner line, which must never
         // replace the full output page.
         if owns_detail && !result.output_paged && !result.output.is_empty() {
@@ -1282,6 +1306,7 @@ impl WorkerHandle {
                 requests: Mutex::default(),
                 degraded: Mutex::default(),
                 degraded_references: Mutex::default(),
+                outbox: Arc::default(),
             }),
             inspect,
             receiver: Mutex::new(Some(receiver)),
@@ -1443,6 +1468,7 @@ impl WorkerHandle {
     /// available, fallback ingress accepts only datagrams authenticated by a configured launcher
     /// attachment for this exact runtime.
     pub async fn start(&self, runtime: &Path) -> Result<(), FailureCode> {
+        self.shared.install_test_settle_hook();
         let receiver = self
             .receiver
             .lock()
@@ -1679,6 +1705,7 @@ impl WorkerHandle {
             };
         }
         let (send, wait) = oneshot::channel();
+        let target = delivery::call_target(tool, &parameters);
         match admit_initial_inspection(&self.inspect, || {
             self.enqueue(
                 invocation,
@@ -1692,8 +1719,15 @@ impl WorkerHandle {
             Ok((reference, permit)) => match tokio::time::timeout(INLINE_REPLY_WAIT, wait).await {
                 Ok(Ok(reply)) => reply,
                 _ => {
-                    self.inspect_reserved(binding, reference, expected, permit)
-                        .await
+                    let reply = self
+                        .inspect_reserved(binding, reference.clone(), expected, permit)
+                        .await;
+                    // The caller leaves with `pending`: the final answer becomes a pushed
+                    // `job-ready` fact instead of something to ask for again (OUTBOX §3.2).
+                    if matches!(reply, PeerReply::Pending { .. }) {
+                        self.shared.defer_pending(&reference, tool, target);
+                    }
+                    reply
                 }
             },
             Err(code) => PeerReply::Error {
@@ -1746,16 +1780,25 @@ impl WorkerHandle {
             ledger.last_activity.remove(&binding);
             ledger.feedback.remove(&binding);
             ledger.delivered.remove(&binding);
+            let live = ledger.details.keys().cloned().collect::<BTreeSet<_>>();
+            ledger
+                .deferred
+                .retain(|reference, _| live.contains(reference));
         }
         if let Some(feed) = &self.shared.project_feed {
             feed.forget(&binding.fingerprint());
         }
+        // OUTBOX §11: the stop reply carries what was never handed over; then nothing is pushed.
+        let undelivered = self.shared.outbox.flush_for_stop(&binding);
         self.shared.notify.notify_one();
         let (send, wait) = oneshot::channel();
         if let Err(code) = self.enqueue(
             invocation,
             AssistanceTool::Stop,
-            serde_json::json!({ "uncollected_test_runs": uncollected }),
+            serde_json::json!({
+                "uncollected_test_runs": uncollected,
+                "undelivered_facts": undelivered,
+            }),
             attachment,
             Some(send),
             None,
@@ -1909,6 +1952,7 @@ impl WorkerHandle {
 
     /// Invalidates cached results on native hints; reads wait for a current MCP sandbox observation.
     pub fn native_hint(&self, binding: BindingRef) {
+        self.shared.outbox.note_native(&binding);
         if let Ok(mut ledger) = self.shared.ledger.lock() {
             let epoch = ledger.native_epoch.entry(binding).or_default();
             *epoch = epoch.saturating_add(1);
@@ -2844,6 +2888,9 @@ impl<'a> Worker<'a> {
                         own_run = self.shared.test_runs.get(&root, id, &binding);
                     }
                     StartResult::Running(id, age) => {
+                        // A second session asking for the busy worktree's run receives its own
+                        // `test-finished` fact when that run settles (OUTBOX §12).
+                        self.shared.test_subscribed(id, &binding);
                         return Ok((
                             PeerReply::Complete {
                                 kind: ResultKind::Test,
@@ -2912,6 +2959,9 @@ impl<'a> Worker<'a> {
                     let Some(id) = running.map(|status| status.id).or(started_id) else {
                         return Err(FailureCode::Internal);
                     };
+                    // The caller leaves with a started line: the outcome is pushed once as a
+                    // `test-finished` fact (OUTBOX §2).
+                    self.shared.test_started(id, &binding, budget);
                     let selected =
                         selected_count.map_or_else(String::new, |summary| format!(" ({summary})"));
                     return Ok((
@@ -3286,7 +3336,14 @@ impl<'a> Worker<'a> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let revoked = self.revoke(&binding, &uncollected).await;
+            let undelivered = job
+                .parameters
+                .get("undelivered_facts")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let revoked = self
+                .revoke(&binding, &uncollected, undelivered.as_deref())
+                .await;
             if revoked.is_err() {
                 job.failure_detail = self.stop_cause.take().map(str::to_owned);
             }
@@ -3516,6 +3573,8 @@ impl<'a> Worker<'a> {
             );
             match sender.send(reply) {
                 Ok(()) => {
+                    // The waiting caller got the answer itself: nothing is pushed for it.
+                    self.shared.reference_read(&binding, &job.reference);
                     if let Some(mark_reply) = mark_reply {
                         self.shared.mark_feedback_inline_delivered(
                             &binding,
@@ -3920,6 +3979,8 @@ impl<'a> Worker<'a> {
         let activation_operation = receipt.operation().to_owned();
         self.grants.insert(binding.clone(), receipt);
         self.leases.insert(binding.clone(), lease);
+        // The session's outbox exists from activation on, so deferred facts have a recipient.
+        self.shared.outbox.open(&binding);
         // The one shared fact a hook ingress can check before emitting a native hint: this
         // channel's binding now holds an activation.
         if let Ok(mut activated) = self.shared.activated.lock() {
@@ -5836,6 +5897,8 @@ impl<'a> Worker<'a> {
     /// Releases binding-owned state only after a committed revoke, including environment notice
     /// baselines, so stopped bindings cannot retain roots or suppress a future binding's notices.
     fn release_binding_state(&mut self, binding: &BindingRef) {
+        // A displaced or revoked session's undelivered facts reach nobody (OUTBOX §11).
+        super::outbox::SessionOutbox::forget(&*self.shared, binding);
         self.unsettled_edits.remove(binding);
         self.quiesce_worktree_caches(binding);
         self.leases.remove(binding);
@@ -5933,10 +5996,13 @@ impl<'a> Worker<'a> {
     /// The reply also names the test runs this binding started but never collected — passed in by
     /// the stop submitter before it marked them read — because a stopped agent otherwise reports
     /// results it never saw (ag-20260930-210040 +403…+465 s).
+    /// `undelivered` is the session outbox's stop flush (OUTBOX §11), appended after the
+    /// uncollected runs when the outbox still held facts.
     async fn revoke(
         &mut self,
         binding: &BindingRef,
         uncollected: &[String],
+        undelivered: Option<&str>,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         self.stop_cause = None;
         let revoked = self.settle_revocation(binding).await?;
@@ -5961,6 +6027,10 @@ impl<'a> Worker<'a> {
                 text.push_str("\n  ");
                 text.push_str(run);
             }
+        }
+        if let Some(undelivered) = undelivered {
+            text.push('\n');
+            text.push_str(undelivered);
         }
         Ok((
             PeerReply::Complete {
@@ -6380,8 +6450,15 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             ..
         }
     );
-    if request.reply.send(reply.clone()).is_ok() && is_context {
-        shared.mark_feedback_inline_delivered(&request.binding, &request.reference, &reply);
+    let terminal = retrieved && !matches!(reply, PeerReply::Pending { .. });
+    if request.reply.send(reply.clone()).is_ok() {
+        if terminal {
+            // Read through its own reference: the job's pushed fact is delivered (OUTBOX §6).
+            shared.reference_read(&request.binding, &request.reference);
+        }
+        if is_context {
+            shared.mark_feedback_inline_delivered(&request.binding, &request.reference, &reply);
+        }
     }
 }
 
@@ -9553,7 +9630,7 @@ mod stop_retry_tests {
 
         let (binding, _) = production_start(&mut worker, "stopped-actor", "stopped-start").await;
         assert!(worker.settle_revocation(&binding).await.unwrap());
-        let (reply, _, _) = worker.revoke(&binding, &[]).await.unwrap();
+        let (reply, _, _) = worker.revoke(&binding, &[], None).await.unwrap();
         assert!(matches!(
             reply,
             PeerReply::Complete { text, .. }
@@ -10093,6 +10170,7 @@ mod stop_retry_tests {
                 requests: Mutex::default(),
                 degraded: Mutex::default(),
                 degraded_references: Mutex::default(),
+                outbox: Arc::default(),
             }),
             workspace,
             observations: WorkspaceStore::new(store),
@@ -11271,7 +11349,7 @@ mod stop_retry_tests {
             .await;
             lock.execute_batch("ROLLBACK;").unwrap();
         };
-        let (outcome, ()) = tokio::join!(worker.revoke(&binding, &[]), release);
+        let (outcome, ()) = tokio::join!(worker.revoke(&binding, &[], None), release);
         assert!(outcome.is_ok(), "{outcome:?}");
         assert!(worker.grants.is_empty());
         assert!(worker.pending_revocations.is_empty());
@@ -11298,7 +11376,7 @@ mod stop_retry_tests {
 
         let lock = rusqlite::Connection::open(fixture.base.join("state.sqlite")).unwrap();
         lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
-        let failed = worker.revoke(&binding, &[]).await;
+        let failed = worker.revoke(&binding, &[], None).await;
         assert!(matches!(failed, Err(FailureCode::Capacity)), "{failed:?}");
         assert!(worker.pending_revocations.contains(&binding));
         assert!(
@@ -11340,7 +11418,7 @@ mod stop_retry_tests {
             .unwrap();
         let lock = rusqlite::Connection::open(fixture.base.join("state.sqlite")).unwrap();
         lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
-        assert!(worker.revoke(&binding, &[]).await.is_err());
+        assert!(worker.revoke(&binding, &[], None).await.is_err());
         // The overflow: the pending set never recorded this binding.
         worker.pending_revocations.clear();
         assert!(worker.grants.contains_key(&binding));
@@ -11872,7 +11950,7 @@ mod stop_retry_tests {
         let lock = rusqlite::Connection::open(fixture.base.join("state.sqlite")).unwrap();
         lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
 
-        let outcome = worker.revoke(&old_binding, &[]).await;
+        let outcome = worker.revoke(&old_binding, &[], None).await;
         assert!(
             matches!(outcome, Err(FailureCode::Capacity)),
             "a busy store is a capacity cause, not an authority one"
@@ -11914,7 +11992,7 @@ mod stop_retry_tests {
         assert_eq!(worker.grants.get(&new_binding), Some(&new_receipt));
         assert!(!worker.grants.contains_key(&old_binding));
 
-        let settled = worker.revoke(&new_binding, &[]).await;
+        let settled = worker.revoke(&new_binding, &[], None).await;
         assert!(settled.is_ok());
         assert!(!worker.grants.contains_key(&new_binding));
         assert!(worker.pending_revocations.is_empty());
