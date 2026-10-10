@@ -515,13 +515,18 @@ pub fn expand_staged(
                         args.push(token.into());
                     }
                 }
-                _ => args.extend(
-                    paths
-                        .get(name)
-                        .into_iter()
-                        .flatten()
-                        .map(|path| path.clone().into_os_string()),
-                ),
+                // The admitted paths of a path parameter (an admitted empty list is valid). A
+                // present value without an admitted entry (no path rule admits it) or of any other
+                // kind would be dropped silently and widen the run, so it is refused; only an
+                // absent optional list expands to nothing.
+                Some(Param::Paths(_) | Param::Path(_)) => match paths.get(name) {
+                    Some(admitted) => {
+                        args.extend(admitted.iter().map(|path| path.clone().into_os_string()))
+                    }
+                    None => return Err(Refusal::WrongKind((*name).to_owned())),
+                },
+                None => {}
+                Some(_) => return Err(Refusal::WrongKind((*name).to_owned())),
             },
             Arg::Joined(prefix, name) => args.push(
                 format!(
@@ -1160,7 +1165,8 @@ mod tests {
     }
 
     /// Tokens expand in order where the template says `Each`; an empty token, one with NUL or
-    /// one that could become an option (`-…`) is refused, as are tokens where one value goes.
+    /// one that could become an option (`-…`) is refused, as are tokens where one value goes and
+    /// a single token or scalar where a list goes; an absent list expands to nothing.
     #[test]
     fn tokens_expand_as_positional_arguments_only() {
         const RUN: EffectRecipe = EffectRecipe {
@@ -1204,6 +1210,54 @@ mod tests {
                 Err(Refusal::WrongKind("selection".into())),
                 "{bad:?}"
             );
+        }
+        // A single token or scalar where the list goes is refused, never dropped (which would
+        // run every test), and so is a path value no path rule admits; an absent list stays
+        // empty.
+        for value in [
+            Param::Token("tests/a.py".into()),
+            Param::Scalar(1),
+            Param::Paths(vec![layout.worktree.join("tests/a.py")]),
+            Param::Path(layout.worktree.join("tests/a.py")),
+        ] {
+            let mut request = request(&["one"]);
+            request.params.insert("selection".into(), value);
+            assert_eq!(
+                expand(&[RUN], &request, &admission),
+                Err(Refusal::WrongKind("selection".into()))
+            );
+        }
+        let mut absent = request(&["one"]);
+        absent.params.remove("selection");
+        assert_eq!(
+            expand(&[RUN], &absent, &admission).unwrap().args,
+            ["run", "--"]
+        );
+        // With a path rule, admitted paths expand (a single path, and an admitted empty list as
+        // nothing).
+        const RUN_PATHS: EffectRecipe = EffectRecipe {
+            paths: &[PathRule {
+                param: "selection",
+                roles: &[PathRole::Worktree],
+                existing_only: false,
+                read_root: false,
+            }],
+            ..RUN
+        };
+        let wanted = layout.worktree.join("tests/a.py");
+        for (value, expected) in [
+            (Param::Paths(vec![wanted.clone()]), vec![wanted.clone()]),
+            (Param::Path(wanted.clone()), vec![wanted.clone()]),
+            (Param::Paths(Vec::new()), Vec::new()),
+        ] {
+            let mut request = request(&["one"]);
+            request.params.insert("selection".into(), value);
+            let args = expand(&[RUN_PATHS], &request, &admission).unwrap().args;
+            let expected: Vec<std::ffi::OsString> = ["run".into(), "--".into()]
+                .into_iter()
+                .chain(expected.into_iter().map(PathBuf::into_os_string))
+                .collect();
+            assert_eq!(args, expected);
         }
         const SINGLE: EffectRecipe = EffectRecipe {
             args: &[Arg::Param("selection")],
