@@ -192,25 +192,14 @@ impl Worker<'_> {
                 // `test-finished` fact (OUTBOX §2).
                 self.shared.test_started(id, &binding, budget);
                 complete(
-                    format!(
-                        "tests #{id}: started — {count} targets in {runs} runs (budget {} s); the \
-                         result arrives by itself as a test-finished fact{started_lines}",
-                        budget.as_secs()
-                    ),
+                    format!("{}{started_lines}", started_line(id, count, runs, budget)),
                     Some(job.reference.clone()),
                 )
             }
             StartResult::Running(id, age) => {
                 // One run per worktree: this session receives the live run's own result.
                 self.shared.test_subscribed(id, &binding);
-                complete(
-                    format!(
-                        "tests #{id}: still running ({} s); nothing new started — its result \
-                         arrives by itself as a test-finished fact",
-                        age.as_secs()
-                    ),
-                    None,
-                )
+                complete(running_line(id, age), None)
             }
             StartResult::Failed { error, .. } => complete(
                 format!(
@@ -378,6 +367,26 @@ impl Worker<'_> {
     }
 }
 
+/// The first line of a started several-target run: `tests #N: started — <n> targets in <r> runs
+/// (budget <b> s); the result arrives by itself as a test-finished fact`.
+fn started_line(id: u64, targets: usize, runs: usize, budget: Duration) -> String {
+    format!(
+        "tests #{id}: started — {targets} targets in {runs} runs (budget {} s); the result \
+         arrives by itself as a test-finished fact",
+        budget.as_secs()
+    )
+}
+
+/// The reply of a several-target start while the worktree's run `id` (running `age`) is live:
+/// nothing new starts, and the live run's result reaches this session too.
+fn running_line(id: u64, age: Duration) -> String {
+    format!(
+        "tests #{id}: still running ({} s); nothing new started — its result arrives by itself \
+         as a test-finished fact",
+        age.as_secs()
+    )
+}
+
 /// The outcome line of a target its language cannot run: the single form's refusal text, or
 /// that no selection was available.
 fn unrunnable(error: &crate::lang::LangError) -> String {
@@ -473,5 +482,19 @@ mod tests {
             unrunnable(&crate::lang::LangError::Unsupported("README.md".to_owned())),
             "not runnable: README.md"
         );
+    }
+
+    /// The started and still-running lines say what happened and never invite polling
+    /// (M024-M027-REPLY-HYGIENE r2 §2).
+    #[test]
+    fn run_lines_never_invite_polling() {
+        let started = started_line(4, 3, 2, Duration::from_secs(300));
+        assert_eq!(
+            started,
+            "tests #4: started — 3 targets in 2 runs (budget 300 s); the result arrives by itself \
+             as a test-finished fact"
+        );
+        crate::assistance::batch::assert_no_polling(&started);
+        crate::assistance::batch::assert_no_polling(&running_line(4, Duration::from_secs(12)));
     }
 }

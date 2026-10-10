@@ -700,6 +700,7 @@ mod tests {
             text.contains("\npending: c.py#h - will be delivered\n"),
             "{text}"
         );
+        batch::assert_no_polling(&text);
         let graph = compose_symbols(
             AssistanceTool::Graph,
             &entries[1..3],

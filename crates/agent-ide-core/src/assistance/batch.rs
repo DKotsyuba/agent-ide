@@ -1159,6 +1159,26 @@ pub(crate) fn test_targets(parameters: &Value) -> Vec<TestTargetSpec> {
     targets
 }
 
+/// The phrases no batch reply line may contain (M024-M027-REPLY-HYGIENE r2 §2): a batch reply
+/// states what happened and never invites the agent to poll or wait.
+#[cfg(test)]
+pub(crate) const POLLING_PHRASES: [&str; 5] = [
+    "poll",
+    "every few seconds",
+    "in a few seconds",
+    "until it completes",
+    "again every",
+];
+
+/// Asserts that `text` contains none of [`POLLING_PHRASES`], case-insensitively.
+#[cfg(test)]
+pub(crate) fn assert_no_polling(text: &str) {
+    let lower = text.to_lowercase();
+    for phrase in POLLING_PHRASES {
+        assert!(!lower.contains(phrase), "{phrase:?} in {text:?}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1822,5 +1842,92 @@ mod tests {
             TestTargetSpec::Path("tests/cli.rs".to_owned()).label(),
             "path tests/cli.rs"
         );
+    }
+    /// Every batch read and edit reply line, the pending diagnostics line and the edit-checked
+    /// fact state what happened and never invite polling (M024-M027-REPLY-HYGIENE r2 §2).
+    #[test]
+    fn batch_reply_lines_never_invite_polling() {
+        use crate::assistance::reply::EditDiagnostics;
+        assert_no_polling(&read_summary(&ReadCounts {
+            items: 3,
+            files: 2,
+            delivered: 1,
+            unchanged: 1,
+            cut: 1,
+            failed: 0,
+        }));
+        assert_no_polling(&unchanged_line("ref-1", "src/a.rs", "1  a\n2  b\n"));
+        let cut = ReadItem::Symbol("src/c.rs#C".to_owned());
+        assert_no_polling(&read_follow_up(ReadForm::Items, &[&cut]));
+        let pending = vec![(
+            "src/a.rs".to_owned(),
+            EditDiagnostics::Pending {
+                detail_ref: "ref-2".to_owned(),
+            },
+        )];
+        let (words, per_file, _) = summarize_diagnostics(&pending);
+        assert!(words.starts_with("pending"), "{words}");
+        assert_no_polling(&words);
+        per_file.iter().for_each(|line| assert_no_polling(line));
+        let draft = edit_checked_draft("op-1", "ref-2", &pending, Vec::new());
+        assert_no_polling(&draft.summary);
+        assert_no_polling(draft.detail.as_deref().unwrap_or_default());
+    }
+    /// Every canonical example of batch-api-v1 (docs/contracts/batch-api-v1.md, one per form)
+    /// passes the facade's validation for its tool, its `…` placeholders read as plain text; a
+    /// shape the facade refused would make the contract's own example invalid.
+    #[test]
+    fn the_contracts_canonical_examples_validate() {
+        let contract = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/contracts/batch-api-v1.md"),
+        )
+        .unwrap();
+        let mut examples = Vec::new();
+        let mut block: Option<String> = None;
+        for line in contract.lines() {
+            match (&mut block, line) {
+                (None, "```json") => block = Some(String::new()),
+                (Some(text), "```") => {
+                    examples.push(text.replace('…', "x"));
+                    block = None;
+                }
+                (Some(text), line) => {
+                    text.push_str(line);
+                    text.push('\n');
+                }
+                (None, _) => {}
+            }
+        }
+        // A block may hold the alternatives of one form (`{paths}` and `{glob}`).
+        let examples = examples
+            .iter()
+            .flat_map(|block| {
+                serde_json::Deserializer::from_str(block)
+                    .into_iter::<Value>()
+                    .map(Result::unwrap)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(examples.len(), 7, "one example per form");
+        for value in examples {
+            let tool = if value.get("items").is_some() {
+                AssistanceTool::Read
+            } else if value.get("paths").is_some() || value.get("glob").is_some() {
+                AssistanceTool::Outline
+            } else if value.get("direction").is_some() {
+                AssistanceTool::Graph
+            } else if value.get("symbols").is_some() {
+                AssistanceTool::Symbol
+            } else if value.get("targets").is_some() {
+                AssistanceTool::Test
+            } else {
+                AssistanceTool::Edit
+            };
+            assert!(
+                super::super::facade::validate_call(tool, value.clone()).is_ok(),
+                "{tool:?}: {value}"
+            );
+        }
     }
 }
