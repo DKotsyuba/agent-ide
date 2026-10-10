@@ -121,6 +121,12 @@ async fn run(mode: &str) -> Vec<String> {
 #[tokio::test]
 async fn the_bridge_answers_are_identical_in_every_mixed_setting() {
     let reference = run(ALL_IN_PROCESS).await;
+    // The activation card lists every namespace the languages cover, the file references too.
+    assert!(
+        reference[0].contains("\nlinks: class, id, style-variable, file-ref facts from css, html"),
+        "{}",
+        reference[0]
+    );
     let card = &reference[2];
     assert!(
         card.contains("links: 3 file references used here"),
