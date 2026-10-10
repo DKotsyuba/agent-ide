@@ -1,6 +1,6 @@
 # Batch API v1 contract
 
-Revision: batch-api-v1 r1 (proposed); tracked boundary id `M027-M024-BATCH-FORMS`, revision 1. Provider: the Assistance facade (`ide.read`, `ide.outline`, `ide.symbol`, `ide.graph`, `ide.test`, `ide.edit`). Consumers: coding agents; the teaching surface (tool descriptions, server instructions, skill, `ide.start` card), which must show exactly these shapes; the session outbox, which carries pending batch results and the multi-file edit's check. Vocabulary: [common](common.md); tool basics: [tools v0.4](tools-v0.4.md); edit receipts: [Changes v0.2](changes-v0.2.md).
+Revision: batch-api-v1 r1 (proposed); tracked boundary id `batch-api-v1`, revision 1. Provider: the Assistance facade (`ide.read`, `ide.outline`, `ide.symbol`, `ide.graph`, `ide.test`, `ide.edit`). Consumers: coding agents; the teaching surface (tool descriptions, server instructions, skill, `ide.start` card), which must show exactly these shapes; the session outbox, which carries pending batch results and the multi-file edit's check. Vocabulary: [common](common.md); tool basics: [tools v0.4](tools-v0.4.md); edit receipts: [Changes v0.2](changes-v0.2.md).
 
 Purpose: an agent names every file, symbol or range it needs in ONE call and gets everything back, and applies one logical change across several files in ONE `ide.edit` with ONE project check.
 
@@ -25,8 +25,9 @@ Forms and caps at a glance (the canonical example of each is under its section):
 - New optional fields: only `force` (boolean, `ide.read {items}` only). There is no `budget` and no `detail` field.
 - The reply opens with ONE summary line (counts and per-item states), then whole blocks in request order. A block is never cut. Blocks that do not fit the reply envelope (64 KiB including the structured copy, about 30 KiB of text) are named in a footer with the exact call that fetches them. A single block larger than the whole envelope is delivered alone through ordinary byte paging, as today. There is no `budget` parameter.
 - Argument limit of the batch forms of `ide.read`, `ide.outline`, `ide.symbol` and `ide.graph`: 16 KiB of serialized JSON (single forms stay at 4 KiB). `ide.test` stays at 24 KiB and `ide.edit` at 136 KiB. Each entry keeps its existing bound (paths and symbol addresses at most 1024 bytes).
-- A batch that does not finish within the inline window (8 s) answers `pending` with its `detail_ref`; its complete result is then delivered once through the session outbox as a result fact. Source-bearing results are not pushed as hook text; they ride the next `ide.*` reply or `ide.inspect {}`. No reply asks the agent to poll.
-- A block whose file changed between observation and delivery is not served stale; it is listed as `changed: <path>; repeat the item`.
+- A batch that does not finish within the inline window (8 s) answers with the generic `pending` reply and its `detail_ref`; its complete result is then delivered once through the session outbox as one `job-ready` fact (session-outbox-v1 §13.3). Source-bearing results are not pushed as hook text; they ride the next `ide.*` reply or `ide.inspect {}`. A batch item listed as pending reads `pending: <item> - will be delivered` and names no call.
+- A block whose file changed between observation and delivery is not served stale; it reads `discarded: <path> changed; repeat`.
+- Reply hygiene (M024-M027-REPLY-HYGIENE r1): no reply line of these forms contains `poll`, `every few seconds`, `in a few seconds`, `until it completes` or `again every`, and no running or pending line carries elapsed seconds. Lines state facts.
 
 ## 2. `ide.read {items}`
 
@@ -59,10 +60,10 @@ source_ref: …-58 (valid for src/a.rs, src/b.rs, docs/api.md)
 Unchanged answer. The IDE remembers, per session, the content digest of every block it delivered in an `items` read. When the same item is requested again and its bytes are identical, the block is replaced by exactly one line:
 
 ```text
-unchanged since your read <ref>: <item> (<n> lines); add "force":true for the text
+unchanged since your read <ref>: <item> (<n> lines); "force":true returns the text
 ```
 
-- `<ref>` is the `detail_ref` of the earlier read that delivered the identical block. `<item>` is the item as requested: the symbol address for `{symbol}`, the path for `{path}`, `<path> lines <a-b>` for `{path, lines}`. `<n>` is the block's line count. Example: `unchanged since your read …-41: src/c.rs#Parser/next (34 lines); add "force":true for the text`.
+- `<ref>` is the `detail_ref` of the earlier read that delivered the identical block. `<item>` is the item as requested: the symbol address for `{symbol}`, the path for `{path}`, `<path> lines <a-b>` for `{path, lines}`. `<n>` is the block's line count. Example: `unchanged since your read …-41: src/c.rs#Parser/next (34 lines); "force":true returns the text`.
 - It counts as `unchanged` in the summary line. The reply's `source_ref` still covers that file, so an edit needs no re-read.
 - `force:true` always returns the text. Any byte change, `ide.stop`, and an observed context compaction of the session reset the memory for that session.
 - It is enabled only on a host whose compaction the session outbox reports (Claude Code: `PreCompact` and `SessionStart` with `source: "compact"`). Everywhere else the unchanged answer is never given and the text is always returned.
@@ -75,7 +76,7 @@ unchanged since your read <ref>: <item> (<n> lines); add "force":true for the te
 {"glob":"crates/x/src/**/*.rs","kinds":"fn"}
 ```
 
-- `paths`: 1–24 files. `glob`: a worktree-relative pattern with `*` (within one path segment), `**` (any depth) and `?`; it never leaves the worktree or the allowed roots, follows no symlink out of them, skips the directories the name index skips (`.git`, `.hg`, `.venv`, `venv`, `node_modules`, `target`, `dist`) and matches regular files only. At most 24 files, sorted by path; more matches are reported as `+<n> more files; narrow the glob`.
+- `paths`: 1–24 files. `glob`: a worktree-relative pattern with `*` (within one path segment), `**` (any depth) and `?`; it never leaves the worktree or the allowed roots, follows no symlink out of them, skips the directories the name index skips (`.git`, `.hg`, `.venv`, `venv`, `node_modules`, `target`, `dist`) and matches regular files only. At most 24 files, sorted by path; more matches are reported as `+<n> more files matched`.
 - `kinds` keeps its closed vocabulary and applies to every file.
 - Reply: `outline: <n> files — <k> outlined, <m> listed only` then one whole outline per file; a file that does not fit becomes `<path> (<lines> lines, <symbols> symbols) → ide.outline {"path":"<path>"}`.
 
@@ -134,13 +135,13 @@ Phase 1 — validate everything, write nothing:
 
 - Every base must name a retained observation of that path in this session whose bytes are still the file's current bytes; a `create` path must still be absent.
 - Every change resolves, applies, the file is formatted once and must pass the language's syntax gate, exactly as in the one-file form.
-- Any failure refuses the whole call: `error: edit_refused (edit:refused)` naming every failed item as `file <k> <path>: …` or `file <k> <path> change <n>: …` with the exact fix (stale bases read `stale_source — re-read <path>`), at most 8 sentences then `+<n> more`. Nothing is written, no receipt is kept and the `operation_id` stays unused.
+- Any failure refuses the whole call: `error: edit_refused (edit:refused)` naming every failed item as `file <k> <path>: …` or `file <k> <path> change <n>: …` with the exact fix (a stale base reads `file <k> <path>: stale_source (changed since <source_ref>)`), at most 8 sentences then `+<n> more`. Nothing is written, no receipt is kept and the `operation_id` stays unused.
 
 Phase 2 — commit:
 
 - A durable batch receipt is recorded before the first write: the canonical request digest (over the caller's arguments only) and, per file in request order, the path, the base digest and the candidate digest.
 - Files are written in request order. Immediately before each write the file's bytes are re-checked against its base. A file that changed meanwhile, or an I/O error, stops the commit; files after it are not written.
-- After the last write of the call, ONE project check runs on the final state: one check generation per affected checked language, normally exactly one. Diagnostics are grouped per file: per-file counts and at most 8 `new:` lines in total. A file no IDE language checks reports `not_analysed`. When the check does not finish within the inline window the reply says `diagnostics: pending` and the result arrives as one `edit-checked` fact for the whole operation.
+- After the last write of the call, ONE project check runs on the final state: one check generation per affected checked language, normally exactly one. Diagnostics are grouped per file: per-file counts and at most 8 `new:` lines in total. A file no IDE language checks reports `not_analysed`. When the check does not finish within the inline window the reply says `diagnostics: pending` and the result arrives as one `edit-checked` fact for the whole operation (subject `edit <operation_id> <first path> +<K> files`), fenced on the written paths when there are at most 8 of them and on the whole worktree otherwise (session-outbox-v1 §3 caps `fence_paths` at 8).
 
 Reply (summary first):
 
@@ -153,7 +154,7 @@ new: crates/cli/src/cli.rs:1790 error[E0063] missing field `roles`
 ```
 
 ```text
-edit: partial — written 1 of 3; not written: 2 crates/cli/src/cli.rs (changed after validation), 3 crates/store/src/new_helper.rs (not reached); retry the same operation_id to finish, or ide.read the files and re-plan
+edit: partial — written 1 of 3; not written: 2 crates/cli/src/cli.rs (changed after validation), 3 crates/store/src/new_helper.rs (not reached); the same operation_id resumes the rest
 ```
 
 - Structured result: `operation_id`, `outcome` (`applied` | `partial` | `conflicting_duplicate` | `outcome_unknown`), `source_ref` (valid for every written file), and per file `path`, `state` (`created` | `replaced` | `unchanged` | `not_written` | `unknown`) and, for `not_written`, `reason` (`changed_after_validation` | `io_error` | `not_reached`).
