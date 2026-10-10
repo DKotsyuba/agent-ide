@@ -2792,6 +2792,7 @@ impl<'a> Worker<'a> {
                         self.shared.test_runs.start_admitted(
                             root.clone(),
                             spec,
+                            argv.clone(),
                             &binding,
                             language,
                             budget,
