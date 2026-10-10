@@ -1,11 +1,11 @@
 {
   "schema": "agent-ide.macos-acceptance.v1",
-  "revision": "a5e80ae905a9a01a6e87e3e49570c33d7d588264",
+  "revision": "cd991dfaae8b0631b7597b693c6b317c87c385ac",
   "route": "product",
   "status": "product_pass",
   "platform": {"os": "macos", "version": "27.0", "architecture": "arm64"},
   "host": {"version": "product-contract"},
-  "toolchains": {"go": "not_tested", "gopls": "not_tested", "rust": "1.98.1", "rust_analyzer": "1.98.1", "node": "24.4.0", "pyright": "1.1.413", "typescript_language_server": "6.0.0", "typescript": "5.9.3"},
+  "toolchains": {"rust": "1.98.1", "rust_analyzer": "1.98.1", "node": "24.4.0", "pyright": "1.1.413", "typescript_language_server": "6.0.0", "typescript": "5.9.3"},
   "scenarios": {"edit_diagnostic_loop": "product_pass", "stale_edit_zero_write": "product_pass", "native_fallback": "product_pass", "telemetry_restart_query_export": "product_pass", "compact_content": "product_pass", "python_provider": "product_pass", "typescript_r3": "product_pass", "divergent_worktrees": "product_pass"},
   "privacy": {"source": false, "prompts": false, "credentials": false, "commands": false, "paths": false, "diagnostic_messages": false, "private_ids": false}
 }
