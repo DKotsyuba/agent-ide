@@ -169,6 +169,46 @@
           "maxLength": 131072,
           "type": "string"
         },
+        "files": {
+          "description": "One logical change across up to 16 files in ONE call, with only `operation_id` and an optional default `source_ref` beside it: each entry is {\"path\",\"changes\":[…]} (exactly the one-file `changes` entries), {\"path\",\"create\":true,\"content\"} (a new file) or {\"path\",\"content\"} (whole new content), with its own optional `source_ref`; at most 128 changes and 128 KiB of text in all. Every file is validated before the first write and any refusal writes nothing; files are written in order, one project check runs on the result, a partial write is reported per file, and the same `operation_id` resumes the rest.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "changes": {
+                "items": {
+                  "type": "object"
+                },
+                "maxItems": 32,
+                "minItems": 1,
+                "type": "array"
+              },
+              "content": {
+                "maxLength": 131072,
+                "type": "string"
+              },
+              "create": {
+                "type": "boolean"
+              },
+              "path": {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              "source_ref": {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "type": "object"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
         "lines": {
           "description": "With `path`: inclusive 1-based line range to replace.",
           "pattern": "^[0-9]+-[0-9]+$",
@@ -264,15 +304,23 @@
           "minLength": 1,
           "type": "string"
         },
+        "symbols": {
+          "description": "Several roots in ONE call instead of `symbol`: up to 8 symbol paths or bare names, one section per root in request order behind one summary line, each exactly as `symbol` would answer it with the same options; a failed root fails only itself.",
+          "items": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "type": "array"
+        },
         "tests": {
           "default": false,
           "description": "Show test symbols as nodes (marked `[test]`) instead of collapsing them into one `+N tests` line per parent.",
           "type": "boolean"
         }
       },
-      "required": [
-        "symbol"
-      ],
       "type": "object"
     },
     "name": "ide.graph"
@@ -323,6 +371,12 @@
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "glob": {
+          "description": "Every file matching this worktree-relative pattern in ONE call instead of `path`: `*` within a segment, `?` one character, `**` any directories (e.g. `crates/x/src/**/*.rs`); at most 24 files in path order, never outside the worktree, skipping hidden and build directories.",
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        },
         "kinds": {
           "description": "Comma list over the closed symbol-kind vocabulary; keeps a symbol whose kind is selected or a descendant's is, so a container of a selected member still shows.",
           "maxLength": 256,
@@ -335,11 +389,19 @@
           "maxLength": 1024,
           "minLength": 1,
           "type": "string"
+        },
+        "paths": {
+          "description": "Several files in ONE call instead of `path`: up to 24 worktree-relative paths, outlined in request order behind one summary line; a file past the reply budget is listed in one line with its exact call.",
+          "items": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 24,
+          "minItems": 1,
+          "type": "array"
         }
       },
-      "required": [
-        "path"
-      ],
       "type": "object"
     },
     "name": "ide.outline"
@@ -353,6 +415,37 @@
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "force": {
+          "default": false,
+          "description": "With `items`: return the text of an item even when its bytes are unchanged since your earlier read.",
+          "type": "boolean"
+        },
+        "items": {
+          "description": "Everything to read in ONE call, up to 32 items over at most 16 files, instead of `symbol`, `path`, `lines`, `symbols` or `ranges`: each item is exactly one of {\"symbol\":\"src/a.rs#Foo/bar\"}, {\"path\":\"docs/x.md\"} (the whole file) or {\"path\":\"src/b.rs\",\"lines\":\"10-40\"}. The reply opens with a summary line, then one block per item in request order; a failed item fails only itself, and one `source_ref` is valid for every file whose items were all delivered.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "lines": {
+                "pattern": "^[0-9]+-[0-9]+$",
+                "type": "string"
+              },
+              "path": {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              "symbol": {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "type": "array"
+        },
         "lines": {
           "description": "Inclusive 1-based line range such as `120-180`.",
           "pattern": "^[0-9]+-[0-9]+$",
@@ -498,15 +591,23 @@
           "minLength": 1,
           "type": "string"
         },
+        "symbols": {
+          "description": "Several cards in ONE call instead of `symbol`: up to 8 symbol paths or bare names, answered in request order behind one summary line, each exactly as `symbol` would answer it with the same options; a failed entry fails only itself.",
+          "items": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "type": "array"
+        },
         "usages": {
           "default": true,
           "description": "Include usages (src/tests split, with source lines).",
           "type": "boolean"
         }
       },
-      "required": [
-        "symbol"
-      ],
       "type": "object"
     },
     "name": "ide.symbol"
@@ -573,6 +674,35 @@
           "maxLength": 1024,
           "minLength": 1,
           "type": "string"
+        },
+        "targets": {
+          "description": "Several targets as ONE run instead of `symbol`/`path`/`pattern`: up to 8 entries, each exactly one of `{\"symbol\":…}`, `{\"path\":…}` or `{\"pattern\":…}`; symbol targets of one language share one runner invocation, the others run one after another in the same run; `budget_s` covers the whole run. One result with a line per target and one rerun line.",
+          "items": {
+            "additionalProperties": false,
+            "maxProperties": 1,
+            "minProperties": 1,
+            "properties": {
+              "path": {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              "pattern": {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              "symbol": {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "type": "array"
         }
       },
       "type": "object"

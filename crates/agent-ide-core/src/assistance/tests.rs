@@ -11,6 +11,11 @@ use std::{
 use super::host_binding::BindingRef;
 use crate::lang::{Language, TestReport};
 
+/// Several targets as one run of a worktree (batch-api-v1 §6).
+#[path = "test_batch.rs"]
+mod batch;
+pub use batch::{BatchCommand, BatchLaunch, BatchPlan, BatchTarget};
+
 /// Maximum combined stdout and stderr retained for `ide.inspect`.
 const MAX_OUTPUT: usize = 256 * 1024;
 /// Maximum output tail retained beside the paged full result.
@@ -111,6 +116,9 @@ pub struct RunResult {
     pub rerun_dir: Option<String>,
     /// Environment chosen at launch, shown only when multiple candidates or a selection exist.
     pub environment_label: Option<String>,
+    /// One line per target of a several-target run (`target 2 path tests/cli.rs: run 2 — 3
+    /// passed, 0 failed`), shown under the result; empty for a single-target run.
+    pub targets: Vec<String>,
 }
 
 /// Result of attempting to start a job in one worktree.
@@ -1172,6 +1180,7 @@ async fn run_child_capped(
         command: Vec::new(),
         rerun_dir: None,
         environment_label: None,
+        targets: Vec::new(),
     }
 }
 
@@ -1193,6 +1202,7 @@ fn failed_run(budget: Duration, output: String) -> RunResult {
         command: Vec::new(),
         rerun_dir: None,
         environment_label: None,
+        targets: Vec::new(),
     }
 }
 

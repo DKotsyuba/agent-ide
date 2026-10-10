@@ -10,7 +10,7 @@ Revision: v0.4. Provider: Agent IDE. Consumers: coding agents and IDE hosts.
 | `ide.edit` symbol operations (`replace`, `insert`, `delete`, `rename`) and `path` + `lines` range operation | implemented (landing now) |
 | Long-lived language server session for Rust | implemented |
 | `ide.start` project card | implemented (appended to the activation reply; no `ide.project`, no `not_a_project`; servers always `not started`) |
-| `ide.test` (`symbol` / `path` / `pattern` / `command` / `status`, `budget_s`; one job per worktree; status line in the `<agent-ide>` block; full output paged through `ide.inspect`) | implemented (wire version 4, 11 tools) |
+| `ide.test` (`symbol` / `path` / `pattern` / `command` / `status` / `targets`, `budget_s`; one job per worktree; status line in the `<agent-ide>` block; full output paged through `ide.inspect`) | implemented (wire version 4, 11 tools) |
 | `ide.graph` (`symbol`, `direction`, `depth`, `tests`; live bounded caller/callee tree; only functions and methods are nodes, and tests collapse to one `+N tests` line per parent unless `tests: true` expands them with `[test]` marks) | implemented (wire version 5, 11 tools) |
 | `ide.diff` cleanup (compact default, `provenance` flag, plain-`git diff` fallback, untracked symlinks listed) | implemented (v0.6.1) |
 | `ide.problems` cleanup | planned |
@@ -146,6 +146,8 @@ Errors: `outside_allowed_roots` (as today). There is no `not_a_project` failure 
 
 Input: `{path, kinds?: "fn,method,…"}`. A `path` naming a directory (trailing slash optional) answers a directory outline instead: subdirectories with file counts, then files with line counts and the first documentation line (`//!` for Rust, the module docstring for Python, the leading comment for TypeScript/JavaScript), one level deep, at most 200 files.
 
+Several files in one call ([batch API v1](batch-api-v1.md) §3): `{paths: [...], kinds?}` (1–24 paths in request order) or `{glob, kinds?}` (the regular files matching a worktree-relative pattern — `*` within a segment, `?` one character, `**` any directories — in path order, at most 24, `+N more files matched` counting the rest; the walk never leaves the worktree, follows no symbolic link and skips hidden and build directories). Each file is outlined exactly as `{path}` would outline it; the reply opens with `outline: <n> files — <k> outlined, <m> listed only, <f> failed`, embeds whole outlines while they fit, and lists every other file (and any outline too large to embed) as `<path> (<lines> lines, <symbols> symbols) → ide.outline {"path":…}`.
+
 `kinds` is an optional comma list over the closed `SymbolKind` vocabulary (`module`, `namespace`, `struct`, `enum`, `class`, `interface`, `trait`, `impl`, `type`, `fn`, `method`, `constructor`, `field`, `variant`, `const`, `var`, `test`, `symbol`), for a file too big to read whole (T163): a symbol shows when its own kind is selected or a descendant's is, so a container of a selected member still shows for context, and test modules always collapse exactly as they do unfiltered. Byte paging already bounds the reply; the filter is the agent-controlled cut for a large outline:
 
 ```text
@@ -180,6 +182,8 @@ Errors: `no_such_file` (the requested path does not exist in the worktree; fix t
 ### 2.3 `ide.symbol` — symbol card and relationships (implemented)
 
 Input: `{symbol, usages?: true, callers?: 0..3, callees?: 0..3, history?: true}`. The descriptions spell out `0–3` because some hosts omit the JSON schema maximum. Defaults: usages, callers 1, callees 0; `history` is opt-in (boolean) and shows the last 3 commits touching the definition.
+
+Several symbols in one call ([batch API v1](batch-api-v1.md) §4–§5): `ide.symbol {symbols: [...], …}` and `ide.graph {symbols: [...], …}` take 1–8 entries instead of `symbol`, with the single form's options for all of them. The reply opens with `symbols: <n> — <k> cards, <a> approximate, <p> pending, <f> failed` (or `graph: <n> roots (<direction>, depth <d>) — <k> graphs, <a> approximate, <p> pending, <u> unavailable, <f> failed`), then each entry's block in request order, exactly the single form's reply text; a failed entry shows the single form's error and fails only itself. Whole blocks are delivered while they fit and the rest are named with the exact call. While a server is still loading, the call answers at once: an entry of a language whose source outline is exact shows the single form's labelled `approximate:` block, any other loading entry reads `pending: <entry> - will be delivered`; the same job then re-runs only those entries precisely (for up to 10 minutes, after which an entry still loading fails as `provider_loading`) and its final reply arrives as one `job-ready` fact, subject `ide.symbol batch <detail_ref>: items <i,j>`, that holds the turn only when an entry got no early answer; `ide.inspect` of the `detail_ref` returns the whole final reply. A caller that already left, or a session with 4 jobs already waiting for precise answers, gets the whole batch once it can be answered.
 
 Output:
 
@@ -300,14 +304,16 @@ source_ref: sym-14
 
 `source_ref` is the reference currently called `detail_ref` by edit: it binds to the read content. A stale or incomplete read is refused as `stale_source` with no write; retry with the newest `source_ref` in the reply, or re-read every page before retrying.
 
-Batch reads fetch everything one edit needs in one call:
+Batch reads fetch everything one edit needs in one call ([batch API v1](batch-api-v1.md) §2):
 
 ```text
+ide.read {"items": [{"symbol": "src/a.rs#Foo/bar"}, {"path": "src/b.rs", "lines": "10-40"},
+                    {"path": "docs/api.md"}]}               // up to 32 items, at most 16 files
 ide.read {"symbols": ["src/a.rs#Foo/bar", "src/b.rs#qux"]}   // up to 16, any files
 ide.read {"path": "src/x.rs", "ranges": ["10-20", "44-60"]}  // up to 16 ranges
 ```
 
-The reply has one block per item in request order, headed by its address and line range, with the same numbered gutter as every read. Unknown symbols are reported per item (`no such symbol: … — check ide.outline {"path":"…"}`) without failing the rest. One `source_ref` is minted per call and is valid for every file it included: a batch `ide.edit` on any of them needs no re-read, and its line numbers are that version's. Blocks are never cut mid-body: what the reply budget could not hold is listed explicitly (`not included (over the reply budget): src/c.rs#C — call ide.read {"symbols":["src/c.rs#C"]}`); a single block larger than the whole budget pages by bytes like any read. An exactly duplicated address renders once; a nested symbol (a method inside a requested type) renders inside its parent and as its own block.
+An `items` entry is exactly one of `{symbol}`, `{path}` (the whole text of any readable text file) or `{path, lines}`; `items` excludes every other read key, and the batch forms accept arguments up to 16 KiB. The reply opens with one summary line, `read: <n> items in <f> files — <d> delivered, <u> unchanged, <c> not included, <x> failed`, then one block per item in request order, headed by its address and line range, with the same numbered gutter as every read. Unknown symbols, missing files and ranges past the end are reported per item in place (`no such symbol: … — check ide.outline {"path":"…"}`) without failing the rest. One `source_ref` is minted per call and is valid for every file whose items were all delivered: a batch `ide.edit` on any of them needs no re-read, and its line numbers are that version's. Blocks are never cut mid-body: the longest prefix that fits the reply is delivered and the rest is listed explicitly with the exact call in the request's own form (`not included (over the reply budget): src/c.rs#C — call ide.read {"items":[{"symbol":"src/c.rs#C"}]}`); a single block larger than the whole budget pages by bytes like any read, with the summary and the footer naming every other item. An exactly duplicated item renders once; a nested symbol (a method inside a requested type) renders inside its parent and as its own block. In the `items` form, an item whose block this session already received with identical bytes answers `unchanged since your read <ref>: <item> (<n> lines); "force":true returns the text` instead, and the reply's `source_ref` still covers its file; this answer is given only while the session's context-compaction epoch is known (session outbox §9.1) and resets when it rises, on any byte change and on `ide.stop`; `"force":true` always returns the text.
 
 A file no IDE language analyzes (a log, `README.md`, YAML, a script, `Cargo.toml`) reads as text in every form that needs no outline — `{path}` alone (the whole file, `(empty file)` when it has no lines, paged by bytes like any read), `{path, lines}`, `{path, ranges}` and a bare file path as an item of `{symbols}` — and the reply carries one line before `source_ref`: `note: no code analysis for this format; showing its text only (ide.outline and ide.symbol do not read it)`. A symbol address into such a file (`ide.read {symbol}`, an item of `{symbols}`) has no outline to resolve: the single form answers `unsupported_file`, a batch item says `<file> has no code symbols; read it with ide.read {path, lines|ranges}` — in either order with a bare-path item of the same file, and without failing the rest. A binary file (not UTF-8, or holding a NUL byte), a directory or a file whose bytes could not be read is refused softly, never as `internal`: the single forms answer `source_unavailable` (`read:not_text` or `read:source_unavailable`) naming the path and a native tool, a batch reports a binary item as `not a readable text file (binary, not UTF-8 or unreadable; inspect it with a native tool such as `file` or `xxd`): <path>` and still answers the rest.
 
@@ -360,7 +366,7 @@ edit: renamed; path src/index.ts; source_ref …-5; diagnostics: current_clean. 
 renamed method → run; 7 sites in 4 files: src/index.ts (3), src/api.ts (2), test/index.test.ts (2), … (+1 more)
 ```
 
-The first line's operation word names what happened: `edit: inserted`, `edit: deleted`, `edit: renamed` (`replace` and every plain edit keep `edit: replaced`, `edit: created`, `edit: unchanged`). The rename's second line lists every touched file with its site count, bounded like every other list (five files inline, then `+N more`); its diagnostics are the last written file's, and a rename never waits for the project check — a still-running check reports `diagnostics: unknown` and reaches the next `<agent-ide>` block or `ide.context` like any other edit.
+The first line's operation word names what happened: `edit: inserted`, `edit: deleted`, `edit: renamed` (`replace` and every plain edit keep `edit: replaced`, `edit: created`, `edit: unchanged`). The rename's second line lists every touched file with its site count, bounded like every other list (five files inline, then `+N more`); its diagnostics are the last written file's, and a rename never waits for the project check — a still-running check reports `diagnostics: unknown` and reaches the next `<agent-ide>` block or `ide.context` like any other edit. A rename is written through the multi-file commit of `ide.edit {files}` with the symbol's own file last: every file's candidate is built before the first write, a file of the server's edit outside the worktree refuses the whole rename (`edit_refused`, nothing written), a rename that stops midway answers the multi-file `edit: partial …` reply naming each file, and the same `operation_id` finishes it (a settled one answers every file as written earlier; a different rename under that id is `edit: conflicting_duplicate`). The reply's `source_ref` is an edit base for every written file.
 
 Errors: `stale_source` (including `edit:lines_moved`, which requires re-reading current lines), `unknown_symbol`, `edit_refused` (address resolution, overlap, or a candidate that does not parse — nothing written, retry with the same `operation_id`).
 
@@ -387,11 +393,24 @@ edit: replaced; path src/x.rs; source_ref …-7; diagnostics: current_clean. Nex
 lines after 12 moved +3
 ```
 
+A multi-file edit applies one logical change across up to 16 files in ONE call ([batch API v1](batch-api-v1.md) §7):
+
+```text
+{operation_id, source_ref?, files: [
+  {path: "src/a.rs", changes: […]},                   // exactly the one-file `changes` entries
+  {path: "src/b.rs", source_ref: "…-61", changes: […]},
+  {path: "src/new.rs", create: true, content: "…"},   // a file that must not exist yet
+  {path: "docs/x.md", content: "…"}]}                 // whole new content; needs a source_ref
+```
+
+At most 32 changes per file, 128 changes and 128 KiB of `content`/`new` text in all. Every file is observed and validated first (base admitted exactly as the one-file form admits it, every change resolved, formatted once and syntax-gated); any refusal answers `edit_refused` naming each failed `file k <path>` and nothing is written. Otherwise a durable receipt records the request digest and each file's base and candidate digests, the files are written in order through the stale-safe write, and one project check (one per affected checked language) runs after the last write. The reply is a complete `edit_batch` result whose text opens with `edit: applied N of N files; source_ref …` or `edit: partial — written w of N; not written: k <path> (changed after validation | write failed | not reached), …; the same operation_id resumes the rest`, then one line per file with its landing and diagnostics. Its `source_ref` is an edit base for every written file. The same `operation_id` with the same request resumes from the receipt (written files stay, an unwritten file is written only while its bytes still equal its validated base), even after a daemon restart; a different request answers `edit: conflicting_duplicate` and writes nothing. A crash after a write answers `outcome_unknown` for the operation.
+
 ### 2.6 `ide.test` — run tests on request, in the background (implemented)
 
 Input: `{symbol}` | `{path}` | `{pattern}` | `{command}`, with optional `budget_s?: 120`.
 
 - `symbol` selects tests that reference the symbol (using the language crate); `path` selects tests for a file/module (for Rust, scoped to that file's package with `--manifest-path`, so one file's tests do not build every target in the workspace); `pattern` filters through the test runner; `command` is an exact project command.
+- `targets` ([batch API v1](batch-api-v1.md) §6) runs 1–8 of `{symbol}`, `{path}` and `{pattern}` as ONE run of the worktree (`command` stays single-target): the symbol targets of one language merge into one runner invocation (the language's own filters for every referencing test: libtest exact names, pytest node ids, vitest files), every path and pattern target is its own invocation, and the invocations run one after another under one run number, holding the worktree's one live run throughout; `budget_s` covers the whole run and an invocation whose turn comes after it is spent does not run. A target that runs nothing (no tests reference it, a file without tests, a file the runner cannot take, an ambiguous name) is answered on its own line and never fails the others. The started reply is `tests #N: started — <n> targets in <r> runs (budget <b> s); the result arrives by itself as a test-finished fact` with one line per target (`target 1 symbol src/a.rs#parse: run 1 (3 tests selected)`); the settled result is the standard result with the summed counts and failures, one line per target (`target 3 path tests/cli.rs: run 2 — 4 passed, 0 failed`) and one `rerun:` line that reproduces the whole run (one invocation's own command, or every invocation in order as one `sh -c` line).
 
 Immediate output:
 

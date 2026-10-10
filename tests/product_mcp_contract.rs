@@ -440,14 +440,19 @@ fn assert_compact_envelope(reply: &Value) {
         // A card or an ambiguity list; a later page continues one of them.
         ("complete", Some("symbol")) => assert!(
             body.starts_with("symbol: ")
+                || body.starts_with("symbols: ")
                 || body.starts_with("ambiguous_symbol: ")
                 || (text.starts_with("page ") && !text.starts_with("page 1;")),
             "{reply}"
         ),
         ("complete", Some("graph")) => assert!(body.starts_with("graph: "), "{reply}"),
+        // A multi-file edit (batch-api-v1 §7) opens with its outcome line.
+        ("complete", Some("edit_batch")) => assert!(body.starts_with("edit: "), "{reply}"),
         // OUTBOX-r3 §8.5: consolidated `ide.inspect` text is plain, with no header of its own.
         ("complete", Some("inspect")) => assert!(!body.is_empty(), "{reply}"),
         // `<file>  (<n> lines, <lang>)` outline header.
+        // A several-file outline (batch-api-v1 §3) opens with its summary line.
+        ("complete", Some("outline")) if body.starts_with("outline: ") => {}
         ("complete", Some("outline")) => {
             let header = body.lines().next().unwrap_or_default();
             let (file, details) = header.split_once("  (").expect("outline file header");
@@ -462,7 +467,9 @@ fn assert_compact_envelope(reply: &Value) {
             let header = body.lines().next().unwrap_or_default();
             // A batch may open with a per-item refusal line instead of a block, and an empty
             // file's block says so instead of naming lines.
-            if !(header.starts_with("no such ")
+            // A batch read opens with its summary line (batch-api-v1 §2).
+            if !(header.starts_with("read: ")
+                || header.starts_with("no such ")
                 || header.starts_with("not a readable text file")
                 || header.contains(" has no code symbols; ")
                 || header.ends_with("  (empty file)"))
@@ -11167,7 +11174,8 @@ async fn configured_product_batch_ranges_read_then_edit_by_those_lines_without_r
     assert_eq!(
         batch_without_status_plate(&read_text),
         format!(
-            "src/batch.rs  (lines 5–7)\n5\tpub fn alpha() -> i32 {{\n6\t    helper(1)\n7\t}}\n\
+            "read: 2 items in 1 files — 2 delivered, 0 unchanged, 0 not included, 0 failed\n\
+             src/batch.rs  (lines 5–7)\n5\tpub fn alpha() -> i32 {{\n6\t    helper(1)\n7\t}}\n\
              src/batch.rs  (lines 9–11)\n 9\tpub fn beta() -> i32 {{\n10\t    helper(2)\n11\t}}\n\
              source_ref: {source_ref}\n"
         ),
@@ -11260,7 +11268,10 @@ async fn configured_product_batch_read_budget_footer_duplicate_and_unknown_symbo
     // The delivered block renders with the same numbered gutter as every read.
     let huge_a_end = 383usize;
     let width = huge_a_end.to_string().len();
-    let mut expected = format!("src/big.rs#huge_a  (lines 1–{huge_a_end})\n");
+    let mut expected = format!(
+        "read: 3 items in 1 files — 1 delivered, 0 unchanged, 1 not included, 1 failed\n\
+         src/big.rs#huge_a  (lines 1–{huge_a_end})\n"
+    );
     for number in 1..=huge_a_end {
         expected.push_str(&format!("{number:>width$}\t{}\n", lines[number - 1]));
     }
@@ -23137,3 +23148,6 @@ async fn failed_stop_is_retried_by_the_daemon_without_another_call() {
     .expect("the daemon's own retry must revoke the grant without another call");
     actor.mcp.close().await;
 }
+
+/// Batch forms (batch-api-v1) against the real daemon, sharing this file's fixtures.
+mod batch_api;

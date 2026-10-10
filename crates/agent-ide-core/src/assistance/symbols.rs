@@ -7,6 +7,7 @@
 
 use super::navigation::{classify_constructions, collapse_named, constructs};
 use super::*;
+use crate::assistance::batch;
 use crate::intelligence::server::ProviderJob as _;
 use crate::lang::{
     self, Language as Lang, LineRange, Outline, SymbolPath, TestId,
@@ -125,11 +126,15 @@ impl Worker<'_> {
         ))
     }
 
-    /// `ide.outline {path}`: the file skeleton.
+    /// `ide.outline {path}`: the file skeleton; the `{paths}` and `{glob}` forms outline each file
+    /// through this same path (`batch_outline`).
     pub(super) async fn outline(
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        if job.parameters.get("paths").is_some() || job.parameters.get("glob").is_some() {
+            return self.batch_outline(job).await;
+        }
         let binding = job.invocation.binding_ref().clone();
         let path = job.parameters["path"]
             .as_str()
@@ -205,21 +210,10 @@ impl Worker<'_> {
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
-        // Batch reads (v0.7): several symbols across files, or several ranges of one file — one
-        // reply in request order, one `source_ref` valid for every file it included.
-        if job.parameters.get("symbols").is_some() {
-            let requested = job.parameters["symbols"]
-                .as_array()
-                .ok_or(FailureCode::Internal)?
-                .clone();
-            return self.read_batch(job, &requested, ReadBatch::Symbols).await;
-        }
-        if job.parameters.get("ranges").is_some() {
-            let requested = job.parameters["ranges"]
-                .as_array()
-                .ok_or(FailureCode::Internal)?
-                .clone();
-            return self.read_batch(job, &requested, ReadBatch::Ranges).await;
+        // Batch reads: `items` (batch-api-v1), or the older `symbols` and `path`+`ranges` lists —
+        // one reply in request order, one `source_ref` valid for every file it included.
+        if let Some((form, requested)) = batch::read_request(&job.parameters) {
+            return self.read_batch(job, requested, form).await;
         }
         let binding = job.invocation.binding_ref().clone();
         let requested = job
@@ -326,49 +320,59 @@ impl Worker<'_> {
         Ok((reply, Some(authority), Some(observed)))
     }
 
-    /// `ide.read {symbols}` or `ide.read {path, ranges}` (v0.7): one block per item in request
-    /// order, one `source_ref` valid for every file it included, so a batch `ide.edit` on any of
-    /// them needs no re-read. Unknown symbols and missing files are reported per item without
-    /// failing the rest; an exactly duplicated address renders once; a block is never cut
-    /// mid-body — what the reply budget could not hold is listed with the exact follow-up call,
-    /// and only files whose blocks were all delivered get an edit base retained.
+    /// Every batch read — `ide.read {items}` (batch-api-v1) and the older `{symbols}` and
+    /// `{path, ranges}` lists, which `form` names: one summary line, then one block per distinct
+    /// item in request order, one `source_ref` valid for every file it included, so a batch
+    /// `ide.edit` on any of them needs no re-read.
     ///
-    /// A `symbols` item may also be a bare file path: for a file no IDE language reads it renders
-    /// the whole text (as `ide.read {path}`), while a symbol address into such a file is one soft
-    /// item (`<file> has no code symbols; read it with ide.read {path, lines|ranges}`), in
-    /// whichever order the two come. A binary or unreadable file is one `not a readable text
-    /// file` item, a missing file one `no such file` item. When any delivered file is one no IDE
-    /// language analyzes the reply carries [`NO_ANALYSIS_NOTE`] once, ahead of `source_ref`.
-    /// Failures that are not about one file (a malformed address, a deadline) still fail the call.
+    /// The summary line comes first:
+    /// `read: <n> items in <f> files — <d> delivered, <u> unchanged, <c> not included, <x> failed`.
+    /// Unknown symbols, missing files and ranges past the end are reported per item in place
+    /// without failing the rest; an exactly duplicated item renders once (duplicates footer); a
+    /// block is never cut mid-body — the longest prefix of blocks that fits the reply envelope is
+    /// delivered and the rest are named with the exact follow-up call in the request's own form.
+    /// Only files whose blocks were all delivered get an edit base retained. When not even the
+    /// first deliverable block fits, it alone is delivered through ordinary byte paging and every
+    /// other item is named in the footer.
+    ///
+    /// Item forms: a `{symbol}` item resolves through the file's outline; a `{path}` item renders
+    /// the whole text of any readable text file; a `{path, lines}` item (and a legacy `ranges`
+    /// entry) renders that range, clamped to the end of the file. A legacy `symbols` entry may be a
+    /// bare file path: for a file no IDE language reads it renders the whole text, while a symbol
+    /// address into such a file is one soft item (`<file> has no code symbols; read it with
+    /// ide.read {path, lines|ranges}`), in whichever order the two come. A binary or unreadable
+    /// file is one `not a readable text file` item, a missing file one `no such file` item. When
+    /// any delivered file is one no IDE language analyzes the reply carries [`NO_ANALYSIS_NOTE`]
+    /// once, ahead of `source_ref`. Failures that are not about one file (a malformed address, a
+    /// deadline) still fail the call.
     async fn read_batch(
         &mut self,
         job: &mut Job,
-        requested: &[Value],
-        form: ReadBatch,
+        requested: Vec<batch::ReadItem>,
+        form: batch::ReadForm,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        use batch::ReadItem;
         let binding = job.invocation.binding_ref().clone();
         // One observation, one outline and one finish per distinct file; items reference files
         // by index so request order survives.
         let mut files: Vec<(PathBuf, SourceObservation, String, Option<Outline>)> = Vec::new();
-        // (rendered block, the file whose observation it retains, the address exactly as
-        // requested) — duplicates never become items, so an item's own address is what the
-        // continuation footer must name, never an index back into `requested`.
-        let mut items: Vec<(String, Option<usize>, String)> = Vec::new();
+        // (rendered block, the file whose observation it retains — `None` for a failed item —,
+        // the item exactly as requested). Duplicates never become items, so an item's own request
+        // is what the continuation footer must name.
+        let mut items: Vec<(String, Option<usize>, ReadItem)> = Vec::new();
         let mut duplicates: Vec<String> = Vec::new();
-        let mut seen: Vec<String> = Vec::new();
-        for entry in requested {
-            let Some(address) = entry.as_str() else {
-                return Err(FailureCode::Internal);
-            };
-            if seen.contains(&address.to_owned()) {
-                if !duplicates.contains(&address.to_owned()) {
-                    duplicates.push(address.to_owned());
+        let mut seen: Vec<ReadItem> = Vec::new();
+        for item in requested {
+            if seen.contains(&item) {
+                let label = item.label();
+                if !duplicates.contains(&label) {
+                    duplicates.push(label);
                 }
                 continue;
             }
-            seen.push(address.to_owned());
-            match form {
-                ReadBatch::Symbols => {
+            seen.push(item.clone());
+            match &item {
+                ReadItem::Symbol(address) => {
                     let Ok(symbol) = SymbolPath::parse_item(address) else {
                         return Err(FailureCode::UnknownSymbol);
                     };
@@ -387,7 +391,7 @@ impl Worker<'_> {
                             items.push((
                                 format!("{NOT_TEXT_REFUSAL}: {}\n", file.display()),
                                 None,
-                                address.to_owned(),
+                                item,
                             ));
                             continue;
                         }
@@ -397,7 +401,7 @@ impl Worker<'_> {
                             items.push((
                                 batch_file_refusal(&code, &file.display().to_string()),
                                 None,
-                                address.to_owned(),
+                                item,
                             ));
                             continue;
                         }
@@ -405,15 +409,12 @@ impl Worker<'_> {
                     };
                     let (_, _, source, outline) = &files[index];
                     if text_file {
-                        items.push((
-                            whole_file_text(&file, address, source),
-                            Some(index),
-                            address.to_owned(),
-                        ));
+                        let text = whole_file_text(&file, address, source);
+                        items.push((text, Some(index), item));
                         continue;
                     }
-                    // A file read earlier in the batch without an outline (a bare path or a range
-                    // item) has no symbols to resolve, whatever order the items came in.
+                    // `read_batch_file` computed the outline when this item asked for one; a
+                    // file without one has no symbols to resolve.
                     let Some(outline) = outline else {
                         items.push((
                             batch_file_refusal(
@@ -421,69 +422,67 @@ impl Worker<'_> {
                                 &file.display().to_string(),
                             ),
                             None,
-                            address.to_owned(),
+                            item,
                         ));
                         continue;
                     };
-                    match outline.find(&symbol) {
+                    let block = match outline.find(&symbol) {
                         Some(found) => {
                             let text = render::read_text(&file, Some(address), found.range, source);
-                            items.push((text, Some(index), address.to_owned()));
+                            (text, Some(index))
                         }
-                        None => items.push((
+                        None => (
                             format!(
                                 "no such symbol: {address} — check ide.outline \
                                  {{\"path\":\"{}\"}}\n",
                                 file.display()
                             ),
                             None,
-                            address.to_owned(),
-                        )),
-                    }
+                        ),
+                    };
+                    items.push((block.0, block.1, item));
                 }
-                ReadBatch::Ranges => {
-                    let path = job.parameters["path"]
-                        .as_str()
-                        .ok_or(FailureCode::Internal)?
-                        .to_owned();
-                    let range = crate::assistance::facade::parse_line_range(address)
-                        .ok_or(FailureCode::Internal)?;
-                    let file = std::path::PathBuf::from(&path);
+                ReadItem::Path(path) | ReadItem::Lines(path, _) => {
+                    let range = match &item {
+                        ReadItem::Lines(_, lines) => Some(
+                            crate::assistance::facade::parse_line_range(lines)
+                                .ok_or(FailureCode::Internal)?,
+                        ),
+                        _ => None,
+                    };
+                    let file = std::path::PathBuf::from(path);
                     let index = match self
                         .read_batch_file(
                             job,
                             &binding,
                             &mut files,
                             file.clone(),
-                            // A language file keeps the outline its ranges read always took,
-                            // which registers it with the language session before any edit; a
-                            // file no language reads has none to take.
-                            Lang::for_path(&file).is_some(),
+                            // A range of a language file keeps the outline its ranges read always
+                            // took, which registers it with the language session before any edit;
+                            // a whole-file item needs none, like `ide.read {path}`.
+                            range.is_some() && Lang::for_path(&file).is_some(),
                         )
                         .await
                     {
                         Ok(Some(index)) => index,
                         Ok(None) => {
-                            items.push((
-                                format!("{NOT_TEXT_REFUSAL}: {path}\n"),
-                                None,
-                                address.to_owned(),
-                            ));
+                            items.push((format!("{NOT_TEXT_REFUSAL}: {path}\n"), None, item));
                             continue;
                         }
                         Err(
                             code @ (FailureCode::NoSuchFile(_) | FailureCode::UnsupportedFile(_)),
                         ) => {
-                            items.push((
-                                batch_file_refusal(&code, &path),
-                                None,
-                                address.to_owned(),
-                            ));
+                            items.push((batch_file_refusal(&code, path), None, item));
                             continue;
                         }
                         Err(code) => return Err(code),
                     };
                     let (_, _, source, _) = &files[index];
+                    let Some(range) = range else {
+                        let text = whole_file_text(&file, path, source);
+                        items.push((text, Some(index), item));
+                        continue;
+                    };
                     let total = lang::line_count(source);
                     if range.start > total {
                         items.push((
@@ -492,16 +491,42 @@ impl Worker<'_> {
                                  ({total} lines)\n"
                             ),
                             None,
-                            address.to_owned(),
+                            item,
                         ));
                         continue;
                     }
                     let clamped = LineRange::new(range.start, range.end.min(total));
                     let text = render::read_text(&file, None, clamped, source);
-                    items.push((text, Some(index), address.to_owned()));
+                    items.push((text, Some(index), item));
                 }
             }
         }
+        // The unchanged answer (batch-api-v1 §2): an `items` block whose bytes this session
+        // already received in the same context epoch becomes one line, unless `force` asks for
+        // the text. Its file stays covered by the reply's `source_ref`.
+        let epoch = (form == batch::ReadForm::Items
+            && job.parameters.get("force").and_then(Value::as_bool) != Some(true))
+        .then(|| self.context_epoch(&binding))
+        .flatten();
+        let unchanged: Vec<bool> = match (epoch, self.shared.ledger.lock()) {
+            (Some(_), Ok(mut ledger)) => {
+                let memory = ledger.read_memory.entry(binding.clone()).or_default();
+                items
+                    .iter_mut()
+                    .map(|(text, file, item)| {
+                        let label = item.label();
+                        match file.and(memory.delivered_before(epoch, &label, text)) {
+                            Some(prior) => {
+                                *text = batch::unchanged_line(&prior, &label, text);
+                                true
+                            }
+                            None => false,
+                        }
+                    })
+                    .collect()
+            }
+            _ => vec![false; items.len()],
+        };
         // Which files' blocks were delivered decides both the `source_ref` line's file list and
         // which observations stay retained as edit bases.
         let reference = job.reference.clone();
@@ -541,107 +566,84 @@ impl Worker<'_> {
                 format!("{note}source_ref: {}\n", job.reference)
             }
         };
-        // The continuation footer names exactly the cut items' own requested addresses and the
-        // exact call that fetches them — one quoted entry per address, so the call is well formed.
-        let follow_up = |items: &[(String, Option<usize>, String)], cut: &[usize]| -> String {
-            let names: Vec<&str> = cut
-                .iter()
-                .map(|&index| items[index].2.as_str())
-                .take(MAX_LANDING_SENTENCES)
-                .collect();
-            let hidden = cut.len().saturating_sub(MAX_LANDING_SENTENCES);
-            match form {
-                ReadBatch::Symbols => {
-                    let list = names
-                        .iter()
-                        .map(|name| format!("\"{name}\""))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let mut footer = format!(
-                        "not included (over the reply budget): {} — call ide.read \
-                         {{\"symbols\":[{list}]}}",
-                        names.join(", ")
-                    );
-                    if hidden > 0 {
-                        footer.push_str(&format!("; +{hidden} more"));
-                    }
-                    footer.push('\n');
-                    footer
-                }
-                ReadBatch::Ranges => {
-                    let path = job.parameters["path"].as_str().unwrap_or_default();
-                    let call = names
-                        .iter()
-                        .map(|name| format!("\"{name}\""))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let mut footer = format!(
-                        "not included (over the reply budget): {} — call ide.read \
-                         {{\"path\":\"{path}\",\"ranges\":[{call}]}}",
-                        names.join(", ")
-                    );
-                    if hidden > 0 {
-                        footer.push_str(&format!("; +{hidden} more"));
-                    }
-                    footer.push('\n');
-                    footer
-                }
-            }
-        };
-        // Compose whole blocks in request order until one more would not fit; never split a
-        // block. A first block larger than the whole budget pages by bytes like any read.
-        let mut included = 0usize;
-        let mut cut: Vec<usize> = Vec::new();
-        let mut delivered: Vec<usize> = Vec::new();
-        for index in 0..items.len() {
-            let (_, file, _) = &items[index];
-            let mut candidate_delivered = delivered.clone();
-            if let Some(file) = file
-                && !candidate_delivered.contains(file)
-            {
-                candidate_delivered.push(*file);
-            }
-            let candidate = items[..=index]
-                .iter()
-                .map(|(text, ..)| text.as_str())
-                .collect::<String>()
-                + &source_line(&candidate_delivered);
-            if fits(&candidate) {
-                included = index + 1;
-                delivered = candidate_delivered;
-            } else {
-                cut.extend(index..items.len());
-                break;
-            }
-        }
-        let mut text = items[..included]
+        let files_named = items
             .iter()
-            .map(|(text, ..)| text.as_str())
-            .collect::<String>();
-        text.push_str(&source_line(&delivered));
-        if !duplicates.is_empty() {
-            text.push_str(&duplicates_footer(&duplicates));
-        }
-        if !cut.is_empty() {
-            text.push_str(&follow_up(&items, &cut));
-        }
-        // The footers may push the whole reply past the budget: give blocks back until it fits.
-        while included > 0 && !fits(&text) {
-            included -= 1;
-            if let Some((_, Some(file), _)) = items.get(included)
-                && !items[..included]
-                    .iter()
-                    .any(|(_, delivered, _)| *delivered == Some(*file))
-            {
-                delivered.retain(|&index| index != *file);
+            .map(|(_, _, item)| item.file())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        // The whole reply when the blocks of `shown` (indexes into `items`, request order) are
+        // delivered and every other item is named in the follow-up footer, with the files those
+        // blocks retain as edit bases.
+        let compose = |shown: &[usize]| -> (String, Vec<usize>) {
+            let mut delivered: Vec<usize> = Vec::new();
+            for &index in shown {
+                if let Some(file) = items[index].1
+                    && !delivered.contains(&file)
+                {
+                    delivered.push(file);
+                }
             }
-            cut.insert(0, included);
-            text = items[..included]
+            let cut: Vec<&ReadItem> = (0..items.len())
+                .filter(|index| !shown.contains(index))
+                .map(|index| &items[index].2)
+                .collect();
+            let failed = shown
                 .iter()
-                .map(|(text, ..)| text.as_str())
-                .collect::<String>();
+                .filter(|&&index| items[index].1.is_none())
+                .count();
+            let repeated = shown.iter().filter(|&&index| unchanged[index]).count();
+            let mut text = batch::read_summary(&batch::ReadCounts {
+                items: items.len(),
+                files: files_named,
+                delivered: shown.len() - failed - repeated,
+                unchanged: repeated,
+                cut: cut.len(),
+                failed,
+            });
+            for &index in shown {
+                text.push_str(&items[index].0);
+            }
             text.push_str(&source_line(&delivered));
-            text.push_str(&follow_up(&items, &cut));
+            if !duplicates.is_empty() {
+                text.push_str(&duplicates_footer(&duplicates));
+            }
+            if !cut.is_empty() {
+                text.push_str(&batch::read_follow_up(form, &cut));
+            }
+            (text, delivered)
+        };
+        // Deliver the longest prefix of whole blocks that fits; never split a block.
+        let prefix = |count: usize| (0..count).collect::<Vec<_>>();
+        let included = (0..=items.len())
+            .rev()
+            .find(|&count| fits(&compose(&prefix(count)).0))
+            .unwrap_or(0);
+        let authority = self.authority(&binding).await.ok();
+        if included == 0
+            && let Some(index) = items.iter().position(|(_, file, _)| file.is_some())
+        {
+            // One block larger than the whole budget: deliver it alone through the ordinary
+            // byte paging (editable once its last page has been delivered, T16B); the summary
+            // and the footer name every other item.
+            let (oversized, _) = compose(&[index]);
+            let file = items[index].1.expect("selected item carries a file");
+            let (reply, page) = ContextPageState::new(oversized, 0, false, ResultKind::Read)
+                .next(&job.reference)?;
+            self.shared.set_context_page(&job.reference, page);
+            return Ok((reply, authority, Some(files[file].1.clone())));
+        }
+        let (text, delivered) = compose(&prefix(included));
+        // Remember the blocks this reply carries in full, so their repeat can answer unchanged.
+        if epoch.is_some()
+            && let Ok(mut ledger) = self.shared.ledger.lock()
+        {
+            let memory = ledger.read_memory.entry(binding.clone()).or_default();
+            for index in 0..included {
+                let (block, file, item) = &items[index];
+                if file.is_some() && !unchanged[index] {
+                    memory.remember(epoch, &item.label(), block, &job.reference);
+                }
+            }
         }
         // Retain one edit base per delivered file: the first returns through the job tuple, the
         // rest ride the same detail as extra sources. A file whose every block was cut gets none.
@@ -649,25 +651,9 @@ impl Worker<'_> {
             .iter()
             .map(|&index| files[index].1.clone())
             .collect();
-        let authority = self.authority(&binding).await.ok();
-        if included == 0 && items.iter().any(|(_, file, _)| file.is_some()) {
-            // One block larger than the whole budget: deliver it alone through the ordinary
-            // byte paging (editable once its last page has been delivered, T16B).
-            let index = items
-                .iter()
-                .position(|(_, file, _)| file.is_some())
-                .unwrap_or_default();
-            let file = items[index].1.expect("selected item carries a file");
-            let mut oversized = items[index].0.clone();
-            oversized.push_str(&source_line(&[file]));
-            let (reply, page) = ContextPageState::new(oversized, 0, false, ResultKind::Read)
-                .next(&job.reference)?;
-            self.shared.set_context_page(&job.reference, page);
-            return Ok((reply, authority, Some(files[file].1.clone())));
-        }
         let job_source = (!sources.is_empty()).then(|| sources.remove(0));
         self.shared.add_edit_sources(&job.reference, sources);
-        let truncated = !cut.is_empty();
+        let truncated = included < items.len();
         let (reply, page) =
             ContextPageState::new(text, 0, false, ResultKind::Read).next(&job.reference)?;
         self.shared.set_context_page(&job.reference, page);
@@ -692,13 +678,15 @@ impl Worker<'_> {
     /// Observes, outlines and finishes one file of a batch read once: every item of that file
     /// shares the observation, the outline and the deadline/authority/source checks.
     ///
-    /// `outline` is false for a bare-path whole-file text item and for the ranges of a file no
-    /// IDE language reads: neither needs one, so any readable file answers them. The file is
-    /// then retained with `None` for its outline, and a later symbol item of the same file must
-    /// not look it up. The ranges of a language file still take the outline, as ever. Returns `Ok(None)` for a file that
-    /// is binary or has no observed bytes (the caller reports it as one soft item), `Ok(Some(index))`
-    /// into `files` otherwise, and `NoSuchFile`/`UnsupportedFile` errors the caller also turns into
-    /// items; every other error fails the whole call.
+    /// `outline` asks for the file's outline. It is false for a whole-file text item and for the
+    /// ranges of a file no IDE language reads: neither needs one, so any readable file answers
+    /// them, and the file is retained with `None` for its outline. A later item of the same file
+    /// that asks for an outline gets it computed then, so item order never changes an answer; an
+    /// outline that cannot be computed fails like a first request would (`UnsupportedFile` for a
+    /// file no IDE language reads). Returns `Ok(None)` for a file that is binary or has no
+    /// observed bytes (the caller reports it as one soft item), `Ok(Some(index))` into `files`
+    /// otherwise, and `NoSuchFile`/`UnsupportedFile` errors the caller also turns into items;
+    /// every other error fails the whole call.
     async fn read_batch_file(
         &mut self,
         job: &mut Job,
@@ -708,6 +696,11 @@ impl Worker<'_> {
         outline: bool,
     ) -> Result<Option<usize>, FailureCode> {
         if let Some(index) = files.iter().position(|(file, ..)| *file == path) {
+            if outline && files[index].3.is_none() {
+                let (_, observed, source, _) = &files[index];
+                let computed = self.outline_of(job, observed, source.as_bytes()).await?.0;
+                files[index].3 = Some(computed);
+            }
             return Ok(Some(index));
         }
         let (observed, bytes) = self
@@ -735,11 +728,30 @@ impl Worker<'_> {
         Ok(Some(files.len() - 1))
     }
 
-    /// `ide.symbol {symbol, usages?, callers?, callees?, history?}`: the symbol card.
+    /// The session's context-compaction epoch (session-outbox-v1 §9.1), which gates the read
+    /// unchanged answer: the outbox's counter for `binding`, `None` — the answer stays off —
+    /// while the session's channel never delivered a native hook.
+    ///
+    /// Test seam (never read by a release build): `AGENT_IDE_TEST_CONTEXT_EPOCH_FILE` names a
+    /// file whose trimmed content is the epoch and replaces the outbox's answer, so product tests
+    /// can simulate a compaction by rewriting it; content that is not a number stands for an
+    /// unknown epoch (`None`).
+    fn context_epoch(&self, binding: &BindingRef) -> Option<u64> {
+        match crate::test_seams::var("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE") {
+            Some(seam) => std::fs::read_to_string(seam).ok()?.trim().parse().ok(),
+            None => crate::assistance::outbox::SessionOutbox::context_epoch(&*self.shared, binding),
+        }
+    }
+
+    /// `ide.symbol {symbol, usages?, callers?, callees?, history?}`: the symbol card; the
+    /// `{symbols}` form answers each entry through this same path (`batch_symbols`).
     pub(super) async fn symbol(
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        if job.parameters.get("symbols").is_some() {
+            return self.batch_symbols(job).await;
+        }
         let binding = job.invocation.binding_ref().clone();
         let requested = job.parameters["symbol"]
             .as_str()
@@ -1123,7 +1135,8 @@ impl Worker<'_> {
         Ok((reply, Some(authority), Some(observed)))
     }
 
-    /// `ide.graph {symbol, direction, depth}`: bounded breadth-first call hierarchy.
+    /// `ide.graph {symbol, direction, depth}`: bounded breadth-first call hierarchy; the
+    /// `{symbols}` form answers each root through this same path (`batch_symbols`).
     ///
     /// A call-hierarchy request that fails is recorded on the node it was made for and the reply
     /// says `unavailable (<cause>)` there (see [`render::call_graph_text`]); the session is marked
@@ -1133,6 +1146,9 @@ impl Worker<'_> {
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        if job.parameters.get("symbols").is_some() {
+            return self.batch_symbols(job).await;
+        }
         let binding = job.invocation.binding_ref().clone();
         let requested = job.parameters["symbol"]
             .as_str()
@@ -2594,7 +2610,7 @@ fn readable_text<'a>(
 }
 
 /// The observed bytes as text; symbol tools need UTF-8 sources.
-fn observed_text<'a>(
+pub(super) fn observed_text<'a>(
     observed: &SourceObservation,
     bytes: &'a [u8],
 ) -> Result<&'a str, FailureCode> {
@@ -2618,7 +2634,7 @@ fn batch_file_refusal(code: &FailureCode, file: &str) -> String {
 /// Maps a registered path's observed state to the closed `no_such_file` failure with its bounded
 /// requested path, `None` while the path is present. A missing draft is a legitimate observation,
 /// never a `source_unavailable` collapse (T163).
-fn no_such_file(
+pub(super) fn no_such_file(
     state: crate::workspace::observation::ObservedState,
     path: &str,
 ) -> Option<FailureCode> {
@@ -2950,7 +2966,7 @@ impl Worker<'_> {
         if let Some(code) = no_such_file(observed.state(), &path) {
             return Err(code);
         }
-        let source = observed_text(&observed, &bytes)?.to_owned();
+        observed_text(&observed, &bytes)?;
         // Exactly the single form's rule: an explicit `source_ref` must name a retained
         // same-path observation whose bytes are still the file's current ones; without one the
         // fresh observation is the base (only a symbol-only batch may omit it — the facade
@@ -3015,7 +3031,83 @@ impl Worker<'_> {
         };
         let entries = job.parameters["changes"]
             .as_array()
-            .ok_or(FailureCode::Internal)?;
+            .ok_or(FailureCode::Internal)?
+            .clone();
+        let candidate = match self
+            .changes_candidate(job, &observed, &bytes, &path, &entries)
+            .await?
+        {
+            Ok((candidate, note)) => {
+                job.format_note = Some(note);
+                candidate
+            }
+            Err(refusal) => {
+                job.failure_detail = Some(format!(
+                    "edit:refused: {}",
+                    crate::assistance::reply::bounded_utf8_prefix(
+                        &refusal.detail(),
+                        MAX_REFUSAL_DETAIL_BYTES
+                    )
+                ));
+                return Err(FailureCode::EditRefused);
+            }
+        };
+        let request = EditRequest::new(
+            &operation_id,
+            file.display().to_string(),
+            &job.reference,
+            &candidate,
+        )
+        .map_err(|_| FailureCode::Internal)?;
+        let prepared = match self.edits.prepare(request.clone()).await {
+            Ok(PrepareAdmission::Prepared(prepared)) => prepared,
+            Ok(
+                PrepareAdmission::Settled(result)
+                | PrepareAdmission::ConflictingDuplicate(result)
+                | PrepareAdmission::OutcomeUnknown(result),
+            ) => {
+                let authority = self.authority(&binding).await.ok();
+                return Ok((
+                    PeerReply::Edit {
+                        result,
+                        diagnostics: EditDiagnostics::Unknown {},
+                        note: None,
+                        operation: None,
+                    },
+                    authority,
+                    None,
+                ));
+            }
+            Err(_) => return Err(FailureCode::Internal),
+        };
+        self.edit_with_source(job, request, prepared, base, true)
+            .await
+    }
+
+    /// One file's `changes` candidate, resolved, applied, formatted and gated without any write.
+    ///
+    /// `observed` and `bytes` are the file's current observation, which the caller has already
+    /// matched against its edit base; `path` is the worktree-relative path as requested and
+    /// `entries` the validated `changes` array. Every address resolves against these bytes before
+    /// anything is applied (an outline is taken only when a `symbol` or `within` address needs
+    /// one), application is bottom-up so each landing is exact, the project formatter formats
+    /// the result once, and the language's syntax gate must accept it.
+    ///
+    /// Returns `Ok(Ok((candidate, note)))` with the formatted candidate and the landing note the
+    /// reply carries (landings, line movement, a pre-existing syntax error, a lexical-outline
+    /// note), `Ok(Err(refusal))` naming every change that cannot apply (nothing may be written
+    /// then), and `Err` for a failure that is not about the changes (unreadable bytes, a
+    /// malformed entry, an outline or module failure).
+    pub(super) async fn changes_candidate(
+        &mut self,
+        job: &mut Job,
+        observed: &SourceObservation,
+        bytes: &[u8],
+        path: &str,
+        entries: &[Value],
+    ) -> Result<Result<(String, String), Refusal>, FailureCode> {
+        let source = observed_text(observed, bytes)?.to_owned();
+        let file = std::path::PathBuf::from(path);
         let requests = parse_change_requests(entries)?;
         // Only `symbol` and `within` addresses resolve against an outline: a batch of `lines`
         // and `old` entries edits a file whose language outlines nowhere here (a probe-checked
@@ -3033,23 +3125,13 @@ impl Worker<'_> {
         });
         let mut outline: Option<Outline> = None;
         let lexical = if needs_outline {
-            let (resolved, _, from_text) = self.outline_of(job, &observed, &bytes).await?;
+            let (resolved, _, from_text) = self.outline_of(job, observed, bytes).await?;
             outline = Some(resolved);
             from_text
                 .as_ref()
                 .and_then(|why| self.lexical_note(job, observed.path(), why))
         } else {
             None
-        };
-        let refused = |job: &mut Job, refusal: Refusal| -> FailureCode {
-            job.failure_detail = Some(format!(
-                "edit:refused: {}",
-                crate::assistance::reply::bounded_utf8_prefix(
-                    &refusal.detail(),
-                    MAX_REFUSAL_DETAIL_BYTES
-                )
-            ));
-            FailureCode::EditRefused
         };
         // Insertion sites are the language's computation: ask for each one first (in process or
         // from its module), then resolve every change synchronously against the answers.
@@ -3086,23 +3168,23 @@ impl Worker<'_> {
                 .unwrap_or_else(|| Err(lang::LangError::UnknownSymbol(symbol.clone())))
         };
         let changes =
-            match resolve_changes_with(&source, outline.as_ref(), &path, &requests, &site_of) {
+            match resolve_changes_with(&source, outline.as_ref(), path, &requests, &site_of) {
                 Ok(changes) => changes,
-                Err(refusal) => return Err(refused(job, refusal)),
+                Err(refusal) => return Ok(Err(refusal)),
             };
-        let (spliced, landings) = match apply_changes(&source, &path, &changes) {
+        let (spliced, landings) = match apply_changes(&source, path, &changes) {
             Ok(applied) => applied,
             Err(refusal) => {
-                return Err(refused(job, refusal));
+                return Ok(Err(refusal));
             }
         };
         let candidate = self
-            .format_candidate(&observed, &file, spliced.clone())
+            .format_candidate(observed, &file, spliced.clone())
             .await;
         // Pre-write structural gate: a candidate that does not parse is not written; a file that
         // already failed the same check before the edit is still edited, with a note.
         let gated = self
-            .gate_candidate(job, &observed, &file, &source, &candidate)
+            .gate_candidate(job, observed, &file, &source, &candidate)
             .await;
         let pre_existing = match gated {
             Ok(note) => note,
@@ -3124,7 +3206,7 @@ impl Worker<'_> {
                         .refused
                         .extend(changes.iter().map(|change| change.number));
                 }
-                return Err(refused(job, refusal));
+                return Ok(Err(refusal));
             }
         };
         let align = if candidate != spliced {
@@ -3160,37 +3242,7 @@ impl Worker<'_> {
         if let Some(lexical) = lexical {
             note = format!("{lexical}\n{note}");
         }
-        job.format_note = Some(note);
-        let request = EditRequest::new(
-            &operation_id,
-            file.display().to_string(),
-            &job.reference,
-            &candidate,
-        )
-        .map_err(|_| FailureCode::Internal)?;
-        let prepared = match self.edits.prepare(request.clone()).await {
-            Ok(PrepareAdmission::Prepared(prepared)) => prepared,
-            Ok(
-                PrepareAdmission::Settled(result)
-                | PrepareAdmission::ConflictingDuplicate(result)
-                | PrepareAdmission::OutcomeUnknown(result),
-            ) => {
-                let authority = self.authority(&binding).await.ok();
-                return Ok((
-                    PeerReply::Edit {
-                        result,
-                        diagnostics: EditDiagnostics::Unknown {},
-                        note: None,
-                        operation: None,
-                    },
-                    authority,
-                    None,
-                ));
-            }
-            Err(_) => return Err(FailureCode::Internal),
-        };
-        self.edit_with_source(job, request, prepared, base, true)
-            .await
+        Ok(Ok((candidate, note)))
     }
 
     /// `ide.edit {path, content}` without `source_ref`: creates a file that does not exist yet.
@@ -3281,7 +3333,7 @@ impl Worker<'_> {
 
     /// Runs the project's stdin formatter over a candidate text; the candidate is returned
     /// unchanged when there is no formatter, it fails, or it takes longer than ten seconds.
-    async fn format_candidate(
+    pub(super) async fn format_candidate(
         &mut self,
         observed: &SourceObservation,
         file: &Path,
@@ -3473,7 +3525,13 @@ impl Worker<'_> {
     }
 
     /// `ide.edit {op:"rename", symbol, new_name}`: the language server computes the project-wide
-    /// edit; every touched file is written through the stale-safe edit path.
+    /// edit, every touched file's candidate is built before anything is written, and the files
+    /// are written through the multi-file commit (batch-api-v1 §7) with the symbol's own file
+    /// last. A file of the edit outside the worktree refuses the whole rename (`edit_refused`,
+    /// nothing written). A complete rename answers `edit: renamed` with a note listing every file
+    /// and its site count; one that stops midway answers the multi-file reply naming each file's
+    /// state, and a retry with the same `operation_id` resumes it. A settled or conflicting
+    /// `operation_id` answers from its receipt before the language server is asked.
     async fn rename_symbol(
         &mut self,
         job: &mut Job,
@@ -3497,6 +3555,11 @@ impl Worker<'_> {
             .file()
             .ok_or(FailureCode::UnknownSymbol)?
             .to_path_buf();
+        // A settled rename (or a different one under this id) answers from its receipt: its
+        // symbol may no longer exist under the old name.
+        if let Some(answer) = self.settled_rename(job, &binding, &operation_id).await? {
+            return Ok(answer);
+        }
         let (observed, bytes) = self.observe(&binding, file.clone()).await?;
         // Rename is server-only: while the server loads, park and retry before the address is
         // resolved, so a lexical outline never answers for it (not even `unknown_symbol`).
@@ -3546,56 +3609,47 @@ impl Worker<'_> {
             job.failure_detail = Some(format!("edit:rename_unsupported_edits:{}", found.name));
             return Err(FailureCode::ProviderUnavailable);
         }
+        // Every file of the server's edit is built before anything is written; a file outside
+        // the worktree refuses the whole rename instead of being skipped.
         let mut summary: Vec<(String, usize)> = Vec::new();
-        let mut last: Option<(PeerReply, Option<SourceObservation>)> = None;
-        for (index, file_edits) in grouped.files.iter().enumerate() {
-            let Ok(absolute) = file_edits.uri.to_file_path() else {
+        let mut files: Vec<batch_edit::RenameFile> = Vec::new();
+        let mut outside: Vec<String> = Vec::new();
+        for file_edits in &grouped.files {
+            let relative = file_edits.uri.to_file_path().ok().and_then(|absolute| {
+                absolute
+                    .strip_prefix(&worktree_root)
+                    .ok()
+                    .map(Path::to_path_buf)
+            });
+            let Some(relative) = relative else {
+                outside.push(file_edits.uri.to_string());
                 continue;
             };
-            let Ok(relative) = absolute.strip_prefix(&worktree_root) else {
-                continue;
-            };
-            let relative = relative.to_path_buf();
             let (observed, bytes) = self.observe(&binding, relative.clone()).await?;
             let source = observed_text(&observed, &bytes)?;
             let candidate = lang::edits::apply_text_edits(source, &file_edits.edits, &encoding)
                 .map_err(|_| FailureCode::Internal)?;
-            let request = EditRequest::new(
-                format!("{operation_id}/{index}"),
-                relative.display().to_string(),
-                &job.reference,
-                &candidate,
-            )
-            .map_err(|_| FailureCode::Internal)?;
-            let prepared = match self.edits.prepare(request.clone()).await {
-                Ok(PrepareAdmission::Prepared(prepared)) => prepared,
-                _ => return Err(FailureCode::Internal),
-            };
-            // Never await the project check per file: a parked rename would resume as one
-            // file's plain edit reply with the remaining files unwritten.
-            let (outcome, _, source) = self
-                .edit_with_source(job, request, prepared, observed, false)
-                .await?;
-            if let PeerReply::Edit { .. } = &outcome {
-                summary.push((relative.display().to_string(), file_edits.edits.len()));
-            }
-            last = Some((outcome, source));
+            let path = relative.display().to_string();
+            summary.push((path.clone(), file_edits.edits.len()));
+            files.push(batch_edit::RenameFile {
+                path,
+                base: observed,
+                candidate,
+            });
         }
-        // One rename answers once, as an edit reply the Edit tool accepts: the operation word
-        // names the rename, the note lists every touched file with its site count, bounded like
-        // every other list, and the diagnostics are the last written file's.
-        let Some((
-            PeerReply::Edit {
-                result,
-                diagnostics,
-                ..
-            },
-            source,
-        )) = last
-        else {
+        if !outside.is_empty() {
+            job.failure_detail = Some(format!(
+                "edit:refused: the rename also changes {} files outside the worktree ({}); \
+                 nothing written",
+                outside.len(),
+                crate::assistance::reply::bounded_utf8_prefix(&outside.join(", "), 256)
+            ));
+            return Err(FailureCode::EditRefused);
+        }
+        if files.is_empty() {
             job.failure_detail = Some("edit:rename_no_edits".to_owned());
             return Err(FailureCode::ProviderUnavailable);
-        };
+        }
         let sites: usize = summary.iter().map(|(_, count)| count).sum();
         let mut note = format!(
             "renamed {} → {new_name}; {sites} sites in {} files",
@@ -3617,17 +3671,12 @@ impl Worker<'_> {
                 note.push_str(&format!("; +{hidden} more"));
             }
         }
-        let authority = self.authority(&binding).await?;
-        Ok((
-            PeerReply::Edit {
-                result,
-                diagnostics,
-                note: Some(note),
-                operation: Some("renamed".to_owned()),
-            },
-            Some(authority),
-            source,
-        ))
+        // The symbol's own file goes last: if the commit stops midway, the retry still finds the
+        // symbol under its old name and resumes the rest.
+        let definition = file.display().to_string();
+        files.sort_by_key(|candidate| candidate.path == definition);
+        self.commit_rename(job, &binding, &operation_id, files, note)
+            .await
     }
 }
 
@@ -3995,7 +4044,7 @@ impl ResolvedChange {
 /// The per-change refusals of one batch that was not applied: each sentence names its change and
 /// the exact fix; the reply states how many of how many were refused and that nothing was written.
 #[derive(Debug)]
-struct Refusal {
+pub(super) struct Refusal {
     /// Sentences in request order, joined with `; ` by [`Self::detail`].
     sentences: Vec<String>,
     /// The change numbers named, for the refused count.
@@ -4013,7 +4062,7 @@ impl Refusal {
 
     /// The whole refusal detail after `edit:refused:` — `2 of 3 changes refused, nothing
     /// written — change 2: …; change 3: …`.
-    fn detail(&self) -> String {
+    pub(super) fn detail(&self) -> String {
         format!(
             "{} of {} changes refused, nothing written — {}",
             self.refused.len(),
@@ -4470,20 +4519,8 @@ fn clip_bytes(text: &str, limit: usize) -> String {
     clipped
 }
 
-/// Which form one batch read takes: several symbol addresses, or several ranges of one file.
-#[derive(Clone, Copy, PartialEq)]
-enum ReadBatch {
-    /// `ide.read {symbols: […]}` — cross-file symbol bodies, and bare-path whole-file text of
-    /// files no IDE language reads.
-    Symbols,
-    /// `ide.read {path, ranges: […]}` — several ranges of the one file.
-    Ranges,
-}
-
-/// The batch-read duplicates footer: every duplicated address named once, eight inline then
-/// `+N more` like the cut footer. The `+N more` form needs more than eight duplicated addresses,
-/// which one call's 16-entry bound cannot produce today — the footer stays honest if that bound
-/// ever rises.
+/// The batch-read duplicates footer: every duplicated item named once by its label, eight inline
+/// then `+N more` like the cut footer, so even 32 `items` with many repeats stay one bounded line.
 fn duplicates_footer(duplicates: &[String]) -> String {
     let shown = duplicates
         .iter()

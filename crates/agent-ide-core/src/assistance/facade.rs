@@ -150,6 +150,7 @@ fn tool_accepts_result_kind(tool: AssistanceTool, kind: ResultKind) -> bool {
             | (AssistanceTool::Symbol, ResultKind::Symbol)
             | (AssistanceTool::Graph, ResultKind::Graph)
             | (AssistanceTool::Test, ResultKind::Test)
+            | (AssistanceTool::Edit, ResultKind::EditBatch)
     )
 }
 
@@ -293,7 +294,8 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "With `path`: inclusive 1-based line range to replace."},
                     "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "The source_ref of the ide.read/ide.context this content is based on; required with `path`+`lines` and to replace an existing file with `path`+`content`, optional (but validated) with `symbol`. Omit it with `path`+`content` to create a new file."},
                     "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES, "description": "Replacement or inserted code, including the symbol's doc comment and attributes."},
-                    "changes": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "additionalProperties": false, "properties": {"lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "op": {"type": "string", "enum": ["replace", "insert", "delete"]}, "where": {"type": "string", "enum": ["before", "after", "first", "last"]}, "content": {"type": "string"}, "old": {"type": "string", "minLength": 1}, "new": {"type": "string"}, "within": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}}, "description": "1–32 changes to ONE file (named by `path`), each addressed by exactly one of `lines`, `symbol` or `old`; every address resolves against the bytes `source_ref` names before anything is applied, and overlapping or unmatched addresses are refused together with nothing written. `lines` numbers are that version's, never shifted by other changes (empty `content` deletes the range); `old` must match exactly once (add `within` to scope it) and `new` replaces exactly the matched bytes, terminators included (`\"\"` deletes the match)."}}
+                    "changes": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "additionalProperties": false, "properties": {"lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "op": {"type": "string", "enum": ["replace", "insert", "delete"]}, "where": {"type": "string", "enum": ["before", "after", "first", "last"]}, "content": {"type": "string"}, "old": {"type": "string", "minLength": 1}, "new": {"type": "string"}, "within": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}}, "description": "1–32 changes to ONE file (named by `path`), each addressed by exactly one of `lines`, `symbol` or `old`; every address resolves against the bytes `source_ref` names before anything is applied, and overlapping or unmatched addresses are refused together with nothing written. `lines` numbers are that version's, never shifted by other changes (empty `content` deletes the range); `old` must match exactly once (add `within` to scope it) and `new` replaces exactly the matched bytes, terminators included (`\"\"` deletes the match)."}},
+                    "files": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_EDIT_FILES, "items": {"type": "object", "additionalProperties": false, "required": ["path"], "properties": {"path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}, "changes": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object"}}, "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES}, "create": {"type": "boolean"}}}, "description": "One logical change across up to 16 files in ONE call, with only `operation_id` and an optional default `source_ref` beside it: each entry is {\"path\",\"changes\":[…]} (exactly the one-file `changes` entries), {\"path\",\"create\":true,\"content\"} (a new file) or {\"path\",\"content\"} (whole new content), with its own optional `source_ref`; at most 128 changes and 128 KiB of text in all. Every file is validated before the first write and any refusal writes nothing; files are written in order, one project check runs on the result, a partial write is reported per file, and the same `operation_id` resumes the rest."}
                 }
             }),
         ),
@@ -301,9 +303,10 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Outline,
             json!({
                 "type": "object", "additionalProperties": false,
-                "required": ["path"],
                 "properties": {
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root."},
+                    "paths": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_OUTLINE_FILES, "items": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "description": "Several files in ONE call instead of `path`: up to 24 worktree-relative paths, outlined in request order behind one summary line; a file past the reply budget is listed in one line with its exact call."},
+                    "glob": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Every file matching this worktree-relative pattern in ONE call instead of `path`: `*` within a segment, `?` one character, `**` any directories (e.g. `crates/x/src/**/*.rs`); at most 24 files in path order, never outside the worktree, skipping hidden and build directories."},
                     "kinds": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol)(,(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol))*$", "description": "Comma list over the closed symbol-kind vocabulary; keeps a symbol whose kind is selected or a descendant's is, so a container of a selected member still shows."}
                 }
             }),
@@ -317,7 +320,9 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root; alone it reads the whole file, with `lines` or `ranges` those lines."},
                     "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "Inclusive 1-based line range such as `120-180`."},
                     "symbols": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "description": "Several bodies in one reply, request order, one `source_ref` valid for every file included: `[\"src/a.rs#Foo/bar\",\"src/b.rs#qux\"]`. Unknown symbols are reported per item without failing the rest; a bare file path reads the text of a file no IDE language reads."},
-                    "ranges": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "description": "Several line ranges of `path` in one reply, request order, with the same numbered gutter and one `source_ref`."}
+                    "ranges": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "description": "Several line ranges of `path` in one reply, request order, with the same numbered gutter and one `source_ref`."},
+                    "items": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_READ_ITEMS, "items": {"type": "object", "additionalProperties": false, "properties": {"symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}}}, "description": "Everything to read in ONE call, up to 32 items over at most 16 files, instead of `symbol`, `path`, `lines`, `symbols` or `ranges`: each item is exactly one of {\"symbol\":\"src/a.rs#Foo/bar\"}, {\"path\":\"docs/x.md\"} (the whole file) or {\"path\":\"src/b.rs\",\"lines\":\"10-40\"}. The reply opens with a summary line, then one block per item in request order; a failed item fails only itself, and one `source_ref` is valid for every file whose items were all delivered."},
+                    "force": {"type": "boolean", "default": false, "description": "With `items`: return the text of an item even when its bytes are unchanged since your earlier read."}
                 }
             }),
         ),
@@ -325,9 +330,9 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Symbol,
             json!({
                 "type": "object", "additionalProperties": false,
-                "required": ["symbol"],
                 "properties": {
                     "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`, or a bare name to search the project."},
+                    "symbols": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_SYMBOL_ENTRIES, "items": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "description": "Several cards in ONE call instead of `symbol`: up to 8 symbol paths or bare names, answered in request order behind one summary line, each exactly as `symbol` would answer it with the same options; a failed entry fails only itself."},
                     "usages": {"type": "boolean", "default": true, "description": "Include usages (src/tests split, with source lines)."},
                     "callers": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1, "description": "Callers to list, 0–3 (0 = none); use ide.graph for deeper trees."},
                     "callees": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0, "description": "Callees to list, 0–3 (0 = none)."},
@@ -339,9 +344,9 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Graph,
             json!({
                 "type": "object", "additionalProperties": false,
-                "required": ["symbol"],
                 "properties": {
                     "symbol": {"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES, "description":"Symbol path `file#Owner/name`, or a bare name to search the project."},
+                    "symbols": {"type":"array", "minItems":1, "maxItems":super::batch::MAX_SYMBOL_ENTRIES, "items":{"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES}, "description":"Several roots in ONE call instead of `symbol`: up to 8 symbol paths or bare names, one section per root in request order behind one summary line, each exactly as `symbol` would answer it with the same options; a failed root fails only itself."},
                     "direction": {"type":"string", "enum":["callers", "callees", "both"], "default":"callers", "description":"`callers`: who calls it (blast radius); `callees`: what it calls; `both`."},
                     "depth": {"type":"integer", "minimum":1, "maximum":3, "default":2, "description":"Levels to expand; 2 is usually enough."},
                     "tests": {"type":"boolean", "default":false, "description":"Show test symbols as nodes (marked `[test]`) instead of collapsing them into one `+N tests` line per parent."}
@@ -360,7 +365,8 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "cwd": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"Working directory relative to the worktree root; must resolve inside the worktree. Only with `command`."},
                     "env": {"type":"object", "maxProperties":MAX_ENV_ENTRIES, "additionalProperties":{"type":"string", "maxLength":MAX_ENV_VALUE_BYTES}, "description":"Environment variables added to the inherited environment for this explicit command. Only with `command`; names are bounded environment identifiers."},
                     "status": {"type":"integer", "minimum":1, "description":"Re-read run number N (from `tests #N`) instead of starting one."},
-                    "budget_s": {"type":"integer", "minimum":1, "maximum":600, "default":120, "description":"Seconds before the run is stopped and reported as timed out."}
+                    "budget_s": {"type":"integer", "minimum":1, "maximum":600, "default":120, "description":"Seconds before the run is stopped and reported as timed out."},
+                    "targets": {"type":"array", "minItems":1, "maxItems":super::batch::MAX_TEST_TARGETS, "items":{"type":"object", "additionalProperties":false, "minProperties":1, "maxProperties":1, "properties":{"symbol":{"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES}, "path":{"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES}, "pattern":{"type":"string", "minLength":1, "maxLength":MAX_TEXT_BYTES}}}, "description":"Several targets as ONE run instead of `symbol`/`path`/`pattern`: up to 8 entries, each exactly one of `{\"symbol\":…}`, `{\"path\":…}` or `{\"pattern\":…}`; symbol targets of one language share one runner invocation, the others run one after another in the same run; `budget_s` covers the whole run. One result with a line per target and one rerun line."}
                 }
             }),
         ),
@@ -489,8 +495,8 @@ pub enum ParameterError {
     ContextTarget,
     /// `ide.outline` requires a relative file or directory path.
     OutlineTarget,
-    /// `ide.read` needs exactly one of: `symbol`, `path` alone (the whole file), `path` with
-    /// `lines`, `path` with `ranges`, or `symbols`.
+    /// `ide.read` needs exactly one of: `items`, `symbol`, `path` alone (the whole file), `path`
+    /// with `lines`, `path` with `ranges`, or `symbols`.
     ReadTarget,
     /// `ide.edit` needs `symbol` (with `op`), or `path` with `lines` and `source_ref` for a range
     /// replace, or the full-file form `path` + `content` (with `source_ref` to replace an existing
@@ -631,8 +637,8 @@ impl ParameterError {
             Self::ContextTarget => CONTEXT_TARGET_MESSAGE.to_string(),
             Self::OutlineTarget => OUTLINE_TARGET_MESSAGE.to_string(),
             Self::ReadTarget => {
-                "ide.read needs one form: `symbol`, or `path` alone (the whole file), or `path` \
-                 with `lines`, or `path` with `ranges`, or `symbols` — exactly one"
+                "ide.read needs one form: `items`, or `symbol`, or `path` alone (the whole \
+                 file), or `path` with `lines`, or `path` with `ranges`, or `symbols` — exactly one"
                     .to_string()
             }
             Self::EditTarget => {
@@ -700,18 +706,24 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "where",
             "new_name",
             "lines",
+            "files",
         ],
-        AssistanceTool::Outline => &["path", "kinds"],
-        AssistanceTool::Read => &["symbol", "path", "lines", "symbols", "ranges"],
-        AssistanceTool::Symbol => &["symbol", "usages", "callers", "callees", "history"],
-        AssistanceTool::Graph => &["symbol", "direction", "depth", "tests"],
+        AssistanceTool::Outline => &["path", "kinds", "paths", "glob"],
+        AssistanceTool::Read => &[
+            "symbol", "path", "lines", "symbols", "ranges", "items", "force",
+        ],
+        AssistanceTool::Symbol => &[
+            "symbol", "usages", "callers", "callees", "history", "symbols",
+        ],
+        AssistanceTool::Graph => &["symbol", "direction", "depth", "tests", "symbols"],
         AssistanceTool::Test => &[
-            "symbol", "path", "pattern", "command", "cwd", "env", "status", "budget_s",
+            "symbol", "path", "pattern", "command", "cwd", "env", "status", "budget_s", "targets",
         ],
     }
 }
 
-/// Returns the hard argument-object byte limit for one logical tool.
+/// Returns the hard argument-object byte limit of one logical tool's non-batch forms; a batch
+/// form (`super::batch::batch_key`) is bounded by `super::batch::MAX_BATCH_PARAMETER_BYTES`.
 fn parameter_limit(tool: AssistanceTool) -> usize {
     match tool {
         AssistanceTool::Edit => crate::changes::edit::MAX_EDIT_ARGUMENT_BYTES,
@@ -732,12 +744,12 @@ fn echoable_field(field: &str) -> Option<String> {
 }
 
 /// Builds one field-level rejection naming the violated closed rule.
-fn invalid_field(field: &'static str, rule: FieldRule) -> ParameterError {
+pub(super) fn invalid_field(field: &'static str, rule: FieldRule) -> ParameterError {
     ParameterError::InvalidField { field, rule }
 }
 
 /// Names the closed relative-path rule one already-bounded path string violated, if any.
-fn path_shape_rule(path: &str) -> Option<FieldRule> {
+pub(super) fn path_shape_rule(path: &str) -> Option<FieldRule> {
     if path.as_bytes().contains(&0) {
         Some(FieldRule::NoNul)
     } else if path.split('/').any(|part| part == "..") {
@@ -775,12 +787,22 @@ pub fn validate_call(
     tool: AssistanceTool,
     mut parameters: Value,
 ) -> Result<ValidatedCall, ParameterError> {
-    let parameter_limit = parameter_limit(tool);
-    if serde_json::to_vec(&parameters)
+    let batch_key = super::batch::batch_key(tool, &parameters);
+    let size = serde_json::to_vec(&parameters)
         .ok()
-        .is_none_or(|value| value.len() > parameter_limit)
-    {
-        return Err(ParameterError::InvalidObject);
+        .map(|value| value.len());
+    match (batch_key, size) {
+        (Some(key), Some(size)) if size > super::batch::MAX_BATCH_PARAMETER_BYTES => {
+            return Err(invalid_field(
+                key,
+                FieldRule::TooLong(super::batch::MAX_BATCH_PARAMETER_BYTES),
+            ));
+        }
+        (Some(_), Some(_)) => {}
+        (_, size) if size.is_none_or(|size| size > parameter_limit(tool)) => {
+            return Err(ParameterError::InvalidObject);
+        }
+        _ => {}
     }
     let object = parameters
         .as_object()
@@ -793,6 +815,9 @@ pub fn validate_call(
         return Err(ParameterError::UnknownField(echoable_field(field)));
     }
     match tool {
+        AssistanceTool::Outline if object.contains_key("paths") || object.contains_key("glob") => {
+            super::batch::validate_outline(object)?;
+        }
         AssistanceTool::Outline => {
             if !object.contains_key("path") {
                 return Err(ParameterError::OutlineTarget);
@@ -817,7 +842,16 @@ pub fn validate_call(
                 ));
             }
         }
+        AssistanceTool::Read if object.contains_key("items") => {
+            super::batch::validate_read_items(object)?;
+        }
         AssistanceTool::Read => {
+            if object.contains_key("force") {
+                return Err(invalid_field(
+                    "force",
+                    FieldRule::OneOf("used only together with \"items\""),
+                ));
+            }
             optional_string(object, "symbol", MAX_SYMBOL_PATH_BYTES)?;
             optional_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
             optional_string(object, "lines", 32)?;
@@ -857,6 +891,9 @@ pub fn validate_call(
                 _ => return Err(ParameterError::ReadTarget),
             }
         }
+        AssistanceTool::Symbol | AssistanceTool::Graph if object.contains_key("symbols") => {
+            super::batch::validate_symbols(tool, object)?;
+        }
         AssistanceTool::Symbol => {
             required_string(object, "symbol", MAX_SYMBOL_PATH_BYTES)?;
             for field in ["usages", "history"] {
@@ -895,6 +932,9 @@ pub fn validate_call(
             if object.get("tests").is_some_and(|value| !value.is_boolean()) {
                 return Err(invalid_field("tests", FieldRule::Boolean));
             }
+        }
+        AssistanceTool::Test if object.contains_key("targets") => {
+            super::batch::validate_test_targets(object)?;
         }
         AssistanceTool::Test => {
             let targets = ["symbol", "path", "pattern", "command", "status"]
@@ -1200,6 +1240,9 @@ pub fn validate_call(
         }
         AssistanceTool::Stop => {
             optional_string(object, "activation_id", MAX_ACTIVATION_ID_BYTES)?;
+        }
+        AssistanceTool::Edit if object.contains_key("files") => {
+            super::batch::validate_edit_files(object)?;
         }
         AssistanceTool::Edit if object.contains_key("changes") => {
             required_string(object, "operation_id", 128)?;
@@ -5017,8 +5060,8 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Read,
-            "ide.read needs one form: `symbol`, or `path` alone (the whole file), or `path` \
-             with `lines`, or `path` with `ranges`, or `symbols` — exactly one"
+            "ide.read needs one form: `items`, or `symbol`, or `path` alone (the whole file), \
+             or `path` with `lines`, or `path` with `ranges`, or `symbols` — exactly one"
                 .to_string(),
         ),
         (

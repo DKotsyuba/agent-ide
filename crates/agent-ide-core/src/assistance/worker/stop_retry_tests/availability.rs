@@ -693,3 +693,6 @@ async fn unresolvable_names_answer_pending_and_the_session_cap_holds() {
     );
     assert!(deferrals_of(&worker, &fifth.reference).is_empty());
 }
+
+/// Several-symbol calls while a server loads, on these fixtures.
+mod batch_loading;
