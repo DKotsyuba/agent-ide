@@ -1,6 +1,6 @@
 # Start index state v1 contract
 
-Revision: start-index-state r1; tracked boundary id `start-index-state`, revision 1. Provider:
+Revision: start-index-state r3; tracked boundary id `start-index-state`, revision 3. Provider:
 activation, writer-lease takeover and language-server state (`assistance/worker.rs` activation,
 `project/mod.rs` servers line, the symbol tools' loading replies). Consumer: the teaching and
 reply-hygiene surface (start reply layout and budget, signature block, skill, server instructions,
@@ -16,7 +16,7 @@ about loading servers or held worktrees is fixed here, so the consumer can teach
   consumer's signature block.
 - The provider owns the activation line and the card. The consumer keeps the whole start reply
   within its byte budget.
-- The servers line is at most 300 bytes.
+- The servers line is at most 360 bytes (r3; r1 and r2 said 300, which three server languages exceed).
 - Servers are started lazily: `ide.start` launches no language server. The first `ide.symbol` or
   `ide.graph` call of a language starts it.
 
