@@ -44,6 +44,8 @@ mod providers;
 pub(super) mod snapshots;
 #[path = "symbols.rs"]
 mod symbols;
+#[path = "takeover.rs"]
+mod takeover;
 
 use self::symbols::Located;
 
@@ -3872,6 +3874,21 @@ impl<'a> Worker<'a> {
                 }
             }
         }
+        // Another actor's writer left behind by a gone or long-inactive session is taken over
+        // instead of refusing this start (start-index-state r2 §4); a live holder keeps it.
+        let mut took_over = String::new();
+        if matches!(
+            activation,
+            Err(crate::workspace::durable::DurableError::Authority(
+                crate::workspace::authority::AuthorityError::WorktreeOwned
+            ))
+        ) && let Some((moved, line)) = self
+            .take_over_stale_writer(job, &requested_tree, &requested_operation, read_only)
+            .await?
+        {
+            activation = moved;
+            took_over = format!("{line}; ");
+        }
         let receipt = match activation {
             Ok(receipt) => receipt,
             Err(
@@ -4161,7 +4178,7 @@ impl<'a> Worker<'a> {
             )
         } else {
             format!(
-                "activated: epoch {}; mode: writer; {reused}baseline: {baseline}",
+                "activated: epoch {}; mode: writer; {took_over}{reused}baseline: {baseline}",
                 authority.epoch(),
             )
         };
@@ -4303,44 +4320,11 @@ impl<'a> Worker<'a> {
                 reason,
             })
         };
-        if self.uncertain.contains(holder) {
-            return busy("an unsettled operation");
-        }
-        if self.unsettled_edits.contains_key(holder) {
-            return busy("an edit with outcome_unknown");
-        }
-        if self
-            .shared
-            .test_runs
-            .uncollected(&holder.fingerprint())
-            .iter()
-            .any(|(_, _, running)| *running)
-        {
-            return busy("a running test");
-        }
         let Ok(mut ledger) = self.shared.ledger.lock() else {
             return busy("an unavailable ledger");
         };
-        {
-            if let Some(job) = ledger
-                .queue
-                .iter()
-                .find(|job| job.invocation.binding_ref() == holder)
-            {
-                return busy(if job.tool == AssistanceTool::Edit || job.stage.is_some() {
-                    "a pending edit"
-                } else {
-                    "queued work"
-                });
-            }
-            for (reference, detail) in &ledger.details {
-                if &detail.binding != holder {
-                    continue;
-                }
-                if matches!(detail.reply, PeerReply::Pending { .. }) && reference != current {
-                    return busy("a pending job");
-                }
-            }
+        if let Some(reason) = self.pending_work(&ledger, holder, current) {
+            return busy(reason);
         }
         // The idle verdict and the fence are one critical section: work the old binding submits
         // while the handover settles is refused at ingress instead of racing the move.

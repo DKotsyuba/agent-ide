@@ -8,6 +8,8 @@
 
 ### Fixed
 
+- A writer activation left by a session that ended without `ide.stop` no longer blocks the worktree: the next writer `ide.start` takes it over when the holder's MCP front exited and nothing arrived from it afterwards, or when the holder has had no tool call and no IDE work in flight for 30 minutes, and says `took over the writer from actor …; its session ended | inactive for <m> min`. A live holder is never displaced; its refusal now says when the slot frees. The displaced actor's next call answers `unavailable: host_binding (taken_over)`. Liveness comes from the kernel's peer process id of the front's calls and lease (evidence only, never identity).
+
 - A bare name whose matches are one declaration and its impl blocks resolves in one `ide.symbol` or `ide.graph` call instead of `ambiguous_symbol: … matches 1 symbols`.
 
 - `ide.graph` no longer renders a failed call-hierarchy request as a graph with no calls: a root whose requests failed answers `graph: callers of <root> unavailable (<cause>)`, a failed direction beside an answered one prints `callers: unavailable (<cause>)`, and a deeper node carries `(callers unavailable: <cause>)` on its row. 0.10.8 answered `1 nodes, 0 edges`.

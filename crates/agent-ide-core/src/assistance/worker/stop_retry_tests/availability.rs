@@ -93,3 +93,171 @@ async fn bare_name_of_a_struct_and_its_impl_resolves_in_one_call() {
         assert!(text.starts_with(start), "{text}");
     }
 }
+
+/// Fires the post-hook of `actor`'s call `id` on the fixture channel, settling that call so the
+/// actor has no tool call in flight.
+fn settle_call(worker: &Worker<'_>, actor: &str, id: &str) {
+    let channel = parse_channel_session(b"stop-retry").unwrap();
+    let hook = parse_hook_event(
+        serde_json::json!({"hook_event_name":"PostToolUse","session_id":actor,"tool_use_id":id})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    let status = worker
+        .shared
+        .bindings
+        .lock()
+        .unwrap()
+        .observe_hook(hook, channel);
+    assert!(matches!(status, BindingStatus::Settled(_)), "{status:?}");
+}
+
+/// What the guard answers a new ordinary call of `actor` (its pre-hook, then validation).
+fn next_call_of(worker: &Worker<'_>, actor: &str, id: &str) -> BindingStatus {
+    let channel = parse_channel_session(b"stop-retry").unwrap();
+    let mut guard = worker.shared.bindings.lock().unwrap();
+    let hook = parse_hook_event(
+        serde_json::json!({"hook_event_name":"PreToolUse","session_id":actor,"tool_use_id":id})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    guard.observe_hook(hook, channel.clone());
+    let candidate = parse_candidate(
+        serde_json::json!({"threadId":actor,"callId":id,"x-codex-turn-metadata":{"turn":"stop-retry"}})
+            .as_object()
+            .unwrap(),
+    )
+    .unwrap();
+    guard.validate_active(candidate, channel)
+}
+
+/// Runs a writer `ide.start` for `actor` and returns its reply (or failure) and failure detail.
+async fn writer_start(
+    worker: &mut Worker<'_>,
+    actor: &str,
+    call: &str,
+) -> (Result<PeerReply, FailureCode>, Option<String>) {
+    let (mut job, _cancel) = start_job(
+        worker,
+        actor,
+        call,
+        serde_json::json!({"activation_id":call}),
+    );
+    let outcome = worker.activate(&mut job).await.map(|(reply, _, _)| reply);
+    (outcome, job.failure_detail)
+}
+
+/// A writer whose carrier (MCP front) ended with nothing heard from it afterwards is taken over by
+/// the next actor's start, which names the holder and the evidence; the displaced actor's next
+/// call is told `taken_over`.
+#[tokio::test]
+async fn a_writer_whose_session_ended_is_taken_over() {
+    use crate::assistance::host_binding::{BindingUnavailable, TakeoverReason};
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let workspace = DurableWorkspace::open(&store).await.unwrap();
+    let mut worker = worker(&store, workspace, fixture.root.clone());
+    worker.observations.install_schema().await.unwrap();
+    let (holder, _) = production_start(&mut worker, "gone-actor", "gone-start").await;
+    {
+        let mut guard = worker.shared.bindings.lock().unwrap();
+        guard.carrier_opened(4242);
+        guard.note_carrier(&holder, 4242);
+        guard.carrier_closed(4242);
+    }
+    let (outcome, detail) = writer_start(&mut worker, "next-actor", "next-start").await;
+    let reply = outcome.unwrap_or_else(|code| panic!("{code:?}: {detail:?}"));
+    let text = complete_text(&reply);
+    assert!(
+        text.contains("mode: writer; took over the writer from actor gone-actor (activation ")
+            && text.contains(", last activity "),
+        "{text}"
+    );
+    assert!(text.contains("; its session ended); "), "{text}");
+    assert!(
+        !worker.grants.contains_key(&holder),
+        "the holder is revoked"
+    );
+    assert_eq!(
+        next_call_of(&worker, "gone-actor", "gone-late"),
+        BindingStatus::Unavailable(BindingUnavailable::TakenOver(TakeoverReason::SessionEnded))
+    );
+}
+
+/// A holder silent for 30 minutes with nothing in flight is taken over as inactive; the same
+/// holder with a tool call still in flight is not.
+#[tokio::test]
+async fn a_long_inactive_writer_is_taken_over_only_when_idle() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let workspace = DurableWorkspace::open(&store).await.unwrap();
+    let mut worker = worker(&store, workspace, fixture.root.clone());
+    worker.observations.install_schema().await.unwrap();
+    let (holder, _) = production_start(&mut worker, "idle-actor", "idle-start").await;
+    let silence = Duration::from_secs(31 * 60);
+    worker
+        .shared
+        .bindings
+        .lock()
+        .unwrap()
+        .backdate_seen(&holder, silence);
+    // Its start call never settled: a tool call is in flight, so the writer is kept.
+    let (outcome, detail) = writer_start(&mut worker, "eager-actor", "eager-start").await;
+    assert_eq!(outcome.err(), Some(FailureCode::Conflict));
+    assert!(
+        detail
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with("start:worktree_held_by_another_actor:")),
+        "{detail:?}"
+    );
+    assert!(worker.grants.contains_key(&holder));
+    settle_call(&worker, "idle-actor", "idle-start");
+    worker
+        .shared
+        .bindings
+        .lock()
+        .unwrap()
+        .backdate_seen(&holder, silence);
+    let (outcome, detail) = writer_start(&mut worker, "eager-actor", "eager-again").await;
+    let reply = outcome.unwrap_or_else(|code| panic!("{code:?}: {detail:?}"));
+    let text = complete_text(&reply);
+    assert!(
+        text.contains("took over the writer from actor idle-actor")
+            && text.contains("; inactive for 31 min); "),
+        "{text}"
+    );
+    assert!(!worker.grants.contains_key(&holder));
+}
+
+/// A live holder, recently heard from and with an attached carrier, is never displaced: the start
+/// is refused with the holder facts and the holder keeps its grant and its calls.
+#[tokio::test]
+async fn a_live_writer_is_never_taken_over() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let workspace = DurableWorkspace::open(&store).await.unwrap();
+    let mut worker = worker(&store, workspace, fixture.root.clone());
+    worker.observations.install_schema().await.unwrap();
+    let (holder, _) = production_start(&mut worker, "live-actor", "live-start").await;
+    settle_call(&worker, "live-actor", "live-start");
+    {
+        let mut guard = worker.shared.bindings.lock().unwrap();
+        guard.carrier_opened(4343);
+        guard.note_carrier(&holder, 4343);
+    }
+    let (outcome, detail) = writer_start(&mut worker, "rival-actor", "rival-start").await;
+    assert_eq!(outcome.err(), Some(FailureCode::Conflict));
+    assert!(
+        detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("actor live-actor")),
+        "{detail:?}"
+    );
+    assert!(worker.grants.contains_key(&holder));
+    assert!(matches!(
+        next_call_of(&worker, "live-actor", "live-next"),
+        BindingStatus::Validated(_)
+    ));
+}

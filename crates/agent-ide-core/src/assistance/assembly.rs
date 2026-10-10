@@ -1296,6 +1296,13 @@ impl ProductDispatcher {
                             && call.parameters().get("detail_ref").is_none(),
                     );
                 }
+                // The process that carried this validated call is the binding's carrier
+                // (stale-writer takeover evidence; never identity).
+                if let Some(pid) = method.carrier()
+                    && let Ok(mut bindings) = self.bindings.lock()
+                {
+                    bindings.note_carrier(invocation.binding_ref(), pid);
+                }
                 let fingerprint = invocation.binding_ref().fingerprint();
                 let mut reply = match method.method() {
                     AssistanceMethod::Stop => {
@@ -1389,6 +1396,18 @@ impl ProductDispatcher {
     }
 }
 impl AssistanceDispatcher for ProductDispatcher {
+    /// Records that process `pid` attached a client lease (stale-writer takeover evidence).
+    fn carrier_opened(&self, pid: u32) {
+        if let Ok(mut bindings) = self.bindings.lock() {
+            bindings.carrier_opened(pid);
+        }
+    }
+    /// Records that a client lease of process `pid` ended (stale-writer takeover evidence).
+    fn carrier_closed(&self, pid: u32) {
+        if let Ok(mut bindings) = self.bindings.lock() {
+            bindings.carrier_closed(pid);
+        }
+    }
     /// Gives a managed Claude MCP its own target on this repository's shared daemon.
     fn register_claude_candidate(&self, candidate: &Path) -> Option<String> {
         if !self.managed_claude {

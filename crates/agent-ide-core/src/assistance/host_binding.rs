@@ -324,6 +324,42 @@ impl HookEvent {
     }
 }
 
+/// Why a stale writer's activation was taken over by another actor's `ide.start`
+/// (start-index-state r2 §4). It is the evidence the successor's reply names and what the
+/// displaced actor's next call is told.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum TakeoverReason {
+    /// The MCP process that carried the holder's calls ended and nothing arrived from the holder
+    /// afterwards: its host session is gone.
+    SessionEnded,
+    /// The holder had no tool call and no IDE work in flight and sent nothing for `minutes`
+    /// whole minutes (at least the 30-minute threshold).
+    Inactive {
+        /// Whole minutes since the holder's last hook or call.
+        minutes: u64,
+    },
+}
+
+impl TakeoverReason {
+    /// The evidence as the successor's start reply names it: `its session ended` or
+    /// `inactive for <m> min`.
+    pub fn evidence(self) -> String {
+        match self {
+            Self::SessionEnded => "its session ended".to_owned(),
+            Self::Inactive { minutes } => format!("inactive for {minutes} min"),
+        }
+    }
+
+    /// The reason as the displaced actor's next call is told: `after this session's IDE
+    /// connection closed` or `after <m> min without activity`.
+    pub fn displaced(self) -> String {
+        match self {
+            Self::SessionEnded => "after this session's IDE connection closed".to_owned(),
+            Self::Inactive { minutes } => format!("after {minutes} min without activity"),
+        }
+    }
+}
+
 /// Describes why host binding is unavailable without retaining or reporting raw host data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BindingUnavailable {
@@ -353,6 +389,9 @@ pub enum BindingUnavailable {
     Replay,
     /// Bounded pending, binding, channel, scope, or replay storage is full.
     CapacityExceeded,
+    /// This scope's activation was taken over by another actor's `ide.start` as a stale writer;
+    /// the remedy is a fresh `ide.start` (read-only while the other actor writes).
+    TakenOver(TakeoverReason),
 }
 
 /// Reports the lifecycle strength available to a Workspace or Execution consumer.
@@ -470,9 +509,126 @@ pub struct HostBindingGuard {
     replays: BTreeMap<ChannelSessionRef, ChannelReplayScopes>,
     /// Monotonic replay insertion order; the oldest settled records are evicted first.
     next_replay_sequence: u64,
+    /// When each bound scope last sent a hook or established its start: the holder-silence
+    /// evidence of a stale-writer takeover. Kept only while the scope holds a binding.
+    last_seen: BTreeMap<(HostKind, String, ChannelSessionRef), std::time::Instant>,
+    /// Scopes whose activation a stale-writer takeover revoked, with why, so their next call is
+    /// told `taken_over` instead of a bare `inactive_binding`. Cleared by the scope's next start;
+    /// bounded like `ever_bound`.
+    displaced: BTreeMap<(HostKind, String, ChannelSessionRef), TakeoverReason>,
+    /// Which process carried each binding's calls and when front leases ended (takeover
+    /// evidence); kept under this guard's lock with the bindings it describes.
+    carriers: super::carriers::Carriers,
 }
 
 impl HostBindingGuard {
+    /// Records that a bound scope was just heard from (a hook or its start). Unbound scopes are
+    /// not recorded, so the table never outgrows the binding table.
+    fn note_seen(&mut self, host: HostKind, actor_id: &str, channel: &ChannelSessionRef) {
+        let key = (host, actor_id.to_owned(), channel.clone());
+        if self.bindings.contains_key(&key) {
+            self.last_seen.insert(key, std::time::Instant::now());
+        }
+    }
+
+    /// When `binding`'s scope last sent a hook or started; `None` when it is not the scope's
+    /// current generation or nothing was recorded.
+    pub fn last_seen(&self, binding: &BindingRef) -> Option<std::time::Instant> {
+        let key = (
+            binding.host,
+            binding.actor_id.clone(),
+            binding.channel.clone(),
+        );
+        (self.bindings.get(&key) == Some(binding))
+            .then(|| self.last_seen.get(&key).copied())
+            .flatten()
+    }
+
+    /// Whether `binding`'s actor has a tool call in flight on its channel: a pre-hook that is
+    /// still waiting for its call or its post, or a validated call still settling. A host that
+    /// lost a post leaves this true for good, which only ever keeps a holder from being taken
+    /// over for inactivity.
+    pub fn call_in_flight(&self, binding: &BindingRef) -> bool {
+        let owned = |invocation: &(CandidateInvocation, ChannelSessionRef)| {
+            invocation.0.host == binding.host
+                && invocation.0.actor_id == binding.actor_id
+                && invocation.1 == binding.channel
+        };
+        self.pre_observed.iter().any(owned) || self.settling.keys().any(owned)
+    }
+
+    /// Revokes `binding` as displaced by a stale-writer takeover: exactly [`Self::stop_binding`],
+    /// plus a record that the scope's next call is refused `TakenOver(reason)` rather than
+    /// `InactiveBinding`. The record lasts until the scope starts again and is bounded by the
+    /// binding-table ceiling (the oldest record goes first).
+    pub fn displace(
+        &mut self,
+        binding: &BindingRef,
+        reason: TakeoverReason,
+    ) -> Result<(), BindingUnavailable> {
+        let stopped = self.stop_binding(binding);
+        let key = (
+            binding.host,
+            binding.actor_id.clone(),
+            binding.channel.clone(),
+        );
+        if !self.bindings.contains_key(&key) {
+            if self.displaced.len() >= MAX_BINDINGS
+                && let Some(oldest) = self.displaced.keys().next().cloned()
+            {
+                self.displaced.remove(&oldest);
+            }
+            self.displaced.insert(key, reason);
+        }
+        stopped
+    }
+
+    /// Records that process `pid` opened a client lease on this daemon: it is a live carrier
+    /// until its last open lease reaches EOF.
+    pub fn carrier_opened(&mut self, pid: u32) {
+        self.carriers.opened(pid);
+    }
+
+    /// Records that a client lease of process `pid` reached EOF now.
+    pub fn carrier_closed(&mut self, pid: u32) {
+        self.carriers.closed(pid, std::time::Instant::now());
+    }
+
+    /// Records that process `pid` carried a validated call of `binding` while it is the scope's
+    /// current generation; a stale generation is ignored.
+    pub fn note_carrier(&mut self, binding: &BindingRef, pid: u32) {
+        if self.check_active(binding).is_ok() {
+            self.carriers.note(binding, pid);
+        }
+    }
+
+    /// The liveness evidence of `binding`'s holder, without its IDE work (the worker adds that):
+    /// when its carrier ended, when it was last heard from, and whether a tool call is in flight.
+    pub(crate) fn holder_evidence(&self, binding: &BindingRef) -> super::carriers::HolderEvidence {
+        super::carriers::HolderEvidence {
+            carrier_ended: self.carriers.ended_at(binding),
+            last_seen: self.last_seen(binding),
+            call_in_flight: self.call_in_flight(binding),
+            pending_work: None,
+        }
+    }
+
+    /// Moves `binding`'s last-seen record `by` into the past, so a test can stand for a long
+    /// silence without waiting.
+    #[cfg(test)]
+    pub(crate) fn backdate_seen(&mut self, binding: &BindingRef, by: std::time::Duration) {
+        let key = (
+            binding.host,
+            binding.actor_id.clone(),
+            binding.channel.clone(),
+        );
+        if let Some(seen) = self.last_seen.get_mut(&key)
+            && let Some(earlier) = seen.checked_sub(by)
+        {
+            *seen = earlier;
+        }
+    }
+
     /// Remembers an established scope without exceeding the binding table's history ceiling.
     fn record_ever_bound(&mut self, key: (HostKind, String, ChannelSessionRef)) {
         if self.ever_bound.contains(&key) {
@@ -592,18 +748,19 @@ impl HostBindingGuard {
         BindingStatus::Validated(validated(candidate, binding, created_binding))
     }
 
-    /// Names the refusal for a scope whose generation is absent: `NeverActivated` while this
-    /// daemon boot never held a binding for it, else `InactiveBinding` for a stopped one.
+    /// Names the refusal for a scope whose generation is absent: `TakenOver` when a stale-writer
+    /// takeover displaced it, else `NeverActivated` while this daemon boot never held a binding
+    /// for it, else `InactiveBinding` for a stopped one.
     fn inactive_or_never(
         &self,
         host: HostKind,
         actor_id: &str,
         channel: &ChannelSessionRef,
     ) -> BindingUnavailable {
-        if self
-            .ever_bound
-            .contains(&(host, actor_id.to_owned(), channel.clone()))
-        {
+        let key = (host, actor_id.to_owned(), channel.clone());
+        if let Some(reason) = self.displaced.get(&key) {
+            BindingUnavailable::TakenOver(*reason)
+        } else if self.ever_bound.contains(&key) {
             BindingUnavailable::InactiveBinding
         } else {
             BindingUnavailable::NeverActivated
@@ -789,9 +946,11 @@ impl HostBindingGuard {
                 generation,
             };
             self.record_ever_bound(binding_key.clone());
+            self.displaced.remove(&binding_key);
             self.bindings.insert(binding_key, binding.clone());
             (binding, true)
         };
+        self.note_seen(candidate.host, &candidate.actor_id, &binding.channel);
         self.pre_observed.remove(&invocation);
         self.settling.insert(invocation, binding.clone());
         BindingStatus::Validated(validated(candidate, binding, created_binding))
@@ -882,6 +1041,8 @@ impl HostBindingGuard {
     /// A pre-hook is not an authority claim. A post-hook never gates MCP result acceptance: it
     /// only settles a call that was already validated by `establish_start` or `validate_active`.
     pub fn observe_hook(&mut self, event: HookEvent, channel: ChannelSessionRef) -> BindingStatus {
+        // Any hook of a bound actor proves its session is alive (takeover evidence).
+        self.note_seen(event.host, &event.actor_id, &channel);
         if event.phase == HookPhase::PostBatch {
             // Claude's PostToolUse already fires once per exact tool call; its uncorrelated batch
             // boundary must never coalesce a native-change hint that Claude never actually proved.
@@ -1306,6 +1467,8 @@ impl HostBindingGuard {
         self.bindings.remove(&key);
         self.stopping.remove(binding);
         self.native_hints.remove(binding);
+        self.last_seen.remove(&key);
+        self.carriers.forget(binding);
         self.settling.retain(|_, owner| owner != binding);
         Ok(())
     }
@@ -1323,6 +1486,8 @@ impl HostBindingGuard {
         self.bindings.remove(&key);
         self.stopping.remove(binding);
         self.native_hints.remove(binding);
+        self.last_seen.remove(&key);
+        self.carriers.forget(binding);
         let pending: Vec<_> = self
             .pre_observed
             .iter()
@@ -1354,6 +1519,7 @@ impl HostBindingGuard {
         self.bindings.clear();
         self.stopping.clear();
         self.native_hints.clear();
+        self.last_seen.clear();
     }
 
     /// Reports whether one exact call identity already delivered its pre-hook on this channel.

@@ -22368,6 +22368,124 @@ async fn managed_claude_stopped_actor_is_never_recovered() {
     mcp.close().await;
 }
 
+/// Runs one hook-paired managed Claude call of root actor `session` and returns its compact text;
+/// a `pending` reply is followed through hook-paired `ide.inspect` calls until it settles (at
+/// most 30 s).
+async fn claude_settled_text(
+    mcp: &mut Mcp,
+    project: &Path,
+    next: &mut usize,
+    session: &str,
+    name: &str,
+    arguments: Value,
+) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let (mut name, mut arguments) = (name.to_owned(), arguments);
+    loop {
+        *next += 1;
+        let call = format!("managed-claude-{next}");
+        let pre = managed_claude_hook(
+            Some(project),
+            managed_claude_event("PreToolUse", session, None, &call),
+        )
+        .await;
+        assert!(pre.status.success(), "managed pre-hook failed");
+        let reply = mcp
+            .exchange(
+                json!({"jsonrpc":"2.0","id":*next,"method":"tools/call","params":{
+                    "name":name,"arguments":arguments,"_meta":{"claudecode/toolUseId":call}
+                }}),
+            )
+            .await;
+        let post = managed_claude_hook(
+            Some(project),
+            managed_claude_event("PostToolUse", session, None, &call),
+        )
+        .await;
+        assert!(post.status.success());
+        let text = assert_claude_envelope(&reply).to_owned();
+        let fields = claude_fields(&text);
+        if fields["state"] != "pending" {
+            return text;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "did not settle: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        name = "ide.inspect".to_owned();
+        arguments = json!({"detail_ref": fields["detail_ref"]});
+    }
+}
+
+/// A writer whose Claude session ended without `ide.stop` (its MCP front exited) is taken over by
+/// the next session's `ide.start` on the same worktree, while a live writer is never displaced
+/// (start-index-state r2 §4). A third front keeps the shared daemon alive throughout, as a lead
+/// agent's session does.
+#[tokio::test]
+async fn managed_claude_writer_of_an_ended_session_is_taken_over() {
+    let fixture = ProductFixture::new(json!([]));
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let keeper = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let mut gone = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let mut next_session = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let mut next = 10;
+    let started = claude_settled_text(
+        &mut gone,
+        &fixture.root,
+        &mut next,
+        "gone-session",
+        "ide.start",
+        json!({}),
+    )
+    .await;
+    assert!(started.contains("mode: writer"), "{started}");
+
+    // While the first session's front is attached and it was just heard from, the writer stays.
+    let refused = claude_settled_text(
+        &mut next_session,
+        &fixture.root,
+        &mut next,
+        "next-session",
+        "ide.start",
+        json!({}),
+    )
+    .await;
+    assert!(
+        refused.starts_with(
+            "error: conflict (start:worktree_held_by_another_actor: actor gone-session"
+        ) && refused.contains("another agent's live session holds the only writer slot"),
+        "{refused}"
+    );
+
+    // The first session ends without ide.stop: its front exits and its lease closes.
+    gone.close().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let taken = loop {
+        let text = claude_settled_text(
+            &mut next_session,
+            &fixture.root,
+            &mut next,
+            "next-session",
+            "ide.start",
+            json!({}),
+        )
+        .await;
+        if !text.starts_with("error: conflict") || tokio::time::Instant::now() >= deadline {
+            break text;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        taken.contains("mode: writer; took over the writer from actor gone-session (activation ")
+            && taken.contains("; its session ended); "),
+        "{taken}"
+    );
+    next_session.close().await;
+    keeper.close().await;
+}
+
 /// A daemon without this release's actor capabilities (the 0.10.2 contract) still serves a current
 /// managed Claude front: start, read and stop all work, and stop is never preceded by anything
 /// that could consume its pre-hook.
