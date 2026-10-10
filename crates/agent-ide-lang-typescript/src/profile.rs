@@ -16,6 +16,7 @@ use std::{
 
 use agent_ide_core::{
     assistance::host_binding::ActiveBindingUse,
+    modules::payload::{InputsVerdict, ProjectInput},
     execution::{
         AdmissionClass, AdmissionController, BackendReapCapability, BackendRelease, CommandKind,
         ControlledCommand, OwnedProtocolChild, OwnerId, ProcessError, ProviderLeaseAdmission,
@@ -315,15 +316,48 @@ impl ProjectResolutionInputsV1 {
         })
     }
 
+    /// Builds the snapshot from inputs the language's interpretation already accepted
+    /// ([`interpret_inputs`], in process or in the module): the core read them, so nothing is
+    /// interpreted here.
+    pub fn from_accepted(
+        worktree: WorktreeRef,
+        document: PathBuf,
+        bundle: &TypeScriptProviderBundleV1,
+        accepted: &ObservedInputs,
+    ) -> Result<Self, TypeScriptProfileError> {
+        let relative = document
+            .strip_prefix(worktree.worktree_path())
+            .ok()
+            .filter(|path| normal_relative(path))
+            .ok_or(TypeScriptProfileError::InvalidResolution)?
+            .to_path_buf();
+        let language_id =
+            typescript_language_id(&relative).ok_or(TypeScriptProfileError::InvalidResolution)?;
+        let files = accepted.files();
+        let bundle_id = bundle.bundle_id();
+        let identity = resolution_identity(&worktree, &relative, language_id, bundle_id, &files);
+        Ok(Self {
+            worktree,
+            document: relative,
+            language_id,
+            bundle_id,
+            files,
+            identity,
+        })
+    }
+
     /// Remeasures every present and missing ancestor candidate against this exact snapshot.
     ///
-    /// Any addition, removal, replacement, byte change, unsupported shape, root replacement, or
-    /// bound failure returns `InvalidResolution`. No caller receives a partially updated identity.
+    /// Any addition, removal, replacement, byte change, root replacement, or bound failure
+    /// returns `InvalidResolution`; equal bytes are the same project, so nothing is interpreted
+    /// again. No caller receives a partially updated identity.
     pub fn verify(
         &self,
         path_proof: &ResolutionPathProof<'_>,
     ) -> Result<(), TypeScriptProfileError> {
-        (observe_resolution_files(&self.worktree, &self.document, path_proof)? == self.files)
+        let known: Vec<PathBuf> = self.files.iter().map(|file| file.path.clone()).collect();
+        (observe_resolution_bytes(&self.worktree, &self.document, &known, path_proof)?
+            == self.files)
             .then_some(())
             .ok_or(TypeScriptProfileError::InvalidResolution)
     }
@@ -1118,18 +1152,168 @@ fn validate_resolution_files(
     Ok(())
 }
 
-/// Reads the complete deterministic ancestor candidate set and returns sorted present identities.
-///
-/// `path_proof` must authorize each auxiliary resolution input before Workspace reads it
-/// (T36B): proving the requested source document never authorizes these files. An unproven
-/// candidate fails the resolution closed — it is never skipped as if missing. Every refusal names
-/// the file and reason through [`ResolutionRejection`].
-fn observe_resolution_files(
-    worktree: &WorktreeRef,
+/// The project inputs the core has read for one document, with the bytes still unspent of the
+/// resolution budget. Reading is the core's (path proof, bounds, exact bytes); what the files mean
+/// is [`interpret_inputs`]'s.
+#[derive(Debug)]
+pub struct ObservedInputs {
+    /// Budget left, in bytes.
+    remaining: usize,
+    /// Everything read so far, in reading order.
+    pub inputs: Vec<ProjectInput>,
+}
+
+/// Whether `interpret_inputs` parses the file (every input but the Yarn and pnpm lockfiles, which
+/// are only fingerprinted).
+fn parsed_input(path: &Path) -> bool {
+    !matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("yarn.lock" | "pnpm-lock.yaml")
+    )
+}
+
+impl ObservedInputs {
+    /// Reads the closed ancestor candidate set of `document` (a worktree-relative path) after the
+    /// `node_modules` ancestry policy: the six fixed names at the document directory and each
+    /// ancestor, never a directory listing.
+    ///
+    /// `path_proof` must authorize each auxiliary input before it is read (T36B): an unproven
+    /// candidate fails the resolution closed, never skipped as if missing.
+    pub fn read_candidates(
+        worktree: &WorktreeRef,
+        document: &Path,
+        path_proof: &ResolutionPathProof<'_>,
+    ) -> Result<Self, ResolutionRejection> {
+        validate_node_modules_ancestry(worktree, document)?;
+        let parent = document
+            .parent()
+            .ok_or_else(|| ResolutionRejection::chain("document has no parent directory"))?;
+        let mut candidates = BTreeSet::new();
+        for directory in parent.ancestors() {
+            for filename in RESOLUTION_FILENAMES {
+                candidates.insert(directory.join(filename));
+            }
+        }
+        let mut observed = Self {
+            remaining: MAX_RESOLUTION_BYTES as usize,
+            inputs: Vec::new(),
+        };
+        for path in candidates {
+            observed.read(worktree, path, path_proof, true)?;
+        }
+        Ok(observed)
+    }
+
+    /// Reads the `paths` an interpretation asked for (project `references` targets). A target that
+    /// cannot be read within the bounds refuses the resolution.
+    pub fn read_referenced(
+        &mut self,
+        worktree: &WorktreeRef,
+        paths: &[PathBuf],
+        path_proof: &ResolutionPathProof<'_>,
+    ) -> Result<(), ResolutionRejection> {
+        for path in paths {
+            if self.inputs.iter().any(|input| &input.path == path) {
+                continue;
+            }
+            self.read(worktree, path.clone(), path_proof, false)?;
+        }
+        Ok(())
+    }
+
+    /// Reads one input; `optional` skips a missing candidate.
+    fn read(
+        &mut self,
+        worktree: &WorktreeRef,
+        path: PathBuf,
+        path_proof: &ResolutionPathProof<'_>,
+        optional: bool,
+    ) -> Result<(), ResolutionRejection> {
+        if !path_proof(&path) {
+            return Err(ResolutionRejection::at(
+                &path,
+                "is outside the allowed roots",
+            ));
+        }
+        let observed = match read_authorized_resolution_input(worktree, &path, self.remaining) {
+            Ok(observed) => observed,
+            Err(ObservationError::Missing) if optional => return Ok(()),
+            Err(_) => {
+                return Err(ResolutionRejection::at(
+                    &path,
+                    if optional {
+                        "could not be read within the resolution bounds"
+                    } else {
+                        "is referenced but could not be read within the resolution bounds"
+                    },
+                ));
+            }
+        };
+        self.remaining = self
+            .remaining
+            .checked_sub(observed.length() as usize)
+            .ok_or_else(|| {
+                ResolutionRejection::at(
+                    &path,
+                    format!(
+                        "project files exceed the {MAX_RESOLUTION_BYTES} byte resolution budget"
+                    ),
+                )
+            })?;
+        self.inputs.push(ProjectInput {
+            path: observed.path().to_path_buf(),
+            bytes: observed.length(),
+            blake3: observed.digest().to_hex().to_string(),
+            contents: parsed_input(&path)
+                .then(|| String::from_utf8(observed.contents().to_vec()).ok())
+                .flatten(),
+        });
+        if self.inputs.len() > MAX_RESOLUTION_FILES {
+            return Err(ResolutionRejection::chain(format!(
+                "more than {MAX_RESOLUTION_FILES} project files on the ancestor chain"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The sorted identities of what was read.
+    fn files(&self) -> Vec<ProjectResolutionFileV1> {
+        let mut files: Vec<_> = self
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                Some(ProjectResolutionFileV1 {
+                    path: input.path.clone(),
+                    blake3: blake3::Hash::from_hex(&input.blake3).ok()?,
+                    bytes: input.bytes,
+                })
+            })
+            .collect();
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        files
+    }
+}
+
+/// The language's interpretation of the project inputs read for `document` (a worktree-relative
+/// path): whether they form a closed project that admits it. Every ancestor candidate present is
+/// checked in path order, then the `references` targets they name (answering
+/// [`InputsVerdict::Need`] until all were read), then the chain as a whole. The same function
+/// answers in process and in the module.
+pub fn interpret_inputs(document: &Path, inputs: &[ProjectInput]) -> InputsVerdict {
+    match interpret(document, inputs) {
+        Ok(verdict) => verdict,
+        Err(rejection) => InputsVerdict::Rejected {
+            file: rejection.file,
+            reason: rejection.reason,
+        },
+    }
+}
+
+/// [`interpret_inputs`] with the refusal as the profile's own error.
+fn interpret(
     document: &Path,
-    path_proof: &ResolutionPathProof<'_>,
-) -> Result<Vec<ProjectResolutionFileV1>, ResolutionRejection> {
-    validate_node_modules_ancestry(worktree, document)?;
+    inputs: &[ProjectInput],
+) -> Result<InputsVerdict, ResolutionRejection> {
     let language_id = typescript_language_id(document)
         .ok_or_else(|| ResolutionRejection::chain("unsupported source extension"))?;
     let parent = document
@@ -1141,106 +1325,58 @@ fn observe_resolution_files(
             candidates.insert(directory.join(filename));
         }
     }
-    let mut files = Vec::new();
-    let mut remaining = MAX_RESOLUTION_BYTES as usize;
-    let mut pending_references = Vec::new();
-    let mut document_covered = false;
-    for path in candidates {
-        if !path_proof(&path) {
-            return Err(ResolutionRejection::at(
-                &path,
-                "is outside the allowed roots",
-            ));
-        }
-        let observed = match read_authorized_resolution_input(worktree, &path, remaining) {
-            Ok(observed) => observed,
-            Err(ObservationError::Missing) => continue,
-            Err(_) => {
-                return Err(ResolutionRejection::at(
-                    &path,
-                    "could not be read within the resolution bounds",
-                ));
-            }
-        };
-        let shape = validate_resolution_shape(
-            observed.path(),
-            observed.contents(),
+    let by_path: BTreeMap<&Path, &ProjectInput> = inputs
+        .iter()
+        .map(|input| (input.path.as_path(), input))
+        .collect();
+    let shape = |input: &ProjectInput, membership| {
+        validate_resolution_shape(
+            &input.path,
+            input.contents.as_deref().unwrap_or_default().as_bytes(),
             language_id,
             document,
-            MembershipRequirement::Required,
-        )?;
+            membership,
+        )
+    };
+    let mut document_covered = false;
+    let mut pending_references = Vec::new();
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    for path in &candidates {
+        let Some(input) = by_path.get(path.as_path()) else {
+            continue;
+        };
+        seen.insert(input.path.clone());
+        let shape = shape(input, MembershipRequirement::Required)?;
         document_covered |= shape.includes_document;
         pending_references.extend(shape.references);
-        remaining = remaining
-            .checked_sub(observed.length() as usize)
-            .ok_or_else(|| {
-                ResolutionRejection::at(
-                    &path,
-                    format!(
-                        "project files exceed the {MAX_RESOLUTION_BYTES} byte resolution budget"
-                    ),
-                )
-            })?;
-        files.push(ProjectResolutionFileV1 {
-            path: observed.path().to_path_buf(),
-            blake3: observed.digest(),
-            bytes: observed.length(),
-        });
-        if files.len() > MAX_RESOLUTION_FILES {
-            return Err(ResolutionRejection::chain(format!(
-                "more than {MAX_RESOLUTION_FILES} project files on the ancestor chain"
-            )));
-        }
     }
-    let mut seen: BTreeSet<PathBuf> = files.iter().map(|file| file.path.clone()).collect();
+    let mut wanted: Vec<PathBuf> = Vec::new();
     for path in pending_references {
-        if !seen.insert(path.clone()) {
-            continue;
-        }
-        if !path_proof(&path) {
-            return Err(ResolutionRejection::at(
-                &path,
-                "is outside the allowed roots",
-            ));
-        }
-        let observed = match read_authorized_resolution_input(worktree, &path, remaining) {
-            Ok(observed) => observed,
-            Err(_) => {
-                return Err(ResolutionRejection::at(
-                    &path,
-                    "is referenced but could not be read within the resolution bounds",
-                ));
-            }
-        };
-        let shape = validate_resolution_shape(
-            observed.path(),
-            observed.contents(),
-            language_id,
-            document,
-            MembershipRequirement::Optional,
-        )?;
-        document_covered |= shape.includes_document;
-        remaining = remaining
-            .checked_sub(observed.length() as usize)
-            .ok_or_else(|| {
-                ResolutionRejection::at(
-                    &path,
-                    format!(
-                        "project files exceed the {MAX_RESOLUTION_BYTES} byte resolution budget"
-                    ),
-                )
-            })?;
-        files.push(ProjectResolutionFileV1 {
-            path: observed.path().to_path_buf(),
-            blake3: observed.digest(),
-            bytes: observed.length(),
-        });
-        if files.len() > MAX_RESOLUTION_FILES {
-            return Err(ResolutionRejection::chain(format!(
-                "more than {MAX_RESOLUTION_FILES} project files on the ancestor chain"
-            )));
+        if seen.insert(path.clone()) {
+            wanted.push(path);
         }
     }
+    let missing: Vec<PathBuf> = wanted
+        .iter()
+        .filter(|path| !by_path.contains_key(path.as_path()))
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        return Ok(InputsVerdict::Need { paths: missing });
+    }
+    for path in &wanted {
+        let input = by_path[path.as_path()];
+        let shape = shape(input, MembershipRequirement::Optional)?;
+        document_covered |= shape.includes_document;
+    }
+    let mut files: Vec<ProjectResolutionFileV1> = inputs
+        .iter()
+        .map(|input| ProjectResolutionFileV1 {
+            path: input.path.clone(),
+            blake3: blake3::Hash::from_hex(&input.blake3).unwrap_or_else(|_| blake3::hash(b"")),
+            bytes: input.bytes,
+        })
+        .collect();
     files.sort_by(|left, right| left.path.cmp(&right.path));
     validate_resolution_files(document, &files)?;
     if !document_covered {
@@ -1248,7 +1384,41 @@ fn observe_resolution_files(
             "no referenced project's `files`/`include` admits the document",
         ));
     }
-    Ok(files)
+    Ok(InputsVerdict::Accepted)
+}
+
+/// Reads and interprets the complete deterministic ancestor candidate set in process and returns
+/// the sorted present identities.
+fn observe_resolution_files(
+    worktree: &WorktreeRef,
+    document: &Path,
+    path_proof: &ResolutionPathProof<'_>,
+) -> Result<Vec<ProjectResolutionFileV1>, ResolutionRejection> {
+    let mut observed = ObservedInputs::read_candidates(worktree, document, path_proof)?;
+    loop {
+        match interpret_inputs(document, &observed.inputs) {
+            InputsVerdict::Accepted => return Ok(observed.files()),
+            InputsVerdict::Rejected { file, reason } => {
+                return Err(ResolutionRejection { file, reason });
+            }
+            InputsVerdict::Need { paths } => {
+                observed.read_referenced(worktree, &paths, path_proof)?;
+            }
+        }
+    }
+}
+
+/// Re-reads the candidate set and the already-known `extra` inputs and returns their sorted
+/// identities, without interpreting anything: equal bytes mean the same verdict.
+fn observe_resolution_bytes(
+    worktree: &WorktreeRef,
+    document: &Path,
+    extra: &[PathBuf],
+    path_proof: &ResolutionPathProof<'_>,
+) -> Result<Vec<ProjectResolutionFileV1>, ResolutionRejection> {
+    let mut observed = ObservedInputs::read_candidates(worktree, document, path_proof)?;
+    observed.read_referenced(worktree, extra, path_proof)?;
+    Ok(observed.files())
 }
 
 /// Allows only real `node_modules` directories inside the worktree, never an ambient parent.

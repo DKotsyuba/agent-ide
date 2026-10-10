@@ -553,6 +553,9 @@ fn describe(request: &Incoming) -> Answer {
         Ok(DescribeQuery::Presence { worktree }) => {
             reply(encode(&TypeScriptChecks.is_present(&worktree)))
         }
+        Ok(DescribeQuery::ProjectInputs { document, inputs }) => {
+            reply(encode(&crate::profile::interpret_inputs(&document, &inputs)))
+        }
         Err(error) => Answer::error(ErrorCode::InvalidRequest, error),
     }
 }

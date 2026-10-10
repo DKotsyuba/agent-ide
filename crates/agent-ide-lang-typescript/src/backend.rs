@@ -582,24 +582,115 @@ async fn observe_typescript_inputs(
     bundle: TypeScriptProviderBundleV1,
     roots: Vec<std::path::PathBuf>,
 ) -> Result<ProjectResolutionInputsV1, FailureCode> {
-    let observed = tokio::task::spawn_blocking(move || {
-        let worktree_root = worktree.worktree_path().to_path_buf();
-        let path_proof = |path: &Path| {
+    let proof = |worktree: &Path, roots: &[PathBuf]| {
+        let (worktree, roots) = (worktree.to_path_buf(), roots.to_vec());
+        move |path: &Path| {
             let absolute = if path.is_absolute() {
                 path.to_path_buf()
             } else {
-                worktree_root.join(path)
+                worktree.join(path)
             };
             agent_ide_core::assistance::launcher::admit_path(&roots, &absolute).is_ok()
-        };
-        ProjectResolutionInputsV1::observe(worktree, document, &bundle, &path_proof)
-    })
-    .await
-    .map_err(|_| FailureCode::Internal)?;
-    observed.map_err(|rejection| {
+        }
+    };
+    let reject = |job: &mut dyn ProviderJob, rejection: crate::profile::ResolutionRejection| {
         job.set_failure_detail(rejection.to_string());
         FailureCode::ResolutionUnverified
+    };
+    // In process the daemon reads and interprets; in module mode it only reads (path proof,
+    // bounds, exact bytes) and the language's module interprets what was read.
+    if agent_ide_core::modules::calls::mode(crate::LANGUAGE)
+        == agent_ide_core::modules::mode::Mode::InProcess
+    {
+        let observed = tokio::task::spawn_blocking(move || {
+            let path_proof = proof(worktree.worktree_path(), &roots);
+            ProjectResolutionInputsV1::observe(worktree, document, &bundle, &path_proof)
+        })
+        .await
+        .map_err(|_| FailureCode::Internal)?;
+        return observed.map_err(|rejection| reject(job, rejection));
+    }
+    let Ok(relative) = document
+        .strip_prefix(worktree.worktree_path())
+        .map(Path::to_path_buf)
+    else {
+        return Err(reject(
+            job,
+            crate::profile::ResolutionRejection {
+                file: None,
+                reason: format!(
+                    "{} is not a normal path below the worktree",
+                    document.display()
+                ),
+            },
+        ));
+    };
+    let reading = (worktree.clone(), relative.clone(), roots.clone());
+    let mut observed = tokio::task::spawn_blocking(move || {
+        let (worktree, relative, roots) = reading;
+        let path_proof = proof(worktree.worktree_path(), &roots);
+        crate::profile::ObservedInputs::read_candidates(&worktree, &relative, &path_proof)
     })
+    .await
+    .map_err(|_| FailureCode::Internal)?
+    .map_err(|rejection| reject(job, rejection))?;
+    // References are followed one round at a time; nesting is refused, so two suffice.
+    for _ in 0..4 {
+        let verdict = match agent_ide_core::modules::calls::project_inputs(
+            crate::LANGUAGE,
+            worktree.worktree_path(),
+            &relative,
+            observed.inputs.clone(),
+        )
+        .await
+        {
+            Some(Ok(verdict)) => verdict,
+            Some(Err(failure)) => {
+                job.set_stage_failure(
+                    &FailureCode::ProviderUnavailable,
+                    &format!("typescript: {failure}"),
+                );
+                return Err(FailureCode::ProviderUnavailable);
+            }
+            None => return Err(FailureCode::Internal),
+        };
+        match verdict {
+            agent_ide_core::modules::payload::InputsVerdict::Accepted => {
+                return ProjectResolutionInputsV1::from_accepted(
+                    worktree, document, &bundle, &observed,
+                )
+                .map_err(|_| {
+                    job.set_failure_detail(TYPESCRIPT_INPUTS_CHANGED.to_owned());
+                    FailureCode::ResolutionUnverified
+                });
+            }
+            agent_ide_core::modules::payload::InputsVerdict::Rejected { file, reason } => {
+                return Err(reject(
+                    job,
+                    crate::profile::ResolutionRejection { file, reason },
+                ));
+            }
+            agent_ide_core::modules::payload::InputsVerdict::Need { paths } => {
+                let (reading, roots) = (worktree.clone(), roots.clone());
+                observed = tokio::task::spawn_blocking(move || {
+                    let path_proof = proof(reading.worktree_path(), &roots);
+                    observed
+                        .read_referenced(&reading, &paths, &path_proof)
+                        .map(|()| observed)
+                })
+                .await
+                .map_err(|_| FailureCode::Internal)?
+                .map_err(|rejection| reject(job, rejection))?;
+            }
+        }
+    }
+    Err(reject(
+        job,
+        crate::profile::ResolutionRejection {
+            file: None,
+            reason: "project references were not settled within four reads".to_owned(),
+        },
+    ))
 }
 
 impl TypeScriptBackend {
