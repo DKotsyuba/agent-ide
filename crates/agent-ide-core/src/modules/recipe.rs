@@ -515,13 +515,16 @@ pub fn expand_staged(
                         args.push(token.into());
                     }
                 }
-                _ => args.extend(
+                // Admitted paths (none when the optional list is absent); any other kind would
+                // be dropped silently and widen the run, so it is refused.
+                Some(Param::Paths(_) | Param::Path(_)) | None => args.extend(
                     paths
                         .get(name)
                         .into_iter()
                         .flatten()
                         .map(|path| path.clone().into_os_string()),
                 ),
+                Some(_) => return Err(Refusal::WrongKind((*name).to_owned())),
             },
             Arg::Joined(prefix, name) => args.push(
                 format!(
@@ -1160,7 +1163,8 @@ mod tests {
     }
 
     /// Tokens expand in order where the template says `Each`; an empty token, one with NUL or
-    /// one that could become an option (`-…`) is refused, as are tokens where one value goes.
+    /// one that could become an option (`-…`) is refused, as are tokens where one value goes and
+    /// a single token or scalar where a list goes; an absent list expands to nothing.
     #[test]
     fn tokens_expand_as_positional_arguments_only() {
         const RUN: EffectRecipe = EffectRecipe {
@@ -1205,6 +1209,22 @@ mod tests {
                 "{bad:?}"
             );
         }
+        // A single token or scalar where the list goes is refused, never dropped (which would
+        // run every test); an absent list stays empty.
+        for value in [Param::Token("tests/a.py".into()), Param::Scalar(1)] {
+            let mut request = request(&["one"]);
+            request.params.insert("selection".into(), value);
+            assert_eq!(
+                expand(&[RUN], &request, &admission),
+                Err(Refusal::WrongKind("selection".into()))
+            );
+        }
+        let mut absent = request(&["one"]);
+        absent.params.remove("selection");
+        assert_eq!(
+            expand(&[RUN], &absent, &admission).unwrap().args,
+            ["run", "--"]
+        );
         const SINGLE: EffectRecipe = EffectRecipe {
             args: &[Arg::Param("selection")],
             ..RUN
