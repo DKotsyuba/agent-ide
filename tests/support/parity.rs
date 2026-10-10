@@ -696,21 +696,36 @@ const METADATA_LABELS: &[&str] = &[
 ];
 
 /// Each row of a reply `text` (with its line end) and whether it is generated metadata: a row
-/// that starts (after its indent) with one of [`METADATA_LABELS`], outside an `ide.context`
-/// reply's body (every row after its header's first empty row). Every other row (numbered
-/// source, usage excerpts, signatures, docs, diagnostics, a context body) is returned content.
+/// that starts (after its indent) with one of [`METADATA_LABELS`], outside a returned body. The
+/// bodies are an `ide.context` reply's rows after its header's first empty row, and a test run's
+/// runner output: the rows after its `  output (tail):` row up to the footer the core appends
+/// after it (its last `  rerun:` row). Every other row (numbered source, usage excerpts,
+/// signatures, docs, diagnostics) is returned content.
 pub fn metadata_rows(text: &str, context: bool) -> impl Iterator<Item = (&str, bool)> {
+    let rows: Vec<&str> = text.split_inclusive('\n').collect();
+    let line = |row: &str| row.trim_end_matches(['\r', '\n']).to_owned();
+    let tail = rows.iter().position(|row| line(row) == "  output (tail):");
+    let footer = tail.map(|start| {
+        rows.iter()
+            .rposition(|row| row.starts_with("  rerun: "))
+            .filter(|end| *end > start)
+            .unwrap_or(rows.len())
+    });
     let mut body = false;
-    text.split_inclusive('\n').map(move |row| {
+    let mut marked = Vec::with_capacity(rows.len());
+    for (index, row) in rows.into_iter().enumerate() {
+        let output = tail
+            .zip(footer)
+            .is_some_and(|(start, end)| index > start && index < end);
         let labelled = METADATA_LABELS
             .iter()
             .any(|label| row.trim_start_matches(' ').starts_with(label));
-        let metadata = !body && labelled;
-        if context && row.trim_end_matches(['\r', '\n']).is_empty() {
+        marked.push((row, !body && !output && labelled));
+        if context && line(row).is_empty() {
             body = true;
         }
-        (row, metadata)
-    })
+    }
+    marked.into_iter()
 }
 
 /// The replies of one daemon run and the process tree seen before `ide.stop`.
@@ -821,9 +836,10 @@ fn start_card(text: &str) -> String {
     out
 }
 
-/// A settled `tests #N: …` status row (`P passed, F failed, S s`, `no summary parsed, S s` or
-/// `no test results (exit C), S s`) with its whole-second duration `S` masked; any other row,
-/// a started one included, is kept exactly.
+/// A settled `tests #N: …` status row (`P passed, F failed, S s`, `exit C, S s`, `no summary
+/// parsed, S s` or `no test results (exit C), S s`, with `C` signed or `unknown` where it can be)
+/// with its whole-second duration `S` masked; any other row, a started one included, is kept
+/// exactly.
 fn test_duration(row: &str) -> String {
     /// The length of the leading ASCII digits of `text`.
     fn digits(text: &str) -> usize {
@@ -838,6 +854,11 @@ fn test_duration(row: &str) -> String {
         let rest = after_number(row.strip_prefix("tests #")?)?.strip_prefix(": ")?;
         let rest = if let Some(rest) = rest.strip_prefix("no summary parsed") {
             rest
+        } else if let Some(rest) = rest.strip_prefix("exit ") {
+            match rest.strip_prefix("unknown") {
+                Some(rest) => rest,
+                None => after_number(rest.strip_prefix('-').unwrap_or(rest))?,
+            }
         } else if let Some(rest) = rest.strip_prefix("no test results (exit ") {
             let rest = rest.strip_prefix('-').unwrap_or(rest);
             after_number(rest)?.strip_prefix(')')?
