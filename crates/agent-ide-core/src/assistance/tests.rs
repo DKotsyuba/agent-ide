@@ -324,6 +324,101 @@ impl TestRuns {
                 .chain(argv.iter().cloned())
                 .collect()
         };
+        let launch = Launch {
+            language,
+            budget,
+            cap: MAX_OUTPUT,
+            detail_ref,
+            rerun_command,
+            rerun_dir,
+            environment_label: resolution.environment_label,
+        };
+        self.register(&mut state, root, owner, child, lease, launch)
+    }
+
+    /// Starts the run the core expanded and admitted from a language's declared test recipe:
+    /// exactly `spec`'s program, arguments, working directory and complete environment (nothing
+    /// inherited, no language command environment), within the smaller of `budget` and the
+    /// spec's timeout, retaining at most its capture ceiling of output. It is an Execution-owned
+    /// job like every test run and, as today, not read-confined (design §2.6: tests may execute
+    /// project code as currently authorized). The rerun line is the program and its arguments.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the run's own facts, as start_with_options carries them in its options"
+    )]
+    pub fn start_admitted(
+        &self,
+        root: PathBuf,
+        spec: crate::checks::runner::RunSpec,
+        owner: &BindingRef,
+        language: Language,
+        budget: Duration,
+        detail_ref: String,
+        environment_label: Option<String>,
+    ) -> StartResult {
+        let mut state = match self.0.lock() {
+            Ok(state) => state,
+            Err(error) => {
+                return StartResult::Failed {
+                    error: error.to_string(),
+                    not_found: false,
+                };
+            }
+        };
+        if let Some((id, job)) = state
+            .jobs
+            .iter()
+            .find(|(_, job)| job.root == root && job.result.is_none())
+        {
+            return StartResult::Running(*id, job.started.elapsed());
+        }
+        let Some(lease) = crate::retention::Lease::for_worktree(&root) else {
+            return StartResult::Failed {
+                error: "the worktree's cache retention lease could not be taken".to_owned(),
+                not_found: false,
+            };
+        };
+        let lease = crate::retention::SettledLease::new(Some(lease));
+        let child = match spawn_spec(&self.1, &root, &spec) {
+            Ok(child) => child,
+            Err(error) => {
+                lease.settled();
+                return StartResult::Failed {
+                    not_found: error.kind() == std::io::ErrorKind::NotFound,
+                    error: error.to_string(),
+                };
+            }
+        };
+        let launch = Launch {
+            language,
+            budget: budget.min(spec.timeout),
+            cap: spec.max_output_bytes.min(MAX_OUTPUT),
+            detail_ref,
+            rerun_command: std::iter::once(spec.program.as_os_str())
+                .chain(spec.args.iter().map(std::ffi::OsString::as_os_str))
+                .map(|part| part.to_string_lossy().into_owned())
+                .collect(),
+            rerun_dir: spec
+                .cwd
+                .strip_prefix(&root)
+                .ok()
+                .filter(|relative| !relative.as_os_str().is_empty())
+                .map(|relative| relative.display().to_string()),
+            environment_label,
+        };
+        self.register(&mut state, root, owner, child, lease, launch)
+    }
+
+    /// Records a spawned run as the next job of `root` and settles it in the background.
+    fn register(
+        &self,
+        state: &mut std::sync::MutexGuard<'_, State>,
+        root: PathBuf,
+        owner: &BindingRef,
+        child: Spawned,
+        lease: crate::retention::SettledLease,
+        launch: Launch,
+    ) -> StartResult {
         state.next_id = state.next_id.saturating_add(1);
         let id = state.next_id;
         let started = tokio::time::Instant::now();
@@ -333,8 +428,8 @@ impl TestRuns {
                 root: root.clone(),
                 owner: owner.fingerprint(),
                 channel: owner.channel_identity().fingerprint(),
-                detail_ref: detail_ref.clone(),
-                command: rerun_command.clone(),
+                detail_ref: launch.detail_ref.clone(),
+                command: launch.rerun_command.clone(),
                 explicit_command: false,
                 started,
                 result: None,
@@ -343,15 +438,15 @@ impl TestRuns {
                 retired: false,
             },
         );
-        let environment_label = resolution.environment_label;
         let registry = self.0.clone();
         tokio::spawn(async move {
-            let mut result = run_child(language, budget, child, &root).await;
+            let mut result =
+                run_child_capped(launch.language, launch.budget, child, &root, launch.cap).await;
             lease.settled();
-            result.detail_ref = detail_ref;
-            result.command = rerun_command;
-            result.rerun_dir = rerun_dir;
-            result.environment_label = environment_label;
+            result.detail_ref = launch.detail_ref;
+            result.command = launch.rerun_command;
+            result.rerun_dir = launch.rerun_dir;
+            result.environment_label = launch.environment_label;
             if let Ok(mut state) = registry.lock()
                 && let Some(job) = state.jobs.get_mut(&id)
             {
@@ -765,7 +860,7 @@ fn prepend_toolchain_path(
 
 /// Names the deepest cwd environment, or the resolver's primary root for rootless projects,
 /// only when alternatives or a stored selection make the choice relevant.
-async fn command_environment_label(
+pub(super) async fn command_environment_label(
     worktree: &std::path::Path,
     cwd: &std::path::Path,
     language: Language,
@@ -903,19 +998,82 @@ fn spawn_resolved(
     )
 }
 
+/// How one started run settles and is shown.
+struct Launch {
+    /// Language whose parser is tried first.
+    language: Language,
+    /// Wall-clock budget.
+    budget: Duration,
+    /// Most combined output bytes retained.
+    cap: usize,
+    /// Detail reference retaining the full result.
+    detail_ref: String,
+    /// The rerun line's command.
+    rerun_command: Vec<String>,
+    /// The rerun line's directory, relative to the worktree.
+    rerun_dir: Option<String>,
+    /// The environment the reply names.
+    environment_label: Option<String>,
+}
+
+/// Starts exactly `spec` as an Execution-owned job of `worktree`'s test owner: its program, its
+/// arguments, its working directory and only its environment.
+fn spawn_spec(
+    admission: &Arc<Mutex<crate::execution::AdmissionController>>,
+    worktree: &std::path::Path,
+    spec: &crate::checks::runner::RunSpec,
+) -> io::Result<Spawned> {
+    use std::ffi::OsString;
+    let command = crate::execution::ControlledCommand::from_validated_peer(
+        crate::execution::CommandKind::Job,
+        spec.program.clone(),
+        spec.args.clone(),
+        spec.cwd.clone(),
+        spec.env
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect(),
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::NotFound, format!("{error:?}")))?;
+    let owner = crate::execution::OwnerId::new(format!(
+        "test:{}",
+        blake3::hash(worktree.as_os_str().as_encoded_bytes()).to_hex()
+    ))
+    .map_err(|error| io::Error::other(format!("{error:?}")))?;
+    crate::execution::job::StreamedJob::start(
+        admission,
+        owner,
+        crate::execution::AdmissionClass::Background,
+        &command,
+    )
+}
+
 /// Runs one already-spawned child, enforcing its wall-clock budget and bounded pipe drain.
+#[cfg(test)]
 async fn run_child(
     language: Language,
     budget: Duration,
     spawned: Spawned,
     root: &std::path::Path,
 ) -> RunResult {
+    run_child_capped(language, budget, spawned, root, MAX_OUTPUT).await
+}
+
+/// Runs one already-spawned child, enforcing its wall-clock budget and bounded pipe drain, and
+/// retains at most the last `cap` bytes of its combined output.
+async fn run_child_capped(
+    language: Language,
+    budget: Duration,
+    spawned: Spawned,
+    root: &std::path::Path,
+    cap: usize,
+) -> RunResult {
     let started = tokio::time::Instant::now();
     let (job, stdout, stderr) = spawned;
     let mut job = Some(job);
     let combined = Arc::new(tokio::sync::Mutex::new(VecDeque::with_capacity(MAX_OUTPUT)));
-    let mut out_task = tokio::spawn(read_into_tail(Some(stdout), combined.clone()));
-    let mut err_task = tokio::spawn(read_into_tail(Some(stderr), combined.clone()));
+    let mut out_task = tokio::spawn(read_into_tail(Some(stdout), combined.clone(), cap));
+    let mut err_task = tokio::spawn(read_into_tail(Some(stderr), combined.clone(), cap));
     let exited = match job.as_mut() {
         Some(running) => running.wait(budget).await,
         None => false,
@@ -1008,6 +1166,7 @@ fn failed_run(budget: Duration, output: String) -> RunResult {
 async fn read_into_tail<R: tokio::io::AsyncRead + Unpin>(
     reader: Option<R>,
     retained: Arc<tokio::sync::Mutex<VecDeque<u8>>>,
+    cap: usize,
 ) {
     let Some(mut reader) = reader else {
         return;
@@ -1020,8 +1179,8 @@ async fn read_into_tail<R: tokio::io::AsyncRead + Unpin>(
             Ok(count) => {
                 let mut retained = retained.lock().await;
                 retained.extend(&chunk[..count]);
-                if retained.len() > MAX_OUTPUT {
-                    let excess = retained.len() - MAX_OUTPUT;
+                if retained.len() > cap {
+                    let excess = retained.len() - cap;
                     retained.drain(..excess);
                 }
             }
@@ -1046,6 +1205,78 @@ mod runner_tests {
             std::env::split_paths(&path).collect::<Vec<_>>(),
             [PathBuf::from("/pinned/bin"), PathBuf::from("/custom/bin")]
         );
+    }
+
+    /// An admitted run is exactly its specification: the process sees only the spec's
+    /// environment (nothing inherited) and its working directory, and keeps at most its capture
+    /// ceiling of output (the tail).
+    #[tokio::test]
+    async fn an_admitted_run_is_exactly_its_specification() {
+        let runs = TestRuns::default();
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("agent-ide-admitted-{}", std::process::id()));
+        let cwd = root.join("pkg");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let owner = BindingRef::fixture("admitted-actor", "admitted-channel", 1);
+        let spec = |program: &str, args: &[&str], cap: usize| crate::checks::runner::RunSpec {
+            program: program.into(),
+            args: args.iter().map(std::ffi::OsString::from).collect(),
+            cwd: cwd.clone(),
+            env: vec![
+                ("ONLY_THIS".to_owned(), "x".to_owned()),
+                ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            ],
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
+            read_denies: Vec::new(),
+            timeout: Duration::from_secs(10),
+            max_output_bytes: cap,
+        };
+        let settle = async |id: u64| {
+            for _ in 0..200 {
+                if let Some(result) = runs.get(&root, id, &owner).and_then(|status| status.result) {
+                    return result;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("run {id} did not settle");
+        };
+        let start = |spec| {
+            runs.start_admitted(
+                root.clone(),
+                spec,
+                &owner,
+                crate::lang::testing::ALPHA,
+                Duration::from_secs(10),
+                "admitted-detail".into(),
+                None,
+            )
+        };
+        assert!(matches!(
+            start(spec("/usr/bin/env", &[], 4096)),
+            StartResult::Started(1)
+        ));
+        let mut seen: Vec<&str> = Vec::new();
+        let env = settle(1).await;
+        seen.extend(env.output.lines());
+        seen.sort_unstable();
+        assert_eq!(seen, ["ONLY_THIS=x", "PATH=/usr/bin:/bin"]);
+        assert_eq!(env.command, ["/usr/bin/env"]);
+        assert!(matches!(
+            start(spec("/bin/pwd", &[], 4096)),
+            StartResult::Started(2)
+        ));
+        assert_eq!(settle(2).await.output.trim(), cwd.display().to_string());
+        let long = "y".repeat(100);
+        assert!(matches!(
+            start(spec("/bin/echo", &[&long], 10)),
+            StartResult::Started(3)
+        ));
+        let capped = settle(3).await;
+        assert_eq!(capped.output, format!("{}\n", "y".repeat(9)));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Delivery for one actor does not make another actor's unchanged plate due again.

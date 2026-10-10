@@ -38,7 +38,7 @@ pub struct Python;
 ///
 /// No own verbosity flag: the project's `addopts` may already carry `-q`, and a doubled `-qq`
 /// makes pytest print no summary line at all, which the parser then cannot read.
-const PYTEST_FLAGS: [&str; 3] = ["--no-header", "-p", "no:cacheprovider"];
+pub(crate) const PYTEST_FLAGS: [&str; 3] = ["--no-header", "-p", "no:cacheprovider"];
 
 /// Root marker files (besides any root `requirements*.txt` and an environment directory, both
 /// matched separately) whose presence identifies a worktree as a Python project.

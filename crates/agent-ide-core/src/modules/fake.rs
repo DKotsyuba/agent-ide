@@ -5,7 +5,10 @@
 //! Language module tasks test their own server against [`in_memory`] / [`socketpair`] before the
 //! real host runtime spawns them; the host runtime tests its channel against [`FakeModule`].
 
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use serde_json::{Value, json};
 
@@ -20,11 +23,11 @@ use super::{
         CallItem, CallsQuery, CheckParseRequest, CheckPlanRequest, ChecksDescription,
         ContextEvidence, DescribeQuery, DiagnosticsEvidence, EditProposal, EffectOutcome,
         EffectRequest, Field, FileDocRequest, FileEdit, FileVerdict, FormatPlanRequest, Hover,
-        InsertSiteRequest, LaunchDescription, LinkageCoverage, LinkageQuery, Location,
-        OutlineRequest, Param, ProjectQuery, RenameAnswer, RenameRequest, Replacement,
+        InputsVerdict, InsertSiteRequest, LaunchDescription, LinkageCoverage, LinkageQuery,
+        Location, OutlineRequest, Param, ProjectQuery, RenameAnswer, RenameRequest, Replacement,
         ResolveAnswer, ResolveCandidate, ResolveRequest, SemanticQuery, SourceAnalysis,
         SourceField, SourceRef, SourceText, SyntaxQuery, TestFacts, TestParseRequest,
-        TestPlanQuery, decode, encode,
+        TestPlanQuery, TestRun, decode, encode,
     },
     serve::{Answer, Effects, Incoming, ModuleServer, ServeError, serve},
     wire::Attachment,
@@ -312,6 +315,17 @@ impl FakeModule {
                         command: vec!["runner".into()],
                     }))
                 }
+                TestPlanQuery::Run { .. } => encode(&Ok::<TestRun, LangError>(TestRun {
+                    tests: Vec::new(),
+                    effect: EffectRequest {
+                        recipe: "test".into(),
+                        params: [(
+                            "selection".to_owned(),
+                            Param::Tokens(vec!["tests/a.alpha::one".into()]),
+                        )]
+                        .into(),
+                    },
+                })),
                 TestPlanQuery::TestIds { outline_paths, .. } => json!(outline_paths),
             },
             Capability::TestParse => {
@@ -389,6 +403,34 @@ impl FakeModule {
                     }))
                 }
                 DescribeQuery::Presence { .. } => json!(true),
+                // Accepts inputs whose attached bytes match their declared length and digest,
+                // and asks for `extra.cfg` until it was read.
+                DescribeQuery::ProjectInputs { inputs, .. } => {
+                    let mismatch = inputs.iter().find(|input| {
+                        input.contents.is_some_and(|id| {
+                            request.attachment(id).is_none_or(|attachment| {
+                                attachment.bytes.len() as u64 != input.bytes
+                                    || blake3::hash(&attachment.bytes).to_hex().as_str()
+                                        != input.blake3
+                            })
+                        })
+                    });
+                    encode(&match mismatch {
+                        Some(input) => InputsVerdict::Rejected {
+                            file: Some(input.path.clone()),
+                            reason: "contents do not match their digest".into(),
+                        },
+                        None if !inputs
+                            .iter()
+                            .any(|input| input.path == Path::new("extra.cfg")) =>
+                        {
+                            InputsVerdict::Need {
+                                paths: vec!["extra.cfg".into()],
+                            }
+                        }
+                        None => InputsVerdict::Accepted,
+                    })
+                }
             },
             Capability::Linkage => match decode::<LinkageQuery>(payload)? {
                 LinkageQuery::Anchors { .. } => encode(&AnchorBatch {
@@ -732,6 +774,64 @@ mod tests {
         payload::DetectAnswer,
         wire::{MAX_CHUNK, MAX_CONTROL, read_frame, write_attachment, write_control},
     };
+
+    /// Project inputs over a real channel: 8 MiB of escape-heavy contents (quotes, backslashes,
+    /// newlines, control characters) travel as attachment bytes, not inside the 1 MiB control
+    /// body, and arrive exact (the fake checks length and digest); a digest that does not match
+    /// its bytes is rejected.
+    #[tokio::test]
+    async fn project_inputs_carry_large_escaped_contents_as_attachments() {
+        let (mut channel, _) = in_memory(
+            FakeModule::new(alpha(), "1.0"),
+            offer(alpha(), "1.0", Role::Analyzer, 1),
+        )
+        .await
+        .unwrap();
+        let bytes: Vec<u8> = "\"\\\n\u{1}\u{7f}é".bytes().cycle().take(8 << 20).collect();
+        let mut ask = async |digest: String| {
+            let query = DescribeQuery::ProjectInputs {
+                document: "doc.x".into(),
+                inputs: vec![
+                    super::super::payload::ProjectInput {
+                        path: "big.cfg".into(),
+                        bytes: bytes.len() as u64,
+                        blake3: digest,
+                        contents: Some(1),
+                    },
+                    super::super::payload::ProjectInput {
+                        path: "extra.cfg".into(),
+                        bytes: 0,
+                        blake3: blake3::hash(b"").to_hex().to_string(),
+                        contents: None,
+                    },
+                ],
+            };
+            let call = Call {
+                capability: Capability::Describe,
+                scope_key: "s".into(),
+                revision_key: "r".into(),
+                payload: encode(&query),
+                attachments: vec![Attachment::octets(1, bytes.clone())],
+            };
+            assert!(encode(&query).to_string().len() < MAX_CONTROL);
+            let reply = channel
+                .call(call, Duration::from_secs(30), &mut NoEffects)
+                .await
+                .unwrap();
+            let Outcome::Result(value) = reply.outcome else {
+                panic!("{:?}", reply.outcome);
+            };
+            decode::<InputsVerdict>(value).unwrap()
+        };
+        assert_eq!(
+            ask(blake3::hash(&bytes).to_hex().to_string()).await,
+            InputsVerdict::Accepted
+        );
+        assert!(matches!(
+            ask(blake3::hash(b"other").to_hex().to_string()).await,
+            InputsVerdict::Rejected { .. }
+        ));
+    }
 
     /// `bundled.alpha`, registered by the core's test languages.
     fn alpha() -> ModuleId {

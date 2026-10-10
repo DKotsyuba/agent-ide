@@ -361,6 +361,23 @@ impl ModuleHost {
         payload: serde_json::Value,
         attachments: Vec<Attachment>,
     ) -> Result<T, ModuleUnavailable> {
+        self.request_valid(language, worktree, capability, payload, attachments, |_| {
+            true
+        })
+        .await
+    }
+
+    /// [`Self::request`] whose typed result must also pass `valid` (its contract bounds): an
+    /// answer that does not is ill-typed, so the instance is retired and counted like a crash.
+    pub async fn request_valid<T: DeserializeOwned>(
+        &self,
+        language: Language,
+        worktree: &Path,
+        capability: Capability,
+        payload: serde_json::Value,
+        attachments: Vec<Attachment>,
+        valid: impl Fn(&T) -> bool,
+    ) -> Result<T, ModuleUnavailable> {
         let call = Call {
             capability,
             scope_key: worktree.display().to_string(),
@@ -368,13 +385,14 @@ impl ModuleHost {
             payload,
             attachments,
         };
-        self.call(
+        self.call_valid(
             language,
             worktree,
             Role::Analyzer,
             call,
             self.budget,
             &mut NoEffects,
+            valid,
         )
         .await
     }
@@ -389,6 +407,25 @@ impl ModuleHost {
         call: Call,
         budget: Duration,
         effects: &mut dyn EffectRunner,
+    ) -> Result<T, ModuleUnavailable> {
+        self.call_valid(language, worktree, role, call, budget, effects, |_| true)
+            .await
+    }
+
+    /// [`Self::call`] whose typed result must also pass `valid`, like [`Self::request_valid`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the call's own arguments plus its check"
+    )]
+    pub async fn call_valid<T: DeserializeOwned>(
+        &self,
+        language: Language,
+        worktree: &Path,
+        role: Role,
+        call: Call,
+        budget: Duration,
+        effects: &mut dyn EffectRunner,
+        valid: impl Fn(&T) -> bool,
     ) -> Result<T, ModuleUnavailable> {
         let failure = |cause| ModuleUnavailable {
             module_id: ModuleId::bundled(language.name()),
@@ -447,10 +484,11 @@ impl ModuleHost {
         };
         match reply.outcome {
             Outcome::Result(value) => match decode(value) {
-                Ok(value) => Ok(value),
-                // A well-framed but ill-typed result is the instance's fault: it is retired and
-                // counted like a crash, as a module session's is.
-                Err(_) => {
+                Ok(value) if valid(&value) => Ok(value),
+                // A well-framed but ill-typed result (or one beyond its contract bounds) is the
+                // instance's fault: it is retired and counted like a crash, as a module
+                // session's is.
+                _ => {
                     supervisor.retire_failed().await?;
                     Err(failure(Cause::Malformed))
                 }
