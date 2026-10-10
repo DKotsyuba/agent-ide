@@ -613,3 +613,135 @@ async fn typescript_node_backend_matches_in_process_answers() {
         assert!(all.contains(expected), "{expected}:\n{all}");
     }
 }
+
+/// One project shape per fixture: the resolution the module interprets must give the daemon the
+/// same verdict as the in-process interpretation, rejection text included.
+fn resolution_fixture(files: &[(&str, &str)]) -> Fixture {
+    Fixture::new(files, json!([typescript_provider()]))
+}
+
+/// The reads of `path` and its context at the declaration on a fresh daemon with `env`.
+async fn resolution_transcript(
+    env: &[(&str, &str)],
+    files: &[(&str, &str)],
+    path: &str,
+    marker: &str,
+) -> Vec<String> {
+    let fixture = resolution_fixture(files);
+    let _daemon = Daemon::start(&fixture, env).await;
+    let mut session = Session::start(&fixture).await;
+    let text = std::fs::read_to_string(fixture.root.join(path)).unwrap();
+    let at = text.find(marker).unwrap() + 2;
+    let mut replies = Vec::new();
+    for (tool, arguments) in [
+        ("ide.outline", json!({"path": path})),
+        ("ide.context", json!({"path": path, "byte_offset": at})),
+    ] {
+        let reply = session.call(&fixture, tool, arguments.clone()).await;
+        replies.push(line_for(&fixture, tool, &arguments, &reply));
+    }
+    session.close(&fixture).await;
+    replies
+}
+
+/// Accepted and refused project shapes give the same answers in module mode and in process: a
+/// plain include, a Vite-style solution `tsconfig.json` whose `references` target must be read
+/// (a second round with the module), a wildcard include, an `exclude`, a `paths` mapping, open
+/// `types` and a document no config admits.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER environments"]
+async fn typescript_project_resolution_matches_in_process_answers() {
+    let source = "export function area(w: number) {\n  return w * w;\n}\n";
+    let options = "\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"bundler\"}";
+    let cases: [(&str, Vec<(&str, String)>, &str); 7] = [
+        (
+            "plain include",
+            vec![
+                ("tsconfig.json", format!("{{{options},\"include\":[\"src\"]}}")),
+                ("src/area.ts", source.to_owned()),
+            ],
+            "semantic",
+        ),
+        (
+            "solution references",
+            vec![
+                (
+                    "tsconfig.json",
+                    "{\"files\":[],\"references\":[{\"path\":\"./tsconfig.app.json\"}]}".to_owned(),
+                ),
+                (
+                    "tsconfig.app.json",
+                    format!("{{{options},\"include\":[\"src\"]}}"),
+                ),
+                ("src/area.ts", source.to_owned()),
+            ],
+            "semantic",
+        ),
+        (
+            "wildcard include",
+            vec![
+                ("tsconfig.json", format!("{{{options},\"include\":[\"src/**/*\"]}}")),
+                ("src/area.ts", source.to_owned()),
+            ],
+            "unverified",
+        ),
+        (
+            "exclude",
+            vec![
+                (
+                    "tsconfig.json",
+                    format!("{{{options},\"include\":[\"src\"],\"exclude\":[\"dist\"]}}"),
+                ),
+                ("src/area.ts", source.to_owned()),
+            ],
+            "unverified",
+        ),
+        (
+            "paths mapping",
+            vec![
+                (
+                    "tsconfig.json",
+                    "{\"compilerOptions\":{\"types\":[],\"moduleResolution\":\"bundler\",\"paths\":{\"@/*\":[\"src/*\"]}},\"include\":[\"src\"]}"
+                        .to_owned(),
+                ),
+                ("src/area.ts", source.to_owned()),
+            ],
+            "unverified",
+        ),
+        (
+            "open types",
+            vec![
+                (
+                    "tsconfig.json",
+                    "{\"compilerOptions\":{\"types\":[\"node\"],\"moduleResolution\":\"bundler\"},\"include\":[\"src\"]}"
+                        .to_owned(),
+                ),
+                ("src/area.ts", source.to_owned()),
+            ],
+            "unverified",
+        ),
+        (
+            "document outside every config",
+            vec![
+                ("tsconfig.json", format!("{{{options},\"include\":[\"lib\"]}}")),
+                ("lib/other.ts", "export const x = 1;\n".to_owned()),
+                ("src/area.ts", source.to_owned()),
+            ],
+            "unverified",
+        ),
+    ];
+    for (name, files, expected) in cases {
+        let files: Vec<(&str, &str)> = files.iter().map(|(a, b)| (*a, b.as_str())).collect();
+        let in_process = resolution_transcript(&[IN_PROCESS], &files, "src/area.ts", "area").await;
+        let moduled = resolution_transcript(&[], &files, "src/area.ts", "area").await;
+        parity::assert_parity(&in_process, &moduled);
+        let joined = moduled.join("\n");
+        match expected {
+            "semantic" => assert!(joined.contains("mode: semantic"), "{name}:\n{joined}"),
+            _ => assert!(
+                joined.contains("project resolution unverified"),
+                "{name} is refused:\n{joined}"
+            ),
+        }
+    }
+}
