@@ -14,11 +14,14 @@ use serde_json::{Value, json};
 
 /// Every language in process: the reference transcript.
 const ALL_IN_PROCESS: &str = "html=in_process,css=in_process,typescript=in_process";
-/// Mixed settings compared against it: one web language in its module, then both.
-const MIXED: [&str; 3] = [
+/// Mixed settings compared against it: each web language in its module alone, the style and
+/// markup languages together, TypeScript alone, and every language in its module.
+const MIXED: [&str; 5] = [
     "css=in_process,typescript=in_process",
     "html=in_process,typescript=in_process",
     "typescript=in_process",
+    "html=in_process,css=in_process",
+    "",
 ];
 
 /// The `mixed-frontend` tree with an assets container holding the file references, a script that

@@ -157,6 +157,8 @@ async fn the_related_links_block_is_identical_in_every_mixed_setting() {
         "css=in_process,typescript=in_process",
         "html=in_process,typescript=in_process",
         "typescript=in_process",
+        "html=in_process,css=in_process",
+        "",
     ] {
         parity::assert_parity(&reference, &settled(mode, &requests).await);
     }
