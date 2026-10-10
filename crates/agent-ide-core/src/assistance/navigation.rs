@@ -64,8 +64,8 @@ pub(super) fn constructs(kind: SymbolKind) -> bool {
 /// one optional generic list (`<…>` or `::<…>`), an occurrence is a construction site when the
 /// text continues with `{` (struct literal), `(` (tuple struct or class call), `::new(`,
 /// `::default(` or `::from(`; for an enum also `::<Variant>(`, `::<Variant> {` or a bare
-/// `::<Variant>` path; or when the occurrence is preceded by the word `new` (TypeScript and
-/// JavaScript). A line that declares or imports (its trimmed text, after visibility words,
+/// `::<Variant>` path; or when the occurrence is preceded by the word `new` (a constructor
+/// expression). A line that declares or imports (its trimmed text, after visibility words,
 /// starts with `use`, `import`, `from`, `impl`, `struct`, `enum`, `class`, `trait`, `type`,
 /// `interface` or `union`) is never one, and neither is an occurrence directly after `->` (a
 /// return type followed by a function body). The definition line itself is excluded by the
@@ -292,14 +292,14 @@ mod tests {
         let mut usages = vec![
             row(1, "fn take(store: Store) {", None),
             row(2, "let s = Store::new();", None),
-            row(3, "let t = Store { a };", Some("[rust]")),
+            row(3, "let t = Store { a };", Some("[alpha]")),
             row(4, "Store(1)", None),
         ];
         classify_constructions(&mut usages, "Store", false);
         let order: Vec<u32> = usages.iter().map(|usage| usage.line).collect();
         assert_eq!(order, vec![2, 4, 1, 3]);
         assert_eq!(usages[0].tag.as_deref(), Some(CONSTRUCTION_TAG));
-        assert_eq!(usages[3].tag.as_deref(), Some("[rust]"));
+        assert_eq!(usages[3].tag.as_deref(), Some("[alpha]"));
     }
 
     /// Only structs, enums and classes are classified.

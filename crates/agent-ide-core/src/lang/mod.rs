@@ -1537,7 +1537,7 @@ pub(crate) mod testing {
 
     /// The document symbols of a scripted `structImpl` session: a struct `a` over both lines of
     /// `sym a\nend\n` and an impl block `a` over the same lines, which normalize to one address
-    /// with kinds `Struct` and `Impl`, the shape rust-analyzer gives a type and its `impl`.
+    /// with kinds `Struct` and `Impl`, the shape a language server gives a type and its impl block.
     #[allow(deprecated)]
     pub(crate) fn fixture_struct_impl_symbols() -> Vec<async_lsp::lsp_types::DocumentSymbol> {
         use async_lsp::lsp_types as lsp;
