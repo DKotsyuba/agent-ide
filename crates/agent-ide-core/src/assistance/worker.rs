@@ -34,6 +34,8 @@ use crate::{
         store::WorkspaceStore,
     },
 };
+#[path = "batch_edit.rs"]
+mod batch_edit;
 #[path = "links.rs"]
 mod links;
 #[path = "providers.rs"]
@@ -117,6 +119,8 @@ struct Job {
 }
 
 /// Resumable state for operations that have already performed an externally visible edit.
+// One stage lives per parked job, so the variant size difference costs nothing measurable.
+#[allow(clippy::large_enum_variant)]
 enum JobStage {
     /// The edit is settled; only its target project-check snapshot and reply remain.
     EditAwaitingCheck {
@@ -143,6 +147,9 @@ enum JobStage {
         /// Last time a matching check may affect the edit reply.
         deadline: tokio::time::Instant,
     },
+    /// A multi-file edit (`ide.edit {files}`) has written; only its one project check and the
+    /// per-file reply remain.
+    EditBatchAwaitingCheck(Box<batch_edit::BatchCheck>),
 }
 
 /// A retained outcome requiring exact binding ownership and fresh durable authorization on access.
@@ -3139,6 +3146,9 @@ impl<'a> Worker<'a> {
                     note: None,
                     operation: edit_operation(&job.parameters),
                 },
+                Some(JobStage::EditBatchAwaitingCheck(check)) => {
+                    check.unknown_reply(&job.reference)
+                }
                 None => PeerReply::Error {
                     code: FailureCode::Internal,
                     detail: Some(crate::telemetry::adapters::default_stage(
@@ -3180,7 +3190,10 @@ impl<'a> Worker<'a> {
                             .as_str()?
                             .split_once('#')
                             .map(|(path, _)| path)
-                    })?;
+                    })
+                    // A multi-file edit names its first file; the operation's receipt keeps
+                    // every file's state for the retry that reconciles it.
+                    .or_else(|| job.parameters.get("files")?.get(0)?.get("path")?.as_str())?;
                 EditResult::new(
                     operation.to_owned(),
                     path.to_owned(),
@@ -5143,9 +5156,16 @@ impl<'a> Worker<'a> {
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        if let Some(JobStage::EditBatchAwaitingCheck(check)) = job
+            .stage
+            .take_if(|stage| matches!(stage, JobStage::EditBatchAwaitingCheck(_)))
+        {
+            return self.finish_batch_check(job, *check).await;
+        }
         if let Some(stage @ JobStage::EditAwaitingCheck { .. }) = job.stage.take() {
             let deadline = match &stage {
                 JobStage::EditAwaitingCheck { deadline, .. } => *deadline,
+                JobStage::EditBatchAwaitingCheck(check) => check.deadline,
             };
             let diagnostics = if *job.cancel.borrow() || tokio::time::Instant::now() >= deadline {
                 Some(EditDiagnostics::Unknown {})
@@ -5163,7 +5183,10 @@ impl<'a> Worker<'a> {
                 authority,
                 path,
                 ..
-            } = stage;
+            } = stage
+            else {
+                return Err(FailureCode::Internal);
+            };
             debug_assert_eq!(result.path, path);
             let source = result
                 .outcome
@@ -5186,6 +5209,9 @@ impl<'a> Worker<'a> {
                 Some(authority),
                 source,
             ));
+        }
+        if job.parameters.get("files").is_some() {
+            return self.edit_files(job).await;
         }
         if job.parameters.get("changes").is_some() {
             return self.edit_changes(job).await;
@@ -5448,6 +5474,7 @@ impl<'a> Worker<'a> {
                 None if tokio::time::Instant::now()
                     < match &stage {
                         JobStage::EditAwaitingCheck { deadline, .. } => *deadline,
+                        JobStage::EditBatchAwaitingCheck(check) => check.deadline,
                     } =>
                 {
                     job.stage = Some(stage);
@@ -5558,6 +5585,8 @@ impl<'a> Worker<'a> {
     /// Returns the matching generation's diagnostics without waiting; absence means the job parks.
     /// Missing feed state preserves the provider fallback, while a completed non-ready snapshot
     /// and a matching ready snapshot map to the same states used by the former bounded wait.
+    /// A multi-file stage has no single file of its own and yields its fallback-free `Unknown`;
+    /// its per-file stages are asked one by one instead.
     fn check_diagnostics(&self, stage: &JobStage) -> Option<EditDiagnostics> {
         use crate::checks::{CheckState, Severity};
         let JobStage::EditAwaitingCheck {
@@ -5568,7 +5597,10 @@ impl<'a> Worker<'a> {
             preexisting,
             language,
             ..
-        } = stage;
+        } = stage
+        else {
+            return Some(EditDiagnostics::Unknown {});
+        };
         let Some(feed) = self.shared.project_feed.as_ref() else {
             return Some(fallback.clone());
         };
@@ -6515,6 +6547,12 @@ fn admitted_edit_source(
                 kind: ResultKind::Context | ResultKind::Read,
                 ..
             } => true,
+            // A multi-file edit retains only the post-write observations of the files it wrote.
+            PeerReply::Complete {
+                kind: ResultKind::EditBatch,
+                detail_ref,
+                ..
+            } => detail_ref.as_deref() == Some(reference),
             PeerReply::Edit { result, .. } => {
                 result.source_ref.as_deref() == Some(reference) && result.outcome.has_post_source()
             }

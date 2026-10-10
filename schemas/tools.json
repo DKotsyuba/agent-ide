@@ -169,6 +169,46 @@
           "maxLength": 131072,
           "type": "string"
         },
+        "files": {
+          "description": "One logical change across up to 16 files in ONE call, with only `operation_id` and an optional default `source_ref` beside it: each entry is {\"path\",\"changes\":[…]} (exactly the one-file `changes` entries), {\"path\",\"create\":true,\"content\"} (a new file) or {\"path\",\"content\"} (whole new content), with its own optional `source_ref`; at most 128 changes and 128 KiB of text in all. Every file is validated before the first write and any refusal writes nothing; files are written in order, one project check runs on the result, a partial write is reported per file, and the same `operation_id` resumes the rest.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "changes": {
+                "items": {
+                  "type": "object"
+                },
+                "maxItems": 32,
+                "minItems": 1,
+                "type": "array"
+              },
+              "content": {
+                "maxLength": 131072,
+                "type": "string"
+              },
+              "create": {
+                "type": "boolean"
+              },
+              "path": {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              "source_ref": {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "type": "object"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
         "lines": {
           "description": "With `path`: inclusive 1-based line range to replace.",
           "pattern": "^[0-9]+-[0-9]+$",

@@ -2504,7 +2504,7 @@ fn readable_text<'a>(
 }
 
 /// The observed bytes as text; symbol tools need UTF-8 sources.
-fn observed_text<'a>(
+pub(super) fn observed_text<'a>(
     observed: &SourceObservation,
     bytes: &'a [u8],
 ) -> Result<&'a str, FailureCode> {
@@ -2528,7 +2528,7 @@ fn batch_file_refusal(code: &FailureCode, file: &str) -> String {
 /// Maps a registered path's observed state to the closed `no_such_file` failure with its bounded
 /// requested path, `None` while the path is present. A missing draft is a legitimate observation,
 /// never a `source_unavailable` collapse (T163).
-fn no_such_file(
+pub(super) fn no_such_file(
     state: crate::workspace::observation::ObservedState,
     path: &str,
 ) -> Option<FailureCode> {
@@ -2860,7 +2860,7 @@ impl Worker<'_> {
         if let Some(code) = no_such_file(observed.state(), &path) {
             return Err(code);
         }
-        let source = observed_text(&observed, &bytes)?.to_owned();
+        observed_text(&observed, &bytes)?;
         // Exactly the single form's rule: an explicit `source_ref` must name a retained
         // same-path observation whose bytes are still the file's current ones; without one the
         // fresh observation is the base (only a symbol-only batch may omit it — the facade
@@ -2925,7 +2925,83 @@ impl Worker<'_> {
         };
         let entries = job.parameters["changes"]
             .as_array()
-            .ok_or(FailureCode::Internal)?;
+            .ok_or(FailureCode::Internal)?
+            .clone();
+        let candidate = match self
+            .changes_candidate(job, &observed, &bytes, &path, &entries)
+            .await?
+        {
+            Ok((candidate, note)) => {
+                job.format_note = Some(note);
+                candidate
+            }
+            Err(refusal) => {
+                job.failure_detail = Some(format!(
+                    "edit:refused: {}",
+                    crate::assistance::reply::bounded_utf8_prefix(
+                        &refusal.detail(),
+                        MAX_REFUSAL_DETAIL_BYTES
+                    )
+                ));
+                return Err(FailureCode::EditRefused);
+            }
+        };
+        let request = EditRequest::new(
+            &operation_id,
+            file.display().to_string(),
+            &job.reference,
+            &candidate,
+        )
+        .map_err(|_| FailureCode::Internal)?;
+        let prepared = match self.edits.prepare(request.clone()).await {
+            Ok(PrepareAdmission::Prepared(prepared)) => prepared,
+            Ok(
+                PrepareAdmission::Settled(result)
+                | PrepareAdmission::ConflictingDuplicate(result)
+                | PrepareAdmission::OutcomeUnknown(result),
+            ) => {
+                let authority = self.authority(&binding).await.ok();
+                return Ok((
+                    PeerReply::Edit {
+                        result,
+                        diagnostics: EditDiagnostics::Unknown {},
+                        note: None,
+                        operation: None,
+                    },
+                    authority,
+                    None,
+                ));
+            }
+            Err(_) => return Err(FailureCode::Internal),
+        };
+        self.edit_with_source(job, request, prepared, base, true)
+            .await
+    }
+
+    /// One file's `changes` candidate, resolved, applied, formatted and gated without any write.
+    ///
+    /// `observed` and `bytes` are the file's current observation, which the caller has already
+    /// matched against its edit base; `path` is the worktree-relative path as requested and
+    /// `entries` the validated `changes` array. Every address resolves against these bytes before
+    /// anything is applied (an outline is taken only when a `symbol` or `within` address needs
+    /// one), application is bottom-up so each landing is exact, the project formatter formats
+    /// the result once, and the language's syntax gate must accept it.
+    ///
+    /// Returns `Ok(Ok((candidate, note)))` with the formatted candidate and the landing note the
+    /// reply carries (landings, line movement, a pre-existing syntax error, a lexical-outline
+    /// note), `Ok(Err(refusal))` naming every change that cannot apply (nothing may be written
+    /// then), and `Err` for a failure that is not about the changes (unreadable bytes, a
+    /// malformed entry, an outline or module failure).
+    pub(super) async fn changes_candidate(
+        &mut self,
+        job: &mut Job,
+        observed: &SourceObservation,
+        bytes: &[u8],
+        path: &str,
+        entries: &[Value],
+    ) -> Result<Result<(String, String), Refusal>, FailureCode> {
+        let source = observed_text(observed, bytes)?.to_owned();
+        let file = std::path::PathBuf::from(path);
         let requests = parse_change_requests(entries)?;
         // Only `symbol` and `within` addresses resolve against an outline: a batch of `lines`
         // and `old` entries edits a file whose language outlines nowhere here (a probe-checked
@@ -2943,23 +3019,13 @@ impl Worker<'_> {
         });
         let mut outline: Option<Outline> = None;
         let lexical = if needs_outline {
-            let (resolved, _, from_text) = self.outline_of(job, &observed, &bytes).await?;
+            let (resolved, _, from_text) = self.outline_of(job, observed, bytes).await?;
             outline = Some(resolved);
             from_text
                 .as_ref()
                 .and_then(|why| self.lexical_note(job, observed.path(), why))
         } else {
             None
-        };
-        let refused = |job: &mut Job, refusal: Refusal| -> FailureCode {
-            job.failure_detail = Some(format!(
-                "edit:refused: {}",
-                crate::assistance::reply::bounded_utf8_prefix(
-                    &refusal.detail(),
-                    MAX_REFUSAL_DETAIL_BYTES
-                )
-            ));
-            FailureCode::EditRefused
         };
         // Insertion sites are the language's computation: ask for each one first (in process or
         // from its module), then resolve every change synchronously against the answers.
@@ -2996,23 +3062,23 @@ impl Worker<'_> {
                 .unwrap_or_else(|| Err(lang::LangError::UnknownSymbol(symbol.clone())))
         };
         let changes =
-            match resolve_changes_with(&source, outline.as_ref(), &path, &requests, &site_of) {
+            match resolve_changes_with(&source, outline.as_ref(), path, &requests, &site_of) {
                 Ok(changes) => changes,
-                Err(refusal) => return Err(refused(job, refusal)),
+                Err(refusal) => return Ok(Err(refusal)),
             };
-        let (spliced, landings) = match apply_changes(&source, &path, &changes) {
+        let (spliced, landings) = match apply_changes(&source, path, &changes) {
             Ok(applied) => applied,
             Err(refusal) => {
-                return Err(refused(job, refusal));
+                return Ok(Err(refusal));
             }
         };
         let candidate = self
-            .format_candidate(&observed, &file, spliced.clone())
+            .format_candidate(observed, &file, spliced.clone())
             .await;
         // Pre-write structural gate: a candidate that does not parse is not written; a file that
         // already failed the same check before the edit is still edited, with a note.
         let gated = self
-            .gate_candidate(job, &observed, &file, &source, &candidate)
+            .gate_candidate(job, observed, &file, &source, &candidate)
             .await;
         let pre_existing = match gated {
             Ok(note) => note,
@@ -3034,7 +3100,7 @@ impl Worker<'_> {
                         .refused
                         .extend(changes.iter().map(|change| change.number));
                 }
-                return Err(refused(job, refusal));
+                return Ok(Err(refusal));
             }
         };
         let align = if candidate != spliced {
@@ -3070,37 +3136,7 @@ impl Worker<'_> {
         if let Some(lexical) = lexical {
             note = format!("{lexical}\n{note}");
         }
-        job.format_note = Some(note);
-        let request = EditRequest::new(
-            &operation_id,
-            file.display().to_string(),
-            &job.reference,
-            &candidate,
-        )
-        .map_err(|_| FailureCode::Internal)?;
-        let prepared = match self.edits.prepare(request.clone()).await {
-            Ok(PrepareAdmission::Prepared(prepared)) => prepared,
-            Ok(
-                PrepareAdmission::Settled(result)
-                | PrepareAdmission::ConflictingDuplicate(result)
-                | PrepareAdmission::OutcomeUnknown(result),
-            ) => {
-                let authority = self.authority(&binding).await.ok();
-                return Ok((
-                    PeerReply::Edit {
-                        result,
-                        diagnostics: EditDiagnostics::Unknown {},
-                        note: None,
-                        operation: None,
-                    },
-                    authority,
-                    None,
-                ));
-            }
-            Err(_) => return Err(FailureCode::Internal),
-        };
-        self.edit_with_source(job, request, prepared, base, true)
-            .await
+        Ok(Ok((candidate, note)))
     }
 
     /// `ide.edit {path, content}` without `source_ref`: creates a file that does not exist yet.
@@ -3191,7 +3227,7 @@ impl Worker<'_> {
 
     /// Runs the project's stdin formatter over a candidate text; the candidate is returned
     /// unchanged when there is no formatter, it fails, or it takes longer than ten seconds.
-    async fn format_candidate(
+    pub(super) async fn format_candidate(
         &mut self,
         observed: &SourceObservation,
         file: &Path,
@@ -3905,7 +3941,7 @@ impl ResolvedChange {
 /// The per-change refusals of one batch that was not applied: each sentence names its change and
 /// the exact fix; the reply states how many of how many were refused and that nothing was written.
 #[derive(Debug)]
-struct Refusal {
+pub(super) struct Refusal {
     /// Sentences in request order, joined with `; ` by [`Self::detail`].
     sentences: Vec<String>,
     /// The change numbers named, for the refused count.
@@ -3923,7 +3959,7 @@ impl Refusal {
 
     /// The whole refusal detail after `edit:refused:` — `2 of 3 changes refused, nothing
     /// written — change 2: …; change 3: …`.
-    fn detail(&self) -> String {
+    pub(super) fn detail(&self) -> String {
         format!(
             "{} of {} changes refused, nothing written — {}",
             self.refused.len(),

@@ -440,6 +440,8 @@ fn assert_compact_envelope(reply: &Value) {
             "{reply}"
         ),
         ("complete", Some("graph")) => assert!(body.starts_with("graph: "), "{reply}"),
+        // A multi-file edit (batch-api-v1 §7) opens with its outcome line.
+        ("complete", Some("edit_batch")) => assert!(body.starts_with("edit: "), "{reply}"),
         // `<file>  (<n> lines, <lang>)` outline header.
         ("complete", Some("outline")) => {
             let header = body.lines().next().unwrap_or_default();

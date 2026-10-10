@@ -10,6 +10,9 @@ use crate::workspace::git::{
 /// Durable request, settlement, recovery and exact-effect semantics for v0.2 single-file edits.
 pub mod edit;
 
+/// Durable digest-only receipts that make multi-file edits resumable without replay.
+pub mod batch;
+
 /// Maximum number of hunks selected by default for one bounded composition.
 pub const DEFAULT_MAX_HUNKS: usize = 32;
 /// Default target bytes across whole hunks; a lone oversized hunk is retained for line paging.

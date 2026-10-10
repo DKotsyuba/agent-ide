@@ -388,6 +388,18 @@ edit: replaced; path src/x.rs; source_ref …-7; diagnostics: current_clean. Nex
 lines after 12 moved +3
 ```
 
+A multi-file edit applies one logical change across up to 16 files in ONE call ([batch API v1](batch-api-v1.md) §7):
+
+```text
+{operation_id, source_ref?, files: [
+  {path: "src/a.rs", changes: […]},                   // exactly the one-file `changes` entries
+  {path: "src/b.rs", source_ref: "…-61", changes: […]},
+  {path: "src/new.rs", create: true, content: "…"},   // a file that must not exist yet
+  {path: "docs/x.md", content: "…"}]}                 // whole new content; needs a source_ref
+```
+
+At most 32 changes per file, 128 changes and 128 KiB of `content`/`new` text in all. Every file is observed and validated first (base admitted exactly as the one-file form admits it, every change resolved, formatted once and syntax-gated); any refusal answers `edit_refused` naming each failed `file k <path>` and nothing is written. Otherwise a durable receipt records the request digest and each file's base and candidate digests, the files are written in order through the stale-safe write, and one project check (one per affected checked language) runs after the last write. The reply is a complete `edit_batch` result whose text opens with `edit: applied N of N files; source_ref …` or `edit: partial — written w of N; not written: k <path> (changed after validation | write failed | not reached), …; the same operation_id resumes the rest`, then one line per file with its landing and diagnostics. Its `source_ref` is an edit base for every written file. The same `operation_id` with the same request resumes from the receipt (written files stay, an unwritten file is written only while its bytes still equal its validated base), even after a daemon restart; a different request answers `edit: conflicting_duplicate` and writes nothing. A crash after a write answers `outcome_unknown` for the operation.
+
 ### 2.6 `ide.test` — run tests on request, in the background (implemented)
 
 Input: `{symbol}` | `{path}` | `{pattern}` | `{command}`, with optional `budget_s?: 120`.

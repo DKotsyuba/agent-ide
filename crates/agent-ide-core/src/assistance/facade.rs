@@ -150,6 +150,7 @@ fn tool_accepts_result_kind(tool: AssistanceTool, kind: ResultKind) -> bool {
             | (AssistanceTool::Symbol, ResultKind::Symbol)
             | (AssistanceTool::Graph, ResultKind::Graph)
             | (AssistanceTool::Test, ResultKind::Test)
+            | (AssistanceTool::Edit, ResultKind::EditBatch)
     )
 }
 
@@ -290,7 +291,8 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "With `path`: inclusive 1-based line range to replace."},
                     "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "The source_ref of the ide.read/ide.context this content is based on; required with `path`+`lines` and to replace an existing file with `path`+`content`, optional (but validated) with `symbol`. Omit it with `path`+`content` to create a new file."},
                     "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES, "description": "Replacement or inserted code, including the symbol's doc comment and attributes."},
-                    "changes": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "additionalProperties": false, "properties": {"lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "op": {"type": "string", "enum": ["replace", "insert", "delete"]}, "where": {"type": "string", "enum": ["before", "after", "first", "last"]}, "content": {"type": "string"}, "old": {"type": "string", "minLength": 1}, "new": {"type": "string"}, "within": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}}, "description": "1–32 changes to ONE file (named by `path`), each addressed by exactly one of `lines`, `symbol` or `old`; every address resolves against the bytes `source_ref` names before anything is applied, and overlapping or unmatched addresses are refused together with nothing written. `lines` numbers are that version's, never shifted by other changes (empty `content` deletes the range); `old` must match exactly once (add `within` to scope it) and `new` replaces exactly the matched bytes, terminators included (`\"\"` deletes the match)."}}
+                    "changes": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "additionalProperties": false, "properties": {"lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "op": {"type": "string", "enum": ["replace", "insert", "delete"]}, "where": {"type": "string", "enum": ["before", "after", "first", "last"]}, "content": {"type": "string"}, "old": {"type": "string", "minLength": 1}, "new": {"type": "string"}, "within": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}}, "description": "1–32 changes to ONE file (named by `path`), each addressed by exactly one of `lines`, `symbol` or `old`; every address resolves against the bytes `source_ref` names before anything is applied, and overlapping or unmatched addresses are refused together with nothing written. `lines` numbers are that version's, never shifted by other changes (empty `content` deletes the range); `old` must match exactly once (add `within` to scope it) and `new` replaces exactly the matched bytes, terminators included (`\"\"` deletes the match)."}},
+                    "files": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_EDIT_FILES, "items": {"type": "object", "additionalProperties": false, "required": ["path"], "properties": {"path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}, "changes": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object"}}, "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES}, "create": {"type": "boolean"}}}, "description": "One logical change across up to 16 files in ONE call, with only `operation_id` and an optional default `source_ref` beside it: each entry is {\"path\",\"changes\":[…]} (exactly the one-file `changes` entries), {\"path\",\"create\":true,\"content\"} (a new file) or {\"path\",\"content\"} (whole new content), with its own optional `source_ref`; at most 128 changes and 128 KiB of text in all. Every file is validated before the first write and any refusal writes nothing; files are written in order, one project check runs on the result, a partial write is reported per file, and the same `operation_id` resumes the rest."}
                 }
             }),
         ),
@@ -699,6 +701,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "where",
             "new_name",
             "lines",
+            "files",
         ],
         AssistanceTool::Outline => &["path", "kinds"],
         AssistanceTool::Read => &[
@@ -1190,6 +1193,9 @@ pub fn validate_call(
         }
         AssistanceTool::Stop => {
             optional_string(object, "activation_id", MAX_ACTIVATION_ID_BYTES)?;
+        }
+        AssistanceTool::Edit if object.contains_key("files") => {
+            super::batch::validate_edit_files(object)?;
         }
         AssistanceTool::Edit if object.contains_key("changes") => {
             required_string(object, "operation_id", 128)?;

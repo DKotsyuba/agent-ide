@@ -210,3 +210,428 @@ async fn legacy_batch_reads_gain_only_the_summary_line() {
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
 }
+
+/// The three text files every multi-file edit test edits, with their committed content.
+const EDIT_FILES: [&str; 3] = ["a.md", "b.md", "c.md"];
+
+/// The committed content of one [`EDIT_FILES`] file.
+fn original(name: &str) -> String {
+    format!("{name} line1\n{name} line2\n")
+}
+
+/// The content one [`edit_arguments`] change produces; applying it twice would add a second
+/// `added` line, so equality proves single application.
+fn edited(name: &str) -> String {
+    format!("{name} line1\nadded\n{name} line2\n")
+}
+
+/// A fixture holding [`EDIT_FILES`] committed with their [`original`] content.
+fn edit_fixture() -> ProductFixture {
+    let fixture = ProductFixture::new(json!([]));
+    for name in EDIT_FILES {
+        std::fs::write(fixture.root.join(name), original(name)).unwrap();
+    }
+    fixture.git(&["add", "--", "a.md", "b.md", "c.md"]);
+    fixture.git(&["commit", "--quiet", "-m", "multi-file edit fixture"]);
+    fixture
+}
+
+/// One multi-file edit request over [`EDIT_FILES`], each replacing line 1 with two lines.
+fn edit_arguments(operation_id: &str, source_ref: &str) -> Value {
+    json!({
+        "operation_id": operation_id,
+        "source_ref": source_ref,
+        "files": EDIT_FILES
+            .iter()
+            .map(|name| json!({"path": name, "changes": [{"lines": "1-1", "content": format!("{name} line1\nadded")}]}))
+            .collect::<Vec<_>>()
+    })
+}
+
+/// Reads [`EDIT_FILES`] in one items call and returns the reply's `source_ref`.
+async fn read_edit_files(actor: &mut ProductActor, fixture: &ProductFixture) -> String {
+    let (read, text) = settled_read(
+        actor,
+        fixture,
+        json!({"items": EDIT_FILES.iter().map(|name| json!({"path": name})).collect::<Vec<_>>()}),
+    )
+    .await;
+    assert!(
+        source_ref_line(&text).contains("valid for a.md, b.md, c.md"),
+        "{text}"
+    );
+    read["detail_ref"].as_str().unwrap().to_owned()
+}
+
+/// Calls `ide.edit` and returns the settled structured reply and its compact text.
+async fn settled_edit(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    arguments: Value,
+) -> (Value, String) {
+    let reply = batch_call_with_text(actor, fixture, "ide.edit", arguments).await;
+    batch_settle_with_text(actor, fixture, reply).await
+}
+
+/// Asserts every [`EDIT_FILES`] file holds exactly `expected(name)`.
+fn assert_files(fixture: &ProductFixture, expected: impl Fn(&str) -> String, context: &str) {
+    for name in EDIT_FILES {
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join(name)).unwrap(),
+            expected(name),
+            "{context}: {name}"
+        );
+    }
+}
+
+/// `ide.edit {files}` validates every file before the first write: a file made stale at any
+/// position, a change that cannot apply at any position, and a create of an existing path each
+/// refuse the whole call as `edit_refused` naming that file, and no file is written.
+#[tokio::test]
+async fn multi_file_edit_writes_nothing_when_any_file_is_stale_or_any_change_fails() {
+    let fixture = edit_fixture();
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "edit-files-refusals").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"edit-files-refusals"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    for (position, stale) in EDIT_FILES.iter().enumerate() {
+        let source_ref = read_edit_files(&mut actor, &fixture).await;
+        let native = format!("{}native\n", original(stale));
+        std::fs::write(fixture.root.join(stale), &native).unwrap();
+        let (reply, text) = settled_edit(
+            &mut actor,
+            &fixture,
+            edit_arguments(&format!("stale-{position}"), &source_ref),
+        )
+        .await;
+        assert_eq!(reply["code"], "edit_refused", "{reply} {text}");
+        assert!(
+            text.contains(&format!("file {} {stale}: stale_source", position + 1)),
+            "{text}"
+        );
+        assert_files(
+            &fixture,
+            |name| {
+                if name == *stale {
+                    native.clone()
+                } else {
+                    original(name)
+                }
+            },
+            "a stale file writes nothing",
+        );
+        std::fs::write(fixture.root.join(stale), original(stale)).unwrap();
+    }
+
+    for (position, failing) in EDIT_FILES.iter().enumerate() {
+        let source_ref = read_edit_files(&mut actor, &fixture).await;
+        let mut arguments = edit_arguments(&format!("failing-{position}"), &source_ref);
+        arguments["files"][position]["changes"] = json!([{"old": "absent text", "new": "x"}]);
+        let (reply, text) = settled_edit(&mut actor, &fixture, arguments).await;
+        assert_eq!(reply["code"], "edit_refused", "{reply} {text}");
+        assert!(
+            text.contains(&format!(
+                "file {} {failing}: 1 of 1 changes refused",
+                position + 1
+            )),
+            "{text}"
+        );
+        assert_files(&fixture, original, "a failing change writes nothing");
+    }
+
+    let source_ref = read_edit_files(&mut actor, &fixture).await;
+    let mut arguments = edit_arguments("create-existing", &source_ref);
+    arguments["files"][2] = json!({"path": "c.md", "create": true, "content": "new\n"});
+    let (reply, text) = settled_edit(&mut actor, &fixture, arguments).await;
+    assert_eq!(reply["code"], "edit_refused", "{reply} {text}");
+    assert!(text.contains("file 3 c.md: already exists"), "{text}");
+    assert_files(
+        &fixture,
+        original,
+        "a create of an existing path writes nothing",
+    );
+
+    // A refused operation id stays unused: the same id now applies.
+    let (reply, text) = settled_edit(
+        &mut actor,
+        &fixture,
+        edit_arguments("create-existing", &source_ref),
+    )
+    .await;
+    assert_eq!(reply["kind"], "edit_batch", "{reply} {text}");
+    assert!(
+        text.starts_with("edit: applied 3 of 3 files; source_ref "),
+        "{text}"
+    );
+    assert_files(&fixture, edited, "the unused id applies");
+
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A daemon crash right after the k-th write (test seam) loses the reply, which reports the
+/// unknown outcome; a replacement daemon answers the same request from the durable receipt:
+/// files 1..k are written earlier, the rest are written now, and no change is applied twice.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn multi_file_edit_resumes_after_a_crash_after_each_write_without_double_application() {
+    for written in 1..=EDIT_FILES.len() {
+        let fixture = edit_fixture();
+        let home = enable_fake_rust_checks(&fixture, &fixture.base);
+        let (fault, _) = fault_flag(&fixture, &format!("batch_edit_after_write_{written}"), true);
+        let env = [("AGENT_IDE_TEST_FAULT", fault.as_str())];
+        let mut daemon = fixture
+            .spawn_configured_daemon_with_env(
+                Some(&home),
+                false,
+                Duration::from_secs(30),
+                None,
+                &env,
+            )
+            .await;
+        let mut actor = ProductActor::new(&fixture, "edit-files-crash").await;
+        let started = actor
+            .call(
+                &fixture,
+                "ide.start",
+                json!({"activation_id":"edit-files-crash"}),
+            )
+            .await;
+        assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+        let source_ref = read_edit_files(&mut actor, &fixture).await;
+        let arguments = edit_arguments("crash-op", &source_ref);
+        let lost = actor.call(&fixture, "ide.edit", arguments.clone()).await;
+        let lost = actor.settle(&fixture, lost).await;
+        assert_eq!(
+            lost["result"]["outcome"], "outcome_unknown",
+            "a crash after a write never answers internal: {lost}"
+        );
+        assert_crash_only_exit(&mut daemon, &fixture).await;
+        actor.mcp.close().await;
+        assert_files(
+            &fixture,
+            |name| {
+                let index = EDIT_FILES.iter().position(|file| *file == name).unwrap();
+                if index < written {
+                    edited(name)
+                } else {
+                    original(name)
+                }
+            },
+            "the crash stopped the commit after the seam's write",
+        );
+
+        let mut replacement = fixture
+            .spawn_configured_daemon_with_env(
+                Some(&home),
+                false,
+                Duration::from_secs(30),
+                None,
+                &env,
+            )
+            .await;
+        let mut again = ProductActor::new(&fixture, "edit-files-crash-again").await;
+        let started = again
+            .call(
+                &fixture,
+                "ide.start",
+                json!({"activation_id":"edit-files-crash-2"}),
+            )
+            .await;
+        assert_eq!(again.settle(&fixture, started).await["kind"], "activation");
+        let (reply, text) = settled_edit(&mut again, &fixture, arguments).await;
+        assert_eq!(reply["kind"], "edit_batch", "{reply} {text}");
+        assert!(text.starts_with("edit: applied 3 of 3 files"), "{text}");
+        for (index, name) in EDIT_FILES.iter().enumerate() {
+            let earlier = format!(
+                "  {} {name}: written earlier by this operation_id",
+                index + 1
+            );
+            assert_eq!(text.contains(&earlier), index < written, "{name}: {text}");
+        }
+        assert_files(
+            &fixture,
+            edited,
+            "the retry finished without double application",
+        );
+        again.call(&fixture, "ide.stop", json!({})).await;
+        again.mcp.close().await;
+        replacement.kill().await.unwrap();
+        replacement.wait().await.unwrap();
+    }
+}
+
+/// A native write that lands between validation and the k-th write (test seam) stops the commit
+/// there: files before k are written, file k keeps the native bytes and later files are not
+/// reached. After file k is restored, the same request resumes and finishes; a different request
+/// with the same operation id conflicts and writes nothing.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn multi_file_edit_stops_at_a_native_write_and_resumes_only_unchanged_bases() {
+    for position in 1..=EDIT_FILES.len() {
+        let fixture = edit_fixture();
+        let home = enable_fake_rust_checks(&fixture, &fixture.base);
+        let (fault, _) = fault_flag(
+            &fixture,
+            &format!("batch_edit_before_write_{position}"),
+            true,
+        );
+        let env = [("AGENT_IDE_TEST_FAULT", fault.as_str())];
+        let mut daemon = fixture
+            .spawn_configured_daemon_with_env(
+                Some(&home),
+                false,
+                Duration::from_secs(30),
+                None,
+                &env,
+            )
+            .await;
+        let mut actor = ProductActor::new(&fixture, "edit-files-native").await;
+        let started = actor
+            .call(
+                &fixture,
+                "ide.start",
+                json!({"activation_id":"edit-files-native"}),
+            )
+            .await;
+        assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+        let source_ref = read_edit_files(&mut actor, &fixture).await;
+        let arguments = edit_arguments("native-op", &source_ref);
+        let (reply, text) = settled_edit(&mut actor, &fixture, arguments.clone()).await;
+        assert_eq!(reply["kind"], "edit_batch", "{reply} {text}");
+        let stale = EDIT_FILES[position - 1];
+        assert!(
+            text.starts_with(&format!(
+                "edit: partial — written {} of 3; not written: {position} {stale} (changed after validation)",
+                position - 1
+            )),
+            "{text}"
+        );
+        let native = format!("{}native\n", original(stale));
+        assert_files(
+            &fixture,
+            |name| {
+                let index = EDIT_FILES.iter().position(|file| *file == name).unwrap() + 1;
+                match index.cmp(&position) {
+                    std::cmp::Ordering::Less => edited(name),
+                    std::cmp::Ordering::Equal => native.clone(),
+                    std::cmp::Ordering::Greater => original(name),
+                }
+            },
+            "the native bytes are never overwritten",
+        );
+
+        // Still changed: the retry stops at the same file again.
+        let (_, text) = settled_edit(&mut actor, &fixture, arguments.clone()).await;
+        assert!(text.starts_with("edit: partial"), "{text}");
+        std::fs::write(fixture.root.join(stale), original(stale)).unwrap();
+        let (reply, text) = settled_edit(&mut actor, &fixture, arguments.clone()).await;
+        assert_eq!(reply["kind"], "edit_batch", "{reply} {text}");
+        assert!(text.starts_with("edit: applied 3 of 3 files"), "{text}");
+        assert_files(&fixture, edited, "the resume finished the rest once");
+
+        let mut other = arguments.clone();
+        other["files"][0]["changes"][0]["content"] = json!("different");
+        let (_, text) = settled_edit(&mut actor, &fixture, other).await;
+        assert!(text.starts_with("edit: conflicting_duplicate"), "{text}");
+        assert_files(&fixture, edited, "a conflicting duplicate writes nothing");
+
+        actor.call(&fixture, "ide.stop", json!({})).await;
+        actor.mcp.close().await;
+        daemon.kill().await.unwrap();
+        daemon.wait().await.unwrap();
+    }
+}
+
+/// One multi-file edit of three Rust files runs exactly one project check and reports each
+/// file's diagnostics; the reply's `source_ref` is an edit base for every written file.
+#[tokio::test]
+async fn multi_file_edit_runs_one_project_check_and_reports_each_file() {
+    let fixture = ProductFixture::new(json!([]));
+    for name in ["src/a.rs", "src/b.rs"] {
+        std::fs::write(fixture.root.join(name), "pub fn f() -> i32 {\n    1\n}\n").unwrap();
+    }
+    fixture.git(&["add", "--", "src/a.rs", "src/b.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "rust edit fixture"]);
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture
+        .spawn_configured_daemon(Some(&home), true, Duration::from_secs(30), None)
+        .await;
+    let mut actor = ProductActor::new(&fixture, "edit-files-check").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"edit-files-check"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let settle = |expected: usize| {
+        let database = fixture.telemetry.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while completed_check_count(&database).await < expected {
+                assert!(tokio::time::Instant::now() < deadline, "no check completed");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            // Quiet period: nothing else may start.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            completed_check_count(&database).await
+        }
+    };
+    let before = settle(1).await;
+    let (read, _) = settled_read(
+        &mut actor,
+        &fixture,
+        json!({"items":[{"path":"src/lib.rs"},{"path":"src/a.rs"},{"path":"src/b.rs"}]}),
+    )
+    .await;
+    let source_ref = read["detail_ref"].as_str().unwrap().to_owned();
+    let (reply, text) = settled_edit(
+        &mut actor,
+        &fixture,
+        json!({"operation_id":"rust-three","source_ref":source_ref,"files":[
+            {"path":"src/lib.rs","changes":[{"lines":"1-1","content":"pub fn value() -> i32 { 8 }"}]},
+            {"path":"src/a.rs","changes":[{"lines":"2-2","content":"    2"}]},
+            {"path":"src/b.rs","changes":[{"lines":"2-2","content":"    3"}]}]}),
+    )
+    .await;
+    assert_eq!(reply["kind"], "edit_batch", "{reply} {text}");
+    assert!(text.starts_with("edit: applied 3 of 3 files"), "{text}");
+    for (index, name) in ["src/lib.rs", "src/a.rs", "src/b.rs"].iter().enumerate() {
+        let line = text
+            .lines()
+            .find(|line| line.starts_with(&format!("  {} {name}: replaced", index + 1)))
+            .unwrap_or_else(|| panic!("no line for {name}: {text}"));
+        assert!(line.contains("; diagnostics "), "{line}");
+    }
+    assert_eq!(
+        settle(before + 1).await,
+        before + 1,
+        "exactly one project check ran for the three files"
+    );
+    let edit_ref = reply["detail_ref"].as_str().unwrap().to_owned();
+    let next = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"rust-next","path":"src/b.rs","source_ref":edit_ref,"changes":[{"lines":"2-2","content":"    4"}]}),
+        )
+        .await;
+    let next = actor.settle(&fixture, next).await;
+    assert_eq!(next["result"]["outcome"], "replaced", "{next}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}

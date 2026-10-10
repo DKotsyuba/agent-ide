@@ -313,6 +313,433 @@ pub(crate) fn read_follow_up(form: ReadForm, cut: &[&ReadItem]) -> String {
     footer
 }
 
+/// Most files one `ide.edit {files}` request may name.
+pub(crate) const MAX_EDIT_FILES: usize = 16;
+
+/// Most changes one `ide.edit {files}` request may carry across all its files.
+pub(crate) const MAX_EDIT_CHANGES_TOTAL: usize = 128;
+
+/// Most bytes all `content` and `new` strings of one `ide.edit {files}` request carry together.
+pub(crate) const MAX_EDIT_TEXT_BYTES: usize = 128 * 1024;
+
+/// The closed entry shape a `files` entry must have, quoted in its refusal.
+const FILE_SHAPE: &str = "an array of 1 to 16 entries, each with \"path\" and exactly one of \
+\"changes\" or \"content\" (\"create\":true only with \"content\"), plus an optional \"source_ref\"";
+
+/// Validates one `ide.edit {operation_id, source_ref?, files}` request object.
+///
+/// Only `operation_id` (required), a batch default `source_ref` and `files` may appear. `files`
+/// holds 1 to [`MAX_EDIT_FILES`] objects with unique paths, each exactly one of `changes`
+/// (validated exactly as the one-file `changes` form with the entry's or the batch's
+/// `source_ref`), `content` with `create: true` (validated as the creation form) or `content`
+/// alone (a whole-content replacement, which needs a `source_ref`). Across all files at most
+/// [`MAX_EDIT_CHANGES_TOTAL`] changes and [`MAX_EDIT_TEXT_BYTES`] of `content` and `new` text are
+/// accepted. The one-file rules run through the facade's own validation of the equivalent
+/// one-file request, so both forms refuse the same entries the same way; nothing is observed.
+pub(crate) fn validate_edit_files(object: &Map<String, Value>) -> Result<(), ParameterError> {
+    use super::facade::validate_call;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "operation_id" | "source_ref" | "files"))
+    {
+        return Err(invalid_field(
+            "files",
+            FieldRule::OneOf("used only with \"operation_id\" and an optional \"source_ref\""),
+        ));
+    }
+    let operation_id = object
+        .get("operation_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| invalid_field("operation_id", FieldRule::Required))?;
+    if operation_id.len() > 128 {
+        return Err(invalid_field("operation_id", FieldRule::TooLong(128)));
+    }
+    let default_ref = match object.get("source_ref") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|reference| !reference.is_empty() && reference.len() <= 128)
+                .ok_or_else(|| invalid_field("source_ref", FieldRule::NonEmptyString))?,
+        ),
+    };
+    let shape = || invalid_field("files", FieldRule::OneOf(FILE_SHAPE));
+    let files = object
+        .get("files")
+        .and_then(Value::as_array)
+        .filter(|files| (1..=MAX_EDIT_FILES).contains(&files.len()))
+        .ok_or_else(shape)?;
+    let mut paths = BTreeSet::new();
+    let mut changes_total = 0usize;
+    let mut text_bytes = 0usize;
+    for entry in files {
+        let entry = entry.as_object().ok_or_else(shape)?;
+        if entry.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "path" | "source_ref" | "changes" | "content" | "create"
+            )
+        }) {
+            return Err(shape());
+        }
+        let path = entry
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty() && path.len() <= 1024)
+            .ok_or_else(shape)?;
+        if let Some(rule) = path_shape_rule(path) {
+            return Err(invalid_field("files", rule));
+        }
+        if !paths.insert(path) {
+            return Err(invalid_field(
+                "files",
+                FieldRule::OneOf("entries naming each path once"),
+            ));
+        }
+        let reference = match entry.get("source_ref") {
+            None => default_ref,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .filter(|reference| !reference.is_empty() && reference.len() <= 128)
+                    .ok_or_else(|| invalid_field("source_ref", FieldRule::NonEmptyString))?,
+            ),
+        };
+        let create = match entry.get("create") {
+            None => false,
+            Some(Value::Bool(create)) => *create,
+            Some(_) => return Err(invalid_field("create", FieldRule::Boolean)),
+        };
+        let mut single = json!({"operation_id": operation_id, "path": path});
+        match (entry.get("changes"), entry.get("content")) {
+            (Some(changes), None) if !create => {
+                let list = changes.as_array().ok_or_else(shape)?;
+                changes_total += list.len();
+                text_bytes += list
+                    .iter()
+                    .flat_map(|change| ["content", "new"].map(|key| change.get(key)))
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::len)
+                    .sum::<usize>();
+                single["changes"] = changes.clone();
+                if let Some(reference) = reference {
+                    single["source_ref"] = json!(reference);
+                }
+            }
+            (None, Some(content)) => {
+                let text = content
+                    .as_str()
+                    .ok_or_else(|| invalid_field("content", FieldRule::String))?;
+                text_bytes += text.len();
+                single["content"] = content.clone();
+                match (create, reference) {
+                    (true, _) => {}
+                    (false, Some(reference)) => single["source_ref"] = json!(reference),
+                    (false, None) => {
+                        return Err(invalid_field("source_ref", FieldRule::ReplaceSourceRef));
+                    }
+                }
+            }
+            _ => return Err(shape()),
+        }
+        validate_call(AssistanceTool::Edit, single)?;
+    }
+    if changes_total > MAX_EDIT_CHANGES_TOTAL {
+        return Err(invalid_field(
+            "files",
+            FieldRule::OneOf("at most 128 changes across all files"),
+        ));
+    }
+    if text_bytes > MAX_EDIT_TEXT_BYTES {
+        return Err(invalid_field(
+            "files",
+            FieldRule::TooLong(MAX_EDIT_TEXT_BYTES),
+        ));
+    }
+    Ok(())
+}
+
+/// What one `files` entry asks for.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum EditBody {
+    /// `changes`: the validated change objects, applied as the one-file `changes` form does.
+    Changes(Vec<Value>),
+    /// `content` with `create: true`: the content of a file that must not exist yet.
+    Create(String),
+    /// `content` alone: the whole new content of an existing file.
+    Replace(String),
+}
+
+/// One `files` entry of a validated multi-file edit, in request order.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct EditFile {
+    /// Worktree-relative path exactly as requested.
+    pub path: String,
+    /// The entry's own `source_ref`, else the batch default; `None` when neither was given.
+    pub source_ref: Option<String>,
+    /// The requested change of this file.
+    pub body: EditBody,
+}
+
+/// Reads a validated `ide.edit {files}` request back into its operation id and typed files.
+///
+/// Returns `None` when the request is not a multi-file edit (no `files` array or no
+/// `operation_id`). The facade has validated every shape; an entry that is nevertheless
+/// malformed makes the whole request `None` rather than silently dropping a file.
+pub(crate) fn edit_files_request(parameters: &Value) -> Option<(String, Vec<EditFile>)> {
+    let operation_id = parameters.get("operation_id")?.as_str()?.to_owned();
+    let default_ref = parameters.get("source_ref").and_then(Value::as_str);
+    let files = parameters
+        .get("files")?
+        .as_array()?
+        .iter()
+        .map(|entry| {
+            let path = entry.get("path")?.as_str()?.to_owned();
+            let source_ref = entry
+                .get("source_ref")
+                .and_then(Value::as_str)
+                .or(default_ref)
+                .map(str::to_owned);
+            let create = entry.get("create").and_then(Value::as_bool) == Some(true);
+            let body = match (entry.get("changes"), entry.get("content")) {
+                (Some(changes), None) => EditBody::Changes(changes.as_array()?.clone()),
+                (None, Some(content)) if create => EditBody::Create(content.as_str()?.to_owned()),
+                (None, Some(content)) => EditBody::Replace(content.as_str()?.to_owned()),
+                _ => return None,
+            };
+            Some(EditFile {
+                path,
+                source_ref,
+                body,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((operation_id, files))
+}
+
+/// Digest of the caller's own multi-file edit arguments (`operation_id`, the batch
+/// `source_ref`, `files`) — never anything the worker derives — so an identical retry, even
+/// after a daemon restart, matches its durable receipt and a changed request conflicts.
+pub(crate) fn edit_request_digest(parameters: &Value) -> [u8; 32] {
+    // serde_json keeps object keys sorted, so equal requests serialize to equal bytes.
+    let canonical = json!({
+        "operation_id": parameters.get("operation_id"),
+        "source_ref": parameters.get("source_ref"),
+        "files": parameters.get("files"),
+    });
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"changes-batch-edit-request-v1");
+    hash.update(canonical.to_string().as_bytes());
+    *hash.finalize().as_bytes()
+}
+
+/// Why a file of a multi-file edit was not written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NotWritten {
+    /// Its bytes no longer match the bytes it was validated against.
+    ChangedAfterValidation,
+    /// The write failed or could not be established (I/O, deadline, cancellation, authority).
+    IoError,
+    /// The commit stopped at an earlier file.
+    NotReached,
+}
+
+impl NotWritten {
+    /// The reason's closed word in replies (`changed after validation`, …).
+    pub(crate) const fn words(self) -> &'static str {
+        match self {
+            Self::ChangedAfterValidation => "changed after validation",
+            Self::IoError => "write failed",
+            Self::NotReached => "not reached",
+        }
+    }
+}
+
+/// The settled state of one file of a multi-file edit after this call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FileState {
+    /// The file did not exist and was created.
+    Created,
+    /// The file's bytes were replaced.
+    Replaced,
+    /// The candidate equalled the current bytes; nothing was written.
+    Unchanged,
+    /// The file was written by an earlier call with the same operation id.
+    WrittenEarlier,
+    /// The file was not written; the reason says why.
+    NotWritten(NotWritten),
+    /// A write may have happened but its result could not be established.
+    Unknown,
+}
+
+impl FileState {
+    /// True when the file now holds this operation's candidate.
+    pub(crate) const fn written(self) -> bool {
+        matches!(
+            self,
+            Self::Created | Self::Replaced | Self::Unchanged | Self::WrittenEarlier
+        )
+    }
+}
+
+/// One file's line in a multi-file edit reply.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FileReport {
+    /// Worktree-relative path as requested.
+    pub path: String,
+    /// What happened to the file in this call.
+    pub state: FileState,
+    /// The first line of the file's landing note (where its changes landed), when written.
+    pub note: Option<String>,
+    /// The file's diagnostics in a few words (`clean`, `2 new problems`, `unknown`, …).
+    pub diagnostics: Option<String>,
+}
+
+/// Renders the whole reply text of one multi-file edit, summary line first.
+///
+/// `files` holds every requested file in request order. When all are written the first line is
+/// `edit: applied <w> of <n> files; source_ref <ref> (valid for all <w>); diagnostics: <d>`;
+/// otherwise it is `edit: partial — written <w> of <n>; not written: <k> <path> (<reason>), …;
+/// the same operation_id resumes the rest`, followed by a `source_ref <ref> (valid for the
+/// written files)` line when any file is written. One line per file follows
+/// (`  <k> <path>: <state>[; <note>][; diagnostics <d>]`), then at most eight `new:` problem lines.
+/// Every line states a fact; none names a waiting or repeating instruction.
+pub(crate) fn render_edit_reply(
+    files: &[FileReport],
+    source_ref: Option<&str>,
+    diagnostics: &str,
+    new_lines: &[String],
+) -> String {
+    let written = files.iter().filter(|file| file.state.written()).count();
+    let total = files.len();
+    let mut text = if written == total {
+        let reference = source_ref
+            .map(|reference| format!("; source_ref {reference} (valid for all {written})"))
+            .unwrap_or_default();
+        format!("edit: applied {written} of {total} files{reference}; diagnostics: {diagnostics}\n")
+    } else {
+        let missing = files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, file)| match file.state {
+                FileState::NotWritten(reason) => {
+                    Some(format!("{} {} ({})", index + 1, file.path, reason.words()))
+                }
+                FileState::Unknown => Some(format!("{} {} (unknown)", index + 1, file.path)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut head = format!(
+            "edit: partial — written {written} of {total}; not written: {missing}; the same \
+             operation_id resumes the rest\n"
+        );
+        if let Some(reference) = source_ref.filter(|_| written > 0) {
+            head.push_str(&format!(
+                "source_ref {reference} (valid for the written files); diagnostics: {diagnostics}\n"
+            ));
+        }
+        head
+    };
+    for (index, file) in files.iter().enumerate() {
+        let state = match file.state {
+            FileState::Created => "created".to_owned(),
+            FileState::Replaced => "replaced".to_owned(),
+            FileState::Unchanged => "unchanged".to_owned(),
+            FileState::WrittenEarlier => "written earlier by this operation_id".to_owned(),
+            FileState::NotWritten(reason) => format!("not written ({})", reason.words()),
+            FileState::Unknown => "unknown (the write may have happened)".to_owned(),
+        };
+        text.push_str(&format!("  {} {}: {state}", index + 1, file.path));
+        if let Some(note) = &file.note {
+            text.push_str(&format!("; {note}"));
+        }
+        if let Some(diagnostics) = &file.diagnostics {
+            text.push_str(&format!("; diagnostics {diagnostics}"));
+        }
+        text.push('\n');
+    }
+    for line in new_lines.iter().take(8) {
+        text.push_str(line);
+        text.push('\n');
+    }
+    text
+}
+
+/// Summarizes one multi-file edit's per-file project-check diagnostics.
+///
+/// `files` pairs each checked file's path with its diagnostics; files never checked are left
+/// out by the caller. Returns the summary words for the first line (`clean`, `<n> new problems
+/// in <f> files`, `unknown`, `not analysed`, or `none` without any checked file), the per-file
+/// words in the same order, and at most eight `new:` problem lines across all files.
+pub(crate) fn summarize_diagnostics(
+    files: &[(String, super::reply::EditDiagnostics)],
+) -> (String, Vec<String>, Vec<String>) {
+    use super::reply::EditDiagnostics;
+    let mut words = Vec::with_capacity(files.len());
+    let mut new_lines = Vec::new();
+    let (mut problems, mut problem_files, mut unknown, mut clean, mut elsewhere) =
+        (0usize, 0usize, false, false, 0u32);
+    for (_, diagnostics) in files {
+        words.push(match diagnostics {
+            EditDiagnostics::CurrentClean { project_errors } => {
+                clean = true;
+                elsewhere = elsewhere.max(*project_errors);
+                "clean".to_owned()
+            }
+            EditDiagnostics::CurrentReported {
+                messages,
+                truncated,
+                ..
+            } => {
+                let fresh = messages
+                    .iter()
+                    .filter(|message| message.starts_with("new: "))
+                    .collect::<Vec<_>>();
+                if fresh.is_empty() {
+                    clean = true;
+                    "pre-existing problems only".to_owned()
+                } else {
+                    problems += fresh.len();
+                    problem_files += 1;
+                    for message in &fresh {
+                        if new_lines.len() < 8 {
+                            new_lines.push((*message).clone());
+                        }
+                    }
+                    let plus = if *truncated { "+" } else { "" };
+                    format!("{}{plus} new problems", fresh.len())
+                }
+            }
+            EditDiagnostics::Unknown {} => {
+                unknown = true;
+                "unknown".to_owned()
+            }
+            EditDiagnostics::NotAnalysed { .. } => "not analysed".to_owned(),
+            EditDiagnostics::Pending { .. } => {
+                unknown = true;
+                "pending".to_owned()
+            }
+        });
+    }
+    let summary = if problems > 0 {
+        format!("{problems} new problems in {problem_files} files")
+    } else if unknown {
+        "unknown".to_owned()
+    } else if clean && elsewhere > 0 {
+        format!("clean in these files; the project check reports {elsewhere} errors elsewhere")
+    } else if clean {
+        "clean".to_owned()
+    } else if files.is_empty() {
+        "none (no checked language)".to_owned()
+    } else {
+        "not analysed".to_owned()
+    };
+    (summary, words, new_lines)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,6 +965,223 @@ mod tests {
         assert!(
             footer.contains("f7.md") && !footer.contains("f8.md"),
             "{footer}"
+        );
+    }
+
+    /// Validates one `ide.edit {files}` request through the facade, as a call would be.
+    fn edit(request: Value) -> Result<(), ParameterError> {
+        crate::assistance::facade::validate_call(AssistanceTool::Edit, request).map(|_| ())
+    }
+
+    #[test]
+    fn edit_files_accept_the_three_entry_forms() {
+        assert!(
+            edit(json!({"operation_id":"op","source_ref":"r-1","files":[
+                {"path":"a.rs","changes":[{"lines":"1-2","content":"x"}]},
+                {"path":"b.rs","source_ref":"r-2","changes":[{"old":"a","new":"b"}]},
+                {"path":"c.rs","changes":[{"symbol":"c.rs#f","op":"delete"}]},
+                {"path":"new.rs","create":true,"content":"fn main() {}\n"},
+                {"path":"d.md","content":"whole"}]}))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn edit_files_refuse_bad_shapes_and_mixes() {
+        for bad in [
+            json!({"files":[{"path":"a.md","content":"x","create":true}]}),
+            json!({"operation_id":"op","files":[]}),
+            json!({"operation_id":"op","path":"a.md","files":[{"path":"a.md","create":true,"content":"x"}]}),
+            json!({"operation_id":"op","files":[{"path":"a.md"}]}),
+            json!({"operation_id":"op","files":[{"path":"a.md","content":"x","changes":[{"lines":"1-1","content":""}]}]}),
+            json!({"operation_id":"op","files":[{"path":"a.md","create":true,"changes":[{"symbol":"a.md#x","op":"delete"}]}]}),
+            json!({"operation_id":"op","files":[{"path":"a.md","content":"replace without a base"}]}),
+            json!({"operation_id":"op","files":[{"path":"a.md","changes":[{"lines":"1-1","content":""}]}]}),
+            json!({"operation_id":"op","files":[{"path":"../a.md","create":true,"content":"x"}]}),
+            json!({"operation_id":"op","files":[{"path":"a.md","create":true,"content":"x"},{"path":"a.md","create":true,"content":"y"}]}),
+            json!({"operation_id":"op","files":[{"path":"a.md","create":"yes","content":"x"}]}),
+            json!({"operation_id":"op","files":[{"path":"a.md","create":true,"content":"x","extra":1}]}),
+        ] {
+            assert!(edit(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn edit_files_cap_files_changes_and_text() {
+        let file =
+            |index: usize| json!({"path": format!("f{index}.md"), "create": true, "content": "x"});
+        assert!(
+            edit(json!({"operation_id":"op","files":(0..16).map(file).collect::<Vec<_>>()}))
+                .is_ok()
+        );
+        assert!(
+            edit(json!({"operation_id":"op","files":(0..17).map(file).collect::<Vec<_>>()}))
+                .is_err()
+        );
+        let many = |index: usize| {
+            json!({"path": format!("f{index}.rs"), "changes": (0..32)
+                .map(|line| json!({"symbol": format!("f{index}.rs#s{line}"), "op": "delete"}))
+                .collect::<Vec<_>>()})
+        };
+        assert!(
+            edit(json!({"operation_id":"op","files":(0..4).map(many).collect::<Vec<_>>()})).is_ok()
+        );
+        assert_eq!(
+            edit(json!({"operation_id":"op","files":(0..5).map(many).collect::<Vec<_>>()})),
+            Err(invalid_field(
+                "files",
+                FieldRule::OneOf("at most 128 changes across all files")
+            ))
+        );
+        let large = |index: usize| json!({"path": format!("f{index}.md"), "create": true, "content": "y".repeat(40 * 1024)});
+        assert_eq!(
+            edit(json!({"operation_id":"op","files":(0..4).map(large).collect::<Vec<_>>()})),
+            Err(ParameterError::InvalidObject),
+            "160 KiB of content is over the 136 KiB argument bound before the text total"
+        );
+        let medium = |index: usize| json!({"path": format!("f{index}.md"), "create": true, "content": "y".repeat(33 * 1024)});
+        assert!(
+            edit(json!({"operation_id":"op","files":(0..3).map(medium).collect::<Vec<_>>()}))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn edit_requests_read_back_and_digest_only_the_callers_arguments() {
+        let request = json!({"operation_id":"op","source_ref":"r-1","files":[
+            {"path":"a.rs","changes":[{"lines":"1-2","content":"x"}]},
+            {"path":"b.rs","source_ref":"r-2","content":"whole"},
+            {"path":"c.rs","create":true,"content":"new"}]});
+        let (operation, files) = edit_files_request(&request).unwrap();
+        assert_eq!(operation, "op");
+        assert_eq!(
+            files,
+            vec![
+                EditFile {
+                    path: "a.rs".into(),
+                    source_ref: Some("r-1".into()),
+                    body: EditBody::Changes(vec![json!({"lines":"1-2","content":"x"})]),
+                },
+                EditFile {
+                    path: "b.rs".into(),
+                    source_ref: Some("r-2".into()),
+                    body: EditBody::Replace("whole".into()),
+                },
+                EditFile {
+                    path: "c.rs".into(),
+                    source_ref: Some("r-1".into()),
+                    body: EditBody::Create("new".into()),
+                },
+            ]
+        );
+        let reordered: Value = serde_json::from_str(
+            r#"{"files":[{"changes":[{"content":"x","lines":"1-2"}],"path":"a.rs"},{"content":"whole","source_ref":"r-2","path":"b.rs"},{"create":true,"path":"c.rs","content":"new"}],"source_ref":"r-1","operation_id":"op"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            edit_request_digest(&request),
+            edit_request_digest(&reordered)
+        );
+        let mut changed = request.clone();
+        changed["files"][2]["content"] = json!("other");
+        assert_ne!(edit_request_digest(&request), edit_request_digest(&changed));
+    }
+
+    #[test]
+    fn edit_replies_state_every_file_and_open_with_the_outcome() {
+        let report = |path: &str, state| FileReport {
+            path: path.into(),
+            state,
+            note: None,
+            diagnostics: None,
+        };
+        let applied = render_edit_reply(
+            &[
+                FileReport {
+                    note: Some("1 change applied: change 1: lines 2 replaced (now 2)".into()),
+                    diagnostics: Some("clean".into()),
+                    ..report("a.rs", FileState::Replaced)
+                },
+                report("b.rs", FileState::WrittenEarlier),
+                report("c.rs", FileState::Created),
+            ],
+            Some("ref-9"),
+            "clean",
+            &[],
+        );
+        assert_eq!(
+            applied,
+            "edit: applied 3 of 3 files; source_ref ref-9 (valid for all 3); diagnostics: clean\n  \
+             1 a.rs: replaced; 1 change applied: change 1: lines 2 replaced (now 2); diagnostics clean\n  \
+             2 b.rs: written earlier by this operation_id\n  3 c.rs: created\n"
+        );
+        let partial = render_edit_reply(
+            &[
+                report("a.rs", FileState::Replaced),
+                report(
+                    "b.rs",
+                    FileState::NotWritten(NotWritten::ChangedAfterValidation),
+                ),
+                report("c.rs", FileState::NotWritten(NotWritten::NotReached)),
+            ],
+            Some("ref-9"),
+            "unknown",
+            &["new: a.rs:1:1 error x".into()],
+        );
+        assert!(
+            partial.starts_with(
+                "edit: partial — written 1 of 3; not written: 2 b.rs (changed after validation), \
+             3 c.rs (not reached); the same operation_id resumes the rest\nsource_ref ref-9 \
+             (valid for the written files); diagnostics: unknown\n"
+            ),
+            "{partial}"
+        );
+        assert!(partial.ends_with("new: a.rs:1:1 error x\n"), "{partial}");
+        for banned in [
+            "poll",
+            "every few seconds",
+            "in a few seconds",
+            "until it completes",
+            "again every",
+        ] {
+            assert!(
+                !applied.contains(banned) && !partial.contains(banned),
+                "{banned}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostics_summaries_count_new_problems_per_file() {
+        use crate::assistance::reply::EditDiagnostics;
+        let (summary, words, lines) = summarize_diagnostics(&[
+            (
+                "a.rs".into(),
+                EditDiagnostics::CurrentClean { project_errors: 0 },
+            ),
+            (
+                "b.rs".into(),
+                EditDiagnostics::CurrentReported {
+                    messages: vec![
+                        "new: b.rs:1:1 error E1".into(),
+                        "pre-existing: b.rs:2:1 warning W".into(),
+                    ],
+                    delta: String::new(),
+                    truncated: false,
+                },
+            ),
+            (
+                "c.md".into(),
+                EditDiagnostics::NotAnalysed { reason: "r".into() },
+            ),
+        ]);
+        assert_eq!(summary, "1 new problems in 1 files");
+        assert_eq!(words, ["clean", "1 new problems", "not analysed"]);
+        assert_eq!(lines, ["new: b.rs:1:1 error E1"]);
+        assert_eq!(summarize_diagnostics(&[]).0, "none (no checked language)");
+        assert_eq!(
+            summarize_diagnostics(&[("a.rs".into(), EditDiagnostics::Unknown {})]).0,
+            "unknown"
         );
     }
 }

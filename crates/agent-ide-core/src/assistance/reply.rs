@@ -310,6 +310,9 @@ pub enum ResultKind {
     Graph,
     /// A background test run result from `ide.test`.
     Test,
+    /// The per-file outcome of a multi-file `ide.edit {files}` (batch-api-v1 §7); its text opens
+    /// with `edit: applied …` or `edit: partial …`.
+    EditBatch,
 }
 
 /// Serde's skip test for a zero count.
