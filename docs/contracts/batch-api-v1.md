@@ -27,7 +27,7 @@ Forms and caps at a glance (the canonical example of each is under its section):
 - Argument limit of the batch forms of `ide.read`, `ide.outline`, `ide.symbol` and `ide.graph`: 16 KiB of serialized JSON (single forms stay at 4 KiB). `ide.test` stays at 24 KiB and `ide.edit` at 136 KiB. Each entry keeps its existing bound (paths and symbol addresses at most 1024 bytes).
 - A batch that does not finish within the inline window (8 s) answers with the outbox's pending placeholder and its `detail_ref` (session-outbox-v1 §8.7); its complete result is then delivered once as one `job-ready` fact through `defer` (session-outbox-v1 §3.2, §13.3). Source-bearing results are not pushed as hook text; they ride the next `ide.*` reply or `ide.inspect {}`. A batch item listed as pending reads `pending: <item> - will be delivered` and names no call.
 - A block whose file changed between observation and delivery is not served stale; it reads as the outbox's discard line `discarded: <path> changed; repeat <tool> <target>` (session-outbox-v1 §7).
-- Reply hygiene (M024-M027-REPLY-HYGIENE r1): no reply line of these forms contains `poll`, `every few seconds`, `in a few seconds`, `until it completes` or `again every`, and no running or pending line carries elapsed seconds. Lines state facts.
+- Reply hygiene (M024-M027-REPLY-HYGIENE r2, reply-hygiene-v1 §2): no reply line of these forms contains `poll`, `every few seconds`, `in a few seconds`, `until it completes` or `again every`, and no running or pending line carries elapsed seconds. Lines state facts.
 
 ## 2. `ide.read {items}`
 

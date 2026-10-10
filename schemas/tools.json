@@ -339,6 +339,37 @@
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "force": {
+          "default": false,
+          "description": "With `items`: return the text of an item even when its bytes are unchanged since your earlier read.",
+          "type": "boolean"
+        },
+        "items": {
+          "description": "Everything to read in ONE call, up to 32 items over at most 16 files, instead of `symbol`, `path`, `lines`, `symbols` or `ranges`: each item is exactly one of {\"symbol\":\"src/a.rs#Foo/bar\"}, {\"path\":\"docs/x.md\"} (the whole file) or {\"path\":\"src/b.rs\",\"lines\":\"10-40\"}. The reply opens with a summary line, then one block per item in request order; a failed item fails only itself, and one `source_ref` is valid for every file whose items were all delivered.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "lines": {
+                "pattern": "^[0-9]+-[0-9]+$",
+                "type": "string"
+              },
+              "path": {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              "symbol": {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "type": "array"
+        },
         "lines": {
           "description": "Inclusive 1-based line range such as `120-180`.",
           "pattern": "^[0-9]+-[0-9]+$",

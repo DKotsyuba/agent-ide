@@ -314,7 +314,9 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root; alone it reads the whole file, with `lines` or `ranges` those lines."},
                     "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "Inclusive 1-based line range such as `120-180`."},
                     "symbols": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "description": "Several bodies in one reply, request order, one `source_ref` valid for every file included: `[\"src/a.rs#Foo/bar\",\"src/b.rs#qux\"]`. Unknown symbols are reported per item without failing the rest; a bare file path reads the text of a file no IDE language reads."},
-                    "ranges": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "description": "Several line ranges of `path` in one reply, request order, with the same numbered gutter and one `source_ref`."}
+                    "ranges": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "description": "Several line ranges of `path` in one reply, request order, with the same numbered gutter and one `source_ref`."},
+                    "items": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_READ_ITEMS, "items": {"type": "object", "additionalProperties": false, "properties": {"symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}}}, "description": "Everything to read in ONE call, up to 32 items over at most 16 files, instead of `symbol`, `path`, `lines`, `symbols` or `ranges`: each item is exactly one of {\"symbol\":\"src/a.rs#Foo/bar\"}, {\"path\":\"docs/x.md\"} (the whole file) or {\"path\":\"src/b.rs\",\"lines\":\"10-40\"}. The reply opens with a summary line, then one block per item in request order; a failed item fails only itself, and one `source_ref` is valid for every file whose items were all delivered."},
+                    "force": {"type": "boolean", "default": false, "description": "With `items`: return the text of an item even when its bytes are unchanged since your earlier read."}
                 }
             }),
         ),
@@ -486,8 +488,8 @@ pub enum ParameterError {
     ContextTarget,
     /// `ide.outline` requires a relative file or directory path.
     OutlineTarget,
-    /// `ide.read` needs exactly one of: `symbol`, `path` alone (the whole file), `path` with
-    /// `lines`, `path` with `ranges`, or `symbols`.
+    /// `ide.read` needs exactly one of: `items`, `symbol`, `path` alone (the whole file), `path`
+    /// with `lines`, `path` with `ranges`, or `symbols`.
     ReadTarget,
     /// `ide.edit` needs `symbol` (with `op`), or `path` with `lines` and `source_ref` for a range
     /// replace, or the full-file form `path` + `content` (with `source_ref` to replace an existing
@@ -628,8 +630,8 @@ impl ParameterError {
             Self::ContextTarget => CONTEXT_TARGET_MESSAGE.to_string(),
             Self::OutlineTarget => OUTLINE_TARGET_MESSAGE.to_string(),
             Self::ReadTarget => {
-                "ide.read needs one form: `symbol`, or `path` alone (the whole file), or `path` \
-                 with `lines`, or `path` with `ranges`, or `symbols` — exactly one"
+                "ide.read needs one form: `items`, or `symbol`, or `path` alone (the whole \
+                 file), or `path` with `lines`, or `path` with `ranges`, or `symbols` — exactly one"
                     .to_string()
             }
             Self::EditTarget => {
@@ -699,7 +701,9 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "lines",
         ],
         AssistanceTool::Outline => &["path", "kinds"],
-        AssistanceTool::Read => &["symbol", "path", "lines", "symbols", "ranges"],
+        AssistanceTool::Read => &[
+            "symbol", "path", "lines", "symbols", "ranges", "items", "force",
+        ],
         AssistanceTool::Symbol => &["symbol", "usages", "callers", "callees", "history"],
         AssistanceTool::Graph => &["symbol", "direction", "depth", "tests"],
         AssistanceTool::Test => &[
@@ -708,7 +712,8 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
     }
 }
 
-/// Returns the hard argument-object byte limit for one logical tool.
+/// Returns the hard argument-object byte limit of one logical tool's non-batch forms; a batch
+/// form (`super::batch::batch_key`) is bounded by `super::batch::MAX_BATCH_PARAMETER_BYTES`.
 fn parameter_limit(tool: AssistanceTool) -> usize {
     match tool {
         AssistanceTool::Edit => crate::changes::edit::MAX_EDIT_ARGUMENT_BYTES,
@@ -729,12 +734,12 @@ fn echoable_field(field: &str) -> Option<String> {
 }
 
 /// Builds one field-level rejection naming the violated closed rule.
-fn invalid_field(field: &'static str, rule: FieldRule) -> ParameterError {
+pub(super) fn invalid_field(field: &'static str, rule: FieldRule) -> ParameterError {
     ParameterError::InvalidField { field, rule }
 }
 
 /// Names the closed relative-path rule one already-bounded path string violated, if any.
-fn path_shape_rule(path: &str) -> Option<FieldRule> {
+pub(super) fn path_shape_rule(path: &str) -> Option<FieldRule> {
     if path.as_bytes().contains(&0) {
         Some(FieldRule::NoNul)
     } else if path.split('/').any(|part| part == "..") {
@@ -772,12 +777,22 @@ pub fn validate_call(
     tool: AssistanceTool,
     mut parameters: Value,
 ) -> Result<ValidatedCall, ParameterError> {
-    let parameter_limit = parameter_limit(tool);
-    if serde_json::to_vec(&parameters)
+    let batch_key = super::batch::batch_key(tool, &parameters);
+    let size = serde_json::to_vec(&parameters)
         .ok()
-        .is_none_or(|value| value.len() > parameter_limit)
-    {
-        return Err(ParameterError::InvalidObject);
+        .map(|value| value.len());
+    match (batch_key, size) {
+        (Some(key), Some(size)) if size > super::batch::MAX_BATCH_PARAMETER_BYTES => {
+            return Err(invalid_field(
+                key,
+                FieldRule::TooLong(super::batch::MAX_BATCH_PARAMETER_BYTES),
+            ));
+        }
+        (Some(_), Some(_)) => {}
+        (_, size) if size.is_none_or(|size| size > parameter_limit(tool)) => {
+            return Err(ParameterError::InvalidObject);
+        }
+        _ => {}
     }
     let object = parameters
         .as_object()
@@ -814,7 +829,16 @@ pub fn validate_call(
                 ));
             }
         }
+        AssistanceTool::Read if object.contains_key("items") => {
+            super::batch::validate_read_items(object)?;
+        }
         AssistanceTool::Read => {
+            if object.contains_key("force") {
+                return Err(invalid_field(
+                    "force",
+                    FieldRule::OneOf("used only together with \"items\""),
+                ));
+            }
             optional_string(object, "symbol", MAX_SYMBOL_PATH_BYTES)?;
             optional_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
             optional_string(object, "lines", 32)?;
@@ -4978,8 +5002,8 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Read,
-            "ide.read needs one form: `symbol`, or `path` alone (the whole file), or `path` \
-             with `lines`, or `path` with `ranges`, or `symbols` — exactly one"
+            "ide.read needs one form: `items`, or `symbol`, or `path` alone (the whole file), \
+             or `path` with `lines`, or `path` with `ranges`, or `symbols` — exactly one"
                 .to_string(),
         ),
         (

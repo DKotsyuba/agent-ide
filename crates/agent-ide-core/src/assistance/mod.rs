@@ -9,6 +9,9 @@ pub mod facade;
 /// Projects validated peer replies into compact model text and unchanged structured results.
 pub(crate) mod content;
 
+/// Batch request forms (batch-api-v1): caps, item parsing, summary lines and follow-up calls.
+pub(crate) mod batch;
+
 /// Connects bounded daemon host correlation to closed peer-boundary outcomes.
 pub mod assembly;
 
