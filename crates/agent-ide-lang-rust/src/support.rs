@@ -650,14 +650,23 @@ fn convert(
     }
 }
 
-/// Extracts a field from its selected name through its type, retaining visibility before the name
-/// while excluding field attributes and comments from the signature.
+/// Extracts a field from its selected name through its type (`symbol`'s UTF-16 selection start to
+/// its range end on `lines`), retaining the visibility before the name while excluding field
+/// attributes, comments and whatever else shares the line from the signature.
+///
+/// The visibility is the text between the name and the nearest `{`, `,` or `]` before it on the
+/// name's line (the struct's opening brace, the previous field on the same line, or the field's
+/// last attribute), kept only when it starts with `pub`; so `pub struct S { a: u8, pub b: u8 }`
+/// gives `a: u8` and `pub b: u8`. `None` when a column falls inside a code point or past its
+/// line, and the caller then renders the field's declaration line instead.
 fn field_signature(lines: &[&str], symbol: &lsp::DocumentSymbol) -> Option<String> {
     let name_line = line_at(lines, symbol.selection_range.start.line + 1);
     let name_byte = utf16_column_byte(name_line, symbol.selection_range.start.character)?;
     let prefix = name_line.get(..name_byte)?;
-    let after_attributes = prefix.rsplit_once(']').map_or(prefix, |(_, suffix)| suffix);
-    let visibility = after_attributes.trim();
+    let own = prefix
+        .rsplit_once(['{', ',', ']'])
+        .map_or(prefix, |(_, suffix)| suffix);
+    let visibility = own.trim();
     let visibility = if visibility.starts_with("pub") {
         format!("{visibility} ")
     } else {

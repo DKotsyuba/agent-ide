@@ -466,10 +466,10 @@ async fn a_check_report_over_two_mib_lands_equally() {
     parity::assert_parity(&pages[..1], &pages[1..]);
 }
 
-/// Killing the Rust module while rust-analyzer indexes settles the waiting semantic call with a
-/// typed `module_unavailable (bundled.rust:…)` refusal; the daemon is the same process and still
-/// healthy, an unrelated language answers on it, rust-analyzer dies with its module, the next
-/// Rust call starts a fresh module, and nothing survives the daemon.
+/// Killing the Rust module while rust-analyzer indexes settles the semantic job still waiting
+/// for the analyzer with a typed `module_unavailable (bundled.rust:…)` refusal; the daemon is the
+/// same process and still healthy, an unrelated language answers on it, rust-analyzer dies with
+/// its module, the next Rust call starts a fresh module, and nothing survives the daemon.
 #[tokio::test]
 #[ignore = "requires the accepted AGENT_IDE_RUST_TOOLCHAIN_DIR, AGENT_IDE_RUST_ANALYZER and AGENT_IDE_RUST_TOOLCHAIN inputs"]
 async fn killing_the_module_while_rust_analyzer_indexes_is_typed_and_leaves_no_orphan() {
@@ -478,11 +478,20 @@ async fn killing_the_module_while_rust_analyzer_indexes_is_typed_and_leaves_no_o
     let mut daemon = Daemon::start(&fixture, &[MODULE]).await;
     let daemon_pid = daemon.pid();
     let mut session = Session::start(&fixture).await;
+    // The semantic call starts the module and rust-analyzer. Its job cannot answer precisely
+    // before the analyzer has loaded the workspace, so it may answer early (labelled approximate,
+    // symbol-graph-item r2 §4, or pending) and keeps waiting; its final outcome then replaces the
+    // early one under the same `detail_ref`. The module is killed as soon as the analyzer runs,
+    // whatever the call has answered by then.
+    let unsettled = |reply: &Value| {
+        reply["state"] == "pending"
+            || reply["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("approximate: "))
+    };
     let call = json!({"symbol":"src/lib.rs#Service/work"});
-    // The semantic call starts the module and rust-analyzer; it cannot answer before the
-    // analyzer has loaded the workspace.
-    let (fixture, outcome) = {
-        let pending = tokio::spawn(async move {
+    let (fixture, answered) = {
+        let asked = tokio::spawn(async move {
             let reply = session.call(&fixture, "ide.symbol", call).await;
             (session, fixture, reply)
         });
@@ -494,20 +503,15 @@ async fn killing_the_module_while_rust_analyzer_indexes_is_typed_and_leaves_no_o
             assert!(Instant::now() < deadline, "rust-analyzer never started");
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        // Indexing: rust-analyzer runs, loading the workspace, and the call is still waiting.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Indexing: rust-analyzer has just started loading the workspace.
         assert!(server.exists(), "rust-analyzer is loading");
-        assert!(
-            !pending.is_finished(),
-            "the semantic call waits for indexing"
-        );
         let loading: Vec<ProcessIdentity> = descendants(module.id.pid)
             .into_iter()
             .map(|(id, _)| id)
             .collect();
         // SAFETY: `module` is the exact identity captured as this test's daemon child just now.
         unsafe { libc::kill(module.id.pid, libc::SIGKILL) };
-        let (returned, fixture, reply) = pending.await.unwrap();
+        let (returned, fixture, reply) = asked.await.unwrap();
         session = returned;
         assert!(module.id.gone().await, "the killed module is reaped");
         for id in loading {
@@ -515,16 +519,28 @@ async fn killing_the_module_while_rust_analyzer_indexes_is_typed_and_leaves_no_o
         }
         (fixture, reply)
     };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut outcome = answered;
+    while unsettled(&outcome) {
+        assert!(
+            Instant::now() < deadline,
+            "the job never settled: {outcome}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let reference = json!({"detail_ref":outcome["detail_ref"].as_str().unwrap()});
+        outcome = session.call(&fixture, "ide.inspect", reference).await;
+    }
     let text = outcome["text"].as_str().unwrap_or_default();
-    // The symbol card keeps its definition and names why usages are missing, or the call fails
-    // whole; either way its own text names the analyzer module's typed fault.
+    // The symbol card keeps its definition and names why usages are missing, or the job fails
+    // whole; either way its own text names the analyzer module's typed fault (a job that had
+    // finished before the kill would carry no fault: it was still waiting for indexing).
     assert!(
         outcome["code"] == "provider_unavailable" || text.contains("usages: unavailable"),
-        "the original call fails its semantic part: {outcome}"
+        "the semantic job fails its semantic part: {outcome}"
     );
     assert!(
         text.contains("module_unavailable (bundled.rust:"),
-        "the original call names the module fault: {outcome}"
+        "the semantic job names the module fault: {outcome}"
     );
     assert_eq!(daemon.pid(), daemon_pid, "the daemon is the same process");
     assert!(

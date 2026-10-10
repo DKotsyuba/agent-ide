@@ -666,8 +666,11 @@ pub trait LanguageSupport: Send + Sync {
     fn detect(&self, root: &Path) -> Option<LanguageProject>;
 
     /// Turns the server's document symbols for `file` into header-inclusive, path-addressed
-    /// symbols. `source` is the exact text the symbols were computed from. Test modules and test
-    /// functions get [`SymbolKind::Test`] so outlines can collapse them.
+    /// symbols. `source` is the exact text the symbols were computed from. Every column is in
+    /// UTF-16 code units, LSP's default, whatever the provider negotiated: the session converts
+    /// its answer ([`crate::intelligence::context::utf16_symbols`]) and a source outline builds
+    /// its symbols the same way. Test modules and test functions get [`SymbolKind::Test`] so
+    /// outlines can collapse them.
     fn normalize(&self, file: &Path, source: &str, symbols: Vec<lsp::DocumentSymbol>) -> Outline;
 
     /// Computes where `where_` relative to `anchor` lands, with the indentation the neighbours use.

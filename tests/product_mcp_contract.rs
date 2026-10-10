@@ -13350,7 +13350,8 @@ async fn configured_product_pending_call_and_old_reference_survive_a_crash_only_
 
 /// While the registered Rust server is still loading, `ide.outline`, `ide.read` and the
 /// symbol-addressed `ide.edit` answer at once from the lexical outline and say so in one
-/// compact line; `ide.symbol` keeps waiting for the server, and once the server reports ready
+/// compact line; `ide.symbol` answers at once with an `approximate:` card (symbol-graph-item r2
+/// §4) whose precise answer follows once the server is ready, and once the server reports ready
 /// the server path is used again (its own symbol appears, the lexical marker disappears).
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_NODE environment"]
@@ -13479,12 +13480,28 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
         "{read}"
     );
 
-    // `ide.symbol` does not answer from the lexical outline: usages need the server, so the
-    // call stays pending instead of completing like the tools above.
+    // `ide.symbol` answers at once, labelled approximate: usages and callers need the server,
+    // so they are name matches from source until its precise answer follows.
+    let approximate = |reply: &Value| {
+        assert_eq!(reply["state"], "complete", "{reply}");
+        let text = reply["text"].as_str().unwrap_or_default();
+        assert!(
+            text.starts_with("approximate: rust-analyzer is still indexing;")
+                && text.contains("the precise answer follows as a fact"),
+            "{reply}"
+        );
+    };
     let symbol = actor
         .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#value"}))
         .await;
-    assert_eq!(symbol["state"], "pending", "{symbol}");
+    approximate(&symbol);
+    assert!(
+        symbol["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("\nsymbol: value"),
+        "{symbol}"
+    );
     tokio::time::sleep(Duration::from_secs(3)).await;
     let still = actor
         .call(
@@ -13493,7 +13510,7 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
             json!({"symbol":"src/lib.rs#caller"}),
         )
         .await;
-    assert_eq!(still["state"], "pending", "{still}");
+    approximate(&still);
     // A read of that server-only address waits for the server too, and so does the outline of
     // a file the lexical scanner refuses (its park is kept, not dropped).
     let server_only = actor
@@ -13513,7 +13530,7 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
     std::fs::write(&ready, "ready").unwrap();
     let settled = actor.settle(&fixture, symbol).await;
     let card = settled["text"].as_str().unwrap_or_default();
-    assert!(card.contains("symbol: value"), "{settled}");
+    assert!(card.starts_with("symbol: value"), "{settled}");
     assert!(!card.contains("outline: from source"), "{settled}");
     let server_only = actor.settle(&fixture, server_only).await;
     let read_text = server_only["text"].as_str().unwrap_or_default();

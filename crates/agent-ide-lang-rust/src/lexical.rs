@@ -398,7 +398,8 @@ fn outline_of(file: &Path, source: &str) -> Option<Outline> {
 
 /// rust-analyzer's `textDocument/documentSymbol` answer for `source` rebuilt from a `syn` parse,
 /// or `None` when the text is refused (see the module docs). Positions are 0-based lines and
-/// character columns; only the lines and the selection line are consumed downstream.
+/// UTF-16 columns, as the session hands rust-analyzer's answer to `normalize`, which slices field
+/// signatures by those columns.
 ///
 /// Everything from tokenizing to dropping the syntax tree runs on a thread of its own with a
 /// [`PARSE_STACK`]-byte stack ([`run_bounded`]), after [`within_bounds`] has checked the tokens
@@ -648,7 +649,8 @@ struct Walker<'a> {
     source: &'a str,
     /// Source lines, for the blank-line rule.
     lines: Vec<&'a str>,
-    /// Source characters (span columns and `line_starts` count characters, not bytes).
+    /// Source characters (span columns and `line_starts` count characters, not bytes; the symbols
+    /// built carry UTF-16 columns, see [`Walker::position`]).
     chars: &'a [char],
     /// Code-only form of the source (comments and literal contents blanked, offsets unchanged),
     /// to find the last code character before an item.
@@ -712,10 +714,10 @@ impl Walker<'_> {
             kind,
             tags: None,
             deprecated: None,
-            range: lsp::Range::new(position(start), position(last.end())),
+            range: lsp::Range::new(self.position(start), self.position(last.end())),
             selection_range: lsp::Range::new(
-                position(selection.start()),
-                position(selection.end()),
+                self.position(selection.start()),
+                self.position(selection.end()),
             ),
             children: (!children.is_empty()).then_some(children),
         };
@@ -777,6 +779,23 @@ impl Walker<'_> {
             .map(str::to_owned)
     }
 
+    /// The LSP position of the span boundary `at` (1-based line, character column): 0-based
+    /// line and a column in UTF-16 code units, as rust-analyzer's answer reaches `normalize`, so a
+    /// character outside the Basic Multilingual Plane earlier on the line counts two units. A
+    /// boundary the source does not reach (never produced by a parsed span) keeps its character
+    /// column.
+    fn position(&self, at: LineColumn) -> lsp::Position {
+        let line = at.line.saturating_sub(1);
+        let column = self
+            .line_starts
+            .get(line)
+            .and_then(|&start| self.chars.get(start..start + at.column))
+            .map_or(at.column, |prefix| {
+                prefix.iter().map(|character| character.len_utf16()).sum()
+            });
+        lsp::Position::new(line as u32, column as u32)
+    }
+
     /// Adds a function or method symbol located by `extent`, with signature `sig`, named and
     /// selected by the function's name: rust-analyzer's `METHOD` when it takes `self`,
     /// `FUNCTION` otherwise (the conversion refines both by owner and test attribute alike).
@@ -823,11 +842,6 @@ impl Walker<'_> {
     ) {
         self.symbol(extent, ident.to_string(), kind, ident.span(), walk);
     }
-}
-
-/// The LSP position of a span boundary: 0-based line, character column.
-fn position(at: LineColumn) -> lsp::Position {
-    lsp::Position::new(at.line.saturating_sub(1) as u32, at.column as u32)
 }
 
 impl<'ast> Visit<'ast> for Walker<'_> {
@@ -1918,6 +1932,105 @@ b: u32,\n}\npub struct Unit;\nmod leaf;\n";
             .outline_from_source(Path::new("src/guard.rs"), SOURCE)
             .expect("scans cleanly");
         assert_eq!(from_source, outline());
+    }
+
+    /// The signatures of `outline`'s first symbol's children: a struct's fields.
+    fn field_signatures(outline: &Outline) -> Vec<String> {
+        outline.symbols[0]
+            .children
+            .iter()
+            .map(|field| field.signature.clone())
+            .collect()
+    }
+
+    /// Re-expresses the UTF-16 columns of `symbols` (and their children) on the lines of `source`
+    /// as UTF-8 byte columns, as rust-analyzer answers a client that negotiated UTF-8.
+    fn utf8_columns(source: &str, symbols: &mut [lsp::DocumentSymbol]) {
+        let lines: Vec<&str> = source.split('\n').collect();
+        let convert = |position: lsp::Position| {
+            let (mut units, mut bytes) = (0, 0);
+            for character in lines[position.line as usize].chars() {
+                if units >= position.character {
+                    break;
+                }
+                units += character.len_utf16() as u32;
+                bytes += character.len_utf8() as u32;
+            }
+            lsp::Position::new(position.line, bytes + position.character - units)
+        };
+        for symbol in symbols {
+            for range in [&mut symbol.range, &mut symbol.selection_range] {
+                range.start = convert(range.start);
+                range.end = convert(range.end);
+            }
+            utf8_columns(source, symbol.children.as_deref_mut().unwrap_or_default());
+        }
+    }
+
+    /// The product negotiates UTF-8 columns with rust-analyzer. Its answer for the whitespace
+    /// corpus (a left-to-right mark, then `pub struct S {` and both fields on one line), converted
+    /// to UTF-16 as the session converts it, normalizes to exactly the lexical outline, fields
+    /// `first: u8` and `second: u8`. Read unconverted, the same answer sliced `rst: u8` and lost
+    /// `second` to the struct header.
+    #[test]
+    fn a_utf8_server_answer_normalizes_to_the_lexical_outline() {
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lexical");
+        let source = std::fs::read_to_string(corpus.join("whitespace.rs")).expect("corpus");
+        let recorded: Vec<lsp::DocumentSymbol> = serde_json::from_str(
+            &std::fs::read_to_string(corpus.join("whitespace.json")).expect("recording"),
+        )
+        .expect("recorded document symbols");
+        let file = Path::new("src/corpus_whitespace.rs");
+        let lexical = lexical_outline(file, &source).expect("the corpus scans cleanly");
+        let struct_at = lexical
+            .symbols
+            .iter()
+            .position(|symbol| symbol.name == "S")
+            .expect("struct S");
+        let fields = |outline: &Outline| {
+            outline.symbols[struct_at]
+                .children
+                .iter()
+                .map(|field| field.signature.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fields(&lexical), ["first: u8", "second: u8"]);
+        let mut utf8 = recorded.clone();
+        utf8_columns(&source, &mut utf8);
+        assert_ne!(utf8, recorded, "the corpus line has multi-byte characters");
+        assert_ne!(
+            fields(&RustSupport.normalize(file, &source, utf8.clone())),
+            fields(&lexical),
+            "unconverted byte columns slice the fields wrongly"
+        );
+        agent_ide_core::intelligence::context::utf16_symbols(
+            &source,
+            &mut utf8,
+            &lsp::PositionEncodingKind::UTF8,
+        );
+        assert_eq!(utf8, recorded);
+        assert_eq!(RustSupport.normalize(file, &source, utf8), lexical);
+    }
+
+    /// Fields that share a line with their struct's header or with each other keep only their
+    /// own visibility: the header and the previous field are not part of a field's signature.
+    #[test]
+    fn fields_on_the_header_line_keep_only_their_own_visibility() {
+        let source = "pub struct S { first: u8, pub(crate) second: u8 }\n";
+        let outline = lexical_outline(Path::new("src/inline.rs"), source).expect("scans cleanly");
+        assert_eq!(
+            field_signatures(&outline),
+            ["first: u8", "pub(crate) second: u8"]
+        );
+    }
+
+    /// A character outside the Basic Multilingual Plane is two UTF-16 units: the fields after one
+    /// on the same line keep their whole names and types in the lexical outline.
+    #[test]
+    fn fields_after_an_astral_character_keep_their_signatures() {
+        let source = "pub struct \u{1d446} { first: u8, second: u8 }\n";
+        let outline = lexical_outline(Path::new("src/astral.rs"), source).expect("scans cleanly");
+        assert_eq!(field_signatures(&outline), ["first: u8", "second: u8"]);
     }
 
     /// A `#[cfg(test)]` module inside a function body still marks its tests.

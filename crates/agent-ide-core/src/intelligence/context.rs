@@ -124,6 +124,50 @@ pub fn position(
     ))
 }
 
+/// Re-expresses every range of `symbols`, and of their children at any depth, in UTF-16 code
+/// units, LSP's default column unit and the one [`crate::lang::LanguageSupport::normalize`]
+/// reads. `encoding` is the unit the provider negotiated for `text`, the exact text the symbols
+/// were computed from; a UTF-16 provider's symbols are left untouched, a UTF-8 provider's columns
+/// count bytes, and any other encoding counts code points (the handshake admits only UTF-8, UTF-16
+/// and UTF-32, see [`position`]). Lines are `text` split at `\n`, as LSP numbers them; a line past
+/// the text's end reads as empty. A UTF-8 column inside a code point counts that whole code point,
+/// and a column past its line's end keeps its excess units past the line's UTF-16 length, so a
+/// provider's end-of-line positions stay at or past the end. Only columns change; line numbers,
+/// names and every other field are kept.
+pub fn utf16_symbols(
+    text: &str,
+    symbols: &mut [async_lsp::lsp_types::DocumentSymbol],
+    encoding: &PositionEncodingKind,
+) {
+    if encoding == &PositionEncodingKind::UTF16 {
+        return;
+    }
+    let lines: Vec<&str> = text.split('\n').collect();
+    let utf8 = encoding == &PositionEncodingKind::UTF8;
+    let convert = |position: Position| {
+        let line = lines.get(position.line as usize).copied().unwrap_or("");
+        let wanted = position.character as usize;
+        let (mut seen, mut units) = (0usize, 0u32);
+        for character in line.chars() {
+            if seen >= wanted {
+                break;
+            }
+            seen += if utf8 { character.len_utf8() } else { 1 };
+            units += character.len_utf16() as u32;
+        }
+        let excess = u32::try_from(wanted.saturating_sub(seen)).unwrap_or(u32::MAX);
+        Position::new(position.line, units.saturating_add(excess))
+    };
+    let mut pending: Vec<&mut async_lsp::lsp_types::DocumentSymbol> = symbols.iter_mut().collect();
+    while let Some(symbol) = pending.pop() {
+        for range in [&mut symbol.range, &mut symbol.selection_range] {
+            range.start = convert(range.start);
+            range.end = convert(range.end);
+        }
+        pending.extend(symbol.children.iter_mut().flatten());
+    }
+}
+
 /// Returns bounded lexical context from the exact observation; never opens files or starts a provider.
 /// `reason` is a caller-supplied unavailability label capped at 256 bytes; malformed source/query fails.
 pub fn lexical_context(
@@ -238,4 +282,61 @@ pub(crate) fn definitions(result: Option<GotoDefinitionResponse>) -> (Vec<Locati
 /// Creates a stable invalid-input error for a violated observation or query boundary.
 pub(crate) fn invalid(message: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+}
+
+/// Unit tests of [`utf16_symbols`].
+#[cfg(test)]
+mod utf16_tests {
+    use super::*;
+    use async_lsp::lsp_types::{DocumentSymbol, Range, SymbolKind};
+
+    /// A childless symbol named `name` whose range and selection both span `start..end` on line
+    /// `line`.
+    #[allow(deprecated)] // `deprecated` is a required field of the LSP type.
+    fn symbol(name: &str, line: u32, start: u32, end: u32) -> DocumentSymbol {
+        let range = Range::new(Position::new(line, start), Position::new(line, end));
+        DocumentSymbol {
+            name: name.to_owned(),
+            detail: None,
+            kind: SymbolKind::FIELD,
+            tags: None,
+            deprecated: None,
+            range,
+            selection_range: range,
+            children: None,
+        }
+    }
+
+    /// UTF-8 byte columns and UTF-32 code-point columns become UTF-16 units on their own line,
+    /// in children too; a column past the line's end keeps its excess; UTF-16 is untouched.
+    #[test]
+    fn columns_become_utf16_units_per_line() {
+        // `first` at bytes 18..23 after a 3-byte mark; `𝑆` (U+1D446) is one code point, 2 units.
+        let text = "fn a() {}\n\u{200e}pub struct S {\u{b}first: u8 }\n\u{1d446} x\n";
+        let mut parent = symbol("S", 1, 3, 44);
+        parent.children = Some(vec![symbol("first", 1, 18, 23)]);
+        let mut utf8 = vec![parent];
+        utf16_symbols(text, &mut utf8, &PositionEncodingKind::UTF8);
+        assert_eq!(
+            utf8[0].range,
+            Range::new(Position::new(1, 1), Position::new(1, 42))
+        );
+        let first = &utf8[0].children.as_ref().unwrap()[0];
+        assert_eq!(
+            first.selection_range,
+            Range::new(Position::new(1, 16), Position::new(1, 21))
+        );
+        let mut utf32 = vec![symbol("x", 2, 2, 3)];
+        utf16_symbols(text, &mut utf32, &PositionEncodingKind::UTF32);
+        assert_eq!(
+            utf32[0].range,
+            Range::new(Position::new(2, 3), Position::new(2, 4))
+        );
+        let mut utf16 = vec![symbol("x", 2, 3, 4)];
+        utf16_symbols(text, &mut utf16, &PositionEncodingKind::UTF16);
+        assert_eq!(
+            utf16[0].range,
+            Range::new(Position::new(2, 3), Position::new(2, 4))
+        );
+    }
 }

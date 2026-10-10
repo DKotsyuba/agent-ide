@@ -1036,10 +1036,18 @@ impl Session {
         Ok(result)
     }
 
-    /// Synchronizes the source and returns the provider's document symbols (nested form).
+    /// Synchronizes the source and returns the provider's document symbols (nested form), with
+    /// every column in UTF-16 code units whatever position encoding the provider negotiated (see
+    /// [`context::utf16_symbols`]), so a language's `normalize` slices the source the same way for
+    /// every provider.
     ///
     /// Flat responses become childless top-level symbols; container names are only hints and may
     /// be ambiguous, so the fallback does not invent a hierarchy or selection range.
+    ///
+    /// # Errors
+    ///
+    /// A module session (it answers `module_outline`), bytes that do not match `observation`, a
+    /// failed synchronization and a failed request.
     pub async fn document_symbols(
         &mut self,
         observation: &SourceObservation,
@@ -1056,7 +1064,7 @@ impl Session {
                 partial_result_params: Default::default(),
             })
             .await?;
-        Ok(match reply {
+        let mut symbols = match reply {
             Some(lsp::DocumentSymbolResponse::Nested(symbols)) => symbols,
             Some(lsp::DocumentSymbolResponse::Flat(symbols)) => symbols
                 .into_iter()
@@ -1075,7 +1083,10 @@ impl Session {
                 })
                 .collect(),
             None => Vec::new(),
-        })
+        };
+        let text = context::observed_text(observation, bytes)?;
+        context::utf16_symbols(text, &mut symbols, &self.capabilities().position_encoding);
+        Ok(symbols)
     }
 
     /// Hover text at a byte offset: the provider's signature/documentation rendering, if any.
