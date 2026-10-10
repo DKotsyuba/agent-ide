@@ -21,11 +21,11 @@ libc = "0.2"
 minijinja = { version = "2.24.0", default-features = false, features = ["serde", "builtins", "fuel"] }
 proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
 quote = { version = "1", default-features = false }
-rmcp = { version = "=3.4.0", features = ["server", "macros", "transport-io"] }
-rusqlite = { version = "0.37", features = ["backup", "bundled"] }
+rmcp = { version = "=3.5.1", features = ["server", "macros", "transport-io"] }
+rusqlite = { version = "0.40", features = ["backup", "bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
-syn = { version = "=2.0.119", default-features = false, features = ["full", "parsing", "printing", "visit"] }
+syn = { version = "=3.0.5", default-features = false, features = ["full", "parsing", "printing", "visit"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 tower-service = "0.3"
