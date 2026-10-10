@@ -1003,8 +1003,16 @@ fn masked_entry(entry: &str) -> String {
 fn mask_run_variance(text: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     for line in text.split('\n') {
-        if line == "modules: rust module" || line == "modules: rust in process (fallback)" {
-            out.push("modules: rust <mode>".to_owned());
+        // The row also names the other languages' modules (`· css module`); those stay compared.
+        let rest = [
+            "modules: rust module",
+            "modules: rust in process (fallback)",
+        ]
+        .iter()
+        .find_map(|head| line.strip_prefix(head))
+        .filter(|rest| rest.is_empty() || rest.starts_with(" · "));
+        if let Some(rest) = rest {
+            out.push(format!("modules: rust <mode>{rest}"));
             continue;
         }
         let mut masked = String::with_capacity(line.len());
@@ -1591,6 +1599,22 @@ fn returned_source_is_never_masked() {
         masked_entry(&card("module")),
         masked_entry(&card("in process (fallback)")),
         "the start card's serving-path row is masked"
+    );
+    // The row also lists the other languages' modules: the Rust part is masked, the rest compared.
+    let row = |mode: &str, other: &str| {
+        format!(
+            "ide.start {{}} -> \"complete\" \"activation\" null\nproject: repo\nmodules: rust {mode} · {other} module\n"
+        )
+    };
+    assert_eq!(
+        masked_entry(&row("module", "css")),
+        masked_entry(&row("in process (fallback)", "css")),
+        "the Rust part of a multi-module row is masked"
+    );
+    assert_ne!(
+        masked_entry(&row("module", "css")),
+        masked_entry(&row("module", "html")),
+        "the other modules of the row stay compared"
     );
     let edit = |seconds: &str| {
         format!(
