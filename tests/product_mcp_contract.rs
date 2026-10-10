@@ -440,6 +440,8 @@ fn assert_compact_envelope(reply: &Value) {
             "{reply}"
         ),
         ("complete", Some("graph")) => assert!(body.starts_with("graph: "), "{reply}"),
+        // OUTBOX-r3 §8.5: consolidated `ide.inspect` text is plain, with no header of its own.
+        ("complete", Some("inspect")) => assert!(!body.is_empty(), "{reply}"),
         // `<file>  (<n> lines, <lang>)` outline header.
         ("complete", Some("outline")) => {
             let header = body.lines().next().unwrap_or_default();
@@ -21175,6 +21177,94 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
     .await;
     assert_managed_hook_silent(&stale);
     std::fs::remove_dir_all(base).unwrap();
+}
+
+/// OUTBOX-r3 §8.5: `ide.inspect {}` hands over the session's facts once, `wait_ms` returns on the
+/// first fact and its deadline cancels nothing, and `detail_refs` answers several references in
+/// order in one reply.
+#[tokio::test]
+async fn outbox_inspect_waits_lists_and_batches() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "outbox-inspect").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"outbox"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let text = |reply: &Value| reply["text"].as_str().unwrap_or_default().to_owned();
+    let empty = actor.call(&fixture, "ide.inspect", json!({})).await;
+    assert_eq!(empty["kind"], "inspect", "{empty}");
+    assert!(text(&empty).starts_with("nothing ready yet"), "{empty}");
+
+    // A run that outlives the inline window leaves a started line; one wait collects its fact.
+    let run = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c","sleep 7; echo first"]}),
+        )
+        .await;
+    assert!(text(&run).starts_with("tests #1: started"), "{run}");
+    let waited_from = tokio::time::Instant::now();
+    let waited = actor
+        .call(&fixture, "ide.inspect", json!({"wait_ms":30000}))
+        .await;
+    assert!(
+        text(&waited).starts_with("test-finished tests #1: "),
+        "{waited}"
+    );
+    assert!(waited_from.elapsed() < Duration::from_secs(25), "{waited}");
+    let again = actor.call(&fixture, "ide.inspect", json!({})).await;
+    let again = text(&again);
+    assert!(again.starts_with("nothing ready yet"), "{again}");
+    assert!(
+        again.contains("recently delivered:\n  test-finished tests #1: "),
+        "{again}"
+    );
+
+    // A short wait that ends first answers what is in flight and leaves the run running.
+    let second = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c","sleep 8; echo second"]}),
+        )
+        .await;
+    assert!(text(&second).starts_with("tests #2: started"), "{second}");
+    let short = actor
+        .call(&fixture, "ide.inspect", json!({"wait_ms":200}))
+        .await;
+    assert!(
+        text(&short).starts_with("nothing ready yet\nin flight: tests #2"),
+        "{short}"
+    );
+    let late = actor
+        .call(&fixture, "ide.inspect", json!({"wait_ms":30000}))
+        .await;
+    assert!(
+        text(&late).starts_with("test-finished tests #2: "),
+        "{late}"
+    );
+
+    // Several references in one reply, in order.
+    let batch = actor
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"detail_refs":["tests #2","tests #1"]}),
+        )
+        .await;
+    let batch = text(&batch);
+    let second_at = batch.find("== tests #2 ==").expect("first section");
+    let first_at = batch.find("== tests #1 ==").expect("second section");
+    assert!(second_at < first_at, "{batch}");
+    assert!(batch.contains("second"), "{batch}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
 }
 
 /// OUTBOX-r3 §8.2: a Claude `ide.*` reply carries a finished run's `test-finished` fact once, at

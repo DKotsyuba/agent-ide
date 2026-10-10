@@ -1269,17 +1269,14 @@ impl ProductDispatcher {
                         worker.stop(invocation, method.opaque_attachment()).await
                     }
                     AssistanceMethod::Inspect => {
-                        let inspection = worker.inspect(
-                            invocation.binding_ref().clone(),
-                            call.parameters()["detail_ref"]
-                                .as_str()
-                                .or_cause(HostBindingCause::InvalidParameters)?
-                                .to_owned(),
-                            method.opaque_attachment(),
-                            None,
-                        );
+                        // OUTBOX-r3 §8.5: one reference, several, or the session's facts.
                         worker
-                            .with_delivery(facts.delivery.clone(), inspection)
+                            .inspect_call(
+                                invocation.binding_ref().clone(),
+                                call.parameters(),
+                                method.opaque_attachment(),
+                                facts.delivery.clone(),
+                            )
                             .await
                     }
                     AssistanceMethod::Context

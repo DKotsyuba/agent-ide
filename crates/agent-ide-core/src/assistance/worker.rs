@@ -36,6 +36,8 @@ use crate::{
 };
 #[path = "delivery.rs"]
 mod delivery;
+#[path = "inspection.rs"]
+mod inspection;
 #[path = "links.rs"]
 mod links;
 #[path = "providers.rs"]
@@ -14353,6 +14355,146 @@ mod stop_retry_tests {
             .await;
             assert_eq!(stage_of(&reply_rx.await.unwrap()), "inspect:detail_unknown");
         }
+    }
+
+    /// OUTBOX-r3 §7/§8.5 boundary (`session-outbox-v1-m025`): a deferred source-bearing answer is
+    /// handed over by `ide.inspect {}` with its re-proved body while its fenced file is unchanged,
+    /// and as the discard line once the file changed; it never holds a turn.
+    #[tokio::test]
+    async fn inspect_expands_a_deferred_answer_or_discards_it_after_a_change() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        std::fs::write(
+            fixture.root.join("a.gamma"),
+            "sym card\n  sym btn\n  #top\n  end\nend\n",
+        )
+        .unwrap();
+        git_commit(&fixture.root, "outbox fixture");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, authority) =
+            activate_worktree(&mut worker, "outbox-actor", "outbox-start").await;
+        // The handle's inspections resolve the fixture's attachment like a registered target.
+        worker
+            .shared
+            .claude_targets
+            .lock()
+            .unwrap()
+            .insert("stop-retry".into(), production_target(&fixture.root));
+        // Two deferred precise answers, as M-025 registers them after an approximate reply.
+        for (index, reference) in ["outbox-read-1", "outbox-read-2"].into_iter().enumerate() {
+            let (reply, read_authority, source) = loop {
+                let invocation =
+                    production_call(&worker, "outbox-actor", &format!("outbox-call-{index}"));
+                let (mut job, _cancel) = tool_job(
+                    &fixture.root,
+                    invocation,
+                    reference,
+                    AssistanceTool::Read,
+                    serde_json::json!({"symbol":"a.gamma#card/btn"}),
+                );
+                let result = worker.read(&mut job).await;
+                if job.park_until.is_some() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                break result.unwrap();
+            };
+            retain_detail(
+                &worker,
+                &binding,
+                reference,
+                AssistanceTool::Read,
+                &authority,
+            );
+            assert!(super::super::outbox::SessionOutbox::defer(
+                &*worker.shared,
+                reference,
+                super::super::outbox::DeferSpec {
+                    tool: AssistanceTool::Read,
+                    target: "a.gamma#card/btn".into(),
+                    fence_paths: vec![super::super::outbox::FencedPath {
+                        path: "a.gamma".into(),
+                        digest: None,
+                    }],
+                    approximate_given: true,
+                },
+            ));
+            worker
+                .shared
+                .complete(reference, reply, read_authority, source, 0);
+            if index == 0 {
+                assert!(
+                    !worker.shared.outbox.has_undelivered(&binding, true),
+                    "a precise answer after an approximate one never holds a turn"
+                );
+                let (send, mut receive) = mpsc::channel(4);
+                let handle = WorkerHandle {
+                    shared: worker.shared.clone(),
+                    inspect: send,
+                    receiver: Mutex::new(None),
+                    task: Mutex::new(None),
+                    startup_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    telemetry: Arc::new(Mutex::new(None)),
+                    fallback_ingress: Arc::new(Mutex::new(None)),
+                };
+                let everything = serde_json::json!({});
+                let (reply, ()) = tokio::join!(
+                    handle.inspect_call(binding.clone(), &everything, "stop-retry", Arc::default()),
+                    async {
+                        if let Ok(Some(request)) =
+                            tokio::time::timeout(Duration::from_secs(10), receive.recv()).await
+                        {
+                            serve_inspection(&worker.workspace, &worker.shared, request).await;
+                        }
+                    }
+                );
+                let PeerReply::Complete { text, .. } = reply else {
+                    panic!("inspect reply: {reply:?}")
+                };
+                assert!(
+                    text.starts_with("job-ready ide.read a.gamma#card/btn: ready\n"),
+                    "{text}"
+                );
+                assert!(text.contains("2\t  sym btn"), "{text}");
+            }
+        }
+        std::fs::write(
+            fixture.root.join("a.gamma"),
+            "sym card\n  sym other\n  end\nend\n",
+        )
+        .unwrap();
+        let (send, mut receive) = mpsc::channel(4);
+        let handle = WorkerHandle {
+            shared: worker.shared.clone(),
+            inspect: send,
+            receiver: Mutex::new(None),
+            task: Mutex::new(None),
+            startup_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            telemetry: Arc::new(Mutex::new(None)),
+            fallback_ingress: Arc::new(Mutex::new(None)),
+        };
+        let everything = serde_json::json!({});
+        let (reply, ()) = tokio::join!(
+            handle.inspect_call(binding.clone(), &everything, "stop-retry", Arc::default()),
+            async {
+                if let Ok(Some(request)) =
+                    tokio::time::timeout(Duration::from_secs(10), receive.recv()).await
+                {
+                    serve_inspection(&worker.workspace, &worker.shared, request).await;
+                }
+            }
+        );
+        let PeerReply::Complete { text, .. } = reply else {
+            panic!("inspect reply: {reply:?}")
+        };
+        assert_eq!(
+            text,
+            "job-ready ide.read a.gamma#card/btn: ready\n  result: ide.inspect outbox-read-2\n\
+             discarded: a.gamma changed; repeat ide.read a.gamma#card/btn"
+        );
     }
 }
 

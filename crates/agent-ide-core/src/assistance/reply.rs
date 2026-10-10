@@ -310,6 +310,9 @@ pub enum ResultKind {
     Graph,
     /// A background test run result from `ide.test`.
     Test,
+    /// The session's delivered facts or several references, gathered by one `ide.inspect` call
+    /// (`{}` or `detail_refs`, OUTBOX-r3 §8.5); plain text with no continuation of its own.
+    Inspect,
 }
 
 /// Serde's skip test for a zero count.
