@@ -4548,7 +4548,7 @@ fn claude_envelope_reconnect_retry_hint_survives_in_content_text() {
 impl StdioFacade {
     /// Builds the eleven-tool router with the language-derived description phrases filled in
     /// from the registered languages (see [`describe_languages`]).
-    fn described_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
+    pub(super) fn described_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
         let mut router = Self::tool_router();
         for route in router.map.values_mut() {
             if let Some(description) = route.attr.description.as_mut() {
@@ -4607,7 +4607,7 @@ impl StdioFacade {
     /// indented, tests collapsed) or of a directory (files with line counts and first doc line).
     /// A fraction of the cost of reading the file — use it before any native read of a source
     /// file longer than a screen. Answers inline on a warm language server; a cold one answers
-    /// `pending` — poll ide.inspect.
+    /// `pending` and the result arrives by itself.
     #[tool(name = "ide.outline", input_schema = tool_schemas()[6].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn outline(
@@ -4680,8 +4680,8 @@ impl StdioFacade {
     }
 
     /// Fetch the result behind a `detail_ref`: a `pending` reply that has since completed, or
-    /// the next page of a long result (outline, symbol, graph, diff, test output). Poll every
-    /// few seconds while it stays pending.
+    /// the next page of a long result (outline, symbol, graph, diff, test output). Results of
+    /// long work reach you by themselves; this call reads one early or pages through it.
     #[tool(name = "ide.inspect", input_schema = tool_schemas()[3].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn inspect(
@@ -4723,13 +4723,13 @@ impl StdioFacade {
 
 /// Connect-time instructions the host shows the model next to the tool list: the one-paragraph
 /// case for the IDE over native file tools, and the two rules every reply relies on.
-const SERVER_INSTRUCTIONS: &str = "Agent IDE: language-server-backed tools for source work. \
+pub(super) const SERVER_INSTRUCTIONS: &str = "Agent IDE: language-server-backed tools for source work. \
 Call ide.start once per task, then prefer the ide.* tools over native file tools for source: \
 ide.outline instead of reading a file, ide.symbol / ide.graph instead of grep for usages and \
 callers, ide.read for one symbol's body, ide.edit for changes (formatted and project-checked in \
 the same reply), ide.test to run exactly the tests that matter, ide.diff to review before \
 ide.stop. Symbols are addressed as `file#Owner/name`. A reply that says `pending` is not an \
-error: call ide.inspect with its detail_ref every few seconds until it completes. Native \
+error: its result arrives by itself in a later <agent-ide> block, so never poll for it. Native \
 read/edit tools remain available for non-source files and as a fallback.";
 
 /// Ensures diagnostics hide both launch attachments and populated host metadata in either format.

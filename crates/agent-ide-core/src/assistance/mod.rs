@@ -48,3 +48,7 @@ pub mod tests;
 
 /// Renders the deterministic, byte-bounded terminal text of one settled test run.
 pub(crate) mod test_fact;
+
+/// Guards that no reply, plate, fact, description or instruction invites polling.
+#[cfg(test)]
+mod hygiene;

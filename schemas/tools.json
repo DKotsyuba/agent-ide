@@ -282,7 +282,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Fetch the result behind a `detail_ref`: a `pending` reply that has since completed, or\nthe next page of a long result (outline, symbol, graph, diff, test output). Poll every\nfew seconds while it stays pending.",
+    "description": "Fetch the result behind a `detail_ref`: a `pending` reply that has since completed, or\nthe next page of a long result (outline, symbol, graph, diff, test output). Results of\nlong work reach you by themselves; this call reads one early or pages through it.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -305,7 +305,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Skeleton of a file (every symbol with signature, doc line and line numbers, members\nindented, tests collapsed) or of a directory (files with line counts and first doc line).\nA fraction of the cost of reading the file — use it before any native read of a source\nfile longer than a screen. Answers inline on a warm language server; a cold one answers\n`pending` — poll ide.inspect.",
+    "description": "Skeleton of a file (every symbol with signature, doc line and line numbers, members\nindented, tests collapsed) or of a directory (files with line counts and first doc line).\nA fraction of the cost of reading the file — use it before any native read of a source\nfile longer than a screen. Answers inline on a warm language server; a cold one answers\n`pending` and the result arrives by itself.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
