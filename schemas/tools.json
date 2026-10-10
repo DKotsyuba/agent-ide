@@ -107,7 +107,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Edit by symbol: `op` replace / insert / delete / rename on `file#Owner/name` (rename is\nproject-wide), or replace a `path` + `lines` range, or a full-file rewrite based on a\n`source_ref`. Formats the result with the project formatter, runs the project check\n(cargo check, pyright or tsc) and returns this file's errors and warnings in the reply.\nPrefer it over native edit/write for source: no line matching, no separate check step.",
+    "description": "Apply one logical change across files in ONE call:\n`ide.edit {\"operation_id\":\"add-field-1\",\"source_ref\":\"…\",\"files\":[{\"path\":\"src/a.rs\",\"changes\":[{\"old\":\"x: 0,\",\"new\":\"x: 0,\\ny: 0,\"}]},{\"path\":\"src/new.rs\",\"create\":true,\"content\":\"fn new() {}\\n\"}]}`\n(up to 16 files). Everything is validated before the first write, and one project check\n(cargo check, pyright or tsc) runs on the final state. The single-file forms still work: a `changes`\nlist, `op` replace / insert / delete / rename on `file#Owner/name` (rename is\nproject-wide), a `path` + `lines` range, or a full-file rewrite based on a `source_ref`.\nFormats with the project formatter and returns errors and warnings in the reply; a check\nthat outlasts the call answers `diagnostics: pending` and its outcome arrives by itself.\nPrefer it over native edit/write for source: no line matching, no separate check step.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -277,7 +277,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Bounded call graph around one symbol: callers, callees or both, depth 1–3, at most 60\nnodes, every node a full symbol path, cycles marked `(seen)`, tests collapsed into `+N tests` per parent (set `tests: true` to list them). Use\nit to see the blast radius before changing a function or to trace how a call reaches a\nsymbol, instead of chained greps.",
+    "description": "Call graphs for several roots in ONE call:\n`ide.graph {\"symbols\":[\"src/a.rs#f\",\"src/b.rs#g\"],\"direction\":\"callers\",\"depth\":1}` (up to\n8); a single `symbol` still works. Bounded: callers, callees or both, depth 1–3, at most\n60 nodes, every node a full symbol path, cycles marked `(seen)`, tests collapsed into\n`+N tests` per parent (set `tests: true` to list them). Before changing a signature, list\nits call sites here (`direction: callers`) instead of chained greps.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -330,7 +330,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Fetch the result behind a `detail_ref`: a `pending` reply that has since completed, or\nthe next page of a long result (outline, symbol, graph, diff, test output). Poll every\nfew seconds while it stays pending.",
+    "description": "Read what Agent IDE holds for you. Results of long work (test runs, project checks after\nedits, answers that were pending) are pushed to you in an `<agent-ide>` block, so never poll\nfor them. `{}` hands over everything ready now; `{\"wait_ms\": 120000}` waits once for the\nnext result when you have nothing else to do; `detail_refs` answers several references in\none call; `detail_ref` reads one result or its next page (outline, symbol, graph, diff,\ntest output).",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -367,7 +367,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Skeleton of a file (every symbol with signature, doc line and line numbers, members\nindented, tests collapsed) or of a directory (files with line counts and first doc line).\nA fraction of the cost of reading the file — use it before any native read of a source\nfile longer than a screen. Answers inline on a warm language server; a cold one answers\n`pending` — poll ide.inspect.",
+    "description": "Skeletons of several files in ONE call: `ide.outline {\"paths\":[\"src/a.rs\",\"src/b.rs\"]}`\n(up to 24) or `ide.outline {\"glob\":\"src/**/*.rs\"}`; a single `path` (a file, or a\ndirectory: files with line counts and first doc line) still works. Each file: every\nsymbol with signature, doc line and line numbers, members indented, tests collapsed. A\nfraction of the cost of reading the file — use it before any native read of a source file\nlonger than a screen. Answers inline on a warm language server; a cold one answers\n`pending` and the result arrives by itself.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -411,7 +411,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Body of one symbol (`file#Owner/name`) or an explicit line range, numbered, with its doc\nheader. The precise replacement for reading a whole file when you already know what you\nneed; its `source_ref` is what a full-file ide.edit is based on.",
+    "description": "Read every body and range you need in ONE call:\n`ide.read {\"items\":[{\"symbol\":\"src/a.rs#Store/get\"},{\"path\":\"src/b.rs\",\"lines\":\"10-40\"}]}`\n(up to 32 items across 16 files; one `source_ref` covers them all; an item unchanged since\nyour last read of it may answer `unchanged since your read`, and `\"force\":true` returns the\ntext). The single `symbol`, or `path` with `lines`, still works. Numbered bodies with doc\nheaders replace reading whole files; the `source_ref` is what ide.edit is based on.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -496,7 +496,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Activate Agent IDE for this project — once per task, before any other ide.* call. Returns\na project card: languages with sizes, the build/check/test/lint commands, layout by\ndirectory, entry points and docs. Use it to orient instead of reading README, Cargo.toml\nor package.json. Then use ide.outline / ide.symbol instead of native file reads.",
+    "description": "Activate Agent IDE for this project — once per task, before any other ide.* call. Returns\na project card: languages with sizes, the build/check/test/lint commands, layout by\ndirectory, entry points and docs, then the exact batch call forms (do not print the tool\ncatalog). Use it to orient instead of reading README, Cargo.toml\nor package.json. Then use ide.outline / ide.symbol instead of native file reads. End the\ntask with ide.stop.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -542,7 +542,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "End this task's IDE session; edited files stay on disk. Lists up to eight test runs started\nin this binding whose results were never collected. Call once when done or before handing off.",
+    "description": "End this task's IDE session; edited files stay on disk. Required when the task ends or\nbefore handing off: it frees the worktree's writer slot at once. Lists up to eight test\nruns started in this binding whose results were never collected, and flushes results not\nyet delivered. Call it once.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -562,7 +562,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Symbol card for `file#Owner/name` or a bare name: resolved signature, doc, definition\nlocation, usages split src/tests with the source line, callers and callees as full symbol\npaths, and with `history: true` the last commits touching the definition. Language-server\naccurate — replaces grep for usages and reading files to find callers. A bare name with\nseveral matches returns the candidate paths.",
+    "description": "Symbol cards for several symbols in ONE call:\n`ide.symbol {\"symbols\":[\"src/a.rs#Store/get\",\"Kind\"],\"usages\":true,\"callers\":1}` (up to 8);\na single `symbol` still works. Each card: resolved signature, doc, definition location,\nusages split src/tests with the source line (construction sites tagged), callers and\ncallees as full symbol paths, and with `history: true` the last commits touching the\ndefinition. Language-server accurate — replaces grep for usages and reading files to find\ncallers. Before adding a field or changing a constructor, list the construction sites\nhere. A bare name with several matches returns the candidate paths.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -616,7 +616,7 @@
     "annotations": {
       "readOnlyHint": false
     },
-    "description": "Run tests selected by `symbol` (the tests that reference it), by `path`, by name\n`pattern`, or an explicit `command`; one background run per worktree under `budget_s`.\nExplicit commands may set a worktree-relative `cwd` and bounded inherited-environment\noverrides through `env`; their argv is limited to 16 KiB in total.\nReturns the pass/fail line with an exact rerun command; full output is paged through\nide.inspect (`status` re-reads a run). Known runner summaries are parsed regardless of how\nthe runner was launched; otherwise the result includes the exit code and bounded output\ntail. Use it instead of running the test command in a shell: bounded selection and output.",
+    "description": "Run several targets as ONE run:\n`ide.test {\"targets\":[{\"symbol\":\"src/a.rs#parse\"},{\"path\":\"tests/cli.rs\"},{\"pattern\":\"roles_\"}]}`\n(up to 8), or a single target: `symbol` (the tests that reference it), `path`, name\n`pattern` or an explicit `command`; one background run per worktree under `budget_s`.\nExplicit commands may set a worktree-relative `cwd` and bounded inherited-environment\noverrides through `env`; their argv is limited to 16 KiB in total.\nReturns the pass/fail line with an exact rerun command; a run that outlasts the call\nanswers `started` and its outcome (counts, up to eight failing tests, the rerun command,\nthe full-output reference) arrives by itself in an `<agent-ide>` block. Full output is paged\nthrough ide.inspect (`status` re-reads a run). Known runner summaries are parsed regardless\nof how the runner was launched; otherwise the result includes the exit code and bounded\noutput tail. Use it instead of running the test command in a shell: bounded selection and\noutput.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

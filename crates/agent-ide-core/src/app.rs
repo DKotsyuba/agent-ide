@@ -46,6 +46,19 @@ pub(crate) const MAX_ASSISTANCE_JSON_BYTES: usize = 144 * 1024;
 /// Maximum time to wait for an Assistance method reply after its request is written.
 const METHOD_DISPATCH_BUDGET: Duration = Duration::from_secs(10);
 
+/// Returns whether one hook submission is a `Stop`/`SubagentStop` the daemon may hold (OUTBOX-r3
+/// §8.3): its sanitized observation names the `stop` or `subagent_stop` phase. Such a request rides
+/// the hold lane with the hold deadline; every other hook keeps the short hook lane and deadline.
+fn is_hold_request(request: &Value) -> bool {
+    matches!(
+        request
+            .get("sanitized_observation_json")
+            .and_then(|observation| observation.get("phase"))
+            .and_then(Value::as_str),
+        Some("stop" | "subagent_stop")
+    )
+}
+
 /// Returns the reply budget of one method dispatch: [`METHOD_DISPATCH_BUDGET`], plus the call's
 /// own `wait_ms` when `method` is `inspect` (clamped to the outbox's 240 s maximum), so a bounded
 /// `ide.inspect` wait (OUTBOX-r3 §8.5) is never cut by the transport. `params` is the dispatch's
@@ -153,13 +166,15 @@ impl Lane {
     }
 }
 
-/// The two connection lanes of one daemon: tool calls (`max_connections`) and hooks.
+/// The connection lanes of one daemon: tool calls (`max_connections`), hooks, and held Stop hooks.
 #[derive(Clone)]
 struct Lanes {
     /// Tool-call connections.
     calls: Lane,
     /// Hook-submission connections.
     hooks: Lane,
+    /// Held Stop hooks (OUTBOX-r3 §8.3): long waits that must never starve the short hook lane.
+    holds: Lane,
 }
 
 /// Reports whether a daemon answered the side-effect-free health request.
@@ -414,6 +429,10 @@ async fn run_daemon_inner(
         let lanes = Lanes {
             calls: Lane::new(ipc.max_connections, "connection_busy:call"),
             hooks: Lane::new(HOOK_CONNECTIONS, "connection_busy:hook"),
+            holds: Lane::new(
+                crate::assistance::outbox::HOLD_CONNECTIONS,
+                "connection_busy:hold",
+            ),
         };
         crate::errorlog::record(
             crate::errorlog::Method::Daemon,
@@ -440,6 +459,7 @@ async fn run_daemon_inner(
                 _ = journal_tick.tick() => {
                     lanes.calls.flush_refusals(false);
                     lanes.hooks.flush_refusals(false);
+                    lanes.holds.flush_refusals(false);
                     continue;
                 }
                 _ = &mut termination => break,
@@ -504,6 +524,7 @@ async fn run_daemon_inner(
         // Refusals still counted in an open window would otherwise die with the daemon.
         lanes.calls.flush_refusals(true);
         lanes.hooks.flush_refusals(true);
+        lanes.holds.flush_refusals(true);
         Ok(())
     }
     .await;
@@ -1318,7 +1339,14 @@ async fn serve_accepted_connection(
             if let (Some(dispatcher), Some(limits)) = (dispatcher, transport_limits) {
                 let hook =
                     request.get("method").and_then(Value::as_str) == Some("assistance.hook_submit");
-                let lane = if hook { &lanes.hooks } else { &lanes.calls };
+                let hold = hook && is_hold_request(&request);
+                let lane = if hold {
+                    &lanes.holds
+                } else if hook {
+                    &lanes.hooks
+                } else {
+                    &lanes.calls
+                };
                 if dispatcher.is_failed() {
                     // Failed and exiting: nothing is dispatched, so nothing ran and the front may
                     // send the call to the replacement.
@@ -1338,6 +1366,8 @@ async fn serve_accepted_connection(
                                 .unwrap_or_default(),
                             request.get("params_json").unwrap_or(&Value::Null),
                         )
+                    } else if hold {
+                        crate::assistance::outbox::HOLD_HOOK_DEADLINE
                     } else {
                         connection_deadline.duration_since(tokio::time::Instant::now())
                     };
@@ -1636,8 +1666,14 @@ async fn serve_assistance_request(
                 .ok_or_else(|| invalid_transport("invalid hook observation"))?,
             )
             .ok_or_else(|| invalid_transport("invalid hook correlation"))?;
+            // A held Stop waits for the daemon's bounded hold (OUTBOX-r3 §8.3).
+            let deadline = if is_hold_request(&request) {
+                crate::assistance::outbox::HOLD_HOOK_DEADLINE
+            } else {
+                limits.deadline
+            };
             let reply = tokio::time::timeout(
-                limits.deadline,
+                deadline,
                 dispatcher.dispatch(AssistanceDispatch::HookSubmit(hook.clone())),
             )
             .await;

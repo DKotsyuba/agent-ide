@@ -211,7 +211,9 @@ async fn legacy_batch_reads_gain_only_the_summary_line() {
     daemon.wait().await.unwrap();
 }
 
-/// The summary counts of a batch read reply text, as `(delivered, unchanged)`.
+/// The summary counts of a batch read reply text, as `(delivered, unchanged)`; only the seam
+/// tests read them.
+#[cfg(feature = "test-seams")]
 fn read_counts(text: &str) -> (usize, usize) {
     let summary = text.lines().next().unwrap_or_default();
     let count = |word: &str| -> usize {

@@ -1967,6 +1967,9 @@ pub async fn submit_hook_event(
             HookPhase::PostFailure => "post_failure",
             HookPhase::PermissionDenied => "permission_denied",
             HookPhase::PostBatch => "post_batch",
+            HookPhase::Stop => "stop",
+            HookPhase::SubagentStop => "subagent_stop",
+            HookPhase::Compaction => "compaction",
         },
         "actor_id": event.actor_id(),
         "call_id": event.optional_call_id(),
@@ -1992,8 +1995,17 @@ pub async fn submit_hook_event(
     match submit_hook_if_running(
         runtime_dir,
         request,
-        HookTransportLimits::new(128 * 1024, MAX_HOOK_BYTES, Duration::from_secs(1))
-            .expect("fixed Assistance hook limits are valid"),
+        // A held Stop waits for the daemon's hold (OUTBOX-r3 §8.3); every other hook stays short.
+        HookTransportLimits::new(
+            128 * 1024,
+            MAX_HOOK_BYTES,
+            if event.phase().holds() {
+                super::outbox::HOLD_HOOK_DEADLINE
+            } else {
+                Duration::from_secs(1)
+            },
+        )
+        .expect("fixed Assistance hook limits are valid"),
     )
     .await
     {
@@ -2015,7 +2027,9 @@ pub async fn submit_hook_event(
 /// Encodes one bounded post-hook delta in the model-context schema required by its explicit host.
 ///
 /// Pre-hooks, empty/oversized text, invalid JSON serialization, and a `PermissionDenied` outcome
-/// all produce no output. Both current host contracts use `hookSpecificOutput`, but the event name
+/// all produce no output. A held `Stop`/`SubagentStop` renders the host's turn-continuation shape
+/// `{"decision":"block","reason":…}` with the text as its reason (OUTBOX-r3 §8.3); a compaction
+/// event renders nothing. Both current host contracts use `hookSpecificOutput`, but the event name
 /// is selected from the validated host event rather than copied from arbitrary input.
 pub fn render_hook_context(event: &HookEvent, text: &str) -> Option<String> {
     if text.is_empty() || text.len() > MAX_FEEDBACK_BYTES {
@@ -2027,6 +2041,11 @@ pub fn render_hook_context(event: &HookEvent, text: &str) -> Option<String> {
         HookPhase::PostFailure => "PostToolUseFailure",
         HookPhase::PermissionDenied => return None,
         HookPhase::PostBatch => "PostToolBatch",
+        // OUTBOX-r3 §8.3: a held turn end continues with the facts as the block reason.
+        HookPhase::Stop | HookPhase::SubagentStop => {
+            return serde_json::to_string(&json!({"decision": "block", "reason": text})).ok();
+        }
+        HookPhase::Compaction => return None,
     };
     serde_json::to_string(&json!({
         "hookSpecificOutput": {
@@ -2413,6 +2432,9 @@ struct ManagedConnection {
     /// Each actor's last admitted start parameters on a current managed Claude daemon, keyed by
     /// the daemon's private actor tag, oldest first, at most [`MAX_REMEMBERED_ACTORS`].
     remembered: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+    /// Requested work each remembered actor was relayed without its result (OUTBOX-r3 §10),
+    /// reported to the new daemon when the actor is re-activated after a replacement.
+    unresolved: Arc<super::unresolved::Unresolved>,
     /// Set once the bounded memory above evicted an actor that may still be active: from then on
     /// the session may hold actors it no longer remembers, so no actor is assumed gone.
     // ponytail: sticky for the rest of the session once more than 32 actors have been remembered
@@ -2450,6 +2472,7 @@ impl ManagedConnection {
             candidate: Arc::new(Mutex::new(None)),
             last_activation: Arc::new(Mutex::new(None)),
             remembered: Arc::new(std::sync::Mutex::new(Vec::new())),
+            unresolved: Arc::default(),
             memory_overflowed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lifecycle: Arc::new(Mutex::new(())),
             recovery_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2520,6 +2543,7 @@ impl ManagedConnection {
 
     /// Forgets one actor's remembered start.
     fn forget(&self, tag: &str) {
+        self.unresolved.forget(tag);
         self.remembered
             .lock()
             .expect("remembered starts mutex")
@@ -3330,6 +3354,16 @@ impl StdioFacade {
             if let Some(expected) = expected {
                 meta["claudecode/actor"] = json!(expected);
             }
+            // OUTBOX-r3 §10: what this actor was relayed unresolved before the replacement; the
+            // new daemon queues one `lost-after-restart` fact for it. Older daemons ignore it.
+            let lost = self
+                .reconnect
+                .as_ref()
+                .map(|reconnect| reconnect.unresolved.subjects(expected.unwrap_or_default()))
+                .unwrap_or_default();
+            if !lost.is_empty() {
+                meta["claudecode/lost"] = json!(lost);
+            }
             host.host_meta = Some(meta);
             let FacadeOutcome::Reply(reply, _) = self
                 .facade
@@ -3348,7 +3382,12 @@ impl StdioFacade {
                 PeerReply::Complete {
                     kind: ResultKind::Activation,
                     ..
-                } => return true,
+                } => {
+                    if let Some(reconnect) = &self.reconnect {
+                        reconnect.unresolved.forget(expected.unwrap_or_default());
+                    }
+                    return true;
+                }
                 // Still activating, or its pre-hook not there yet: one more bounded attempt.
                 PeerReply::Pending { .. }
                 | PeerReply::Unavailable {
@@ -3454,6 +3493,7 @@ impl StdioFacade {
     async fn forget_remembered_activation(&self) {
         if let Some(reconnect) = &self.reconnect {
             *reconnect.last_activation.lock().await = None;
+            reconnect.unresolved.forget("");
             reconnect.mark_activated();
         }
     }
@@ -3762,6 +3802,19 @@ impl StdioFacade {
         };
         if tool == AssistanceTool::Stop && expected.is_none() && may_have_applied {
             self.forget_remembered_activation().await;
+        }
+        // OUTBOX-r3 §10: remember what this reply leaves owed and forget what it resolves.
+        if tool != AssistanceTool::Stop
+            && let Some(reconnect) = &self.reconnect
+            && let FacadeOutcome::Reply(reply, status) = &outcome
+        {
+            reconnect.unresolved.observe(
+                tag.as_deref().unwrap_or_default(),
+                tool,
+                &stage_parameters,
+                reply,
+                status.as_deref(),
+            );
         }
         crate::telemetry::adapters::log_front_outcome(
             tool,
@@ -4625,7 +4678,7 @@ fn claude_envelope_reconnect_retry_hint_survives_in_content_text() {
 impl StdioFacade {
     /// Builds the eleven-tool router with the language-derived description phrases filled in
     /// from the registered languages (see [`describe_languages`]).
-    fn described_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
+    pub(super) fn described_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
         let mut router = Self::tool_router();
         for route in router.map.values_mut() {
             if let Some(description) = route.attr.description.as_mut() {
@@ -4640,8 +4693,10 @@ impl StdioFacade {
 impl StdioFacade {
     /// Activate Agent IDE for this project — once per task, before any other ide.* call. Returns
     /// a project card: languages with sizes, the build/check/test/lint commands, layout by
-    /// directory, entry points and docs. Use it to orient instead of reading README, {manifests_head}
-    /// {manifests_tail}. Then use ide.outline / ide.symbol instead of native file reads.
+    /// directory, entry points and docs, then the exact batch call forms (do not print the tool
+    /// catalog). Use it to orient instead of reading README, {manifests_head}
+    /// {manifests_tail}. Then use ide.outline / ide.symbol instead of native file reads. End the
+    /// task with ide.stop.
     #[tool(name = "ide.start", input_schema = tool_schemas()[0].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn start(
@@ -4680,11 +4735,13 @@ impl StdioFacade {
         self.call(AssistanceTool::Diff, parameters, context).await
     }
 
-    /// Skeleton of a file (every symbol with signature, doc line and line numbers, members
-    /// indented, tests collapsed) or of a directory (files with line counts and first doc line).
-    /// A fraction of the cost of reading the file — use it before any native read of a source
-    /// file longer than a screen. Answers inline on a warm language server; a cold one answers
-    /// `pending` — poll ide.inspect.
+    /// Skeletons of several files in ONE call: `ide.outline {"paths":["src/a.rs","src/b.rs"]}`
+    /// (up to 24) or `ide.outline {"glob":"src/**/*.rs"}`; a single `path` (a file, or a
+    /// directory: files with line counts and first doc line) still works. Each file: every
+    /// symbol with signature, doc line and line numbers, members indented, tests collapsed. A
+    /// fraction of the cost of reading the file — use it before any native read of a source file
+    /// longer than a screen. Answers inline on a warm language server; a cold one answers
+    /// `pending` and the result arrives by itself.
     #[tool(name = "ide.outline", input_schema = tool_schemas()[6].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn outline(
@@ -4696,9 +4753,12 @@ impl StdioFacade {
             .await
     }
 
-    /// Body of one symbol (`file#Owner/name`) or an explicit line range, numbered, with its doc
-    /// header. The precise replacement for reading a whole file when you already know what you
-    /// need; its `source_ref` is what a full-file ide.edit is based on.
+    /// Read every body and range you need in ONE call:
+    /// `ide.read {"items":[{"symbol":"src/a.rs#Store/get"},{"path":"src/b.rs","lines":"10-40"}]}`
+    /// (up to 32 items across 16 files; one `source_ref` covers them all; an item unchanged since
+    /// your last read of it may answer `unchanged since your read`, and `"force":true` returns the
+    /// text). The single `symbol`, or `path` with `lines`, still works. Numbered bodies with doc
+    /// headers replace reading whole files; the `source_ref` is what ide.edit is based on.
     #[tool(name = "ide.read", input_schema = tool_schemas()[7].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn read(
@@ -4709,11 +4769,14 @@ impl StdioFacade {
         self.call(AssistanceTool::Read, parameters, context).await
     }
 
-    /// Symbol card for `file#Owner/name` or a bare name: resolved signature, doc, definition
-    /// location, usages split src/tests with the source line, callers and callees as full symbol
-    /// paths, and with `history: true` the last commits touching the definition. Language-server
-    /// accurate — replaces grep for usages and reading files to find callers. A bare name with
-    /// several matches returns the candidate paths.
+    /// Symbol cards for several symbols in ONE call:
+    /// `ide.symbol {"symbols":["src/a.rs#Store/get","Kind"],"usages":true,"callers":1}` (up to 8);
+    /// a single `symbol` still works. Each card: resolved signature, doc, definition location,
+    /// usages split src/tests with the source line (construction sites tagged), callers and
+    /// callees as full symbol paths, and with `history: true` the last commits touching the
+    /// definition. Language-server accurate — replaces grep for usages and reading files to find
+    /// callers. Before adding a field or changing a constructor, list the construction sites
+    /// here. A bare name with several matches returns the candidate paths.
     #[tool(name = "ide.symbol", input_schema = tool_schemas()[8].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn symbol(
@@ -4724,10 +4787,12 @@ impl StdioFacade {
         self.call(AssistanceTool::Symbol, parameters, context).await
     }
 
-    /// Bounded call graph around one symbol: callers, callees or both, depth 1–3, at most 60
-    /// nodes, every node a full symbol path, cycles marked `(seen)`, tests collapsed into `+N tests` per parent (set `tests: true` to list them). Use
-    /// it to see the blast radius before changing a function or to trace how a call reaches a
-    /// symbol, instead of chained greps.
+    /// Call graphs for several roots in ONE call:
+    /// `ide.graph {"symbols":["src/a.rs#f","src/b.rs#g"],"direction":"callers","depth":1}` (up to
+    /// 8); a single `symbol` still works. Bounded: callers, callees or both, depth 1–3, at most
+    /// 60 nodes, every node a full symbol path, cycles marked `(seen)`, tests collapsed into
+    /// `+N tests` per parent (set `tests: true` to list them). Before changing a signature, list
+    /// its call sites here (`direction: callers`) instead of chained greps.
     #[tool(name = "ide.graph", input_schema = tool_schemas()[9].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn graph(
@@ -4738,14 +4803,19 @@ impl StdioFacade {
         self.call(AssistanceTool::Graph, parameters, context).await
     }
 
-    /// Run tests selected by `symbol` (the tests that reference it), by `path`, by name
-    /// `pattern`, or an explicit `command`; one background run per worktree under `budget_s`.
+    /// Run several targets as ONE run:
+    /// `ide.test {"targets":[{"symbol":"src/a.rs#parse"},{"path":"tests/cli.rs"},{"pattern":"roles_"}]}`
+    /// (up to 8), or a single target: `symbol` (the tests that reference it), `path`, name
+    /// `pattern` or an explicit `command`; one background run per worktree under `budget_s`.
     /// Explicit commands may set a worktree-relative `cwd` and bounded inherited-environment
     /// overrides through `env`; their argv is limited to 16 KiB in total.
-    /// Returns the pass/fail line with an exact rerun command; full output is paged through
-    /// ide.inspect (`status` re-reads a run). Known runner summaries are parsed regardless of how
-    /// the runner was launched; otherwise the result includes the exit code and bounded output
-    /// tail. Use it instead of running the test command in a shell: bounded selection and output.
+    /// Returns the pass/fail line with an exact rerun command; a run that outlasts the call
+    /// answers `started` and its outcome (counts, up to eight failing tests, the rerun command,
+    /// the full-output reference) arrives by itself in an `<agent-ide>` block. Full output is paged
+    /// through ide.inspect (`status` re-reads a run). Known runner summaries are parsed regardless
+    /// of how the runner was launched; otherwise the result includes the exit code and bounded
+    /// output tail. Use it instead of running the test command in a shell: bounded selection and
+    /// output.
     #[tool(name = "ide.test", input_schema = tool_schemas()[10].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false))]
     async fn test(
@@ -4756,9 +4826,12 @@ impl StdioFacade {
         self.call(AssistanceTool::Test, parameters, context).await
     }
 
-    /// Fetch the result behind a `detail_ref`: a `pending` reply that has since completed, or
-    /// the next page of a long result (outline, symbol, graph, diff, test output). Poll every
-    /// few seconds while it stays pending.
+    /// Read what Agent IDE holds for you. Results of long work (test runs, project checks after
+    /// edits, answers that were pending) are pushed to you in an `<agent-ide>` block, so never poll
+    /// for them. `{}` hands over everything ready now; `{"wait_ms": 120000}` waits once for the
+    /// next result when you have nothing else to do; `detail_refs` answers several references in
+    /// one call; `detail_ref` reads one result or its next page (outline, symbol, graph, diff,
+    /// test output).
     #[tool(name = "ide.inspect", input_schema = tool_schemas()[3].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn inspect(
@@ -4770,8 +4843,10 @@ impl StdioFacade {
             .await
     }
 
-    /// End this task's IDE session; edited files stay on disk. Lists up to eight test runs started
-    /// in this binding whose results were never collected. Call once when done or before handing off.
+    /// End this task's IDE session; edited files stay on disk. Required when the task ends or
+    /// before handing off: it frees the worktree's writer slot at once. Lists up to eight test
+    /// runs started in this binding whose results were never collected, and flushes results not
+    /// yet delivered. Call it once.
     #[tool(name = "ide.stop", input_schema = tool_schemas()[4].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn stop(
@@ -4782,10 +4857,14 @@ impl StdioFacade {
         self.call(AssistanceTool::Stop, parameters, context).await
     }
 
-    /// Edit by symbol: `op` replace / insert / delete / rename on `file#Owner/name` (rename is
-    /// project-wide), or replace a `path` + `lines` range, or a full-file rewrite based on a
-    /// `source_ref`. Formats the result with the project formatter, runs the project check
-    /// ({project_checks}) and returns this file's errors and warnings in the reply.
+    /// Apply one logical change across files in ONE call:
+    /// `ide.edit {"operation_id":"add-field-1","source_ref":"…","files":[{"path":"src/a.rs","changes":[{"old":"x: 0,","new":"x: 0,\ny: 0,"}]},{"path":"src/new.rs","create":true,"content":"fn new() {}\n"}]}`
+    /// (up to 16 files). Everything is validated before the first write, and one project check
+    /// ({project_checks}) runs on the final state. The single-file forms still work: a `changes`
+    /// list, `op` replace / insert / delete / rename on `file#Owner/name` (rename is
+    /// project-wide), a `path` + `lines` range, or a full-file rewrite based on a `source_ref`.
+    /// Formats with the project formatter and returns errors and warnings in the reply; a check
+    /// that outlasts the call answers `diagnostics: pending` and its outcome arrives by itself.
     /// Prefer it over native edit/write for source: no line matching, no separate check step.
     #[tool(name = "ide.edit", input_schema = tool_schemas()[5].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false))]
@@ -4800,14 +4879,15 @@ impl StdioFacade {
 
 /// Connect-time instructions the host shows the model next to the tool list: the one-paragraph
 /// case for the IDE over native file tools, and the two rules every reply relies on.
-const SERVER_INSTRUCTIONS: &str = "Agent IDE: language-server-backed tools for source work. \
-Call ide.start once per task, then prefer the ide.* tools over native file tools for source: \
-ide.outline instead of reading a file, ide.symbol / ide.graph instead of grep for usages and \
-callers, ide.read for one symbol's body, ide.edit for changes (formatted and project-checked in \
-the same reply), ide.test to run exactly the tests that matter, ide.diff to review before \
-ide.stop. Symbols are addressed as `file#Owner/name`. A reply that says `pending` is not an \
-error: call ide.inspect with its detail_ref every few seconds until it completes. Native \
-read/edit tools remain available for non-source files and as a fallback.";
+pub(super) const SERVER_INSTRUCTIONS: &str = "Agent IDE: language-server-backed source tools. \
+Call ide.start once per task and ide.stop at the end. Prefer ide.* over native tools for \
+source: plan first, then read everything in ONE ide.read {\"items\":[…]}; ide.outline / \
+ide.symbol / ide.graph instead of reading files and grep; ONE ide.edit {\"files\":[…]} per \
+logical change, with one project check; ide.test for the tests that matter. Symbols are \
+`file#Owner/name`. Results of long work (test runs, project checks, pending answers) are pushed \
+to you in an <agent-ide> block after your next tool call or when you end your turn, so never \
+poll for them; with nothing else to do, call ide.inspect {\"wait_ms\": 120000} once. Native \
+tools remain for non-source files and as a fallback.";
 
 /// Ensures diagnostics hide both launch attachments and populated host metadata in either format.
 #[test]

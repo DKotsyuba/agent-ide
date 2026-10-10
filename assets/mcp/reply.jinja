@@ -78,7 +78,7 @@ feedback: {{ text }}
 host_stopped: host binding released; no workspace authority was created
 {%- endif -%}
 {%- if state == "pending" -%}
-pending: use ide.inspect with detail_ref {{ detail_ref }}
+pending: the result arrives by itself in a later <agent-ide> block (detail_ref {{ detail_ref }})
 {%- endif -%}
 {%- if state == "error" -%}
 {%- if code == "resolution_unverified" -%}
@@ -337,7 +337,7 @@ edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }};
 {%- elif diagnostics.state == "not_analysed" -%}
 edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: not_analysed ({{ diagnostics.reason }})
 {%- elif diagnostics.state == "pending" -%}
-edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: pending. Next: use ide.inspect with detail_ref {{ diagnostics.detail_ref }}
+edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: pending; the project check arrives by itself as an edit-checked fact
 {%- endif -%}
 {%- if note %}{{ "\n" }}{{ note }}{%- endif %}
 {%- endif -%}

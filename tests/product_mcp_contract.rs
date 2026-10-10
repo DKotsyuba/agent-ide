@@ -535,12 +535,12 @@ fn assert_claude_envelope(reply: &Value) -> &str {
 /// source reference; refusal prose is never parsed as one. Unset fields are simply absent from
 /// the returned object, matching `serde_json::Value`'s null-on-missing-key indexing.
 fn claude_fields(text: &str) -> Value {
-    /// Returns the bounded token starting at `text`, ending at the first space, `;`, `\n`, `.` or
-    /// the string end; every identifier this parser extracts (`reason`, `code`, `outcome`,
+    /// Returns the bounded token starting at `text`, ending at the first space, `;`, `\n`, `.`, `)`
+    /// or the string end; every identifier this parser extracts (`reason`, `code`, `outcome`,
     /// `detail_ref`, `source_ref`) is itself a single space-free token, so this stops exactly where
     /// the surrounding sentence resumes.
     fn token(text: &str) -> &str {
-        let end = text.find([' ', ';', '\n', '.']).unwrap_or(text.len());
+        let end = text.find([' ', ';', '\n', '.', ')']).unwrap_or(text.len());
         text[..end].trim()
     }
     /// Returns the bounded token immediately following the first occurrence of `marker`, if any.
@@ -1485,15 +1485,28 @@ async fn binary_codex_hooks_bind_exact_parallel_actors_and_stop_before_workspace
         restarted["result"]["structuredContent"]["code"],
         "host_binding"
     );
-    // Duplicate and premature post observations cannot be repaired by a subsequent MCP call.
-    for (call, second_phase) in [("duplicate", "PreToolUse"), ("early-post", "PostToolUse")] {
-        hook(&runtime, "PreToolUse", "session_id", "root", call).await;
-        hook(&runtime, second_phase, "session_id", "root", call).await;
-        boundary(
-            &root.exchange(host_call("root", call, "ide.start")).await,
-            "host_binding",
-        );
+    // The same pre delivered twice (one handler registered twice) is one pre and admits its
+    // call (T-010); a premature post cannot be repaired by a subsequent MCP call.
+    for _ in 0..2 {
+        hook(&runtime, "PreToolUse", "session_id", "root", "duplicate").await;
     }
+    let doubled = root
+        .exchange(host_call("root", "duplicate", "ide.start"))
+        .await;
+    assert_compact_envelope(&doubled);
+    assert_ne!(
+        doubled["result"]["structuredContent"]["code"],
+        "host_binding"
+    );
+    hook(&runtime, "PostToolUse", "session_id", "root", "duplicate").await;
+    hook(&runtime, "PreToolUse", "session_id", "root", "early-post").await;
+    hook(&runtime, "PostToolUse", "session_id", "root", "early-post").await;
+    boundary(
+        &root
+            .exchange(host_call("root", "early-post", "ide.start"))
+            .await,
+        "host_binding",
+    );
     // MCP-before-pre is permanently rejected for that exact invocation.
     boundary(
         &root
@@ -2000,6 +2013,11 @@ async fn binary_codex_hooks_print_emits_only_the_managed_fragment() {
                 "PreToolUse": [{"matcher": ".*", "hooks": [{
                     "type": "command", "command": command, "timeout": 1}]}],
                 "PostToolUse": [{"matcher": ".*", "hooks": [{
+                    "type": "command", "command": command, "timeout": 1}]}],
+                // OUTBOX-r3 §16: the turn-end hold and the compaction signal.
+                "Stop": [{"hooks": [{
+                    "type": "command", "command": command, "timeout": 330}]}],
+                "PreCompact": [{"hooks": [{
                     "type": "command", "command": command, "timeout": 1}]}],
             }
         })
@@ -6086,6 +6104,84 @@ async fn a_slow_edit_check_answers_at_once_and_arrives_as_one_fact() {
     daemon.wait().await.unwrap();
 }
 
+/// Reply hygiene (M024-M027-REPLY-HYGIENE r2, M024-M026 outbox texts): every real reply of a batch
+/// read, a batch edit whose project check outlasts the call, the two inspections that hand over its
+/// fact and the `ide.stop` reply states what happened and never invites polling, in its text and
+/// carried status.
+#[tokio::test]
+async fn pending_and_batch_replies_never_invite_polling() {
+    let fixture = ProductFixture::new(json!([]));
+    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 12");
+    write_problems_count(&fixture.root, "1");
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "hygiene-batch").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"hygiene"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let mut seen = vec![started.clone()];
+
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"items":[{"path":"src/lib.rs","lines":"1-2"},{"path":"missing.rs"}]}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let source_ref = read["detail_ref"].as_str().unwrap().to_owned();
+    seen.push(read);
+    let edit = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"hygiene-1","source_ref":source_ref,
+                   "files":[{"path":"src/lib.rs","changes":[{"lines":"1-1","content":"pub fn value() -> i32 { 7 }"}]}]}),
+        )
+        .await;
+    assert!(
+        edit["text"].as_str().is_some_and(
+            |text| text.contains("diagnostics: pending; the project check arrives by itself")
+        ),
+        "{edit}"
+    );
+    seen.push(edit);
+    let checked = actor
+        .call(&fixture, "ide.inspect", json!({"wait_ms":60000}))
+        .await;
+    assert!(
+        checked["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("edit-checked edit hygiene-1: ")),
+        "{checked}"
+    );
+    seen.push(checked);
+    seen.push(actor.call(&fixture, "ide.inspect", json!({})).await);
+    // The stop reply is read after a call too: it is held to the same rule.
+    seen.push(actor.call(&fixture, "ide.stop", json!({})).await);
+    for reply in &seen {
+        let shown = format!(
+            "{} {}",
+            reply["text"].as_str().unwrap_or_default(),
+            reply["status"].as_str().unwrap_or_default()
+        )
+        .to_lowercase();
+        for banned in [
+            "poll",
+            "every few seconds",
+            "in a few seconds",
+            "until it completes",
+            "again every",
+        ] {
+            assert!(!shown.contains(banned), "{banned}: {reply}");
+        }
+    }
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A pending edit whose project check was capped with none of this file's problems retained
 /// settles as `unknown`: an empty `current_reported` is not a closed reply, and it used to turn
 /// the whole detail into `inspect:internal` (a Python project with thousands of errors).
@@ -9078,8 +9174,8 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     );
     assert_eq!(
         start_text.trim_end(),
-        "tests #1: started — cargo test --manifest-path Cargo.toml --lib (budget 120 s); poll: call \
-         ide.test with {\"status\": 1}",
+        "tests #1: started — cargo test --manifest-path Cargo.toml --lib (budget 120 s); the result \
+         arrives by itself in a later <agent-ide> block",
         "{start_text}"
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
@@ -14463,6 +14559,29 @@ async fn configured_product_activation_reply_includes_the_project_card() {
         text.contains("\nservers: rust not started; outline, read and edit answer from source; the first symbol or graph call starts it and answers approximately at once · typescript not started; the first symbol or graph call starts it and its answer follows as a fact"),
         "{text}"
     );
+    // start-index-state §1: the call-signature block ends the reply, after the card and its
+    // servers line, within 2 KiB, with one example per batch form and the required stop.
+    let (card, signature) = text
+        .split_once("\n\ncall forms (")
+        .unwrap_or_else(|| panic!("no signature block: {text}"));
+    assert!(card.contains("\nservers: "), "{text}");
+    assert!(!card.contains("ide.read {\"items\""), "{text}");
+    let signature = format!("call forms ({signature}");
+    assert!(signature.len() <= 2048, "{} bytes", signature.len());
+    for form in [
+        "ide.read {\"items\"",
+        "ide.outline {\"paths\"",
+        "ide.symbol {\"symbols\"",
+        "ide.graph {\"symbols\"",
+        "ide.test {\"targets\"",
+        "ide.edit {\"operation_id\"",
+        "ide.inspect {\"wait_ms\"",
+    ] {
+        assert!(signature.contains(form), "{form}: {signature}");
+    }
+    assert!(signature.contains("\"files\":["), "{signature}");
+    assert!(text.ends_with("End the task with ide.stop."), "{text}");
+    assert!(!signature.contains("poll"), "{signature}");
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     actor.mcp.close().await;
@@ -21397,6 +21516,381 @@ async fn outbox_inspect_waits_lists_and_batches() {
     daemon.wait().await.unwrap();
 }
 
+/// Runs one Claude `Stop` hook for `actor` through the real hook command, allowing a held turn
+/// end up to `wait`; returns its stdout and how long it took.
+async fn claude_stop_hook(
+    fixture: &ProductFixture,
+    actor: &ProductActor,
+    wait: Duration,
+) -> (String, Duration) {
+    let started = tokio::time::Instant::now();
+    let mut child = claude_hook_process(&fixture.runtime, Some(actor.attachment));
+    let payload = json!({"hook_event_name":"Stop",actor.actor_field:actor.actor,
+        "stop_hook_active":false,"last_assistant_message":"done"});
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(payload.to_string().as_bytes())
+        .await
+        .unwrap();
+    input.shutdown().await.unwrap();
+    drop(input);
+    let output = tokio::time::timeout(wait, child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success() && output.stderr.is_empty());
+    (String::from_utf8(output.stdout).unwrap(), started.elapsed())
+}
+
+/// OUTBOX-r3 §8.3: a Claude turn end with nothing requested releases at once; one with its own
+/// test still running is held in the hook until the run settles and continues the turn with the
+/// `test-finished` fact and the restate sentence, exactly once across five concurrent holds,
+/// while the short hook lane keeps pairing tool calls; the next turn end releases.
+#[tokio::test]
+async fn outbox_claude_stop_hold_delivers_once_and_hooks_stay_free() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "outbox-hold").await;
+    let started = actor
+        .call_claude(&fixture, "ide.start", json!({"activation_id":"outbox"}))
+        .await;
+    let (started, _) = actor.settle_claude(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let (released, took) = claude_stop_hook(&fixture, &actor, Duration::from_secs(10)).await;
+    assert_eq!(released, "", "nothing requested: the turn ends");
+    assert!(took < Duration::from_secs(3), "{took:?}");
+
+    let run = actor
+        .call_claude(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c","sleep 8; echo held"]}),
+        )
+        .await;
+    assert!(
+        run["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("tests #1: started")),
+        "{run}"
+    );
+    let holds = futures_join5(
+        claude_stop_hook(&fixture, &actor, Duration::from_secs(60)),
+        claude_stop_hook(&fixture, &actor, Duration::from_secs(60)),
+        claude_stop_hook(&fixture, &actor, Duration::from_secs(60)),
+        claude_stop_hook(&fixture, &actor, Duration::from_secs(60)),
+        claude_stop_hook(&fixture, &actor, Duration::from_secs(60)),
+        async {
+            // While five holds wait, a native tool's Pre/Post pair still rides the hook lane.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let pre = actor
+                .claude_lifecycle_output(&fixture, "PreToolUse", "native-during-hold")
+                .await;
+            let post = actor
+                .claude_lifecycle_output(&fixture, "PostToolUse", "native-during-hold")
+                .await;
+            assert!(pre.status.success() && post.status.success());
+        },
+    )
+    .await;
+    let blocked = holds
+        .iter()
+        .filter(|(output, _)| !output.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(blocked.len(), 1, "{holds:?}");
+    let block: Value = serde_json::from_str(blocked[0].0.trim()).unwrap();
+    assert_eq!(block["decision"], "block", "{block}");
+    let reason = block["reason"].as_str().unwrap();
+    assert!(
+        reason.starts_with("<agent-ide>\ntest-finished tests #1: "),
+        "{reason}"
+    );
+    assert!(
+        reason.ends_with("then restate your complete final answer."),
+        "{reason}"
+    );
+    let (again, _) = claude_stop_hook(&fixture, &actor, Duration::from_secs(10)).await;
+    assert_eq!(again, "", "a fact is never held twice");
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Awaits five same-typed futures and one unit future concurrently, returning the five outputs.
+async fn futures_join5<T>(
+    a: impl std::future::Future<Output = T>,
+    b: impl std::future::Future<Output = T>,
+    c: impl std::future::Future<Output = T>,
+    d: impl std::future::Future<Output = T>,
+    e: impl std::future::Future<Output = T>,
+    side: impl std::future::Future<Output = ()>,
+) -> Vec<T> {
+    let (a, b, c, d, e, ()) = tokio::join!(a, b, c, d, e, side);
+    vec![a, b, c, d, e]
+}
+
+/// Runs one managed Claude call like [`managed_claude_call`] and returns the raw model text.
+async fn managed_claude_text(
+    mcp: &mut Mcp,
+    project: &Path,
+    next: &mut usize,
+    session: &str,
+    agent: Option<&str>,
+    name: &str,
+    arguments: Value,
+) -> String {
+    *next += 1;
+    let call = format!("managed-claude-{next}");
+    let pre = managed_claude_hook(
+        Some(project),
+        managed_claude_event("PreToolUse", session, agent, &call),
+    )
+    .await;
+    assert!(pre.status.success() && pre.stdout.is_empty(), "{pre:?}");
+    let reply = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":*next,"method":"tools/call","params":{
+                "name":name,"arguments":arguments,"_meta":{"claudecode/toolUseId":call}
+            }}),
+        )
+        .await;
+    let post = managed_claude_hook(
+        Some(project),
+        managed_claude_event("PostToolUse", session, agent, &call),
+    )
+    .await;
+    assert!(post.status.success() && post.stderr.is_empty(), "{post:?}");
+    assert_claude_envelope(&reply).to_owned()
+}
+
+/// OUTBOX-r3 §10: after a daemon replacement each actor that was owed results gets one
+/// `lost-after-restart` fact naming only its own unresolved requests, on its first call; the
+/// next call and an actor that was owed nothing get none.
+#[tokio::test]
+async fn outbox_managed_claude_restart_reports_lost_results_once_per_actor() {
+    let fixture = ProductFixture::new(json!([]));
+    let worktrees = add_worktrees(&fixture, &["lost-child", "lost-idle"]);
+    let (child, idle) = (&worktrees[0], &worktrees[1]);
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let session = "lost-after-restart";
+    let mut next = 10;
+    let actors = [
+        (&fixture.root, None, "parent"),
+        (child, Some("agent-child"), "child"),
+        (idle, Some("agent-idle"), "idle"),
+    ];
+    for (root, agent, activation) in actors {
+        claude_start_actor(
+            &mut mcp,
+            root,
+            &mut next,
+            session,
+            agent,
+            json!({"activation_id":activation,"root":root}),
+        )
+        .await;
+    }
+    // Parent and child each leave with a started line (one run at a time: the parent's settles
+    // unseen just after its line); the idle actor is owed nothing.
+    for ((root, agent, _), command) in actors[..2].iter().zip(["sleep 6.5", "sleep 60"]) {
+        let started = managed_claude_text(
+            &mut mcp,
+            root,
+            &mut next,
+            session,
+            *agent,
+            "ide.test",
+            json!({"command":["/bin/sh","-c",command]}),
+        )
+        .await;
+        assert!(started.contains(": started"), "{agent:?}: {started}");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let stale = managed_claude_candidate_attachment(&fixture.root);
+    terminate_shared_claude_daemon(&runtime);
+    wait_for_healed_daemon(&fixture.root, &runtime, &stale).await;
+    let read = json!({"path":"src/lib.rs","lines":"1-2"});
+    for (root, agent, own, other) in [
+        (&fixture.root, None, "tests #1", "tests #2"),
+        (child, Some("agent-child"), "tests #2", "tests #1"),
+    ] {
+        let first = managed_claude_text(
+            &mut mcp,
+            root,
+            &mut next,
+            session,
+            agent,
+            "ide.read",
+            read.clone(),
+        )
+        .await;
+        assert!(
+            first.starts_with(&format!(
+                "<agent-ide>\nlost-after-restart restart: the IDE restarted; results not \
+                 delivered before it may be lost: {own} (before restart)"
+            )),
+            "{agent:?}: {first}"
+        );
+        assert!(!first.contains(other), "{agent:?}: {first}");
+        let second = managed_claude_text(
+            &mut mcp,
+            root,
+            &mut next,
+            session,
+            agent,
+            "ide.read",
+            read.clone(),
+        )
+        .await;
+        assert!(
+            !second.contains("lost-after-restart"),
+            "{agent:?}: {second}"
+        );
+    }
+    let quiet = managed_claude_text(
+        &mut mcp,
+        idle,
+        &mut next,
+        session,
+        Some("agent-idle"),
+        "ide.read",
+        read,
+    )
+    .await;
+    assert!(!quiet.contains("lost-after-restart"), "{quiet}");
+    assert!(quiet.contains("pub fn"), "{quiet}");
+    mcp.close().await;
+}
+
+/// Runs one Claude-path call for `actor` with its native Pre/Post hooks and returns the raw
+/// model text.
+async fn claude_raw_call(
+    fixture: &ProductFixture,
+    actor: &mut ProductActor,
+    name: &str,
+    arguments: Value,
+) -> String {
+    actor.next += 1;
+    let call = format!("call-{}", actor.next);
+    actor.claude_lifecycle(fixture, "PreToolUse", &call).await;
+    let reply = actor
+        .mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
+            "name":name,"arguments":arguments,"_meta":{"claudecode/toolUseId":call}}}),
+        )
+        .await;
+    let _ = actor
+        .claude_lifecycle_output(fixture, "PostToolUse", &call)
+        .await;
+    assert_claude_envelope(&reply).to_owned()
+}
+
+/// OUTBOX-r3 §9.1 meets batch-api-v1 §2: a `PreCompact` hook raises the session's context
+/// epoch through the real hook path, so a read the agent received before the compaction is sent
+/// in full again instead of "unchanged since your read".
+#[tokio::test]
+async fn outbox_compaction_clears_the_unchanged_read_memory() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "outbox-compaction").await;
+    let started = actor
+        .call_claude(&fixture, "ide.start", json!({"activation_id":"compaction"}))
+        .await;
+    let (started, _) = actor.settle_claude(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let items = json!({"items":[{"path":"src/lib.rs"}]});
+    let first = claude_raw_call(&fixture, &mut actor, "ide.read", items.clone()).await;
+    assert!(!first.contains("unchanged since your read"), "{first}");
+    let again = claude_raw_call(&fixture, &mut actor, "ide.read", items.clone()).await;
+    assert!(again.contains("unchanged since your read"), "{again}");
+    let mut child = claude_hook_process(&fixture.runtime, Some(actor.attachment));
+    let mut input = child.stdin.take().unwrap();
+    input
+        .write_all(
+            json!({"hook_event_name":"PreCompact",actor.actor_field:actor.actor,
+                "trigger":"manual"})
+            .to_string()
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    input.shutdown().await.unwrap();
+    drop(input);
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success() && output.stdout.is_empty());
+    let after = claude_raw_call(&fixture, &mut actor, "ide.read", items).await;
+    assert!(!after.contains("unchanged since your read"), "{after}");
+    assert!(
+        after.contains("1 delivered, 0 unchanged") && after.contains("pub fn value()"),
+        "the compacted session gets the full text again: {after}"
+    );
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// OUTBOX-r3 §11: `ide.stop` lists the facts no carrier handed over, once.
+#[tokio::test]
+async fn outbox_claude_stop_flushes_undelivered_facts() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "outbox-stop").await;
+    let started = actor
+        .call_claude(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"outbox-stop"}),
+        )
+        .await;
+    let (started, _) = actor.settle_claude(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let run = actor
+        .call_claude(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c","sleep 7; echo done"]}),
+        )
+        .await;
+    assert!(
+        run["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("tests #1: started")),
+        "{run}"
+    );
+    // No call or hook runs while the run settles, so its fact stays undelivered.
+    tokio::time::sleep(Duration::from_secs(9)).await;
+    actor.next += 1;
+    let call = format!("call-{}", actor.next);
+    actor.claude_lifecycle(&fixture, "PreToolUse", &call).await;
+    let reply = actor
+        .mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
+            "name":"ide.stop","arguments":{},"_meta":{"claudecode/toolUseId":call}}}),
+        )
+        .await;
+    let text = assert_claude_envelope(&reply).to_owned();
+    assert!(text.starts_with("complete stop: "), "{text}");
+    assert_eq!(
+        text.matches("\ntest-finished tests #1: ").count(),
+        1,
+        "{text}"
+    );
+    assert!(text.contains("undelivered facts:"), "{text}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// OUTBOX-r3 §8.2: a Claude `ide.*` reply carries a finished run's `test-finished` fact once, at
 /// the start of what the model reads, with no plate test line; the call's own post hook and the
 /// next reply stay silent about it.
@@ -21453,6 +21947,74 @@ async fn outbox_claude_reply_carries_a_finished_run_fact_once() {
     assert!(!carried[0].contains("poll"), "{}", carried[0]);
     assert!(!carried[1].contains("tests #1"), "{}", carried[1]);
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A test run that is still running adds nothing to any later reply or plate: no running line, no
+/// elapsed seconds, no instruction. Its outcome then arrives once, as the terminal fact of
+/// M024-M026-TEST-FACT (counts, the failing test, the rerun line and the output reference), and a
+/// call after it carries nothing about the run.
+#[tokio::test]
+async fn a_running_test_adds_no_plate_line_and_one_terminal_fact_follows() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "running-no-plate").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"running"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let text = |reply: &Value| reply["text"].as_str().unwrap_or_default().to_owned();
+    let run = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c",
+                "sleep 14; printf '%s\\n' 'running 1 test' 'test tests::fails ... FAILED' '' 'failures:' '' '---- tests::fails stdout ----' \"thread 'tests::fails' panicked at src/lib.rs:3:5:\" 'boom' '' 'failures:' '    tests::fails' '' 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'; exit 101"]}),
+        )
+        .await;
+    assert!(text(&run).starts_with("tests #1: started"), "{run}");
+    assert!(!text(&run).contains("poll"), "{run}");
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let reply = actor
+            .call(&fixture, "ide.context", json!({"kind":"problems"}))
+            .await;
+        let carried = carried_status(&reply).unwrap_or_default();
+        for seen in [carried.to_owned(), text(&reply)] {
+            assert!(
+                !seen.contains("tests #1") && !seen.contains("poll"),
+                "a running test must not show up: {reply}"
+            );
+        }
+    }
+    let waited = actor
+        .call(&fixture, "ide.inspect", json!({"wait_ms":30000}))
+        .await;
+    let fact = text(&waited);
+    assert!(fact.starts_with("test-finished tests #1: "), "{fact}");
+    assert!(fact.contains("\n  FAIL tests::fails"), "{fact}");
+    assert!(fact.contains("\n  rerun: "), "{fact}");
+    assert_eq!(
+        fact.matches("full output: ide.inspect ").count(),
+        1,
+        "{fact}"
+    );
+    assert!(!fact.contains("poll"), "{fact}");
+    let after = actor
+        .call(&fixture, "ide.context", json!({"kind":"problems"}))
+        .await;
+    assert!(
+        !text(&after).contains("tests #1")
+            && !carried_status(&after)
+                .unwrap_or_default()
+                .contains("tests #1"),
+        "the outcome must not repeat: {after}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     actor.mcp.close().await;
     daemon.kill().await.unwrap();

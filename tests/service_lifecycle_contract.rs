@@ -600,6 +600,7 @@ async fn worktree_start_flow(
     let detail_ref = text
         .split("detail_ref ")
         .nth(1)
+        .and_then(|rest| rest.split([')', ' ', '\n']).next())
         .map(str::to_owned)
         .unwrap_or_default();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);

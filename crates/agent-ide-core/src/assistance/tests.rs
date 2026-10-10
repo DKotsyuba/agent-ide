@@ -50,8 +50,6 @@ struct State {
     next_id: u64,
     /// Retained jobs keyed by daemon-local id and partitioned by `Job::root`.
     jobs: BTreeMap<u64, Job>,
-    /// Last no-feed status plate delivered per worktree and starting binding.
-    delivered_status: BTreeMap<(PathBuf, [u8; 32]), String>,
     /// Called with a run's id right after its result is recorded (the session outbox's
     /// `test-finished` producer); absent until the worker installs it.
     on_settle: Option<Arc<dyn Fn(u64) + Send + Sync>>,
@@ -81,9 +79,6 @@ struct Job {
     completed_at: Option<tokio::time::Instant>,
     /// True after an explicit `status` request has retrieved the completed result.
     observed: bool,
-    /// True once the owner's `ide.stop` ended the activation that started the run: its status is
-    /// still readable by handle, but no later plate of the same session announces it.
-    retired: bool,
 }
 
 /// Captured parser summary, bounded output, and whether the budget killed the child.
@@ -444,7 +439,6 @@ impl TestRuns {
                 result: None,
                 completed_at: None,
                 observed: false,
-                retired: false,
             },
         );
         let registry = self.0.clone();
@@ -584,13 +578,11 @@ impl TestRuns {
         })
     }
 
-    /// Marks every job started by `binding` observed so stopping that actor cannot pin idle exit,
-    /// and retired so a later activation of the same session is not shown its status.
+    /// Marks every job started by `binding` observed so stopping that actor cannot pin idle exit.
     pub fn observe_binding(&self, binding: &[u8; 32]) {
         if let Ok(mut state) = self.0.lock() {
             for job in state.jobs.values_mut().filter(|job| &job.owner == binding) {
                 job.observed = true;
-                job.retired = true;
             }
         }
     }
@@ -626,93 +618,6 @@ impl TestRuns {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    /// Returns the current compact status line for the newest run in `root`.
-    pub fn status_line(&self, root: &PathBuf) -> Option<String> {
-        let state = self.0.lock().ok()?;
-        let (id, job) = state.jobs.iter().rev().find(|(_, job)| &job.root == root)?;
-        render_status_line(*id, job)
-    }
-
-    /// Returns an undelivered current status line for the newest run owned by one binding. A run
-    /// its `ide.stop` retired ([`TestRuns::observe_binding`]) belongs to the ended activation: a
-    /// later activation of the same session is not told about it.
-    pub fn status_line_for_binding(&self, binding: &[u8; 32]) -> Option<String> {
-        let state = self.0.lock().ok()?;
-        let (id, job) = state
-            .jobs
-            .iter()
-            .rev()
-            .find(|(_, job)| &job.owner == binding)?;
-        if job.retired {
-            return None;
-        }
-        let line = render_status_line(*id, job)?;
-        (state.delivered_status.get(&(job.root.clone(), *binding)) != Some(&line)).then_some(line)
-    }
-
-    /// Marks one exact current status line delivered for its starting binding.
-    pub fn mark_status_delivered(&self, binding: &[u8; 32], line: &str) -> bool {
-        let Ok(mut state) = self.0.lock() else {
-            return false;
-        };
-        let Some((owner_id, owner_job)) = state
-            .jobs
-            .iter()
-            .rev()
-            .find(|(_, job)| &job.owner == binding)
-        else {
-            return false;
-        };
-        let key = (owner_job.root.clone(), *binding);
-        let owner_id = *owner_id;
-        let is_current = state
-            .jobs
-            .get(&owner_id)
-            .and_then(|job| render_status_line(owner_id, job))
-            .as_deref()
-            == Some(line);
-        state.delivered_status.insert(key, line.to_owned());
-        if is_current
-            && let Some(job) = state.jobs.get_mut(&owner_id)
-            && job.result.is_some()
-        {
-            job.observed = true;
-        }
-        true
-    }
-
-    /// Marks a completed result observed after its worktree feed delivered that exact line.
-    pub fn mark_feed_status_delivered(&self, root: &PathBuf, line: &str) -> bool {
-        let Ok(mut state) = self.0.lock() else {
-            return false;
-        };
-        let Some((id, owner)) = state
-            .jobs
-            .iter()
-            .rev()
-            .find(|(_, job)| &job.root == root && job.result.is_some())
-            .map(|(id, job)| (*id, job.owner))
-        else {
-            return false;
-        };
-        if state
-            .jobs
-            .get(&id)
-            .and_then(|job| render_status_line(id, job))
-            .as_deref()
-            != Some(line)
-        {
-            return false;
-        }
-        state
-            .delivered_status
-            .insert((root.clone(), owner), line.to_owned());
-        if let Some(job) = state.jobs.get_mut(&id) {
-            job.observed = true;
-        }
-        true
     }
 
     /// Returns the output detail references of every retained run; the worker never evicts them,
@@ -757,80 +662,6 @@ fn prune_completed(registry: &Arc<Mutex<State>>, root: &PathBuf) {
             state.jobs.remove(&completed.remove(0));
         }
     }
-}
-
-/// Renders one job's current compact status without consuming its delivery state.
-fn render_status_line(id: u64, job: &Job) -> Option<String> {
-    Some(match &job.result {
-        Some(result) => settled_line(id, result, false),
-        None => format!(
-            "tests #{id}: running {} s; poll: call ide.test with {{\"status\": {id}}}",
-            job.started.elapsed().as_secs()
-        ),
-    })
-}
-
-/// Renders one settled run's first status line for the full result.
-///
-/// A run that counted no test is never shown as `0 passed, 0 failed`: a non-zero exit says the
-/// runner could not run (`no test results (exit N)` plus a bounded output excerpt and detail ref),
-/// and a missing summary says so.
-pub fn result_line(id: u64, result: &RunResult) -> String {
-    settled_line(id, result, true)
-}
-
-/// Suffix that names a run's full output in reply lines; status plates never carry it.
-const FULL_OUTPUT: &str = "; full output: ide.inspect ";
-
-/// The status-plate form of a reply's first line: the line without its full-output reference.
-/// The plate is length-bounded, and a cut reference would name a detail that was never issued.
-pub fn plate_line(line: &str) -> &str {
-    line.split_once(FULL_OUTPUT).map_or(line, |(head, _)| head)
-}
-
-/// Renders the terminal status, optionally with a full-output reference and launch environment.
-fn settled_line(id: u64, result: &RunResult, with_ref: bool) -> String {
-    let report = &result.report;
-    let seconds = result.elapsed.as_secs();
-    let counted = report.passed != 0 || report.failed != 0;
-    let reference = if with_ref {
-        format!("{FULL_OUTPUT}{}", result.detail_ref)
-    } else {
-        String::new()
-    };
-    let mut line = if result.stopped {
-        format!(
-            "tests #{id}: stopped at budget {} s — {} passed, {} failed so far",
-            result.budget.as_secs(),
-            report.passed,
-            report.failed
-        )
-    } else if let Some(code) = result.exit.filter(|code| *code != 0 && !counted) {
-        format!(
-            "tests #{id}: no test results (exit {code}), {seconds} s — runner said: {}{reference}",
-            runner_excerpt(&result.output)
-        )
-    } else if !counted && report.incomplete {
-        let summary = format!("tests #{id}: no summary parsed, {seconds} s");
-        if let Some(code) = result.exit.filter(|code| *code != 0) {
-            format!(
-                "{summary} (exit {code}) — runner said: {}{reference}",
-                runner_excerpt(&result.output)
-            )
-        } else {
-            format!("{summary} — inspect the runner's full output with ide.inspect")
-        }
-    } else {
-        format!(
-            "tests #{id}: {} passed, {} failed, {seconds} s",
-            report.passed, report.failed
-        )
-    };
-    if let Some(label) = &result.environment_label {
-        let at = line.find(FULL_OUTPUT).unwrap_or(line.len());
-        line.insert_str(at, &format!(" · env {label}"));
-    }
-    line
 }
 
 /// Selects the most useful bounded runner line for an empty result summary.
@@ -1236,6 +1067,7 @@ async fn read_into_tail<R: tokio::io::AsyncRead + Unpin>(
 mod runner_tests {
     //! Minimal process and parser checks for the test runner.
     use super::*;
+    use crate::assistance::test_fact::terminal_fact;
 
     /// A pinned toolchain leads PATH without discarding the caller's explicit override.
     #[test]
@@ -1325,72 +1157,16 @@ mod runner_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Delivery for one actor does not make another actor's unchanged plate due again.
-    #[test]
-    fn status_delivery_is_partitioned_by_root_and_binding() {
-        let runs = TestRuns::default();
-        let root = PathBuf::from("/tmp/shared-worktree");
-        let first = [1; 32];
-        let second = [2; 32];
-        {
-            let mut state = runs.0.lock().unwrap();
-            for (id, owner) in [(1, first), (2, second)] {
-                state.jobs.insert(
-                    id,
-                    Job {
-                        root: root.clone(),
-                        owner,
-                        channel: [id as u8; 32],
-                        detail_ref: format!("detail-{id}"),
-                        command: vec!["check".to_owned()],
-                        explicit_command: true,
-                        started: tokio::time::Instant::now(),
-                        result: None,
-                        completed_at: None,
-                        observed: false,
-                        retired: false,
-                    },
-                );
-            }
-        }
-        let first_line = runs.status_line_for_binding(&first).unwrap();
-        assert!(runs.mark_status_delivered(&first, &first_line));
-        let second_line = runs.status_line_for_binding(&second).unwrap();
-        assert!(runs.mark_status_delivered(&second, &second_line));
-        assert_eq!(runs.status_line_for_binding(&first), None);
-        assert_eq!(runs.status_line_for_binding(&second), None);
-    }
-
-    /// Empty summaries surface the first error line, falling back to the final output line.
+    /// Empty summaries surface the first error line, falling back to the final output line, and
+    /// never more than 200 bytes.
     #[test]
     fn empty_summary_quotes_bounded_runner_reason() {
-        let mut result = failed_run(
-            Duration::from_secs(10),
-            "noise\nERROR: missing collectors\nlast\n".into(),
-        );
-        result.exit = Some(4);
         assert_eq!(
-            result_line(3, &result),
-            format!(
-                "tests #3: no test results (exit 4), 0 s — runner said: ERROR: missing collectors; full output: ide.inspect {}",
-                result.detail_ref
-            )
+            runner_excerpt("noise\nERROR: missing collectors\nlast\n"),
+            "ERROR: missing collectors"
         );
-        // The status plate keeps the reason but never a reference it might cut, and the reason
-        // survives the output being paged into the detail ledger.
-        let plate =
-            "tests #3: no test results (exit 4), 0 s — runner said: ERROR: missing collectors";
-        assert_eq!(settled_line(3, &result, false), plate);
-        // The reply's first line, as the dispatcher snapshots it for the plate, agrees.
-        assert_eq!(plate_line(&result_line(3, &result)), plate);
-        result.output = runner_excerpt(&result.output);
-        assert_eq!(settled_line(3, &result, false), plate);
-        result.output = "noise\nlast line\n".into();
-        assert!(
-            result_line(3, &result).contains("runner said: last line; full output: ide.inspect")
-        );
-        result.output = "x".repeat(300);
-        assert!(runner_excerpt(&result.output).len() <= 200);
+        assert_eq!(runner_excerpt("noise\nlast line\n"), "last line");
+        assert!(runner_excerpt(&"x".repeat(300)).len() <= 200);
     }
 
     /// Uses a test-language transcript to prove captured output reaches the language parser.
@@ -1527,7 +1303,7 @@ mod runner_tests {
         )
         .await;
         assert_eq!(result.exit, Some(2));
-        let line = result_line(1, &result);
+        let line = terminal_fact(1, &result, true).reply_text(1);
         assert!(
             line.starts_with("tests #1: no test results (exit 2), "),
             "{line}"
@@ -1537,11 +1313,8 @@ mod runner_tests {
             exit: Some(0),
             ..result.clone()
         };
-        assert!(
-            result_line(1, &counted_zero).starts_with("tests #1: 0 passed, 0 failed, "),
-            "{}",
-            result_line(1, &counted_zero)
-        );
+        let line = terminal_fact(1, &counted_zero, true).reply_text(1);
+        assert!(line.starts_with("tests #1: 0 passed, 0 failed, "), "{line}");
         let failed = RunResult {
             report: TestReport {
                 failed: 1,
@@ -1549,7 +1322,11 @@ mod runner_tests {
             },
             ..result
         };
-        assert!(result_line(1, &failed).starts_with("tests #1: 0 passed, 1 failed, "));
+        assert!(
+            terminal_fact(1, &failed, true)
+                .reply_text(1)
+                .starts_with("tests #1: 0 passed, 1 failed, ")
+        );
     }
 
     /// Refuses a second live test job for the same worktree.
@@ -1583,8 +1360,7 @@ mod runner_tests {
 
     /// A status lookup answers the run's own actor and channel in any binding generation, and
     /// refuses another actor's retained run in the same worktree, whose failures and rerun
-    /// command stay with the actor that started it. Plates continue to show the owner's run when
-    /// a later activation starts another actor's job in the same worktree.
+    /// command stay with the actor that started it.
     #[tokio::test]
     async fn status_lookup_is_scoped_to_the_starting_actor() {
         let runs = TestRuns::default();
@@ -1630,19 +1406,6 @@ mod runner_tests {
             ),
             StartResult::Started(2)
         ));
-        for _ in 0..500 {
-            if runs
-                .get(&root, 2, &other)
-                .is_some_and(|status| status.result.is_some())
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let owner_plate = runs.status_line_for_binding(&owner.fingerprint()).unwrap();
-        let other_plate = runs.status_line_for_binding(&other.fingerprint()).unwrap();
-        assert!(owner_plate.starts_with("tests #1:"), "{owner_plate}");
-        assert!(other_plate.starts_with("tests #2:"), "{other_plate}");
     }
 
     /// Reports an uncollected run with its command until the owner reads the settled result.
@@ -1679,41 +1442,37 @@ mod runner_tests {
         assert!(runs.uncollected(&binding).is_empty());
     }
 
-    /// A run settled after its owner's `ide.stop` is never announced to a later activation of the
-    /// same session (same binding), while a run that activation starts is.
+    /// A run its owner's `ide.stop` observed neither stays uncollected after it settles nor keeps
+    /// the daemon busy.
     #[tokio::test]
-    async fn stop_retires_runs_from_later_status_plates() {
+    async fn stop_observes_the_runs_of_its_owner() {
         let runs = TestRuns::default();
         let root = std::env::temp_dir().to_path_buf();
-        let owner = BindingRef::fixture("retired-actor", "retired-channel", 1);
+        let owner = BindingRef::fixture("observed-actor", "observed-channel", 1);
         let binding = owner.fingerprint();
-        let start = |detail: &str| {
+        assert!(matches!(
             runs.start(
                 root.clone(),
                 vec!["/bin/echo".into(), "done".into()],
                 crate::lang::testing::ALPHA,
                 Duration::from_secs(10),
-                detail.into(),
+                "observed-detail".into(),
                 &owner,
-            )
-        };
-        assert!(matches!(start("retired-old"), StartResult::Started(1)));
+            ),
+            StartResult::Started(1)
+        ));
         runs.observe_binding(&binding);
-        // Waits through the worktree status line, which reads nothing on the owner's behalf.
         for _ in 0..100 {
             if runs
-                .status_line(&root)
-                .is_some_and(|line| !line.contains("running"))
+                .get(&root, 1, &owner)
+                .is_some_and(|status| status.result.is_some())
             {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(!runs.status_line(&root).unwrap().contains("running"));
-        assert_eq!(runs.status_line_for_binding(&binding), None);
-        assert!(matches!(start("retired-new"), StartResult::Started(2)));
-        let fresh = runs.status_line_for_binding(&binding).unwrap();
-        assert!(fresh.starts_with("tests #2:"), "{fresh}");
+        assert!(runs.uncollected(&binding).is_empty());
+        assert!(!runs.is_busy());
     }
 
     /// Both command modes apply prefix argv, resolved variables and PATH ahead of caller values.
@@ -1760,8 +1519,8 @@ mod runner_tests {
         result.report.passed = 1;
         result.environment_label = Some("two".into());
         assert_eq!(
-            result_line(1, &result),
-            "tests #1: 1 passed, 0 failed, 0 s · env two"
+            terminal_fact(1, &result, true).summary,
+            "1 passed, 0 failed, 0 s · env two"
         );
     }
 }

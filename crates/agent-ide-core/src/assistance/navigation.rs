@@ -15,18 +15,21 @@ use crate::lang::{
 
 /// Collapses the same-name candidates of one outline by rendered address.
 ///
-/// `candidates` are the outline's symbols with the requested name, in outline order. Candidates
-/// that share one address (a struct and its `impl` blocks) count once: the first non-`impl`
-/// candidate of that address is kept, or the first `impl` when the address has no declaration.
-/// The result keeps the first-occurrence order of each address; an empty input gives an empty
+/// `candidates` are the outline's symbols with the requested name, in outline order. Only `impl`
+/// blocks fold: an `impl` that shares its address with a declaration (or with an earlier `impl`)
+/// counts as that declaration, and the declaration replaces an `impl` kept before it. Distinct
+/// declarations that share an address (`struct Store` and `trait Store`) all stay, so the name
+/// remains ambiguous. The result keeps first-occurrence order; an empty input gives an empty
 /// result.
 pub(super) fn collapse_named(candidates: Vec<&Symbol>) -> Vec<&Symbol> {
     let mut kept: Vec<&Symbol> = Vec::new();
     for candidate in candidates {
-        match kept.iter_mut().find(|kept| kept.path == candidate.path) {
-            Some(kept) if kept.kind == SymbolKind::Impl && candidate.kind != SymbolKind::Impl => {
-                *kept = candidate;
-            }
+        let block = candidate.kind == SymbolKind::Impl;
+        let same = kept
+            .iter_mut()
+            .find(|kept| kept.path == candidate.path && (block || kept.kind == SymbolKind::Impl));
+        match same {
+            Some(kept) if !block => *kept = candidate,
             Some(_) => {}
             None => kept.push(candidate),
         }
@@ -230,6 +233,25 @@ mod tests {
             SymbolKind::Impl
         );
         assert!(collapse_named(Vec::new()).is_empty());
+    }
+
+    /// Two distinct declarations at one address stay two, so the bare name stays ambiguous; the
+    /// impl block still folds into whichever declaration it shares the address with.
+    #[test]
+    fn collapse_keeps_distinct_declarations_ambiguous() {
+        let declaration = symbol(SymbolKind::Struct);
+        let behaviour = symbol(SymbolKind::Trait);
+        let implementation = symbol(SymbolKind::Impl);
+        let collapsed = collapse_named(vec![&declaration, &implementation, &behaviour]);
+        assert_eq!(
+            collapsed.iter().map(|kept| kept.kind).collect::<Vec<_>>(),
+            [SymbolKind::Struct, SymbolKind::Trait]
+        );
+        let collapsed = collapse_named(vec![&implementation, &behaviour, &declaration]);
+        assert_eq!(
+            collapsed.iter().map(|kept| kept.kind).collect::<Vec<_>>(),
+            [SymbolKind::Trait, SymbolKind::Struct]
+        );
     }
 
     /// The construction matrix of symbol-graph-item r2 §3: what builds a value, and what only

@@ -43,6 +43,12 @@ pub const MAX_HISTORY: usize = 16;
 pub const MAX_WAIT_MS: u64 = 240_000;
 /// Most references one `ide.inspect {"detail_refs": …}` call names (OUTBOX §8.5).
 pub const MAX_DETAIL_REFS: usize = 8;
+/// Longest one Stop/SubagentStop hold waits for a holding fact (OUTBOX §8.3).
+pub const HOLD_CAP: std::time::Duration = std::time::Duration::from_secs(300);
+/// Hook-side and transport deadline of a held Stop hook: the hold cap plus a settling margin.
+pub const HOLD_HOOK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(305);
+/// Most Stop holds one daemon serves at once; a hold beyond it releases at once (OUTBOX §8.3).
+pub const HOLD_CONNECTIONS: usize = 16;
 
 /// The closed set of fact kinds (OUTBOX §2). Adding a kind is a contract revision.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

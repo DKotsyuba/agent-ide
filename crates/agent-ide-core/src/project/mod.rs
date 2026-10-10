@@ -927,13 +927,33 @@ fn render_docs(card: &ProjectCard, shown: usize) -> String {
     line
 }
 
+/// Longest servers line in bytes (start-index-state r3 §1).
+const SERVERS_LINE_MAX: usize = 360;
+
+/// Renders `servers: <language> <state>[ · …]` within [`SERVERS_LINE_MAX`] bytes.
+///
+/// When the full line is too long, languages from the last one backwards keep only their state's
+/// head (the text before its first `;`, such as `not started` or `warming`) until it fits; the
+/// first languages keep their whole state for as long as the budget allows.
+///
+/// ponytail: a card with so many languages that even the state heads overflow drops languages
+/// from the end; no product language set comes near that (about 14 languages).
 fn render_servers(card: &ProjectCard) -> String {
-    let parts: Vec<String> = card
+    let mut parts: Vec<String> = card
         .servers
         .iter()
         .map(|server| format!("{} {}", server.language, server.state))
         .collect();
-    format!("servers: {}", parts.join(" · "))
+    let line = |parts: &[String]| format!("servers: {}", parts.join(" · "));
+    for (index, server) in card.servers.iter().enumerate().rev() {
+        if line(&parts).len() <= SERVERS_LINE_MAX {
+            break;
+        }
+        let head = server.state.split(';').next().unwrap_or_default();
+        parts[index] = format!("{} {head}", server.language);
+    }
+    while line(&parts).len() > SERVERS_LINE_MAX && parts.pop().is_some() {}
+    line(&parts)
 }
 
 /// The `not started` state `ide.start` prints for one language whose server has no session for
@@ -1163,6 +1183,46 @@ mod tests {
              follows as a fact · beta not started; the first symbol or graph call starts it and \
              its answer follows as a fact"
         );
+    }
+
+    /// A card with five languages, every one not started, keeps its servers line within the
+    /// 360-byte budget of start-index-state r3 §1: later languages keep only their state head,
+    /// every language is still named, and the first keeps its whole state.
+    #[test]
+    fn servers_line_stays_within_its_byte_budget() {
+        crate::lang::testing::install();
+        use crate::lang::testing::{ALPHA, BETA, DELTA, EPSILON, GAMMA};
+        let languages = [EPSILON, ALPHA, BETA, GAMMA, DELTA];
+        let card = ProjectCard {
+            root: PathBuf::from("/repo"),
+            name: "repo".to_owned(),
+            git: None,
+            languages: Vec::new(),
+            layout: Vec::new(),
+            docs: Vec::new(),
+            servers: languages
+                .iter()
+                .map(|language| ServerState {
+                    language: *language,
+                    state: not_started_state(*language).to_owned(),
+                })
+                .collect(),
+            problems: None,
+            truncated: false,
+            agent_commands: crate::lang::ProjectCommands::default(),
+            environments: Vec::new(),
+            modes: None,
+        };
+        let line = render_servers(&card);
+        assert!(line.len() <= 360, "{} bytes: {line}", line.len());
+        assert!(
+            line.starts_with(&format!("servers: epsilon {}", not_started_state(EPSILON))),
+            "{line}"
+        );
+        assert!(line.ends_with(" · delta not started"), "{line}");
+        for language in languages {
+            assert!(line.contains(&format!("{language} not started")), "{line}");
+        }
     }
 
     /// Every servers-line state reads exactly as start-index-state r2 §2 fixes it: the lazy-start

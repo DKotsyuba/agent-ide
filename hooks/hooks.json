@@ -24,6 +24,30 @@
         "matcher": "",
         "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT:-$(pwd)}/hooks/claude-hook.sh"}]
       }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT:-$(pwd)}/hooks/claude-hook.sh", "timeout": 330}]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT:-$(pwd)}/hooks/claude-hook.sh", "timeout": 330}]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT:-$(pwd)}/hooks/claude-hook.sh"}]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "compact|clear",
+        "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT:-$(pwd)}/hooks/claude-hook.sh"}]
+      }
     ]
   }
 }

@@ -43,8 +43,14 @@ pub mod worker;
 /// Defines the per-session outbox of deferred facts and its producer/carrier seam (OUTBOX-r3).
 pub mod outbox;
 
+/// Wakes an idle agent for its own requested results behind one narrow interface (OUTBOX-r3 §8.4).
+pub mod wake;
+
 /// Stores each session's undelivered facts, change counters and agent state (OUTBOX-r3 §5-§9).
 pub mod session_outbox;
+
+/// Remembers, in the MCP front, requested work it relayed unresolved, for restarts (OUTBOX-r3 §10).
+pub mod unresolved;
 
 /// Tracks environment resolution changes across worktree bindings.
 mod environment;
@@ -54,3 +60,13 @@ pub mod telemetry;
 
 /// Owns explicitly requested background test runs for the daemon lifetime.
 pub mod tests;
+
+/// Renders the deterministic, byte-bounded terminal text of one settled test run.
+pub(crate) mod test_fact;
+
+/// Holds the call-signature block that ends every `ide.start` reply.
+pub(crate) mod signature_card;
+
+/// Guards that no reply, plate, fact, description or instruction invites polling.
+#[cfg(test)]
+mod hygiene;
