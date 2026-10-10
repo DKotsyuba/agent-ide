@@ -300,9 +300,10 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Outline,
             json!({
                 "type": "object", "additionalProperties": false,
-                "required": ["path"],
                 "properties": {
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root."},
+                    "paths": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_OUTLINE_FILES, "items": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "description": "Several files in ONE call instead of `path`: up to 24 worktree-relative paths, outlined in request order behind one summary line; a file past the reply budget is listed in one line with its exact call."},
+                    "glob": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Every file matching this worktree-relative pattern in ONE call instead of `path`: `*` within a segment, `?` one character, `**` any directories (e.g. `crates/x/src/**/*.rs`); at most 24 files in path order, never outside the worktree, skipping hidden and build directories."},
                     "kinds": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol)(,(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol))*$", "description": "Comma list over the closed symbol-kind vocabulary; keeps a symbol whose kind is selected or a descendant's is, so a container of a selected member still shows."}
                 }
             }),
@@ -703,7 +704,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "lines",
             "files",
         ],
-        AssistanceTool::Outline => &["path", "kinds"],
+        AssistanceTool::Outline => &["path", "kinds", "paths", "glob"],
         AssistanceTool::Read => &[
             "symbol", "path", "lines", "symbols", "ranges", "items", "force",
         ],
@@ -810,6 +811,9 @@ pub fn validate_call(
         return Err(ParameterError::UnknownField(echoable_field(field)));
     }
     match tool {
+        AssistanceTool::Outline if object.contains_key("paths") || object.contains_key("glob") => {
+            super::batch::validate_outline(object)?;
+        }
         AssistanceTool::Outline => {
             if !object.contains_key("path") {
                 return Err(ParameterError::OutlineTarget);

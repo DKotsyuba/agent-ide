@@ -1,4 +1,5 @@
-//! Several-target forms of `ide.symbol` and `ide.graph` (batch-api-v1 §4–§5) on the worker.
+//! Several-target forms of `ide.symbol`, `ide.graph` and `ide.outline` (batch-api-v1 §3–§5) on
+//! the worker.
 //!
 //! Each entry is answered by the single form itself, called once per entry inside the batch's
 //! one job with the shared options, so its block equals the single form's reply text
@@ -8,6 +9,7 @@
 //! can, so a batch never mixes a partial answer with a waiting one.
 
 use super::*;
+use crate::assistance::batch;
 
 /// How one entry of a several-symbol call was answered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -189,6 +191,219 @@ impl Worker<'_> {
         self.shared.set_context_page(&job.reference, page);
         Ok((reply, authority, None))
     }
+
+    /// `ide.outline {paths | glob, kinds?}`: several files outlined in ONE reply.
+    ///
+    /// The files are the `paths` in request order (an exact repeat once), or the regular files
+    /// below the worktree matching `glob` in path order, at most
+    /// [`batch::MAX_OUTLINE_FILES`]. Each file is outlined by the single form with the same
+    /// `kinds`, so its block is the single form's text and a failed file fails only itself. The
+    /// reply opens with `outline: <n> files — <k> outlined, <m> listed only, <f> failed`, plus
+    /// `; +<x> more files matched` when a glob matched more. Whole outlines are delivered in order
+    /// while they fit; every later file is one line `<path> (<lines> lines, <symbols> symbols) →
+    /// ide.outline {"path":…}`.
+    pub(super) async fn batch_outline(
+        &mut self,
+        job: &mut Job,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let request = job.parameters.clone();
+        let authority = self.authority(job.invocation.binding_ref()).await?;
+        let (paths, more) = match request.get("glob").and_then(Value::as_str) {
+            Some(pattern) => glob_files(authority.worktree().worktree_path(), pattern),
+            None => {
+                let mut paths: Vec<String> = Vec::new();
+                for path in request
+                    .get("paths")
+                    .and_then(Value::as_array)
+                    .ok_or(FailureCode::Internal)?
+                    .iter()
+                    .filter_map(Value::as_str)
+                {
+                    if !paths.iter().any(|known| known == path) {
+                        paths.push(path.to_owned());
+                    }
+                }
+                (paths, 0)
+            }
+        };
+        let mut single = serde_json::json!({});
+        if let Some(kinds) = request.get("kinds") {
+            single["kinds"] = kinds.clone();
+        }
+        // (path, text, failed, paged): a paged outline is too large to embed and is listed.
+        let mut blocks: Vec<(String, String, bool, bool)> = Vec::with_capacity(paths.len());
+        for path in &paths {
+            let mut call = single.clone();
+            call["path"] = serde_json::json!(path);
+            job.parameters = call;
+            job.failure_detail = None;
+            // Boxed: the single form routes its own batch keys back here.
+            let answer = Box::pin(self.outline(job)).await;
+            job.parameters = request.clone();
+            match answer {
+                Ok((
+                    PeerReply::Complete {
+                        mut text,
+                        continuation,
+                        ..
+                    },
+                    ..,
+                )) => {
+                    if !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                    blocks.push((path.clone(), text, false, continuation));
+                }
+                Err(FailureCode::ProviderLoading) if job.park_until.is_some() => {
+                    return Err(FailureCode::ProviderLoading);
+                }
+                Ok((other, ..)) => {
+                    let text = rendered_text(other, AssistanceTool::Outline);
+                    blocks.push((path.clone(), text, true, false));
+                }
+                Err(code) => {
+                    let detail = job.failure_detail.take();
+                    let text =
+                        rendered_text(PeerReply::Error { code, detail }, AssistanceTool::Outline);
+                    blocks.push((path.clone(), text, true, false));
+                }
+            }
+        }
+        job.failure_detail = None;
+        let reference = job.reference.clone();
+        let fits = |text: &str| {
+            content::fits(
+                &PeerReply::Complete {
+                    kind: ResultKind::Outline,
+                    text: text.to_owned(),
+                    detail_ref: Some(reference.clone()),
+                    truncated: true,
+                    continuation: false,
+                },
+                content::Envelope::WithStructured,
+            )
+        };
+        let full = |index: usize, count: usize| {
+            let (_, _, failed, paged) = &blocks[index];
+            *failed || (index < count && !*paged)
+        };
+        let compose = |count: usize| {
+            let failed = blocks.iter().filter(|block| block.2).count();
+            let outlined = (0..blocks.len())
+                .filter(|&index| full(index, count) && !blocks[index].2)
+                .count();
+            let listed = blocks.len() - failed - outlined;
+            let mut text = format!(
+                "outline: {} files — {outlined} outlined, {listed} listed only, {failed} failed",
+                blocks.len()
+            );
+            if more > 0 {
+                text.push_str(&format!("; +{more} more files matched"));
+            }
+            text.push('\n');
+            for (index, (path, block, ..)) in blocks.iter().enumerate() {
+                if full(index, count) {
+                    text.push_str(block);
+                } else {
+                    text.push_str(&listed_line(path, block));
+                }
+            }
+            text
+        };
+        let included = (0..=blocks.len())
+            .rev()
+            .find(|&count| fits(&compose(count)))
+            .unwrap_or(0);
+        let text = compose(included);
+        let (reply, page) =
+            ContextPageState::new(text, 0, false, ResultKind::Outline).next(&job.reference)?;
+        self.shared.set_context_page(&job.reference, page);
+        Ok((reply, Some(authority), None))
+    }
+}
+
+/// Most files a glob walk compares before it stops counting.
+const MAX_GLOB_CANDIDATES: usize = 10_000;
+
+/// Most directories a glob walk opens.
+const MAX_GLOB_DIRECTORIES: usize = 2_000;
+
+/// The worktree-relative regular files below `root` matching `pattern`, path-sorted, at most
+/// [`batch::MAX_OUTLINE_FILES`], and how many more matched.
+///
+/// The walk starts at the pattern's literal directory ([`batch::glob_root`]) only when that
+/// directory resolves inside the worktree, opens at most [`MAX_GLOB_DIRECTORIES`] directories,
+/// never follows a symbolic link (a linked file or directory is not a match), and skips hidden
+/// directories and the directories the name index skips (`target`, `node_modules`, …).
+fn glob_files(root: &Path, pattern: &str) -> (Vec<String>, usize) {
+    let start = batch::glob_root(pattern);
+    let inside = std::fs::canonicalize(root)
+        .ok()
+        .zip(std::fs::canonicalize(root.join(&start)).ok())
+        .is_some_and(|(root, start)| start.starts_with(root));
+    if !inside {
+        return (Vec::new(), 0);
+    }
+    let mut matched: Vec<String> = Vec::new();
+    let mut queue = std::collections::VecDeque::from([PathBuf::from(&start)]);
+    let mut opened = 0;
+    while let Some(directory) = queue.pop_front() {
+        opened += 1;
+        if opened > MAX_GLOB_DIRECTORIES {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(root.join(&directory)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = directory.join(&name);
+            if kind.is_dir() {
+                if !name.starts_with('.')
+                    && !crate::intelligence::names::SKIPPED_DIRECTORIES.contains(&name.as_str())
+                {
+                    queue.push_back(path);
+                }
+            } else if kind.is_file()
+                && let Some(path) = path.to_str()
+                && batch::glob_matches(pattern, path)
+            {
+                matched.push(path.to_owned());
+                if matched.len() >= MAX_GLOB_CANDIDATES {
+                    queue.clear();
+                    break;
+                }
+            }
+        }
+    }
+    matched.sort();
+    let more = matched.len().saturating_sub(batch::MAX_OUTLINE_FILES);
+    matched.truncate(batch::MAX_OUTLINE_FILES);
+    (matched, more)
+}
+
+/// The one line a file past the reply budget gets: `<path> (<lines> lines, <symbols> symbols)
+/// → ide.outline {"path":…}`, read from its outline block (header `<path>  (<n> lines, …)`,
+/// one line per symbol after it). A block the single form paged (it opens with its `page` line)
+/// holds only its first page, so its line names the file's lines alone.
+fn listed_line(path: &str, block: &str) -> String {
+    let header = block
+        .lines()
+        .find(|line| line.contains("  ("))
+        .unwrap_or_default();
+    let lines = header
+        .split_once("  (")
+        .and_then(|(_, rest)| rest.split(' ').next())
+        .unwrap_or("?");
+    let call = Value::String(path.to_owned());
+    if block.starts_with("page ") {
+        return format!("{path} ({lines} lines) → ide.outline {{\"path\":{call}}}\n");
+    }
+    let symbols = block.lines().count().saturating_sub(1);
+    format!("{path} ({lines} lines, {symbols} symbols) → ide.outline {{\"path\":{call}}}\n")
 }
 
 /// The complete-result kind of a several-symbol call: the tool's own kind.

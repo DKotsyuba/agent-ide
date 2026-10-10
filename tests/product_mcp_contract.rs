@@ -444,6 +444,8 @@ fn assert_compact_envelope(reply: &Value) {
         // A multi-file edit (batch-api-v1 §7) opens with its outcome line.
         ("complete", Some("edit_batch")) => assert!(body.starts_with("edit: "), "{reply}"),
         // `<file>  (<n> lines, <lang>)` outline header.
+        // A several-file outline (batch-api-v1 §3) opens with its summary line.
+        ("complete", Some("outline")) if body.starts_with("outline: ") => {}
         ("complete", Some("outline")) => {
             let header = body.lines().next().unwrap_or_default();
             let (file, details) = header.split_once("  (").expect("outline file header");

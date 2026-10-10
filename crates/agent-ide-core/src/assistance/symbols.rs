@@ -125,11 +125,15 @@ impl Worker<'_> {
         ))
     }
 
-    /// `ide.outline {path}`: the file skeleton.
+    /// `ide.outline {path}`: the file skeleton; the `{paths}` and `{glob}` forms outline each file
+    /// through this same path (`batch_outline`).
     pub(super) async fn outline(
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        if job.parameters.get("paths").is_some() || job.parameters.get("glob").is_some() {
+            return self.batch_outline(job).await;
+        }
         let binding = job.invocation.binding_ref().clone();
         let path = job.parameters["path"]
             .as_str()

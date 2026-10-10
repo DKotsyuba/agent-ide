@@ -357,6 +357,12 @@
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "glob": {
+          "description": "Every file matching this worktree-relative pattern in ONE call instead of `path`: `*` within a segment, `?` one character, `**` any directories (e.g. `crates/x/src/**/*.rs`); at most 24 files in path order, never outside the worktree, skipping hidden and build directories.",
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        },
         "kinds": {
           "description": "Comma list over the closed symbol-kind vocabulary; keeps a symbol whose kind is selected or a descendant's is, so a container of a selected member still shows.",
           "maxLength": 256,
@@ -369,11 +375,19 @@
           "maxLength": 1024,
           "minLength": 1,
           "type": "string"
+        },
+        "paths": {
+          "description": "Several files in ONE call instead of `path`: up to 24 worktree-relative paths, outlined in request order behind one summary line; a file past the reply budget is listed in one line with its exact call.",
+          "items": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 24,
+          "minItems": 1,
+          "type": "array"
         }
       },
-      "required": [
-        "path"
-      ],
       "type": "object"
     },
     "name": "ide.outline"

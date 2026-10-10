@@ -36,16 +36,120 @@ const ITEM_SHAPE: &str = "an array of 1 to 32 items, each exactly one of {\"symb
 ///
 /// `parameters` is the raw argument value before validation; a non-object yields `None`. The
 /// returned key decides the argument ceiling ([`MAX_BATCH_PARAMETER_BYTES`]) and is the field an
-/// over-limit refusal names: `ide.read`'s `items`, `symbols` and `ranges`, and the `symbols` of
-/// `ide.symbol` and `ide.graph`.
+/// over-limit refusal names: `ide.read`'s `items`, `symbols` and `ranges`, the `symbols` of
+/// `ide.symbol` and `ide.graph`, and `ide.outline`'s `paths` and `glob`.
 pub(crate) fn batch_key(tool: AssistanceTool, parameters: &Value) -> Option<&'static str> {
     let object = parameters.as_object()?;
     let keys: &[&'static str] = match tool {
         AssistanceTool::Read => &["items", "symbols", "ranges"],
         AssistanceTool::Symbol | AssistanceTool::Graph => &["symbols"],
+        AssistanceTool::Outline => &["paths", "glob"],
         _ => &[],
     };
     keys.iter().copied().find(|key| object.contains_key(*key))
+}
+
+/// Most files one `ide.outline {paths}` or `ide.outline {glob}` call outlines.
+pub(crate) const MAX_OUTLINE_FILES: usize = 24;
+
+/// Validates one `ide.outline {paths | glob, kinds?}` request object.
+///
+/// Exactly one of `paths` (1 to [`MAX_OUTLINE_FILES`] worktree-relative paths, each validated as
+/// the single form's `path`) and `glob` (one worktree-relative pattern of at most 1024 bytes with
+/// no absolute start, no `..` segment and no NUL) appears, never beside `path`; `kinds` keeps its
+/// single-form rule.
+pub(crate) fn validate_outline(object: &Map<String, Value>) -> Result<(), ParameterError> {
+    use super::facade::validate_call;
+    let keys = ["path", "paths", "glob"]
+        .iter()
+        .filter(|key| object.contains_key(**key))
+        .count();
+    if keys != 1 {
+        return Err(ParameterError::OutlineTarget);
+    }
+    let single = |path: &Value| {
+        let mut single = object.clone();
+        single.remove("paths");
+        single.remove("glob");
+        single.insert("path".to_owned(), path.clone());
+        validate_call(AssistanceTool::Outline, Value::Object(single)).map(|_| ())
+    };
+    if let Some(paths) = object.get("paths") {
+        let paths = paths
+            .as_array()
+            .filter(|paths| (1..=MAX_OUTLINE_FILES).contains(&paths.len()))
+            .ok_or_else(|| {
+                invalid_field(
+                    "paths",
+                    FieldRule::OneOf("an array of 1 to 24 worktree-relative paths"),
+                )
+            })?;
+        return paths.iter().try_for_each(single);
+    }
+    let glob = object
+        .get("glob")
+        .and_then(Value::as_str)
+        .filter(|glob| !glob.is_empty() && glob.len() <= 1024)
+        .ok_or_else(|| invalid_field("glob", FieldRule::NonEmptyString))?;
+    if let Some(rule) = path_shape_rule(glob) {
+        return Err(invalid_field("glob", rule));
+    }
+    if glob.starts_with('/') {
+        return Err(invalid_field("glob", FieldRule::RelativePath));
+    }
+    // `kinds` is checked against the single form with a placeholder path.
+    single(&json!("placeholder.rs"))
+}
+
+/// The literal directory a glob's walk starts in: its leading segments before the first one with
+/// a wildcard (`*` or `?`); empty for a pattern that starts with one.
+pub(crate) fn glob_root(pattern: &str) -> String {
+    let segments: Vec<&str> = pattern.split('/').collect();
+    segments[..segments.len() - 1]
+        .iter()
+        .take_while(|segment| !segment.contains(['*', '?']))
+        .copied()
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Whether a worktree-relative `path` matches `pattern`: `*` matches within one segment, `?`
+/// one character, and a `**` segment any number of whole segments (none included).
+pub(crate) fn glob_matches(pattern: &str, path: &str) -> bool {
+    /// Matches one segment's characters against one pattern segment's.
+    fn segment(pattern: &[char], name: &[char]) -> bool {
+        match (pattern.first(), name.first()) {
+            (None, None) => true,
+            (Some('*'), _) => {
+                segment(&pattern[1..], name) || (!name.is_empty() && segment(pattern, &name[1..]))
+            }
+            (Some('?'), Some(_)) => segment(&pattern[1..], &name[1..]),
+            (Some(expected), Some(actual)) if expected == actual => {
+                segment(&pattern[1..], &name[1..])
+            }
+            _ => false,
+        }
+    }
+    /// Matches whole segment lists, with `**` spanning any number of segments.
+    fn segments(pattern: &[&str], path: &[&str]) -> bool {
+        match (pattern.first(), path.first()) {
+            (None, None) => true,
+            (Some(&"**"), _) => {
+                segments(&pattern[1..], path) || (!path.is_empty() && segments(pattern, &path[1..]))
+            }
+            (Some(expected), Some(actual)) => {
+                segment(
+                    &expected.chars().collect::<Vec<_>>(),
+                    &actual.chars().collect::<Vec<_>>(),
+                ) && segments(&pattern[1..], &path[1..])
+            }
+            _ => false,
+        }
+    }
+    segments(
+        &pattern.split('/').collect::<Vec<_>>(),
+        &path.split('/').collect::<Vec<_>>(),
+    )
 }
 
 /// Most entries `ide.symbol {symbols}` and `ide.graph {symbols}` accept.
@@ -1321,6 +1425,48 @@ mod tests {
                 "{banned}"
             );
         }
+    }
+
+    #[test]
+    fn globs_match_segments_and_any_depth() {
+        assert!(glob_matches("src/**/*.rs", "src/a.rs"));
+        assert!(glob_matches("src/**/*.rs", "src/x/y/z.rs"));
+        assert!(!glob_matches("src/**/*.rs", "lib/a.rs"));
+        assert!(!glob_matches("src/*.rs", "src/x/a.rs"));
+        assert!(glob_matches("src/?.rs", "src/a.rs"));
+        assert!(!glob_matches("src/?.rs", "src/ab.rs"));
+        assert!(glob_matches("**/*_test.py", "pkg/sub/a_test.py"));
+        assert!(glob_matches("*.md", "README.md"));
+        assert!(!glob_matches("*.md", "docs/a.md"));
+        assert_eq!(glob_root("crates/x/src/**/*.rs"), "crates/x/src");
+        assert_eq!(glob_root("**/*.rs"), "");
+        assert_eq!(glob_root("src/*.rs"), "src");
+        assert_eq!(glob_root("*.md"), "");
+    }
+
+    #[test]
+    fn outline_batches_take_one_of_paths_or_glob() {
+        use crate::assistance::facade::validate_call;
+        let outline = |request: Value| validate_call(AssistanceTool::Outline, request);
+        assert!(outline(json!({"paths":["src/a.rs","src/b.rs"],"kinds":"fn,struct"})).is_ok());
+        assert!(outline(json!({"glob":"src/**/*.rs","kinds":"fn"})).is_ok());
+        for bad in [
+            json!({"paths":[]}),
+            json!({ "paths": vec!["a.rs"; 25] }),
+            json!({"paths":["../a.rs"]}),
+            json!({"paths":["a.rs"],"glob":"*.rs"}),
+            json!({"paths":["a.rs"],"path":"b.rs"}),
+            json!({"glob":"../**/*.rs"}),
+            json!({"glob":"/etc/*"}),
+            json!({"glob":""}),
+            json!({"glob":"*.rs","kinds":"function"}),
+        ] {
+            assert!(outline(bad.clone()).is_err(), "{bad}");
+        }
+        assert!(
+            outline(json!({"path":"src/a.rs"})).is_ok(),
+            "the single form is unchanged"
+        );
     }
 
     #[test]

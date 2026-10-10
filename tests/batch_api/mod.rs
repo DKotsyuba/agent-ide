@@ -427,6 +427,151 @@ async fn symbol_and_graph_answer_several_symbols_in_one_reply() {
     daemon.wait().await.unwrap();
 }
 
+/// `ide.outline {paths}` outlines several files in request order with a failed file in place;
+/// `ide.outline {glob}` outlines the matching regular files in path order, never leaving the
+/// worktree, never through a symbolic link, skipping hidden and build directories, at most 24
+/// with the rest counted; files past the reply budget are one line each.
+#[tokio::test]
+async fn outline_answers_several_paths_or_a_bounded_glob() {
+    use std::os::unix::fs::symlink;
+    let fixture = symbol_test_fixture();
+    let function = |name: &str| format!("pub fn {name}() -> i32 {{\n    1\n}}\n");
+    let files = [
+        ("src/a.rs", function("alpha")),
+        ("src/b.rs", function("beta")),
+        ("src/nested/c.rs", function("gamma")),
+        ("src/nested/d.txt", "text\n".to_owned()),
+        ("src/target/skipped.rs", function("skipped")),
+        ("src/.hidden/skipped.rs", function("hidden")),
+        (
+            "big/huge.rs",
+            (0..2500)
+                .map(|index| function(&format!("f{index}")))
+                .collect(),
+        ),
+    ];
+    for (path, content) in &files {
+        let path = fixture.root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+    for index in 0..26 {
+        let path = fixture.root.join(format!("many/m{index:02}.rs"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, function(&format!("m{index}"))).unwrap();
+    }
+    let outside = fixture.base.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("escape.rs"), function("escape")).unwrap();
+    symlink(&outside, fixture.root.join("src/link")).unwrap();
+    symlink(&outside, fixture.root.join("linked")).unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "batch-outline").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"batch-outline"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    let (paths, text) = settled_call(
+        &mut actor,
+        &fixture,
+        "ide.outline",
+        json!({"paths":["src/b.rs","src/missing.rs","src/a.rs"]}),
+    )
+    .await;
+    assert_eq!(paths["kind"], "outline", "{paths} {text}");
+    assert!(
+        text.starts_with("outline: 3 files — 2 outlined, 0 listed only, 1 failed\n"),
+        "{text}"
+    );
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("{needle}: {text}"))
+    };
+    assert!(
+        at("beta") < at("no_such_file") && at("no_such_file") < at("alpha"),
+        "{text}"
+    );
+
+    let (_, text) = settled_call(
+        &mut actor,
+        &fixture,
+        "ide.outline",
+        json!({"glob":"src/**/*.rs","kinds":"fn"}),
+    )
+    .await;
+    assert!(
+        text.starts_with("outline: 4 files — 4 outlined, 0 listed only, 0 failed\n"),
+        "{text}"
+    );
+    assert!(
+        at_order(
+            &text,
+            &["src/a.rs", "src/b.rs", "src/lib.rs", "src/nested/c.rs"]
+        ),
+        "{text}"
+    );
+    for absent in ["skipped", "hidden", "escape"] {
+        assert!(!text.contains(absent), "{absent}: {text}");
+    }
+    let (_, text) = settled_call(
+        &mut actor,
+        &fixture,
+        "ide.outline",
+        json!({"glob":"linked/*.rs"}),
+    )
+    .await;
+    assert!(text.starts_with("outline: 0 files — "), "{text}");
+    // A glob with `..` or an absolute start is refused by the facade (unit-tested there).
+
+    let (_, text) = settled_call(
+        &mut actor,
+        &fixture,
+        "ide.outline",
+        json!({"glob":"many/*.rs"}),
+    )
+    .await;
+    assert!(
+        text.starts_with(
+            "outline: 24 files — 24 outlined, 0 listed only, 0 failed; +2 more files matched\n"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("m23") && !text.contains("m24"), "{text}");
+
+    let (_, text) = settled_call(
+        &mut actor,
+        &fixture,
+        "ide.outline",
+        json!({"paths":["src/a.rs","big/huge.rs","src/b.rs"]}),
+    )
+    .await;
+    assert!(
+        text.starts_with("outline: 3 files — 2 outlined, 1 listed only, 0 failed\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("big/huge.rs (7500 lines) → ide.outline {\"path\":\"big/huge.rs\"}"),
+        "{text}"
+    );
+    assert!(at_order(&text, &["alpha", "big/huge.rs", "beta"]), "{text}");
+
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Whether `needles` occur in `text` in this order.
+fn at_order(text: &str, needles: &[&str]) -> bool {
+    let positions: Vec<Option<usize>> = needles.iter().map(|needle| text.find(needle)).collect();
+    positions.iter().all(Option::is_some) && positions.windows(2).all(|pair| pair[0] < pair[1])
+}
+
 /// The three text files every multi-file edit test edits, with their committed content.
 const EDIT_FILES: [&str; 3] = ["a.md", "b.md", "c.md"];
 
