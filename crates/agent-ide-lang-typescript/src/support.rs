@@ -51,6 +51,27 @@ pub const TS_PROBE: &str = "let ts;try{ts=require(process.argv[1])}catch(e){proc
 /// Most lines scanned for one declaration's header and signature.
 const SCAN_LINES: usize = 200;
 
+impl TypeScript {
+    /// The runner argument of one file target: a directory (`__tests__/`) selects the test files
+    /// inside it and passes through unchanged; a plain script file must be one the runner would
+    /// collect by convention, or the module would be imported top-level as a test target, so any
+    /// other is [`LangError::Unsupported`].
+    fn test_file_argument(&self, file: &Path) -> Result<String, LangError> {
+        if file
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| SCRIPT_EXTENSIONS.contains(&extension))
+            && !self.is_test_file(file)
+        {
+            return Err(LangError::Unsupported(format!(
+                "no tests in {}",
+                file.display()
+            )));
+        }
+        Ok(file.display().to_string())
+    }
+}
+
 impl LanguageSupport for TypeScript {
     /// Always the TypeScript [`LANGUAGE`] (JavaScript files included).
     fn language(&self) -> Language {
@@ -415,8 +436,9 @@ impl LanguageSupport for TypeScript {
     /// `MAX_NAMED_TESTS` only the files run. A symbol no test references is
     /// [`LangError::Unsupported`]. A file target runs whole only when the runner would collect
     /// it by convention (`*.test.*`, `*.spec.*`, under `__tests__/`); a directory target selects
-    /// the test files inside it; a non-test script file is [`LangError::Unsupported`]. Patterns
-    /// pass through unescaped.
+    /// the test files inside it; a non-test script file is [`LangError::Unsupported`]. Several
+    /// file targets (`Files`) are one runner invocation over all of them, each checked as a file
+    /// target. Patterns pass through unescaped.
     fn test_selection(
         &self,
         project: &LanguageProject,
@@ -442,23 +464,15 @@ impl LanguageSupport for TypeScript {
                 let files = distinct_files(&tests);
                 (tests, files, pattern)
             }
-            TestTarget::File(file) => {
-                // A directory (`__tests__/`) selects the test files inside it and passes through
-                // unchanged; a plain script file must be one the runner would collect by
-                // convention, or the module would be imported top-level as a test target.
-                if file
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| SCRIPT_EXTENSIONS.contains(&extension))
-                    && !self.is_test_file(file)
-                {
-                    return Err(LangError::Unsupported(format!(
-                        "no tests in {}",
-                        file.display()
-                    )));
-                }
-                (Vec::new(), vec![file.display().to_string()], None)
-            }
+            TestTarget::File(file) => (Vec::new(), vec![self.test_file_argument(file)?], None),
+            TestTarget::Files(files) => (
+                Vec::new(),
+                files
+                    .iter()
+                    .map(|file| self.test_file_argument(file))
+                    .collect::<Result<Vec<_>, _>>()?,
+                None,
+            ),
             TestTarget::Pattern(pattern) => (Vec::new(), Vec::new(), Some(pattern.clone())),
         };
         let mut command: Vec<String> = match runner {
@@ -2014,6 +2028,28 @@ src/transport.ts  (29 lines, typescript)
         );
         let node = TypeScript.test_selection(&project(&[]), &file).unwrap();
         assert_eq!(node.command, argv(&["node", "--test", "src/a.test.ts"]));
+        // Several file targets are one runner invocation over all of them.
+        let several = TestTarget::Files(vec![
+            PathBuf::from("src/a.test.ts"),
+            PathBuf::from("src/__tests__"),
+        ]);
+        let vitest = TypeScript
+            .test_selection(&project(&[("test_runner", "vitest")]), &several)
+            .unwrap();
+        assert_eq!(
+            vitest.command,
+            argv(&["npx", "vitest", "run", "src/a.test.ts", "src/__tests__"])
+        );
+        assert!(matches!(
+            TypeScript.test_selection(
+                &project(&[]),
+                &TestTarget::Files(vec![
+                    PathBuf::from("src/a.test.ts"),
+                    PathBuf::from("src/details.tsx"),
+                ])
+            ),
+            Err(LangError::Unsupported(_))
+        ));
     }
 
     /// Non-test script files never become runner targets; directories pass through and let the

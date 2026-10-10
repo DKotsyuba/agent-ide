@@ -3,8 +3,10 @@
 //!
 //! Each target is planned as the single form plans it. Symbol targets of one language merge
 //! their referencing tests into one selection, so the language's runner gets every filter in one
-//! invocation (libtest names, pytest node ids, vitest files); every path and pattern target is
-//! its own invocation. The invocations then run one after another as one run of the worktree
+//! invocation (libtest names, pytest node ids, vitest files). Path targets of one language merge
+//! into one invocation when the language's runner takes several files at once (pytest paths,
+//! vitest/jest/node files, cargo integration tests of one package); otherwise each path, and
+//! every pattern target, is its own invocation. The invocations then run one after another as one run of the worktree
 //! ([`super::tests::TestRuns::start_batch`]), whose single result has one line per target and
 //! one rerun line for the whole run, and reaches the caller as one `test-finished` fact.
 
@@ -20,6 +22,8 @@ type Planned = (usize, BatchLaunch, Option<String>);
 /// What planning one target yields: a planned invocation, the target's whole outcome when it
 /// runs nothing, or (symbol targets) its definition, referencing tests and language for merging.
 enum TargetPlan {
+    /// A test file of a known language, to merge with the language's other path targets.
+    File(PathBuf, crate::lang::Language),
     /// Its own invocation: argv, language, selected count and how it starts.
     Run(
         Vec<String>,
@@ -71,6 +75,8 @@ impl Worker<'_> {
         // the targets they came from.
         let mut merged: Vec<(crate::lang::Language, SymbolPath, Vec<TestId>, Vec<usize>)> =
             Vec::new();
+        // Path targets of one language, each with its target index.
+        let mut paths: Vec<(crate::lang::Language, Vec<(usize, PathBuf)>)> = Vec::new();
         for (index, spec) in specs.iter().enumerate() {
             match self.plan_target(job, &binding, &root, spec, budget).await? {
                 TargetPlan::Run(argv, language, count, start) => {
@@ -80,6 +86,12 @@ impl Worker<'_> {
                     planned.push((index, launch, count));
                 }
                 TargetPlan::Settled(outcome) => targets[index].settled = Some(outcome),
+                TargetPlan::File(path, language) => {
+                    match paths.iter_mut().find(|group| group.0 == language) {
+                        Some(group) => group.1.push((index, path)),
+                        None => paths.push((language, vec![(index, path)])),
+                    }
+                }
                 TargetPlan::Tests(path, tests, language) => {
                     match merged.iter_mut().find(|group| group.0 == language) {
                         Some(group) => {
@@ -88,6 +100,38 @@ impl Worker<'_> {
                         }
                         None => merged.push((language, path, tests, vec![index])),
                     }
+                }
+            }
+        }
+        for (_, files) in paths {
+            // One invocation for every file when the runner takes them together.
+            if files.len() > 1 {
+                let all = TestTarget::Files(files.iter().map(|file| file.1.clone()).collect());
+                if let Ok((argv, language, count, start)) = test_selection(&root, all, budget)
+                    .await
+                    .map_err(|failure| symbols::module_failure(job, &failure))?
+                {
+                    let indexes: Vec<usize> = files.iter().map(|file| file.0).collect();
+                    let first = indexes[0];
+                    let launch = self
+                        .batch_launch(job, &root, indexes, argv, language, start)
+                        .await?;
+                    planned.push((first, launch, count));
+                    continue;
+                }
+            }
+            for (index, path) in files {
+                match test_selection(&root, TestTarget::File(path), budget)
+                    .await
+                    .map_err(|failure| symbols::module_failure(job, &failure))?
+                {
+                    Ok((argv, language, count, start)) => {
+                        let launch = self
+                            .batch_launch(job, &root, vec![index], argv, language, start)
+                            .await?;
+                        planned.push((index, launch, count));
+                    }
+                    Err(error) => targets[index].settled = Some(unrunnable(&error)),
                 }
             }
         }
@@ -196,10 +240,10 @@ impl Worker<'_> {
                     Some(job.reference.clone()),
                 )
             }
-            StartResult::Running(id, age) => {
+            StartResult::Running(id, _) => {
                 // One run per worktree: this session receives the live run's own result.
                 self.shared.test_subscribed(id, &binding);
-                complete(running_line(id, age), None)
+                complete(running_line(id), None)
             }
             StartResult::Failed { error, .. } => complete(
                 format!(
@@ -213,8 +257,8 @@ impl Worker<'_> {
 
     /// Plans one target as the single form would: a path that is not a test file of a language
     /// whose tests live only in test files, a symbol no test references, an ambiguous bare name
-    /// and a selection the language cannot run settle the target on its own line; a symbol's
-    /// referencing tests are returned for merging. Failures of the target alone (an unknown
+    /// and a selection the language cannot run settle the target on its own line; a test file of
+    /// a known language and a symbol's referencing tests are returned for merging. Failures of the target alone (an unknown
     /// symbol) settle it too; a loading server parks the whole call as in the single form.
     async fn plan_target(
         &mut self,
@@ -243,6 +287,12 @@ impl Worker<'_> {
                     return Ok(TargetPlan::Settled(format!(
                         "no tests in {path}; the file has no tests"
                     )));
+                }
+                // A test file of a known language may share its language's invocation.
+                if let Some(language) = crate::lang::Language::for_path(&target)
+                    && !root.join(&target).is_dir()
+                {
+                    return Ok(TargetPlan::File(target, language));
                 }
                 test_selection(root, TestTarget::File(target), budget).await
             }
@@ -377,14 +427,11 @@ fn started_line(id: u64, targets: usize, runs: usize, budget: Duration) -> Strin
     )
 }
 
-/// The reply of a several-target start while the worktree's run `id` (running `age`) is live:
-/// nothing new starts, and the live run's result reaches this session too.
-fn running_line(id: u64, age: Duration) -> String {
-    format!(
-        "tests #{id}: still running ({} s); nothing new started — its result arrives by itself \
-         as a test-finished fact",
-        age.as_secs()
-    )
+/// The reply of a several-target start while the worktree's run `id` is live, exactly the
+/// hygiene text `tests #N: still running` (no seconds on unfinished work, M024-M027-REPLY-HYGIENE
+/// r2 §2); nothing new starts and the live run's result reaches this session too.
+fn running_line(id: u64) -> String {
+    format!("tests #{id}: still running")
 }
 
 /// The outcome line of a target its language cannot run: the single form's refusal text, or
@@ -484,8 +531,8 @@ mod tests {
         );
     }
 
-    /// The started and still-running lines say what happened and never invite polling
-    /// (M024-M027-REPLY-HYGIENE r2 §2).
+    /// The started and still-running lines say what happened and never invite polling, and the
+    /// still-running line carries no seconds count (M024-M027-REPLY-HYGIENE r2 §2).
     #[test]
     fn run_lines_never_invite_polling() {
         let started = started_line(4, 3, 2, Duration::from_secs(300));
@@ -495,6 +542,9 @@ mod tests {
              as a test-finished fact"
         );
         crate::assistance::batch::assert_no_polling(&started);
-        crate::assistance::batch::assert_no_polling(&running_line(4, Duration::from_secs(12)));
+        let running = running_line(4);
+        assert_eq!(running, "tests #4: still running");
+        crate::assistance::batch::assert_no_polling(&running);
+        crate::assistance::batch::assert_no_unfinished_seconds(&running);
     }
 }

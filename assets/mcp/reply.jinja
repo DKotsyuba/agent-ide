@@ -302,7 +302,7 @@ complete context: {{ text }}
 {{ "\n" }}Diagnostics are exactly as reported; use ide.edit with source_ref {{ detail_ref }} when available, otherwise use the native editor
 {%- endif -%}
 {%- endif -%}
-{%- if state == "complete" and (kind == "outline" or kind == "read" or kind == "symbol" or kind == "graph" or kind == "test" or kind == "inspect" or kind == "edit_batch") -%}
+{%- if state == "complete" and (kind == "outline" or kind == "read" or kind == "symbol" or kind == "graph" or kind == "test" or kind == "inspect") -%}
 {{ text }}
 {%- if truncated and detail_ref and continuation -%}
 {{ "\n" }}Output is truncated; use ide.inspect with detail_ref {{ detail_ref }} for the next page
@@ -340,6 +340,12 @@ edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }};
 edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: pending. Next: use ide.inspect with detail_ref {{ diagnostics.detail_ref }}
 {%- endif -%}
 {%- if note %}{{ "\n" }}{{ note }}{%- endif %}
+{%- endif -%}
+{%- if state == "edit_batch" -%}
+{{ text }}
+{%- if truncated -%}
+{{ "\n" }}Output is incomplete
+{%- endif -%}
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "stale_source" -%}
 edit: stale_source; path {{ result.path }}. No write occurred — this file changed or the source_ref missed part of its read. Re-read with ide.read and inspect every page before retrying{% if note %}{{ "\n" }}{{ note }}{% endif %}

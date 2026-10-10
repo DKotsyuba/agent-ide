@@ -701,6 +701,7 @@ mod tests {
             "{text}"
         );
         batch::assert_no_polling(&text);
+        batch::assert_no_unfinished_seconds(&text);
         let graph = compose_symbols(
             AssistanceTool::Graph,
             &entries[1..3],

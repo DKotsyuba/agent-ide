@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::{
     assistance::{
         facade::{AssistanceTool, HookIngressOutcome},
-        reply::{EditDiagnostics, FailureCode, MissingPeer, PeerReply},
+        reply::{EditBatchOutcome, EditDiagnostics, FailureCode, MissingPeer, PeerReply},
     },
     changes::edit::EditOutcome,
     checks::{CheckState, ProblemSnapshot, UnavailableReason},
@@ -588,6 +588,11 @@ fn reply_outcome(reply: &PeerReply) -> ToolOutcome {
             | EditOutcome::CapacityNoEffect
             | EditOutcome::OutcomeUnknown => ToolOutcome::Incomplete,
             EditOutcome::UnavailableBeforeDispatch => ToolOutcome::Unavailable,
+        },
+        PeerReply::EditBatch { outcome, .. } => match outcome {
+            EditBatchOutcome::Applied => ToolOutcome::Completed,
+            EditBatchOutcome::ConflictingDuplicate => ToolOutcome::Invalid,
+            EditBatchOutcome::Partial | EditBatchOutcome::OutcomeUnknown => ToolOutcome::Incomplete,
         },
     }
 }

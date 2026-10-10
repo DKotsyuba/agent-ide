@@ -12,6 +12,9 @@ use serde_json::{Map, Value, json};
 use super::facade::{
     AssistanceTool, FieldRule, ParameterError, invalid_field, parse_line_range, path_shape_rule,
 };
+use super::reply::{
+    EditBatchFile, EditBatchFileState, EditBatchOutcome, EditBatchReason, PeerReply,
+};
 use crate::lang::SymbolPath;
 
 /// Argument ceiling, in serialized JSON bytes, of every batch form of `ide.read`,
@@ -802,8 +805,12 @@ pub(crate) enum FileState {
     Replaced,
     /// The candidate equalled the current bytes; nothing was written.
     Unchanged,
-    /// The file was written by an earlier call with the same operation id.
-    WrittenEarlier,
+    /// The file was written by an earlier call with the same operation id; `created` when the
+    /// file did not exist before the operation (its recorded base is an absence).
+    WrittenEarlier {
+        /// True when the operation created the file.
+        created: bool,
+    },
     /// The file was not written; the reason says why.
     NotWritten(NotWritten),
     /// A write may have happened but its result could not be established.
@@ -815,7 +822,7 @@ impl FileState {
     pub(crate) const fn written(self) -> bool {
         matches!(
             self,
-            Self::Created | Self::Replaced | Self::Unchanged | Self::WrittenEarlier
+            Self::Created | Self::Replaced | Self::Unchanged | Self::WrittenEarlier { .. }
         )
     }
 }
@@ -868,10 +875,17 @@ pub(crate) fn render_edit_reply(
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let mut head = format!(
-            "edit: partial — written {written} of {total}; not written: {missing}; the same \
-             operation_id resumes the rest\n"
-        );
+        let mut head = if files.iter().any(|file| file.state == FileState::Unknown) {
+            format!(
+                "edit: outcome_unknown — written {written} of {total}; not written or unknown: \
+                 {missing}; the same operation_id resumes the rest from the recorded digests\n"
+            )
+        } else {
+            format!(
+                "edit: partial — written {written} of {total}; not written: {missing}; the same \
+                 operation_id resumes the rest\n"
+            )
+        };
         if let Some(reference) = source_ref.filter(|_| written > 0) {
             head.push_str(&format!(
                 "source_ref {reference} (valid for the written files); diagnostics: {diagnostics}\n"
@@ -884,7 +898,7 @@ pub(crate) fn render_edit_reply(
             FileState::Created => "created".to_owned(),
             FileState::Replaced => "replaced".to_owned(),
             FileState::Unchanged => "unchanged".to_owned(),
-            FileState::WrittenEarlier => "written earlier by this operation_id".to_owned(),
+            FileState::WrittenEarlier { .. } => "written earlier by this operation_id".to_owned(),
             FileState::NotWritten(reason) => format!("not written ({})", reason.words()),
             FileState::Unknown => "unknown (the write may have happened)".to_owned(),
         };
@@ -902,6 +916,107 @@ pub(crate) fn render_edit_reply(
         text.push('\n');
     }
     text
+}
+
+/// The closed outcome of a multi-file edit whose files ended in `files`: `outcome_unknown` when a
+/// write may have happened unobserved, `applied` when every file holds its candidate, else
+/// `partial`.
+pub(crate) fn edit_outcome(files: &[FileReport]) -> EditBatchOutcome {
+    if files.iter().any(|file| file.state == FileState::Unknown) {
+        EditBatchOutcome::OutcomeUnknown
+    } else if files.iter().all(|file| file.state.written()) {
+        EditBatchOutcome::Applied
+    } else {
+        EditBatchOutcome::Partial
+    }
+}
+
+/// The structured per-file states of a multi-file edit, request order: a file written by an
+/// earlier call with the same operation id reads `created` or `replaced` as that call wrote it.
+pub(crate) fn edit_batch_files(files: &[FileReport]) -> Vec<EditBatchFile> {
+    files
+        .iter()
+        .map(|file| {
+            let (state, reason) = match file.state {
+                FileState::Created | FileState::WrittenEarlier { created: true } => {
+                    (EditBatchFileState::Created, None)
+                }
+                FileState::Replaced | FileState::WrittenEarlier { created: false } => {
+                    (EditBatchFileState::Replaced, None)
+                }
+                FileState::Unchanged => (EditBatchFileState::Unchanged, None),
+                FileState::NotWritten(reason) => (
+                    EditBatchFileState::NotWritten,
+                    Some(match reason {
+                        NotWritten::ChangedAfterValidation => {
+                            EditBatchReason::ChangedAfterValidation
+                        }
+                        NotWritten::IoError => EditBatchReason::IoError,
+                        NotWritten::NotReached => EditBatchReason::NotReached,
+                    }),
+                ),
+                FileState::Unknown => (EditBatchFileState::Unknown, None),
+            };
+            EditBatchFile {
+                path: file.path.clone(),
+                state,
+                reason,
+            }
+        })
+        .collect()
+}
+
+/// The complete reply of one multi-file edit (batch-api-v1 §7): the compact text of
+/// [`render_edit_reply`] and the structured `operation_id`, outcome, `source_ref` (only when a
+/// file holds its candidate) and per-file states.
+pub(crate) fn edit_batch_reply(
+    operation_id: &str,
+    files: &[FileReport],
+    source_ref: Option<&str>,
+    diagnostics: &str,
+    new_lines: &[String],
+) -> PeerReply {
+    let source_ref = source_ref.filter(|_| files.iter().any(|file| file.state.written()));
+    PeerReply::EditBatch {
+        operation_id: operation_id.to_owned(),
+        outcome: edit_outcome(files),
+        source_ref: source_ref.map(str::to_owned),
+        files: edit_batch_files(files),
+        text: render_edit_reply(files, source_ref, diagnostics, new_lines),
+        truncated: false,
+    }
+}
+
+/// The reply to a reused `operation_id` whose recorded request differs: outcome
+/// `conflicting_duplicate`, no file touched, nothing written.
+pub(crate) fn conflicting_duplicate_reply(operation_id: &str) -> PeerReply {
+    PeerReply::EditBatch {
+        operation_id: operation_id.to_owned(),
+        outcome: EditBatchOutcome::ConflictingDuplicate,
+        source_ref: None,
+        files: Vec::new(),
+        text: format!(
+            "edit: conflicting_duplicate; operation_id {operation_id} already names a different \
+             multi-file edit; nothing written\n"
+        ),
+        truncated: false,
+    }
+}
+
+/// The reply of a multi-file edit whose call ended before it could establish its writes (a panic
+/// after a write): outcome `outcome_unknown` with every requested file `unknown`; the operation's
+/// receipt settles each file on the retry.
+pub(crate) fn unknown_batch_reply(operation_id: &str, paths: &[String]) -> PeerReply {
+    let files = paths
+        .iter()
+        .map(|path| FileReport {
+            path: path.clone(),
+            state: FileState::Unknown,
+            note: None,
+            diagnostics: None,
+        })
+        .collect::<Vec<_>>();
+    edit_batch_reply(operation_id, &files, None, "unknown", &[])
 }
 
 /// Builds the one `edit-checked` fact of a multi-file edit whose reply said `diagnostics:
@@ -1169,6 +1284,24 @@ pub(crate) const POLLING_PHRASES: [&str; 5] = [
     "until it completes",
     "again every",
 ];
+
+/// Asserts that `text`, a line about unfinished work (running, pending, still active), carries no
+/// seconds count such as `12 s` or `12s` (M024-M027-REPLY-HYGIENE r2 §2: no seconds on something
+/// unfinished).
+#[cfg(test)]
+pub(crate) fn assert_no_unfinished_seconds(text: &str) {
+    let bytes = text.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if !byte.is_ascii_digit() || bytes.get(index + 1).is_some_and(u8::is_ascii_digit) {
+            continue;
+        }
+        let rest = text[index + 1..].trim_start_matches(' ');
+        let seconds = rest
+            .strip_prefix('s')
+            .is_some_and(|after| !after.starts_with(|next: char| next.is_ascii_alphanumeric()));
+        assert!(!seconds, "a seconds count on unfinished work: {text:?}");
+    }
+}
 
 /// Asserts that `text` contains none of [`POLLING_PHRASES`], case-insensitively.
 #[cfg(test)]
@@ -1523,6 +1656,20 @@ mod tests {
             edit(json!({"operation_id":"op","files":(0..3).map(medium).collect::<Vec<_>>()}))
                 .is_ok()
         );
+        // 4 × 33 KiB = 132 KiB of text: inside the 136 KiB argument bound, so only the 128 KiB
+        // text total refuses it.
+        let four = json!({"operation_id":"op","files":(0..4).map(medium).collect::<Vec<_>>()});
+        assert!(
+            serde_json::to_string(&four).unwrap().len()
+                <= crate::changes::edit::MAX_EDIT_ARGUMENT_BYTES
+        );
+        assert_eq!(
+            edit(four),
+            Err(invalid_field(
+                "files",
+                FieldRule::TooLong(MAX_EDIT_TEXT_BYTES)
+            ))
+        );
     }
 
     #[test]
@@ -1581,7 +1728,7 @@ mod tests {
                     diagnostics: Some("clean".into()),
                     ..report("a.rs", FileState::Replaced)
                 },
-                report("b.rs", FileState::WrittenEarlier),
+                report("b.rs", FileState::WrittenEarlier { created: false }),
                 report("c.rs", FileState::Created),
             ],
             Some("ref-9"),
@@ -1868,6 +2015,14 @@ mod tests {
         let (words, per_file, _) = summarize_diagnostics(&pending);
         assert!(words.starts_with("pending"), "{words}");
         assert_no_polling(&words);
+        assert_no_unfinished_seconds(&words);
+        for unfinished in ["tests #4: still running (12 s)", "pending for 3s"] {
+            assert!(
+                std::panic::catch_unwind(|| assert_no_unfinished_seconds(unfinished)).is_err(),
+                "the guard refuses {unfinished:?}"
+            );
+        }
+        assert_no_unfinished_seconds("tests #4: still running");
         per_file.iter().for_each(|line| assert_no_polling(line));
         let draft = edit_checked_draft("op-1", "ref-2", &pending, Vec::new());
         assert_no_polling(&draft.summary);
@@ -1928,6 +2083,150 @@ mod tests {
                 super::super::facade::validate_call(tool, value.clone()).is_ok(),
                 "{tool:?}: {value}"
             );
+        }
+    }
+    /// Every multi-file edit outcome carries the structured result of batch-api-v1 §7 beside its
+    /// text: `operation_id`, `outcome`, `source_ref` only when a file holds its candidate, and
+    /// per file `path`, `state` and, for a file not written, `reason`.
+    #[test]
+    fn edit_batch_replies_carry_the_structured_result_for_every_outcome() {
+        let report = |path: &str, state: FileState| FileReport {
+            path: path.into(),
+            state,
+            note: None,
+            diagnostics: None,
+        };
+        let structured = |reply: PeerReply| serde_json::to_value(reply).unwrap();
+        let applied = structured(edit_batch_reply(
+            "op-1",
+            &[
+                report("a.rs", FileState::Replaced),
+                report("b.rs", FileState::WrittenEarlier { created: true }),
+                report("c.rs", FileState::Unchanged),
+            ],
+            Some("ref-1"),
+            "clean",
+            &[],
+        ));
+        assert_eq!(applied["state"], "edit_batch");
+        assert_eq!(applied["operation_id"], "op-1");
+        assert_eq!(applied["outcome"], "applied");
+        assert_eq!(applied["source_ref"], "ref-1");
+        assert_eq!(
+            applied["files"],
+            json!([
+                {"path":"a.rs","state":"replaced"},
+                {"path":"b.rs","state":"created"},
+                {"path":"c.rs","state":"unchanged"}
+            ])
+        );
+        assert!(
+            applied["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("edit: applied 3 of 3 files")
+        );
+        let partial = structured(edit_batch_reply(
+            "op-2",
+            &[
+                report("a.rs", FileState::Created),
+                report(
+                    "b.rs",
+                    FileState::NotWritten(NotWritten::ChangedAfterValidation),
+                ),
+                report("c.rs", FileState::NotWritten(NotWritten::NotReached)),
+                report("d.rs", FileState::NotWritten(NotWritten::IoError)),
+            ],
+            Some("ref-2"),
+            "unknown",
+            &[],
+        ));
+        assert_eq!(partial["outcome"], "partial");
+        assert_eq!(partial["source_ref"], "ref-2");
+        assert_eq!(
+            partial["files"],
+            json!([
+                {"path":"a.rs","state":"created"},
+                {"path":"b.rs","state":"not_written","reason":"changed_after_validation"},
+                {"path":"c.rs","state":"not_written","reason":"not_reached"},
+                {"path":"d.rs","state":"not_written","reason":"io_error"}
+            ])
+        );
+        let nothing = structured(edit_batch_reply(
+            "op-3",
+            &[report(
+                "a.rs",
+                FileState::NotWritten(NotWritten::ChangedAfterValidation),
+            )],
+            Some("ref-3"),
+            "none",
+            &[],
+        ));
+        assert_eq!(nothing["outcome"], "partial");
+        assert!(
+            nothing["source_ref"].is_null(),
+            "no written file, no source_ref"
+        );
+        let duplicate = structured(conflicting_duplicate_reply("op-4"));
+        assert_eq!(duplicate["outcome"], "conflicting_duplicate");
+        assert_eq!(duplicate["files"], json!([]));
+        assert!(duplicate["source_ref"].is_null());
+        assert!(
+            duplicate["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("edit: conflicting_duplicate")
+        );
+        let lost = structured(edit_batch_reply(
+            "op-5",
+            &[
+                report("a.rs", FileState::Replaced),
+                report("b.rs", FileState::Unknown),
+                report("c.rs", FileState::NotWritten(NotWritten::NotReached)),
+            ],
+            Some("ref-5"),
+            "unknown",
+            &[],
+        ));
+        assert_eq!(lost["outcome"], "outcome_unknown");
+        assert_eq!(lost["files"][1], json!({"path":"b.rs","state":"unknown"}));
+        assert!(
+            lost["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("edit: outcome_unknown — written 1 of 3")
+        );
+        let panicked = structured(unknown_batch_reply(
+            "op-6",
+            &["a.rs".to_owned(), "b.rs".to_owned()],
+        ));
+        assert_eq!(panicked["outcome"], "outcome_unknown");
+        assert!(panicked["source_ref"].is_null());
+        assert_eq!(
+            panicked["files"],
+            json!([{"path":"a.rs","state":"unknown"},{"path":"b.rs","state":"unknown"}])
+        );
+        for reply in [&applied, &partial, &duplicate, &lost, &panicked] {
+            let text = reply["text"].as_str().unwrap();
+            assert_no_polling(text);
+            let decoded = PeerReply::decode(&serde_json::to_string(reply).unwrap())
+                .unwrap_or_else(|| panic!("the closed reply decodes: {reply}"));
+            let rendered = super::super::content::render_with_call(
+                decoded,
+                None,
+                super::super::content::Envelope::WithStructured,
+                Some("ide.edit"),
+                None,
+            )
+            .expect("the edit_batch state renders");
+            assert_eq!(
+                rendered.content[0]
+                    .as_text()
+                    .map(|block| block.text.as_str()),
+                Some(text),
+                "the compact text is the reply text"
+            );
+            assert_eq!(rendered.structured_content.as_ref(), Some(reply));
         }
     }
 }

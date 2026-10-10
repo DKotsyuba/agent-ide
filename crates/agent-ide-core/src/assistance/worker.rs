@@ -3313,7 +3313,8 @@ impl<'a> Worker<'a> {
     ///
     /// The caller's call answers `internal` under the tool's default stage (never the panic text),
     /// except an `ide.edit`, which may already have written before it panicked: it answers the
-    /// unknown outcome its durable receipt also keeps, so no one resends it. The worker does not
+    /// unknown outcome its durable receipt also keeps, so no one resends it — for a multi-file
+    /// edit the batch shape with every requested file `unknown`. The worker does not
     /// serve again after this: the shared state the unwind left behind is whatever it stopped at,
     /// so the caller marks the daemon failed (crash-only) right after.
     fn settle_panicked(&mut self, job: &mut Job) {
@@ -3334,10 +3335,7 @@ impl<'a> Worker<'a> {
                             .as_str()?
                             .split_once('#')
                             .map(|(path, _)| path)
-                    })
-                    // A multi-file edit names its first file; the operation's receipt keeps
-                    // every file's state for the retry that reconciles it.
-                    .or_else(|| job.parameters.get("files")?.get(0)?.get("path")?.as_str())?;
+                    })?;
                 EditResult::new(
                     operation.to_owned(),
                     path.to_owned(),
@@ -3353,14 +3351,28 @@ impl<'a> Worker<'a> {
                 .or_default()
                 .insert(result.operation_id.clone());
         }
-        let reply = match unknown_edit {
-            Some(result) => PeerReply::Edit {
+        // A multi-file edit answers the batch shape: `outcome_unknown` with every requested file
+        // `unknown`; the operation's receipt keeps each file's digests for the retry.
+        let unknown_batch = (job.tool == AssistanceTool::Edit)
+            .then(|| super::batch::edit_files_request(&job.parameters))
+            .flatten()
+            .map(|(operation, files)| {
+                self.unsettled_edits
+                    .entry(job.invocation.binding_ref().clone())
+                    .or_default()
+                    .insert(operation.clone());
+                let paths = files.into_iter().map(|file| file.path).collect::<Vec<_>>();
+                super::batch::unknown_batch_reply(&operation, &paths)
+            });
+        let reply = match (unknown_batch, unknown_edit) {
+            (Some(reply), _) => reply,
+            (None, Some(result)) => PeerReply::Edit {
                 result,
                 diagnostics: EditDiagnostics::Unknown {},
                 note: None,
                 operation: None,
             },
-            None => PeerReply::Error {
+            (None, None) => PeerReply::Error {
                 code: FailureCode::Internal,
                 detail: Some(detail),
             },
@@ -6703,11 +6715,7 @@ fn admitted_edit_source(
                 ..
             } => true,
             // A multi-file edit retains only the post-write observations of the files it wrote.
-            PeerReply::Complete {
-                kind: ResultKind::EditBatch,
-                detail_ref,
-                ..
-            } => detail_ref.as_deref() == Some(reference),
+            PeerReply::EditBatch { source_ref, .. } => source_ref.as_deref() == Some(reference),
             PeerReply::Edit { result, .. } => {
                 result.source_ref.as_deref() == Some(reference) && result.outcome.has_post_source()
             }
@@ -7605,6 +7613,7 @@ async fn test_selection(
     let target_file = match &target {
         crate::lang::TestTarget::Symbol { path, .. } => path.file(),
         crate::lang::TestTarget::File(path) => Some(path.as_path()),
+        crate::lang::TestTarget::Files(paths) => paths.first().map(PathBuf::as_path),
         crate::lang::TestTarget::Pattern(_) => None,
     };
     let Some((language, project)) = target_file

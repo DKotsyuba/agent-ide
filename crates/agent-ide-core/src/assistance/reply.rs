@@ -326,9 +326,62 @@ pub enum ResultKind {
     /// The session's delivered facts or several references, gathered by one `ide.inspect` call
     /// (`{}` or `detail_refs`, OUTBOX-r3 §8.5); plain text with no continuation of its own.
     Inspect,
-    /// The per-file outcome of a multi-file `ide.edit {files}` (batch-api-v1 §7); its text opens
-    /// with `edit: applied …` or `edit: partial …`.
-    EditBatch,
+}
+
+/// Closed outcome of one multi-file `ide.edit {files}` (batch-api-v1 §7).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditBatchOutcome {
+    /// Every file now holds its candidate.
+    Applied,
+    /// Some files are written and the rest are not; the same `operation_id` resumes them.
+    Partial,
+    /// The `operation_id` already names a different request; nothing was written.
+    ConflictingDuplicate,
+    /// A write may have happened that the call could not establish (a lost write result, a
+    /// panic after a write); the receipt's digests settle it on the retry.
+    OutcomeUnknown,
+}
+
+/// Closed state of one file of a multi-file edit after the call (batch-api-v1 §7).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditBatchFileState {
+    /// The file did not exist and now holds its candidate.
+    Created,
+    /// The file's bytes were replaced by its candidate.
+    Replaced,
+    /// The candidate equalled the file's bytes; nothing was written.
+    Unchanged,
+    /// The file was not written; `reason` says why.
+    NotWritten,
+    /// A write may have happened; its result is not established.
+    Unknown,
+}
+
+/// Closed reason a file of a multi-file edit was not written (batch-api-v1 §7).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditBatchReason {
+    /// Its bytes changed after the call validated them.
+    ChangedAfterValidation,
+    /// The write failed or could not be performed.
+    IoError,
+    /// The commit stopped at an earlier file.
+    NotReached,
+}
+
+/// One file of a multi-file edit result, in request order.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditBatchFile {
+    /// Worktree-relative path as requested.
+    pub path: String,
+    /// What the file holds after the call.
+    pub state: EditBatchFileState,
+    /// Why the file was not written; present only with [`EditBatchFileState::NotWritten`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<EditBatchReason>,
 }
 
 /// Serde's skip test for a zero count.
@@ -580,6 +633,23 @@ pub enum PeerReply {
         #[serde(default)]
         operation: Option<String>,
     },
+    /// One multi-file `ide.edit {files}` result (batch-api-v1 §7): the closed operation outcome
+    /// and per-file states, with the compact reply text that also carries the diagnostics.
+    EditBatch {
+        /// The caller's operation id.
+        operation_id: String,
+        /// Closed outcome of the whole operation.
+        outcome: EditBatchOutcome,
+        /// Edit base valid for every written file; absent when no file holds its candidate.
+        source_ref: Option<String>,
+        /// Every requested file in request order (empty for a conflicting duplicate).
+        files: Vec<EditBatchFile>,
+        /// The compact reply, summary line first.
+        text: String,
+        /// True when serialized-result budgeting cut the text.
+        #[serde(default)]
+        truncated: bool,
+    },
 }
 impl std::fmt::Debug for PeerReply {
     /// Omits text and detail handles from diagnostics.
@@ -621,9 +691,12 @@ impl PeerReply {
     /// Reduces only owner text while preserving UTF-8 and explicitly marking omitted content.
     /// Returns false for non-text results or already empty text; callers then fail closed.
     pub(crate) fn shrink_text(&mut self) -> bool {
-        let Self::Complete {
+        let (Self::Complete {
             text, truncated, ..
-        } = self
+        }
+        | Self::EditBatch {
+            text, truncated, ..
+        }) = self
         else {
             return false;
         };
@@ -687,6 +760,7 @@ impl PeerReply {
         let reference = match self {
             Self::Pending { detail_ref, .. } => Some(detail_ref),
             Self::Complete { detail_ref, .. } => detail_ref.as_ref(),
+            Self::EditBatch { source_ref, .. } => source_ref.as_ref(),
             _ => None,
         };
         reference.is_none_or(|value| {

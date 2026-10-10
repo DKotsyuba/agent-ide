@@ -446,8 +446,15 @@ fn assert_compact_envelope(reply: &Value) {
             "{reply}"
         ),
         ("complete", Some("graph")) => assert!(body.starts_with("graph: "), "{reply}"),
-        // A multi-file edit (batch-api-v1 §7) opens with its outcome line.
-        ("complete", Some("edit_batch")) => assert!(body.starts_with("edit: "), "{reply}"),
+        // A multi-file edit (batch-api-v1 §7) opens with its outcome line and carries its closed
+        // structured result.
+        ("edit_batch", _) => assert!(
+            body.starts_with("edit: ")
+                && structured["operation_id"].is_string()
+                && structured["outcome"].is_string()
+                && structured["files"].is_array(),
+            "{reply}"
+        ),
         // OUTBOX-r3 §8.5: consolidated `ide.inspect` text is plain, with no header of its own.
         ("complete", Some("inspect")) => assert!(!body.is_empty(), "{reply}"),
         // `<file>  (<n> lines, <lang>)` outline header.

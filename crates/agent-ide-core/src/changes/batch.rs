@@ -7,7 +7,9 @@
 //! marked written once its write is known; the operation is settled once every file is written.
 //! A retry with the same operation id and request compares current bytes against these digests,
 //! so it resumes exactly the unwritten files, never applies a change twice and never overwrites
-//! bytes it did not validate. The receipt holds digests and paths only, never content.
+//! bytes it did not validate. The receipt holds digests and paths only, never content; once the
+//! operation's project check settles, Assistance adds that result's diagnostics words (summary,
+//! per-file words, new-problem lines) so a retry of the settled operation answers them again.
 
 use rusqlite::{params, types::Value};
 
@@ -23,7 +25,7 @@ const KEY: &str = "batch_edit_receipts_v1";
 /// Changes-owned schema: one row per operation and one row per file of it, digests only.
 const SQL: &str = "CREATE TABLE changes_batch_receipts (
  operation_id TEXT PRIMARY KEY, request_digest BLOB NOT NULL,
- state TEXT NOT NULL CHECK(state IN ('prepared','settled')));
+ state TEXT NOT NULL CHECK(state IN ('prepared','settled')), diagnostics TEXT);
 CREATE TABLE changes_batch_files (
  operation_id TEXT NOT NULL REFERENCES changes_batch_receipts(operation_id),
  idx INTEGER NOT NULL CHECK(idx >= 0), relative_path TEXT NOT NULL,
@@ -56,6 +58,9 @@ pub struct BatchReceipt {
     pub settled: bool,
     /// Every file in request order.
     pub files: Vec<BatchFile>,
+    /// The settled operation's diagnostics as Assistance recorded them (an opaque bounded text);
+    /// absent until its project check settled.
+    pub diagnostics: Option<String>,
 }
 
 /// Why a receipt operation could not establish durable state.
@@ -229,6 +234,31 @@ impl<'a> BatchReceiptStore<'a> {
         }
     }
 
+    /// Records the diagnostics of the operation's settled project check, once: a later record of
+    /// the same operation changes nothing.
+    pub async fn record_diagnostics(
+        &self,
+        operation_id: &str,
+        diagnostics: &str,
+    ) -> Result<(), BatchReceiptError> {
+        let operation = operation_id.to_owned();
+        let diagnostics = diagnostics.to_owned();
+        let result = self
+            .application
+            .execute(mechanics("diagnostics", operation_id, None)?, move |tx| {
+                tx.execute(
+                    "UPDATE changes_batch_receipts SET diagnostics=?2 WHERE operation_id=?1",
+                    params![operation, diagnostics],
+                )?;
+                Ok(())
+            })
+            .await;
+        match result {
+            Ok(()) | Err(StoreError::DuplicateOperation { .. }) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Reads one operation's receipt and files without consuming an Application operation.
     pub async fn load(
         &self,
@@ -237,12 +267,19 @@ impl<'a> BatchReceiptStore<'a> {
         let head = self
             .application
             .read_one(
-                "SELECT request_digest,state FROM changes_batch_receipts WHERE operation_id=?1",
+                "SELECT request_digest,state,diagnostics FROM changes_batch_receipts \
+                 WHERE operation_id=?1",
                 vec![Value::Text(operation_id.to_owned())],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .await?;
-        let Some((request_digest, state)) = head else {
+        let Some((request_digest, state, diagnostics)) = head else {
             return Ok(None);
         };
         let rows = self
@@ -287,6 +324,7 @@ impl<'a> BatchReceiptStore<'a> {
             request_digest: digest(request_digest)?,
             settled: state == "settled",
             files,
+            diagnostics,
         }))
     }
 }
@@ -371,6 +409,7 @@ mod tests {
             request_digest: [9; 32],
             settled: false,
             files: expected.clone(),
+            diagnostics: None,
         };
         assert_eq!(
             receipts.load("op").await.expect("load"),
@@ -396,6 +435,25 @@ mod tests {
         receipts.settle("op").await.expect("settle");
         let settled = receipts.load("op").await.expect("load").expect("row");
         assert!(settled.settled && settled.files.iter().all(|file| file.written));
+        receipts
+            .record_diagnostics("op", "first")
+            .await
+            .expect("record");
+        receipts
+            .record_diagnostics("op", "second")
+            .await
+            .expect("record again");
+        assert_eq!(
+            receipts
+                .load("op")
+                .await
+                .expect("load")
+                .expect("row")
+                .diagnostics
+                .as_deref(),
+            Some("first"),
+            "the settled check's diagnostics are recorded once"
+        );
     }
 
     #[tokio::test]

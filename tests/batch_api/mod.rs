@@ -818,7 +818,7 @@ async fn multi_file_edit_writes_nothing_when_any_file_is_stale_or_any_change_fai
         edit_arguments("create-existing", &source_ref),
     )
     .await;
-    assert_eq!(reply["kind"], "edit_batch", "{reply} {text}");
+    assert_eq!(reply["state"], "edit_batch", "{reply} {text}");
     assert!(
         text.starts_with("edit: applied 3 of 3 files; source_ref "),
         "{text}"
@@ -864,9 +864,21 @@ async fn multi_file_edit_resumes_after_a_crash_after_each_write_without_double_a
         let arguments = edit_arguments("crash-op", &source_ref);
         let lost = actor.call(&fixture, "ide.edit", arguments.clone()).await;
         let lost = actor.settle(&fixture, lost).await;
+        assert_eq!(lost["state"], "edit_batch", "{lost}");
         assert_eq!(
-            lost["result"]["outcome"], "outcome_unknown",
+            lost["outcome"], "outcome_unknown",
             "a crash after a write never answers internal: {lost}"
+        );
+        assert_eq!(lost["operation_id"], "crash-op", "{lost}");
+        assert_eq!(
+            lost["files"],
+            json!(
+                EDIT_FILES
+                    .iter()
+                    .map(|path| json!({"path": path, "state": "unknown"}))
+                    .collect::<Vec<_>>()
+            ),
+            "{lost}"
         );
         assert_crash_only_exit(&mut daemon, &fixture).await;
         actor.mcp.close().await;
@@ -902,7 +914,7 @@ async fn multi_file_edit_resumes_after_a_crash_after_each_write_without_double_a
             .await;
         assert_eq!(again.settle(&fixture, started).await["kind"], "activation");
         let (reply, text) = settled_edit(&mut again, &fixture, arguments).await;
-        assert_eq!(reply["kind"], "edit_batch", "{reply} {text}");
+        assert_eq!(reply["state"], "edit_batch", "{reply} {text}");
         assert!(text.starts_with("edit: applied 3 of 3 files"), "{text}");
         for (index, name) in EDIT_FILES.iter().enumerate() {
             let earlier = format!(
@@ -960,8 +972,22 @@ async fn multi_file_edit_stops_at_a_native_write_and_resumes_only_unchanged_base
         let source_ref = read_edit_files(&mut actor, &fixture).await;
         let arguments = edit_arguments("native-op", &source_ref);
         let (reply, text) = settled_edit(&mut actor, &fixture, arguments.clone()).await;
-        assert_eq!(reply["kind"], "edit_batch", "{reply} {text}");
+        assert_eq!(reply["state"], "edit_batch", "{reply} {text}");
         let stale = EDIT_FILES[position - 1];
+        assert_eq!(reply["outcome"], "partial", "{reply}");
+        assert_eq!(
+            reply["files"][position - 1],
+            json!({"path": stale, "state": "not_written", "reason": "changed_after_validation"}),
+            "{reply}"
+        );
+        if position < EDIT_FILES.len() {
+            assert_eq!(reply["files"][position]["reason"], "not_reached", "{reply}");
+        }
+        assert_eq!(
+            reply["source_ref"].is_string(),
+            position > 1,
+            "a source_ref only when a file is written: {reply}"
+        );
         assert!(
             text.starts_with(&format!(
                 "edit: partial — written {} of 3; not written: {position} {stale} (changed after validation)",
@@ -988,14 +1014,17 @@ async fn multi_file_edit_stops_at_a_native_write_and_resumes_only_unchanged_base
         assert!(text.starts_with("edit: partial"), "{text}");
         std::fs::write(fixture.root.join(stale), original(stale)).unwrap();
         let (reply, text) = settled_edit(&mut actor, &fixture, arguments.clone()).await;
-        assert_eq!(reply["kind"], "edit_batch", "{reply} {text}");
+        assert_eq!(reply["state"], "edit_batch", "{reply} {text}");
         assert!(text.starts_with("edit: applied 3 of 3 files"), "{text}");
         assert_files(&fixture, edited, "the resume finished the rest once");
 
+        assert_eq!(reply["outcome"], "applied", "{reply}");
         let mut other = arguments.clone();
         other["files"][0]["changes"][0]["content"] = json!("different");
-        let (_, text) = settled_edit(&mut actor, &fixture, other).await;
+        let (duplicate, text) = settled_edit(&mut actor, &fixture, other).await;
         assert!(text.starts_with("edit: conflicting_duplicate"), "{text}");
+        assert_eq!(duplicate["outcome"], "conflicting_duplicate", "{duplicate}");
+        assert_eq!(duplicate["files"], json!([]), "{duplicate}");
         assert_files(&fixture, edited, "a conflicting duplicate writes nothing");
 
         actor.call(&fixture, "ide.stop", json!({})).await;
@@ -1049,16 +1078,12 @@ async fn multi_file_edit_runs_one_project_check_and_reports_each_file() {
     )
     .await;
     let source_ref = read["detail_ref"].as_str().unwrap().to_owned();
-    let (reply, text) = settled_edit(
-        &mut actor,
-        &fixture,
-        json!({"operation_id":"rust-three","source_ref":source_ref,"files":[
-            {"path":"src/lib.rs","changes":[{"lines":"1-1","content":"pub fn value() -> i32 { 8 }"}]},
-            {"path":"src/a.rs","changes":[{"lines":"2-2","content":"    2"}]},
-            {"path":"src/b.rs","changes":[{"lines":"2-2","content":"    3"}]}]}),
-    )
-    .await;
-    assert_eq!(reply["kind"], "edit_batch", "{reply} {text}");
+    let three = json!({"operation_id":"rust-three","source_ref":source_ref,"files":[
+        {"path":"src/lib.rs","changes":[{"lines":"1-1","content":"pub fn value() -> i32 { 8 }"}]},
+        {"path":"src/a.rs","changes":[{"lines":"2-2","content":"    2"}]},
+        {"path":"src/b.rs","changes":[{"lines":"2-2","content":"    3"}]}]});
+    let (reply, text) = settled_edit(&mut actor, &fixture, three.clone()).await;
+    assert_eq!(reply["state"], "edit_batch", "{reply} {text}");
     assert!(text.starts_with("edit: applied 3 of 3 files"), "{text}");
     for (index, name) in ["src/lib.rs", "src/a.rs", "src/b.rs"].iter().enumerate() {
         let line = text
@@ -1072,7 +1097,34 @@ async fn multi_file_edit_runs_one_project_check_and_reports_each_file() {
         before + 1,
         "exactly one project check ran for the three files"
     );
-    let edit_ref = reply["detail_ref"].as_str().unwrap().to_owned();
+    // A retry of the settled operation writes nothing and answers the settled diagnostics.
+    let (retry, retried) = settled_edit(&mut actor, &fixture, three).await;
+    assert_eq!(retry["outcome"], "applied", "{retry}");
+    let summary = |text: &str| {
+        text.lines()
+            .next()
+            .and_then(|line| line.split_once("; diagnostics: "))
+            .map(|(_, words)| words.to_owned())
+    };
+    assert_eq!(summary(&retried), summary(&text), "{retried}");
+    assert!(!retried.contains("no checked language"), "{retried}");
+    for (index, name) in ["src/lib.rs", "src/a.rs", "src/b.rs"].iter().enumerate() {
+        let words = |text: &str| {
+            text.lines()
+                .find(|line| line.starts_with(&format!("  {} {name}: ", index + 1)))
+                .and_then(|line| line.split_once("; diagnostics "))
+                .map(|(_, words)| words.to_owned())
+        };
+        assert!(
+            retried.contains(&format!(
+                "  {} {name}: written earlier by this operation_id",
+                index + 1
+            )),
+            "{retried}"
+        );
+        assert_eq!(words(&retried), words(&text), "{name}: {retried}");
+    }
+    let edit_ref = reply["source_ref"].as_str().unwrap().to_owned();
     let next = actor
         .call(
             &fixture,
@@ -1129,7 +1181,7 @@ async fn slow_multi_file_edit_check_arrives_as_one_edit_checked_fact() {
     )
     .await;
     assert_eq!(
-        edit["kind"], "edit_batch",
+        edit["state"], "edit_batch",
         "the check never parks the reply: {edit} {text}"
     );
     assert!(
@@ -1206,7 +1258,7 @@ async fn rename_stopped_midway_reports_each_file_and_the_same_operation_id_finis
     let rename = json!({"operation_id":"rename-op","op":"rename","symbol":"src/lib.rs#helper","new_name":"assist"});
 
     let (reply, text) = settled_edit(&mut actor, &fixture, rename.clone()).await;
-    assert_eq!(reply["kind"], "edit_batch", "{reply} {text}");
+    assert_eq!(reply["state"], "edit_batch", "{reply} {text}");
     assert!(
         text.starts_with(
             "edit: partial — written 1 of 2; not written: 2 src/lib.rs (changed after validation)"
@@ -1242,7 +1294,7 @@ async fn rename_stopped_midway_reports_each_file_and_the_same_operation_id_finis
     );
 
     let (again, text) = settled_edit(&mut actor, &fixture, rename.clone()).await;
-    assert_eq!(again["kind"], "edit_batch", "{again} {text}");
+    assert_eq!(again["state"], "edit_batch", "{again} {text}");
     assert!(text.starts_with("edit: applied 2 of 2 files"), "{text}");
     assert!(
         text.contains("written earlier by this operation_id"),
@@ -1264,10 +1316,11 @@ async fn rename_stopped_midway_reports_each_file_and_the_same_operation_id_finis
 }
 
 /// `ide.test {targets}` runs every target as ONE run of the worktree: the symbol targets of one
-/// language merge into one runner invocation (libtest exact names), the path target runs after
-/// it in the same run, and a target the runner cannot take is answered on its own line. While
-/// the run is live, another start in the worktree answers that run; the settled result has one
-/// line per target and one rerun line, and that line reproduces the whole run.
+/// language merge into one runner invocation (libtest exact names); the two integration test
+/// files, which cargo's admitted recipes run one per invocation, run one after another in the
+/// same run; and a target the runner cannot take is answered on its own line. While the run is live, another
+/// several-target start in the worktree answers exactly `tests #1: still running`; the settled
+/// result has one line per target and one rerun line, and that line reproduces the whole run.
 #[tokio::test]
 async fn test_targets_run_as_one_run_with_a_line_per_target_and_one_rerun() {
     let fixture = symbol_test_fixture();
@@ -1280,7 +1333,12 @@ async fn test_targets_run_as_one_run_with_a_line_per_target_and_one_rerun() {
          \n    #[test]\n    fn halves() {\n        assert_eq!(super::half(4), 2);\n    }\n}\n",
     )
     .unwrap();
-    fixture.git(&["add", "--", "src/lib.rs"]);
+    std::fs::write(
+        fixture.root.join("tests/more_tests.rs"),
+        "#[test]\nfn more_is_file() {\n    assert!(product_fixture::FileFlag.is_file());\n}\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "tests/more_tests.rs"]);
     fixture.git(&["commit", "--quiet", "-m", "test targets fixture"]);
     let mut daemon = fixture.daemon().await;
     let mut actor = ProductActor::new(&fixture, "test-targets").await;
@@ -1305,6 +1363,7 @@ async fn test_targets_run_as_one_run_with_a_line_per_target_and_one_rerun() {
                 {"symbol":"src/lib.rs#twice"},
                 {"symbol":"src/lib.rs#half"},
                 {"path":"tests/path_tests.rs"},
+                {"path":"tests/more_tests.rs"},
                 {"path":"README.md"}
             ]}),
         )
@@ -1313,7 +1372,7 @@ async fn test_targets_run_as_one_run_with_a_line_per_target_and_one_rerun() {
     let text = batch_without_status_plate(run["text"].as_str().unwrap_or_default()).to_owned();
     assert!(
         text.starts_with(
-            "tests #1: started — 4 targets in 2 runs (budget 120 s); the result arrives by itself \
+            "tests #1: started — 5 targets in 3 runs (budget 120 s); the result arrives by itself \
              as a test-finished fact\n"
         ),
         "{text}"
@@ -1322,18 +1381,21 @@ async fn test_targets_run_as_one_run_with_a_line_per_target_and_one_rerun() {
         text.contains("\n  target 1 symbol src/lib.rs#twice: run 1 (3 tests selected)")
             && text.contains("\n  target 2 symbol src/lib.rs#half: run 1 (3 tests selected)")
             && text.contains("\n  target 3 path tests/path_tests.rs: run 2")
-            && text.contains("\n  target 4 path README.md: not runnable: "),
+            && text.contains("\n  target 4 path tests/more_tests.rs: run 3")
+            && text.contains("\n  target 5 path README.md: not runnable: "),
         "{text}"
     );
     let busy = actor
-        .call(&fixture, "ide.test", json!({"pattern":"doubles"}))
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"targets":[{"pattern":"doubles"}]}),
+        )
         .await;
-    assert!(
-        busy["text"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("tests #1: still running"),
-        "one run per worktree: {busy}"
+    assert_eq!(
+        batch_without_status_plate(busy["text"].as_str().unwrap_or_default()),
+        "tests #1: still running",
+        "one run per worktree, no seconds on unfinished work: {busy}"
     );
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
@@ -1350,7 +1412,7 @@ async fn test_targets_run_as_one_run_with_a_line_per_target_and_one_rerun() {
         }
     };
     assert!(
-        result.starts_with("tests #1: 3 passed, 1 failed, "),
+        result.starts_with("tests #1: 4 passed, 1 failed, "),
         "{result}"
     );
     assert!(result.contains("FAIL tests::fails"), "{result}");
@@ -1358,7 +1420,8 @@ async fn test_targets_run_as_one_run_with_a_line_per_target_and_one_rerun() {
         result.contains("\n  target 1 symbol src/lib.rs#twice: run 1 — 2 passed, 1 failed")
             && result.contains("\n  target 2 symbol src/lib.rs#half: run 1 — 2 passed, 1 failed")
             && result.contains("\n  target 3 path tests/path_tests.rs: run 2 — 1 passed, 0 failed")
-            && result.contains("\n  target 4 path README.md: not runnable: "),
+            && result.contains("\n  target 4 path tests/more_tests.rs: run 3 — 1 passed, 0 failed")
+            && result.contains("\n  target 5 path README.md: not runnable: "),
         "{result}"
     );
     let rerun = result
@@ -1367,7 +1430,10 @@ async fn test_targets_run_as_one_run_with_a_line_per_target_and_one_rerun() {
         .unwrap_or_else(|| panic!("one rerun line: {result}"));
     assert!(
         rerun.starts_with("sh -c 'cargo test --workspace -- --exact ")
-            && rerun.ends_with("; cargo test --manifest-path Cargo.toml --test path_tests'"),
+            && rerun.ends_with(
+                "; cargo test --manifest-path Cargo.toml --test path_tests; cargo test \
+                 --manifest-path Cargo.toml --test more_tests'"
+            ),
         "{rerun}"
     );
     let reproduced = std::process::Command::new("/bin/sh")
@@ -1381,10 +1447,94 @@ async fn test_targets_run_as_one_run_with_a_line_per_target_and_one_rerun() {
         "test tests::fails ... FAILED",
         "test tests::halves ... ok",
         "test checks_is_file ... ok",
+        "test more_is_file ... ok",
     ] {
         assert!(reproduced.contains(line), "{line}: {reproduced}");
     }
 
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Path targets of a runner that takes several files at once share ONE invocation per language:
+/// two pytest test files run as one `pytest a b` run. Whether or not this machine has pytest, the
+/// merge shows in the run numbers; with pytest the rerun line names both files.
+#[tokio::test]
+async fn path_targets_of_one_pytest_project_share_one_invocation() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::create_dir_all(fixture.root.join("tools")).unwrap();
+    std::fs::write(fixture.root.join("tools/requirements-ml.txt"), "pytest\n").unwrap();
+    std::fs::write(fixture.root.join("tools/analyze.py"), "import pandas\n").unwrap();
+    std::fs::create_dir_all(fixture.root.join("tests")).unwrap();
+    for name in ["test_a.py", "test_b.py"] {
+        std::fs::write(
+            fixture.root.join("tests").join(name),
+            "def test_it():\n    assert [] == []\n",
+        )
+        .unwrap();
+    }
+    fixture.git(&["add", "--", "."]);
+    fixture.git(&["commit", "--quiet", "-m", "pytest targets fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "pytest-targets").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"pytest-targets"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let run = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"targets":[{"path":"tests/test_a.py"},{"path":"tests/test_b.py"}]}),
+        )
+        .await;
+    let run = actor.settle(&fixture, run).await;
+    let text = batch_without_status_plate(run["text"].as_str().unwrap_or_default()).to_owned();
+    assert!(
+        text.starts_with("tests #1: started — 2 targets in 1 runs ("),
+        "{run}"
+    );
+    assert!(
+        text.contains("\n  target 1 path tests/test_a.py: run 1")
+            && text.contains("\n  target 2 path tests/test_b.py: run 1"),
+        "{text}"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let result = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the run did not settle"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let status = actor.call(&fixture, "ide.test", json!({"status":1})).await;
+        let text = batch_without_status_plate(status["text"].as_str().unwrap_or_default());
+        if !text.contains("running") {
+            break text.to_owned();
+        }
+    };
+    let rerun = result
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("rerun: "))
+        .unwrap_or_else(|| panic!("one rerun line: {result}"));
+    assert!(!rerun.starts_with("sh -c"), "one invocation: {result}");
+    // Without pytest the planned run cannot start and its rerun names only the missing program.
+    if !result.contains("could not start") {
+        assert!(
+            rerun.contains("tests/test_a.py tests/test_b.py"),
+            "one invocation for both files: {result}"
+        );
+    }
+    assert!(
+        result.contains("\n  target 1 path tests/test_a.py: run 1")
+            && result.contains("\n  target 2 path tests/test_b.py: run 1"),
+        "{result}"
+    );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();

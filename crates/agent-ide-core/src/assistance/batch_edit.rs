@@ -47,20 +47,6 @@ pub(super) struct Committed {
     authority: AuthorityStamp,
 }
 
-/// The reply to a reused `operation_id` whose recorded request differs: nothing is written.
-fn conflicting_duplicate(operation_id: &str) -> PeerReply {
-    PeerReply::Complete {
-        kind: ResultKind::EditBatch,
-        text: format!(
-            "edit: conflicting_duplicate; operation_id {operation_id} already names a different \
-             multi-file edit; nothing written\n"
-        ),
-        detail_ref: None,
-        truncated: false,
-        continuation: false,
-    }
-}
-
 /// A multi-file edit parked after its writes, waiting for its one project check.
 pub(super) struct BatchCheck {
     /// Every requested file in request order with its write state and landing note.
@@ -101,13 +87,15 @@ impl BatchCheck {
             })
             .collect();
         files.extend(self.unchecked.iter().cloned());
-        batch_reply(reference, &self.reports, &files)
+        batch_reply(&self.operation_id, reference, &self.reports, &files)
     }
 }
 
-/// Builds the complete multi-file edit reply: per-file diagnostics joined to their report lines,
-/// the summary first, and the job's own reference as the `source_ref` when any file is written.
+/// Builds the complete multi-file edit reply of `operation_id` ([`batch::edit_batch_reply`]):
+/// per-file diagnostics joined to their report lines, the summary first, and the job's own
+/// reference as the `source_ref` when any file is written.
 fn batch_reply(
+    operation_id: &str,
     reference: &str,
     reports: &[FileReport],
     diagnostics: &[(String, EditDiagnostics)],
@@ -119,16 +107,60 @@ fn batch_reply(
             report.diagnostics = Some(word);
         }
     }
-    let written = reports.iter().any(|report| report.state.written());
-    let text =
-        batch::render_edit_reply(&reports, written.then_some(reference), &summary, &new_lines);
-    PeerReply::Complete {
-        kind: ResultKind::EditBatch,
-        text,
-        detail_ref: Some(reference.to_owned()),
-        truncated: false,
-        continuation: false,
+    batch::edit_batch_reply(
+        operation_id,
+        &reports,
+        Some(reference),
+        &summary,
+        &new_lines,
+    )
+}
+
+/// The diagnostics a settled operation's receipt keeps for its retries
+/// ([`crate::changes::batch::BatchReceiptStore::record_diagnostics`]): the summary words, each
+/// file's words by path and the new-problem lines, as JSON.
+fn stored_diagnostics(diagnostics: &[(String, EditDiagnostics)]) -> String {
+    let (summary, words, new_lines) = batch::summarize_diagnostics(diagnostics);
+    let files = diagnostics
+        .iter()
+        .map(|(path, _)| path)
+        .zip(words)
+        .collect::<Vec<_>>();
+    serde_json::json!({"summary": summary, "files": files, "new": new_lines}).to_string()
+}
+
+/// The reply of a retried, settled operation from the diagnostics its receipt kept
+/// ([`stored_diagnostics`]): every file as written earlier with its settled words, the settled
+/// summary and new-problem lines, and `reference` as the `source_ref`; `None` when the stored text
+/// does not read back.
+fn settled_reply(
+    operation_id: &str,
+    reference: &str,
+    reports: &[FileReport],
+    stored: &str,
+) -> Option<PeerReply> {
+    let value: Value = serde_json::from_str(stored).ok()?;
+    let summary = value.get("summary")?.as_str()?;
+    let mut reports = reports.to_vec();
+    for entry in value.get("files")?.as_array()? {
+        let (path, word) = (entry.get(0)?.as_str()?, entry.get(1)?.as_str()?);
+        if let Some(report) = reports.iter_mut().find(|report| report.path == path) {
+            report.diagnostics = Some(word.to_owned());
+        }
     }
+    let new_lines = value
+        .get("new")?
+        .as_array()?
+        .iter()
+        .filter_map(|line| line.as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    Some(batch::edit_batch_reply(
+        operation_id,
+        &reports,
+        Some(reference),
+        summary,
+        &new_lines,
+    ))
 }
 
 impl Worker<'_> {
@@ -216,6 +248,7 @@ impl Worker<'_> {
             request_digest: digest,
             settled: false,
             files: rows,
+            diagnostics: None,
         };
         let committed = self
             .commit_files(
@@ -245,12 +278,34 @@ impl Worker<'_> {
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         if existing.request_digest != digest || existing.files.len() != files.len() {
             let authority = self.authority(binding).await.ok();
-            return Ok((conflicting_duplicate(operation_id), authority, None));
+            return Ok((
+                batch::conflicting_duplicate_reply(operation_id),
+                authority,
+                None,
+            ));
         }
         let planned = files.iter().map(|_| None).collect();
         let committed = self
             .commit_files(job, binding, operation_id, files, &existing, planned)
             .await?;
+        // A settled operation answers the diagnostics its settled check recorded.
+        if let Some(stored) = existing.diagnostics.as_deref()
+            && committed
+                .reports
+                .iter()
+                .all(|report| report.state.written())
+            && let Some(reply) =
+                settled_reply(operation_id, &job.reference, &committed.reports, stored)
+        {
+            let Committed {
+                mut sources,
+                authority,
+                ..
+            } = committed;
+            let first = (!sources.is_empty()).then(|| sources.remove(0));
+            self.shared.add_edit_sources(&job.reference, sources);
+            return Ok((reply, Some(authority), first));
+        }
         self.schedule_batch_check(job, binding, operation_id, committed)
             .await
     }
@@ -402,7 +457,12 @@ impl Worker<'_> {
                 {
                     sources.push(observed);
                 }
-                reports.push(report(FileState::WrittenEarlier, None));
+                reports.push(report(
+                    FileState::WrittenEarlier {
+                        created: row.base.is_none(),
+                    },
+                    None,
+                ));
                 continue;
             }
             let plan = match planned[index].take() {
@@ -418,7 +478,12 @@ impl Worker<'_> {
                     if observed.bytes().map(|bytes| *bytes.digest()) == Some(row.candidate) {
                         sources.push(observed);
                         let _ = receipts.mark_written(operation_id, index).await;
-                        reports.push(report(FileState::WrittenEarlier, None));
+                        reports.push(report(
+                            FileState::WrittenEarlier {
+                                created: row.base.is_none(),
+                            },
+                            None,
+                        ));
                         continue;
                     }
                     match self
@@ -631,25 +696,31 @@ impl Worker<'_> {
         let mut stages = Vec::new();
         let mut unchecked = Vec::new();
         let mut generations: BTreeMap<String, Option<u64>> = BTreeMap::new();
-        for report in reports.iter().filter(|report| {
-            matches!(
-                report.state,
-                FileState::Created | FileState::Replaced | FileState::Unchanged
-            )
-        }) {
-            let checked = Language::for_path(Path::new(&report.path))
-                .filter(|language| language.checks().is_some());
-            let (Some(language), Some(feed), Some(deadline)) =
-                (checked, self.shared.project_feed.as_ref(), deadline)
-            else {
-                if Language::for_path(Path::new(&report.path)).is_none() {
-                    unchecked.push((
-                        report.path.clone(),
-                        EditDiagnostics::NotAnalysed {
-                            reason: "no IDE language checks this file type".to_owned(),
-                        },
-                    ));
+        // Every file that holds its candidate is reported, one written by an earlier call of
+        // the operation included; a file the check cannot cover is `not_analysed` with why.
+        for report in reports.iter().filter(|report| report.state.written()) {
+            let language = Language::for_path(Path::new(&report.path));
+            let feed = self.shared.project_feed.as_ref();
+            let not_analysed = match (language, feed, deadline) {
+                (None, ..) => Some("no IDE language checks this file type"),
+                (Some(language), ..) if language.checks().is_none() => {
+                    Some("no project check covers this file type")
                 }
+                (_, None, _) => Some("no project check runs in this session"),
+                (_, _, None) => Some("no time was left in this call for the project check"),
+                _ => None,
+            };
+            let (None, Some(language), Some(feed), Some(deadline)) =
+                (not_analysed, language, feed, deadline)
+            else {
+                unchecked.push((
+                    report.path.clone(),
+                    EditDiagnostics::NotAnalysed {
+                        reason: not_analysed
+                            .unwrap_or("no IDE language checks this file type")
+                            .to_owned(),
+                    },
+                ));
                 continue;
             };
             // One generation per language: the first written file of the language triggers it,
@@ -660,6 +731,12 @@ impl Worker<'_> {
                     feed.changed_generation(&binding.fingerprint(), Some(&report.path))
                 });
             let Some(generation) = generation else {
+                unchecked.push((
+                    report.path.clone(),
+                    EditDiagnostics::NotAnalysed {
+                        reason: "the project check did not accept this change".to_owned(),
+                    },
+                ));
                 continue;
             };
             job.check_scheduled = true;
@@ -677,7 +754,11 @@ impl Worker<'_> {
                 generation,
                 worktree: worktree.clone(),
                 wanted: report.path.trim_start_matches("./").to_owned(),
-                preexisting: preexisting.remove(&report.path).unwrap_or_default(),
+                // A file written by an earlier call has no pre-write record: the latest check
+                // of it is its baseline, so only problems that appear now read as new.
+                preexisting: preexisting
+                    .remove(&report.path)
+                    .unwrap_or_else(|| self.pre_edit_problem_keys(&authority, &report.path)),
                 language,
                 deadline,
             });
@@ -745,7 +826,19 @@ impl Worker<'_> {
                 .outbox
                 .push_draft(&recipients, draft, work.epoch);
         }
-        let reply = batch_reply(&job.reference, &check.reports, &diagnostics);
+        if check.reports.iter().all(|report| report.state.written()) {
+            let _ = self
+                .edits
+                .batches()
+                .record_diagnostics(&check.operation_id, &stored_diagnostics(&diagnostics))
+                .await;
+        }
+        let reply = batch_reply(
+            &check.operation_id,
+            &job.reference,
+            &check.reports,
+            &diagnostics,
+        );
         let mut sources = check.sources;
         let first = (!sources.is_empty()).then(|| sources.remove(0));
         self.shared.add_edit_sources(&job.reference, sources);
@@ -801,7 +894,12 @@ impl Worker<'_> {
             })
             .collect();
         pending.extend(check.unchecked.iter().cloned());
-        let reply = batch_reply(&job.reference, &check.reports, &pending);
+        let reply = batch_reply(
+            &check.operation_id,
+            &job.reference,
+            &check.reports,
+            &pending,
+        );
         if let Some(sender) = job.stop_reply.take() {
             if sender.send(reply).is_err() {
                 let _ = self.shared.outbox.take_holding(&job.reference);
@@ -828,7 +926,11 @@ impl Worker<'_> {
         match receipt {
             Some(existing) if existing.request_digest != digest => {
                 let authority = self.authority(binding).await.ok();
-                Ok(Some((conflicting_duplicate(operation_id), authority, None)))
+                Ok(Some((
+                    batch::conflicting_duplicate_reply(operation_id),
+                    authority,
+                    None,
+                )))
             }
             Some(existing) if existing.settled => {
                 let files = rename_files(&existing);
@@ -836,7 +938,7 @@ impl Worker<'_> {
                 let committed = self
                     .commit_files(job, binding, operation_id, &files, &existing, planned)
                     .await?;
-                Ok(Some(self.partial_rename(job, committed)))
+                Ok(Some(self.partial_rename(job, operation_id, committed)))
             }
             _ => Ok(None),
         }
@@ -865,7 +967,11 @@ impl Worker<'_> {
         let receipt = match self.rename_receipt(job, operation_id).await? {
             Some(existing) if existing.request_digest != digest => {
                 let authority = self.authority(binding).await.ok();
-                return Ok((conflicting_duplicate(operation_id), authority, None));
+                return Ok((
+                    batch::conflicting_duplicate_reply(operation_id),
+                    authority,
+                    None,
+                ));
             }
             Some(existing) => existing,
             None => {
@@ -888,13 +994,18 @@ impl Worker<'_> {
                         request_digest: digest,
                         settled: false,
                         files: rows,
+                        diagnostics: None,
                     },
                     Ok(BatchAdmission::Existing(existing)) if existing.request_digest == digest => {
                         existing
                     }
                     Ok(BatchAdmission::Existing(_)) => {
                         let authority = self.authority(binding).await.ok();
-                        return Ok((conflicting_duplicate(operation_id), authority, None));
+                        return Ok((
+                            batch::conflicting_duplicate_reply(operation_id),
+                            authority,
+                            None,
+                        ));
                     }
                     Err(_) => {
                         job.failure_detail = Some("edit:batch_receipt_unavailable".to_owned());
@@ -930,9 +1041,9 @@ impl Worker<'_> {
             && committed
                 .reports
                 .iter()
-                .any(|report| report.state != FileState::WrittenEarlier);
+                .any(|report| !matches!(report.state, FileState::WrittenEarlier { .. }));
         if !complete {
-            return Ok(self.partial_rename(job, committed));
+            return Ok(self.partial_rename(job, operation_id, committed));
         }
         let Committed {
             reports,
@@ -973,6 +1084,7 @@ impl Worker<'_> {
     fn partial_rename(
         &self,
         job: &Job,
+        operation_id: &str,
         committed: Committed,
     ) -> (PeerReply, Option<AuthorityStamp>, Option<SourceObservation>) {
         let Committed {
@@ -986,7 +1098,7 @@ impl Worker<'_> {
             .filter(|report| report.state.written())
             .map(|report| (report.path.clone(), EditDiagnostics::Unknown {}))
             .collect::<Vec<_>>();
-        let reply = batch_reply(&job.reference, &reports, &diagnostics);
+        let reply = batch_reply(operation_id, &job.reference, &reports, &diagnostics);
         let first = (!sources.is_empty()).then(|| sources.remove(0));
         self.shared.add_edit_sources(&job.reference, sources);
         (reply, Some(authority), first)

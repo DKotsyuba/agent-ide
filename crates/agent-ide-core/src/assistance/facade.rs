@@ -150,7 +150,6 @@ fn tool_accepts_result_kind(tool: AssistanceTool, kind: ResultKind) -> bool {
             | (AssistanceTool::Symbol, ResultKind::Symbol)
             | (AssistanceTool::Graph, ResultKind::Graph)
             | (AssistanceTool::Test, ResultKind::Test)
-            | (AssistanceTool::Edit, ResultKind::EditBatch)
     )
 }
 
@@ -1825,9 +1824,10 @@ impl AssistanceFacade {
                         | PeerReply::InvalidParameters { .. }),
                         status,
                     )) => FacadeOutcome::Reply(Box::new(reply), status),
-                    Some((reply @ PeerReply::Edit { .. }, status))
-                        if matches!(tool, AssistanceTool::Edit | AssistanceTool::Inspect) =>
-                    {
+                    Some((
+                        reply @ (PeerReply::Edit { .. } | PeerReply::EditBatch { .. }),
+                        status,
+                    )) if matches!(tool, AssistanceTool::Edit | AssistanceTool::Inspect) => {
                         FacadeOutcome::Reply(Box::new(reply), status)
                     }
                     Some((reply @ PeerReply::Complete { kind, .. }, status))

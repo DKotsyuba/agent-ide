@@ -489,6 +489,10 @@ pub enum TestTarget {
     },
     /// Every test in one file or module.
     File(PathBuf),
+    /// Every test in several files or modules of one language, as ONE runner invocation; a
+    /// language whose runner cannot take them together answers [`LangError::Unsupported`] and
+    /// the caller runs each as a [`Self::File`] target.
+    Files(Vec<PathBuf>),
     /// A raw filter passed to the language's test runner.
     Pattern(String),
 }

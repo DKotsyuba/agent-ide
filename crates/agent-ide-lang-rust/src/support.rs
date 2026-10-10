@@ -244,6 +244,8 @@ impl LanguageSupport for RustSupport {
     ///   `tests/<name>/…` → `--test <name>`; `src/lib.rs` → `--lib`, `src/main.rs` → `--bins`,
     ///   `src/bin/<x>.rs` → `--bin <x>`, any other `src` file → its module path filter
     ///   (`src/a/b.rs` → `a::b::`, `mod.rs` dropped). Other files are [`LangError::Unsupported`].
+    /// * Files: [`LangError::Unsupported`]; the module's admitted `cargo test` recipes take one
+    ///   file target per run, so the caller runs the files one after another.
     /// * Pattern: `cargo test --workspace <pattern>`.
     ///
     /// Only the symbol form lists the tests it expects to cover.
@@ -335,6 +337,11 @@ impl LanguageSupport for RustSupport {
                     command,
                 })
             }
+            // The module's admitted `cargo test` recipes take one file target per run, so several
+            // files run one after another (the caller's fallback).
+            TestTarget::Files(_) => Err(LangError::Unsupported(
+                "cargo test runs one file target per invocation".to_owned(),
+            )),
             TestTarget::Pattern(pattern) => {
                 command.push(pattern.clone());
                 Ok(TestSelection {
@@ -1590,6 +1597,12 @@ mod tests {
             command(TestTarget::Pattern("lang::".into())),
             "cargo test --workspace lang::"
         );
+        let files =
+            |paths: &[&str]| TestTarget::Files(paths.iter().map(PathBuf::from).collect::<Vec<_>>());
+        assert!(matches!(
+            RustSupport.test_selection(&project(), &files(&["tests/lang.rs", "tests/cli.rs"])),
+            Err(LangError::Unsupported(_))
+        ));
         let integration = |file: &str, name: &str| TestId {
             file: PathBuf::from(file),
             name: name.to_owned(),

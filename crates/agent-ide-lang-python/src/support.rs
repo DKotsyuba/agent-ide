@@ -215,6 +215,22 @@ pub(crate) fn venv_directories(root: &Path) -> Vec<PathBuf> {
 /// means no checker was proven).
 pub(crate) const PY_AST_PROBE: &str = "import ast,sys\ntry:\n    ast.parse(sys.stdin.read())\nexcept SyntaxError as e:\n    print(f\"{e.lineno}: {e.msg}\")\n    sys.exit(1)";
 
+impl Python {
+    /// The pytest argument of one file target: a directory (`tests/`) selects the test files
+    /// inside it and passes through unchanged; a plain `.py` file must be one pytest would collect
+    /// by convention, or the module would be imported top-level as a test target, so any other
+    /// is [`LangError::Unsupported`].
+    fn test_file_argument(&self, file: &Path) -> Result<String, LangError> {
+        if file.extension().is_some_and(|extension| extension == "py") && !self.is_test_file(file) {
+            return Err(LangError::Unsupported(format!(
+                "no tests in {}",
+                file.display()
+            )));
+        }
+        Ok(file.display().to_string())
+    }
+}
+
 impl LanguageSupport for Python {
     /// Always the Python [`LANGUAGE`].
     fn language(&self) -> Language {
@@ -539,7 +555,9 @@ impl LanguageSupport for Python {
     /// symbol no test references is [`LangError::Unsupported`]. A file target runs whole only
     /// when the file is one pytest would collect by convention (`test_*.py`, `*_test.py`,
     /// `conftest.py`, under `tests/` or `test/`); a directory target selects the test files
-    /// inside it; a non-test `.py` file is [`LangError::Unsupported`]. Patterns go to `-k`.
+    /// inside it; a non-test `.py` file is [`LangError::Unsupported`]. Several file targets
+    /// (`Files`) are one pytest invocation over all of them, each checked as a file target.
+    /// Patterns go to `-k`.
     fn test_selection(
         &self,
         project: &LanguageProject,
@@ -561,20 +579,14 @@ impl LanguageSupport for Python {
                 };
                 (tests, args)
             }
-            TestTarget::File(file) => {
-                // A directory (`tests/`) selects the test files inside it and passes through
-                // unchanged; a plain `.py` file must be one pytest would collect by convention,
-                // or the module would be imported top-level as a test target.
-                if file.extension().is_some_and(|extension| extension == "py")
-                    && !self.is_test_file(file)
-                {
-                    return Err(LangError::Unsupported(format!(
-                        "no tests in {}",
-                        file.display()
-                    )));
-                }
-                (Vec::new(), vec![file.display().to_string()])
-            }
+            TestTarget::File(file) => (Vec::new(), vec![self.test_file_argument(file)?]),
+            TestTarget::Files(files) => (
+                Vec::new(),
+                files
+                    .iter()
+                    .map(|file| self.test_file_argument(file))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
             TestTarget::Pattern(pattern) => (Vec::new(), vec!["-k".to_owned(), pattern.clone()]),
         };
         let mut command = in_environment(project, &["pytest"]).map_err(LangError::Unsupported)?;
@@ -1904,6 +1916,28 @@ src/pkg/contract.py  (27 lines, python)
                 .command[..2],
             argv(&["pytest", "tests"])
         );
+        // Several file targets are one pytest invocation; a non-test file among them refuses.
+        let several = TestTarget::Files(vec![
+            PathBuf::from("tests/test_a.py"),
+            PathBuf::from("tests/unit"),
+        ]);
+        assert_eq!(
+            &Python
+                .test_selection(&project(&[]), &several)
+                .unwrap()
+                .command[..3],
+            argv(&["pytest", "tests/test_a.py", "tests/unit"])
+        );
+        assert!(matches!(
+            Python.test_selection(
+                &project(&[]),
+                &TestTarget::Files(vec![
+                    PathBuf::from("tests/test_a.py"),
+                    PathBuf::from("src/hypfactory/yaml_subset.py"),
+                ])
+            ),
+            Err(LangError::Unsupported(_))
+        ));
         assert!(Python.is_test_file(&PathBuf::from("test/helper.py")));
         assert!(!Python.is_test_file(&PathBuf::from("src/value.py")));
 
