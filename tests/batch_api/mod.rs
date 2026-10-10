@@ -211,6 +211,136 @@ async fn legacy_batch_reads_gain_only_the_summary_line() {
     daemon.wait().await.unwrap();
 }
 
+/// The summary counts of a batch read reply text, as `(delivered, unchanged)`.
+fn read_counts(text: &str) -> (usize, usize) {
+    let summary = text.lines().next().unwrap_or_default();
+    let count = |word: &str| -> usize {
+        summary
+            .split(", ")
+            .chain(summary.split(" — "))
+            .find_map(|part| part.trim().strip_suffix(word))
+            .and_then(|number| number.trim().rsplit(' ').next())
+            .and_then(|number| number.parse().ok())
+            .unwrap_or_else(|| panic!("no {word} count: {summary}"))
+    };
+    (count(" delivered"), count(" unchanged"))
+}
+
+/// With a known context epoch (test seam standing in for the session outbox's compaction
+/// signal), a repeated items read of identical bytes answers `unchanged since your read <ref>`
+/// with a `source_ref` that still admits an edit; changed bytes, `force:true`, a new epoch and
+/// `ide.stop` each bring the text back.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn read_items_answer_unchanged_for_identical_bytes_until_change_force_compaction_or_stop() {
+    let fixture = edit_fixture();
+    let epoch = fixture.base.join("context-epoch");
+    std::fs::write(&epoch, "1").unwrap();
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let env = [("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE", epoch.to_str().unwrap())];
+    let mut daemon = fixture
+        .spawn_configured_daemon_with_env(Some(&home), false, Duration::from_secs(30), None, &env)
+        .await;
+    let mut actor = ProductActor::new(&fixture, "read-unchanged").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"read-unchanged"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let items = json!({"items":[{"path":"a.md"},{"path":"b.md"}]});
+
+    let (first, text) = settled_read(&mut actor, &fixture, items.clone()).await;
+    assert_eq!(read_counts(&text), (2, 0), "{text}");
+    let first_ref = first["detail_ref"].as_str().unwrap().to_owned();
+    let (second, text) = settled_read(&mut actor, &fixture, items.clone()).await;
+    assert_eq!(read_counts(&text), (0, 2), "{text}");
+    assert!(
+        text.contains(&format!(
+            "unchanged since your read {first_ref}: a.md (2 lines); \"force\":true returns the text"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("a.md line1"), "{text}");
+    assert!(
+        source_ref_line(&text).contains("valid for a.md, b.md"),
+        "{text}"
+    );
+    let second_ref = second["detail_ref"].as_str().unwrap().to_owned();
+    let edit = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"after-unchanged","path":"a.md","source_ref":second_ref,
+                   "changes":[{"lines":"2-2","content":"a.md changed"}]}),
+        )
+        .await;
+    let edit = actor.settle(&fixture, edit).await;
+    assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
+
+    let (_, text) = settled_read(&mut actor, &fixture, items.clone()).await;
+    assert_eq!(
+        read_counts(&text),
+        (1, 1),
+        "changed bytes come back: {text}"
+    );
+    assert!(text.contains("a.md changed"), "{text}");
+    let mut forced = items.clone();
+    forced["force"] = json!(true);
+    let (_, text) = settled_read(&mut actor, &fixture, forced).await;
+    assert_eq!(read_counts(&text), (2, 0), "force returns the text: {text}");
+    std::fs::write(&epoch, "2").unwrap();
+    let (_, text) = settled_read(&mut actor, &fixture, items.clone()).await;
+    assert_eq!(read_counts(&text), (2, 0), "a compaction resets: {text}");
+    let (_, text) = settled_read(&mut actor, &fixture, items.clone()).await;
+    assert_eq!(read_counts(&text), (0, 2), "{text}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"read-unchanged-2"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let (_, text) = settled_read(&mut actor, &fixture, items.clone()).await;
+    assert_eq!(read_counts(&text), (2, 0), "ide.stop resets: {text}");
+
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Without a compaction signal the unchanged answer is never given: a repeated items read
+/// returns the text.
+#[tokio::test]
+async fn read_items_never_answer_unchanged_without_a_compaction_signal() {
+    let fixture = edit_fixture();
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "read-no-signal").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"read-no-signal"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let items = json!({"items":[{"path":"a.md"},{"path":"b.md"}]});
+    for _ in 0..2 {
+        let (_, text) = settled_read(&mut actor, &fixture, items.clone()).await;
+        assert_eq!(read_counts(&text), (2, 0), "{text}");
+    }
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// The three text files every multi-file edit test edits, with their committed content.
 const EDIT_FILES: [&str; 3] = ["a.md", "b.md", "c.md"];
 

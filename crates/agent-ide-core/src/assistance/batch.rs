@@ -313,6 +313,85 @@ pub(crate) fn read_follow_up(form: ReadForm, cut: &[&ReadItem]) -> String {
     footer
 }
 
+/// Most delivered blocks one session's [`ReadMemory`] keeps; past it the memory starts over,
+/// which only ever means a block is sent again.
+const MAX_REMEMBERED_BLOCKS: usize = 512;
+
+/// One session's memory of the blocks `ide.read {items}` delivered (batch-api-v1 §2), so a
+/// repeated item whose bytes are identical answers `unchanged since your read <ref>` instead of
+/// its text.
+///
+/// The memory belongs to one context epoch of the session (session-outbox-v1 §9.1): a different
+/// epoch — the host compacted or cleared the agent's context — drops every entry, and an unknown
+/// epoch (`None`) disables the memory entirely, because nothing proves the model still holds an
+/// earlier read. The owner drops the whole memory when the session stops.
+#[derive(Debug, Default)]
+pub(crate) struct ReadMemory {
+    /// The epoch the entries were delivered in.
+    epoch: Option<u64>,
+    /// Per item label: the digest of the delivered block and the `detail_ref` that delivered it.
+    blocks: std::collections::BTreeMap<String, ([u8; 32], String)>,
+}
+
+impl ReadMemory {
+    /// Returns the `detail_ref` of the earlier read that delivered exactly `block` for `item` in
+    /// this same context epoch, or `None` (unknown epoch, new epoch, unknown item, changed bytes).
+    /// A new epoch clears the memory.
+    pub(crate) fn delivered_before(
+        &mut self,
+        epoch: Option<u64>,
+        item: &str,
+        block: &str,
+    ) -> Option<String> {
+        let epoch = epoch?;
+        if self.epoch != Some(epoch) {
+            self.blocks.clear();
+            self.epoch = Some(epoch);
+            return None;
+        }
+        let digest = *blake3::hash(block.as_bytes()).as_bytes();
+        self.blocks
+            .get(item)
+            .filter(|(known, _)| *known == digest)
+            .map(|(_, reference)| reference.clone())
+    }
+
+    /// Records that `reference` delivered `block` for `item` in `epoch`; nothing is recorded for
+    /// an unknown epoch.
+    pub(crate) fn remember(
+        &mut self,
+        epoch: Option<u64>,
+        item: &str,
+        block: &str,
+        reference: &str,
+    ) {
+        let Some(epoch) = epoch else {
+            return;
+        };
+        if self.epoch != Some(epoch) || self.blocks.len() >= MAX_REMEMBERED_BLOCKS {
+            self.blocks.clear();
+            self.epoch = Some(epoch);
+        }
+        self.blocks.insert(
+            item.to_owned(),
+            (
+                *blake3::hash(block.as_bytes()).as_bytes(),
+                reference.to_owned(),
+            ),
+        );
+    }
+}
+
+/// The one line that replaces an unchanged block:
+/// `unchanged since your read <ref>: <item> (<n> lines); "force":true returns the text`, where
+/// `<n>` counts the block's numbered lines (its header line excluded).
+pub(crate) fn unchanged_line(reference: &str, item: &str, block: &str) -> String {
+    let lines = block.lines().count().saturating_sub(1);
+    format!(
+        "unchanged since your read {reference}: {item} ({lines} lines); \"force\":true returns the text\n"
+    )
+}
+
 /// Most files one `ide.edit {files}` request may name.
 pub(crate) const MAX_EDIT_FILES: usize = 16;
 
@@ -980,6 +1059,46 @@ mod tests {
         assert!(
             footer.contains("f7.md") && !footer.contains("f8.md"),
             "{footer}"
+        );
+    }
+
+    #[test]
+    fn read_memory_answers_unchanged_only_for_identical_bytes_in_one_known_epoch() {
+        use crate::assistance::outbox::{RecordingOutbox, SessionOutbox};
+        let outbox = RecordingOutbox::default();
+        let session = crate::assistance::host_binding::BindingRef::fixture("reader", "channel", 1);
+        let mut memory = ReadMemory::default();
+        let block = "a.md  (lines 1–2)\n1\tone\n2\ttwo\n";
+        // No compaction signal: never answered unchanged, nothing remembered.
+        assert_eq!(outbox.context_epoch(&session), None);
+        memory.remember(outbox.context_epoch(&session), "a.md", block, "ref-1");
+        assert_eq!(
+            memory.delivered_before(outbox.context_epoch(&session), "a.md", block),
+            None
+        );
+        outbox.set_context_epoch(&session, 1);
+        let epoch = outbox.context_epoch(&session);
+        assert_eq!(memory.delivered_before(epoch, "a.md", block), None);
+        memory.remember(epoch, "a.md", block, "ref-1");
+        assert_eq!(
+            memory.delivered_before(epoch, "a.md", block),
+            Some("ref-1".to_owned())
+        );
+        assert_eq!(
+            memory.delivered_before(epoch, "a.md", "a.md  (lines 1–2)\n1\tone\n2\tTWO\n"),
+            None,
+            "changed bytes are sent again"
+        );
+        assert_eq!(memory.delivered_before(epoch, "b.md", block), None);
+        outbox.set_context_epoch(&session, 2);
+        assert_eq!(
+            memory.delivered_before(outbox.context_epoch(&session), "a.md", block),
+            None,
+            "a compaction forgets every earlier read"
+        );
+        assert_eq!(
+            unchanged_line("ref-1", "a.md", block),
+            "unchanged since your read ref-1: a.md (2 lines); \"force\":true returns the text\n"
         );
     }
 

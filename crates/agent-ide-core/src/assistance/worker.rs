@@ -549,6 +549,9 @@ struct Ledger {
     /// Bindings whose activation is being handed to another worktree: ingress refuses their new
     /// work until the handover settles, so nothing can queue against the old root meanwhile.
     handing_over: BTreeSet<BindingRef>,
+    /// Per active binding, the blocks `ide.read {items}` delivered, for the unchanged answer.
+    /// Cleared at the same points `feedback` is cleared.
+    read_memory: BTreeMap<BindingRef, super::batch::ReadMemory>,
 }
 impl Default for Ledger {
     /// Creates empty finite bookkeeping; no file or process work occurs.
@@ -565,6 +568,7 @@ impl Default for Ledger {
             feedback: BTreeMap::new(),
             delivered: BTreeMap::new(),
             handing_over: BTreeSet::new(),
+            read_memory: BTreeMap::new(),
         }
     }
 }
@@ -1753,6 +1757,7 @@ impl WorkerHandle {
             ledger.last_activity.remove(&binding);
             ledger.feedback.remove(&binding);
             ledger.delivered.remove(&binding);
+            ledger.read_memory.remove(&binding);
         }
         if let Some(feed) = &self.shared.project_feed {
             feed.forget(&binding.fingerprint());
@@ -5886,6 +5891,7 @@ impl<'a> Worker<'a> {
         if let Ok(mut ledger) = self.shared.ledger.lock() {
             ledger.feedback.remove(binding);
             ledger.delivered.remove(binding);
+            ledger.read_memory.remove(binding);
         }
     }
 

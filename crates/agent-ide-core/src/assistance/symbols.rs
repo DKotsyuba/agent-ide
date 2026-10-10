@@ -496,6 +496,32 @@ impl Worker<'_> {
                 }
             }
         }
+        // The unchanged answer (batch-api-v1 §2): an `items` block whose bytes this session
+        // already received in the same context epoch becomes one line, unless `force` asks for
+        // the text. Its file stays covered by the reply's `source_ref`.
+        let epoch = (form == batch::ReadForm::Items
+            && job.parameters.get("force").and_then(Value::as_bool) != Some(true))
+        .then(|| self.context_epoch(&binding))
+        .flatten();
+        let unchanged: Vec<bool> = match (epoch, self.shared.ledger.lock()) {
+            (Some(_), Ok(mut ledger)) => {
+                let memory = ledger.read_memory.entry(binding.clone()).or_default();
+                items
+                    .iter_mut()
+                    .map(|(text, file, item)| {
+                        let label = item.label();
+                        match file.and(memory.delivered_before(epoch, &label, text)) {
+                            Some(prior) => {
+                                *text = batch::unchanged_line(&prior, &label, text);
+                                true
+                            }
+                            None => false,
+                        }
+                    })
+                    .collect()
+            }
+            _ => vec![false; items.len()],
+        };
         // Which files' blocks were delivered decides both the `source_ref` line's file list and
         // which observations stay retained as edit bases.
         let reference = job.reference.clone();
@@ -560,11 +586,12 @@ impl Worker<'_> {
                 .iter()
                 .filter(|&&index| items[index].1.is_none())
                 .count();
+            let repeated = shown.iter().filter(|&&index| unchanged[index]).count();
             let mut text = batch::read_summary(&batch::ReadCounts {
                 items: items.len(),
                 files: files_named,
-                delivered: shown.len() - failed,
-                unchanged: 0,
+                delivered: shown.len() - failed - repeated,
+                unchanged: repeated,
                 cut: cut.len(),
                 failed,
             });
@@ -601,6 +628,18 @@ impl Worker<'_> {
             return Ok((reply, authority, Some(files[file].1.clone())));
         }
         let (text, delivered) = compose(&prefix(included));
+        // Remember the blocks this reply carries in full, so their repeat can answer unchanged.
+        if epoch.is_some()
+            && let Ok(mut ledger) = self.shared.ledger.lock()
+        {
+            let memory = ledger.read_memory.entry(binding.clone()).or_default();
+            for index in 0..included {
+                let (block, file, item) = &items[index];
+                if file.is_some() && !unchanged[index] {
+                    memory.remember(epoch, &item.label(), block, &job.reference);
+                }
+            }
+        }
         // Retain one edit base per delivered file: the first returns through the job tuple, the
         // rest ride the same detail as extra sources. A file whose every block was cut gets none.
         let mut sources: Vec<SourceObservation> = delivered
@@ -682,6 +721,18 @@ impl Worker<'_> {
         self.finish_symbol_job(job, binding, &observed).await?;
         files.push((path, observed, source, outline));
         Ok(Some(files.len() - 1))
+    }
+
+    /// The session's context-compaction epoch (session-outbox-v1 §9.1), which gates the read
+    /// unchanged answer. `None` — the answer stays off — until the session outbox's worker
+    /// implementation reports one for `binding`.
+    ///
+    /// Test seam (never read by a release build): `AGENT_IDE_TEST_CONTEXT_EPOCH_FILE` names a
+    /// file whose trimmed content is the epoch, so product tests can simulate a compaction by
+    /// rewriting it.
+    fn context_epoch(&self, _binding: &BindingRef) -> Option<u64> {
+        let seam = crate::test_seams::var("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE")?;
+        std::fs::read_to_string(seam).ok()?.trim().parse().ok()
     }
 
     /// `ide.symbol {symbol, usages?, callers?, callees?, history?}`: the symbol card.
