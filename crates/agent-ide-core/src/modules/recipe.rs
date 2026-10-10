@@ -434,6 +434,7 @@ pub fn expand_staged(
             | EnvRule::Pattern { param, .. }
             | EnvRule::SearchPath { param, .. } => declared.push(param),
             EnvRule::Literal { .. }
+            | EnvRule::SlotDir { .. }
             | EnvRule::Home { .. }
             | EnvRule::ReadRootsJson { .. }
             | EnvRule::ReadDeniesJson { .. } => {}
@@ -577,6 +578,18 @@ pub fn expand_staged(
                     .into_iter()
                     .flatten()
                     .map(|path| path.display().to_string())
+                    .chain(fixed.iter().map(|entry| (*entry).to_owned()))
+                    .collect();
+                env.push(((*name).to_owned(), entries.join(":")));
+            }
+            EnvRule::SlotDir { name, slot, fixed } => {
+                let program = admission
+                    .programs
+                    .iter()
+                    .find(|(known, _)| known == slot)
+                    .and_then(|(_, path)| path.parent())
+                    .ok_or_else(|| Refusal::Missing((*slot).to_owned()))?;
+                let entries: Vec<String> = std::iter::once(program.display().to_string())
                     .chain(fixed.iter().map(|entry| (*entry).to_owned()))
                     .collect();
                 env.push(((*name).to_owned(), entries.join(":")));

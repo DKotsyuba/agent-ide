@@ -829,6 +829,16 @@ pub enum EnvRule {
         /// Fixed trailing entries.
         fixed: &'static [&'static str],
     },
+    /// The directory of a resolved executable slot followed by fixed entries, joined with `:`
+    /// (a script tool whose interpreter sits beside it, such as `npx` and `node`).
+    SlotDir {
+        /// Variable name.
+        name: &'static str,
+        /// The executable slot whose resolved program's directory leads the path.
+        slot: &'static str,
+        /// Fixed trailing entries.
+        fixed: &'static [&'static str],
+    },
     /// The real user home.
     Home {
         /// Variable name.

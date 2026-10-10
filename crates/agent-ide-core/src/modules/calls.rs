@@ -673,6 +673,7 @@ fn stdin_run(
     language: Language,
     worktree: &Path,
     effect: Option<EffectRequest>,
+    configured: &[&Path],
 ) -> Routed<Option<StdinRun>> {
     let Some(effect) = effect else {
         return Ok(None);
@@ -692,6 +693,8 @@ fn stdin_run(
         .collect();
     let mut roots = super::recipe::declared_roots(language.name());
     roots.extend(super::recipe::environment_roots(language.name(), worktree));
+    // The operator-declared programs of the launcher configuration (a probe's Node and package).
+    roots.extend(configured.iter().map(|path| path.to_path_buf()));
     let developer_dirs = super::recipe::platform_developer_dirs();
     let home = crate::userhome::user_home();
     let scratch = std::env::temp_dir().join("agent-ide-interactive");
@@ -743,7 +746,7 @@ pub async fn format_stdin_command(
                     Vec::new(),
                 )
                 .await?;
-            stdin_run(language, worktree, effect)
+            stdin_run(language, worktree, effect, &[])
         }
     }
 }
@@ -777,7 +780,15 @@ pub async fn syntax_probe_command(
                     Vec::new(),
                 )
                 .await?;
-            stdin_run(language, worktree, effect)
+            stdin_run(
+                language,
+                worktree,
+                effect,
+                &configured
+                    .iter()
+                    .flat_map(|tools| [tools.program.as_path(), tools.module.as_path()])
+                    .collect::<Vec<_>>(),
+            )
         }
     }
 }
