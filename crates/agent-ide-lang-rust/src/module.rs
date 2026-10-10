@@ -1,7 +1,7 @@
 //! The Rust language as a bundled `bundled-module/0` module (`bundled.rust`).
 //!
 //! The same sealed binary serves it in the hidden `agent-ide module rust <role>` mode. The
-//! analyzer role answers every interactive Rust computation with the unchanged [`RustSupport`]
+//! analyzer role answers every interactive Rust computation with the unchanged [`RustSupport`](crate::support::RustSupport)
 //! (project facts, lexical outline and syntax verdict, insertion geometry, test selection and
 //! output parsing, formatter choice, module-graph scope) and with
 //! rust-analyzer; the checker role plans and interprets `cargo check`. Every process a module

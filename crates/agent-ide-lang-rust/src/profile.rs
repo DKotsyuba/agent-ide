@@ -430,7 +430,7 @@ impl agent_ide_core::intelligence::session::SessionProfile for RustProfile {
         Some(RUST_STATUS_METHOD)
     }
 
-    /// See [`rust_status`].
+    /// See `rust_status`.
     fn status(
         &self,
         params: serde_json::Value,
@@ -438,7 +438,7 @@ impl agent_ide_core::intelligence::session::SessionProfile for RustProfile {
         rust_status(params)
     }
 
-    /// See [`rust_language_id`].
+    /// See `rust_language_id`.
     fn language_id(&self, path: &Path) -> &'static str {
         rust_language_id(path)
     }
@@ -490,7 +490,7 @@ impl agent_ide_core::intelligence::session::SessionProfile for RustModuleSession
         Some(RUST_STATUS_METHOD)
     }
 
-    /// See [`rust_status`].
+    /// See `rust_status`.
     fn status(
         &self,
         params: serde_json::Value,
@@ -498,7 +498,7 @@ impl agent_ide_core::intelligence::session::SessionProfile for RustModuleSession
         rust_status(params)
     }
 
-    /// See [`rust_language_id`].
+    /// See `rust_language_id`.
     fn language_id(&self, path: &Path) -> &'static str {
         rust_language_id(path)
     }
