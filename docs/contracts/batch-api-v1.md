@@ -87,8 +87,9 @@ unchanged since your read <ref>: <item> (<n> lines); "force":true returns the te
 ```
 
 - `symbols`: 1–8 entries. `usages`, `callers`, `callees` and `history` keep their meaning and apply to every entry.
-- Each entry is answered exactly as the single form answers it (precise, labelled approximate with the precise answer delivered later, or failed), as one card in request order.
-- Reply: `symbols: <n> — <k> cards, <a> approximate, <f> failed` then the cards.
+- Each entry is answered by the per-item engine of [symbol-graph-item r2](symbol-graph-item-v1.md) §1, so its block equals the single form's reply text, as one card in request order. An `approximate` entry shows its labelled block at once; a `deferred` entry reads `pending: <entry> - will be delivered`.
+- Follow-up: the batch job re-runs its approximate and deferred entries in `precise` mode and delivers ONE `job-ready` fact naming the batch `detail_ref` and those entry indexes (session-outbox-v1 §13.3); it holds the turn when any entry was deferred.
+- Reply: `symbols: <n> — <k> cards, <a> approximate, <p> pending, <f> failed` then the cards.
 
 ## 5. `ide.graph {symbols}`
 
@@ -97,8 +98,8 @@ unchanged since your read <ref>: <item> (<n> lines); "force":true returns the te
 ```
 
 - `symbols`: 1–8 roots. `direction`, `depth` and `tests` apply to every root.
-- One section per root, each with the single form's caps (60 nodes, 120 edges). A root whose call-hierarchy request faulted is `unavailable (<cause>)`, never an empty graph.
-- Reply: `graph: <n> roots (<direction>, depth <d>) — <k> graphs, <u> unavailable`.
+- One section per root through the same per-item engine, each with the single form's caps (60 nodes, 120 edges). A root whose every requested direction faulted is `unavailable (<cause>)`, never an empty graph. Approximate and deferred roots follow the §4 rules.
+- Reply: `graph: <n> roots (<direction>, depth <d>) — <k> graphs, <a> approximate, <p> pending, <u> unavailable, <f> failed`.
 
 ## 6. `ide.test {targets}`
 
