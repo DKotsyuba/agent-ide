@@ -37,6 +37,9 @@ pub mod worker;
 /// Defines the per-session outbox of deferred facts and its producer/carrier seam (OUTBOX-r3).
 pub mod outbox;
 
+/// Wakes an idle agent for its own requested results behind one narrow interface (OUTBOX-r3 §8.4).
+pub mod wake;
+
 /// Stores each session's undelivered facts, change counters and agent state (OUTBOX-r3 §5-§9).
 pub mod session_outbox;
 

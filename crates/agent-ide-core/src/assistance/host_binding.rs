@@ -149,6 +149,12 @@ impl BindingRef {
         self.host
     }
 
+    /// Returns whether this binding's actor is the host session itself (a Claude main thread or a
+    /// Codex thread) rather than a subagent: `session_id` is the host's own session identifier.
+    pub(crate) fn actor_is(&self, session_id: &str) -> bool {
+        self.actor_id == session_id
+    }
+
     /// Returns a stable opaque persistence key without exposing actor/channel fields or minting proof.
     /// The domain and length framing preserve distinct actor, channel, and generation identities.
     pub(crate) fn fingerprint(&self) -> [u8; 32] {

@@ -7,70 +7,18 @@
 //! restate its complete final answer (agent runners keep the last assistant text as the answer).
 //! Without a fact the hold releases and the session counts as idle.
 
-use std::path::{Path, PathBuf};
-
 use super::super::{
     host_binding::{BindingRef, HostKind},
     outbox::{Carrier, HOLD_CAP},
     reply::MAX_FEEDBACK_BYTES,
     session_outbox::AgentState,
+    wake::{claude_config_dir, interactive_claude_session},
 };
 use super::WorkerHandle;
 
 /// The sentence that ends every hold's block reason (OUTBOX §8.3 rule 4).
 pub(crate) const RESTATE: &str = "These results you requested arrived as you ended your turn. Take \
      them into account, then restate your complete final answer.";
-/// Most registry descriptors read while looking for one Claude session.
-const MAX_REGISTRY_FILES: usize = 512;
-/// Largest registry descriptor read.
-const MAX_DESCRIPTOR_BYTES: u64 = 64 * 1024;
-
-/// Returns the Claude configuration directory: `CLAUDE_CONFIG_DIR`, else `$HOME/.claude`.
-pub(crate) fn claude_config_dir() -> Option<PathBuf> {
-    std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
-}
-
-/// Reads the Claude session-registry descriptor (`<registry>/<pid>.json`) whose `sessionId` is
-/// `session_id`, as a JSON object; `None` when there is none, or it is unreadable or oversized.
-///
-/// The registry is read-only here and bounded to [`MAX_REGISTRY_FILES`] descriptors of at most
-/// [`MAX_DESCRIPTOR_BYTES`]; malformed entries are skipped.
-pub(crate) fn registry_entry(
-    registry: &Path,
-    session_id: &str,
-) -> Option<serde_json::Map<String, serde_json::Value>> {
-    let mut paths = std::fs::read_dir(registry)
-        .ok()?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-        })
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths.into_iter().take(MAX_REGISTRY_FILES).find_map(|path| {
-        let metadata = std::fs::metadata(&path).ok()?;
-        if !metadata.is_file() || metadata.len() > MAX_DESCRIPTOR_BYTES {
-            return None;
-        }
-        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
-        let object = value.as_object()?;
-        (object.get("sessionId").and_then(serde_json::Value::as_str) == Some(session_id))
-            .then(|| object.clone())
-    })
-}
-
-/// Whether `session_id` names an interactive Claude session in the registry under `registry`:
-/// only such a session may hold a `SubagentStop` (OUTBOX §8.3 rule 6), because a headless
-/// session's background subagent outliving its parent's result breaks agent runners.
-pub(crate) fn interactive_claude_session(registry: &Path, session_id: &str) -> bool {
-    registry_entry(registry, session_id).is_some_and(|entry| {
-        entry.get("kind").and_then(serde_json::Value::as_str) == Some("interactive")
-    })
-}
 
 impl WorkerHandle {
     /// Decides one turn end of `binding` (OUTBOX §8.3): returns the block reason that continues
@@ -140,33 +88,6 @@ impl WorkerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Only a descriptor naming the session with kind `interactive` proves an interactive session.
-    #[test]
-    fn registry_proves_interactive_sessions_only() {
-        let registry =
-            std::path::PathBuf::from(format!("/private/tmp/m026-registry-{}", std::process::id()));
-        std::fs::create_dir_all(&registry).unwrap();
-        std::fs::write(
-            registry.join("100.json"),
-            r#"{"pid":100,"sessionId":"live","kind":"interactive","status":"idle"}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            registry.join("200.json"),
-            r#"{"pid":200,"sessionId":"headless","kind":"sdk","status":"busy"}"#,
-        )
-        .unwrap();
-        std::fs::write(registry.join("300.json"), "not json").unwrap();
-        assert!(interactive_claude_session(&registry, "live"));
-        assert!(!interactive_claude_session(&registry, "headless"));
-        assert!(!interactive_claude_session(&registry, "absent"));
-        assert_eq!(
-            registry_entry(&registry, "live").and_then(|entry| entry.get("status").cloned()),
-            Some(serde_json::json!("idle"))
-        );
-        let _ = std::fs::remove_dir_all(&registry);
-    }
 
     /// The restate sentence leaves room for facts inside the hook budget.
     #[test]

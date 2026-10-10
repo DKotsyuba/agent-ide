@@ -682,6 +682,8 @@ struct Shared {
     failed: tokio::sync::watch::Sender<bool>,
     /// Per-session outbox of deferred facts (OUTBOX-r3); shared with the test-run settle hook.
     outbox: Arc<super::session_outbox::Outbox>,
+    /// The one seam to host wake routes (OUTBOX-r3 §8.4); the Claude registry route by default.
+    waker: Arc<dyn super::wake::SessionWaker>,
 }
 
 /// Most queued-job call ids [`Shared::requests`] and [`Shared::degraded`] keep; past it the oldest
@@ -1311,6 +1313,7 @@ impl WorkerHandle {
                 degraded: Mutex::default(),
                 degraded_references: Mutex::default(),
                 outbox: Arc::default(),
+                waker: Arc::new(super::wake::HostWaker::default()),
             }),
             inspect,
             receiver: Mutex::new(Some(receiver)),
@@ -10240,6 +10243,7 @@ mod stop_retry_tests {
                 degraded: Mutex::default(),
                 degraded_references: Mutex::default(),
                 outbox: Arc::default(),
+                waker: Arc::new(crate::assistance::wake::HostWaker::default()),
             }),
             workspace,
             observations: WorkspaceStore::new(store),

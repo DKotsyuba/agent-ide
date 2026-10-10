@@ -5,7 +5,8 @@
 //! [`Outbox`](crate::assistance::session_outbox::Outbox) store and adds what only the worker knows,
 //! the job ledger behind `defer`, the test-run registry behind `test-finished` facts, and the
 //! translation of settled replies into `job-ready` fact drafts. Everything here is synchronous
-//! bookkeeping under short locks; nothing awaits while a lock is held.
+//! bookkeeping under short locks, except the idle wake, which runs detached after its grace;
+//! nothing awaits while a lock is held.
 
 use std::{sync::Arc, time::Duration};
 
@@ -15,6 +16,7 @@ use super::super::{
     content::{self, Envelope},
     facade::AssistanceTool,
     host_binding::BindingRef,
+    outbox::Carrier,
     outbox::FencedPath,
     outbox::{
         DeferSpec, FactDraft, FactKind, HandoffRequest, JobEpoch, MAX_FACT_BYTES,
@@ -22,7 +24,9 @@ use super::super::{
         SessionOutbox,
     },
     reply::{EditDiagnostics, PeerReply},
-    tests::RunResult,
+    session_outbox::{AgentState, Outbox, compose_block, render_fact},
+    tests::{RunResult, TestRuns},
+    wake::{MAX_WAKE_BYTES, SessionWaker, WakeOutcome, WakeTarget},
 };
 use super::{INLINE_REPLY_WAIT, Job, JobStage, Shared, Worker, edit_operation, test_result_text};
 use crate::changes::edit::EditResult;
@@ -35,6 +39,13 @@ const RUN_SETTLE_SLACK: Duration = Duration::from_secs(5);
 const EARLY_EDIT_REPLY_MARGIN: Duration = Duration::from_millis(1500);
 /// Most diagnostic `new:` lines one `edit-checked` fact carries (OUTBOX §3.3).
 const MAX_NEW_LINES: usize = 8;
+/// How long a holding fact waits before an idle session is woken, so an imminent hook takes it
+/// instead (OUTBOX §8.4).
+const WAKE_GRACE: Duration = Duration::from_secs(2);
+/// The sentence that ends every wake message (OUTBOX §8.4).
+const WAKE_TAIL: &str = "Results you requested from Agent IDE arrived while you were idle.";
+/// Room in a wake message for the envelope tags and the overflow line around the facts.
+const WAKE_FRAME: usize = 96;
 
 /// Returns the fact subject of test run `id`: `tests #N`, the handle every `ide.test` line names.
 pub(super) fn test_subject(id: u64) -> String {
@@ -390,17 +401,7 @@ impl SessionOutbox for Shared {
 
     /// Commits a reservation and marks the owner's settled test runs among it collected.
     fn commit(&self, binding: &BindingRef, token: u64) -> usize {
-        let committed = self.outbox.commit_taken(binding, token);
-        for (kind, subject) in &committed {
-            if *kind == FactKind::TestFinished
-                && let Some(id) = subject
-                    .strip_prefix("tests #")
-                    .and_then(|id| id.parse::<u64>().ok())
-            {
-                self.test_runs.mark_observed(id, &binding.fingerprint());
-            }
-        }
-        committed.len()
+        commit_collected(&self.outbox, &self.test_runs, binding, token)
     }
 
     /// Releases a reservation unchanged.
@@ -409,7 +410,95 @@ impl SessionOutbox for Shared {
     }
 }
 
+/// Commits reservation `token` of `binding` and marks the owner's settled test runs among it
+/// collected; returns the number of facts delivered.
+fn commit_collected(
+    outbox: &Outbox,
+    test_runs: &TestRuns,
+    binding: &BindingRef,
+    token: u64,
+) -> usize {
+    let committed = outbox.commit_taken(binding, token);
+    for (kind, subject) in &committed {
+        if *kind == FactKind::TestFinished
+            && let Some(id) = subject
+                .strip_prefix("tests #")
+                .and_then(|id| id.parse::<u64>().ok())
+        {
+            test_runs.mark_observed(id, &binding.fingerprint());
+        }
+    }
+    committed.len()
+}
+
+/// Wakes `binding`'s idle host session with its holding facts as one user message (OUTBOX §8.4).
+///
+/// At most one attempt per idle period: the session must be idle, unwoken since it last worked,
+/// and hold an undelivered holding fact. Only holding facts ride the wake, never source text. An
+/// accepted or ambiguous wake delivers them; a refused or unavailable one returns them unchanged.
+/// Returns `None` when no wake was attempted.
+async fn wake_session(
+    outbox: &Outbox,
+    test_runs: &TestRuns,
+    waker: &dyn SessionWaker,
+    binding: &BindingRef,
+) -> Option<WakeOutcome> {
+    let session_id = outbox.claim_wake(binding)?;
+    let reservation = outbox.reserve_facts(
+        binding,
+        HandoffRequest {
+            carrier: Carrier::Wake,
+            budget: MAX_WAKE_BYTES - WAKE_TAIL.len() - WAKE_FRAME,
+            holding_only: true,
+        },
+    )?;
+    let lines = reservation
+        .facts
+        .iter()
+        .map(render_fact)
+        .collect::<Vec<_>>();
+    let text = compose_block(None, &lines, reservation.remaining)
+        .map(|block| format!("{block}\n{WAKE_TAIL}"))
+        .filter(|text| text.len() <= MAX_WAKE_BYTES);
+    let target = WakeTarget {
+        host: binding.host(),
+        actor_is_main: binding.actor_is(&session_id),
+        session_id,
+    };
+    let outcome = match &text {
+        Some(text) => waker.wake(&target, text).await,
+        None => WakeOutcome::Refused,
+    };
+    if matches!(outcome, WakeOutcome::Accepted | WakeOutcome::Ambiguous) {
+        commit_collected(outbox, test_runs, binding, reservation.token);
+    } else {
+        outbox.release_reservation(binding, reservation.token);
+    }
+    Some(outcome)
+}
+
 impl Shared {
+    /// Schedules the idle wake (OUTBOX §8.4) of each of `recipients` whose agent is idle; the
+    /// attempt runs after [`WAKE_GRACE`] and re-checks every condition then.
+    pub(super) fn schedule_wake(&self, recipients: &[BindingRef]) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        for binding in recipients {
+            if self.outbox.agent_state(binding) != Some(AgentState::Idle) {
+                continue;
+            }
+            let outbox = Arc::clone(&self.outbox);
+            let test_runs = self.test_runs.clone();
+            let waker = Arc::clone(&self.waker);
+            let binding = binding.clone();
+            runtime.spawn(async move {
+                tokio::time::sleep(WAKE_GRACE).await;
+                let _ = wake_session(&outbox, &test_runs, waker.as_ref(), &binding).await;
+            });
+        }
+    }
+
     /// Defers the job behind `reference` after its caller left with `pending` (the inline-wait
     /// timeout): its final answer becomes a holding `job-ready` fact.
     pub(super) fn defer_pending(&self, reference: &str, tool: AssistanceTool, target: String) {
@@ -449,6 +538,7 @@ impl Shared {
                 job_fact(reference, reply, &spec),
                 epoch,
             );
+            self.schedule_wake(std::slice::from_ref(owner));
             return;
         }
         if let (
@@ -465,6 +555,7 @@ impl Shared {
                 edit_checked_fact(reference, result, diagnostics),
                 work.epoch,
             );
+            self.schedule_wake(std::slice::from_ref(&work.owner));
         }
     }
 
@@ -519,6 +610,8 @@ impl Shared {
             self.outbox
                 .push_draft(&work.subscribers, test_fact(id, &result, false), work.epoch);
         }
+        self.schedule_wake(std::slice::from_ref(&work.owner));
+        self.schedule_wake(&work.subscribers);
     }
 
     /// Installs the test-run settle hook that produces `test-finished` facts; it holds only a weak
@@ -999,5 +1092,94 @@ mod worker_tests {
         assert_eq!(handle.outbox().context_epoch(&owner), Some(1));
         handle.note_compaction(&owner);
         assert_eq!(handle.outbox().context_epoch(&owner), Some(2));
+    }
+
+    /// A waker that records each wake and answers a fixed outcome.
+    struct FakeWaker {
+        /// Outcome every wake answers.
+        outcome: WakeOutcome,
+        /// Every target and text woken.
+        woken: Mutex<Vec<(WakeTarget, String)>>,
+    }
+
+    impl SessionWaker for FakeWaker {
+        /// Records the wake and answers the fixed outcome.
+        fn wake<'a>(
+            &'a self,
+            target: &'a WakeTarget,
+            text: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = WakeOutcome> + Send + 'a>> {
+            self.woken
+                .lock()
+                .unwrap()
+                .push((target.clone(), text.to_owned()));
+            Box::pin(std::future::ready(self.outcome))
+        }
+    }
+
+    /// OUTBOX §8.4: only an idle session with an undelivered holding fact is woken, once per idle
+    /// period, with its holding facts only; a refused wake keeps them, an accepted one delivers.
+    #[tokio::test]
+    async fn an_idle_session_is_woken_once_with_its_holding_facts() {
+        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
+        let owner = bind(&bindings, "owner");
+        let handle = handle(bindings);
+        let shared = &handle.shared;
+        let outbox = &shared.outbox;
+        let waker = |outcome| FakeWaker {
+            outcome,
+            woken: Mutex::default(),
+        };
+        let accepting = waker(WakeOutcome::Accepted);
+        let refusing = waker(WakeOutcome::Refused);
+        outbox.open(&owner);
+        outbox.note_host_session(&owner, "owner");
+        outbox.set_agent_state(&owner, AgentState::Idle);
+        let unrequested = FactDraft {
+            kind: FactKind::JobReady,
+            subject: "ide.read src/a.rs".to_owned(),
+            summary: "ready".to_owned(),
+            detail: None,
+            detail_ref: Some("job-1".to_owned()),
+            failed: false,
+            holds_turn: false,
+            source_bearing: false,
+            fence_paths: Vec::new(),
+        };
+        assert!(SessionOutbox::push(
+            shared.as_ref(),
+            std::slice::from_ref(&owner),
+            unrequested,
+            outbox.current_epoch(&owner)
+        ));
+        let wake = |waker| wake_session(outbox, &shared.test_runs, waker, &owner);
+        assert_eq!(wake(&accepting).await, None, "unrequested facts never wake");
+        outbox.set_agent_state(&owner, AgentState::Working);
+        assert!(finished(shared, &owner, "tests #1"));
+        assert_eq!(wake(&accepting).await, None, "a working agent is not woken");
+        outbox.set_agent_state(&owner, AgentState::Idle);
+        assert_eq!(wake(&refusing).await, Some(WakeOutcome::Refused));
+        assert!(outbox.has_undelivered(&owner, true), "a refused wake keeps");
+        assert_eq!(wake(&accepting).await, None, "one attempt per idle period");
+        outbox.set_agent_state(&owner, AgentState::Working);
+        outbox.set_agent_state(&owner, AgentState::Idle);
+        assert_eq!(wake(&accepting).await, Some(WakeOutcome::Accepted));
+        let woken = accepting.woken.lock().unwrap();
+        let [(target, text)] = woken.as_slice() else {
+            panic!("exactly one wake: {woken:?}")
+        };
+        assert_eq!(target.session_id, "owner");
+        assert!(target.actor_is_main);
+        assert!(
+            text.starts_with("<agent-ide>\ntest-finished tests #1"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(&format!("</agent-ide>\n{WAKE_TAIL}")),
+            "{text}"
+        );
+        assert!(!text.contains("ide.read"), "{text}");
+        assert!(!outbox.has_undelivered(&owner, true));
+        assert!(outbox.has_undelivered(&owner, false));
     }
 }
