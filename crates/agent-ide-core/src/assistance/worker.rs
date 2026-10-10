@@ -34,18 +34,26 @@ use crate::{
         store::WorkspaceStore,
     },
 };
+#[path = "approximate.rs"]
+mod approximate;
 #[path = "delivery.rs"]
 mod delivery;
+#[path = "index_state.rs"]
+mod index_state;
 #[path = "inspection.rs"]
 mod inspection;
 #[path = "links.rs"]
 mod links;
+#[path = "navigation.rs"]
+mod navigation;
 #[path = "providers.rs"]
 mod providers;
 #[path = "snapshots.rs"]
 pub(super) mod snapshots;
 #[path = "symbols.rs"]
 mod symbols;
+#[path = "takeover.rs"]
+mod takeover;
 
 use self::symbols::Located;
 
@@ -1668,6 +1676,7 @@ impl WorkerHandle {
                     names: Default::default(),
                     telemetry,
                     activity: BTreeMap::new(),
+                    deferred_precise: BTreeMap::new(),
                 }
                 .run(receiver)
                 .await
@@ -2576,6 +2585,10 @@ struct Worker<'a> {
     /// Wall-clock milliseconds of each active binding's last completed job, keyed by binding
     /// fingerprint, so a refused activation can name the holder's last observed activity.
     activity: BTreeMap<[u8; 32], u64>,
+    /// Symbol and graph jobs that answered their caller early (approximately, or `pending`) and
+    /// keep running for the precise answer, by job reference, with their owning binding; at most
+    /// [`approximate::MAX_DEFERRED_PER_SESSION`] per binding (symbol-graph-item r2 §5).
+    deferred_precise: BTreeMap<String, BindingRef>,
 }
 
 impl<'a> Worker<'a> {
@@ -3444,6 +3457,13 @@ impl<'a> Worker<'a> {
                 }
             }
         };
+        // A symbol or graph call that meets a loading server answers its caller at once and
+        // keeps running for the precise answer (symbol-graph-item r2 §4-§5).
+        if matches!(job.tool, AssistanceTool::Symbol | AssistanceTool::Graph)
+            && (job.park_until.is_some() || matches!(result, Err(FailureCode::ProviderLoading)))
+        {
+            self.answer_while_loading(job).await;
+        }
         if job.park_until.is_some() {
             return;
         }
@@ -3981,6 +4001,21 @@ impl<'a> Worker<'a> {
                 }
             }
         }
+        // Another actor's writer left behind by a gone or long-inactive session is taken over
+        // instead of refusing this start (start-index-state r2 §4); a live holder keeps it.
+        let mut took_over = String::new();
+        if matches!(
+            activation,
+            Err(crate::workspace::durable::DurableError::Authority(
+                crate::workspace::authority::AuthorityError::WorktreeOwned
+            ))
+        ) && let Some((moved, line)) = self
+            .take_over_stale_writer(job, &requested_tree, &requested_operation, read_only)
+            .await?
+        {
+            activation = moved;
+            took_over = format!("{line}; ");
+        }
         let receipt = match activation {
             Ok(receipt) => receipt,
             Err(
@@ -4201,26 +4236,15 @@ impl<'a> Worker<'a> {
                 languages.clear();
                 environments.clear();
             }
-            let modes = crate::modules::calls::modes_line(
-                &languages
-                    .iter()
-                    .map(|project| project.language)
-                    .collect::<Vec<_>>(),
-            );
+            let detected = languages
+                .iter()
+                .map(|project| project.language)
+                .collect::<Vec<_>>();
+            let modes = crate::modules::calls::modes_line(&detected);
+            // Servers start lazily (first symbol or graph call); the card reports each server
+            // language's session as it is now, starting nothing (start-index-state r2 §2).
+            let servers = self.server_states(&binding, &detected).await;
             let walk = tokio::task::spawn_blocking(move || {
-                // The daemon does not probe language servers at start; every detected language's
-                // server state is the honest "not started" until a later tool observes otherwise,
-                // and it names what already works from source so a heavy user does not wait for
-                // semantic tools that only the server can answer. Only languages that have a
-                // server get a server state.
-                let servers = languages
-                    .iter()
-                    .filter(|project| project.language.server().is_some())
-                    .map(|project| CardServerState {
-                        language: project.language,
-                        state: project_card::not_started_state(project.language).to_owned(),
-                    })
-                    .collect();
                 let links = project_card::links_line(&languages);
                 let mut project = project_card::collect(&root, languages, servers, None);
                 project.environments = environments;
@@ -4272,7 +4296,7 @@ impl<'a> Worker<'a> {
             )
         } else {
             format!(
-                "activated: epoch {}; mode: writer; {reused}baseline: {baseline}",
+                "activated: epoch {}; mode: writer; {took_over}{reused}baseline: {baseline}",
                 authority.epoch(),
             )
         };
@@ -4414,44 +4438,11 @@ impl<'a> Worker<'a> {
                 reason,
             })
         };
-        if self.uncertain.contains(holder) {
-            return busy("an unsettled operation");
-        }
-        if self.unsettled_edits.contains_key(holder) {
-            return busy("an edit with outcome_unknown");
-        }
-        if self
-            .shared
-            .test_runs
-            .uncollected(&holder.fingerprint())
-            .iter()
-            .any(|(_, _, running)| *running)
-        {
-            return busy("a running test");
-        }
         let Ok(mut ledger) = self.shared.ledger.lock() else {
             return busy("an unavailable ledger");
         };
-        {
-            if let Some(job) = ledger
-                .queue
-                .iter()
-                .find(|job| job.invocation.binding_ref() == holder)
-            {
-                return busy(if job.tool == AssistanceTool::Edit || job.stage.is_some() {
-                    "a pending edit"
-                } else {
-                    "queued work"
-                });
-            }
-            for (reference, detail) in &ledger.details {
-                if &detail.binding != holder {
-                    continue;
-                }
-                if matches!(detail.reply, PeerReply::Pending { .. }) && reference != current {
-                    return busy("a pending job");
-                }
-            }
+        if let Some(reason) = self.pending_work(&ledger, holder, current) {
+            return busy(reason);
         }
         // The idle verdict and the fence are one critical section: work the old binding submits
         // while the handover settles is refused at ingress instead of racing the move.
@@ -4947,7 +4938,7 @@ impl<'a> Worker<'a> {
             Err(FailureCode::ProviderLoading) => (
                 lexical(
                     job,
-                    "semantic provider is still loading the workspace; repeat the call in a few seconds",
+                    "semantic provider is still loading the workspace; this context is lexical, without semantic facts",
                 )?,
                 None,
             ),
@@ -7910,6 +7901,10 @@ mod stop_retry_tests {
     };
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+    /// Availability and navigation tests (stale writer takeover, servers line, approximate and
+    /// faulted symbol/graph answers), kept in their own file beside these fixtures.
+    mod availability;
+
     /// Separates disposable fixture roots within the current process.
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -9278,15 +9273,15 @@ mod stop_retry_tests {
     }
 
     /// Runs one `tool` job of `actor` against the scripted fixture session through the production
-    /// tool path, then settles the session's health as `perform` does. Returns the tool's outcome
-    /// and how many sessions are marked failed afterwards.
+    /// tool path, then settles the session's health as `perform` does. Returns the tool's reply
+    /// (or failure code) and how many sessions are marked failed afterwards.
     async fn scripted_tool(
         worker: &mut Worker<'_>,
         actor: &str,
         call: &str,
         tool: AssistanceTool,
         parameters: Value,
-    ) -> (Result<(), FailureCode>, usize) {
+    ) -> (Result<PeerReply, FailureCode>, usize) {
         let invocation = production_call(worker, actor, call);
         let (cancel_sender, cancel) = watch::channel(false);
         let _keep = cancel_sender;
@@ -9312,7 +9307,7 @@ mod stop_retry_tests {
             AssistanceTool::Graph => worker.graph(&mut job).await,
             _ => worker.symbol(&mut job).await,
         }
-        .map(|_| ());
+        .map(|(reply, _, _)| reply);
         assert!(job.park_until.is_none(), "{call} parked: {outcome:?}");
         worker.settle_session_health(&job).await;
         (outcome, worker.test_failed_sessions())
@@ -10175,6 +10170,7 @@ mod stop_retry_tests {
             names: Default::default(),
             telemetry: None,
             activity: BTreeMap::new(),
+            deferred_precise: BTreeMap::new(),
         }
     }
 

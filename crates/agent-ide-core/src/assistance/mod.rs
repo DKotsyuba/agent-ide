@@ -15,6 +15,9 @@ pub mod assembly;
 /// Correlates exact Codex and Claude host identity from native hooks and MCP call metadata.
 pub mod host_binding;
 
+/// Carrier liveness evidence and the stale-writer takeover rule.
+pub(crate) mod carriers;
+
 /// Exposes the bounded fail-open native Codex and Claude hook command modes.
 pub mod codex_hook;
 

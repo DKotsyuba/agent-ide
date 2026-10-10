@@ -139,6 +139,14 @@ fn project(
             fields.remove("detail");
         }
     }
+    if let PeerReply::Unavailable {
+        cause: Some(super::reply::HostBindingCause::TakenOver { reason }),
+        ..
+    } = reply
+    {
+        // The takeover's fixed reason phrase completes the `taken_over` sentence.
+        context["resolution_message"] = serde_json::Value::String(reason.clone());
+    }
     if let PeerReply::Unavailable { .. } = reply {
         // The public structured shape keeps its historical fields; the closed cause reaches the
         // compact text only, exactly like an error's `detail` (T15B).
@@ -841,6 +849,41 @@ mod tests {
         );
     }
 
+    /// A session displaced by a stale-writer takeover is told why and how to start again, in the
+    /// exact start-index-state r2 §4c words.
+    #[test]
+    fn taken_over_names_the_reason_and_the_read_only_restart() {
+        use crate::assistance::host_binding::TakeoverReason;
+        for (reason, why) in [
+            (
+                TakeoverReason::SessionEnded,
+                "after this session's IDE connection closed",
+            ),
+            (
+                TakeoverReason::Inactive { minutes: 31 },
+                "after 31 min without activity",
+            ),
+        ] {
+            let cause = crate::assistance::reply::HostBindingCause::from_binding(
+                crate::assistance::host_binding::BindingUnavailable::TakenOver(reason),
+            );
+            let rendered = render(
+                PeerReply::Unavailable {
+                    reason: MissingPeer::HostBinding,
+                    cause,
+                },
+                Envelope::TextOnly,
+            )
+            .unwrap();
+            assert_eq!(
+                text_of(&rendered),
+                format!(
+                    "unavailable: host_binding (taken_over); another agent took over this worktree's IDE activation {why}. Call ide.start ({{\"read_only\": true}} while the other agent writes), or continue with native tools"
+                )
+            );
+        }
+    }
+
     /// Every host-binding cause names its closed tag in compact text without changing the public
     /// structured copy; a cause-less refusal keeps its historical text (T15B).
     #[test]
@@ -1259,7 +1302,7 @@ mod tests {
             "since 2026-10-04T10:00:00Z",
             "last activity 2026-10-04T10:01:00Z",
             "Start with {\"read_only\": true} to read alongside",
-            "wait for the writer to stop",
+            "the slot frees when that session ends or after 30 min without activity",
         ] {
             assert!(held.contains(fact), "missing {fact:?}: {held}");
         }

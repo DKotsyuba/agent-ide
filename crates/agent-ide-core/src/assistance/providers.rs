@@ -743,6 +743,31 @@ impl Worker<'_> {
         Ok(live)
     }
 
+    /// What the session of `server` serving `binding` says right now, without starting, retiring
+    /// or waiting for anything. The serving session is the binding's own, or the one of the
+    /// writer (or reading owner) a reader borrows from. `None` when no live session is open
+    /// (never started, or released); `Some(Err(WorkspaceError))` for a session marked failed;
+    /// otherwise its zero-budget readiness (`Ok` ready, `Loading`, `WorkspaceError` or `Gone`).
+    /// Used for the start card's servers line; it never marks the session's health.
+    pub(super) async fn session_readiness(
+        &mut self,
+        binding: &BindingRef,
+        server: &'static dyn LanguageServer,
+    ) -> Option<Result<(), ReadinessError>> {
+        let owner = self
+            .session_owner_of(binding)
+            .unwrap_or_else(|| binding.clone());
+        let index = self.providers.slot_of(server).ok()?;
+        if self.providers.failed.contains_key(&(owner.clone(), index)) {
+            return Some(Err(ReadinessError::WorkspaceError));
+        }
+        let live = self.providers.slots[index]
+            .backend
+            .as_mut()?
+            .live_session(&owner)?;
+        Some(live.wait_ready(Duration::ZERO).await)
+    }
+
     /// Returns the language server whose live session answers `path`, for capability checks.
     pub(super) fn session_server(&self, path: &Path) -> Option<&'static dyn LanguageServer> {
         self.providers.session_server(path)

@@ -163,9 +163,9 @@ mod start_card_tests {
             .expect("the card renders a servers line");
         assert_eq!(
             servers_line,
-            "servers: rust not started; ide.outline, ide.read and ide.edit answer from source \
-             now; ide.symbol and ide.graph wait for the server, which starts on their first \
-             use · python not started; starts on first use"
+            "servers: rust not started; outline, read and edit answer from source; the first \
+             symbol or graph call starts it and answers approximately at once · python not \
+             started; the first symbol or graph call starts it and its answer follows as a fact"
         );
         std::fs::remove_dir_all(&root).unwrap();
     }

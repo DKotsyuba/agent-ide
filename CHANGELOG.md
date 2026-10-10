@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Added
+
+- `ide.symbol` and `ide.graph` never leave the agent waiting on a loading server. For a language whose source outline is exact (Rust) they answer at once with an answer labelled `approximate:` (definition from the source outline, usages and depth-1 callers as name matches marked `~`); for other languages, or a bare name the scan cannot resolve to one definition, they answer `pending` at once. The same job keeps running for up to 10 minutes (at most 4 per session) and its precise answer is registered with the session outbox, to arrive as a fact. A cold Rust worktree's first `ide.symbol` now answers in about 0.5 s instead of `pending` after 8 s. A bare name whose servers are all loading answers `provider_loading` instead of `provider_unavailable`, and the remaining `provider_loading` replies no longer ask to repeat the call.
+- The `ide.start` card's servers line reports each server language's session for the worktree as it is: `ready`, `warming; …`, `not started; …` or `unavailable (<cause>)`. Servers still start lazily, on the first `ide.symbol` or `ide.graph` call of the language; the start launches nothing.
+- `ide.symbol` usages of a struct, enum or class tag the rows that build a value of it (`Name {`, `Name(`, `Name::new(`, `new Name(`, an enum variant) as `construction ~`, list them first and count them on the usages line (`…; 9 constructions`). The rule is lexical and marked as a heuristic.
+
+### Fixed
+
+- A writer activation left by a session that ended without `ide.stop` no longer blocks the worktree: the next writer `ide.start` takes it over when the holder's MCP front exited and nothing arrived from it afterwards, or when the holder has had no tool call and no IDE work in flight for 30 minutes, and says `took over the writer from actor …; its session ended | inactive for <m> min`. A live holder is never displaced; its refusal now says when the slot frees. The displaced actor's next call answers `unavailable: host_binding (taken_over)`. Liveness comes from the kernel's peer process id of the front's calls and lease (evidence only, never identity).
+
+- A bare name whose matches are one declaration and its impl blocks resolves in one `ide.symbol` or `ide.graph` call instead of `ambiguous_symbol: … matches 1 symbols`.
+
+- `ide.graph` no longer renders a failed call-hierarchy request as a graph with no calls: a root whose requests failed answers `graph: callers of <root> unavailable (<cause>)`, a failed direction beside an answered one prints `callers: unavailable (<cause>)`, and a deeper node carries `(callers unavailable: <cause>)` on its row. 0.10.8 answered `1 nodes, 0 edges`.
+
 ## 0.10.8 — 2026-10-10
 
 ### Added

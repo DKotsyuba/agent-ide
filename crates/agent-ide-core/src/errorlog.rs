@@ -420,8 +420,9 @@ impl ReasonCode {
 }
 
 impl From<BindingUnavailable> for ReasonCode {
-    /// Drops only the closed static field-name payload of `MissingField`/`InvalidField`; every
-    /// other variant maps one-to-one.
+    /// Drops only the closed static field-name payload of `MissingField`/`InvalidField`; a
+    /// never-activated or taken-over scope reads as `inactive_binding` (the reply's cause names
+    /// which); every other variant maps one-to-one.
     fn from(value: BindingUnavailable) -> Self {
         match value {
             BindingUnavailable::InvalidMetadata => Self::InvalidMetadata,
@@ -433,7 +434,9 @@ impl From<BindingUnavailable> for ReasonCode {
             BindingUnavailable::MissingPre => Self::MissingPre,
             BindingUnavailable::MissingInvocation => Self::MissingInvocation,
             BindingUnavailable::InactiveBinding => Self::InactiveBinding,
-            BindingUnavailable::NeverActivated => Self::InactiveBinding,
+            BindingUnavailable::NeverActivated | BindingUnavailable::TakenOver(_) => {
+                Self::InactiveBinding
+            }
             BindingUnavailable::Replay => Self::Replay,
             BindingUnavailable::CapacityExceeded => Self::CapacityExceeded,
         }
