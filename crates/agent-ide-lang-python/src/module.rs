@@ -61,6 +61,13 @@ struct Pyright {
 }
 
 impl ProviderBuilder for Pyright {
+    /// Plans Pyright for `worktree` from the core's accepted `settings` (the analyzer settings
+    /// the grant carries): the worktree's resolved interpreter and environment, its import roots,
+    /// and `node <pyright> --stdio` with only `PATH` (node's directory) and a `TMPDIR` inside the
+    /// cache namespace. Settings that do not decode, a malformed script or node digest, or a node
+    /// path without an absolute parent are `InvalidInput`; a profile the accepted identity
+    /// refuses is `PermissionDenied`. Records whether no interpreter was found for
+    /// [`ProviderBuilder::diagnostics`].
     fn plan(
         &self,
         worktree: &Path,
@@ -111,6 +118,9 @@ impl ProviderBuilder for Pyright {
         Ok((ProviderSettings::new(profile), plan))
     }
 
+    /// With no interpreter planned, summarizes the session's flood of unresolved-import
+    /// diagnostics into one missing-environment notice, exactly as the in-process backend does;
+    /// otherwise leaves `snapshot` as Pyright reported it.
     fn diagnostics(
         &self,
         snapshot: &mut agent_ide_core::intelligence::session::DiagnosticSnapshot,
@@ -576,6 +586,9 @@ struct Bridge(
 );
 
 impl ConfinedRunner for Bridge {
+    /// Hands `spec` to the serving loop, which asks the core to run it as an effect, and waits
+    /// for the outcome. Lives only as long as one check: once the check ended (the loop dropped
+    /// its receiver or reply) the run fails with `check ended`; a core refusal is the run's error.
     fn run(&self, spec: RunSpec) -> BoxFuture<'_, io::Result<RunOutput>> {
         let (reply, answer) = tokio::sync::oneshot::channel();
         let sent = self.0.send((spec, reply));
@@ -670,6 +683,7 @@ impl CheckerServer {
 }
 
 impl ModuleServer for CheckerServer {
+    /// The support declaration with `check_plan` and `describe` also supported.
     fn declaration(&self) -> Declaration {
         let mut declaration = self.support.declaration();
         for decl in &mut declaration.capabilities {
@@ -683,6 +697,10 @@ impl ModuleServer for CheckerServer {
         declaration
     }
 
+    /// `check_plan` runs one check, each of its Pyright runs an effect the core expands and
+    /// runs; `describe` answers the checks section's programs and roots or whether a worktree is
+    /// a Python project (other describe queries are unsupported); everything else is the support
+    /// adapter's. A request that does not decode is a protocol fault.
     async fn call<'a>(
         &'a mut self,
         request: Incoming,
