@@ -21572,7 +21572,8 @@ async fn a_running_test_adds_no_plate_line_and_one_terminal_fact_follows() {
         .call(
             &fixture,
             "ide.test",
-            json!({"command":["/bin/sh","-c","sleep 14; echo 'test result: FAILED. 0 passed; 1 failed; 0 ignored'; exit 1"]}),
+            json!({"command":["/bin/sh","-c",
+                "sleep 14; printf '%s\\n' 'running 1 test' 'test tests::fails ... FAILED' '' 'failures:' '' '---- tests::fails stdout ----' \"thread 'tests::fails' panicked at src/lib.rs:3:5:\" 'boom' '' 'failures:' '    tests::fails' '' 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'; exit 101"]}),
         )
         .await;
     assert!(text(&run).starts_with("tests #1: started"), "{run}");
@@ -21595,7 +21596,13 @@ async fn a_running_test_adds_no_plate_line_and_one_terminal_fact_follows() {
         .await;
     let fact = text(&waited);
     assert!(fact.starts_with("test-finished tests #1: "), "{fact}");
+    assert!(fact.contains("\n  FAIL tests::fails"), "{fact}");
     assert!(fact.contains("\n  rerun: "), "{fact}");
+    assert_eq!(
+        fact.matches("full output: ide.inspect ").count(),
+        1,
+        "{fact}"
+    );
     assert!(!fact.contains("poll"), "{fact}");
     let after = actor
         .call(&fixture, "ide.context", json!({"kind":"problems"}))
