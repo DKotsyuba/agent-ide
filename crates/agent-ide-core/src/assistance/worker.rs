@@ -40,6 +40,8 @@ mod approximate;
 mod batch_edit;
 #[path = "batch_targets.rs"]
 mod batch_targets;
+#[path = "batch_tests.rs"]
+mod batch_tests;
 #[path = "delivery.rs"]
 mod delivery;
 #[path = "index_state.rs"]
@@ -2613,7 +2615,7 @@ struct Worker<'a> {
 impl<'a> Worker<'a> {
     /// Handles an explicit test start or a status request for a run the caller's own actor and
     /// channel started in this worktree; an unknown run id returns `invalid_detail` with the
-    /// `test:unknown_run` stage.
+    /// `test:unknown_run` stage. The `{targets}` form runs as one run in `batch_tests`.
     /// Runs inside the queued job. The `symbol` branch resolves references through the live
     /// language server before selecting tests, so its caller already holds a `pending` reply (see
     /// [`WorkerHandle::submit`]) and reads the started/no-tests line through `ide.inspect`; the other
@@ -2623,6 +2625,9 @@ impl<'a> Worker<'a> {
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        if job.parameters.get("targets").is_some() {
+            return self.batch_tests(job).await;
+        }
         let binding = job.invocation.binding_ref().clone();
         let authority = self.authority(&binding).await?;
         self.shared.active(&binding)?;
@@ -7744,6 +7749,7 @@ fn test_result_text(
             report.failures.len() - MAX_LISTED_FAILURES
         ));
     }
+    push_target_lines(&mut text, result);
     text.push_str(&format!("\n  rerun: {}", rerun_text(result)));
     if owns_detail {
         text.push_str(&format!(
@@ -7752,6 +7758,14 @@ fn test_result_text(
         ));
     }
     text
+}
+
+/// Appends a several-target run's per-target lines (batch-api-v1 §6), each bounded like a
+/// failure line; a single-target run has none.
+fn push_target_lines(text: &mut String, result: &super::tests::RunResult) {
+    for line in &result.targets {
+        text.push_str(&format!("\n  {}", test_text_line(line, 240)));
+    }
 }
 
 /// Renders one summary-less run: exit code, chosen environment, bounded output tail, rerun, and —
@@ -7766,6 +7780,7 @@ fn command_result_text(id: u64, result: &super::tests::RunResult, owns_detail: b
     if let Some(label) = &result.environment_label {
         text.push_str(&format!(" · env {label}"));
     }
+    push_target_lines(&mut text, result);
     let tail = super::tests::output_tail(&result.output);
     if !tail.is_empty() {
         text.push_str("\n  output (tail):\n");
@@ -7804,6 +7819,7 @@ mod tool_reply_fix_tests {
             command: vec!["echo".into(), "hello".into()],
             rerun_dir: None,
             environment_label: None,
+            targets: Vec::new(),
         }
     }
 

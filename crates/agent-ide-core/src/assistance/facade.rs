@@ -365,7 +365,8 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "cwd": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"Working directory relative to the worktree root; must resolve inside the worktree. Only with `command`."},
                     "env": {"type":"object", "maxProperties":MAX_ENV_ENTRIES, "additionalProperties":{"type":"string", "maxLength":MAX_ENV_VALUE_BYTES}, "description":"Environment variables added to the inherited environment for this explicit command. Only with `command`; names are bounded environment identifiers."},
                     "status": {"type":"integer", "minimum":1, "description":"Re-read run number N (from `tests #N`) instead of starting one."},
-                    "budget_s": {"type":"integer", "minimum":1, "maximum":600, "default":120, "description":"Seconds before the run is stopped and reported as timed out."}
+                    "budget_s": {"type":"integer", "minimum":1, "maximum":600, "default":120, "description":"Seconds before the run is stopped and reported as timed out."},
+                    "targets": {"type":"array", "minItems":1, "maxItems":super::batch::MAX_TEST_TARGETS, "items":{"type":"object", "additionalProperties":false, "minProperties":1, "maxProperties":1, "properties":{"symbol":{"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES}, "path":{"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES}, "pattern":{"type":"string", "minLength":1, "maxLength":MAX_TEXT_BYTES}}}, "description":"Several targets as ONE run instead of `symbol`/`path`/`pattern`: up to 8 entries, each exactly one of `{\"symbol\":…}`, `{\"path\":…}` or `{\"pattern\":…}`; symbol targets of one language share one runner invocation, the others run one after another in the same run; `budget_s` covers the whole run. One result with a line per target and one rerun line."}
                 }
             }),
         ),
@@ -716,7 +717,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
         ],
         AssistanceTool::Graph => &["symbol", "direction", "depth", "tests", "symbols"],
         AssistanceTool::Test => &[
-            "symbol", "path", "pattern", "command", "cwd", "env", "status", "budget_s",
+            "symbol", "path", "pattern", "command", "cwd", "env", "status", "budget_s", "targets",
         ],
     }
 }
@@ -931,6 +932,9 @@ pub fn validate_call(
             if object.get("tests").is_some_and(|value| !value.is_boolean()) {
                 return Err(invalid_field("tests", FieldRule::Boolean));
             }
+        }
+        AssistanceTool::Test if object.contains_key("targets") => {
+            super::batch::validate_test_targets(object)?;
         }
         AssistanceTool::Test => {
             let targets = ["symbol", "path", "pattern", "command", "status"]

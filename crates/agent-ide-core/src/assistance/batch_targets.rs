@@ -622,7 +622,7 @@ fn kind_of(tool: AssistanceTool) -> ResultKind {
 
 /// The text the single form shows for `reply` (an entry's failure), rendered exactly as the
 /// facade renders that reply on its own, without a status plate.
-fn rendered_text(reply: PeerReply, tool: AssistanceTool) -> String {
+pub(super) fn rendered_text(reply: PeerReply, tool: AssistanceTool) -> String {
     let mut text = content::render_with_call(
         reply,
         None,

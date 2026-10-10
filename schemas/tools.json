@@ -674,6 +674,35 @@
           "maxLength": 1024,
           "minLength": 1,
           "type": "string"
+        },
+        "targets": {
+          "description": "Several targets as ONE run instead of `symbol`/`path`/`pattern`: up to 8 entries, each exactly one of `{\"symbol\":…}`, `{\"path\":…}` or `{\"pattern\":…}`; symbol targets of one language share one runner invocation, the others run one after another in the same run; `budget_s` covers the whole run. One result with a line per target and one rerun line.",
+          "items": {
+            "additionalProperties": false,
+            "maxProperties": 1,
+            "minProperties": 1,
+            "properties": {
+              "path": {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              "pattern": {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              "symbol": {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "type": "array"
         }
       },
       "type": "object"

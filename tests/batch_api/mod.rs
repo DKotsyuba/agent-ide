@@ -1262,3 +1262,131 @@ async fn rename_stopped_midway_reports_each_file_and_the_same_operation_id_finis
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
 }
+
+/// `ide.test {targets}` runs every target as ONE run of the worktree: the symbol targets of one
+/// language merge into one runner invocation (libtest exact names), the path target runs after
+/// it in the same run, and a target the runner cannot take is answered on its own line. While
+/// the run is live, another start in the worktree answers that run; the settled result has one
+/// line per target and one rerun line, and that line reproduces the whole run.
+#[tokio::test]
+async fn test_targets_run_as_one_run_with_a_line_per_target_and_one_rerun() {
+    let fixture = symbol_test_fixture();
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub struct FileFlag;\nimpl FileFlag { pub fn is_file(&self) -> bool { true } }\n\
+         pub fn twice(x: i32) -> i32 {\n    x * 2\n}\npub fn half(x: i32) -> i32 {\n    x / 2\n}\n\
+         #[cfg(test)]\nmod tests {\n    #[test]\n    fn doubles() {\n        assert_eq!(super::twice(2), 4);\n    }\n\
+         \n    #[test]\n    fn fails() {\n        assert_eq!(super::twice(2), 5);\n    }\n\
+         \n    #[test]\n    fn halves() {\n        assert_eq!(super::half(4), 2);\n    }\n}\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "src/lib.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "test targets fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "test-targets").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"test-targets"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let warm = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":"src/lib.rs#twice"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, warm).await["kind"], "symbol");
+
+    let run = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"targets":[
+                {"symbol":"src/lib.rs#twice"},
+                {"symbol":"src/lib.rs#half"},
+                {"path":"tests/path_tests.rs"},
+                {"path":"README.md"}
+            ]}),
+        )
+        .await;
+    let run = actor.settle(&fixture, run).await;
+    let text = batch_without_status_plate(run["text"].as_str().unwrap_or_default()).to_owned();
+    assert!(
+        text.starts_with(
+            "tests #1: started — 4 targets in 2 runs (budget 120 s); the result arrives by itself \
+             as a test-finished fact\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("\n  target 1 symbol src/lib.rs#twice: run 1 (3 tests selected)")
+            && text.contains("\n  target 2 symbol src/lib.rs#half: run 1 (3 tests selected)")
+            && text.contains("\n  target 3 path tests/path_tests.rs: run 2")
+            && text.contains("\n  target 4 path README.md: not runnable: "),
+        "{text}"
+    );
+    let busy = actor
+        .call(&fixture, "ide.test", json!({"pattern":"doubles"}))
+        .await;
+    assert!(
+        busy["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("tests #1: still running"),
+        "one run per worktree: {busy}"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+    let result = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the run did not settle"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let status = actor.call(&fixture, "ide.test", json!({"status":1})).await;
+        let text = batch_without_status_plate(status["text"].as_str().unwrap_or_default());
+        if !text.contains("running") {
+            break text.to_owned();
+        }
+    };
+    assert!(
+        result.starts_with("tests #1: 3 passed, 1 failed, "),
+        "{result}"
+    );
+    assert!(result.contains("FAIL tests::fails"), "{result}");
+    assert!(
+        result.contains("\n  target 1 symbol src/lib.rs#twice: run 1 — 2 passed, 1 failed")
+            && result.contains("\n  target 2 symbol src/lib.rs#half: run 1 — 2 passed, 1 failed")
+            && result.contains("\n  target 3 path tests/path_tests.rs: run 2 — 1 passed, 0 failed")
+            && result.contains("\n  target 4 path README.md: not runnable: "),
+        "{result}"
+    );
+    let rerun = result
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("rerun: "))
+        .unwrap_or_else(|| panic!("one rerun line: {result}"));
+    assert!(
+        rerun.starts_with("sh -c 'cargo test --workspace -- --exact ")
+            && rerun.ends_with("; cargo test --manifest-path Cargo.toml --test path_tests'"),
+        "{rerun}"
+    );
+    let reproduced = std::process::Command::new("/bin/sh")
+        .args(["-c", rerun])
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    let reproduced = String::from_utf8_lossy(&reproduced.stdout);
+    for line in [
+        "test tests::doubles ... ok",
+        "test tests::fails ... FAILED",
+        "test tests::halves ... ok",
+        "test checks_is_file ... ok",
+    ] {
+        assert!(reproduced.contains(line), "{line}: {reproduced}");
+    }
+
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}

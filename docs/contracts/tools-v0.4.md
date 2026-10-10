@@ -10,7 +10,7 @@ Revision: v0.4. Provider: Agent IDE. Consumers: coding agents and IDE hosts.
 | `ide.edit` symbol operations (`replace`, `insert`, `delete`, `rename`) and `path` + `lines` range operation | implemented (landing now) |
 | Long-lived language server session for Rust | implemented |
 | `ide.start` project card | implemented (appended to the activation reply; no `ide.project`, no `not_a_project`; servers always `not started`) |
-| `ide.test` (`symbol` / `path` / `pattern` / `command` / `status`, `budget_s`; one job per worktree; status line in the `<agent-ide>` block; full output paged through `ide.inspect`) | implemented (wire version 4, 11 tools) |
+| `ide.test` (`symbol` / `path` / `pattern` / `command` / `status` / `targets`, `budget_s`; one job per worktree; status line in the `<agent-ide>` block; full output paged through `ide.inspect`) | implemented (wire version 4, 11 tools) |
 | `ide.graph` (`symbol`, `direction`, `depth`, `tests`; live bounded caller/callee tree; only functions and methods are nodes, and tests collapse to one `+N tests` line per parent unless `tests: true` expands them with `[test]` marks) | implemented (wire version 5, 11 tools) |
 | `ide.diff` cleanup (compact default, `provenance` flag, plain-`git diff` fallback, untracked symlinks listed) | implemented (v0.6.1) |
 | `ide.problems` cleanup | planned |
@@ -410,6 +410,7 @@ At most 32 changes per file, 128 changes and 128 KiB of `content`/`new` text in 
 Input: `{symbol}` | `{path}` | `{pattern}` | `{command}`, with optional `budget_s?: 120`.
 
 - `symbol` selects tests that reference the symbol (using the language crate); `path` selects tests for a file/module (for Rust, scoped to that file's package with `--manifest-path`, so one file's tests do not build every target in the workspace); `pattern` filters through the test runner; `command` is an exact project command.
+- `targets` ([batch API v1](batch-api-v1.md) §6) runs 1–8 of `{symbol}`, `{path}` and `{pattern}` as ONE run of the worktree (`command` stays single-target): the symbol targets of one language merge into one runner invocation (the language's own filters for every referencing test: libtest exact names, pytest node ids, vitest files), every path and pattern target is its own invocation, and the invocations run one after another under one run number, holding the worktree's one live run throughout; `budget_s` covers the whole run and an invocation whose turn comes after it is spent does not run. A target that runs nothing (no tests reference it, a file without tests, a file the runner cannot take, an ambiguous name) is answered on its own line and never fails the others. The started reply is `tests #N: started — <n> targets in <r> runs (budget <b> s); the result arrives by itself as a test-finished fact` with one line per target (`target 1 symbol src/a.rs#parse: run 1 (3 tests selected)`); the settled result is the standard result with the summed counts and failures, one line per target (`target 3 path tests/cli.rs: run 2 — 4 passed, 0 failed`) and one `rerun:` line that reproduces the whole run (one invocation's own command, or every invocation in order as one `sh -c` line).
 
 Immediate output:
 

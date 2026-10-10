@@ -1057,6 +1057,108 @@ pub(crate) fn summarize_diagnostics(
     (summary, words, new_lines)
 }
 
+/// Most targets one `ide.test {targets}` request may carry.
+pub(crate) const MAX_TEST_TARGETS: usize = 8;
+
+/// The closed target shape a `targets` entry must have, quoted in its refusal.
+const TARGET_SHAPE: &str = "an array of 1 to 8 targets, each exactly one of \
+{\"symbol\":\"src/a.rs#parse\"}, {\"path\":\"tests/cli.rs\"} or {\"pattern\":\"roles_\"}";
+
+/// One target of an `ide.test {targets}` request, in request order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TestTargetSpec {
+    /// The tests that reference a symbol (`file#Owner/name` or a bare name).
+    Symbol(String),
+    /// Every test in one file or directory.
+    Path(String),
+    /// A raw filter for the language's runner.
+    Pattern(String),
+}
+
+impl TestTargetSpec {
+    /// The target as its line names it: `symbol <address>`, `path <path>` or
+    /// `pattern <filter>`.
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Self::Symbol(symbol) => format!("symbol {symbol}"),
+            Self::Path(path) => format!("path {path}"),
+            Self::Pattern(pattern) => format!("pattern {pattern}"),
+        }
+    }
+}
+
+/// Validates one `ide.test {targets, budget_s?}` request object.
+///
+/// No single-target key (`symbol`, `path`, `pattern`), `command` (single-target only), `status`,
+/// `cwd` or `env` appears beside `targets`; `targets` holds 1 to [`MAX_TEST_TARGETS`] objects,
+/// each exactly one of `{symbol}`, `{path}` or `{pattern}`, validated as the single form validates
+/// that key together with the request's `budget_s`.
+pub(crate) fn validate_test_targets(object: &Map<String, Value>) -> Result<(), ParameterError> {
+    if [
+        "symbol", "path", "pattern", "command", "status", "cwd", "env",
+    ]
+    .iter()
+    .any(|field| object.contains_key(*field))
+    {
+        return Err(invalid_field(
+            "targets",
+            FieldRule::OneOf(
+                "used instead of symbol, path, pattern, command or status, never beside them",
+            ),
+        ));
+    }
+    let shape = || invalid_field("targets", FieldRule::OneOf(TARGET_SHAPE));
+    let targets = object
+        .get("targets")
+        .and_then(Value::as_array)
+        .filter(|targets| (1..=MAX_TEST_TARGETS).contains(&targets.len()))
+        .ok_or_else(shape)?;
+    for target in targets {
+        let entry = target
+            .as_object()
+            .filter(|entry| {
+                entry.len() == 1
+                    && entry
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "symbol" | "path" | "pattern"))
+            })
+            .ok_or_else(shape)?;
+        let mut single = entry.clone();
+        if let Some(budget) = object.get("budget_s") {
+            single.insert("budget_s".to_owned(), budget.clone());
+        }
+        super::facade::validate_call(AssistanceTool::Test, Value::Object(single))?;
+    }
+    Ok(())
+}
+
+/// The targets of a validated `ide.test {targets}` request in request order, an exactly
+/// repeated target once; an entry of any other shape is skipped (the facade refused it).
+pub(crate) fn test_targets(parameters: &Value) -> Vec<TestTargetSpec> {
+    let mut targets: Vec<TestTargetSpec> = Vec::new();
+    for entry in parameters
+        .get("targets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let text = |key: &str| entry.get(key).and_then(Value::as_str).map(str::to_owned);
+        let target = if let Some(symbol) = text("symbol") {
+            TestTargetSpec::Symbol(symbol)
+        } else if let Some(path) = text("path") {
+            TestTargetSpec::Path(path)
+        } else if let Some(pattern) = text("pattern") {
+            TestTargetSpec::Pattern(pattern)
+        } else {
+            continue;
+        };
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    targets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1682,6 +1784,43 @@ mod tests {
         assert_eq!(
             summarize_diagnostics(&[("a.rs".into(), EditDiagnostics::Unknown {})]).0,
             "unknown"
+        );
+    }
+    #[test]
+    fn test_targets_validate_each_entry_as_its_single_form() {
+        let valid = json!({"targets":[{"symbol":"src/a.rs#parse"},{"path":"tests/cli.rs"},{"pattern":"roles_"}],"budget_s":300});
+        assert!(super::super::facade::validate_call(AssistanceTool::Test, valid.clone()).is_ok());
+        assert_eq!(
+            test_targets(&valid),
+            vec![
+                TestTargetSpec::Symbol("src/a.rs#parse".to_owned()),
+                TestTargetSpec::Path("tests/cli.rs".to_owned()),
+                TestTargetSpec::Pattern("roles_".to_owned()),
+            ]
+        );
+        assert_eq!(
+            test_targets(&json!({"targets":[{"pattern":"a"},{"pattern":"a"}]})),
+            vec![TestTargetSpec::Pattern("a".to_owned())],
+            "an exact repeat runs once"
+        );
+        for invalid in [
+            json!({"targets":[]}),
+            json!({"targets":[{"pattern":"a"}],"symbol":"src/a.rs#f"}),
+            json!({"targets":[{"pattern":"a"}],"command":["true"]}),
+            json!({"targets":[{"pattern":"a","path":"tests/a.rs"}]}),
+            json!({"targets":[{"command":["true"]}]}),
+            json!({"targets":[{"path":"../outside.rs"}]}),
+            json!({"targets":[{"pattern":"a"}],"budget_s":0}),
+            json!({"targets":(0..9).map(|index| json!({"pattern":format!("p{index}")})).collect::<Vec<_>>()}),
+        ] {
+            assert!(
+                super::super::facade::validate_call(AssistanceTool::Test, invalid.clone()).is_err(),
+                "{invalid}"
+            );
+        }
+        assert_eq!(
+            TestTargetSpec::Path("tests/cli.rs".to_owned()).label(),
+            "path tests/cli.rs"
         );
     }
 }
