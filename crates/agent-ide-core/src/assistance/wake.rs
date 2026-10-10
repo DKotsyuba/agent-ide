@@ -549,4 +549,25 @@ mod tests {
         };
         assert_eq!(waker.wake(&codex, "x").await, WakeOutcome::Unavailable);
     }
+
+    /// Live check, run by hand against an interactive Claude session the operator started:
+    /// wakes the session named by `AGENT_IDE_LIVE_WAKE_SESSION` through the real registry; the
+    /// message must then appear in that session's transcript as one new turn.
+    #[tokio::test]
+    #[ignore = "needs a live, idle, interactive Claude session"]
+    async fn live_wake_reaches_an_idle_interactive_session() {
+        let session_id = std::env::var("AGENT_IDE_LIVE_WAKE_SESSION").expect("session id");
+        let target = WakeTarget {
+            host: HostKind::Claude,
+            session_id,
+            actor_is_main: true,
+        };
+        let text = "<agent-ide>\ntest-finished tests #1: 3 passed, 2 s\n</agent-ide>\nResults \
+                    you requested from Agent IDE arrived while you were idle.";
+        // An idle session accepts the frame at once and sends no receipt (probe Q7).
+        assert!(matches!(
+            HostWaker::default().wake(&target, text).await,
+            WakeOutcome::Accepted | WakeOutcome::Ambiguous
+        ));
+    }
 }
