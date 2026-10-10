@@ -46,7 +46,7 @@ const SCRIPT_EXTENSIONS: [&str; 8] = ["ts", "tsx", "js", "jsx", "mts", "cts", "m
 /// buffer and decoded once, so a multibyte character split across chunk boundaries cannot fake a
 /// syntax error. Exit 3 (module not loadable), a missing node or any other nonzero output means
 /// no checker was proven.
-const TS_PROBE: &str = "let ts;try{ts=require(process.argv[1])}catch(e){process.exit(3)}let cs=[];process.stdin.on('data',c=>cs.push(c)).on('end',()=>{const d=Buffer.concat(cs).toString('utf8');const f=ts.createSourceFile(process.argv[2]||'c.ts',d,ts.ScriptTarget.Latest,true);const p=f.parseDiagnostics[0];if(p){const l=f.getLineAndCharacterOfPosition(p.start).line+1;console.log(l+': '+ts.flattenDiagnosticMessageText(p.messageText,' '));process.exit(1)}});";
+pub const TS_PROBE: &str = "let ts;try{ts=require(process.argv[1])}catch(e){process.exit(3)}let cs=[];process.stdin.on('data',c=>cs.push(c)).on('end',()=>{const d=Buffer.concat(cs).toString('utf8');const f=ts.createSourceFile(process.argv[2]||'c.ts',d,ts.ScriptTarget.Latest,true);const p=f.parseDiagnostics[0];if(p){const l=f.getLineAndCharacterOfPosition(p.start).line+1;console.log(l+': '+ts.flattenDiagnosticMessageText(p.messageText,' '));process.exit(1)}});";
 
 /// Most lines scanned for one declaration's header and signature.
 const SCAN_LINES: usize = 200;

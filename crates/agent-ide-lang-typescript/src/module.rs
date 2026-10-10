@@ -340,8 +340,188 @@ pub const TSC: EffectRecipe = EffectRecipe {
     ],
 };
 
-/// The effect recipes of the TypeScript module, declared by the root.
-pub const RECIPES: &[EffectRecipe] = &[TSC];
+/// Install prefixes an accepted Node or TypeScript package may live under beyond the worktree
+/// and the user's home (Homebrew, MacPorts, system and developer installs): the roots the
+/// syntax-probe recipe admits its Node and `typescript.js` from.
+pub const INSTALL_PREFIXES: [&str; 6] = [
+    "/opt",
+    "/usr/local",
+    "/usr",
+    "/Library/Frameworks",
+    "/Library/Developer",
+    "/Applications",
+];
+
+/// Roles of the Node and the `typescript.js` the syntax probe runs.
+const TOOL_ROLES: &[PathRole] = &[
+    PathRole::Worktree,
+    PathRole::HomeRelative,
+    PathRole::LauncherRoot,
+    PathRole::DeveloperDir,
+];
+
+/// Home tools an interactive recipe may run, looked up by the core on its formatter PATH.
+const HOME_TOOLS: &[ExecutableSlot] = &[
+    ExecutableSlot {
+        name: "npx",
+        source: SlotSource::HomeTool("npx"),
+    },
+    ExecutableSlot {
+        name: "node",
+        source: SlotSource::HomeTool("node"),
+    },
+];
+
+/// Fixed trailing `PATH` entries of an interactive run.
+const SYSTEM_PATH: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
+
+/// The environment of a run of a program found on the formatter `PATH`: its own directory leads
+/// `PATH`, so a script tool finds the interpreter beside it.
+const fn tool_env(slot: &'static str) -> [EnvRule; 2] {
+    [
+        EnvRule::Home { name: "HOME" },
+        EnvRule::SlotDir {
+            name: "PATH",
+            slot,
+            fixed: SYSTEM_PATH,
+        },
+    ]
+}
+
+/// The environment of a run of an admitted Node path.
+const PATH_ENV: [EnvRule; 2] = [
+    EnvRule::Home { name: "HOME" },
+    EnvRule::Literal {
+        name: "PATH",
+        value: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+    },
+];
+
+/// A recipe reading the candidate on stdin: `program` is a home tool slot or a path parameter
+/// admitted under [`TOOL_ROLES`].
+const fn interactive(
+    id: &'static str,
+    program: &'static str,
+    args: &'static [Arg],
+    env: &'static [EnvRule],
+) -> EffectRecipe {
+    EffectRecipe {
+        id,
+        program,
+        args,
+        env,
+        paths: &[
+            PathRule {
+                param: "node_path",
+                roles: TOOL_ROLES,
+                existing_only: false,
+                read_root: false,
+            },
+            PathRule {
+                param: "module",
+                roles: TOOL_ROLES,
+                existing_only: false,
+                read_root: false,
+            },
+        ],
+        executables: HOME_TOOLS,
+        stdin: Stdin::Candidate,
+        class: RunClass::Interactive,
+        timeout_ceiling_ms: 10_000,
+        capture_bytes: 64 << 20,
+        assets: &[],
+    }
+}
+
+const NPX_ENV: [EnvRule; 2] = tool_env("npx");
+const NODE_TOOL_ENV: [EnvRule; 2] = tool_env("node");
+
+/// The effect recipes of the TypeScript module, declared by the root: the `tsc` check, the
+/// Prettier formatter and the syntax probe that read the candidate on stdin.
+pub const RECIPES: &[EffectRecipe] = &[
+    TSC,
+    interactive(
+        "prettier-npx",
+        "npx",
+        &[
+            Arg::Literal("prettier"),
+            Arg::Literal("--stdin-filepath"),
+            Arg::Param("file"),
+        ],
+        &NPX_ENV,
+    ),
+    interactive(
+        "ts-probe",
+        "node_path",
+        &[
+            Arg::Literal("-e"),
+            Arg::Literal(crate::support::TS_PROBE),
+            Arg::Param("module"),
+            Arg::Param("file"),
+        ],
+        &PATH_ENV,
+    ),
+    interactive(
+        "ts-probe-tool",
+        "node",
+        &[
+            Arg::Literal("-e"),
+            Arg::Literal(crate::support::TS_PROBE),
+            Arg::Param("module"),
+            Arg::Param("file"),
+        ],
+        &NODE_TOOL_ENV,
+    ),
+];
+
+/// The recipe request of a formatter or probe argument vector the in-process support builds
+/// ([`crate::support`]); `None` for any other shape, which the core then refuses.
+pub fn interactive_effect(argv: &[String]) -> Option<EffectRequest> {
+    let words: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let token = |value: &str| Param::Token(value.to_owned());
+    let (recipe, params): (&str, Vec<(&str, Param)>) = match words.as_slice() {
+        ["npx", "prettier", "--stdin-filepath", file] => (
+            "prettier-npx",
+            vec![
+                ("npx", Param::Executable("npx".to_owned())),
+                ("file", token(file)),
+            ],
+        ),
+        [node, "-e", probe, module, file]
+            if *probe == crate::support::TS_PROBE && module.starts_with('/') =>
+        {
+            if node.starts_with('/') {
+                (
+                    "ts-probe",
+                    vec![
+                        ("node_path", Param::Path(PathBuf::from(node))),
+                        ("module", Param::Path(PathBuf::from(module))),
+                        ("file", token(file)),
+                    ],
+                )
+            } else if *node == "node" {
+                (
+                    "ts-probe-tool",
+                    vec![
+                        ("node", Param::Executable("node".to_owned())),
+                        ("module", Param::Path(PathBuf::from(module))),
+                        ("file", token(file)),
+                    ],
+                )
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    Some(EffectRequest {
+        recipe: recipe.to_owned(),
+        params: params
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect(),
+    })
+}
 
 /// Name of the Node slot and program.
 const NODE: &str = "node";
@@ -553,9 +733,9 @@ fn describe(request: &Incoming) -> Answer {
         Ok(DescribeQuery::Presence { worktree }) => {
             reply(encode(&TypeScriptChecks.is_present(&worktree)))
         }
-        Ok(DescribeQuery::ProjectInputs { document, inputs }) => {
-            reply(encode(&crate::profile::interpret_inputs(&document, &inputs)))
-        }
+        Ok(DescribeQuery::ProjectInputs { document, inputs }) => reply(encode(
+            &crate::profile::interpret_inputs(&document, &inputs),
+        )),
         Err(error) => Answer::error(ErrorCode::InvalidRequest, error),
     }
 }
@@ -697,7 +877,8 @@ impl ModuleServer for AnalyzerServer {
 ///
 /// The transport fault that ended the loop.
 pub async fn serve(role: Role) -> Result<(), ServeError> {
-    let support = SupportServer::new(crate::LANGUAGE, env!("CARGO_PKG_VERSION"));
+    let support = SupportServer::new(crate::LANGUAGE, env!("CARGO_PKG_VERSION"))
+        .with_effect_plans(interactive_effect);
     match role {
         Role::Analyzer => {
             let provider = ProviderServer::new(support, Host);
@@ -935,5 +1116,88 @@ mod tests {
         let worktree = layout.base.join("outer/ws");
         assert!(TypeScriptChecks.is_present(&worktree));
         assert!(!TypeScriptChecks.is_present(&layout.base));
+    }
+
+    /// The formatter and both syntax-probe argument vectors the in-process support builds become
+    /// requests of the declared recipes that expand to exactly those argument vectors, with the
+    /// tool's own directory leading `PATH`; anything else is no request, and an unadmitted Node
+    /// is refused.
+    #[test]
+    fn interactive_plans_expand_to_the_in_process_commands() {
+        let (layout, ..) = layout("interactive");
+        let worktree = layout.base.join("outer/ws");
+        let cache = layout.base.join("cache");
+        let home = layout.base.join("home");
+        let tools_dir = layout.base.join("tools/bin");
+        let node = tools_dir.join("node");
+        let npx = tools_dir.join("npx");
+        let roots = vec![layout.base.join("tools")];
+        let programs = vec![("npx".to_owned(), npx), ("node".to_owned(), node.clone())];
+        let admission = agent_ide_core::modules::recipe::Admission {
+            worktree: &worktree,
+            cache_dir: &cache,
+            read_denies: &[],
+            home: Some(&home),
+            launcher_roots: &roots,
+            developer_dirs: &[],
+            programs: &programs,
+            timeout: Duration::from_secs(10),
+        };
+        let module = layout
+            .base
+            .join("tools/lib/node_modules/typescript/lib/typescript.js");
+        let (node_text, module_text) = (node.display().to_string(), module.display().to_string());
+        let probe = crate::support::TS_PROBE;
+        for argv in [
+            vec!["npx", "prettier", "--stdin-filepath", "src/a.ts"],
+            vec![
+                node_text.as_str(),
+                "-e",
+                probe,
+                module_text.as_str(),
+                "a.tsx",
+            ],
+            vec!["node", "-e", probe, module_text.as_str(), "a.mjs"],
+        ] {
+            let argv: Vec<String> = argv.into_iter().map(str::to_owned).collect();
+            let effect = interactive_effect(&argv).expect("a recipe request");
+            let spec = agent_ide_core::modules::recipe::expand(RECIPES, &effect, &admission)
+                .unwrap_or_else(|refusal| panic!("{argv:?}: {refusal:?}"));
+            let program = if argv[0].starts_with('/') {
+                PathBuf::from(&argv[0])
+            } else {
+                tools_dir.join(&argv[0])
+            };
+            assert_eq!(spec.program, program, "{argv:?}");
+            assert_eq!(
+                spec.args,
+                argv[1..]
+                    .iter()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>(),
+                "{argv:?}"
+            );
+            assert_eq!(spec.cwd, worktree);
+            if !argv[0].starts_with('/') {
+                let path = spec.env.iter().find(|(key, _)| key == "PATH").unwrap();
+                assert!(
+                    path.1.starts_with(&tools_dir.display().to_string()),
+                    "{path:?}"
+                );
+            }
+        }
+        assert!(interactive_effect(&["sh".into(), "-c".into(), "x".into()]).is_none());
+        let outside = interactive_effect(&[
+            "/private/var/root/node".into(),
+            "-e".into(),
+            probe.into(),
+            module_text,
+            "a.ts".into(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            agent_ide_core::modules::recipe::expand(RECIPES, &outside, &admission),
+            Err(Refusal::OutOfRule(name, _)) if name == "node_path"
+        ));
     }
 }

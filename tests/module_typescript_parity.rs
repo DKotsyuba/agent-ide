@@ -382,3 +382,234 @@ async fn edits_match(bridge: bool) {
         assert!(files[1].starts_with("export function Panel(): JSX.Element {"));
     }
 }
+
+/// A Node back-end project: ESM entry with `exports`/`main`, a CommonJS module pair, a
+/// `node_modules` package the entry imports, `node:test` files (one passing, one failing, one
+/// TAP-style), and a server-side `tsconfig.json` the `tsc` check runs on.
+fn node_fixture(bridge: bool) -> Fixture {
+    let fixture = Fixture::new(
+        &[
+            (
+                "package.json",
+                "{\"name\":\"api\",\"version\":\"1.0.0\",\"type\":\"module\",\"main\":\"src/index.js\",\"exports\":{\".\":\"./src/index.js\"},\"scripts\":{\"test\":\"node --test\"}}\n",
+            ),
+            (
+                "tsconfig.json",
+                "{\"compilerOptions\":{\"allowJs\":true,\"checkJs\":true,\"noEmit\":true,\"module\":\"esnext\",\"target\":\"es2022\",\"moduleResolution\":\"bundler\",\"types\":[]},\"include\":[\"src\"]}\n",
+            ),
+            (
+                "src/index.js",
+                "import { shout } from 'dep';\nimport { legacy } from './legacy.cjs';\n\nexport function hello(name) {\n  return shout('hello ' + name) + legacy();\n}\n\nexport const PORT = 8080;\n\nexport function broken() {\n  /** @type {number} */\n  const n = 'text';\n  return n;\n}\n",
+            ),
+            (".prettierrc", "{\"semi\":true}\n"),
+            (
+                "src/legacy.cjs",
+                "const util = require('./util.cjs');\nfunction legacy() {\n  return util.tag();\n}\nmodule.exports = { legacy };\n",
+            ),
+            (
+                "src/util.cjs",
+                "exports.tag = function tag() {\n  return '!';\n};\n",
+            ),
+            (
+                "node_modules/dep/package.json",
+                "{\"name\":\"dep\",\"version\":\"1.0.0\",\"main\":\"index.js\"}\n",
+            ),
+            (
+                "node_modules/dep/index.js",
+                "exports.shout = function shout(text) {\n  return text.toUpperCase();\n};\n",
+            ),
+            (
+                "test/pass.test.mjs",
+                "import test from 'node:test';\nimport assert from 'node:assert';\n\ntest('adds', () => {\n  assert.equal(1 + 1, 2);\n});\n",
+            ),
+            (
+                "test/fail.test.mjs",
+                "import test from 'node:test';\nimport assert from 'node:assert';\n\ntest('subtracts', () => {\n  assert.equal(2 - 1, 3);\n});\n",
+            ),
+        ],
+        if bridge {
+            json!([typescript_provider()])
+        } else {
+            json!([])
+        },
+    );
+    let node = std::env::var("AGENT_IDE_NODE").unwrap();
+    let tsc = Path::new(&std::env::var("AGENT_IDE_TSSERVER").unwrap())
+        .with_file_name("tsc.js")
+        .display()
+        .to_string();
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    config["project_checks"] = json!({
+        "debounce_ms":100,
+        "check_timeout_s":30,
+        "typescript":{"node":node,"tsc_cli":tsc}
+    });
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+    fixture
+}
+
+/// `line` with the duration after `project check ` (`0.7s`) masked.
+fn untimed(line: &str) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    while let Some(at) = rest.find("project check ") {
+        let (head, tail) = rest.split_at(at + "project check ".len());
+        out.push_str(head);
+        let end = tail
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(tail.len());
+        let (number, after) = tail.split_at(end);
+        if number.is_empty() || !after.starts_with('s') {
+            out.push_str(number);
+        } else {
+            out.push_str("<t>");
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Settles an `ide.test` run: starts it and polls its status until it reports a result.
+async fn run_tests(session: &mut Session, fixture: &Fixture, arguments: Value) -> (Value, String) {
+    let started = session.call(fixture, "ide.test", arguments).await;
+    let text = started["text"].as_str().unwrap_or_default().to_owned();
+    let Some(id) = text
+        .strip_prefix("tests #")
+        .and_then(|rest| rest.split(':').next())
+        .and_then(|id| id.parse::<u64>().ok())
+    else {
+        return (started, text);
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let reply = session
+            .call(fixture, "ide.test", json!({"status": id}))
+            .await;
+        let text = reply["text"].as_str().unwrap_or_default().to_owned();
+        if !text.contains("started") && !text.contains("running")
+            || std::time::Instant::now() > deadline
+        {
+            return (reply, text);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+}
+
+/// The Node back-end transcript on a fresh daemon with `env`: reads, cards, positions, rename,
+/// test runs and the tsc check page.
+async fn node_transcript(env: &[(&str, &str)]) -> Vec<String> {
+    let fixture = node_fixture(true);
+    let _daemon = Daemon::start(&fixture, env).await;
+    let mut session = Session::start(&fixture).await;
+    let text = std::fs::read_to_string(fixture.root.join("src/index.js")).unwrap();
+    let hello = text.find("hello(").unwrap() + 2;
+    let shout = text.find("shout(").unwrap() + 2;
+    let mut replies = Vec::new();
+    let reads = [
+        ("ide.outline", json!({"path":"src/index.js"})),
+        ("ide.outline", json!({"path":"src/legacy.cjs"})),
+        ("ide.outline", json!({"path":"test/pass.test.mjs"})),
+        ("ide.read", json!({"symbol":"src/index.js#hello"})),
+        (
+            "ide.symbol",
+            json!({"symbol":"src/index.js#hello","callees":1}),
+        ),
+        ("ide.symbol", json!({"symbol":"src/index.js#PORT"})),
+        (
+            "ide.context",
+            json!({"path":"src/index.js","byte_offset":hello}),
+        ),
+        (
+            "ide.context",
+            json!({"path":"src/index.js","byte_offset":shout}),
+        ),
+    ];
+    for (tool, arguments) in reads {
+        let reply = session.call(&fixture, tool, arguments.clone()).await;
+        replies.push(line_for(&fixture, tool, &arguments, &reply));
+    }
+    for arguments in [
+        json!({"path":"test/pass.test.mjs"}),
+        json!({"path":"test/fail.test.mjs"}),
+        json!({"path":"src/index.js"}),
+        // A TAP stream from the explicit command the product parses too.
+        json!({"command":["node","--test","--test-reporter=tap","test/fail.test.mjs"]}),
+    ] {
+        let (reply, _) = run_tests(&mut session, &fixture, arguments.clone()).await;
+        replies.push(line_for(&fixture, "ide.test", &arguments, &reply));
+    }
+    let rename = json!({"operation_id":"rename-port","op":"rename","symbol":"src/index.js#PORT","new_name":"LISTEN_PORT"});
+    let reply = session.call(&fixture, "ide.edit", rename.clone()).await;
+    replies.push(line_for(&fixture, "ide.edit", &rename, &reply));
+    replies.push(std::fs::read_to_string(fixture.root.join("src/index.js")).unwrap());
+    // An edit the formatter plan is asked about (prettier is configured by `.prettierrc`).
+    let format = json!({"operation_id":"format-hello","op":"replace","symbol":"src/index.js#hello","content":"export function hello(name){return shout('hello '+name)+legacy()}"});
+    let reply = session.call(&fixture, "ide.edit", format.clone()).await;
+    // The edit's own project-check duration is the one timing in the reply.
+    replies.push(untimed(&line_for(&fixture, "ide.edit", &format, &reply)));
+    replies.push(std::fs::read_to_string(fixture.root.join("src/index.js")).unwrap());
+    // A candidate that does not parse is refused by the syntax probe, nothing written.
+    let broken = json!({"operation_id":"broken-hello","op":"replace","symbol":"src/index.js#hello","content":"export function hello( {"});
+    let reply = session.call(&fixture, "ide.edit", broken.clone()).await;
+    replies.push(line_for(&fixture, "ide.edit", &broken, &reply));
+    replies.push(std::fs::read_to_string(fixture.root.join("src/index.js")).unwrap());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let page = session
+            .call(
+                &fixture,
+                "ide.context",
+                json!({"kind":"problems","language":"typescript"}),
+            )
+            .await;
+        let text = page["text"].as_str().unwrap_or_default().to_owned();
+        if (!text.contains("checking") && text.contains("typescript: "))
+            || std::time::Instant::now() > deadline
+        {
+            replies.push(text);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    session.close(&fixture).await;
+    replies
+}
+
+/// The Node back-end project answers the same in module mode and in process: outline, read, cards
+/// with callees, positions across a `node_modules` import and a CommonJS require, `node:test`
+/// runs (pass, fail, no tests), a project-wide rename and the server-side `tsc` check.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_NODE, AGENT_IDE_TYPESCRIPT_LANGUAGE_SERVER and AGENT_IDE_TSSERVER environments"]
+async fn typescript_node_backend_matches_in_process_answers() {
+    let in_process = node_transcript(&[IN_PROCESS]).await;
+    let moduled = node_transcript(&[]).await;
+    for r in &moduled {
+        eprintln!(
+            "=====\n{}",
+            r.lines().take(30).collect::<Vec<_>>().join("\n")
+        );
+    }
+    if let Ok(dir) = std::env::var("TS_DUMP") {
+        std::fs::write(
+            format!("{dir}/node-inproc.txt"),
+            in_process.join("\n#####\n"),
+        )
+        .unwrap();
+        std::fs::write(format!("{dir}/node-module.txt"), moduled.join("\n#####\n")).unwrap();
+    }
+    parity::assert_parity(&in_process, &moduled);
+    let all = moduled.join("\n");
+    for expected in [
+        "1 passed, 0 failed",
+        "FAIL subtracts",
+        "no tests in src/index.js",
+        "renamed PORT → LISTEN_PORT",
+        "import { shout } from \"dep\";",
+        "produced a syntax error",
+        "TS2322",
+    ] {
+        assert!(all.contains(expected), "{expected}:\n{all}");
+    }
+}

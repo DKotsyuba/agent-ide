@@ -87,10 +87,16 @@ pub mod languages {
 
     /// Each language's static install roots its interactive recipes may name (Python's standard
     /// interpreter prefixes).
-    pub static INSTALL_ROOTS: [(&str, &[&str]); 1] = [(
-        "python",
-        &agent_ide_lang_python::module::INTERPRETER_PREFIXES,
-    )];
+    pub static INSTALL_ROOTS: [(&str, &[&str]); 2] = [
+        (
+            "python",
+            &agent_ide_lang_python::module::INTERPRETER_PREFIXES,
+        ),
+        (
+            "typescript",
+            &agent_ide_lang_typescript::module::INSTALL_PREFIXES,
+        ),
+    ];
 
     /// Each language's host-side resolution of a worktree's accepted environments (Python's
     /// selected, pinned or discovered environments and their installation prefixes).
