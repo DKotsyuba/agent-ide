@@ -4598,7 +4598,8 @@ impl StdioFacade {
     /// Activate Agent IDE for this project — once per task, before any other ide.* call. Returns
     /// a project card: languages with sizes, the build/check/test/lint commands, layout by
     /// directory, entry points and docs. Use it to orient instead of reading README, {manifests_head}
-    /// {manifests_tail}. Then use ide.outline / ide.symbol instead of native file reads.
+    /// {manifests_tail}. Then use ide.outline / ide.symbol instead of native file reads. End the
+    /// task with ide.stop.
     #[tool(name = "ide.start", input_schema = tool_schemas()[0].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn start(
@@ -4699,10 +4700,13 @@ impl StdioFacade {
     /// `pattern`, or an explicit `command`; one background run per worktree under `budget_s`.
     /// Explicit commands may set a worktree-relative `cwd` and bounded inherited-environment
     /// overrides through `env`; their argv is limited to 16 KiB in total.
-    /// Returns the pass/fail line with an exact rerun command; full output is paged through
-    /// ide.inspect (`status` re-reads a run). Known runner summaries are parsed regardless of how
-    /// the runner was launched; otherwise the result includes the exit code and bounded output
-    /// tail. Use it instead of running the test command in a shell: bounded selection and output.
+    /// Returns the pass/fail line with an exact rerun command; a run that outlasts the call
+    /// answers `started` and its outcome (counts, up to eight failing tests, the rerun command,
+    /// the full-output reference) arrives by itself in an <agent-ide> block. Full output is paged
+    /// through ide.inspect (`status` re-reads a run). Known runner summaries are parsed regardless
+    /// of how the runner was launched; otherwise the result includes the exit code and bounded
+    /// output tail. Use it instead of running the test command in a shell: bounded selection and
+    /// output.
     #[tool(name = "ide.test", input_schema = tool_schemas()[10].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false))]
     async fn test(
@@ -4713,9 +4717,12 @@ impl StdioFacade {
         self.call(AssistanceTool::Test, parameters, context).await
     }
 
-    /// Fetch the result behind a `detail_ref`: a `pending` reply that has since completed, or
-    /// the next page of a long result (outline, symbol, graph, diff, test output). Results of
-    /// long work reach you by themselves; this call reads one early or pages through it.
+    /// Read what Agent IDE holds for you. Results of long work (test runs, project checks after
+    /// edits, answers that were pending) are pushed to you in an <agent-ide> block, so never poll
+    /// for them. `{}` hands over everything ready now; `{"wait_ms": 120000}` waits once for the
+    /// next result when you have nothing else to do; `detail_refs` answers several references in
+    /// one call; `detail_ref` reads one result or its next page (outline, symbol, graph, diff,
+    /// test output).
     #[tool(name = "ide.inspect", input_schema = tool_schemas()[3].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn inspect(
@@ -4727,8 +4734,10 @@ impl StdioFacade {
             .await
     }
 
-    /// End this task's IDE session; edited files stay on disk. Lists up to eight test runs started
-    /// in this binding whose results were never collected. Call once when done or before handing off.
+    /// End this task's IDE session; edited files stay on disk. Required when the task ends or
+    /// before handing off: it frees the worktree's writer slot at once. Lists up to eight test
+    /// runs started in this binding whose results were never collected, and flushes results not
+    /// yet delivered. Call it once.
     #[tool(name = "ide.stop", input_schema = tool_schemas()[4].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn stop(
@@ -4742,7 +4751,8 @@ impl StdioFacade {
     /// Edit by symbol: `op` replace / insert / delete / rename on `file#Owner/name` (rename is
     /// project-wide), or replace a `path` + `lines` range, or a full-file rewrite based on a
     /// `source_ref`. Formats the result with the project formatter, runs the project check
-    /// ({project_checks}) and returns this file's errors and warnings in the reply.
+    /// ({project_checks}) and returns this file's errors and warnings in the reply; a check that
+    /// outlasts the call answers `diagnostics: pending` and its outcome arrives by itself.
     /// Prefer it over native edit/write for source: no line matching, no separate check step.
     #[tool(name = "ide.edit", input_schema = tool_schemas()[5].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false))]
@@ -4761,10 +4771,12 @@ pub(super) const SERVER_INSTRUCTIONS: &str = "Agent IDE: language-server-backed 
 Call ide.start once per task, then prefer the ide.* tools over native file tools for source: \
 ide.outline instead of reading a file, ide.symbol / ide.graph instead of grep for usages and \
 callers, ide.read for one symbol's body, ide.edit for changes (formatted and project-checked in \
-the same reply), ide.test to run exactly the tests that matter, ide.diff to review before \
-ide.stop. Symbols are addressed as `file#Owner/name`. A reply that says `pending` is not an \
-error: its result arrives by itself in a later <agent-ide> block, so never poll for it. Native \
-read/edit tools remain available for non-source files and as a fallback.";
+the same reply), ide.test to run exactly the tests that matter, ide.diff to review, then \
+ide.stop at the end of the task. Symbols are addressed as `file#Owner/name`. Results of long \
+work (test runs, project checks after edits, answers that were pending) are pushed to you in an \
+<agent-ide> block after your next tool call or when you end your turn, so never poll for them; \
+if you have nothing else to do, call ide.inspect {\"wait_ms\": 120000} once. Native read/edit \
+tools remain available for non-source files and as a fallback.";
 
 /// Ensures diagnostics hide both launch attachments and populated host metadata in either format.
 #[test]

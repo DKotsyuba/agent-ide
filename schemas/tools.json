@@ -107,7 +107,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Edit by symbol: `op` replace / insert / delete / rename on `file#Owner/name` (rename is\nproject-wide), or replace a `path` + `lines` range, or a full-file rewrite based on a\n`source_ref`. Formats the result with the project formatter, runs the project check\n(cargo check, pyright or tsc) and returns this file's errors and warnings in the reply.\nPrefer it over native edit/write for source: no line matching, no separate check step.",
+    "description": "Edit by symbol: `op` replace / insert / delete / rename on `file#Owner/name` (rename is\nproject-wide), or replace a `path` + `lines` range, or a full-file rewrite based on a\n`source_ref`. Formats the result with the project formatter, runs the project check\n(cargo check, pyright or tsc) and returns this file's errors and warnings in the reply; a check that\noutlasts the call answers `diagnostics: pending` and its outcome arrives by itself.\nPrefer it over native edit/write for source: no line matching, no separate check step.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -282,7 +282,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Fetch the result behind a `detail_ref`: a `pending` reply that has since completed, or\nthe next page of a long result (outline, symbol, graph, diff, test output). Results of\nlong work reach you by themselves; this call reads one early or pages through it.",
+    "description": "Read what Agent IDE holds for you. Results of long work (test runs, project checks after\nedits, answers that were pending) are pushed to you in an <agent-ide> block, so never poll\nfor them. `{}` hands over everything ready now; `{\"wait_ms\": 120000}` waits once for the\nnext result when you have nothing else to do; `detail_refs` answers several references in\none call; `detail_ref` reads one result or its next page (outline, symbol, graph, diff,\ntest output).",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -403,7 +403,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Activate Agent IDE for this project — once per task, before any other ide.* call. Returns\na project card: languages with sizes, the build/check/test/lint commands, layout by\ndirectory, entry points and docs. Use it to orient instead of reading README, Cargo.toml\nor package.json. Then use ide.outline / ide.symbol instead of native file reads.",
+    "description": "Activate Agent IDE for this project — once per task, before any other ide.* call. Returns\na project card: languages with sizes, the build/check/test/lint commands, layout by\ndirectory, entry points and docs. Use it to orient instead of reading README, Cargo.toml\nor package.json. Then use ide.outline / ide.symbol instead of native file reads. End the\ntask with ide.stop.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -449,7 +449,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "End this task's IDE session; edited files stay on disk. Lists up to eight test runs started\nin this binding whose results were never collected. Call once when done or before handing off.",
+    "description": "End this task's IDE session; edited files stay on disk. Required when the task ends or\nbefore handing off: it frees the worktree's writer slot at once. Lists up to eight test\nruns started in this binding whose results were never collected, and flushes results not\nyet delivered. Call it once.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -515,7 +515,7 @@
     "annotations": {
       "readOnlyHint": false
     },
-    "description": "Run tests selected by `symbol` (the tests that reference it), by `path`, by name\n`pattern`, or an explicit `command`; one background run per worktree under `budget_s`.\nExplicit commands may set a worktree-relative `cwd` and bounded inherited-environment\noverrides through `env`; their argv is limited to 16 KiB in total.\nReturns the pass/fail line with an exact rerun command; full output is paged through\nide.inspect (`status` re-reads a run). Known runner summaries are parsed regardless of how\nthe runner was launched; otherwise the result includes the exit code and bounded output\ntail. Use it instead of running the test command in a shell: bounded selection and output.",
+    "description": "Run tests selected by `symbol` (the tests that reference it), by `path`, by name\n`pattern`, or an explicit `command`; one background run per worktree under `budget_s`.\nExplicit commands may set a worktree-relative `cwd` and bounded inherited-environment\noverrides through `env`; their argv is limited to 16 KiB in total.\nReturns the pass/fail line with an exact rerun command; a run that outlasts the call\nanswers `started` and its outcome (counts, up to eight failing tests, the rerun command,\nthe full-output reference) arrives by itself in an <agent-ide> block. Full output is paged\nthrough ide.inspect (`status` re-reads a run). Known runner summaries are parsed regardless\nof how the runner was launched; otherwise the result includes the exit code and bounded\noutput tail. Use it instead of running the test command in a shell: bounded selection and\noutput.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

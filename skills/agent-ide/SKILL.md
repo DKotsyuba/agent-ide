@@ -35,9 +35,9 @@ definitions again once; the server accepts every current parameter either way.
 
 Each accepted reply carries one compact decision-facing text block that states every fact needed
 for the next action — state, `detail_ref`, `continuation`, `retry`, Edit outcome and `source_ref`.
-Replies come back complete when the work finishes within a few seconds (the usual case on a
-warm language server); only a longer job answers `pending` — then call `ide.inspect` with its
-`detail_ref` to retrieve the result.
+Replies come back complete when the work finishes quickly (the usual case on a warm
+language server); a longer job answers `pending` (a test run, `started`) and its result is
+pushed to you later — see "Pushed results" below.
 
 ## Understanding code by symbols
 
@@ -142,9 +142,11 @@ check (cargo check, pyright or tsc) and answers with the edited file's problems 
   file; the project check reports N errors in other files`, read them with
   `ide.context {"kind":"problems"}`: the project still does not build.
 - `not_analysed (<reason>)` — nothing checked this file; follow the step the reason names.
-- `unknown` — a broken edit is usually reported within seconds, but the check waits at most
-  90 s; after that the reply says `diagnostics: unknown` and `ide.context {"kind":"problems"}`
-  shows the result when it lands.
+- `pending` — the project check outlasted the call. The reply ends `diagnostics: pending; the
+  project check arrives by itself as an edit-checked fact`: keep working, and the fact (counts
+  and up to eight `new:` lines) arrives in an `<agent-ide>` block.
+- `unknown` — the check waits at most 90 s; after that the diagnostics read `unknown` and
+  `ide.context {"kind":"problems"}` shows the result when it lands.
 
 Symbol paths are `file#Owner/name`: `#` separates the file, `/` is nesting (impl, class,
 namespace, module → member). Inherent `impl Foo` members are addressed as `Foo/method`;
@@ -228,8 +230,8 @@ loading — `ide.context {"kind":"problems"}` shows the project check.
    Rust file → declare its `mod`; a Rust file built only under a `cfg`/`#[path]` gate → check
    it with a build or `ide.test` command that enables it; a Python file with no covering root
    or environment → create one or pick it with `ide.start` `environment`; `no IDE language
-   checks this file type` → nothing to check, continue. A pending diagnostic still requires
-   `ide.inspect` with its returned `detail_ref`. An `outcome_unknown` *result* is a different
+   checks this file type` → nothing to check, continue. `diagnostics: pending` → keep working;
+   the check arrives by itself as an edit-checked fact. An `outcome_unknown` *result* is a different
    unknown from `unknown` *diagnostics*: the edit's own effect, not just its diagnostics, is
    unproven, so inspect the named path with native host tools instead — never call
    `ide.context` to replay it, and never blind-retry.
@@ -242,26 +244,27 @@ loading — `ide.context {"kind":"problems"}` shows the project check.
    overrides. The combined command arguments are limited to 16 KiB. A `path` or `symbol`
    target runs the runner of that file's language — in a mixed worktree a `.py` test path
    selects pytest, never cargo — while a bare pattern or command uses the first detected
-   project. The reply is `tests #N: started — <argv> [(K tests selected)] (budget B s); poll:
-   call ide.test with {"status": N}`. A `symbol` target may first answer `pending` (use
-   `ide.inspect`); an explicit `command` that ends within a few seconds answers its result
-   directly; while a run is active in the worktree, another start answers `tests #N: still
-   running …` for that run. Call `ide.test {"status":N}` to poll until `tests #N: P passed,
-   F failed, T s` with up to sixteen `FAIL name` / `file:line message` entries (more add
-   `(+N more failed tests in the full output)`), a `rerun:` line that reproduces the run
+   project. A run that outlasts the call answers `tests #N: started — <argv> [(K tests
+   selected)] (budget B s); the result arrives by itself in a later <agent-ide> block`, and
+   nothing more about it reaches you until it ends. A `symbol` target may first answer
+   `pending` (its started line is pushed like any pending result); an explicit `command` that
+   ends quickly answers its result directly; while a run is active in the
+   worktree, another start answers `tests #N: still running` for that run, and you receive that
+   run's result too. The outcome arrives once as `test-finished tests #N: P passed, F failed,
+   T s` with up to eight `FAIL name` entries (each with its `file:line message` line; more add
+   `(+K more failed tests in the full output)`), a `rerun:` line that reproduces the run
    (`cd <dir> && env NAME=VALUE … <argv>` when `cwd` or `env` was given) and `full output:
-   ide.inspect <detail_ref>`. `ide.inspect` also accepts a test-run handle (`tests #N`,
-   `tests-N`, `#N`, `N`) and answers that run's current result; a worktree keeps at most four
-   finished runs. After `ide.stop`, `ide.test {"status":N}` is refused; its reply names
-   `ide.inspect {"detail_ref":"tests #N"}` as the way to read that run, which still answers.
-   Known pytest, cargo test, vitest/jest, and go test summaries are parsed from output regardless
-   of whether the command called the runner directly or through a wrapper. When no known test
-   summary appears, the result gives the exit code and a bounded output tail labelled `output`;
-   long output has a full-output inspection route. Status plates show only this activation's own
-   test jobs, so another actor's earlier run is not attributed to this session.
-   One job per worktree at a time; a stopped budget says `stopped at budget`. The
-   `<agent-ide>` block carries the job's line while it runs (it may repeat with the elapsed
-   time updated) and once when it ends.
+   ide.inspect <detail_ref>`; the reply of a run that ends inside the call reads the same.
+   `ide.test {"status":N}` and `ide.inspect` of a test-run handle (`tests #N`, `tests-N`,
+   `#N`, `N`) read one run on demand (`tests #N: running` while it runs); a worktree keeps at
+   most four finished runs. After `ide.stop`, `ide.test {"status":N}` is refused; its reply
+   names `ide.inspect {"detail_ref":"tests #N"}` as the way to read that run, which still
+   answers. Known pytest, cargo test, vitest/jest, and go test summaries are parsed from
+   output regardless of whether the command called the runner directly or through a wrapper.
+   When no known test summary appears, the result gives the exit code and a bounded output
+   tail labelled `output`; long output has a full-output inspection route. Only this
+   activation's own runs reach you, so another actor's earlier run is not attributed to this
+   session. One job per worktree at a time; a stopped budget says `stopped at budget`.
 6. `ide.diff` before finishing the task, to review the accumulated change; before finishing a
    task whose work you committed, review it with `ide.diff {"mode":"task"}`, which includes
    commits since activation (if no activation commit was recorded it directs you to `head`).
@@ -279,9 +282,10 @@ loading — `ide.context {"kind":"problems"}` shows the project check.
    Capture limits direct you to narrower `paths` or native Git. With `"provenance": true` the
    header's `current_tree` line says what the capture established; call `ide.diff` again
    after committing, staging or adding files.
-7. `ide.inspect` with the returned `detail_ref` whenever a reply is `pending` or says
+7. `ide.inspect` with the returned `detail_ref` whenever a reply says
    `Output is truncated; use ide.inspect with detail_ref …` (a diff: `hunks: N more
-   (ide.inspect …)` or a hunk part that continues). Do not repeat the original call instead.
+   (ide.inspect …)` or a hunk part that continues); a `pending` result arrives by itself, and
+   `ide.inspect` with its `detail_ref` only reads it earlier. Do not repeat the original call instead.
    The reply you hold is page one, so the first inspect returns page two; repeat until the
    last page and concatenate them in order. Context, outline, read, symbol, graph and
    test-output pages start with `page N; bytes A-B of TOTAL`, and the last reads `page N
@@ -295,8 +299,9 @@ loading — `ide.context {"kind":"problems"}` shows the project check.
    A diff page refused with `source_stale` means a tracked file changed after capture: call
    `ide.diff` again. A root-less start refused for `missing_pre` may also include a `retry`
    hint with the current directory as an explicit root.
-8. `ide.stop` at handoff to another actor, or when the task ends, to release this binding's
-   activation (`activation_id` is optional). Its reply lists test runs you have not collected;
+8. `ide.stop` is required at handoff to another actor and when the task ends: it releases this
+   binding's activation and frees the worktree's writer slot at once (`activation_id` is
+   optional). Its reply lists test runs you have not collected and results not yet delivered;
    read them with `ide.inspect {"detail_ref":"tests #N"}` before reporting results.
    A stop that could not be recorded names its cause: `capacity (stop:busy)`, `capacity
    (stop:store_full)` (the repository's state store is full: it clears only when every session
@@ -333,11 +338,26 @@ environment's own missing-cause line), `no files analyzed`, `outside allowed roo
 `unavailable: read_restricted` or `checks disabled` mean the feed has no counts for that
 language — never treat them as a clean result.
 
-## Pending replies
+## Pushed results
 
-Both Codex and Claude call the IDE tool directly. When a reply is `pending`, call `ide.inspect`
-with the given `detail_ref`, and again every few seconds while it stays `pending`; never run a
-helper command.
+Results of long work — a test run, the project check after an edit, an answer that was `pending`
+— are pushed to you in an `<agent-ide>` block as `test-finished …`, `edit-checked …` or
+`job-ready …` facts, each exactly once and labelled data. Never run a helper command to wait
+for them. What to rely on, by host:
+
+- Claude: "Results of long work (test runs, project checks after edits, answers that were
+  pending) are pushed to you in an <agent-ide> block after your next tool call or when you end
+  your turn, so never poll for them; if you have nothing else to do, call ide.inspect
+  {"wait_ms": 120000} once."
+- Codex: "Results of long work (test runs, project checks after edits, answers that were
+  pending) are pushed to you in an <agent-ide> block at the top of your next ide.* reply, after
+  your next tool call, or when you end your turn, so never poll for them; if you have nothing
+  else to do, call ide.inspect {"wait_ms": 120000} once."
+
+`ide.inspect {"wait_ms": 120000}` returns as soon as a result is ready (at most 240000 ms); a
+wait that ends first answers `nothing ready yet` with what is in flight and cancels nothing.
+`ide.inspect {}` hands over what is ready now. `{"detail_refs": [...]}` answers up to eight
+references in one call.
 
 ## Independence and fallback
 
