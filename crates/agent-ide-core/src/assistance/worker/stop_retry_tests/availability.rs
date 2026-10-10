@@ -354,6 +354,54 @@ async fn a_long_inactive_writer_is_taken_over_only_when_idle() {
     assert!(!worker.grants.contains_key(&holder));
 }
 
+/// A hook of the holder that lands between the takeover's evidence snapshot and its fence aborts
+/// the takeover: the stale snapshot alone fences the idle holder, but once the holder's next call
+/// arrives in that window the fence is lifted and the holder keeps its writer and its call.
+#[tokio::test]
+async fn a_hook_racing_the_takeover_snapshot_keeps_the_writer() {
+    use crate::assistance::host_binding::TakeoverReason;
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let workspace = DurableWorkspace::open(&store).await.unwrap();
+    let mut worker = worker(&store, workspace, fixture.root.clone());
+    worker.observations.install_schema().await.unwrap();
+    let (holder, _) = production_start(&mut worker, "racing-actor", "racing-start").await;
+    settle_call(&worker, "racing-actor", "racing-start");
+    let snapshot = |worker: &Worker<'_>| {
+        let mut guard = worker.shared.bindings.lock().unwrap();
+        guard.backdate_seen(&holder, Duration::from_secs(31 * 60));
+        guard.holder_evidence(&holder)
+    };
+    let fenced = |worker: &Worker<'_>| {
+        worker
+            .shared
+            .ledger
+            .lock()
+            .unwrap()
+            .handing_over
+            .contains(&holder)
+    };
+    // Control: with nothing heard since the snapshot, the idle holder is fenced for takeover.
+    assert_eq!(
+        worker.fence_stale_holder(&holder, snapshot(&worker), "rival-start"),
+        Some(TakeoverReason::Inactive { minutes: 31 })
+    );
+    assert!(fenced(&worker));
+    worker.end_handover_fence(&holder);
+    // The race: the holder's next call arrives after the snapshot, before the fence.
+    let evidence = snapshot(&worker);
+    assert!(matches!(
+        next_call_of(&worker, "racing-actor", "racing-next"),
+        BindingStatus::Validated(_)
+    ));
+    assert_eq!(
+        worker.fence_stale_holder(&holder, evidence, "rival-start"),
+        None
+    );
+    assert!(!fenced(&worker), "an aborted takeover leaves no fence");
+    assert!(worker.grants.contains_key(&holder));
+}
+
 /// A live holder, recently heard from and with an attached carrier, is never displaced: the start
 /// is refused with the holder facts and the holder keeps its grant and its calls.
 #[tokio::test]
