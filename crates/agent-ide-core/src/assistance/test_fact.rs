@@ -578,10 +578,10 @@ mod tests {
     #[test]
     fn environment_label_is_part_of_the_bounded_summary() {
         let mut result = run(1, 0, Vec::new());
-        result.environment_label = Some("python .venv".to_owned());
+        result.environment_label = Some("tool env".to_owned());
         assert_eq!(
             terminal_fact(1, &result, true).summary,
-            "1 passed, 0 failed, 12 s · env python .venv"
+            "1 passed, 0 failed, 12 s · env tool env"
         );
         result.environment_label = Some("é".repeat(400));
         let fact = terminal_fact(1, &result, true);

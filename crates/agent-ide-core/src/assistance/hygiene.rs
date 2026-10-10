@@ -181,7 +181,7 @@ fn surfaces() -> Vec<Surface> {
 fn stop_surfaces() -> Vec<Surface> {
     let runs = [
         "#1 cargo test (still running)".to_owned(),
-        "#2 pytest".to_owned(),
+        "#2 other runner".to_owned(),
     ];
     vec![
         reply_surface("ide.stop reply", stop_text(true, &runs, None), true),
@@ -310,7 +310,7 @@ fn format_literals(relative: &str, name: &str) -> String {
     literals_of(&body[..body.find("\n}\n").unwrap_or(body.len())])
 }
 
-/// Returns the string literals of the Rust `body` as one text: line continuations joined, `{{`
+/// Returns the string literals of the source `body` as one text: line continuations joined, `{{`
 /// and `}}` as single braces, and every other `{…}` placeholder replaced by `1`.
 fn literals_of(body: &str) -> String {
     let mut text = String::new();
