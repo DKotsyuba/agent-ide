@@ -425,6 +425,12 @@ impl Outbox {
         .flatten()
     }
 
+    /// Gives back a wake claimed by [`Self::claim_wake`] that sent nothing, so the idle period
+    /// keeps its one attempt.
+    pub fn unclaim_wake(&self, binding: &BindingRef) {
+        self.with_session(binding, |session| session.woken = false);
+    }
+
     /// Registers in-flight work under `key` that may produce a holding fact for `owner` by `until`,
     /// capturing the owner's current counters as the fact's fence epoch.
     ///

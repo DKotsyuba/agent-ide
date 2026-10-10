@@ -574,6 +574,9 @@ struct Ledger {
     /// Pending `job-ready` registrations (OUTBOX §3.2) by result reference, with the epoch the
     /// fact is fenced at; taken by the job's settlement or by a read through its own reference.
     deferred: BTreeMap<String, (super::outbox::DeferSpec, super::outbox::JobEpoch)>,
+    /// The session state each job started from (OUTBOX §3.1), by result reference, recorded when
+    /// the job first executes; only references still in `details` are kept.
+    started: BTreeMap<String, super::outbox::JobEpoch>,
 }
 impl Default for Ledger {
     /// Creates empty finite bookkeeping; no file or process work occurs.
@@ -592,6 +595,7 @@ impl Default for Ledger {
             handing_over: BTreeSet::new(),
             read_memory: BTreeMap::new(),
             deferred: BTreeMap::new(),
+            started: BTreeMap::new(),
         }
     }
 }
@@ -856,7 +860,14 @@ impl Shared {
             if !matches!(detail.reply, PeerReply::Pending { .. }) {
                 let owner = detail.binding.clone();
                 let final_reply = detail.reply.clone();
-                settled = Some((owner, final_reply, ledger.deferred.remove(reference)));
+                // A deferral made before the job started is fenced at the job's own start.
+                let deferred = ledger.deferred.remove(reference).map(|(spec, epoch)| {
+                    (
+                        spec,
+                        ledger.started.get(reference).copied().unwrap_or(epoch),
+                    )
+                });
+                settled = Some((owner, final_reply, deferred));
             }
         }
         if let Some((owner, final_reply, deferred)) = settled {
@@ -3395,6 +3406,7 @@ impl<'a> Worker<'a> {
             .ok()
             .and_then(|ledger| ledger.native_epoch.get(&binding).copied())
             .unwrap_or(0);
+        self.shared.note_job_started(&job.reference, &binding);
         // Mutating tools are refused before they reach edit preparation or process admission when
         // this activation is read-only. Every edit form shares the same tool and refusal path.
         let reader_refusal = if matches!(job.tool, AssistanceTool::Edit | AssistanceTool::Test)

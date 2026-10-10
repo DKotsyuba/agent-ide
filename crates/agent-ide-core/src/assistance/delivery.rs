@@ -290,9 +290,9 @@ fn test_fact(id: u64, result: &RunResult, owns_detail: bool) -> FactDraft {
 
 /// Builds the `edit-checked` draft of one single-file edit's project check (OUTBOX §3.3).
 ///
-/// Reported diagnostics are compiler output about the file, so their `new:` lines ride only
-/// reply-shaped carriers (`source_bearing`); hooks carry the counts summary alone. `reference` is
-/// the edit job's own result reference: reading it delivers the fact.
+/// Reported diagnostics become at most eight `new:` lines under the counts summary; the fact is
+/// never source-bearing, so every carrier keeps them. `reference` is the edit job's own result
+/// reference: reading it delivers the fact.
 fn edit_checked_fact(
     reference: &str,
     result: &EditResult,
@@ -345,7 +345,6 @@ fn edit_checked_fact(
             ("1 file, diagnostics unknown".to_owned(), None, false)
         }
     };
-    let source_bearing = detail.is_some() && failed;
     FactDraft {
         kind: FactKind::EditChecked,
         subject: bounded(
@@ -358,7 +357,9 @@ fn edit_checked_fact(
         detail_ref: Some(reference.to_owned()),
         failed,
         holds_turn: true,
-        source_bearing,
+        // Diagnostics name the file and the problem, never its source text (OUTBOX §2), so the
+        // `new:` lines ride every carrier, hooks, the Stop hold and the wake included.
+        source_bearing: false,
         fence_paths: vec![FencedPath {
             path: result.path.clone(),
             digest: None,
@@ -451,18 +452,32 @@ impl SessionOutbox for Shared {
             return false;
         };
         let owner = detail.binding.clone();
-        let epoch = self.outbox.current_epoch(&owner);
+        // The state the job started from (OUTBOX §3.1); a job still queued has not started, so
+        // the session's state now is the closest earlier bound.
+        let epoch = ledger
+            .started
+            .get(reference)
+            .copied()
+            .unwrap_or_else(|| self.outbox.current_epoch(&owner));
         if matches!(detail.reply, PeerReply::Pending { .. }) {
             ledger
                 .deferred
                 .insert(reference.to_owned(), (spec.clone(), epoch));
-            drop(ledger);
+            // Registered before the ledger is released: a settlement waits for the ledger, so it
+            // always finds and takes this registration (ledger before outbox, as everywhere).
             if !spec.approximate_given {
                 let until = tokio::time::Instant::now()
                     + Duration::from_millis(self.launcher.limits.operation_ms);
                 self.outbox
                     .begin_holding(reference, &owner, &spec.subject(), until);
             }
+            drop(ledger);
+            #[cfg(test)]
+            tests::DEFER_GAP.with(|gap| {
+                if let Some(gap) = gap.borrow().as_ref() {
+                    gap();
+                }
+            });
             return true;
         }
         let reply = detail.reply.clone();
@@ -542,14 +557,18 @@ async fn wake_session(
     binding: &BindingRef,
 ) -> Option<WakeOutcome> {
     let session_id = outbox.claim_wake(binding)?;
-    let reservation = outbox.reserve_facts(
+    let Some(reservation) = outbox.reserve_facts(
         binding,
         HandoffRequest {
             carrier: Carrier::Wake,
             budget: MAX_WAKE_BYTES - WAKE_TAIL.len() - WAKE_FRAME,
             holding_only: true,
         },
-    )?;
+    ) else {
+        // Another carrier took the fact meanwhile: no wake was sent, so none is spent.
+        outbox.unclaim_wake(binding);
+        return None;
+    };
     let lines = reservation
         .facts
         .iter()
@@ -576,6 +595,21 @@ async fn wake_session(
 }
 
 impl Shared {
+    /// Records the session state the job behind `reference` started from, once: the epoch its
+    /// `job-ready` fact is fenced at (OUTBOX §3.1). Records of results no longer retained go.
+    pub(super) fn note_job_started(&self, reference: &str, binding: &BindingRef) {
+        let epoch = self.outbox.current_epoch(binding);
+        if let Ok(mut ledger) = self.ledger.lock() {
+            let super::Ledger {
+                started, details, ..
+            } = &mut *ledger;
+            started.retain(|kept, _| details.contains_key(kept));
+            if details.contains_key(reference) {
+                started.entry(reference.to_owned()).or_insert(epoch);
+            }
+        }
+    }
+
     /// Schedules the idle wake (OUTBOX §8.4) of each of `recipients` whose agent is idle; the
     /// attempt runs after [`WAKE_GRACE`] and re-checks every condition then.
     pub(super) fn schedule_wake(&self, recipients: &[BindingRef]) {
@@ -743,6 +777,13 @@ impl super::WorkerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Test seam: runs on the calling thread right after `defer` released the ledger, the
+        /// moment a concurrent settlement of the job could land.
+        pub(super) static DEFER_GAP: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
 
     /// The target is the first named argument, bounded, with a fallback.
     #[test]
@@ -1327,6 +1368,117 @@ mod worker_tests {
         assert_eq!(handle.outbox().context_epoch(&owner), Some(1));
         handle.note_compaction(&owner);
         assert_eq!(handle.outbox().context_epoch(&owner), Some(2));
+    }
+
+    /// Review fix (OUTBOX §2, §3.3, §7): an edit check that found new diagnostics is not
+    /// source-bearing, so its `new:` lines reach the agent on the hook, the Stop hold and the
+    /// wake alike, never only as counts.
+    #[tokio::test]
+    async fn a_failed_edit_check_keeps_its_new_lines_on_every_carrier() {
+        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
+        let owner = bind(&bindings, "owner");
+        let handle = handle(bindings);
+        let shared = &*handle.shared;
+        shared.outbox.open(&owner);
+        shared.outbox.note_host_session(&owner, "owner");
+        let draft = edit_checked_fact(
+            "edit-ref",
+            &EditResult {
+                operation_id: "op-7".to_owned(),
+                path: "src/a.rs".to_owned(),
+                outcome: crate::changes::edit::EditOutcome::Replaced,
+                source_ref: None,
+            },
+            &EditDiagnostics::CurrentReported {
+                messages: vec!["expected `;`, found `}`".to_owned()],
+                delta: "1 new error".to_owned(),
+                truncated: false,
+            },
+        );
+        let push = || {
+            assert!(SessionOutbox::push(
+                shared,
+                std::slice::from_ref(&owner),
+                draft.clone(),
+                shared.outbox.current_epoch(&owner),
+            ));
+        };
+        let new_line = "  new: src/a.rs: expected `;`, found `}`";
+        push();
+        let hook = handle
+            .take_facts(&owner, Carrier::Hook, None, 4096, |_| true)
+            .expect("the hook carries the fact");
+        assert!(hook.contains(new_line), "{hook}");
+        push();
+        let hold = handle
+            .hold_turn(&owner, false, Some("owner"))
+            .await
+            .expect("the hold blocks with the fact");
+        assert!(hold.contains(new_line), "{hold}");
+        push();
+        shared.outbox.set_agent_state(&owner, AgentState::Idle);
+        let waker = FakeWaker {
+            outcome: WakeOutcome::Accepted,
+            woken: Mutex::default(),
+        };
+        assert_eq!(
+            wake_session(&shared.outbox, &shared.test_runs, &waker, &owner).await,
+            Some(WakeOutcome::Accepted)
+        );
+        let woken = waker.woken.lock().unwrap();
+        assert!(woken[0].1.contains(new_line), "{:?}", woken[0].1);
+    }
+
+    /// Review fix: a job that settles in the instant after `defer` released the ledger still
+    /// pushes its fact and leaves no holding work behind, so a later turn end is never held for
+    /// work that already finished.
+    #[tokio::test]
+    async fn a_job_settling_right_after_its_defer_leaves_nothing_in_flight() {
+        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
+        let owner = bind(&bindings, "owner");
+        let handle = handle(bindings);
+        let shared = handle.shared.clone();
+        shared.outbox.open(&owner);
+        plant(&handle, "r-9", &owner, pending("r-9"));
+        let settle = shared.clone();
+        tests::DEFER_GAP.with(|gap| {
+            *gap.borrow_mut() = Some(Box::new(move || {
+                settle.complete("r-9", answer(), None, None, 0);
+            }));
+        });
+        assert!(SessionOutbox::defer(&*shared, "r-9", read_spec()));
+        tests::DEFER_GAP.with(|gap| *gap.borrow_mut() = None);
+        assert!(
+            shared.outbox.holding_until(&owner).is_none(),
+            "no work stays in flight"
+        );
+        assert!(
+            shared.outbox.has_undelivered(&owner, true),
+            "the fact was pushed"
+        );
+    }
+
+    /// Review fix (OUTBOX §3.1): a deferred job's fact is fenced at the state the job started
+    /// from, not at the later defer, so an edit made while it ran labels its answer.
+    #[tokio::test]
+    async fn a_deferred_fact_is_fenced_at_the_job_start() {
+        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
+        let owner = bind(&bindings, "owner");
+        let handle = handle(bindings);
+        let shared = &*handle.shared;
+        shared.outbox.open(&owner);
+        plant(&handle, "r-5", &owner, pending("r-5"));
+        shared.note_job_started("r-5", &owner);
+        shared.outbox.note_edit(&owner, &["src/a.rs".to_owned()]);
+        assert!(SessionOutbox::defer(shared, "r-5", read_spec()));
+        shared.complete("r-5", answer(), None, None, 0);
+        let block = handle
+            .take_facts(&owner, Carrier::Reply, None, 4096, |_| true)
+            .expect("the fact");
+        assert!(
+            block.contains("job-ready ide.read src/a.rs: ready (files changed since)"),
+            "{block}"
+        );
     }
 
     /// Probe Q1: Claude overrides a ninth consecutive Stop block, so a session's turn ends are
