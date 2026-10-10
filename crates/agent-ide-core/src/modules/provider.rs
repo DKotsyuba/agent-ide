@@ -173,7 +173,7 @@ pub trait ProviderBuilder: Send + 'static {
         let _ = snapshot;
     }
 
-    /// Whether a context answer first waits (at most [`DIAGNOSTICS_WAIT`], within the request's
+    /// Whether a context answer first waits (at most `DIAGNOSTICS_WAIT`, within the request's
     /// budget) for the provider's diagnostics of the synchronized text, as the language's
     /// in-process backend does: by default every context does; a language that waits only for
     /// the whole-file read (the post-edit diagnostic read) answers `whole_file`.
