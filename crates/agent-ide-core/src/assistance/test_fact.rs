@@ -295,7 +295,10 @@ mod tests {
     use std::{path::PathBuf, time::Duration};
 
     use super::*;
-    use crate::lang::{TestFailure, TestReport};
+    use crate::{
+        assistance::outbox::{FactDraft, FactKind},
+        lang::{TestFailure, TestReport},
+    };
 
     /// A settled run with the given counts and failures, one second long, rerunnable as
     /// `cargo test`, owning a retained output.
@@ -330,8 +333,21 @@ mod tests {
         }
     }
 
-    /// Every fact stays in budget, has one summary line and ends with the rerun line.
+    /// Every fact stays in budget, has one summary line and ends with the rerun line, and the
+    /// session outbox accepts it as a `test-finished` draft the way M-026 builds one.
     fn assert_in_contract(fact: &TerminalFact) {
+        let draft = FactDraft {
+            kind: FactKind::TestFinished,
+            subject: "tests #3".to_owned(),
+            summary: fact.summary.clone(),
+            detail: Some(fact.detail.clone()),
+            detail_ref: Some("ref-3".to_owned()),
+            failed: true,
+            holds_turn: true,
+            source_bearing: false,
+            fence_paths: Vec::new(),
+        };
+        assert_eq!(draft.validate(), Ok(()), "{fact:?}");
         assert!(fact.summary.len() <= MAX_SUMMARY_BYTES, "{fact:?}");
         assert!(!fact.summary.contains('\n'), "{fact:?}");
         assert!(
