@@ -10,11 +10,13 @@
 //! adapter for, and runs itself. The module never spawns a check and never writes.
 
 use std::{
+    collections::BTreeMap,
     io,
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
 };
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use agent_ide_core::{
@@ -23,16 +25,17 @@ use agent_ide_core::{
         BoxFuture, LanguageChecks,
         runner::{ConfinedRunner, RunOutput, RunSpec},
     },
-    intelligence::server::LanguageServer,
+    intelligence::{server::LanguageServer, session::ProviderSettings},
     modules::{
         adapter::SupportServer,
-        contract::{Capability, CapabilityDecl, Declaration, ErrorCode, Role, Support},
+        contract::{Capability, CapabilityDecl, Declaration, ErrorCode, HelloOffer, Role, Support},
         payload::{
             Arg, CheckPlanRequest, ChecksDescription, DeclaredExecutable, DescribeQuery,
             EffectOutcome, EffectRecipe, EffectRequest, EnvRule, ExecutableSlot, LaunchDescription,
             NamedProgram, Param, PathRole, PathRule, RecipeAsset, RunClass, SlotSource, Stdin,
             decode, encode,
         },
+        provider::{ProviderBuilder, ProviderLaunchPlan, ProviderServer},
         serve::{Answer, Effects, Incoming, ModuleServer, ServeError, serve_stdio},
         wire::Attachment,
     },
@@ -41,7 +44,150 @@ use agent_ide_core::{
 use crate::{
     backend::TypeScriptServer,
     checks::{ProjectTypeScriptChecksConfig, TypeScriptChecker, TypeScriptChecks},
+    profile::{
+        ModuleSessionProfile, TypeScriptBundleFileV1, TypeScriptProviderBundleV1,
+        TypeScriptProviderBundleV1Identity,
+    },
 };
+
+/// One accepted file of the bridge bundle as the core hands it to the analyzer module.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedFile {
+    /// Absolute accepted path.
+    pub path: PathBuf,
+    /// Its accepted BLAKE3 digest, hex.
+    pub blake3: String,
+    /// Its exact accepted byte length.
+    pub bytes: u64,
+}
+
+impl AcceptedFile {
+    /// The bundle member this file names.
+    fn member(&self) -> io::Result<TypeScriptBundleFileV1> {
+        Ok(TypeScriptBundleFileV1 {
+            path: self.path.clone(),
+            blake3: digest(&self.blake3)?,
+            bytes: self.bytes,
+        })
+    }
+
+    /// The file `member` measured as.
+    fn of(member: &TypeScriptBundleFileV1) -> Self {
+        Self {
+            path: member.path.clone(),
+            blake3: member.blake3.to_hex().to_string(),
+            bytes: member.bytes,
+        }
+    }
+}
+
+/// A hex BLAKE3 digest, or the configuration refusal.
+fn digest(hex: &str) -> io::Result<blake3::Hash> {
+    blake3::Hash::from_hex(hex)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "typescript digest"))
+}
+
+/// The launcher-accepted bridge bundle the core hands its analyzer module
+/// (`hello.config.provider.settings`); the module re-measures every file before it starts the
+/// bridge. Project resolution stays with the core, which admits each document before asking.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnalyzerSettings {
+    /// Accepted Node executable.
+    pub node: PathBuf,
+    /// Its accepted BLAKE3 digest, hex.
+    pub node_digest: String,
+    /// Accepted Node release identity.
+    pub node_version: String,
+    /// Accepted bridge entry module.
+    pub bridge: AcceptedFile,
+    /// Accepted bridge release identity.
+    pub bridge_version: String,
+    /// Accepted `tsserver.js`.
+    pub tsserver: AcceptedFile,
+    /// Accepted TypeScript release identity.
+    pub typescript_version: String,
+    /// The accepted runtime closure, strictly sorted.
+    pub closure: Vec<AcceptedFile>,
+    /// The bridge's private temporary directory (the core created it).
+    pub tmp: PathBuf,
+}
+
+impl AnalyzerSettings {
+    /// The settings that grant `bundle`, its bridge running with `tmp` as its temporary directory.
+    pub fn of(bundle: &TypeScriptProviderBundleV1, tmp: PathBuf) -> Self {
+        let identity = bundle.identity();
+        Self {
+            node: identity.node.clone(),
+            node_digest: identity.node_blake3.to_hex().to_string(),
+            node_version: identity.node_version.clone(),
+            bridge: AcceptedFile::of(&identity.bridge),
+            bridge_version: identity.bridge_version.clone(),
+            tsserver: AcceptedFile::of(&identity.tsserver),
+            typescript_version: identity.typescript_version.clone(),
+            closure: identity.closure.iter().map(AcceptedFile::of).collect(),
+            tmp,
+        }
+    }
+
+    /// Every file the module may load, with its digest: the core grants exactly these.
+    pub fn accepted(&self) -> Vec<(PathBuf, String)> {
+        std::iter::once((self.node.clone(), self.node_digest.clone()))
+            .chain(
+                std::iter::once(&self.bridge)
+                    .chain(std::iter::once(&self.tsserver))
+                    .chain(&self.closure)
+                    .map(|file| (file.path.clone(), file.blake3.clone())),
+            )
+            .collect()
+    }
+
+    /// The measured bundle: every file must still match what the core accepted.
+    fn bundle(&self) -> io::Result<TypeScriptProviderBundleV1> {
+        TypeScriptProviderBundleV1::new(TypeScriptProviderBundleV1Identity {
+            node: self.node.clone(),
+            node_blake3: digest(&self.node_digest)?,
+            node_version: self.node_version.clone(),
+            bridge: self.bridge.member()?,
+            bridge_version: self.bridge_version.clone(),
+            tsserver: self.tsserver.member()?,
+            typescript_version: self.typescript_version.clone(),
+            closure: self
+                .closure
+                .iter()
+                .map(AcceptedFile::member)
+                .collect::<io::Result<_>>()?,
+        })
+        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "typescript bundle refused"))
+    }
+}
+
+/// Plans the bridge session exactly as the in-process backend starts it: `node <bridge> --stdio`
+/// with a private temporary directory and nothing else in its environment.
+struct Host;
+
+impl ProviderBuilder for Host {
+    fn plan(
+        &self,
+        _worktree: &Path,
+        settings: &Value,
+    ) -> io::Result<(ProviderSettings, ProviderLaunchPlan)> {
+        let settings: AnalyzerSettings = serde_json::from_value(settings.clone())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "typescript settings"))?;
+        let bundle = settings.bundle()?;
+        let plan = ProviderLaunchPlan {
+            program: settings.node.clone(),
+            args: vec![bundle.bridge().display().to_string(), "--stdio".to_owned()],
+            env: BTreeMap::from([("TMPDIR".to_owned(), settings.tmp.display().to_string())]),
+            reads: vec![bundle.bridge().to_path_buf()],
+        };
+        Ok((
+            ProviderSettings::new(ModuleSessionProfile::new(bundle.tsserver().to_path_buf())),
+            plan,
+        ))
+    }
+}
 
 /// The embedded compiler adapter, staged by the core in the private cache before each run.
 const ADAPTER: &[u8] = include_bytes!("typescript_adapter.js");
@@ -500,16 +646,17 @@ impl ModuleServer for CheckerServer {
     }
 }
 
-/// The analyzer role: the language's support and the launcher `describe` answers.
+/// The analyzer role: the language's support, the launcher `describe` answers and the bridge
+/// session the core granted.
 struct AnalyzerServer {
-    /// The language's support, for every other capability.
-    support: SupportServer,
+    /// The language's support and its hosted bridge, for every other capability.
+    provider: ProviderServer<Host>,
 }
 
 impl ModuleServer for AnalyzerServer {
-    /// The support declaration plus `describe`.
+    /// The provider's declaration plus `describe`.
     fn declaration(&self) -> Declaration {
-        let mut declaration = self.support.declaration();
+        let mut declaration = self.provider.declaration();
         for decl in &mut declaration.capabilities {
             if decl.capability == Capability::Describe {
                 *decl = CapabilityDecl::v0(decl.capability, Support::Supported);
@@ -518,7 +665,16 @@ impl ModuleServer for AnalyzerServer {
         declaration
     }
 
-    /// `describe` answers the launcher questions; everything else is the language's own support.
+    /// Keeps the granted bridge launch (and starts it) as the provider server does.
+    fn hello(
+        &mut self,
+        offer: &HelloOffer,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        self.provider.hello(offer)
+    }
+
+    /// `describe` answers the launcher questions; everything else is the language's own support
+    /// or the hosted bridge.
     async fn call<'a>(
         &'a mut self,
         request: Incoming,
@@ -526,7 +682,7 @@ impl ModuleServer for AnalyzerServer {
     ) -> Result<Answer, ServeError> {
         match request.capability {
             Capability::Describe => Ok(describe(&request)),
-            _ => self.support.call(request, effects).await,
+            _ => self.provider.call(request, effects).await,
         }
     }
 }
@@ -540,7 +696,10 @@ impl ModuleServer for AnalyzerServer {
 pub async fn serve(role: Role) -> Result<(), ServeError> {
     let support = SupportServer::new(crate::LANGUAGE, env!("CARGO_PKG_VERSION"));
     match role {
-        Role::Analyzer => serve_stdio(AnalyzerServer { support }, role).await,
+        Role::Analyzer => {
+            let provider = ProviderServer::new(support, Host);
+            serve_stdio(AnalyzerServer { provider }, role).await
+        }
         Role::Checker => serve_stdio(CheckerServer { support }, role).await,
     }
 }

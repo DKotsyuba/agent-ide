@@ -153,6 +153,11 @@ impl TypeScriptProviderBundleV1 {
         }
     }
 
+    /// Returns the complete accepted identity this bundle was measured against.
+    pub fn identity(&self) -> &TypeScriptProviderBundleV1Identity {
+        &self.identity
+    }
+
     /// Returns the exact accepted Node executable used by the controlled command.
     pub fn node(&self) -> &Path {
         &self.identity.node
@@ -396,12 +401,7 @@ impl TypeScriptProfile {
         }
         self.bundle.verify()?;
         self.resolution.verify(path_proof)?;
-        let namespace = self
-            .cache_namespace
-            .file_name()
-            .ok_or(TypeScriptProfileError::InvalidProfile)?;
-        let temp = std::env::temp_dir().join(namespace).join("tmp");
-        std::fs::create_dir_all(&temp).map_err(|_| TypeScriptProfileError::InvalidProfile)?;
+        let temp = self.private_temp()?;
         let command = ControlledCommand::from_validated_peer(
             CommandKind::Provider,
             self.bundle.node().to_path_buf(),
@@ -417,6 +417,17 @@ impl TypeScriptProfile {
             .has_program_digest(&self.bundle.identity.node_blake3)
             .then_some(command)
             .ok_or(TypeScriptProfileError::InvalidBundle)
+    }
+
+    /// The bridge's private temporary directory, created: `<host temp>/<cache namespace id>/tmp`.
+    pub fn private_temp(&self) -> Result<PathBuf, TypeScriptProfileError> {
+        let namespace = self
+            .cache_namespace
+            .file_name()
+            .ok_or(TypeScriptProfileError::InvalidProfile)?;
+        let temp = std::env::temp_dir().join(namespace).join("tmp");
+        std::fs::create_dir_all(&temp).map_err(|_| TypeScriptProfileError::InvalidProfile)?;
+        Ok(temp)
     }
 
     /// Remeasures the complete immutable provider bundle at the final profile boundary.
@@ -435,17 +446,7 @@ impl TypeScriptProfile {
     /// Returns fixed initialization options disabling typing acquisition, plugins, package auto
     /// imports, syntax servers, logs, and traces while selecting only the accepted `tsserver.js`.
     pub fn initialization_options(&self) -> serde_json::Value {
-        serde_json::json!({
-            "disableAutomaticTypingAcquisition": true,
-            "plugins": [],
-            "preferences": {"includePackageJsonAutoImports": "off"},
-            "tsserver": {
-                "path": self.bundle.tsserver().display().to_string(),
-                "useSyntaxServer": "never",
-                "logVerbosity": "off",
-                "trace": "off"
-            }
-        })
+        initialization_options(self.bundle.tsserver())
     }
 
     /// Returns the stable exact-profile key, including worktree and resolution identities.
@@ -468,33 +469,76 @@ impl TypeScriptProfile {
     }
 }
 
-impl agent_ide_core::intelligence::session::SessionProfile for TypeScriptProfile {
-    /// Answers configuration requests with the fixed initialization options.
-    fn workspace_configuration(&self) -> serde_json::Value {
-        self.initialization_options()
-    }
+/// The fixed initialization options for a bridge selecting only `tsserver`.
+fn initialization_options(tsserver: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "disableAutomaticTypingAcquisition": true,
+        "plugins": [],
+        "preferences": {"includePackageJsonAutoImports": "off"},
+        "tsserver": {
+            "path": tsserver.display().to_string(),
+            "useSyntaxServer": "never",
+            "logVerbosity": "off",
+            "trace": "off"
+        }
+    })
+}
 
-    /// Accepts an omitted identity or one named `typescript-language-server`.
-    fn accepts_server(&self, info: Option<&async_lsp::lsp_types::ServerInfo>) -> bool {
-        info.is_none_or(|info| info.name == "typescript-language-server")
-    }
+/// Implements [`SessionProfile`] for a profile whose only variable is its `tsserver` path: the
+/// in-process [`TypeScriptProfile`] and the analyzer module's [`ModuleSessionProfile`] speak to
+/// the same bridge the same way.
+macro_rules! typescript_session_profile {
+    ($profile:ty, |$this:ident| $tsserver:expr) => {
+        impl agent_ide_core::intelligence::session::SessionProfile for $profile {
+            /// Answers configuration requests with the fixed initialization options.
+            fn workspace_configuration(&self) -> serde_json::Value {
+                let $this = self;
+                initialization_options($tsserver)
+            }
 
-    /// The bridge pushes unversioned diagnostics; a diagnostics wait never exceeds two seconds.
-    fn diagnostic_wait_cap(&self) -> Option<Duration> {
-        Some(Duration::from_secs(2))
-    }
+            /// Accepts an omitted identity or one named `typescript-language-server`.
+            fn accepts_server(&self, info: Option<&async_lsp::lsp_types::ServerInfo>) -> bool {
+                info.is_none_or(|info| info.name == "typescript-language-server")
+            }
 
-    /// A nonempty unversioned push after the initial open describes the opened bytes.
-    fn accepts_unversioned_initial_report(&self) -> bool {
-        true
-    }
+            /// The bridge pushes unversioned diagnostics; a diagnostics wait never exceeds two
+            /// seconds.
+            fn diagnostic_wait_cap(&self) -> Option<Duration> {
+                Some(Duration::from_secs(2))
+            }
 
-    /// Opens `.js`/`.jsx`/`.ts`/`.tsx` with their exact identifiers; everything else (including
-    /// `.mts`/`.cts`/`.mjs`/`.cjs`) stays `plaintext`.
-    fn language_id(&self, path: &Path) -> &'static str {
-        typescript_language_id(path).unwrap_or("plaintext")
+            /// A nonempty unversioned push after the initial open describes the opened bytes.
+            fn accepts_unversioned_initial_report(&self) -> bool {
+                true
+            }
+
+            /// Opens `.js`/`.jsx`/`.ts`/`.tsx` with their exact identifiers; everything else
+            /// (including `.mts`/`.cts`/`.mjs`/`.cjs`) stays `plaintext`.
+            fn language_id(&self, path: &Path) -> &'static str {
+                typescript_language_id(path).unwrap_or("plaintext")
+            }
+        }
+    };
+}
+
+typescript_session_profile!(TypeScriptProfile, |profile| profile.bundle.tsserver());
+
+/// The session behaviour of the analyzer module's bridge, which has no project resolution of its
+/// own: the core observed it and granted the accepted bundle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModuleSessionProfile {
+    /// The accepted `tsserver.js` the bridge selects.
+    tsserver: PathBuf,
+}
+
+impl ModuleSessionProfile {
+    /// The profile selecting `tsserver`.
+    pub fn new(tsserver: PathBuf) -> Self {
+        Self { tsserver }
     }
 }
+
+typescript_session_profile!(ModuleSessionProfile, |profile| &profile.tsserver);
 
 /// Couples one canonical worktree incarnation to its exact Execution authority.
 #[derive(Clone, Debug, Eq, PartialEq)]

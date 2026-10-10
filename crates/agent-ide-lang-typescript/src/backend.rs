@@ -529,6 +529,34 @@ struct TypeScriptLive {
     inputs: Box<ProjectResolutionInputsV1>,
     /// Transport driver and synchronized document state.
     live: LiveSession,
+    /// The accepted inputs (module executable digest and settings) a module session started
+    /// with, against which its failures count; `None` when the bridge runs in process.
+    module_inputs: Option<String>,
+}
+
+/// Counts one failure of a TypeScript analyzer module started with `inputs` against the shared
+/// restart policy (`exited` when no typed failure is known).
+fn record_module_failure(
+    worktree: &Path,
+    inputs: &str,
+    failure: Option<agent_ide_core::modules::contract::ModuleUnavailable>,
+) {
+    use agent_ide_core::modules::contract::{Cause, ModuleId, ModuleUnavailable, Role, Stage};
+    let failure = failure.unwrap_or(ModuleUnavailable {
+        module_id: ModuleId::bundled(crate::DESCRIPTOR.id),
+        module_version: env!("CARGO_PKG_VERSION").to_owned(),
+        role: Role::Analyzer,
+        stage: Stage::Request,
+        cause: Cause::Exited,
+        instance: None,
+        retry_after_ms: None,
+    });
+    agent_ide_core::modules::analyzer::record_failure(
+        crate::DESCRIPTOR.id,
+        worktree,
+        inputs,
+        &failure,
+    );
 }
 
 /// Exclusive TypeScript generations, the owner-lifetime profile quarantine and every binding's
@@ -595,6 +623,19 @@ impl TypeScriptBackend {
             return Err(FailureCode::ExecutionProfile);
         }
         let binding = job.binding().clone();
+        // In module mode the bridge runs in the analyzer module; the project inputs, view and
+        // quarantine stay with the core either way.
+        let module = match agent_ide_core::modules::calls::module_executable(crate::LANGUAGE) {
+            None => None,
+            Some(Ok(executable)) => Some(executable),
+            Some(Err(failure)) => {
+                job.set_stage_failure(
+                    &FailureCode::ProviderUnavailable,
+                    &format!("typescript: {failure}"),
+                );
+                return Err(FailureCode::ProviderUnavailable);
+            }
+        };
         let authority = host.authority(&binding).await?;
         let cache_namespace = host.cache_namespace(&binding, &authority, launch, &launch.trust)?;
         let bundle = launch
@@ -625,6 +666,17 @@ impl TypeScriptBackend {
         {
             return Ok(());
         }
+        // A module session that died counts against the shared restart policy.
+        if let Some(entry) = self.live.get(&binding)
+            && let Some(inputs) = &entry.module_inputs
+            && !entry.live.is_alive()
+        {
+            record_module_failure(
+                authority.worktree().worktree_path(),
+                inputs,
+                entry.live.module_unavailable(),
+            );
+        }
         self.release(host, &binding).await;
         let profile = match TypeScriptProfile::new(
             bundle,
@@ -644,6 +696,8 @@ impl TypeScriptBackend {
             server::execution_authority(&authority)?,
         )
         .map_err(|_| FailureCode::WorkspaceAuthority)?;
+        // The bridge's own command also remeasures the bundle and the project inputs, so the
+        // module is never asked on a changed project.
         let command = match profile.command(&worktree, &path_proof) {
             Ok(command) => command,
             Err(TypeScriptProfileError::InvalidResolution) => {
@@ -656,8 +710,62 @@ impl TypeScriptBackend {
             .options::<TypeScriptLaunchOptions>()
             .and_then(|options| options.node.as_ref())
             .ok_or(FailureCode::ExecutionProfile)?;
+        // The same accepted bundle, handed to the analyzer module that starts the bridge.
+        let settings = match &module {
+            Some(_) => Some(crate::module::AnalyzerSettings::of(
+                &launch
+                    .typescript_bundle()
+                    .map_err(|_| FailureCode::ExecutionProfile)?,
+                profile
+                    .private_temp()
+                    .map_err(|_| FailureCode::ExecutionProfile)?,
+            )),
+            None => None,
+        };
+        let module_inputs = module
+            .as_ref()
+            .zip(settings.as_ref())
+            .map(|(executable, settings)| {
+                format!(
+                    "{}:{}",
+                    executable.digest.to_hex(),
+                    serde_json::json!(settings)
+                )
+            });
+        if let Some(inputs) = &module_inputs
+            && let Err(failure) = agent_ide_core::modules::analyzer::start_permit(
+                crate::DESCRIPTOR.id,
+                authority.worktree().worktree_path(),
+                inputs,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+        {
+            job.set_stage_failure(
+                &FailureCode::ProviderUnavailable,
+                &format!("typescript: {failure}"),
+            );
+            return Err(FailureCode::ProviderUnavailable);
+        }
+        let module_program = module.as_ref().map(|executable| AcceptedExecutable {
+            path: executable.path.clone(),
+            identity: "agent-ide-module".to_owned(),
+            blake3: executable.digest.to_hex().to_string(),
+        });
+        let (command, program) = match (&module, &module_program) {
+            (Some(executable), Some(program)) => (
+                agent_ide_core::modules::analyzer::analyzer_command(
+                    executable,
+                    crate::DESCRIPTOR.id,
+                    worktree.worktree(),
+                )
+                .ok_or(FailureCode::ExecutionProfile)?,
+                program,
+            ),
+            _ => (command, node),
+        };
         let request = host
-            .execution_request(&*job, &authority, command, node)
+            .execution_request(&*job, &authority, command, program)
             .await?;
         let active = host.active(&binding)?;
         let view = {
@@ -734,20 +842,51 @@ impl TypeScriptBackend {
         let generation = view.generation();
         let opened = match child.take_pipes() {
             Some((stdin, stdout)) => {
-                let open = LiveSession::open(
-                    stdout,
-                    stdin,
-                    source.worktree().clone(),
-                    source.authority_epoch(),
-                    ViewGeneration {
-                        backend: generation,
-                        configuration: 1,
-                        toolchain: 1,
-                        view: generation,
-                    },
-                    ProviderSettings::new(profile.clone()),
-                    Duration::from_secs(30),
-                );
+                let generation = ViewGeneration {
+                    backend: generation,
+                    configuration: 1,
+                    toolchain: 1,
+                    view: generation,
+                };
+                let open = async {
+                    match (&module, &settings) {
+                        (Some(executable), Some(settings)) => {
+                            let offer = agent_ide_core::modules::analyzer::analyzer_offer(
+                                executable,
+                                crate::DESCRIPTOR.id,
+                                generation.backend,
+                                source.worktree(),
+                                settings.accepted(),
+                                vec![settings.tmp.clone()],
+                                Duration::from_secs(30),
+                                serde_json::json!(settings),
+                            );
+                            agent_ide_core::modules::analyzer::open_session(
+                                stdout,
+                                stdin,
+                                offer,
+                                source.worktree().clone(),
+                                source.authority_epoch(),
+                                generation,
+                                ProviderSettings::new(profile.clone()),
+                                agent_ide_core::modules::router::budget_or(Duration::from_secs(30)),
+                            )
+                            .await
+                        }
+                        _ => {
+                            LiveSession::open(
+                                stdout,
+                                stdin,
+                                source.worktree().clone(),
+                                source.authority_epoch(),
+                                generation,
+                                ProviderSettings::new(profile.clone()),
+                                Duration::from_secs(30),
+                            )
+                            .await
+                        }
+                    }
+                };
                 tokio::pin!(open);
                 tokio::select! { result = &mut open => result, _ = job.cancel().changed() => Err(std::io::Error::other("cancelled")), }
             }
@@ -762,19 +901,38 @@ impl TypeScriptBackend {
                         view,
                         inputs: Box::new(inputs),
                         live,
+                        module_inputs,
                     },
                 );
                 Ok(())
             }
-            Err(_) => {
-                self.reap(host, &binding, child, view, false).await;
+            Err(error) => {
+                self.reap(host, &binding, child, view, false, module.is_some())
+                    .await;
                 if job.cancelled() {
                     Err(FailureCode::Cancelled)
                 } else {
-                    job.set_stage_failure(
-                        &FailureCode::ProviderUnavailable,
-                        "typescript: initialize failed",
-                    );
+                    let typed = error
+                        .get_ref()
+                        .and_then(|inner| {
+                            inner.downcast_ref::<agent_ide_core::modules::contract::ModuleUnavailable>()
+                        })
+                        .cloned();
+                    let stage = match &module_inputs {
+                        Some(inputs) => {
+                            record_module_failure(
+                                authority.worktree().worktree_path(),
+                                inputs,
+                                typed.clone(),
+                            );
+                            typed.map_or_else(
+                                || "typescript: initialize failed".to_owned(),
+                                |failure| format!("typescript: {failure}"),
+                            )
+                        }
+                        None => "typescript: initialize failed".to_owned(),
+                    };
+                    job.set_stage_failure(&FailureCode::ProviderUnavailable, &stage);
                     Err(FailureCode::ProviderUnavailable)
                 }
             }
@@ -801,7 +959,26 @@ impl TypeScriptBackend {
         self.ensure(host, job, launch, source).await?;
         let (result, diagnostics) = {
             let entry = self.live.get_mut(&binding).ok_or(FailureCode::Internal)?;
-            server::exchange_context(&mut entry.live, job, source, bytes, query, true).await
+            let (result, diagnostics) =
+                server::exchange_context(&mut entry.live, job, source, bytes, query, true).await;
+            // A module fault is a typed refusal naming it, never a quiet lexical answer; the
+            // next call starts a fresh module.
+            if let Some(fault) = entry.live.remote_fault().map(str::to_owned) {
+                if let Some(inputs) = &entry.module_inputs {
+                    record_module_failure(
+                        source.worktree().worktree_path(),
+                        inputs,
+                        entry.live.module_unavailable(),
+                    );
+                }
+                self.release(host, &binding).await;
+                job.set_stage_failure(
+                    &FailureCode::ProviderUnavailable,
+                    &format!("typescript: {fault}"),
+                );
+                return Err(FailureCode::ProviderUnavailable);
+            }
+            (result, diagnostics)
         };
         let context = match result {
             Ok(context) => context,
@@ -879,12 +1056,23 @@ impl TypeScriptBackend {
     /// Shuts down and reaps `binding`'s bridge session, if any.
     async fn release(&mut self, host: &mut dyn ProviderHost, binding: &BindingRef) {
         if let Some(TypeScriptLive {
-            child, view, live, ..
+            child,
+            view,
+            live,
+            module_inputs,
+            ..
         }) = self.live.remove(binding)
         {
             let shutdown_completed = live.shutdown().await;
-            self.reap(host, binding, child, view, shutdown_completed)
-                .await;
+            self.reap(
+                host,
+                binding,
+                child,
+                view,
+                shutdown_completed,
+                module_inputs.is_some(),
+            )
+            .await;
         }
     }
 
@@ -903,12 +1091,17 @@ impl TypeScriptBackend {
         mut child: TypeScriptProtocolChild,
         view: TypeScriptView,
         shutdown_completed: bool,
+        hosted: bool,
     ) {
         let result = if shutdown_completed {
             match child.wait_for_exit(Duration::from_secs(1)).await {
                 Ok(waited) => {
-                    self.profiles
-                        .quarantine_after_unsuccessful_wait(&view, &waited);
+                    // A module's exit is the shared restart policy's to count; only an
+                    // in-process bridge's nonzero exit quarantines its exact profile.
+                    if !hosted {
+                        self.profiles
+                            .quarantine_after_unsuccessful_wait(&view, &waited);
+                    }
                     child.finish_reap(waited, Duration::from_millis(500)).await
                 }
                 Err(_) => {
