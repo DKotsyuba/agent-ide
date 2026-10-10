@@ -18,13 +18,13 @@ use super::super::{
     outbox::FencedPath,
     outbox::{
         DeferSpec, FactDraft, FactKind, HandoffRequest, JobEpoch, MAX_FACT_BYTES,
-        MAX_SUBJECT_BYTES, MAX_SUMMARY_BYTES, MAX_TARGET_BYTES, MAX_TEST_FACT_BYTES, Reservation,
-        SessionOutbox,
+        MAX_SUBJECT_BYTES, MAX_SUMMARY_BYTES, MAX_TARGET_BYTES, Reservation, SessionOutbox,
     },
     reply::{EditDiagnostics, PeerReply},
+    test_fact::terminal_fact,
     tests::RunResult,
 };
-use super::{INLINE_REPLY_WAIT, Job, JobStage, Shared, Worker, edit_operation, test_result_text};
+use super::{INLINE_REPLY_WAIT, Job, JobStage, Shared, Worker, edit_operation};
 use crate::changes::edit::EditResult;
 
 /// Slack added to a run's budget before its holding registration expires: settlement, output
@@ -142,39 +142,15 @@ fn job_fact(reference: &str, reply: &PeerReply, spec: &DeferSpec) -> FactDraft {
 
 /// Builds the `test-finished` draft of settled run `id` for one recipient.
 ///
-/// ponytail: substitute for M-024's `terminal_fact` (`M024-M026-TEST-FACT` r3): it splits the
-/// settled reply text into summary and detail and cuts it to the r3 budget; replace with
-/// `terminal_fact` once that lands on the integration branch.
+/// The text is M-024's [`terminal_fact`] (`M024-M026-TEST-FACT` r3): a summary of at most 256
+/// bytes plus a detail that stays inside the `test-finished` budget, rendered verbatim.
 fn test_fact(id: u64, result: &RunResult, owns_detail: bool) -> FactDraft {
-    let text = test_result_text(id, result, owns_detail, false);
-    let mut lines = text.lines();
-    let first = lines.next().unwrap_or_default();
-    let prefix = format!("{}: ", test_subject(id));
-    let summary = bounded(
-        first.strip_prefix(&prefix).unwrap_or(first),
-        MAX_SUMMARY_BYTES,
-        false,
-    );
-    let mut detail = String::new();
-    for line in lines {
-        let line = bounded(line, MAX_SUMMARY_BYTES, false);
-        if summary.len() + detail.len() + line.len() + 1 > MAX_TEST_FACT_BYTES {
-            break;
-        }
-        if !detail.is_empty() {
-            detail.push('\n');
-        }
-        detail.push_str(&line);
-    }
+    let fact = terminal_fact(id, result, owns_detail);
     FactDraft {
         kind: FactKind::TestFinished,
         subject: test_subject(id),
-        summary: if summary.trim().is_empty() {
-            "settled".to_owned()
-        } else {
-            summary
-        },
-        detail: (!detail.is_empty()).then_some(detail),
+        summary: fact.summary,
+        detail: Some(fact.detail),
         detail_ref: owns_detail.then(|| result.detail_ref.clone()),
         failed: result.report.failed > 0 || result.stopped || result.exit != Some(0),
         holds_turn: true,
@@ -556,6 +532,55 @@ mod tests {
             call_target(AssistanceTool::Read, &serde_json::json!({ "path": long })).len(),
             MAX_TARGET_BYTES
         );
+    }
+
+    /// A settled run becomes a `test-finished` draft that is exactly M-024's terminal text, valid
+    /// for the outbox, with the owner's reference named once and none for a subscriber.
+    #[test]
+    fn test_fact_is_the_terminal_text_of_the_run() {
+        let result = RunResult {
+            report: crate::lang::TestReport {
+                passed: 2,
+                failed: 1,
+                ignored: 0,
+                failures: vec![crate::lang::TestFailure {
+                    name: "tests::fails".to_owned(),
+                    location: None,
+                    message: "boom".to_owned(),
+                }],
+                incomplete: false,
+            },
+            output: "output\n".to_owned(),
+            output_paged: false,
+            elapsed: Duration::from_secs(3),
+            stopped: false,
+            exit: Some(101),
+            budget: Duration::from_secs(120),
+            detail_ref: "run-detail".to_owned(),
+            command: vec!["cargo".to_owned(), "test".to_owned()],
+            rerun_dir: None,
+            environment_label: None,
+        };
+        let owner = test_fact(7, &result, true);
+        let expected = terminal_fact(7, &result, true);
+        assert_eq!(owner.summary, "2 passed, 1 failed, 3 s");
+        assert_eq!(owner.detail.as_deref(), Some(expected.detail.as_str()));
+        assert_eq!(owner.subject, "tests #7");
+        assert!(owner.failed && owner.holds_turn && !owner.source_bearing);
+        assert_eq!(owner.detail_ref.as_deref(), Some("run-detail"));
+        assert_eq!(owner.validate(), Ok(()));
+        assert_eq!(
+            owner
+                .detail
+                .as_deref()
+                .unwrap()
+                .matches("run-detail")
+                .count(),
+            1
+        );
+        let subscriber = test_fact(7, &result, false);
+        assert_eq!(subscriber.detail_ref, None);
+        assert!(!subscriber.detail.unwrap().contains("run-detail"));
     }
 
     /// Source-bearing answers carry no text in their fact; failures carry their first line.
