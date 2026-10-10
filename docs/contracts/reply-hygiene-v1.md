@@ -44,6 +44,7 @@ tests #N: <summary>
   FAIL <name>
        <file>:<line>  <message>
   (+K more failed tests in the full output)
+  <one line per target of a several-target run, at most 160 bytes each>
   rerun: <command>
   full output: ide.inspect <detail_ref>
 ```
@@ -53,8 +54,7 @@ tests #N: <summary>
 | counts parsed | `P passed, F failed, S s` |
 | stopped at its budget | `stopped at budget B s — P passed, F failed so far` |
 | non-zero exit, no counts | `no test results (exit C), S s — runner said: <excerpt, at most 200 bytes>` |
-| no counts, zero exit, summary expected | `no summary parsed, S s` |
-| explicit command, no known summary | `exit C, S s`; `detail` adds `output (tail):` and at most 10 lines and 1024 bytes of the output tail |
+| no recognised summary (only the exit status is known, whatever the status) | `exit C, S s` (`exit unknown` after a signal); `detail` adds `output (tail):` and at most 10 lines and 1024 bytes of the output tail |
 
 `S` is the whole seconds the finished run took: an outcome, not progress. An environment label,
 when the run has one, follows the summary as ` · env <label>`; the whole summary is cut on a
@@ -71,8 +71,9 @@ Rules (each one is a unit test):
 3. `full output: ide.inspect <detail_ref>` is present exactly when `owns_detail` and the run has a
    retained output.
 4. `summary` plus `detail` is at most 1536 bytes, the `test-finished` body limit of
-   session-outbox-v1 (§2, §3.4). When the text is longer, first drop the message lines from the
-   last `FAIL` entry backwards, then drop entries from the end (the `+K` count grows). Summary,
+   session-outbox-v1 (§2, §3.4). When the text is longer, first drop the quoted output lines,
+   then the target lines from the end, then the message lines from the last `FAIL` entry
+   backwards, then drop entries from the end (the `+K` count grows). Summary,
    `rerun:` and `full output:` are never dropped: they take at most 256 + 308 + about 100 bytes,
    which leaves about 870 bytes for `FAIL` entries.
 5. Every cut is on a UTF-8 character boundary. Control characters in runner-provided names,

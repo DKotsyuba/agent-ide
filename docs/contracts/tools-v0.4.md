@@ -10,7 +10,7 @@ Revision: v0.4. Provider: Agent IDE. Consumers: coding agents and IDE hosts.
 | `ide.edit` symbol operations (`replace`, `insert`, `delete`, `rename`) and `path` + `lines` range operation | implemented (landing now) |
 | Long-lived language server session for Rust | implemented |
 | `ide.start` project card | implemented (appended to the activation reply; no `ide.project`, no `not_a_project`; servers always `not started`) |
-| `ide.test` (`symbol` / `path` / `pattern` / `command` / `status` / `targets`, `budget_s`; one job per worktree; status line in the `<agent-ide>` block; full output paged through `ide.inspect`) | implemented (wire version 4, 11 tools) |
+| `ide.test` (`symbol` / `path` / `pattern` / `command` / `status` / `targets`, `budget_s`; one job per worktree; the outcome pushed once as a `test-finished` fact in the `<agent-ide>` block; full output paged through `ide.inspect`) | implemented (wire version 4, 11 tools) |
 | `ide.graph` (`symbol`, `direction`, `depth`, `tests`; live bounded caller/callee tree; only functions and methods are nodes, and tests collapse to one `+N tests` line per parent unless `tests: true` expands them with `[test]` marks) | implemented (wire version 5, 11 tools) |
 | `ide.diff` cleanup (compact default, `provenance` flag, plain-`git diff` fallback, untracked symlinks listed) | implemented (v0.6.1) |
 | `ide.problems` cleanup | planned |
@@ -58,19 +58,23 @@ ambiguous_symbol: new matches 3 symbols; repeat ide.symbol with one exact path:
 
 ### Readiness and waiting
 
-- Return a result directly if the server responds within about 10 seconds. Otherwise return `pending: use ide.inspect with detail_ref X`. `ide.inspect` waits up to 10 seconds before returning `pending` again.
+- Return a result directly if the server responds within the inline window (8 seconds, inside the 10-second method budget). Otherwise return `pending: the result arrives by itself in a later <agent-ide> block (detail_ref X)`: the finished answer is pushed as a fact ([session-outbox](session-outbox-v1.md) §2, §8), and `ide.inspect` with that `detail_ref`, or `ide.inspect {"wait_ms": 120000}` once when there is nothing else to do, reads it early. No reply asks the agent to poll ([reply hygiene](reply-hygiene-v1.md) §2).
 - Servers start lazily: the first `ide.symbol` or `ide.graph` call of a language starts its server; `ide.start` launches none and its card reports each server language as `ready`, `warming`, `not started` or `unavailable (<cause>)` ([start-index-state](start-index-state-v1.md) §2).
 - While a server loads, `ide.symbol` and `ide.graph` answer at once and never park inside the call: for a language whose source outline is exact (Rust today) with an answer labelled `approximate:` (definition from the source outline, usages and depth-1 callers as name matches marked `~`), otherwise `pending`; the same job keeps running for up to 10 minutes (at most 4 per session) and its precise answer follows as a fact ([symbol-graph-item](symbol-graph-item-v1.md) §4-§5). A call that still meets a loading server outside that path answers `error: provider_loading (<detail>); the language server is still loading the workspace, so this call was not answered and nothing was changed. Continue with other work or native tools; ide.symbol and ide.graph answer at once meanwhile`.
 - A language that opts in to outlining from its text while loading (today only Rust) answers `ide.outline`, `ide.read {symbol}` and the symbol form of `ide.edit` (`replace`/`insert`/`delete`) from that lexical outline while its registered server is still loading, when that server is unavailable (its workspace failed to load, or no launch configures it), and when its ready session's `documentSymbols` exchange itself fails, and the reply says so in one compact line — `outline: from source, exact (rust-analyzer still indexing; no need to repeat)` while it loads, `outline: from source, exact (rust-analyzer unavailable; no need to repeat)` when it failed, `outline: from source, exact (rust-analyzer request failed: <short cause>; no need to repeat)` when the exchange failed — the outline is already exact, so the call needs no repeat, but semantic facts (usages, callers, rename) are not included. A lexical outline is either exactly the outline the server path would give for the same text (addresses, kinds, ranges, children) or it is not used: a file it cannot reproduce exactly (for Rust, whose lexical outline comes from a full parse: a syntax error, from which rust-analyzer recovers with a tree of its own; comment text directly above an item, which rust-analyzer may attach to the item's range; an `extern` block; a `// region:` comment; more tokens or deeper brackets than the parse's bounded stack is sized for — 240 000 tokens, 128 brackets) keeps `provider_loading` rather than a guessed range while the server loads, and `provider_unavailable` when it failed or its exchange did. An address the lexical outline does not contain is not proven absent: while the server loads the call waits for it (`provider_loading`, parked like any loading call; an edit answers it at once) instead of `unknown_symbol`, and when the server is unavailable the call answers `provider_unavailable` at once rather than park for a server that will not answer. `ide.symbol` answers approximately while the server loads (above); when the server is unavailable it answers the definition-only card — signature, doc and definition come from the lexical outline — with each live-session section noting the failed workspace (`usages: unavailable (rust-analyzer workspace failed to load)`). `ide.graph` answers approximately while the server loads (above); `rename` always waits for the server. A refusal on these paths names its stage (`<server>: workspace load failed`, `<server>: transport gone`, `<server>: documentSymbols/references request failed`) and its reply states what still works (`ide.outline`/`ide.read` from source), what does not (usages, callers) and how to recover (retry later; if it keeps failing, fix what stops the project from loading — `ide.context {"kind":"problems"}` shows the project check). The moment the live session answers, the server path is used again.
 
 ### `<agent-ide>` status block
 
-A hook or the top of a response may include check and background-test status, in no more than 6 lines:
+A hook or the top of a response may include the check status plate (at most 256 bytes) and the facts that are due, in one block ([session-outbox](session-outbox-v1.md) §3-§4). A test run contributes nothing while it runs; its outcome arrives once as a `test-finished` fact ([reply hygiene](reply-hygiene-v1.md) §1):
 
 ```text
 <agent-ide>
 rust: 0 errors, 0 warnings
-tests #3: running 42 s; poll: call ide.test with {"status": 3}
+test-finished tests #3: 3 passed, 1 failed, 12 s
+  FAIL assistance::worker::tests::stop_cancels_queue
+       src/assistance/worker.rs:4012  assertion failed: left 5, right 6
+  rerun: cargo test stop_cancels_queue
+  full output: ide.inspect test-3
 </agent-ide>
 ```
 
@@ -97,6 +101,8 @@ default derived from its session binding, so repeating it returns the same activ
 reader. Readers coexist with writers and other readers. A reader can upgrade by starting without
 `read_only` when the writer slot is free, and a writer can downgrade by starting with
 `read_only: true`. A reader's start schedules no project check (neither the first check nor later triggers or environment restarts); it still sees the problems a writer's check produced.
+
+The reply is the activation line, the project card (its servers line included, [start-index-state](start-index-state-v1.md) §1) and last the call-signature block: at most 2048 bytes (about 1.1 KiB today) with one JSON example per batch form ([batch API v1](batch-api-v1.md)), the sentence that results of long work arrive by themselves in an `<agent-ide>` block, and the required `ide.stop`. Every start gets it, including a repeated start and a read-only one; nothing follows it but the daemon-currency line when another session keeps an older daemon alive.
 
 `environment` selects the current environment per project root: for example,
 `{"environment":{"python":".venv-py314","python:packages/alpha":".venv"}}`.
@@ -415,35 +421,37 @@ Input: `{symbol}` | `{path}` | `{pattern}` | `{command}`, with optional `budget_
 Immediate output:
 
 ```text
-tests #3: started — cargo test --workspace worker::  (4 tests selected, budget 120 s); poll: ide.test {"status": 3}
+tests #3: started — cargo test --workspace worker::  (4 tests selected, budget 120 s); the result arrives by itself in a later <agent-ide> block
 ```
 
 The `symbol` form first asks the live language server for the symbol's references, which takes
 seconds on a cold session, so it answers `pending` at once and the started line (or
-`tests: no tests reference …`) arrives through `ide.inspect`; `path`, `pattern` and `command`
-answer inline. Start and running lines say `poll: call ide.test with {"status": N}` so the hint
-cannot be mistaken for an `ide.inspect` detail reference. If that hint is passed to
-`ide.inspect` anyway, the reply directs the caller to `ide.test {"status": N}`. Explicit
-`command` runs with no parsed test counts keep the call inline briefly: a completed run answers
-in the starting call with its exit code, up to 4 KiB of output, and `rerun:`; only a truncated
-output includes `full output: ide.inspect <detail_ref>`. A longer run returns the ordinary
-started line. Parsed test-runner replies are unchanged. Every start and running line ends with
-the poll hint, and
-`ide.inspect` with a test-run handle (`tests #N`, `tests-N`, `#N`, `N`) answers with that run's
-status line, so a handle mistaken for a `detail_ref` still reaches the result.
+`tests: no tests reference …`) is pushed like any pending result; `path`, `pattern` and
+`command` answer inline. The started line carries no elapsed time and no instruction. While the
+run is active, `ide.test` with `status`, and `ide.inspect` of a test-run handle (`tests #N`,
+`tests-N`, `#N`, `N`), answer `tests #N: running`; a second start answers
+`tests #N: still running`. Explicit `command` runs with no parsed test counts keep the call
+inline briefly: a completed run answers in the starting call with `tests #N: exit <code>, <s> s`,
+up to 4 KiB of output, and `rerun:`; only a truncated output includes
+`full output: ide.inspect <detail_ref>`. A longer run returns the ordinary started line. Parsed
+test-runner replies read as the terminal text below.
 
-Status appears in the status block and through `ide.test {status: 3}`:
+The outcome of a run arrives once, as the `test-finished` fact of the session outbox and as the
+settled reply body of `ide.test` with `status`, of `ide.inspect` of the handle, or of a run that
+ends inside the starting call. Both are the text of `terminal_fact`
+([reply hygiene](reply-hygiene-v1.md) §1):
 
 ```text
 tests #3: 3 passed, 1 failed, 12 s
   FAIL assistance::worker::tests::stop_cancels_queue
        src/assistance/worker.rs:4012  assertion failed: left 5, right 6
-  rerun: cargo test stop_cancels_queue      full output: ide.inspect test-3
+  rerun: cargo test stop_cancels_queue
+  full output: ide.inspect test-3
 ```
 
-Up to 16 failing tests are listed, each with its location and up to four message lines; more add one `(+N more failed tests in the full output)` line. The `rerun:` line reproduces the run exactly: an explicit command given `cwd` or `env` reads `rerun: cd <dir> && env NAME=VALUE … <argv>`.
+Up to 8 failing tests are listed, each with its location and message on one line of at most 160 bytes; more add one `(+K more failed tests in the full output)` line, and a several-target run lists one line per target before the `rerun:` line. The summary line is at most 256 bytes and the whole text at most 1536 bytes: when it runs out of room, quoted output goes first, then target lines, then message lines, then failures from the end; the summary, the `rerun:` line (cut at 300 bytes with `…`) and the `full output:` line (the run's owner only) always stay. The `rerun:` line reproduces the run exactly: an explicit command given `cwd` or `env` reads `rerun: cd <dir> && env NAME=VALUE … <argv>`.
 
-A run that counted no test is never shown as `0 passed, 0 failed`: a non-zero exit reads `tests #3: no test results (exit 2), 1 s — runner said: <bounded runner line>; full output: ide.inspect <detail_ref>` (the runner could not run, e.g. `uv run pytest` without a usable environment), and a zero exit without a parsed summary reads `no summary parsed`. The `<agent-ide>` status line for the same run keeps the runner line but omits the reference, which the bounded block could otherwise cut.
+A run that counted no test is never shown as `0 passed, 0 failed`: a non-zero exit reads `tests #3: no test results (exit 2), 1 s — runner said: <bounded runner line>` (the runner could not run, e.g. `uv run pytest` without a usable environment), and a run with no recognised summary at all reads `tests #3: exit <code>, <s> s` with the output tail (up to 10 lines and 1024 bytes in the fact; the reply body of that run keeps up to 4 KiB). A budget kill reads `stopped at budget <b> s — P passed, F failed so far`.
 
 Run at most one test job at a time per worktree. Stop a run when its budget expires, return its partial result and the command for manual execution, and page full output through `detail_ref`. `ide.stop` lists up to eight runs started in this binding whose results were never collected, including each run number and command (and whether it is still running). The IDE never starts tests on its own.
 
