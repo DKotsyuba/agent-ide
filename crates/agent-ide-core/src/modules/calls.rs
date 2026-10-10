@@ -649,17 +649,29 @@ pub async fn insert_site(
     }
 }
 
-/// A selected test run: the tests it runs, its argument vector (program first), and for a
-/// module-planned run the specification the core expanded and admitted from one of the
-/// language's declared test recipes, which is exactly what runs.
+/// A selected test run: the tests it runs, its argument vector (program first), and how it
+/// starts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannedRun {
     /// The selected tests.
     pub tests: Vec<crate::lang::TestId>,
     /// Argv, program first.
     pub command: Vec<String>,
-    /// The admitted run of a module-planned selection; `None` in process.
-    pub spec: Option<crate::checks::runner::RunSpec>,
+    /// How the run starts.
+    pub start: PlannedStart,
+}
+
+/// How a selected test run starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlannedStart {
+    /// In process: the language's own argument vector in its command environment.
+    InProcess,
+    /// Module-planned: exactly the specification the core expanded and admitted from one of the
+    /// language's declared test recipes.
+    Admitted(crate::checks::runner::RunSpec),
+    /// Module-planned through a home tool that is not installed (as in process, the run
+    /// cannot start and the reply names the missing program).
+    MissingTool(String),
 }
 
 /// The run of `LanguageSupport::test_selection` within `budget`: in process the language's own
@@ -680,7 +692,7 @@ pub async fn test_run(
             .map(|selection| PlannedRun {
                 tests: selection.tests,
                 command: selection.command,
-                spec: None,
+                start: PlannedStart::InProcess,
             }));
     };
     let run: super::payload::RunAnswer = host
@@ -698,6 +710,31 @@ pub async fn test_run(
     let Ok(run) = run else {
         return Ok(Err(run.unwrap_err()));
     };
+    // A declared home tool the core cannot find on its tool path is not installed: the run
+    // fails to start exactly as the in-process command would, naming the program.
+    let tool = super::recipe::declared(language.name())
+        .iter()
+        .find(|recipe| recipe.id == run.effect.recipe)
+        .and_then(|recipe| match run.effect.params.get(recipe.program) {
+            Some(super::payload::Param::Executable(slot)) => recipe
+                .executables
+                .iter()
+                .find(|declared| declared.name == slot)
+                .and_then(|declared| match declared.source {
+                    super::payload::SlotSource::HomeTool(name) => Some(name),
+                    super::payload::SlotSource::Launcher(_) => None,
+                }),
+            _ => None,
+        });
+    if let Some(name) = tool
+        && crate::execution::job::executable_on(name, worktree, &tool_path()).is_none()
+    {
+        return Ok(Ok(PlannedRun {
+            tests: run.tests,
+            command: vec![name.to_owned()],
+            start: PlannedStart::MissingTool(name.to_owned()),
+        }));
+    }
     let spec = admitted(
         language,
         worktree,
@@ -711,7 +748,7 @@ pub async fn test_run(
             .chain(spec.args.iter().map(std::ffi::OsString::as_os_str))
             .map(|part| part.to_string_lossy().into_owned())
             .collect(),
-        spec: Some(spec),
+        start: PlannedStart::Admitted(spec),
     }))
 }
 
