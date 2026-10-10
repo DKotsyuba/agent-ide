@@ -37,6 +37,9 @@ pub mod reply;
 /// Runs one bounded daemon-owned job/detail worker with durable authority gates.
 pub mod worker;
 
+/// Defines the per-session outbox of deferred facts and its producer/carrier seam (OUTBOX-r3).
+pub mod outbox;
+
 /// Tracks environment resolution changes across worktree bindings.
 mod environment;
 
