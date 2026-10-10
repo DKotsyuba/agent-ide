@@ -1,11 +1,11 @@
 //! Where the name index gets a file's facts when a language computes in its module: the module
 //! answers `linkage/0` anchors, the core turns them back into the facts the index joins.
 //!
-//! The index never learns where a language runs. [`AnchorSource`] is the one seam: the daemon
+//! The index never learns where a language runs. [`AnchorSource`](crate::intelligence::anchors::AnchorSource) is the one seam: the daemon
 //! installs a source that routes a language to its module (blocking the calling thread, which is
 //! always a blocking-pool thread), and every language it does not route is extracted in process
 //! through [`NameFacts`](crate::lang::names::NameFacts) exactly as before. An in-process
-//! extraction and the same extraction served by a module and converted by [`facts_from_anchors`]
+//! extraction and the same extraction served by a module and converted by [`facts_from_anchors`](crate::intelligence::anchors::facts_from_anchors)
 //! are equal fact for fact; that equality is what keeps a mixed setting (one language in its
 //! module, another in process) joining with identical answers.
 

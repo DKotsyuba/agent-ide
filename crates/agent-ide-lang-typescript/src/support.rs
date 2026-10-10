@@ -38,7 +38,7 @@ const SCRIPT_EXTENSIONS: [&str; 8] = ["ts", "tsx", "js", "jsx", "mts", "cts", "m
 /// `-e` program of the syntax probe: parses stdin with the `typescript` package named by the
 /// argument after the program (`process.argv[1]`, an absolute `typescript.js` the caller
 /// resolved) and prints `<line+1>: <message>` for the first parse diagnostic — the exact line
-/// [`SyntaxVerdict::from_probe`] maps. The second argument (`process.argv[2]`) is the edited
+/// `SyntaxVerdict::from_probe` maps. The second argument (`process.argv[2]`) is the edited
 /// file's own name, so the parser picks the file's language variant: TypeScript parses `.tsx`
 /// and `.jsx` with JSX enabled, and a hardcoded `.ts` name would report a false syntax error on
 /// the first JSX element of an untouched base file — which the gate would then treat as
