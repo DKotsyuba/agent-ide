@@ -34,6 +34,8 @@ use crate::{
         store::WorkspaceStore,
     },
 };
+#[path = "index_state.rs"]
+mod index_state;
 #[path = "links.rs"]
 mod links;
 #[path = "navigation.rs"]
@@ -4107,26 +4109,15 @@ impl<'a> Worker<'a> {
                 languages.clear();
                 environments.clear();
             }
-            let modes = crate::modules::calls::modes_line(
-                &languages
-                    .iter()
-                    .map(|project| project.language)
-                    .collect::<Vec<_>>(),
-            );
+            let detected = languages
+                .iter()
+                .map(|project| project.language)
+                .collect::<Vec<_>>();
+            let modes = crate::modules::calls::modes_line(&detected);
+            // Servers start lazily (first symbol or graph call); the card reports each server
+            // language's session as it is now, starting nothing (start-index-state r2 §2).
+            let servers = self.server_states(&binding, &detected).await;
             let walk = tokio::task::spawn_blocking(move || {
-                // The daemon does not probe language servers at start; every detected language's
-                // server state is the honest "not started" until a later tool observes otherwise,
-                // and it names what already works from source so a heavy user does not wait for
-                // semantic tools that only the server can answer. Only languages that have a
-                // server get a server state.
-                let servers = languages
-                    .iter()
-                    .filter(|project| project.language.server().is_some())
-                    .map(|project| CardServerState {
-                        language: project.language,
-                        state: project_card::not_started_state(project.language).to_owned(),
-                    })
-                    .collect();
                 let links = project_card::links_line(&languages);
                 let mut project = project_card::collect(&root, languages, servers, None);
                 project.environments = environments;

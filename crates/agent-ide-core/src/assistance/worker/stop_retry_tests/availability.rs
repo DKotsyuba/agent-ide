@@ -13,6 +13,129 @@ fn complete_text(reply: &PeerReply) -> &str {
     }
 }
 
+/// Runs one symbol job of `actor` for `a.epsilon#a` through the production tool path and returns
+/// its outcome; unlike `scripted_tool` it allows the job to park (a loading session).
+async fn scripted_symbol_attempt(
+    worker: &mut Worker<'_>,
+    actor: &str,
+    call: &str,
+) -> Result<PeerReply, FailureCode> {
+    let invocation = production_call(worker, actor, call);
+    let (cancel_sender, cancel) = watch::channel(false);
+    let _keep = cancel_sender;
+    let mut job = Job {
+        reference: format!("attempt-{call}"),
+        invocation,
+        tool: AssistanceTool::Symbol,
+        parameters: serde_json::json!({"symbol":"a.epsilon#a","usages":false,"callers":0}),
+        target: provider_target(&worker.runtime),
+        deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+        cancel,
+        stop_reply: None,
+        native_epoch: 0,
+        failure_detail: None,
+        format_note: None,
+        check_scheduled: false,
+        park_until: None,
+        stage: None,
+        session_binding: None,
+    };
+    worker.providers.begin_job();
+    let outcome = worker.symbol(&mut job).await.map(|(reply, _, _)| reply);
+    worker.settle_session_health(&job).await;
+    outcome
+}
+
+/// Runs a production `ide.start` of `actor` with the epsilon fixture provider configured and
+/// returns the reply text (`read_only` selects the mode; `id` is the activation id).
+async fn provider_start_text(worker: &mut Worker<'_>, actor: &str, id: &str) -> String {
+    crate::lang::testing::install();
+    let invocation = production_call(worker, actor, id);
+    let (_cancel_sender, cancel) = watch::channel(false);
+    let mut job = Job {
+        reference: format!("provider-text-{id}"),
+        invocation,
+        tool: AssistanceTool::Start,
+        parameters: serde_json::json!({"activation_id":actor,"read_only":true}),
+        target: provider_target(&worker.runtime),
+        deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+        cancel,
+        stop_reply: None,
+        native_epoch: 0,
+        failure_detail: None,
+        format_note: None,
+        check_scheduled: false,
+        park_until: None,
+        stage: None,
+        session_binding: None,
+    };
+    let (reply, _, _) = worker.activate(&mut job).await.unwrap();
+    complete_text(&reply).to_owned()
+}
+
+/// The start card's servers line reports the worktree's session as it is: `not started` (with
+/// the lazy-start wording) before the first semantic call, `warming` while a session loads and
+/// `ready` once one answers. The start itself starts nothing.
+#[tokio::test]
+async fn the_servers_line_reports_the_session_as_it_is() {
+    use crate::lang::testing::fixture_serve_session;
+    let fixture = Fixture::new();
+    epsilon_source(&fixture);
+    std::fs::write(fixture.root.join("a.epsilon"), "sym a\nend\n").unwrap();
+    std::fs::write(fixture.root.join("epsilon.toml"), "").unwrap();
+    git_commit(&fixture.root, "scripted source");
+    let store = fixture.store();
+    let workspace = DurableWorkspace::open(&store).await.unwrap();
+    let mut worker = worker(&store, workspace, fixture.root.clone());
+    worker.observations.install_schema().await.unwrap();
+    let first = provider_start_text(&mut worker, "card-reader", "card-1").await;
+    let servers = |text: &str| {
+        text.lines()
+            .find(|line| line.starts_with("servers: "))
+            .unwrap_or_else(|| panic!("no servers line: {text}"))
+            .to_owned()
+    };
+    assert_eq!(
+        servers(&first),
+        format!(
+            "servers: epsilon {}",
+            crate::project::not_started_state(crate::lang::testing::EPSILON)
+        )
+    );
+    assert!(
+        servers(&first).contains("answers approximately at once"),
+        "{first}"
+    );
+    let reader = production_call(&worker, "card-reader", "card-bind")
+        .binding_ref()
+        .clone();
+    // A session that loads: the first symbol call starts it, the card then reads `warming`.
+    fixture_serve_session(&reader, &["loading"]);
+    let _ = scripted_symbol_attempt(&mut worker, "card-reader", "card-load").await;
+    let warming = provider_start_text(&mut worker, "card-reader", "card-warm").await;
+    assert_eq!(
+        servers(&warming),
+        format!(
+            "servers: epsilon {}",
+            crate::project::warming_state(crate::lang::testing::EPSILON)
+        ),
+        "{warming}"
+    );
+    worker.release_live(&reader).await;
+    fixture_serve_session(&reader, &[]);
+    let (opened, _) = scripted_tool(
+        &mut worker,
+        "card-reader",
+        "card-symbol",
+        AssistanceTool::Symbol,
+        serde_json::json!({"symbol":"a.epsilon#a","usages":false,"callers":0}),
+    )
+    .await;
+    opened.expect("the scripted session answers");
+    let again = provider_start_text(&mut worker, "card-reader", "card-2").await;
+    assert_eq!(servers(&again), "servers: epsilon ready", "{again}");
+}
+
 /// A graph whose call-hierarchy request fails answers `unavailable (<cause>)`, never a normal
 /// graph with 0 edges (0.10.8 answered `1 nodes, 0 edges`). The scripted epsilon server fails
 /// every call-hierarchy request.

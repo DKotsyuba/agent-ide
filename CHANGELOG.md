@@ -4,6 +4,7 @@
 
 ### Added
 
+- The `ide.start` card's servers line reports each server language's session for the worktree as it is: `ready`, `warming; …`, `not started; …` or `unavailable (<cause>)`. Servers still start lazily, on the first `ide.symbol` or `ide.graph` call of the language; the start launches nothing.
 - `ide.symbol` usages of a struct, enum or class tag the rows that build a value of it (`Name {`, `Name(`, `Name::new(`, `new Name(`, an enum variant) as `construction ~`, list them first and count them on the usages line (`…; 9 constructions`). The rule is lexical and marked as a heuristic.
 
 ### Fixed
