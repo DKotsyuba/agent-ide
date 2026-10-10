@@ -6,6 +6,7 @@
 
 - Cross-language links gain two kinds. File references: HTML `<script src>`/`<link href>` and static relative `import`/`export … from`/`require`/`import()` in TypeScript and JavaScript link to the file they name (extension and directory-index probes are labelled heuristic), shown in a symbol's `links:` section and the graph's link leaves. CSS-module members: `styles.foo` and `styles["foo"]` join class `foo` of exactly that `*.module.*` style sheet and never a global `.foo`. Dynamic, templated, aliased, package and escaping references give no link.
 - HTML and CSS run as bundled language modules (default-on, `AGENT_IDE_LANGUAGE_MODE=html=in_process,css=in_process` falls back); their cross-language facts travel as `linkage/0` anchors and join exactly like in-process facts.
+- TypeScript and JavaScript (all eight script extensions, front end and Node back end) run as a bundled language module (default-on, `AGENT_IDE_LANGUAGE_MODE=typescript=in_process` falls back): the accepted Node + typescript-language-server + tsserver bundle is hosted in `module typescript analyzer`, which also interprets the project's `tsconfig`/`package.json` inputs the daemon reads, and the `tsc` check, Prettier formatter, syntax probe and `node --test`/Vitest/Jest runs are fixed recipes the daemon admits and runs; answers are the same as in-process. `ide.context` gains an optional bounded `related_links:` block with the cross-language names of the file or position.
 
 ### Changed
 
