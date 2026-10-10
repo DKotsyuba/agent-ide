@@ -26,16 +26,16 @@ use super::{
         AnalysisScopeRequest, AnalyzeSource, AnchorBatch, CheckSelectionAnswer, CommandEnvAnswer,
         DetectAnswer, EffectRequest, EnvironmentsAnswer, Field, FileDocRequest, FileVerdict,
         FormatPlanRequest, InputsVerdict, InsertSiteAnswer, InsertSiteRequest, MAX_INPUT_ROUNDS,
-        MAX_PROJECT_INPUTS, ProjectInput, ProjectQuery, SelectionAnswer, SourceAnalysis,
-        SourceField, SourceRef, SourceText, SyntaxQuery, TestFacts, TestParseRequest,
-        TestPlanQuery, TestToolchainAnswer, encode,
+        MAX_PROJECT_INPUTS, ProjectInput, ProjectQuery, SourceAnalysis, SourceField, SourceRef,
+        SourceText, SyntaxQuery, TestFacts, TestParseRequest, TestPlanQuery, TestToolchainAnswer,
+        encode,
     },
     router::ModuleHost,
     wire::Attachment,
 };
 use crate::lang::{
     InsertSite, InsertWhere, LangError, Language, LanguageProject, Outline, ProbePrograms,
-    SymbolPath, SyntaxVerdict, TestReport, TestSelection, TestTarget, environment,
+    SymbolPath, SyntaxVerdict, TestReport, TestTarget, environment,
 };
 
 /// The daemon's module routing, installed once at startup.
@@ -219,7 +219,8 @@ pub struct ReadInput {
 /// verdict over `inputs`, repeated while the module asks for more files. Each requested path is
 /// read only through `read` (the core's own admission and exact read; `None` refuses the
 /// document), at most [`MAX_INPUT_ROUNDS`] rounds and [`MAX_PROJECT_INPUTS`] inputs; a verdict
-/// beyond its bounds is the module's typed malformed fault.
+/// beyond its bounds is ill-typed: the instance is retired and the call answers its typed
+/// malformed fault.
 pub async fn project_inputs(
     language: Language,
     worktree: &Path,
@@ -231,12 +232,13 @@ pub async fn project_inputs(
     let ask = |query: super::payload::DescribeQuery, attachments: Vec<Attachment>| {
         let host = host.clone();
         async move {
-            host.request(
+            host.request_valid(
                 language,
                 worktree,
                 Capability::Describe,
                 encode(&query),
                 attachments,
+                InputsVerdict::bounded,
             )
             .await
         }
@@ -647,29 +649,62 @@ pub async fn insert_site(
     }
 }
 
-/// `LanguageSupport::test_selection`.
-pub async fn test_selection(
+/// A selected test run: the tests it runs and its argument vector, program first. `admitted`
+/// marks a module-planned run, whose program and arguments the core expanded from one of the
+/// language's declared test recipes (so its program is never replaced afterwards).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedRun {
+    /// The selected tests.
+    pub tests: Vec<crate::lang::TestId>,
+    /// Argv, program first.
+    pub command: Vec<String>,
+    /// The core expanded `command` from a declared recipe.
+    pub admitted: bool,
+}
+
+/// The run of `LanguageSupport::test_selection`: in process the language's own argument
+/// vector; in module mode the module's request of one of the language's declared test recipes,
+/// expanded by the core (a request outside them is refused, never run).
+pub async fn test_run(
     language: Language,
     worktree: &Path,
     project: &LanguageProject,
     target: &TestTarget,
-) -> Routed<Result<TestSelection, LangError>> {
-    match module(language) {
-        None => Ok(language.support().test_selection(project, target)),
-        Some(host) => {
-            host.request::<SelectionAnswer>(
-                language,
-                worktree,
-                Capability::TestPlan,
-                encode(&TestPlanQuery::Selection {
-                    project: Box::new(project.clone()),
-                    target: target.clone(),
-                }),
-                Vec::new(),
-            )
-            .await
-        }
-    }
+) -> Routed<Result<PlannedRun, LangError>> {
+    let Some(host) = module(language) else {
+        return Ok(language
+            .support()
+            .test_selection(project, target)
+            .map(|selection| PlannedRun {
+                tests: selection.tests,
+                command: selection.command,
+                admitted: false,
+            }));
+    };
+    let run: super::payload::RunAnswer = host
+        .request(
+            language,
+            worktree,
+            Capability::TestPlan,
+            encode(&TestPlanQuery::Run {
+                project: Box::new(project.clone()),
+                target: target.clone(),
+            }),
+            Vec::new(),
+        )
+        .await?;
+    let Ok(run) = run else {
+        return Ok(Err(run.unwrap_err()));
+    };
+    let spec = admitted(language, worktree, &run.effect)?;
+    Ok(Ok(PlannedRun {
+        tests: run.tests,
+        command: std::iter::once(spec.program.as_os_str())
+            .chain(spec.args.iter().map(std::ffi::OsString::as_os_str))
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect(),
+        admitted: true,
+    }))
 }
 
 /// `LanguageSupport::test_id` of one outline path.
@@ -769,9 +804,21 @@ fn stdin_run(
     worktree: &Path,
     effect: Option<EffectRequest>,
 ) -> Routed<Option<StdinRun>> {
-    let Some(effect) = effect else {
-        return Ok(None);
-    };
+    match effect {
+        Some(effect) => {
+            admitted(language, worktree, &effect).map(|spec| Some(StdinRun::Spec(spec)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Expands `effect` under the core's interactive admission (see [`stdin_run`]); a request
+/// outside the language's declared recipes is refused as `policy_refused`.
+fn admitted(
+    language: Language,
+    worktree: &Path,
+    effect: &EffectRequest,
+) -> Routed<crate::checks::runner::RunSpec> {
     let recipes = super::recipe::declared(language.name());
     let path = tool_path();
     let programs: Vec<(String, PathBuf)> = recipes
@@ -800,17 +847,15 @@ fn stdin_run(
         programs: &programs,
         timeout: std::time::Duration::from_secs(10),
     };
-    super::recipe::expand(recipes, &effect, &admission)
-        .map(|spec| Some(StdinRun::Spec(spec)))
-        .map_err(|_| ModuleUnavailable {
-            module_id: super::contract::ModuleId::bundled(language.name()),
-            module_version: env!("CARGO_PKG_VERSION").to_owned(),
-            role: super::contract::Role::Analyzer,
-            stage: super::contract::Stage::Decode,
-            cause: super::contract::Cause::PolicyRefused,
-            instance: None,
-            retry_after_ms: None,
-        })
+    super::recipe::expand(recipes, effect, &admission).map_err(|_| ModuleUnavailable {
+        module_id: super::contract::ModuleId::bundled(language.name()),
+        module_version: env!("CARGO_PKG_VERSION").to_owned(),
+        role: super::contract::Role::Analyzer,
+        stage: super::contract::Stage::Decode,
+        cause: super::contract::Cause::PolicyRefused,
+        instance: None,
+        retry_after_ms: None,
+    })
 }
 
 /// `LanguageSupport::format_stdin_command`.

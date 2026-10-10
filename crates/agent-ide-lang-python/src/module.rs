@@ -166,9 +166,9 @@ const INTERPRETER_ROLES: &[PathRole] = &[
     PathRole::DeveloperDir,
 ];
 
-/// The effect recipes of the Python module, declared by the root: the Pyright check, and the
+/// The effect recipes of the Python module, declared by the root: the Pyright check, the
 /// formatter (black or ruff, through the project interpreter, `uv run` or a home tool) and the
-/// syntax probe that read the candidate on stdin.
+/// syntax probe that read the candidate on stdin, and the pytest test runs.
 pub const RECIPES: &[EffectRecipe] = &[
     PYRIGHT,
     interactive(
@@ -246,7 +246,120 @@ pub const RECIPES: &[EffectRecipe] = &[
             Arg::Literal(crate::support::PY_AST_PROBE),
         ],
     ),
+    TEST_RECIPES[0],
+    TEST_RECIPES[1],
+    TEST_RECIPES[2],
+    TEST_RECIPES[3],
+    TEST_RECIPES[4],
+    TEST_RECIPES[5],
 ];
+
+/// A pytest run's fixed trailing flags as recipe literals.
+const PYTEST_TAIL: [Arg; 3] = [
+    Arg::Literal("--no-header"),
+    Arg::Literal("-p"),
+    Arg::Literal("no:cacheprovider"),
+];
+
+/// The pytest test-run recipes: through the project interpreter (`-m pytest`), `uv run pytest`
+/// or a home `pytest`, each with positional selection tokens or one `-k` pattern.
+const TEST_RECIPES: [EffectRecipe; 6] = [
+    test_run(
+        "pytest-module",
+        "interpreter",
+        &[
+            Arg::Literal("-m"),
+            Arg::Literal("pytest"),
+            Arg::Each("selection"),
+            PYTEST_TAIL[0],
+            PYTEST_TAIL[1],
+            PYTEST_TAIL[2],
+        ],
+    ),
+    test_run(
+        "pytest-module-k",
+        "interpreter",
+        &[
+            Arg::Literal("-m"),
+            Arg::Literal("pytest"),
+            Arg::Literal("-k"),
+            Arg::Param("pattern"),
+            PYTEST_TAIL[0],
+            PYTEST_TAIL[1],
+            PYTEST_TAIL[2],
+        ],
+    ),
+    test_run(
+        "pytest-uv",
+        "uv",
+        &[
+            Arg::Literal("run"),
+            Arg::Literal("pytest"),
+            Arg::Each("selection"),
+            PYTEST_TAIL[0],
+            PYTEST_TAIL[1],
+            PYTEST_TAIL[2],
+        ],
+    ),
+    test_run(
+        "pytest-uv-k",
+        "uv",
+        &[
+            Arg::Literal("run"),
+            Arg::Literal("pytest"),
+            Arg::Literal("-k"),
+            Arg::Param("pattern"),
+            PYTEST_TAIL[0],
+            PYTEST_TAIL[1],
+            PYTEST_TAIL[2],
+        ],
+    ),
+    test_run(
+        "pytest-tool",
+        "pytest",
+        &[
+            Arg::Each("selection"),
+            PYTEST_TAIL[0],
+            PYTEST_TAIL[1],
+            PYTEST_TAIL[2],
+        ],
+    ),
+    test_run(
+        "pytest-tool-k",
+        "pytest",
+        &[
+            Arg::Literal("-k"),
+            Arg::Param("pattern"),
+            PYTEST_TAIL[0],
+            PYTEST_TAIL[1],
+            PYTEST_TAIL[2],
+        ],
+    ),
+];
+
+/// A test-run recipe: `program` is the `interpreter` path parameter (admitted under
+/// [`INTERPRETER_ROLES`]) or a home tool slot of the same name. The core takes its program and
+/// arguments and runs them as an `ide.test` job in the language's environment.
+const fn test_run(id: &'static str, program: &'static str, args: &'static [Arg]) -> EffectRecipe {
+    EffectRecipe {
+        id,
+        program,
+        args,
+        env: &[],
+        paths: &[PathRule {
+            param: "interpreter",
+            roles: INTERPRETER_ROLES,
+            existing_only: false,
+            read_root: false,
+        }],
+        executables: HOME_TOOLS,
+        stdin: Stdin::Null,
+        class: RunClass::Test,
+        timeout_ceiling_ms: 3_600_000,
+        capture_bytes: 64 << 20,
+        assets: &[],
+    }
+}
 
 /// Home tools an interactive recipe may run, looked up by the core on its formatter PATH.
 const HOME_TOOLS: &[ExecutableSlot] = &[
@@ -265,6 +378,10 @@ const HOME_TOOLS: &[ExecutableSlot] = &[
     ExecutableSlot {
         name: "python3",
         source: SlotSource::HomeTool("python3"),
+    },
+    ExecutableSlot {
+        name: "pytest",
+        source: SlotSource::HomeTool("pytest"),
     },
 ];
 
@@ -301,10 +418,51 @@ const fn interactive(
     }
 }
 
-/// The recipe request of a formatter or probe argument vector the in-process support builds
-/// ([`crate::support`]); `None` for any other shape, which the core then refuses.
+/// The recipe request of a pytest run the in-process selection builds
+/// ([`crate::support`]): through the project interpreter, `uv run` or a home `pytest`, with the
+/// selected node ids or files as positional tokens or one `-k` pattern; `None` for any other
+/// shape.
+fn test_effect(words: &[&str]) -> Option<EffectRequest> {
+    let words = words.strip_suffix(&crate::support::PYTEST_FLAGS[..])?;
+    let path = |value: &str| Param::Path(PathBuf::from(value));
+    let tool = |name: &str| Param::Executable(name.to_owned());
+    let (base, program, rest) = match words {
+        [interpreter, "-m", "pytest", rest @ ..] if interpreter.starts_with('/') => {
+            ("pytest-module", ("interpreter", path(interpreter)), rest)
+        }
+        ["uv", "run", "pytest", rest @ ..] => ("pytest-uv", ("uv", tool("uv")), rest),
+        ["pytest", rest @ ..] => ("pytest-tool", ("pytest", tool("pytest")), rest),
+        _ => return None,
+    };
+    let (recipe, selection) = match rest {
+        ["-k", pattern] => (
+            format!("{base}-k"),
+            ("pattern", Param::Token((*pattern).to_owned())),
+        ),
+        tokens => (
+            base.to_owned(),
+            (
+                "selection",
+                Param::Tokens(tokens.iter().map(|token| (*token).to_owned()).collect()),
+            ),
+        ),
+    };
+    Some(EffectRequest {
+        recipe,
+        params: [program, selection]
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect(),
+    })
+}
+
+/// The recipe request of a formatter, probe or test-run argument vector the in-process support
+/// builds ([`crate::support`]); `None` for any other shape, which the core then refuses.
 pub fn interactive_effect(argv: &[String]) -> Option<EffectRequest> {
     let words: Vec<&str> = argv.iter().map(String::as_str).collect();
+    if let Some(effect) = test_effect(&words) {
+        return Some(effect);
+    }
     let path = |value: &str| Param::Path(PathBuf::from(value));
     let tool = |name: &str| Param::Executable(name.to_owned());
     let (recipe, params): (&str, Vec<(&str, Param)>) = match words.as_slice() {
@@ -871,15 +1029,16 @@ mod tests {
         ));
     }
 
-    /// Every formatter and probe argument vector the in-process support builds becomes a
-    /// request of a declared recipe that the core expands to exactly that program and those
-    /// arguments (a home tool resolved by the core); any other shape has no request, and an
-    /// interpreter outside every interpreter root is refused.
+    /// Every formatter, probe and pytest argument vector the in-process support builds becomes
+    /// a request of a declared recipe that the core expands to exactly that program and those
+    /// arguments (a home tool resolved by the core); any other shape has no request, a selection
+    /// token that would be an option and an interpreter outside every interpreter root are
+    /// refused.
     #[test]
-    fn formatter_and_probe_plans_are_recipes() {
+    fn formatter_probe_and_test_plans_are_recipes() {
         let (layout, request, _, interpreter) = layout("interactive");
         let home = layout.base.join("home");
-        let tools: Vec<(String, PathBuf)> = ["uv", "black", "ruff", "python3"]
+        let tools: Vec<(String, PathBuf)> = ["uv", "black", "ruff", "python3", "pytest"]
             .into_iter()
             .map(|name| {
                 (
@@ -926,6 +1085,43 @@ mod tests {
             vec!["ruff", "format", "--stdin-filename", "a.py", "-"],
             vec![python.as_str(), "-c", probe],
             vec!["python3", "-c", probe],
+            vec![
+                python.as_str(),
+                "-m",
+                "pytest",
+                "tests/test_a.py::test_one",
+                "tests/test_a.py::TestB::test_two",
+                "--no-header",
+                "-p",
+                "no:cacheprovider",
+            ],
+            vec![
+                python.as_str(),
+                "-m",
+                "pytest",
+                "-k",
+                "-not slow",
+                "--no-header",
+                "-p",
+                "no:cacheprovider",
+            ],
+            vec![
+                "uv",
+                "run",
+                "pytest",
+                "tests",
+                "--no-header",
+                "-p",
+                "no:cacheprovider",
+            ],
+            vec![
+                "pytest",
+                "-k",
+                "one",
+                "--no-header",
+                "-p",
+                "no:cacheprovider",
+            ],
         ] {
             let argv: Vec<String> = argv.into_iter().map(str::to_owned).collect();
             let effect = interactive_effect(&argv).expect("a recipe request");
@@ -947,6 +1143,22 @@ mod tests {
             assert_eq!(spec.cwd, request.worktree);
         }
         assert!(interactive_effect(&["sh".into(), "-c".into(), "x".into()]).is_none());
+        // A selection token that would be an option is refused by the core, never run.
+        let option = interactive_effect(
+            &[
+                "pytest",
+                "--rootdir=/",
+                "--no-header",
+                "-p",
+                "no:cacheprovider",
+            ]
+            .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(
+            expand(RECIPES, &option, &admission),
+            Err(Refusal::WrongKind("selection".into()))
+        );
         let outside = interactive_effect(&[
             "/private/var/root/python".into(),
             "-m".into(),

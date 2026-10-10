@@ -187,6 +187,49 @@ async fn transport_faults_are_typed_and_recover() {
     );
 }
 
+/// A well-framed answer outside its contract bounds is the instance's fault: the call answers
+/// `decode`/`malformed`, the live instance is retired (its process gone), and the next call is
+/// served by a fresh instance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_out_of_bounds_answer_retires_the_instance() {
+    let _serial = SERIAL.lock().await;
+    let scratch = Scratch::new("bounds");
+    let host = host(None);
+    assert_eq!(file_doc(&host, &scratch.0).await, Ok(in_process()));
+    let first = modules();
+    assert_eq!(first.len(), 1, "one live instance");
+    let error = host
+        .request_valid(
+            agent_ide::languages::CSS,
+            &scratch.0,
+            Capability::FileDoc,
+            encode(&FileDocRequest {
+                source: SourceRef {
+                    path: "a.css".into(),
+                    revision: "r1".into(),
+                    text: SourceText::Inline("/* Buttons. */\n.btn {}\n".into()),
+                },
+            }),
+            Vec::new(),
+            |_: &Option<String>| false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (error.stage, error.cause),
+        (Stage::Decode, Cause::Malformed)
+    );
+    assert!(first[0].gone().await, "the instance was retired");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(file_doc(&host, &scratch.0).await, Ok(in_process()));
+    assert!(
+        modules().iter().all(|id| *id != first[0]),
+        "a fresh instance answered"
+    );
+    host.stop_all().await;
+    assert!(no_modules_left().await);
+}
+
 /// A module killed while idle is noticed before the next call, which restarts and answers; a
 /// stderr flood is drained without affecting the reply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

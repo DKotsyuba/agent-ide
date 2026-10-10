@@ -2522,7 +2522,7 @@ impl<'a> Worker<'a> {
             let mut explicit_command = false;
             let mut command_cwd = root.clone();
             let mut command_env = Vec::new();
-            let (argv, language, selected_count) = if let Some(path) = job
+            let (argv, language, selected_count, admitted) = if let Some(path) = job
                 .parameters
                 .get("path")
                 .and_then(Value::as_str)
@@ -2637,7 +2637,7 @@ impl<'a> Worker<'a> {
                     return Err(FailureCode::ProviderUnavailable);
                 };
                 explicit_command = true;
-                (argv, language, None)
+                (argv, language, None, false)
             } else if let Some(symbol) = job
                 .parameters
                 .get("symbol")
@@ -2711,7 +2711,7 @@ impl<'a> Worker<'a> {
                     .await
                     .map_err(|failure| symbols::module_failure(job, &failure))?
                     .ok_or(FailureCode::ProviderUnavailable)?;
-                let selection = match crate::modules::calls::test_selection(
+                let selection = match crate::modules::calls::test_run(
                     language, &root, &project, &target,
                 )
                 .await
@@ -2751,7 +2751,7 @@ impl<'a> Worker<'a> {
                 } else {
                     format!("{} tests selected", selection.tests.len())
                 });
-                (selection.command, language, count)
+                (selection.command, language, count, selection.admitted)
             } else {
                 return Ok((
                     PeerReply::Error {
@@ -2777,7 +2777,7 @@ impl<'a> Worker<'a> {
             if own_run.is_none() {
                 // The command environment is the language's computation, resolved before the
                 // run starts (in process or by its module).
-                let resolution = super::tests::resolve_command(
+                let mut resolution = super::tests::resolve_command(
                     &root,
                     if explicit_command {
                         &command_cwd
@@ -2789,6 +2789,13 @@ impl<'a> Worker<'a> {
                 )
                 .await
                 .map_err(|failure| symbols::module_failure(job, &failure))?;
+                // A module-planned run starts the program the core admitted from its recipe: the
+                // language's environment may activate it (PATH prefix, variables), never swap it.
+                // ponytail: the activation itself is still the language's command-environment
+                // answer, as for an explicit command; a recipe-declared activation would close it.
+                if admitted && let Some(resolved) = &mut resolution.resolved {
+                    resolved.argv_prefix.clear();
+                }
                 let start = self.shared.test_runs.start_with_options(
                     root.clone(),
                     argv.clone(),
@@ -7346,7 +7353,7 @@ async fn test_selection(
     root: &Path,
     target: crate::lang::TestTarget,
 ) -> Result<
-    Result<(Vec<String>, crate::lang::Language, Option<String>), crate::lang::LangError>,
+    Result<(Vec<String>, crate::lang::Language, Option<String>, bool), crate::lang::LangError>,
     crate::modules::contract::ModuleUnavailable,
 > {
     let projects = test_projects(root).await?;
@@ -7364,14 +7371,19 @@ async fn test_selection(
             "no supported test runner was detected".to_owned(),
         )));
     };
-    let selection =
-        match crate::modules::calls::test_selection(*language, root, project, &target).await? {
-            Ok(selection) => selection,
-            Err(error) => return Ok(Err(error)),
-        };
+    let selection = match crate::modules::calls::test_run(*language, root, project, &target).await?
+    {
+        Ok(selection) => selection,
+        Err(error) => return Ok(Err(error)),
+    };
     let count = (!selection.tests.is_empty())
         .then_some(format!("{} tests selected", selection.tests.len()));
-    Ok(Ok((selection.command, *language, count)))
+    Ok(Ok((
+        selection.command,
+        *language,
+        count,
+        selection.admitted,
+    )))
 }
 
 /// Formats an argv vector for the compact test status line without shell interpretation.
