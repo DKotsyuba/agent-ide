@@ -9020,24 +9020,20 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     };
     let result_text = completed["text"].as_str().unwrap();
     assert!(result_text.contains("FAIL tests::fails"), "{result_text}");
+    // OUTBOX-r3 §4/§6: a run's outcome is never a plate line, and a run read through its own
+    // handle is delivered, so no carrier repeats it as a `test-finished` fact.
     assert!(
-        carried_status(&completed)
-            .is_some_and(|status| status.contains("tests #1: 1 passed, 1 failed")),
-        "completion status plate must carry the test delta once: {completed}"
-    );
-    assert_eq!(
-        carried_status(&completed).and_then(|status| status.lines().nth(1)),
-        result_text.lines().next(),
-        "the result and completion plate use the same worker status snapshot"
+        carried_status(&completed).is_none_or(|status| !status.contains("tests #1")),
+        "a read run is not carried again: {completed}"
     );
     let repeated = actor.call(&fixture, "ide.test", json!({"status":1})).await;
     assert!(
-        carried_status(&repeated).is_none(),
-        "the completion plate must not repeat: {repeated}"
+        carried_status(&repeated).is_none_or(|status| !status.contains("tests #1")),
+        "the outcome must not repeat: {repeated}"
     );
     println!("ide.test start: {start_text}");
     println!("ide.test result: {result_text}");
-    println!("ide.test status: {}", carried_status(&completed).unwrap());
+    println!("ide.test status: {:?}", carried_status(&completed));
 
     // The runner keeps a 256 KiB tail, and ide.inspect must page that tail rather than shrink it.
     let verbose_start = actor
@@ -21181,6 +21177,68 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
     std::fs::remove_dir_all(base).unwrap();
 }
 
+/// OUTBOX-r3 §8.2: a Claude `ide.*` reply carries a finished run's `test-finished` fact once, at
+/// the start of what the model reads, with no plate test line; the call's own post hook and the
+/// next reply stay silent about it.
+#[tokio::test]
+async fn outbox_claude_reply_carries_a_finished_run_fact_once() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "outbox-claude").await;
+    let started = actor
+        .call_claude(&fixture, "ide.start", json!({"activation_id":"outbox"}))
+        .await;
+    let (started, _) = actor.settle_claude(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    // An explicit command that outlives the inline window leaves its caller a started line.
+    let run = actor
+        .call_claude(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c","sleep 7; echo done"]}),
+        )
+        .await;
+    assert!(
+        run["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("tests #1: started")),
+        "{run}"
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut carried = Vec::new();
+    for _ in 0..2 {
+        actor.next += 1;
+        let call = format!("call-{}", actor.next);
+        actor.claude_lifecycle(&fixture, "PreToolUse", &call).await;
+        let reply = actor
+            .mcp
+            .exchange(
+                json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
+                "name":"ide.context","arguments":{"kind":"problems"},
+                "_meta":{"claudecode/toolUseId":call}}}),
+            )
+            .await;
+        let text = assert_claude_envelope(&reply).to_owned();
+        let post = actor
+            .claude_lifecycle_output(&fixture, "PostToolUse", &call)
+            .await;
+        assert!(post.status.success() && post.stdout.is_empty(), "{post:?}");
+        carried.push(text);
+    }
+    assert!(
+        carried[0].starts_with("<agent-ide>\ntest-finished tests #1: "),
+        "{}",
+        carried[0]
+    );
+    assert!(!carried[0].contains("poll"), "{}", carried[0]);
+    assert!(!carried[1].contains("tests #1"), "{}", carried[1]);
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Claude keeps hook-only plate delivery: `ide.*` replies never carry the plate even while one is
 /// due, the withheld posts stay silent, and the still-due plate reaches the next native post (T28B).
 #[tokio::test]
@@ -21726,9 +21784,10 @@ async fn configured_product_environment_repeat_start_keeps_own_cache_and_binding
     daemon.wait().await.unwrap();
 }
 
-/// A repeated start that switches environments while a failed run's long status line is due
-/// still answers with its activation card: the environment notice joins the plate, which
-/// together exceed the feed's 256-byte block yet must not make the facade refuse the reply.
+/// A repeated start that switches environments while a failed run's long `test-finished` fact is
+/// due still answers with its activation card: the environment notice leads the plate and the
+/// fact follows it, which together exceed the feed's 256-byte block yet must not make the facade
+/// refuse the reply.
 #[tokio::test]
 async fn configured_product_environment_switch_plate_with_due_test_line_keeps_the_card() {
     use std::os::unix::fs::PermissionsExt;
@@ -21785,7 +21844,7 @@ async fn configured_product_environment_switch_plate_with_due_test_line_keeps_th
         )
         .await;
     assert_eq!(run["kind"], "test", "{run}");
-    // Let the failing run settle without polling it, so its status line stays due.
+    // Let the failing run settle without polling it, so its `test-finished` fact stays due.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let switched = actor
         .call_raw(
@@ -21804,10 +21863,8 @@ async fn configured_product_environment_switch_plate_with_due_test_line_keeps_th
         text.contains("python: environment now .venv-py314 (was .venv; selected)"),
         "{text}"
     );
-    assert!(
-        text.contains("tests #1: no test results (exit 1)"),
-        "{text}"
-    );
+    // OUTBOX-r3 §4: the settled run arrives as its fact after the plate, never as a plate line.
+    assert!(text.contains("\ntest-finished tests #1: exit 1"), "{text}");
     assert!(
         text.contains("environment: python .venv-py314 (3.14.3, selected)"),
         "{text}"

@@ -1338,7 +1338,6 @@ impl WorkerHandle {
         let shared = Arc::get_mut(&mut self.shared)
             .expect("project feed must be attached before worker startup");
         shared.problem_source = Some(feed.clone());
-        feed.with_test_runs(shared.test_runs.clone());
         shared.project_feed = Some(feed);
         self
     }
@@ -1348,14 +1347,77 @@ impl WorkerHandle {
         self.shared.project_feed.as_ref()
     }
 
-    /// Returns an undelivered test status line for the binding that started that job.
-    pub fn test_status_line(&self, binding: &[u8; 32]) -> Option<String> {
-        self.shared.test_runs.status_line_for_binding(binding)
+    /// Returns the daemon's session outbox store, for carriers (OUTBOX-r3 §8).
+    pub fn outbox_store(&self) -> &super::session_outbox::Outbox {
+        &self.shared.outbox
     }
 
-    /// Marks a test status line delivered only if it is still current and fits the reply.
-    pub fn mark_test_status_delivered(&self, binding: &[u8; 32], line: &str) -> bool {
-        self.shared.test_runs.mark_status_delivered(binding, line)
+    /// Returns the daemon's session outbox seam, for producers and carriers (OUTBOX-r3 §3.1).
+    pub fn outbox(&self) -> &dyn super::outbox::SessionOutbox {
+        &*self.shared
+    }
+
+    /// Hands due facts of `binding` to one carrier inside an `<agent-ide>` block that starts with
+    /// `ambient` (a complete plate, if any) and stays within `budget` bytes; `fits` decides whether
+    /// the composed block can actually be carried whole.
+    ///
+    /// The facts are committed (delivered, OUTBOX §6) only when `fits` accepts the block, and
+    /// released unchanged otherwise. Returns the block to carry: the composed one, or `ambient`
+    /// unchanged when no fact was handed over.
+    pub fn take_facts(
+        &self,
+        binding: &BindingRef,
+        carrier: super::outbox::Carrier,
+        ambient: Option<String>,
+        budget: usize,
+        fits: impl FnOnce(&str) -> bool,
+    ) -> Option<String> {
+        use super::outbox::SessionOutbox;
+        // Room for the envelope tags and the overflow line around the facts.
+        const FRAME: usize = 96;
+        let room = budget.saturating_sub(ambient.as_ref().map_or(0, String::len) + FRAME);
+        let Some(reservation) = self.shared.reserve(
+            binding,
+            super::outbox::HandoffRequest {
+                carrier,
+                budget: room,
+                holding_only: false,
+            },
+        ) else {
+            return ambient;
+        };
+        let lines = reservation
+            .facts
+            .iter()
+            .map(super::session_outbox::render_fact)
+            .collect::<Vec<_>>();
+        match super::session_outbox::compose_block(
+            ambient.as_deref(),
+            &lines,
+            reservation.remaining,
+        ) {
+            Some(block) if block.len() <= budget && fits(&block) => {
+                self.shared.commit(binding, reservation.token);
+                Some(block)
+            }
+            _ => {
+                self.shared.release(binding, reservation.token);
+                ambient
+            }
+        }
+    }
+
+    /// Records host activity for `binding`: its agent is working (OUTBOX §9).
+    pub fn note_activity(&self, binding: &BindingRef) {
+        self.shared
+            .outbox
+            .set_agent_state(binding, super::session_outbox::AgentState::Working);
+    }
+
+    /// Records that `binding`'s channel delivered a native hook, so compaction is observable.
+    pub fn note_hook(&self, binding: &BindingRef) {
+        self.shared.outbox.note_hook(binding);
+        self.note_activity(binding);
     }
 
     /// Refreshes environment identities before plate rendering and returns due git/environment notices.

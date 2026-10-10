@@ -294,15 +294,8 @@ async fn due_plate(
     if reserved + crate::feed::MAX_BLOCK_BYTES > super::reply::MAX_FEEDBACK_BYTES {
         return None;
     }
-    if let Some(feed) = feed {
-        return feed.next_block(fingerprint);
-    }
-    let worker = worker?;
-    let line = worker.test_status_line(fingerprint)?;
-    let plate = format!("<agent-ide>\n{line}\n</agent-ide>");
-    (reserved + plate.len() <= super::reply::MAX_FEEDBACK_BYTES
-        && worker.mark_test_status_delivered(fingerprint, &line))
-    .then_some(plate)
+    // A test run's outcome is a session-outbox fact, never a plate line (OUTBOX-r3 §4).
+    feed?.next_block(fingerprint)
 }
 
 /// Leads `plate` with due one-shot git and environment notices when the
@@ -338,76 +331,25 @@ fn attach_reply_plate(
     feed: Option<&Arc<ProjectProblemFeed>>,
     fingerprint: &[u8; 32],
     reply: &mut PeerReply,
-    test_status_snapshot: Option<&str>,
 ) -> Option<String> {
     let feed = feed?;
     let mut fitting = reply.clone();
-    let plate =
-        feed.next_block_when_with_test_status(fingerprint, test_status_snapshot, |plate| {
-            loop {
-                if super::content::fits_with_status(
-                    &fitting,
-                    plate,
-                    super::content::Envelope::WithStructured,
-                ) {
-                    return true;
-                }
-                if !fitting.shrink_text() {
-                    return false;
-                }
+    let plate = feed.next_block_when(fingerprint, |plate| {
+        loop {
+            if super::content::fits_with_status(
+                &fitting,
+                plate,
+                super::content::Envelope::WithStructured,
+            ) {
+                return true;
             }
-        })?;
+            if !fitting.shrink_text() {
+                return false;
+            }
+        }
+    })?;
     *reply = fitting;
     Some(plate)
-}
-
-/// Attaches one explicit-test status plate when project checks are not configured.
-fn attach_test_plate(
-    worker: &WorkerHandle,
-    binding: &[u8; 32],
-    reply: &mut PeerReply,
-    test_status_snapshot: Option<&str>,
-) -> Option<String> {
-    let current = worker.test_status_line(binding);
-    // The reply's own snapshot wins a completion race, but only while that line is still
-    // undelivered: a repeated status lookup of a finished run must not plate it again.
-    let line = match test_status_snapshot {
-        Some(snapshot) => (current.as_deref() == Some(snapshot)).then(|| snapshot.to_owned()),
-        None => current,
-    }?;
-    let plate = format!("<agent-ide>\n{line}\n</agent-ide>");
-    let mut fitting = reply.clone();
-    loop {
-        if super::content::fits_with_status(
-            &fitting,
-            &plate,
-            super::content::Envelope::WithStructured,
-        ) {
-            if worker.mark_test_status_delivered(binding, &line) {
-                *reply = fitting;
-                return Some(plate);
-            }
-            return None;
-        }
-        if !fitting.shrink_text() {
-            return None;
-        }
-    }
-}
-
-/// Reuses the test status captured in the worker's reply to avoid a completion race before plating.
-fn test_status_snapshot(reply: &PeerReply) -> Option<String> {
-    let PeerReply::Complete {
-        kind: super::reply::ResultKind::Test,
-        text,
-        ..
-    } = reply
-    else {
-        return None;
-    };
-    let line = super::tests::plate_line(text.lines().next()?);
-    (line.starts_with("tests #") && !line.contains("started —") && !line.contains("still running"))
-        .then(|| line.to_owned())
 }
 
 impl std::fmt::Debug for ProductDispatcher {
@@ -722,21 +664,30 @@ impl ProductDispatcher {
                 // call may just have completed an activation or a check, so a due status
                 // plate is still delivered on this post phase (T22B) for hosts whose
                 // replies never carry one.
+                if let Some(worker) = &self.worker {
+                    worker.note_hook(binding.binding_ref());
+                }
                 if settled_plate
                     && let Some(worker) = &self.worker
-                    && let Some(block) = with_git_notice(
-                        worker,
-                        &binding.binding_ref().fingerprint(),
-                        due_plate(
-                            worker.project_feed(),
-                            Some(worker),
+                    && let Some(block) = worker.take_facts(
+                        binding.binding_ref(),
+                        super::outbox::Carrier::Hook,
+                        with_git_notice(
+                            worker,
                             &binding.binding_ref().fingerprint(),
-                            None,
+                            due_plate(
+                                worker.project_feed(),
+                                Some(worker),
+                                &binding.binding_ref().fingerprint(),
+                                None,
+                            )
+                            .await,
+                            |plate| plate.len() <= super::reply::MAX_FEEDBACK_BYTES,
                         )
                         .await,
-                        |plate| plate.len() <= super::reply::MAX_FEEDBACK_BYTES,
+                        super::reply::MAX_FEEDBACK_BYTES,
+                        |block| block.len() <= super::reply::MAX_FEEDBACK_BYTES,
                     )
-                    .await
                 {
                     return Ok(PeerReply::Feedback { text: block });
                 }
@@ -769,6 +720,8 @@ impl ProductDispatcher {
                             object.get("tool_file").and_then(|value| value.as_str()),
                         );
                     }
+                    worker.note_hook(&binding);
+                    let session = binding.clone();
                     let feedback = if feed.is_some_and(|feed| feed.is_read_restricted(&fingerprint))
                     {
                         None
@@ -786,6 +739,20 @@ impl ProductDispatcher {
                         |plate| reserved + plate.len() <= super::reply::MAX_FEEDBACK_BYTES,
                     )
                     .await;
+                    // OUTBOX-r3 §8.2: a post phase also hands over the session's due facts,
+                    // after the plate and within the same bounded hook context.
+                    let block = if hook_post {
+                        let budget = super::reply::MAX_FEEDBACK_BYTES.saturating_sub(reserved);
+                        worker.take_facts(
+                            &session,
+                            super::outbox::Carrier::Hook,
+                            block,
+                            budget,
+                            |block| block.len() <= budget,
+                        )
+                    } else {
+                        block
+                    };
                     let text = match (block, feedback) {
                         (Some(block), Some(feedback)) => Some(format!("{block}\n{feedback}")),
                         (block, feedback) => block.or(feedback),
@@ -1352,25 +1319,12 @@ impl ProductDispatcher {
                     && !stopped
                 {
                     let _ = worker.git_notice(&fingerprint).await;
-                    let test_status = test_status_snapshot(&reply);
                     if let Some(feed) = worker.project_feed() {
                         feed.changed(&fingerprint);
                     }
                     if !matches!(reply, PeerReply::Pending { .. }) {
-                        *status = match worker.project_feed() {
-                            Some(feed) => attach_reply_plate(
-                                Some(feed),
-                                &fingerprint,
-                                &mut reply,
-                                test_status.as_deref(),
-                            ),
-                            None => attach_test_plate(
-                                worker,
-                                &fingerprint,
-                                &mut reply,
-                                test_status.as_deref(),
-                            ),
-                        };
+                        *status =
+                            attach_reply_plate(worker.project_feed(), &fingerprint, &mut reply);
                         // The facade decodes a carried plate up to the hook feedback ceiling.
                         *status = with_git_notice(worker, &fingerprint, status.take(), |plate| {
                             plate.len() <= super::reply::MAX_FEEDBACK_BYTES
@@ -1382,6 +1336,28 @@ impl ProductDispatcher {
                         })
                         .await;
                     }
+                }
+                // OUTBOX-r3 §8.2: every terminal reply of every host carries the session's due
+                // facts after the plate; `ide.stop` flushes its own, a placeholder carries none.
+                if method.method() != AssistanceMethod::Stop
+                    && !stopped
+                    && !matches!(reply, PeerReply::Pending { .. })
+                    && let Some(binding) = facts.binding.as_ref()
+                {
+                    worker.note_activity(binding);
+                    *status = worker.take_facts(
+                        binding,
+                        super::outbox::Carrier::Reply,
+                        status.take(),
+                        super::reply::MAX_FEEDBACK_BYTES,
+                        |block| {
+                            super::content::fits_with_status(
+                                &reply,
+                                block,
+                                super::content::Envelope::WithStructured,
+                            )
+                        },
+                    );
                 }
                 Ok(reply)
             }

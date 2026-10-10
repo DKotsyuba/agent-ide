@@ -660,4 +660,79 @@ mod worker_tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// A draft fenced at the session's current epoch.
+    fn finished(shared: &Shared, owner: &BindingRef, subject: &str) -> bool {
+        SessionOutbox::push(
+            shared,
+            std::slice::from_ref(owner),
+            FactDraft {
+                kind: FactKind::TestFinished,
+                subject: subject.to_owned(),
+                summary: "1 passed, 1 failed, 2 s".to_owned(),
+                detail: Some("  FAIL a::b".to_owned()),
+                detail_ref: Some("run-1".to_owned()),
+                failed: true,
+                holds_turn: true,
+                source_bearing: false,
+                fence_paths: Vec::new(),
+            },
+            shared.outbox.current_epoch(owner),
+        )
+    }
+
+    /// OUTBOX §6 boundary: two carriers racing for one session (a hook and a reply) hand each
+    /// fact over exactly once, whatever the interleaving.
+    #[test]
+    fn concurrent_carriers_hand_a_fact_over_once() {
+        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
+        let owner = bind(&bindings, "owner");
+        let handle = Arc::new(handle(bindings));
+        handle.shared.outbox.open(&owner);
+        for round in 0..200 {
+            assert!(finished(&handle.shared, &owner, &format!("tests #{round}")));
+            let carriers = [Carrier::Hook, Carrier::Reply].map(|carrier| {
+                let handle = handle.clone();
+                let owner = owner.clone();
+                std::thread::spawn(move || handle.take_facts(&owner, carrier, None, 4096, |_| true))
+            });
+            let delivered = carriers
+                .into_iter()
+                .filter_map(|carrier| carrier.join().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(delivered.len(), 1, "round {round}: {delivered:?}");
+            assert!(delivered[0].contains(&format!("test-finished tests #{round}: ")));
+        }
+    }
+
+    /// A carrier composes facts after the plate in one block, labels a fact that ran before a
+    /// later edit, keeps it when the block does not fit, and never repeats a delivered fact.
+    #[test]
+    fn carriers_compose_label_and_release() {
+        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
+        let owner = bind(&bindings, "owner");
+        let handle = handle(bindings);
+        handle.shared.outbox.open(&owner);
+        assert!(finished(&handle.shared, &owner, "tests #1"));
+        handle
+            .shared
+            .outbox
+            .note_edit(&owner, &["src/b.rs".to_owned()]);
+        let plate = Some("<agent-ide>\nrust: 0 errors, 0 warnings\n</agent-ide>".to_owned());
+        let refused = handle.take_facts(&owner, Carrier::Reply, plate.clone(), 4096, |_| false);
+        assert_eq!(refused, plate, "a block that does not fit keeps the facts");
+        let block = handle
+            .take_facts(&owner, Carrier::Hook, plate.clone(), 4096, |_| true)
+            .unwrap();
+        assert_eq!(
+            block,
+            "<agent-ide>\nrust: 0 errors, 0 warnings\ntest-finished tests #1: 1 passed, 1 \
+             failed, 2 s (ran before your later edits to src/b.rs)\n  FAIL a::b\n  full output: \
+             ide.inspect run-1\n</agent-ide>"
+        );
+        assert_eq!(
+            handle.take_facts(&owner, Carrier::Hook, plate.clone(), 4096, |_| true),
+            plate
+        );
+    }
 }
