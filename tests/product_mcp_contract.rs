@@ -10820,8 +10820,17 @@ async fn configured_product_batch_typescript_syntax_gate_refuses_and_writes() {
         "{\"name\":\"fixture\",\"private\":true}\n",
     )
     .unwrap();
-    std::fs::create_dir_all(fixture.root.join("node_modules")).unwrap();
-    std::os::unix::fs::symlink(&typescript, fixture.root.join("node_modules/typescript")).unwrap();
+    // The project's own copy of the parser (the probe loads `lib/typescript.js` alone): a real
+    // file inside the worktree, which the TypeScript module's probe recipe admits as a project
+    // path, where a symlink out of it would need a declared root.
+    let local = fixture.root.join("node_modules/typescript");
+    std::fs::create_dir_all(local.join("lib")).unwrap();
+    std::fs::copy(
+        typescript.join("lib/typescript.js"),
+        local.join("lib/typescript.js"),
+    )
+    .unwrap();
+    std::fs::copy(typescript.join("package.json"), local.join("package.json")).unwrap();
     let app = "function value(): number {\n    return 1;\n}\n\nfunction broken(): number {\n    \
                return 2;\n}\n";
     std::fs::write(fixture.root.join("app.ts"), app).unwrap();
