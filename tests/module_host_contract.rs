@@ -287,6 +287,24 @@ fn parity_normalizer_masks_only_volatile_tokens() {
         test("tests #1: 1 passed, 0 failed, 0 s"),
         test("tests #1: 2 passed, 0 failed, 0 s")
     );
+    assert_eq!(
+        test("tests #2: no summary parsed, 4 s — inspect"),
+        test("tests #2: no summary parsed, 5 s — inspect")
+    );
+    assert_eq!(
+        test("tests #2: no test results (exit 2), 4 s — runner said: x"),
+        test("tests #2: no test results (exit 2), 5 s — runner said: x")
+    );
+    // Only the settled status row: the runner's output tail and a started run's arguments keep
+    // anything shaped like a duration.
+    assert_ne!(
+        test("tests #1: 1 passed, 0 failed, 0 s\n  output (tail):\ntests #7 marker, 12 s\n"),
+        test("tests #1: 1 passed, 0 failed, 0 s\n  output (tail):\ntests #7 marker, 13 s\n")
+    );
+    assert_ne!(
+        test("tests #1: started — pytest test_a,12 s.py (budget 120 s)"),
+        test("tests #1: started — pytest test_a,13 s.py (budget 120 s)")
+    );
     // A request's echoed references are masked by value only; the request still differs by
     // its other fields.
     let reply = json!({"state":"complete","kind":"edit","code":null,"text":"ok"});

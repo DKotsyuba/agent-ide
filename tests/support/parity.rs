@@ -758,11 +758,14 @@ pub fn normalized(text: &str) -> String {
     if text.starts_with("ide.start ") {
         start_card(text)
     } else if text.starts_with("ide.test ") {
-        text.split_inclusive('\n')
-            .map(|row| match row.strip_prefix("tests #") {
-                Some(_) => test_duration(row),
-                None => row.to_owned(),
-            })
+        // Only the settled status row (the reply's first row after the call header); started
+        // arguments and the runner's output tail stay exact.
+        let mut rows = text.split_inclusive('\n');
+        let header = rows.next().unwrap_or_default();
+        let status = rows.next().map(test_duration).unwrap_or_default();
+        std::iter::once(header.to_owned())
+            .chain(std::iter::once(status))
+            .chain(rows.map(str::to_owned))
             .collect()
     } else {
         text.to_owned()
@@ -818,16 +821,43 @@ fn start_card(text: &str) -> String {
     out
 }
 
-/// One settled `tests #N: …` row with the whole seconds of its `, S s` duration masked.
+/// A settled `tests #N: …` status row (`P passed, F failed, S s`, `no summary parsed, S s` or
+/// `no test results (exit C), S s`) with its whole-second duration `S` masked; any other row,
+/// a started one included, is kept exactly.
 fn test_duration(row: &str) -> String {
-    for (at, _) in row.match_indices(", ") {
-        let rest = &row[at + 2..];
-        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-        if digits > 0 && rest[digits..].starts_with(" s") {
-            return format!("{}, <secs>{}", &row[..at], &rest[digits..]);
-        }
+    /// The length of the leading ASCII digits of `text`.
+    fn digits(text: &str) -> usize {
+        text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len()
     }
-    row.to_owned()
+    /// `text` after one leading run of digits, if there is one.
+    fn after_number(text: &str) -> Option<&str> {
+        let count = digits(text);
+        (count > 0).then(|| &text[count..])
+    }
+    let settled = || -> Option<usize> {
+        let rest = after_number(row.strip_prefix("tests #")?)?.strip_prefix(": ")?;
+        let rest = if let Some(rest) = rest.strip_prefix("no summary parsed") {
+            rest
+        } else if let Some(rest) = rest.strip_prefix("no test results (exit ") {
+            let rest = rest.strip_prefix('-').unwrap_or(rest);
+            after_number(rest)?.strip_prefix(')')?
+        } else {
+            let rest = after_number(rest)?.strip_prefix(" passed, ")?;
+            after_number(rest)?.strip_prefix(" failed")?
+        };
+        let seconds = rest.strip_prefix(", ")?;
+        let after = after_number(seconds)?;
+        let end = after.strip_prefix(" s")?;
+        matches!(end.chars().next(), None | Some(' ' | '\n' | '\r' | ';'))
+            .then_some(row.len() - seconds.len())
+    };
+    match settled() {
+        Some(at) => {
+            let count = digits(&row[at..]);
+            format!("{}<secs>{}", &row[..at], &row[at + count..])
+        }
+        None => row.to_owned(),
+    }
 }
 
 /// Asserts both transcripts have the same calls and equal normalized replies.
