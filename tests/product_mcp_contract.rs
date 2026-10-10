@@ -5955,11 +5955,12 @@ async fn claude_context_pages_survive_native_posts_but_not_real_edits() {
     daemon.wait().await.unwrap();
 }
 
-/// A pending edit is collectible: when its project check outlasts the inline wait, the edit
-/// answers `pending` and `ide.inspect` later returns the settled edit reply — never the silent
-/// `inspect:internal` a byte-overlong diagnostic message used to turn the whole detail into.
+/// OUTBOX-r3 §8.6: when an edit's project check outlasts the inline wait, the edit answers with
+/// its write and `diagnostics: pending` (never a whole-reply `pending`), the check arrives once as
+/// an `edit-checked` fact, and the edit's own reference later returns the settled reply — never
+/// the silent `inspect:internal` a byte-overlong diagnostic message used to turn it into.
 #[tokio::test]
-async fn a_pending_edit_is_collected_by_inspect_once_its_check_settles() {
+async fn a_slow_edit_check_answers_at_once_and_arrives_as_one_fact() {
     let fixture = ProductFixture::new(json!([]));
     // A rust check held past the inline wait, reporting one over-long multibyte message: 300
     // characters of "é" are 600 bytes, so a character-bound truncation used to leave a message
@@ -5999,11 +6000,40 @@ async fn a_pending_edit_is_collected_by_inspect_once_its_check_settles() {
                    "source_ref":source_ref,"content":"pub fn value() -> i32 { 7 }"}),
         )
         .await;
-    assert!(
-        matches!(edit["state"].as_str(), Some("pending" | "edit")),
-        "the held check parks the edit or settles inline: {edit}"
+    assert_eq!(
+        edit["state"], "edit",
+        "the held check never parks the reply: {edit}"
     );
-    let settled = actor.settle(&fixture, edit).await;
+    assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
+    assert_eq!(edit["diagnostics"]["state"], "pending", "{edit}");
+    let reference = edit["diagnostics"]["detail_ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let checked = actor
+        .call(&fixture, "ide.inspect", json!({"wait_ms":60000}))
+        .await;
+    let checked_text = checked["text"].as_str().unwrap_or_default();
+    assert!(
+        checked_text.starts_with("edit-checked edit pending-edit-1: 1 file"),
+        "{checked}"
+    );
+    for line in checked_text
+        .lines()
+        .filter(|line| line.trim_start().starts_with("new: "))
+    {
+        assert!(line.len() <= 200, "fact lines stay bounded: {checked}");
+    }
+    let again = actor.call(&fixture, "ide.inspect", json!({})).await;
+    assert!(
+        again["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("nothing ready yet")),
+        "the fact is handed over once: {again}"
+    );
+    let settled = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
+        .await;
     assert_eq!(settled["state"], "edit", "{settled}");
     assert_eq!(settled["result"]["outcome"], "replaced", "{settled}");
     assert!(
@@ -6067,7 +6097,26 @@ async fn a_pending_edit_under_a_capped_check_of_other_files_settles_unknown() {
                    "source_ref":source_ref,"content":"pub fn value() -> i32 { 7 }"}),
         )
         .await;
-    let settled = actor.settle(&fixture, edit).await;
+    // OUTBOX-r3 §8.6: the write answers at once; the check arrives as its fact.
+    assert_eq!(edit["diagnostics"]["state"], "pending", "{edit}");
+    let checked = actor
+        .call(&fixture, "ide.inspect", json!({"wait_ms":60000}))
+        .await;
+    assert_eq!(
+        checked["text"],
+        format!(
+            "edit-checked edit capped-edit-1: 1 file, diagnostics unknown\n  result: ide.inspect {}",
+            edit["diagnostics"]["detail_ref"].as_str().unwrap()
+        ),
+        "{checked}"
+    );
+    let settled = actor
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"detail_ref":edit["diagnostics"]["detail_ref"]}),
+        )
+        .await;
     assert_eq!(settled["state"], "edit", "{settled}");
     assert_eq!(settled["result"]["outcome"], "replaced", "{settled}");
     assert_eq!(

@@ -5278,6 +5278,9 @@ impl<'a> Worker<'a> {
                 self.check_diagnostics(&stage)
             };
             let Some(diagnostics) = diagnostics else {
+                // OUTBOX-r3 §8.6: before the caller's inline window ends, the write is answered
+                // with `diagnostics: pending`; the check continues and arrives as a fact.
+                self.reply_edit_early(job, &stage);
                 job.stage = Some(stage);
                 job.park_until = Some(tokio::time::Instant::now() + Duration::from_millis(250));
                 return Err(FailureCode::ProviderLoading);

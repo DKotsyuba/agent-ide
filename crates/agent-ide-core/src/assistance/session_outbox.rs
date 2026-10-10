@@ -228,7 +228,7 @@ pub fn render_fact(fact: &PendingFact) -> String {
             .as_deref()
             .is_some_and(|detail| detail.contains(reference.as_str()))
     {
-        let label = if fact.kind == FactKind::JobReady {
+        let label = if matches!(fact.kind, FactKind::JobReady | FactKind::EditChecked) {
             "result"
         } else {
             "full output"

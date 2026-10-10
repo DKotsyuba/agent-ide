@@ -15,19 +15,26 @@ use super::super::{
     content::{self, Envelope},
     facade::AssistanceTool,
     host_binding::BindingRef,
+    outbox::FencedPath,
     outbox::{
         DeferSpec, FactDraft, FactKind, HandoffRequest, JobEpoch, MAX_FACT_BYTES,
         MAX_SUBJECT_BYTES, MAX_SUMMARY_BYTES, MAX_TARGET_BYTES, MAX_TEST_FACT_BYTES, Reservation,
         SessionOutbox,
     },
-    reply::PeerReply,
+    reply::{EditDiagnostics, PeerReply},
     tests::RunResult,
 };
-use super::{Shared, test_result_text};
+use super::{INLINE_REPLY_WAIT, Job, JobStage, Shared, Worker, edit_operation, test_result_text};
+use crate::changes::edit::EditResult;
 
 /// Slack added to a run's budget before its holding registration expires: settlement, output
 /// draining and the settle hook itself.
 const RUN_SETTLE_SLACK: Duration = Duration::from_secs(5);
+/// How long before the caller's inline window ends an edit still awaiting its project check is
+/// answered with `diagnostics: pending` (OUTBOX §8.6), leaving room for the reply to travel.
+const EARLY_EDIT_REPLY_MARGIN: Duration = Duration::from_millis(1500);
+/// Most diagnostic `new:` lines one `edit-checked` fact carries (OUTBOX §3.3).
+const MAX_NEW_LINES: usize = 8;
 
 /// Returns the fact subject of test run `id`: `tests #N`, the handle every `ide.test` line names.
 pub(super) fn test_subject(id: u64) -> String {
@@ -176,6 +183,142 @@ fn test_fact(id: u64, result: &RunResult, owns_detail: bool) -> FactDraft {
     }
 }
 
+/// Builds the `edit-checked` draft of one single-file edit's project check (OUTBOX §3.3).
+///
+/// Reported diagnostics are compiler output about the file, so their `new:` lines ride only
+/// reply-shaped carriers (`source_bearing`); hooks carry the counts summary alone. `reference` is
+/// the edit job's own result reference: reading it delivers the fact.
+fn edit_checked_fact(
+    reference: &str,
+    result: &EditResult,
+    diagnostics: &EditDiagnostics,
+) -> FactDraft {
+    let path = bounded(&result.path, MAX_SUBJECT_BYTES, false);
+    let (summary, detail, failed) = match diagnostics {
+        EditDiagnostics::CurrentClean { project_errors } => (
+            "1 file, clean".to_owned(),
+            (*project_errors > 0).then(|| {
+                format!(
+                    "  {path}: clean; the project check reports {project_errors} errors in other files"
+                )
+            }),
+            false,
+        ),
+        EditDiagnostics::CurrentReported {
+            messages,
+            delta,
+            truncated,
+        } => {
+            let mut lines = messages
+                .iter()
+                .take(MAX_NEW_LINES)
+                .map(|message| format!("  new: {path}: {}", bounded(message, 160, false)))
+                .collect::<Vec<_>>();
+            if *truncated || messages.len() > MAX_NEW_LINES {
+                lines.push("  (more in ide.context with kind problems)".to_owned());
+            }
+            (
+                bounded(&format!("1 file: {delta}"), MAX_SUMMARY_BYTES, false),
+                Some(bounded(
+                    &lines.join("\n"),
+                    MAX_FACT_BYTES - MAX_SUMMARY_BYTES,
+                    true,
+                )),
+                true,
+            )
+        }
+        EditDiagnostics::NotAnalysed { reason } => (
+            bounded(
+                &format!("1 file, not analysed ({reason})"),
+                MAX_SUMMARY_BYTES,
+                false,
+            ),
+            None,
+            false,
+        ),
+        EditDiagnostics::Unknown {} | EditDiagnostics::Pending { .. } => {
+            ("1 file, diagnostics unknown".to_owned(), None, false)
+        }
+    };
+    let source_bearing = detail.is_some() && failed;
+    FactDraft {
+        kind: FactKind::EditChecked,
+        subject: bounded(
+            &format!("edit {}", result.operation_id),
+            MAX_SUBJECT_BYTES,
+            false,
+        ),
+        summary,
+        detail,
+        detail_ref: Some(reference.to_owned()),
+        failed,
+        holds_turn: true,
+        source_bearing,
+        fence_paths: vec![FencedPath {
+            path: result.path.clone(),
+            digest: None,
+        }],
+    }
+}
+
+impl Worker<'_> {
+    /// Answers an edit whose project check is still running with `diagnostics: pending` shortly
+    /// before its caller's inline window ends (OUTBOX §8.6).
+    ///
+    /// Only a caller still waiting is answered, and only when the session's outbox can hold the
+    /// check as in-flight work under the job's reference: the job stays parked on its check and
+    /// its settlement pushes one `edit-checked` fact ([`Shared::job_settled`]). The write is
+    /// counted for staleness before the registration, so the fact never labels its own edit.
+    pub(super) fn reply_edit_early(&self, job: &mut Job, stage: &JobStage) {
+        let JobStage::EditAwaitingCheck {
+            result, deadline, ..
+        } = stage;
+        let started = job.deadline.checked_sub(Duration::from_millis(
+            self.shared.launcher.limits.operation_ms,
+        ));
+        let due = started.is_none_or(|started| {
+            tokio::time::Instant::now() + EARLY_EDIT_REPLY_MARGIN >= started + INLINE_REPLY_WAIT
+        });
+        let waiting = job
+            .stop_reply
+            .as_ref()
+            .is_some_and(|sender| !sender.is_closed());
+        let binding = job.invocation.binding_ref().clone();
+        if !due || !waiting || !self.shared.outbox.is_open(&binding) {
+            return;
+        }
+        if result.outcome.has_post_source() {
+            self.shared
+                .outbox
+                .note_edit(&binding, std::slice::from_ref(&result.path));
+        }
+        let subject = format!("edit {}", result.operation_id);
+        if !self
+            .shared
+            .outbox
+            .begin_holding(&job.reference, &binding, &subject, *deadline)
+        {
+            return;
+        }
+        let reply = PeerReply::Edit {
+            result: result.clone(),
+            diagnostics: EditDiagnostics::Pending {
+                detail_ref: job.reference.clone(),
+            },
+            note: job
+                .format_note
+                .clone()
+                .filter(|_| result.outcome.has_post_source()),
+            operation: edit_operation(&job.parameters),
+        };
+        if let Some(sender) = job.stop_reply.take()
+            && sender.send(reply).is_err()
+        {
+            let _ = self.shared.outbox.take_holding(&job.reference);
+        }
+    }
+}
+
 impl SessionOutbox for Shared {
     /// Queues the draft for every open recipient session (the store's validation applies).
     fn push(&self, recipients: &[BindingRef], draft: FactDraft, epoch: JobEpoch) -> bool {
@@ -281,6 +424,10 @@ impl Shared {
 
     /// Settles the outbox side of a job: a written edit advances the owner's edit counter, and a
     /// deferred job's final reply becomes its `job-ready` fact.
+    ///
+    /// An edit already answered early with `diagnostics: pending` (its holding registration is
+    /// keyed by the job's reference) pushes its `edit-checked` fact instead, and its write was
+    /// already counted when it was answered.
     pub(super) fn job_settled(
         &self,
         reference: &str,
@@ -288,21 +435,37 @@ impl Shared {
         reply: &PeerReply,
         deferred: Option<(DeferSpec, JobEpoch)>,
     ) {
+        let held = self.outbox.take_holding(reference);
         if let PeerReply::Edit { result, .. } = reply
             && result.outcome.has_post_source()
+            && (held.is_none() || deferred.is_some())
         {
             self.outbox
                 .note_edit(owner, std::slice::from_ref(&result.path));
         }
-        let Some((spec, epoch)) = deferred else {
+        if let Some((spec, epoch)) = deferred {
+            self.outbox.push_draft(
+                std::slice::from_ref(owner),
+                job_fact(reference, reply, &spec),
+                epoch,
+            );
             return;
-        };
-        let _ = self.outbox.take_holding(reference);
-        self.outbox.push_draft(
-            std::slice::from_ref(owner),
-            job_fact(reference, reply, &spec),
-            epoch,
-        );
+        }
+        if let (
+            Some(work),
+            PeerReply::Edit {
+                result,
+                diagnostics,
+                ..
+            },
+        ) = (held, reply)
+        {
+            self.outbox.push_draft(
+                std::slice::from_ref(&work.owner),
+                edit_checked_fact(reference, result, diagnostics),
+                work.epoch,
+            );
+        }
     }
 
     /// The job behind `reference` reached `binding` through its own reference: its deferral ends

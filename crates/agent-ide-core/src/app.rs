@@ -1680,8 +1680,12 @@ async fn serve_assistance_request(
                 .ok_or_else(|| invalid_transport("invalid method parameters"))?,
             )
             .ok_or_else(|| invalid_transport("invalid method correlation"))?;
+            let budget = method_dispatch_budget(
+                required_string(object, "dispatch_method")?,
+                required_value(object, "params_json")?,
+            );
             let reply = tokio::time::timeout(
-                METHOD_DISPATCH_BUDGET,
+                budget,
                 dispatcher.dispatch(AssistanceDispatch::MethodDispatch(dispatch.clone())),
             )
             .await;
@@ -2224,6 +2228,28 @@ mod tests {
         assert!(
             METHOD_DISPATCH_BUDGET > crate::assistance::worker::INLINE_REPLY_WAIT,
             "the bridge must preserve the original invocation through the inline wait"
+        );
+    }
+
+    /// An `ide.inspect` wait extends the dispatch budget by itself, clamped; nothing else does.
+    #[test]
+    fn inspect_waits_extend_the_dispatch_budget() {
+        let waiting = json!({"parameters":{"wait_ms":30000}});
+        assert_eq!(
+            method_dispatch_budget("inspect", &waiting),
+            METHOD_DISPATCH_BUDGET + Duration::from_secs(30)
+        );
+        assert_eq!(
+            method_dispatch_budget("inspect", &json!({"parameters":{"wait_ms":u64::MAX}})),
+            METHOD_DISPATCH_BUDGET + Duration::from_secs(240)
+        );
+        assert_eq!(
+            method_dispatch_budget("read", &waiting),
+            METHOD_DISPATCH_BUDGET
+        );
+        assert_eq!(
+            method_dispatch_budget("inspect", &json!({})),
+            METHOD_DISPATCH_BUDGET
         );
     }
 
