@@ -354,6 +354,34 @@ async fn parity_session_settles_a_late_activation() {
     session.close(&fixture).await;
 }
 
+/// A start that never settles fails at its one overall deadline, however many nested pending
+/// polls it would otherwise take.
+#[tokio::test]
+#[should_panic(expected = "ide.start did not settle to an activation within")]
+async fn parity_session_start_has_one_deadline() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = parity::Fixture::new(&[("a.css", ".a {}\n")], json!([]));
+    let front = fixture.base.join("pending-front");
+    std::fs::write(
+        &front,
+        FAKE_FRONT.replace(
+            r#"*'"ide.inspect"'*) reply='{"structuredContent":{"state":"complete","kind":"activation","text":"ok"}}' ;;"#,
+            r#"*'"ide.inspect"'*) reply='{"structuredContent":{"state":"pending","detail_ref":"start-1"}}' ;;"#,
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&front, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let started = std::time::Instant::now();
+    let session = tokio::time::timeout(
+        Duration::from_secs(20),
+        parity::Session::start_within(&fixture, front, Duration::from_secs(3)),
+    )
+    .await
+    .expect("the start's own deadline ends it first");
+    drop(session);
+    panic!("never settles ({:?})", started.elapsed());
+}
+
 /// The parity harness runs the same calls on two fresh daemons, with and without the fallback
 /// switch, and finds them equal; CSS runs as a module by default exactly when it ships as one.
 #[tokio::test]

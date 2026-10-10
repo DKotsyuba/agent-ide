@@ -433,10 +433,15 @@ impl Session {
         Self::start_with(fixture, binary()).await
     }
 
-    /// [`Session::start`] with `program` serving the front and its hooks. The start is repeated
-    /// (the same activation id, so it is idempotent) until it settles to an activation, for at
-    /// most 30 s; a pending start is settled through `ide.inspect` like every pending reply.
+    /// [`Session::start`] with `program` serving the front and its hooks, within 30 s.
     pub async fn start_with(fixture: &Fixture, program: PathBuf) -> Self {
+        Self::start_within(fixture, program, Duration::from_secs(30)).await
+    }
+
+    /// [`Session::start_with`] within `deadline`: the start is repeated (the same activation id,
+    /// so it is idempotent) until it settles to an activation, a pending start settled through
+    /// `ide.inspect`; one overall deadline covers every repeat and every nested poll.
+    pub async fn start_within(fixture: &Fixture, program: PathBuf, deadline: Duration) -> Self {
         let mut child = Command::new(&program)
             .env("TOKIO_WORKER_THREADS", "1")
             .env("AGENT_IDE_HOST_ATTACHMENT", ATTACHMENT)
@@ -463,16 +468,21 @@ impl Session {
             .send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
             .await;
         let arguments = json!({"activation_id":"parity-start"});
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let mut start = session.call(fixture, "ide.start", arguments.clone()).await;
-        while start["kind"] != "activation" {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "ide.start did not settle to an activation within 30 s: {start}"
-            );
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            start = session.call(fixture, "ide.start", arguments.clone()).await;
-        }
+        let mut last = Value::Null;
+        let settled = tokio::time::timeout(deadline, async {
+            loop {
+                last = session.call(fixture, "ide.start", arguments.clone()).await;
+                if last["kind"] == "activation" {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "ide.start did not settle to an activation within {deadline:?}: {last}"
+        );
         session
     }
 
