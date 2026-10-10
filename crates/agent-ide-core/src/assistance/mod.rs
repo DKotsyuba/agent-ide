@@ -42,3 +42,6 @@ pub mod telemetry;
 
 /// Owns explicitly requested background test runs for the daemon lifetime.
 pub mod tests;
+
+/// Renders the deterministic, byte-bounded terminal text of one settled test run.
+pub(crate) mod test_fact;

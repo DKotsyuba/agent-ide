@@ -8998,8 +8998,8 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     );
     assert_eq!(
         start_text.trim_end(),
-        "tests #1: started — cargo test --manifest-path Cargo.toml --lib (budget 120 s); poll: call \
-         ide.test with {\"status\": 1}",
+        "tests #1: started — cargo test --manifest-path Cargo.toml --lib (budget 120 s); the result \
+         arrives by itself in a later <agent-ide> block",
         "{start_text}"
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
