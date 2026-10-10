@@ -158,7 +158,7 @@ pub enum ContentKey {
 }
 
 /// Key of one cached extraction: the language, its extractor revision, the worktree-relative path
-/// and the content. The path is part of the key because facts depend on it (a CSS module's class
+/// and the content. The path is part of the key because facts depend on it (a style module's class
 /// domain is its path, a file reference joins the path's directory): identical bytes at two paths
 /// are two extractions.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1885,7 +1885,7 @@ mod tests {
     }
 
     /// Identical bytes at different paths are different extractions: the cache key carries the
-    /// path (a CSS module's class domain, a file reference's directory depend on it).
+    /// path (a style module's class domain, a file reference's directory depend on it).
     #[test]
     fn cache_keys_carry_the_path() {
         testing::install();

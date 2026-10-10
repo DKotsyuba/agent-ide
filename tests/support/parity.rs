@@ -341,6 +341,28 @@ impl Drop for Daemon {
     }
 }
 
+/// The daemon's own `health` answer on `fixture`'s endpoint (`"ok"` when healthy), read over its
+/// framed IPC socket independently of any MCP front.
+pub async fn health(fixture: &Fixture) -> String {
+    let mut stream = UnixStream::connect(fixture.runtime.join("agent-ide.sock"))
+        .await
+        .unwrap();
+    let body =
+        serde_json::to_vec(&json!({"version":1,"request_id":"parity-health","method":"health"}))
+            .unwrap();
+    stream
+        .write_all(&(body.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    stream.write_all(&body).await.unwrap();
+    let mut length = [0_u8; 4];
+    stream.read_exact(&mut length).await.unwrap();
+    let mut body = vec![0; u32::from_be_bytes(length) as usize];
+    stream.read_exact(&mut body).await.unwrap();
+    let reply: Value = serde_json::from_slice(&body).unwrap();
+    reply["status"].as_str().unwrap_or_default().to_owned()
+}
+
 /// One daemon child with its own children.
 #[derive(Clone, Debug)]
 pub struct Node {
@@ -544,9 +566,10 @@ impl Session {
 
 /// One settled reply rendered as `tool args -> state kind code` plus its text. The per-daemon
 /// references the reply itself generated (every `source_ref`/`detail_ref` value of its structured
-/// form) are written as `<ref>` in the reply's metadata rows ([`metadata_rows`]), and the ones a
-/// request echoes are masked in its arguments; no other byte changes, and source rows the reply
-/// returns stay exact.
+/// form) are written as `<ref>` in the reply's metadata rows ([`metadata_rows`]), the ones a
+/// request echoes are masked in its arguments, and a leading `<agent-ide>` status plate (the
+/// feed of what changed since the last call) is dropped; no other byte changes, and source rows
+/// the reply returns stay exact.
 pub fn line(tool: &str, arguments: &Value, reply: &Value) -> String {
     masked_line(tool, arguments, reply, None)
 }
@@ -596,6 +619,12 @@ fn masked_line(tool: &str, arguments: &Value, reply: &Value, root: Option<&str>)
     // Longest first, so a value that contains another is masked whole.
     masks.sort_by_key(|(value, _)| std::cmp::Reverse(value.len()));
     let text = reply["text"].as_str().unwrap_or_default();
+    // A leading `<agent-ide>` status plate is the daemon's feed of what changed since the last
+    // call (a check still running or landed), not this reply's answer: it is dropped whole.
+    let text = text
+        .strip_prefix("<agent-ide>\n")
+        .and_then(|plate| plate.split_once("</agent-ide>\n"))
+        .map_or(text, |(_, rest)| rest);
     let context = reply["kind"] == "context";
     let text: String = metadata_rows(text, context)
         .map(|(row, metadata)| {
@@ -614,23 +643,42 @@ fn masked_line(tool: &str, arguments: &Value, reply: &Value, root: Option<&str>)
     )
 }
 
-/// Each row of a reply `text` (with its line end) and whether it is generated metadata rather
-/// than returned source: a numbered source row (`  12\tcode`) is source, and so is every row of
-/// an `ide.context` reply after its header (the first empty row); every other row is metadata.
+/// The rows a reply generates around what it returns, by their leading label: the `source_ref:`
+/// row of a read, the `edit:`/`Next:` rows of an edit, a test run's `tests #`/`rerun:`/`full
+/// output:` rows, a pending or truncated reply's `ide.inspect` rows, the start card's `project:`
+/// row and a context header's `Detail:`/`definitions:`/`references:`/`lexical_matches:` rows.
+const METADATA_LABELS: &[&str] = &[
+    "source_ref:",
+    "edit:",
+    "Next:",
+    "pending:",
+    "tests #",
+    "rerun:",
+    "full output:",
+    "Output is",
+    "Diagnostics are",
+    "project:",
+    "Detail:",
+    "definitions:",
+    "references:",
+    "lexical_matches:",
+];
+
+/// Each row of a reply `text` (with its line end) and whether it is generated metadata: a row
+/// that starts (after its indent) with one of [`METADATA_LABELS`], outside an `ide.context`
+/// reply's body (every row after its header's first empty row). Every other row (numbered
+/// source, usage excerpts, signatures, docs, diagnostics, a context body) is returned content.
 pub fn metadata_rows(text: &str, context: bool) -> impl Iterator<Item = (&str, bool)> {
     let mut body = false;
     text.split_inclusive('\n').map(move |row| {
-        let numbered = row
-            .trim_start_matches(' ')
-            .split_once('\t')
-            .is_some_and(|(number, _)| {
-                !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
-            });
-        let source = body || numbered;
+        let labelled = METADATA_LABELS
+            .iter()
+            .any(|label| row.trim_start_matches(' ').starts_with(label));
+        let metadata = !body && labelled;
         if context && row.trim_end_matches(['\r', '\n']).is_empty() {
             body = true;
         }
-        (row, !source)
+        (row, metadata)
     })
 }
 

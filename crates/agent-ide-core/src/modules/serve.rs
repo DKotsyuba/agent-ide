@@ -291,13 +291,28 @@ pub const FAULT_SEAM: &str = "AGENT_IDE_TEST_MODULE_FAULT";
 /// `test-seams` builds.
 pub const FIXTURE_SEAM: &str = "AGENT_IDE_TEST_MODULE_FIXTURE";
 
+/// The kinds the serving loop acts out; any other kind belongs to a language's own seam (such as
+/// a checker's `widen`), which must find its flag file still there.
+const SERVE_FAULTS: [&str; 9] = [
+    "exit",
+    "stall",
+    "late",
+    "malformed",
+    "oversize",
+    "wrong-fence",
+    "truncate",
+    "stderr-flood",
+    "orphan",
+];
+
 /// The one-time fault the seam selects for `target` (a capability's wire name, or `hello`),
-/// consumed when its flag file is removed; returns the kind and the flag path.
+/// consumed when its flag file is removed; returns the kind and the flag path. A kind the serving
+/// loop does not act out is left alone.
 fn fault_seam(target: &str) -> Option<(String, String)> {
     let value = crate::test_seams::var(FAULT_SEAM)?;
     let mut parts = value.splitn(3, ':');
     let (kind, wanted, flag) = (parts.next()?, parts.next()?, parts.next()?);
-    (wanted == target && std::fs::remove_file(flag).is_ok())
+    (wanted == target && SERVE_FAULTS.contains(&kind) && std::fs::remove_file(flag).is_ok())
         .then(|| (kind.to_owned(), flag.to_owned()))
 }
 
