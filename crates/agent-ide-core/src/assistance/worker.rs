@@ -7854,6 +7854,10 @@ mod stop_retry_tests {
     };
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+    /// Availability and navigation tests (stale writer takeover, servers line, approximate and
+    /// faulted symbol/graph answers), kept in their own file beside these fixtures.
+    mod availability;
+
     /// Separates disposable fixture roots within the current process.
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -9222,15 +9226,15 @@ mod stop_retry_tests {
     }
 
     /// Runs one `tool` job of `actor` against the scripted fixture session through the production
-    /// tool path, then settles the session's health as `perform` does. Returns the tool's outcome
-    /// and how many sessions are marked failed afterwards.
+    /// tool path, then settles the session's health as `perform` does. Returns the tool's reply
+    /// (or failure code) and how many sessions are marked failed afterwards.
     async fn scripted_tool(
         worker: &mut Worker<'_>,
         actor: &str,
         call: &str,
         tool: AssistanceTool,
         parameters: Value,
-    ) -> (Result<(), FailureCode>, usize) {
+    ) -> (Result<PeerReply, FailureCode>, usize) {
         let invocation = production_call(worker, actor, call);
         let (cancel_sender, cancel) = watch::channel(false);
         let _keep = cancel_sender;
@@ -9256,7 +9260,7 @@ mod stop_retry_tests {
             AssistanceTool::Graph => worker.graph(&mut job).await,
             _ => worker.symbol(&mut job).await,
         }
-        .map(|_| ());
+        .map(|(reply, _, _)| reply);
         assert!(job.park_until.is_none(), "{call} parked: {outcome:?}");
         worker.settle_session_health(&job).await;
         (outcome, worker.test_failed_sessions())

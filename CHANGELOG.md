@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- `ide.graph` no longer renders a failed call-hierarchy request as a graph with no calls: a root whose requests failed answers `graph: callers of <root> unavailable (<cause>)`, a failed direction beside an answered one prints `callers: unavailable (<cause>)`, and a deeper node carries `(callers unavailable: <cause>)` on its row. 0.10.8 answered `1 nodes, 0 edges`.
+
 ## 0.10.8 — 2026-10-10
 
 ### Added

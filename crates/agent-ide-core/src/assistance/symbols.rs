@@ -1112,6 +1112,11 @@ impl Worker<'_> {
     }
 
     /// `ide.graph {symbol, direction, depth}`: bounded breadth-first call hierarchy.
+    ///
+    /// A call-hierarchy request that fails is recorded on the node it was made for and the reply
+    /// says `unavailable (<cause>)` there (see [`render::call_graph_text`]); the session is marked
+    /// faulted and the call journaled as degraded. A failed request never yields a normal graph
+    /// with missing edges, and the walk continues with the other nodes.
     pub(super) async fn graph(
         &mut self,
         job: &mut Job,
@@ -1335,26 +1340,38 @@ impl Worker<'_> {
             let source = observed_text(&source_observed, &source_bytes)?;
             let offset = name_offset(source, &symbol)?;
             let live = self.live_session_for(job, &source_observed).await?;
-            let mut faulted = false;
-            let related_items = match edge_direction {
-                render::GraphDirection::Callers => live
-                    .session
-                    .incoming_calls(&source_observed, &source_bytes, offset)
-                    .await
-                    .map(|calls| calls.into_iter().map(|call| call.from).collect::<Vec<_>>()),
-                render::GraphDirection::Callees => live
-                    .session
-                    .outgoing_calls(&source_observed, &source_bytes, offset)
-                    .await
-                    .map(|calls| calls.into_iter().map(|call| call.to).collect::<Vec<_>>()),
-            }
-            .unwrap_or_else(|_| {
-                faulted = true;
-                Vec::new()
-            });
-            if faulted {
-                self.providers.note_session_fault();
-            }
+            let (request, answered) = match edge_direction {
+                render::GraphDirection::Callers => (
+                    "incoming calls",
+                    live.session
+                        .incoming_calls(&source_observed, &source_bytes, offset)
+                        .await
+                        .map(|calls| calls.into_iter().map(|call| call.from).collect::<Vec<_>>()),
+                ),
+                render::GraphDirection::Callees => (
+                    "outgoing calls",
+                    live.session
+                        .outgoing_calls(&source_observed, &source_bytes, offset)
+                        .await
+                        .map(|calls| calls.into_iter().map(|call| call.to).collect::<Vec<_>>()),
+                ),
+            };
+            // A failed request is reported on its node, never rendered as "no calls" (0.10.8
+            // answered `1 nodes, 0 edges` for a root whose request had failed).
+            let related_items = match answered {
+                Ok(items) => items,
+                Err(error) => {
+                    self.providers.note_session_fault();
+                    self.shared.mark_degraded(&job.reference);
+                    let language = Lang::for_path(&relative).unwrap_or(outline.language);
+                    graph.note_fault(
+                        parent,
+                        edge_direction,
+                        request_failed(request, &error, language),
+                    );
+                    Vec::new()
+                }
+            };
             for item in related_items {
                 let (node, item_file, item_symbol) =
                     match self.graph_node(job, &worktree_root, item.clone()).await {

@@ -38,6 +38,15 @@ impl GraphDirection {
             Self::Callees => "→",
         }
     }
+
+    /// Returns the plural noun of this direction's section, `callers` or `callees`, as printed
+    /// in an `unavailable (<cause>)` line.
+    pub const fn noun(self) -> &'static str {
+        match self {
+            Self::Callers => "callers",
+            Self::Callees => "callees",
+        }
+    }
 }
 
 /// One unique symbol in a bounded live call graph.
@@ -81,6 +90,10 @@ pub struct CallGraph {
     pub collapsed_tests: std::collections::BTreeMap<(usize, GraphDirection), usize>,
     /// Set when adding a node or edge reached the fixed graph ceiling.
     pub capped: bool,
+    /// Call-hierarchy requests that failed, keyed by the queried node index and direction, with
+    /// the cause rendered in parentheses. A failed request is reported where it happened and is
+    /// never rendered as an absence of calls.
+    pub faults: std::collections::BTreeMap<(usize, GraphDirection), String>,
 }
 
 impl CallGraph {
@@ -91,7 +104,38 @@ impl CallGraph {
             edges: Vec::new(),
             collapsed_tests: Default::default(),
             capped: false,
+            faults: Default::default(),
         }
+    }
+
+    /// Records that the `direction` call-hierarchy request of node `node` failed with `cause`
+    /// (for example `incoming calls request failed`). The first cause recorded for one node and
+    /// direction is kept; recording never adds a node or an edge.
+    pub fn note_fault(&mut self, node: usize, direction: GraphDirection, cause: String) {
+        self.faults.entry((node, direction)).or_insert(cause);
+    }
+
+    /// The cause when the root has no answer at all for `directions`: every listed direction's
+    /// request faulted and no edge of those directions leaves the root (a cross-language link
+    /// edge is an answer). Several distinct causes are joined with `; `. `None` when any listed
+    /// direction answered or `directions` is empty.
+    pub fn root_unavailable(&self, directions: &[GraphDirection]) -> Option<String> {
+        if directions.is_empty()
+            || self
+                .edges
+                .iter()
+                .any(|edge| edge.from == 0 && directions.contains(&edge.direction))
+        {
+            return None;
+        }
+        let mut causes: Vec<&str> = Vec::new();
+        for direction in directions {
+            let cause = self.faults.get(&(0, *direction))?;
+            if !causes.contains(&cause.as_str()) {
+                causes.push(cause);
+            }
+        }
+        Some(causes.join("; "))
     }
 
     /// Adds a unique node, returning its index; returns `None` after the 60-node ceiling.
@@ -120,6 +164,13 @@ impl CallGraph {
 }
 
 /// Renders a depth-limited graph as an indented tree; repeated nodes are marked `(seen)`.
+///
+/// A failed call-hierarchy request is never rendered as an absence of calls:
+/// - when the root has no answer for any selected direction, the whole reply is the single line
+///   `graph: <subject> of <root> unavailable (<cause>)`;
+/// - a root direction that faulted while another answered prints `<noun>: unavailable (<cause>)`
+///   before that direction's rows;
+/// - a deeper node whose request faulted ends its row with `(<noun> unavailable: <cause>)`.
 pub fn call_graph_text(graph: &CallGraph, direction: &str, depth: u8) -> String {
     let root = &graph.nodes[0];
     let subject = match direction {
@@ -127,6 +178,14 @@ pub fn call_graph_text(graph: &CallGraph, direction: &str, depth: u8) -> String 
         "callees" => "callees",
         _ => "callers",
     };
+    let directions: &[GraphDirection] = match direction {
+        "both" => &[GraphDirection::Callers, GraphDirection::Callees],
+        "callees" => &[GraphDirection::Callees],
+        _ => &[GraphDirection::Callers],
+    };
+    if let Some(cause) = graph.root_unavailable(directions) {
+        return format!("graph: {subject} of {} unavailable ({cause})\n", root.path);
+    }
     let mut out = format!(
         "graph: {subject} of {} (depth {depth}, {} nodes, {} edges)\n",
         root.path,
@@ -135,15 +194,11 @@ pub fn call_graph_text(graph: &CallGraph, direction: &str, depth: u8) -> String 
     );
     let mut seen = vec![false; graph.nodes.len()];
     seen[0] = true;
-    let directions = if direction == "both" {
-        [Some(GraphDirection::Callers), Some(GraphDirection::Callees)]
-    } else if direction == "callees" {
-        [Some(GraphDirection::Callees), None]
-    } else {
-        [Some(GraphDirection::Callers), None]
-    };
-    for selected in directions.into_iter().flatten() {
-        render_graph_children(graph, 0, selected, 1, depth, &mut seen, &mut out);
+    for selected in directions {
+        if let Some(cause) = graph.faults.get(&(0, *selected)) {
+            out.push_str(&format!("{}: unavailable ({cause})\n", selected.noun()));
+        }
+        render_graph_children(graph, 0, *selected, 1, depth, &mut seen, &mut out);
     }
     if graph.capped {
         out.push_str("… capped at 60 nodes or 120 edges\n");
@@ -191,6 +246,8 @@ fn render_graph_children(
         }
         if already_seen {
             out.push_str(" (seen)");
+        } else if let Some(cause) = graph.faults.get(&(edge.to, direction)) {
+            out.push_str(&format!(" ({} unavailable: {cause})", direction.noun()));
         }
         out.push('\n');
         if !already_seen {
@@ -273,6 +330,70 @@ mod graph_tests {
         );
         assert!(graph.capped);
         assert!(call_graph_text(&graph, "callers", 1).contains("… capped at 60 nodes"));
+    }
+
+    /// A failed call-hierarchy request is reported where it happened, never as missing calls: a
+    /// root with no answer is one `unavailable` line, a root direction that faulted beside one
+    /// that answered prints its own line, and a deeper node carries the cause on its row.
+    #[test]
+    fn call_graph_reports_faulted_requests_as_unavailable() {
+        let node = |path: &str, line: u32| GraphNode {
+            path: path.to_owned(),
+            file: "src/lib.rs".to_owned(),
+            line,
+            is_test: false,
+            tag: None,
+        };
+        let mut graph = CallGraph::new(node("root", 1));
+        graph.note_fault(
+            0,
+            GraphDirection::Callers,
+            "incoming calls request failed".into(),
+        );
+        assert_eq!(
+            call_graph_text(&graph, "callers", 2),
+            "graph: callers of root unavailable (incoming calls request failed)\n"
+        );
+
+        // Callees answered, callers did not: the graph renders with the callers line.
+        let callee = graph.add_node(node("callee", 5)).unwrap();
+        graph.add_edge(GraphEdge {
+            from: 0,
+            to: callee,
+            direction: GraphDirection::Callees,
+            link: false,
+        });
+        graph.note_fault(
+            callee,
+            GraphDirection::Callees,
+            "outgoing calls request failed".into(),
+        );
+        let text = call_graph_text(&graph, "both", 2);
+        assert!(
+            text.starts_with("graph: callers and callees of root (depth 2, 2 nodes, 1 edges)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("callers: unavailable (incoming calls request failed)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "→ callee  src/lib.rs:5 (callees unavailable: outgoing calls request failed)\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            graph
+                .root_unavailable(&[GraphDirection::Callers, GraphDirection::Callees])
+                .is_none()
+        );
+        assert_eq!(
+            graph
+                .root_unavailable(&[GraphDirection::Callers])
+                .as_deref(),
+            Some("incoming calls request failed")
+        );
     }
 
     /// Keeps callers before callees for a two-sided graph and marks a repeated test node.
