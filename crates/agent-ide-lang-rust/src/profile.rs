@@ -430,7 +430,8 @@ impl agent_ide_core::intelligence::session::SessionProfile for RustProfile {
         Some(RUST_STATUS_METHOD)
     }
 
-    /// See `rust_status`.
+    /// Quiescent with health `ok` or `warning` is ready, quiescent with `error` failed, anything
+    /// not quiescent still busy; params that are not the accepted status shape fail decoding.
     fn status(
         &self,
         params: serde_json::Value,
@@ -438,7 +439,7 @@ impl agent_ide_core::intelligence::session::SessionProfile for RustProfile {
         rust_status(params)
     }
 
-    /// See `rust_language_id`.
+    /// Opens `.rs` files as `rust`; everything else stays `plaintext`.
     fn language_id(&self, path: &Path) -> &'static str {
         rust_language_id(path)
     }
@@ -490,7 +491,8 @@ impl agent_ide_core::intelligence::session::SessionProfile for RustModuleSession
         Some(RUST_STATUS_METHOD)
     }
 
-    /// See `rust_status`.
+    /// Quiescent with health `ok` or `warning` is ready, quiescent with `error` failed, anything
+    /// not quiescent still busy; params that are not the accepted status shape fail decoding.
     fn status(
         &self,
         params: serde_json::Value,
@@ -498,7 +500,7 @@ impl agent_ide_core::intelligence::session::SessionProfile for RustModuleSession
         rust_status(params)
     }
 
-    /// See `rust_language_id`.
+    /// Opens `.rs` files as `rust`; everything else stays `plaintext`.
     fn language_id(&self, path: &Path) -> &'static str {
         rust_language_id(path)
     }
