@@ -377,6 +377,9 @@ impl FakeModule {
                     }))
                 }
                 DescribeQuery::VerifyProvider { .. } => encode(&Ok::<(), String>(())),
+                DescribeQuery::ProjectInputs { .. } => {
+                    encode(&super::payload::InputsVerdict::Accepted)
+                }
                 DescribeQuery::Checks { section } => {
                     encode(&Ok::<ChecksDescription, String>(ChecksDescription {
                         valid: true,

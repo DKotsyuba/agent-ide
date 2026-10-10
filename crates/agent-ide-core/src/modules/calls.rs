@@ -261,6 +261,31 @@ fn field<T>(value: Field<T>, default: T) -> T {
     }
 }
 
+/// The language's interpretation of the project `inputs` read for `document`: `None` when the
+/// language computes in process (the caller interprets them itself), otherwise its module's
+/// verdict.
+pub async fn project_inputs(
+    language: Language,
+    worktree: &Path,
+    document: &Path,
+    inputs: Vec<super::payload::ProjectInput>,
+) -> Option<Routed<super::payload::InputsVerdict>> {
+    let host = module(language)?;
+    Some(
+        host.request(
+            language,
+            worktree,
+            Capability::Describe,
+            encode(&super::payload::DescribeQuery::ProjectInputs {
+                document: document.to_path_buf(),
+                inputs,
+            }),
+            Vec::new(),
+        )
+        .await,
+    )
+}
+
 /// `LanguageSupport::detect`.
 pub async fn detect(language: Language, root: &Path) -> Routed<Option<LanguageProject>> {
     match module(language) {

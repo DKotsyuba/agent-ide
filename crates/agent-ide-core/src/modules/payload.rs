@@ -964,6 +964,49 @@ pub enum DescribeQuery {
         /// Absolute worktree.
         worktree: PathBuf,
     },
+    /// The language's interpretation of the project files the core read for `document` (exact
+    /// reads, path admission and bounds stay with the core); answers [`InputsVerdict`]. Stateless:
+    /// the core repeats the query with more inputs while the verdict asks for them.
+    ProjectInputs {
+        /// Worktree-relative document.
+        document: PathBuf,
+        /// Every input read so far.
+        inputs: Vec<ProjectInput>,
+    },
+}
+
+/// One project file the core read for a language's interpretation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectInput {
+    /// Worktree-relative path.
+    pub path: PathBuf,
+    /// Exact byte length.
+    pub bytes: u64,
+    /// BLAKE3 digest of the bytes, hex.
+    pub blake3: String,
+    /// The text, for a file the language parses; `None` for one it only fingerprints.
+    pub contents: Option<String>,
+}
+
+/// What a language makes of the project inputs read so far.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "verdict", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InputsVerdict {
+    /// The inputs form a closed, admissible project for the document.
+    Accepted,
+    /// Further files must be read (and the query repeated with them).
+    Need {
+        /// Worktree-relative paths, in the order the language wants them.
+        paths: Vec<PathBuf>,
+    },
+    /// The document cannot be served from these inputs.
+    Rejected {
+        /// The input the refusal concerns, if one.
+        file: Option<PathBuf>,
+        /// Short plain-words reason.
+        reason: String,
+    },
 }
 
 /// One accepted executable as the launcher declares it.
