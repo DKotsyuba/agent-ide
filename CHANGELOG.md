@@ -6,7 +6,7 @@
 
 ### Added
 
-- Python runs as a bundled language module: the daemon starts the installed `agent-ide` binary in a hidden `module python <role>` mode, admitted, measured and supervised like any owned child, and Python analysis (Pyright now runs inside the module), its language facts, formatter and syntax-probe plans, test selection and parsing, and the Python project check all compute there; every process a check needs is a fixed recipe the daemon admits and runs itself. Answers are the same as in-process. A killed, stalled or malformed module gives a typed `module_unavailable` refusal naming it and is restarted (within a restart budget) while the daemon keeps serving. `AGENT_IDE_LANGUAGE_MODE=python=in_process` in the daemon's environment sends Python back in process; `agent-ide doctor`, the `ide.start` card and the error log name which path serves. The earlier `AGENT_IDE_PILOT_MODULE` pilot is replaced by this and no longer read.
+- The bundled language module host: a language can compute in a hidden `agent-ide module <language> <role>` process of the installed binary, admitted, measured and supervised by the daemon (restart budget, typed `module_unavailable` refusals naming the module, no orphans), with every process it needs run by the daemon from fixed recipes. No language ships in module mode yet; `AGENT_IDE_LANGUAGE_MODE=<id>=in_process` is the fallback switch for one that does. The experimental `AGENT_IDE_PILOT_MODULE` pilot is removed.
 
 ### Removed
 

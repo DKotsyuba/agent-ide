@@ -167,51 +167,8 @@ struct PyrightLive {
     live: LiveSession,
     /// Interpreter the session was started with, `None` when no environment resolved.
     interpreter: Option<PathBuf>,
-    /// Pyright runs in the analyzer module, which resolved the interpreter and summarized a
-    /// missing environment's import flood itself.
-    in_module: bool,
-    /// The accepted inputs (module executable digest and settings) a module session started
-    /// with, against which its failures count.
-    module_inputs: Option<String>,
     /// Shared-resolver identity of that environment; a different identity at use restarts.
     environment: String,
-}
-
-/// Counts one failure of a Python analyzer module started with `inputs` against the shared
-/// restart policy (`exited` when no typed failure is known).
-fn record_module_failure(
-    worktree: &std::path::Path,
-    inputs: &str,
-    failure: Option<agent_ide_core::modules::contract::ModuleUnavailable>,
-) {
-    let failure = failure.unwrap_or(agent_ide_core::modules::contract::ModuleUnavailable {
-        module_id: agent_ide_core::modules::contract::ModuleId::bundled(crate::DESCRIPTOR.id),
-        module_version: env!("CARGO_PKG_VERSION").to_owned(),
-        role: agent_ide_core::modules::contract::Role::Analyzer,
-        stage: agent_ide_core::modules::contract::Stage::Request,
-        cause: agent_ide_core::modules::contract::Cause::Exited,
-        instance: None,
-        retry_after_ms: None,
-    });
-    agent_ide_core::modules::analyzer::record_failure(
-        crate::DESCRIPTOR.id,
-        worktree,
-        inputs,
-        &failure,
-    );
-}
-
-/// The identity of the module's environment resolutions of `worktree` (every project root's),
-/// computed in the module; `unavailable` when the module could not answer.
-async fn module_environment(worktree: &std::path::Path) -> String {
-    match agent_ide_core::modules::calls::environments(crate::LANGUAGE, worktree).await {
-        Ok(environments) => environments
-            .iter()
-            .map(|environment| environment.identity.as_str())
-            .collect::<Vec<_>>()
-            .join(";"),
-        Err(_) => "unavailable".to_owned(),
-    }
 }
 
 /// Whether a live session started for `started` may keep serving a worktree whose environment
@@ -247,35 +204,12 @@ impl PyrightBackend {
         source: &SourceObservation,
     ) -> Result<(), FailureCode> {
         let binding = job.binding().clone();
-        let worktree_path = source.worktree().worktree_path();
-        // In module mode the module resolves the interpreter and import roots itself; the
-        // session restarts when any of the module's environment resolutions changes identity.
-        let module = match agent_ide_core::modules::calls::module_executable(crate::LANGUAGE) {
-            None => None,
-            Some(Ok(executable)) => Some(executable),
-            Some(Err(failure)) => {
-                job.set_stage_failure(
-                    &FailureCode::ProviderUnavailable,
-                    &format!("python: {failure}"),
-                );
-                return Err(FailureCode::ProviderUnavailable);
-            }
-        };
-        let (interpreter, environment) = match &module {
-            Some(_) => (None, module_environment(worktree_path).await),
-            None => crate::environment::session(worktree_path),
-        };
+        let (interpreter, environment) =
+            crate::environment::session(source.worktree().worktree_path());
         if self.live.get(&binding).is_some_and(|entry| {
             keeps_session(entry.live.is_alive(), &entry.environment, &environment)
         }) {
             return Ok(());
-        }
-        // A module session that died counts against the shared restart policy.
-        if let Some(entry) = self.live.get(&binding)
-            && let Some(inputs) = &entry.module_inputs
-            && !entry.live.is_alive()
-        {
-            record_module_failure(worktree_path, inputs, entry.live.module_unavailable());
         }
         self.release(host, &binding).await;
         let authority = host.authority(&binding).await?;
@@ -284,48 +218,7 @@ impl PyrightBackend {
             .options::<PyrightLaunchOptions>()
             .and_then(|options| options.node.as_ref())
             .ok_or(FailureCode::ExecutionProfile)?;
-        let extra_paths = match &module {
-            Some(_) => Vec::new(),
-            None => crate::support::import_roots(worktree_path),
-        };
-        // The same accepted identities, handed to the analyzer module that starts Pyright.
-        let settings = crate::module::AnalyzerSettings {
-            binary: launch.executable.path.clone(),
-            script_digest: launch.executable.blake3.clone(),
-            version: launch.executable.identity.clone(),
-            node: node.path.clone(),
-            node_digest: node.blake3.clone(),
-            node_identity: node.identity.clone(),
-            trust: launch.trust.clone(),
-            cache_namespace: cache_namespace.clone(),
-        };
-        let module_inputs = module.as_ref().map(|executable| {
-            format!(
-                "{}:{}",
-                executable.digest.to_hex(),
-                serde_json::json!(settings)
-            )
-        });
-        if let Some(inputs) = &module_inputs
-            && let Err(failure) = agent_ide_core::modules::analyzer::start_permit(
-                crate::DESCRIPTOR.id,
-                worktree_path,
-                inputs,
-                tokio::time::Instant::now() + Duration::from_secs(5),
-            )
-            .await
-        {
-            job.set_stage_failure(
-                &FailureCode::ProviderUnavailable,
-                &format!("python: {failure}"),
-            );
-            return Err(FailureCode::ProviderUnavailable);
-        }
-        let module_program = module.as_ref().map(|executable| AcceptedExecutable {
-            path: executable.path.clone(),
-            identity: "agent-ide-module".to_owned(),
-            blake3: executable.digest.to_hex().to_string(),
-        });
+        let extra_paths = crate::support::import_roots(source.worktree().worktree_path());
         let profile = PyrightProfile::new(PyrightProfileIdentity {
             binary: launch.executable.path.clone(),
             accepted_script_digest: blake3::Hash::from_hex(&launch.executable.blake3)
@@ -346,23 +239,10 @@ impl PyrightBackend {
             server::execution_authority(&authority)?,
         )
         .map_err(|_| FailureCode::WorkspaceAuthority)?;
-        let (command, program) = match (&module, &module_program) {
-            (Some(executable), Some(program)) => (
-                agent_ide_core::modules::analyzer::analyzer_command(
-                    executable,
-                    crate::DESCRIPTOR.id,
-                    worktree.worktree(),
-                )
-                .ok_or(FailureCode::ExecutionProfile)?,
-                program,
-            ),
-            _ => (
-                profile
-                    .command(&worktree)
-                    .map_err(|_| FailureCode::ExecutionProfile)?,
-                node,
-            ),
-        };
+        let command = profile
+            .command(&worktree)
+            .map_err(|_| FailureCode::ExecutionProfile)?;
+        let program = node;
         let request = host
             .execution_request(&*job, &authority, command, program)
             .await?;
@@ -434,48 +314,15 @@ impl PyrightBackend {
                     toolchain: 1,
                     view: generation,
                 };
-                let open = async {
-                    match &module {
-                        Some(executable) => {
-                            let offer = agent_ide_core::modules::analyzer::analyzer_offer(
-                                executable,
-                                crate::DESCRIPTOR.id,
-                                generation.backend,
-                                source.worktree(),
-                                vec![
-                                    (settings.node.clone(), settings.node_digest.clone()),
-                                    (settings.binary.clone(), settings.script_digest.clone()),
-                                ],
-                                vec![PathBuf::from(&settings.cache_namespace)],
-                                Duration::from_secs(30),
-                                serde_json::json!(settings),
-                            );
-                            agent_ide_core::modules::analyzer::open_session(
-                                stdout,
-                                stdin,
-                                offer,
-                                source.worktree().clone(),
-                                source.authority_epoch(),
-                                generation,
-                                ProviderSettings::new(profile),
-                                agent_ide_core::modules::router::budget_or(Duration::from_secs(30)),
-                            )
-                            .await
-                        }
-                        None => {
-                            LiveSession::open(
-                                stdout,
-                                stdin,
-                                source.worktree().clone(),
-                                source.authority_epoch(),
-                                generation,
-                                ProviderSettings::new(profile),
-                                Duration::from_secs(30),
-                            )
-                            .await
-                        }
-                    }
-                };
+                let open = LiveSession::open(
+                    stdout,
+                    stdin,
+                    source.worktree().clone(),
+                    source.authority_epoch(),
+                    generation,
+                    ProviderSettings::new(profile),
+                    Duration::from_secs(30),
+                );
                 tokio::pin!(open);
                 tokio::select! { result = &mut open => result, _ = job.cancel().changed() => Err(std::io::Error::other("cancelled")), }
             }
@@ -490,35 +337,20 @@ impl PyrightBackend {
                         view,
                         live,
                         interpreter,
-                        in_module: module.is_some(),
-                        module_inputs,
                         environment,
                     },
                 );
                 Ok(())
             }
-            Err(error) => {
+            Err(_) => {
                 self.reap(host, &binding, child, view).await;
                 if job.cancelled() {
                     Err(FailureCode::Cancelled)
                 } else {
-                    let typed = error
-                        .get_ref()
-                        .and_then(|inner| {
-                            inner.downcast_ref::<agent_ide_core::modules::contract::ModuleUnavailable>()
-                        })
-                        .cloned();
-                    let stage = match (&module_inputs, &typed) {
-                        (Some(inputs), _) => {
-                            record_module_failure(worktree_path, inputs, typed.clone());
-                            typed.map_or_else(
-                                || "python: initialize failed".to_owned(),
-                                |failure| format!("python: {failure}"),
-                            )
-                        }
-                        (None, _) => "python: initialize failed".to_owned(),
-                    };
-                    job.set_stage_failure(&FailureCode::ProviderUnavailable, &stage);
+                    job.set_stage_failure(
+                        &FailureCode::ProviderUnavailable,
+                        "python: initialize failed",
+                    );
                     Err(FailureCode::ProviderUnavailable)
                 }
             }
@@ -549,28 +381,7 @@ impl PyrightBackend {
             let entry = self.live.get_mut(&binding).ok_or(FailureCode::Internal)?;
             let (result, diagnostics) =
                 server::exchange_context(&mut entry.live, job, source, bytes, query, true).await;
-            // A module fault is a typed refusal naming it, never a quiet lexical answer; the
-            // next call starts a fresh module.
-            if let Some(fault) = entry.live.remote_fault().map(str::to_owned) {
-                if let Some(inputs) = &entry.module_inputs {
-                    record_module_failure(
-                        source.worktree().worktree_path(),
-                        inputs,
-                        entry.live.module_unavailable(),
-                    );
-                }
-                self.release(host, &binding).await;
-                job.set_stage_failure(
-                    &FailureCode::ProviderUnavailable,
-                    &format!("python: {fault}"),
-                );
-                return Err(FailureCode::ProviderUnavailable);
-            }
-            (
-                result,
-                diagnostics,
-                entry.interpreter.is_none() && !entry.in_module,
-            )
+            (result, diagnostics, entry.interpreter.is_none())
         };
         let context = match result {
             Ok(context) => context,
@@ -704,7 +515,7 @@ const IMPORT_RESOLUTION_RULES: [&str; 2] = ["reportMissingImports", "reportMissi
 /// [`MISSING_ENVIRONMENT_IMPORTS`] line; the caller has already established that the worktree
 /// has no Python environment. Diagnostics of every other rule survive untouched, and the line is
 /// appended after them, so an edit reply says why its imports were not checked exactly once.
-pub(crate) fn summarize_missing_environment(
+fn summarize_missing_environment(
     diagnostics: &mut agent_ide_core::intelligence::session::DiagnosticSnapshot,
 ) {
     if !diagnostics.diagnostics.iter().any(is_import_resolution) {
