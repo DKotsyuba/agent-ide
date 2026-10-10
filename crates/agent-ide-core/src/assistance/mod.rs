@@ -43,6 +43,9 @@ pub mod wake;
 /// Stores each session's undelivered facts, change counters and agent state (OUTBOX-r3 §5-§9).
 pub mod session_outbox;
 
+/// Remembers, in the MCP front, requested work it relayed unresolved, for restarts (OUTBOX-r3 §10).
+pub mod unresolved;
+
 /// Tracks environment resolution changes across worktree bindings.
 mod environment;
 

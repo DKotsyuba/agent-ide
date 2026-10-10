@@ -2389,6 +2389,9 @@ struct ManagedConnection {
     /// Each actor's last admitted start parameters on a current managed Claude daemon, keyed by
     /// the daemon's private actor tag, oldest first, at most [`MAX_REMEMBERED_ACTORS`].
     remembered: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+    /// Requested work each remembered actor was relayed without its result (OUTBOX-r3 §10),
+    /// reported to the new daemon when the actor is re-activated after a replacement.
+    unresolved: Arc<super::unresolved::Unresolved>,
     /// Set once the bounded memory above evicted an actor that may still be active: from then on
     /// the session may hold actors it no longer remembers, so no actor is assumed gone.
     // ponytail: sticky for the rest of the session once more than 32 actors have been remembered
@@ -2426,6 +2429,7 @@ impl ManagedConnection {
             candidate: Arc::new(Mutex::new(None)),
             last_activation: Arc::new(Mutex::new(None)),
             remembered: Arc::new(std::sync::Mutex::new(Vec::new())),
+            unresolved: Arc::default(),
             memory_overflowed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lifecycle: Arc::new(Mutex::new(())),
             recovery_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2496,6 +2500,7 @@ impl ManagedConnection {
 
     /// Forgets one actor's remembered start.
     fn forget(&self, tag: &str) {
+        self.unresolved.forget(tag);
         self.remembered
             .lock()
             .expect("remembered starts mutex")
@@ -3306,6 +3311,16 @@ impl StdioFacade {
             if let Some(expected) = expected {
                 meta["claudecode/actor"] = json!(expected);
             }
+            // OUTBOX-r3 §10: what this actor was relayed unresolved before the replacement; the
+            // new daemon queues one `lost-after-restart` fact for it. Older daemons ignore it.
+            let lost = self
+                .reconnect
+                .as_ref()
+                .map(|reconnect| reconnect.unresolved.subjects(expected.unwrap_or_default()))
+                .unwrap_or_default();
+            if !lost.is_empty() {
+                meta["claudecode/lost"] = json!(lost);
+            }
             host.host_meta = Some(meta);
             let FacadeOutcome::Reply(reply, _) = self
                 .facade
@@ -3324,7 +3339,12 @@ impl StdioFacade {
                 PeerReply::Complete {
                     kind: ResultKind::Activation,
                     ..
-                } => return true,
+                } => {
+                    if let Some(reconnect) = &self.reconnect {
+                        reconnect.unresolved.forget(expected.unwrap_or_default());
+                    }
+                    return true;
+                }
                 // Still activating, or its pre-hook not there yet: one more bounded attempt.
                 PeerReply::Pending { .. }
                 | PeerReply::Unavailable {
@@ -3430,6 +3450,7 @@ impl StdioFacade {
     async fn forget_remembered_activation(&self) {
         if let Some(reconnect) = &self.reconnect {
             *reconnect.last_activation.lock().await = None;
+            reconnect.unresolved.forget("");
             reconnect.mark_activated();
         }
     }
@@ -3738,6 +3759,19 @@ impl StdioFacade {
         };
         if tool == AssistanceTool::Stop && expected.is_none() && may_have_applied {
             self.forget_remembered_activation().await;
+        }
+        // OUTBOX-r3 §10: remember what this reply leaves owed and forget what it resolves.
+        if tool != AssistanceTool::Stop
+            && let Some(reconnect) = &self.reconnect
+            && let FacadeOutcome::Reply(reply, status) = &outcome
+        {
+            reconnect.unresolved.observe(
+                tag.as_deref().unwrap_or_default(),
+                tool,
+                &stage_parameters,
+                reply,
+                status.as_deref(),
+            );
         }
         crate::telemetry::adapters::log_front_outcome(
             tool,

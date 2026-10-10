@@ -21435,6 +21435,194 @@ async fn futures_join5<T>(
     vec![a, b, c, d, e]
 }
 
+/// Runs one managed Claude call like [`managed_claude_call`] and returns the raw model text.
+async fn managed_claude_text(
+    mcp: &mut Mcp,
+    project: &Path,
+    next: &mut usize,
+    session: &str,
+    agent: Option<&str>,
+    name: &str,
+    arguments: Value,
+) -> String {
+    *next += 1;
+    let call = format!("managed-claude-{next}");
+    let pre = managed_claude_hook(
+        Some(project),
+        managed_claude_event("PreToolUse", session, agent, &call),
+    )
+    .await;
+    assert!(pre.status.success() && pre.stdout.is_empty(), "{pre:?}");
+    let reply = mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":*next,"method":"tools/call","params":{
+                "name":name,"arguments":arguments,"_meta":{"claudecode/toolUseId":call}
+            }}),
+        )
+        .await;
+    let post = managed_claude_hook(
+        Some(project),
+        managed_claude_event("PostToolUse", session, agent, &call),
+    )
+    .await;
+    assert!(post.status.success() && post.stderr.is_empty(), "{post:?}");
+    assert_claude_envelope(&reply).to_owned()
+}
+
+/// OUTBOX-r3 §10: after a daemon replacement each actor that was owed results gets one
+/// `lost-after-restart` fact naming only its own unresolved requests, on its first call; the
+/// next call and an actor that was owed nothing get none.
+#[tokio::test]
+async fn outbox_managed_claude_restart_reports_lost_results_once_per_actor() {
+    let fixture = ProductFixture::new(json!([]));
+    let worktrees = add_worktrees(&fixture, &["lost-child", "lost-idle"]);
+    let (child, idle) = (&worktrees[0], &worktrees[1]);
+    let runtime = managed_claude_runtime_path(&fixture.root);
+    let _guard = SharedClaudeDaemonGuard(runtime.clone());
+    let mut mcp = Mcp::start_managed_claude(&fixture.config, &fixture.root).await;
+    let session = "lost-after-restart";
+    let mut next = 10;
+    let actors = [
+        (&fixture.root, None, "parent"),
+        (child, Some("agent-child"), "child"),
+        (idle, Some("agent-idle"), "idle"),
+    ];
+    for (root, agent, activation) in actors {
+        claude_start_actor(
+            &mut mcp,
+            root,
+            &mut next,
+            session,
+            agent,
+            json!({"activation_id":activation,"root":root}),
+        )
+        .await;
+    }
+    // Parent and child each leave with a started line (one run at a time: the parent's settles
+    // unseen just after its line); the idle actor is owed nothing.
+    for ((root, agent, _), command) in actors[..2].iter().zip(["sleep 6.5", "sleep 60"]) {
+        let started = managed_claude_text(
+            &mut mcp,
+            root,
+            &mut next,
+            session,
+            *agent,
+            "ide.test",
+            json!({"command":["/bin/sh","-c",command]}),
+        )
+        .await;
+        assert!(started.contains(": started"), "{agent:?}: {started}");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let stale = managed_claude_candidate_attachment(&fixture.root);
+    terminate_shared_claude_daemon(&runtime);
+    wait_for_healed_daemon(&fixture.root, &runtime, &stale).await;
+    let read = json!({"path":"src/lib.rs","lines":"1-2"});
+    for (root, agent, own, other) in [
+        (&fixture.root, None, "tests #1", "tests #2"),
+        (child, Some("agent-child"), "tests #2", "tests #1"),
+    ] {
+        let first = managed_claude_text(
+            &mut mcp,
+            root,
+            &mut next,
+            session,
+            agent,
+            "ide.read",
+            read.clone(),
+        )
+        .await;
+        assert!(
+            first.starts_with(&format!(
+                "<agent-ide>\nlost-after-restart restart: the IDE restarted; results not \
+                 delivered before it may be lost: {own} (before restart)"
+            )),
+            "{agent:?}: {first}"
+        );
+        assert!(!first.contains(other), "{agent:?}: {first}");
+        let second = managed_claude_text(
+            &mut mcp,
+            root,
+            &mut next,
+            session,
+            agent,
+            "ide.read",
+            read.clone(),
+        )
+        .await;
+        assert!(
+            !second.contains("lost-after-restart"),
+            "{agent:?}: {second}"
+        );
+    }
+    let quiet = managed_claude_text(
+        &mut mcp,
+        idle,
+        &mut next,
+        session,
+        Some("agent-idle"),
+        "ide.read",
+        read,
+    )
+    .await;
+    assert!(!quiet.contains("lost-after-restart"), "{quiet}");
+    assert!(quiet.contains("pub fn"), "{quiet}");
+    mcp.close().await;
+}
+
+/// OUTBOX-r3 §11: `ide.stop` lists the facts no carrier handed over, once.
+#[tokio::test]
+async fn outbox_claude_stop_flushes_undelivered_facts() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "outbox-stop").await;
+    let started = actor
+        .call_claude(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"outbox-stop"}),
+        )
+        .await;
+    let (started, _) = actor.settle_claude(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let run = actor
+        .call_claude(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c","sleep 7; echo done"]}),
+        )
+        .await;
+    assert!(
+        run["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("tests #1: started")),
+        "{run}"
+    );
+    // No call or hook runs while the run settles, so its fact stays undelivered.
+    tokio::time::sleep(Duration::from_secs(9)).await;
+    actor.next += 1;
+    let call = format!("call-{}", actor.next);
+    actor.claude_lifecycle(&fixture, "PreToolUse", &call).await;
+    let reply = actor
+        .mcp
+        .exchange(
+            json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
+            "name":"ide.stop","arguments":{},"_meta":{"claudecode/toolUseId":call}}}),
+        )
+        .await;
+    let text = assert_claude_envelope(&reply).to_owned();
+    assert!(text.starts_with("complete stop: "), "{text}");
+    assert_eq!(
+        text.matches("\ntest-finished tests #1: ").count(),
+        1,
+        "{text}"
+    );
+    assert!(text.contains("undelivered facts:"), "{text}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// OUTBOX-r3 §8.2: a Claude `ide.*` reply carries a finished run's `test-finished` fact once, at
 /// the start of what the model reads, with no plate test line; the call's own post hook and the
 /// next reply stay silent about it.

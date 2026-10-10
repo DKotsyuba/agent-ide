@@ -155,6 +155,11 @@ impl BindingRef {
         self.actor_id == session_id
     }
 
+    /// Returns the private actor tag of this binding's actor (see [`actor_tag`]).
+    pub(crate) fn actor_tag(&self) -> String {
+        actor_tag(&self.actor_id)
+    }
+
     /// Returns a stable opaque persistence key without exposing actor/channel fields or minting proof.
     /// The domain and length framing preserve distinct actor, channel, and generation identities.
     pub(crate) fn fingerprint(&self) -> [u8; 32] {

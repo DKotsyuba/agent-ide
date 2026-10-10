@@ -115,6 +115,25 @@ fn actor_tags(tags: &Value) -> Option<Vec<&str>> {
         .collect()
 }
 
+/// Parses a re-activation's `claudecode/lost` list (OUTBOX-r3 §10): at most
+/// [`super::unresolved::MAX_UNRESOLVED`] one-line subjects of at most
+/// [`super::outbox::MAX_SUBJECT_BYTES`]; anything else is ignored, never refused.
+fn lost_subjects(subjects: &Value) -> Vec<String> {
+    subjects
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|subject| {
+            !subject.is_empty()
+                && subject.len() <= super::outbox::MAX_SUBJECT_BYTES
+                && !subject.chars().any(char::is_control)
+        })
+        .take(super::unresolved::MAX_UNRESOLVED)
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Size above which the managed Claude hook path prunes attachment records of settled pres.
 const PRE_ATTACHMENT_PRUNE: usize = 256;
 
@@ -1253,6 +1272,11 @@ impl ProductDispatcher {
                 // and touches no worktree state, like `ide.stop`'s own.
                 let stopped = stopped(&invocation);
                 facts.binding = Some(invocation.binding_ref().clone());
+                // A current managed Claude front learns the actor of every call, so it can remember
+                // per actor the work it relays unresolved (OUTBOX-r3 §10).
+                if recover.is_some() && tag.is_none() {
+                    *tag = Some(invocation.binding_ref().actor_tag());
+                }
                 facts.role = self
                     .worker
                     .as_ref()
@@ -1328,6 +1352,21 @@ impl ProductDispatcher {
                             .await
                     }
                 };
+                // OUTBOX-r3 §10: a re-activation after a daemon replacement names what its front
+                // relayed unresolved before; the actor gets one `lost-after-restart` fact.
+                if reactivation
+                    && matches!(
+                        reply,
+                        PeerReply::Complete {
+                            kind: super::reply::ResultKind::Activation,
+                            ..
+                        }
+                    )
+                    && let (Some(binding), Some(lost)) =
+                        (facts.binding.as_ref(), meta.get("claudecode/lost"))
+                {
+                    worker.queue_lost(binding, &lost_subjects(lost));
+                }
                 // T28B/T29B: reply-carrying hosts lead every terminal `ide.*` reply with the due
                 // plate. Every such call first reconciles the bound worktree's inputs (free while
                 // unchanged, T20B) — for managed Codex this stays even though hooks may now
@@ -1361,8 +1400,10 @@ impl ProductDispatcher {
                 }
                 // OUTBOX-r3 §8.2: every terminal reply of every host carries the session's due
                 // facts after the plate; `ide.stop` flushes its own, a placeholder carries none.
+                // A re-activation's reply is read by the front alone, never by the agent.
                 if method.method() != AssistanceMethod::Stop
                     && !stopped
+                    && !reactivation
                     && !matches!(reply, PeerReply::Pending { .. })
                     && let Some(binding) = facts.binding.as_ref()
                 {

@@ -23,7 +23,7 @@ use super::super::{
         MAX_SUBJECT_BYTES, MAX_SUMMARY_BYTES, MAX_TARGET_BYTES, MAX_TEST_FACT_BYTES, Reservation,
         SessionOutbox,
     },
-    reply::{EditDiagnostics, PeerReply},
+    reply::{EditDiagnostics, PeerReply, ResultKind},
     session_outbox::{AgentState, Outbox, compose_block, render_fact},
     tests::{RunResult, TestRuns},
     wake::{MAX_WAKE_BYTES, SessionWaker, WakeOutcome, WakeTarget},
@@ -83,6 +83,123 @@ pub(super) fn call_target(tool: AssistanceTool, parameters: &Value) -> String {
         } else {
             "call".to_owned()
         }
+    })
+}
+
+/// What one call's reply leaves owed to its caller (OUTBOX §2: the request got no answer for
+/// this subject): the fact kind and subject that will answer it, and the reference that reads it
+/// back. `None` when the reply answered the call.
+pub(crate) fn owed_fact(
+    tool: AssistanceTool,
+    parameters: &Value,
+    reply: &PeerReply,
+) -> Option<(FactKind, String, Option<String>)> {
+    match reply {
+        PeerReply::Pending { detail_ref }
+            if !matches!(
+                tool,
+                AssistanceTool::Start | AssistanceTool::Stop | AssistanceTool::Inspect
+            ) =>
+        {
+            let subject = format!("{} {}", tool.mcp_name(), call_target(tool, parameters));
+            Some((
+                FactKind::JobReady,
+                bounded(&subject, MAX_SUBJECT_BYTES, false),
+                Some(detail_ref.clone()),
+            ))
+        }
+        PeerReply::Edit {
+            result,
+            diagnostics: EditDiagnostics::Pending { detail_ref },
+            ..
+        } if tool == AssistanceTool::Edit => Some((
+            FactKind::EditChecked,
+            bounded(
+                &format!("edit {}", result.operation_id),
+                MAX_SUBJECT_BYTES,
+                false,
+            ),
+            Some(detail_ref.clone()),
+        )),
+        PeerReply::Complete {
+            kind: ResultKind::Test,
+            text,
+            ..
+        } if tool == AssistanceTool::Test => match run_line(text) {
+            Some((id, "started")) => Some((FactKind::TestFinished, test_subject(id), None)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The run a test reply reports settled: its text starts `tests #N:` and the run is neither
+/// started nor running.
+pub(crate) fn settled_run(reply: &PeerReply) -> Option<u64> {
+    let PeerReply::Complete {
+        kind: ResultKind::Test,
+        text,
+        ..
+    } = reply
+    else {
+        return None;
+    };
+    run_line(text)
+        .filter(|(_, state)| !matches!(*state, "started" | "running"))
+        .map(|(id, _)| id)
+}
+
+/// Splits a test line `tests #N: <word> ...` into the run id and its first word.
+fn run_line(text: &str) -> Option<(u64, &str)> {
+    let (handle, rest) = text.strip_prefix("tests #")?.split_once(": ")?;
+    let id = handle.parse().ok()?;
+    let word = rest.split([' ', ';', ',']).next().unwrap_or_default();
+    Some((id, word))
+}
+
+/// The one `lost-after-restart` fact for `subjects`, the requested work an actor's front relayed
+/// unresolved before the daemon was replaced (OUTBOX §10). Run numbers restart with the daemon,
+/// so run subjects say "before restart". Subjects that do not fit the summary are counted.
+// ponytail: one summary line of at most 256 bytes; move the list into detail lines if long
+// subject lists prove common.
+fn lost_fact(subjects: &[String]) -> Option<FactDraft> {
+    const HEAD: &str = "the IDE restarted; results not delivered before it may be lost: ";
+    let named = subjects
+        .iter()
+        .map(|subject| {
+            if subject.starts_with("tests #") {
+                format!("{subject} (before restart)")
+            } else {
+                subject.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut summary = HEAD.to_owned();
+    for (index, subject) in named.iter().enumerate() {
+        let rest = named.len() - index - 1;
+        let more = if rest > 0 {
+            format!(" +{rest} more")
+        } else {
+            String::new()
+        };
+        let separator = if index == 0 { "" } else { ", " };
+        if summary.len() + separator.len() + subject.len() + more.len() > MAX_SUMMARY_BYTES {
+            summary.push_str(&format!(" +{} more", named.len() - index));
+            break;
+        }
+        summary.push_str(separator);
+        summary.push_str(subject);
+    }
+    (!named.is_empty()).then(|| FactDraft {
+        kind: FactKind::LostAfterRestart,
+        subject: "restart".to_owned(),
+        summary,
+        detail: None,
+        detail_ref: None,
+        failed: false,
+        holds_turn: false,
+        source_bearing: false,
+        fence_paths: Vec::new(),
     })
 }
 
@@ -626,6 +743,22 @@ impl Shared {
     }
 }
 
+impl super::WorkerHandle {
+    /// Queues the one `lost-after-restart` fact of `binding`, just re-activated after a daemon
+    /// replacement, for the `subjects` its front relayed unresolved (OUTBOX §10). A later
+    /// re-activation with the same list replaces it (coalescing on the fixed subject).
+    pub fn queue_lost(&self, binding: &BindingRef, subjects: &[String]) {
+        if let Some(draft) = lost_fact(subjects) {
+            let outbox = &self.shared.outbox;
+            outbox.push_draft(
+                std::slice::from_ref(binding),
+                draft,
+                outbox.current_epoch(binding),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,6 +814,77 @@ mod tests {
         assert!(fact.failed && !fact.source_bearing);
         assert_ne!(fact.summary, "ready");
         assert_eq!(fact.validate(), Ok(()));
+    }
+
+    /// A pending answer owes its `job-ready` subject (the one its fact carries), a started run
+    /// its `tests #N`; answered calls, starts and running or settled runs owe nothing.
+    #[test]
+    fn owed_facts_match_the_facts_that_answer_them() {
+        let symbol = serde_json::json!({"symbol":"src/a.rs#Foo"});
+        let pending = PeerReply::Pending {
+            detail_ref: "r-1".to_owned(),
+        };
+        let spec = DeferSpec {
+            tool: AssistanceTool::Symbol,
+            target: call_target(AssistanceTool::Symbol, &symbol),
+            fence_paths: Vec::new(),
+            approximate_given: false,
+        };
+        let Some((FactKind::JobReady, subject, Some(reference))) =
+            owed_fact(AssistanceTool::Symbol, &symbol, &pending)
+        else {
+            panic!("a pending answer owes a job-ready fact")
+        };
+        assert_eq!(subject, job_fact("r-1", &pending, &spec).subject);
+        assert_eq!(reference, "r-1");
+        assert_eq!(owed_fact(AssistanceTool::Start, &symbol, &pending), None);
+        let line = |text: &str| PeerReply::Complete {
+            kind: ResultKind::Test,
+            text: text.to_owned(),
+            detail_ref: None,
+            truncated: false,
+            continuation: false,
+        };
+        assert_eq!(
+            owed_fact(
+                AssistanceTool::Test,
+                &Value::Null,
+                &line("tests #4: started — cargo test (budget 60 s)")
+            ),
+            Some((FactKind::TestFinished, "tests #4".to_owned(), None))
+        );
+        assert_eq!(
+            owed_fact(
+                AssistanceTool::Test,
+                &Value::Null,
+                &line("tests #4: running")
+            ),
+            None
+        );
+        assert_eq!(settled_run(&line("tests #4: running")), None);
+        assert_eq!(settled_run(&line("tests #4: 3 passed, 2 s")), Some(4));
+    }
+
+    /// The restart fact lists every subject, labels runs, fits its summary bound and never holds
+    /// a turn; nothing to report queues nothing.
+    #[test]
+    fn the_lost_fact_lists_subjects_within_its_bound() {
+        let fact = lost_fact(&["tests #3".to_owned(), "edit op-7".to_owned()]).unwrap();
+        assert_eq!(
+            fact.summary,
+            "the IDE restarted; results not delivered before it may be lost: tests #3 (before \
+             restart), edit op-7"
+        );
+        assert_eq!(fact.subject, "restart");
+        assert!(!fact.holds_turn && fact.validate().is_ok());
+        let many = (0..16)
+            .map(|index| format!("ide.symbol src/{index}/{}", "x".repeat(40)))
+            .collect::<Vec<_>>();
+        let fact = lost_fact(&many).unwrap();
+        assert!(fact.summary.len() <= MAX_SUMMARY_BYTES, "{}", fact.summary);
+        assert!(fact.summary.ends_with(" more"), "{}", fact.summary);
+        assert_eq!(fact.validate(), Ok(()));
+        assert!(lost_fact(&[]).is_none());
     }
 }
 
@@ -1092,6 +1296,61 @@ mod worker_tests {
         assert_eq!(handle.outbox().context_epoch(&owner), Some(1));
         handle.note_compaction(&owner);
         assert_eq!(handle.outbox().context_epoch(&owner), Some(2));
+    }
+
+    /// OUTBOX §11: the stop flush lists every undelivered fact once; afterwards no producer,
+    /// hold or wake reaches the stopped session.
+    #[tokio::test]
+    async fn a_stop_flushes_once_and_nothing_follows() {
+        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
+        let owner = bind(&bindings, "owner");
+        let handle = handle(bindings);
+        let outbox = &handle.shared.outbox;
+        outbox.open(&owner);
+        outbox.note_host_session(&owner, "owner");
+        let until = tokio::time::Instant::now() + Duration::from_secs(60);
+        assert!(outbox.begin_holding("tests #2", &owner, "tests #2", until));
+        assert!(finished(&handle.shared, &owner, "tests #1"));
+        let flush = outbox.flush_for_stop(&owner).expect("an undelivered fact");
+        assert!(flush.contains("test-finished tests #1: "), "{flush}");
+        assert_eq!(outbox.flush_for_stop(&owner), None);
+        assert!(
+            outbox.take_holding("tests #2").is_none(),
+            "in-flight work ends"
+        );
+        assert!(!finished(&handle.shared, &owner, "tests #2"));
+        handle.queue_lost(&owner, &["tests #9".to_owned()]);
+        assert!(!outbox.has_undelivered(&owner, false));
+        outbox.set_agent_state(&owner, AgentState::Idle);
+        assert_eq!(outbox.claim_wake(&owner), None);
+        let started = tokio::time::Instant::now();
+        assert_eq!(handle.hold_turn(&owner, false, Some("owner")).await, None);
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    /// OUTBOX §10: a re-activated session receives one `lost-after-restart` fact, and a repeated
+    /// re-activation with the same list replaces it rather than adding another.
+    #[test]
+    fn lost_after_restart_is_one_fact_per_session() {
+        let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
+        let owner = bind(&bindings, "owner");
+        let other = bind(&bindings, "other");
+        let handle = handle(bindings);
+        handle.shared.outbox.open(&owner);
+        handle.shared.outbox.open(&other);
+        let lost = ["tests #3".to_owned(), "edit op-7".to_owned()];
+        handle.queue_lost(&owner, &lost);
+        handle.queue_lost(&owner, &lost);
+        let block = handle
+            .take_facts(&owner, Carrier::Hook, None, 4096, |_| true)
+            .expect("the restart fact");
+        assert_eq!(block.matches("lost-after-restart restart: ").count(), 1);
+        assert!(
+            block.contains("tests #3 (before restart), edit op-7"),
+            "{block}"
+        );
+        assert!(!handle.shared.outbox.has_undelivered(&other, false));
+        assert!(!handle.shared.outbox.has_undelivered(&owner, true));
     }
 
     /// A waker that records each wake and answers a fixed outcome.

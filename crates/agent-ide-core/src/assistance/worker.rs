@@ -36,6 +36,7 @@ use crate::{
 };
 #[path = "delivery.rs"]
 mod delivery;
+pub(crate) use delivery::{owed_fact, settled_run};
 #[path = "inspection.rs"]
 mod inspection;
 #[path = "links.rs"]
