@@ -21378,6 +21378,67 @@ async fn outbox_claude_reply_carries_a_finished_run_fact_once() {
     daemon.wait().await.unwrap();
 }
 
+/// A test run that is still running adds nothing to any later reply or plate: no running line, no
+/// elapsed seconds, no instruction. Its outcome then arrives once, as the terminal fact of
+/// M024-M026-TEST-FACT (counts, the failing test, the rerun line and the output reference), and a
+/// call after it carries nothing about the run.
+#[tokio::test]
+async fn a_running_test_adds_no_plate_line_and_one_terminal_fact_follows() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "running-no-plate").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"running"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let text = |reply: &Value| reply["text"].as_str().unwrap_or_default().to_owned();
+    let run = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c","sleep 14; echo 'test result: FAILED. 0 passed; 1 failed; 0 ignored'; exit 1"]}),
+        )
+        .await;
+    assert!(text(&run).starts_with("tests #1: started"), "{run}");
+    assert!(!text(&run).contains("poll"), "{run}");
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let reply = actor
+            .call(&fixture, "ide.context", json!({"kind":"problems"}))
+            .await;
+        let carried = carried_status(&reply).unwrap_or_default();
+        for seen in [carried.to_owned(), text(&reply)] {
+            assert!(
+                !seen.contains("tests #1") && !seen.contains("poll"),
+                "a running test must not show up: {reply}"
+            );
+        }
+    }
+    let waited = actor
+        .call(&fixture, "ide.inspect", json!({"wait_ms":30000}))
+        .await;
+    let fact = text(&waited);
+    assert!(fact.starts_with("test-finished tests #1: "), "{fact}");
+    assert!(fact.contains("\n  rerun: "), "{fact}");
+    assert!(!fact.contains("poll"), "{fact}");
+    let after = actor
+        .call(&fixture, "ide.context", json!({"kind":"problems"}))
+        .await;
+    assert!(
+        !text(&after).contains("tests #1")
+            && !carried_status(&after)
+                .unwrap_or_default()
+                .contains("tests #1"),
+        "the outcome must not repeat: {after}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Claude keeps hook-only plate delivery: `ide.*` replies never carry the plate even while one is
 /// due, the withheld posts stay silent, and the still-due plate reaches the next native post (T28B).
 #[tokio::test]
