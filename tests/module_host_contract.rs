@@ -245,6 +245,20 @@ fn parity_normalizer_masks_only_volatile_tokens() {
         rooted(&one, &at(&one), "x\n"),
         rooted(&two, &at(&two), "x\n")
     );
+    // A symbol card's usage excerpt is returned source too.
+    let card = |row: &str| {
+        parity::line_for(
+            &one,
+            "ide.symbol",
+            &json!({"symbol":"a.py#p"}),
+            &json!({"state":"complete","kind":"symbol","code":null,
+                "text":format!("symbol: p\nusages: 1 in 1 files\n  a.py:1  {row}\n")}),
+        )
+    };
+    assert_ne!(
+        card(&format!("p = '{}'", one.root.display())),
+        card("p = '<root>'")
+    );
     let path = format!("p = '{}'\n", one.root.display());
     assert_ne!(
         rooted(&one, "definitions: null", &path),
