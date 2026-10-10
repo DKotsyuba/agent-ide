@@ -45,6 +45,9 @@ const MAX_TAIL_BYTES: usize = 1024;
 /// Longest single quoted output line of an exit-only fact.
 const MAX_TAIL_LINE_BYTES: usize = 160;
 
+/// Longest per-target line of a several-target run (batch-api-v1 §6).
+const MAX_TARGET_LINE_BYTES: usize = 160;
+
 /// The terminal outcome of one settled run, split the way the outbox carries it.
 ///
 /// Both parts are plain text without control characters. `summary` is one line of at most
@@ -55,7 +58,8 @@ const MAX_TAIL_LINE_BYTES: usize = 160;
 pub(crate) struct TerminalFact {
     /// The outcome in one line, for example `3 passed, 1 failed, 12 s`.
     pub summary: String,
-    /// The `FAIL` entries, the `+K more` line, the `rerun:` line and the `full output:` line.
+    /// The `FAIL` entries, the `+K more` line, one line per target of a several-target run, the
+    /// `rerun:` line and the `full output:` line.
     pub detail: String,
 }
 
@@ -123,11 +127,13 @@ struct Entry {
 /// - a non-zero exit with no counted test: `no test results (exit C), S s — runner said: …`;
 /// - otherwise `P passed, F failed, S s`.
 ///
-/// The detail lists at most [`MAX_FAILURES`] failing tests, then the rerun command (cut at
+/// The detail lists at most [`MAX_FAILURES`] failing tests, one line per target of a
+/// several-target run (cut at [`MAX_TARGET_LINE_BYTES`]), then the rerun command (cut at
 /// [`MAX_RERUN_BYTES`]) and the full-output reference. When the whole text would exceed
-/// [`MAX_FACT_BYTES`], message lines are dropped from the last entry backwards, then entries from
-/// the end (the `+K more` count grows); the summary, the rerun line and the reference are never
-/// dropped. The result depends only on the arguments: no clock, no I/O.
+/// [`MAX_FACT_BYTES`], quoted output lines go first, then target lines from the end, then message
+/// lines from the last entry backwards, then entries from the end (the `+K more` count grows);
+/// the summary, the rerun line and the reference are never dropped. The result depends only on
+/// the arguments: no clock, no I/O.
 pub(crate) fn terminal_fact(_id: u64, result: &RunResult, owns_detail: bool) -> TerminalFact {
     let report = &result.report;
     let seconds = result.elapsed.as_secs();
@@ -167,6 +173,11 @@ pub(crate) fn terminal_fact(_id: u64, result: &RunResult, owns_detail: bool) -> 
         Vec::new()
     };
     let entries = failure_entries(result);
+    let targets: Vec<String> = result
+        .targets
+        .iter()
+        .map(|line| format!("  {}", clean(line, MAX_TARGET_LINE_BYTES)))
+        .collect();
     let mut closing = vec![format!(
         "  rerun: {}",
         cut_with_ellipsis(&rerun_text(result), MAX_RERUN_BYTES)
@@ -178,6 +189,7 @@ pub(crate) fn terminal_fact(_id: u64, result: &RunResult, owns_detail: bool) -> 
     let mut shown = entries.len().min(MAX_FAILURES);
     let mut messages = shown;
     let mut tail_lines = tail.len();
+    let mut target_lines = targets.len();
     loop {
         let mut lines = Vec::new();
         if tail_lines > 0 {
@@ -202,15 +214,21 @@ pub(crate) fn terminal_fact(_id: u64, result: &RunResult, owns_detail: bool) -> 
                 entries.len() - shown
             ));
         }
+        lines.extend(targets.iter().take(target_lines).cloned());
         lines.extend(closing.iter().cloned());
         let detail = lines.join("\n");
-        if summary.len() + detail.len() <= MAX_FACT_BYTES || (shown == 0 && tail_lines == 0) {
+        if summary.len() + detail.len() <= MAX_FACT_BYTES
+            || (shown == 0 && tail_lines == 0 && target_lines == 0)
+        {
             return TerminalFact { summary, detail };
         }
         // Shrink in contract order: quoted output first (it is the least specific), then the
-        // message lines from the last entry backwards, then whole entries from the end.
+        // target lines from the end, then the message lines from the last entry backwards, then
+        // whole entries from the end.
         if tail_lines > 0 {
             tail_lines -= 1;
+        } else if target_lines > 0 {
+            target_lines -= 1;
         } else if messages > 0 {
             messages -= 1;
         } else {
@@ -321,6 +339,7 @@ mod tests {
             command: vec!["cargo".to_owned(), "test".to_owned()],
             rerun_dir: None,
             environment_label: None,
+            targets: Vec::new(),
         }
     }
 
@@ -620,6 +639,40 @@ mod tests {
                 assert!(!line.contains(banned), "{banned}: {line}");
             }
         }
+    }
+
+    /// A several-target run lists one line per target between the failures and the rerun line;
+    /// when space runs out the target lines go before any failure does.
+    #[test]
+    fn target_lines_sit_before_the_rerun_line_and_yield_to_failures() {
+        let mut result = run(3, 1, vec![failure("tests::fails", 4, "boom")]);
+        result.targets = vec![
+            "target 1 symbol a.rs#f: run 1 — 2 passed, 0 failed".to_owned(),
+            "target 2 path b.rs: run 1 — 1 passed, 1 failed".to_owned(),
+        ];
+        let fact = terminal_fact(8, &result, true);
+        assert_eq!(
+            fact.detail,
+            "  FAIL tests::fails\n       src/a.rs:4  boom\n  target 1 symbol a.rs#f: run 1 — 2 passed, 0 failed\n  target 2 path b.rs: run 1 — 1 passed, 1 failed\n  rerun: cargo test\n  full output: ide.inspect ref-3"
+        );
+        assert_in_contract(&fact);
+        let failures = (0..8)
+            .map(|index| {
+                failure(
+                    &format!("{}{index}", "n".repeat(100)),
+                    index,
+                    &"m".repeat(150),
+                )
+            })
+            .collect();
+        let mut crowded = run(0, 8, failures);
+        crowded.targets = (0..8)
+            .map(|index| format!("target {index} {}", "t".repeat(150)))
+            .collect();
+        let fact = terminal_fact(8, &crowded, true);
+        assert_in_contract(&fact);
+        assert_eq!(fact.detail.matches("  FAIL ").count(), 8, "{fact:?}");
+        assert!(fact.detail.matches("\n  target ").count() < 8, "{fact:?}");
     }
 
     /// The same run always renders the same text.

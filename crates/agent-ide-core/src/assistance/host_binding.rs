@@ -521,9 +521,10 @@ pub struct HostBindingGuard {
     /// evidence of a stale-writer takeover. Kept only while the scope holds a binding.
     last_seen: BTreeMap<(HostKind, String, ChannelSessionRef), std::time::Instant>,
     /// Scopes whose activation a stale-writer takeover revoked, with why, so their next call is
-    /// told `taken_over` instead of a bare `inactive_binding`. Cleared by the scope's next start;
-    /// bounded like `ever_bound`.
-    displaced: BTreeMap<(HostKind, String, ChannelSessionRef), TakeoverReason>,
+    /// told `taken_over` instead of a bare `inactive_binding`, and when. Cleared by the scope's
+    /// next start; past the binding-table ceiling the oldest record goes first.
+    displaced:
+        BTreeMap<(HostKind, String, ChannelSessionRef), (TakeoverReason, std::time::Instant)>,
     /// Which process carried each binding's calls and when front leases ended (takeover
     /// evidence); kept under this guard's lock with the bindings it describes.
     carriers: super::carriers::Carriers,
@@ -582,11 +583,16 @@ impl HostBindingGuard {
         );
         if !self.bindings.contains_key(&key) {
             if self.displaced.len() >= MAX_BINDINGS
-                && let Some(oldest) = self.displaced.keys().next().cloned()
+                && let Some(oldest) = self
+                    .displaced
+                    .iter()
+                    .min_by_key(|(_, (_, at))| *at)
+                    .map(|(scope, _)| scope.clone())
             {
                 self.displaced.remove(&oldest);
             }
-            self.displaced.insert(key, reason);
+            self.displaced
+                .insert(key, (reason, std::time::Instant::now()));
         }
         stopped
     }
@@ -766,7 +772,7 @@ impl HostBindingGuard {
         channel: &ChannelSessionRef,
     ) -> BindingUnavailable {
         let key = (host, actor_id.to_owned(), channel.clone());
-        if let Some(reason) = self.displaced.get(&key) {
+        if let Some((reason, _)) = self.displaced.get(&key) {
             BindingUnavailable::TakenOver(*reason)
         } else if self.ever_bound.contains(&key) {
             BindingUnavailable::InactiveBinding
@@ -2970,6 +2976,40 @@ mod tests {
             BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded)
         ));
         // Nothing but live sessions is never evicted.
+    }
+
+    /// Past the binding-table ceiling, the displacement record that goes first is the oldest one,
+    /// not the smallest scope: the first displaced scope sorts last here and is still evicted.
+    #[test]
+    fn displacement_records_evict_the_oldest_first() {
+        let mut guard = HostBindingGuard::default();
+        let names: Vec<String> = std::iter::once("z-first".to_owned())
+            .chain((0..MAX_BINDINGS).map(|index| format!("a-{index:02}")))
+            .collect();
+        for name in &names {
+            let scope = channel(name);
+            let event = parse_hook_event(
+                json!({"hook_event_name":"PreToolUse","session_id":"actor","tool_use_id":name})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .expect("test hook is valid");
+            guard.observe_hook(event, scope.clone());
+            let BindingStatus::Validated(call) =
+                guard.establish_start(codex_candidate("actor", name), scope)
+            else {
+                panic!("{name} binds");
+            };
+            let _ = guard.displace(&call.binding, TakeoverReason::SessionEnded);
+        }
+        let displaced = |name: &str| {
+            guard
+                .displaced
+                .contains_key(&(HostKind::Codex, "actor".to_owned(), channel(name)))
+        };
+        assert_eq!(guard.displaced.len(), MAX_BINDINGS);
+        assert!(!displaced("z-first"), "the oldest record went first");
+        assert!(displaced("a-00") && displaced("a-63"));
     }
 
     /// Keeps total channel, scope, and record counts within their explicit product bounds.

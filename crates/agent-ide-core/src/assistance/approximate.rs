@@ -62,11 +62,11 @@ struct Scan {
 }
 
 /// The approximate answer of one symbol or graph job and the file it is built from.
-struct Approximate {
+pub(super) struct Approximate {
     /// The complete reply text, starting with the `approximate:` line.
-    text: String,
+    pub(super) text: String,
     /// Worktree-relative definition file: the outbox fence of the precise answer.
-    definition: PathBuf,
+    pub(super) definition: PathBuf,
 }
 
 impl Worker<'_> {
@@ -166,7 +166,7 @@ impl Worker<'_> {
 
     /// How many jobs of `binding` answered early and still wait for their precise answer; jobs
     /// whose retained result settled (or was dropped) are forgotten here.
-    fn deferred_count(&mut self, binding: &BindingRef) -> usize {
+    pub(super) fn deferred_count(&mut self, binding: &BindingRef) -> usize {
         let pending: BTreeSet<String> = self
             .shared
             .ledger
@@ -190,7 +190,7 @@ impl Worker<'_> {
 
     /// The outbox fence of a precise answer built from `file`: that path with the digest of its
     /// current bytes, so only an edit of the definition file discards the answer.
-    fn fence_of(&self, binding: &BindingRef, file: &Path) -> Vec<FencedPath> {
+    pub(super) fn fence_of(&self, binding: &BindingRef, file: &Path) -> Vec<FencedPath> {
         let Some(receipt) = self.grants.get(binding) else {
             return Vec::new();
         };
@@ -206,7 +206,7 @@ impl Worker<'_> {
     /// The approximate answer of `job`, or `None` when its language's source outline is not
     /// exact, the address does not resolve lexically to exactly one definition, or the file
     /// cannot be read.
-    async fn approximate(&mut self, job: &mut Job) -> Option<Approximate> {
+    pub(super) async fn approximate(&mut self, job: &mut Job) -> Option<Approximate> {
         let binding = job.invocation.binding_ref().clone();
         let requested = job.parameters["symbol"].as_str()?.to_owned();
         let symbol = SymbolPath::parse(&requested).ok()?;

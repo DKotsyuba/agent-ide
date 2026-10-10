@@ -36,6 +36,12 @@ use crate::{
 };
 #[path = "approximate.rs"]
 mod approximate;
+#[path = "batch_edit.rs"]
+mod batch_edit;
+#[path = "batch_targets.rs"]
+mod batch_targets;
+#[path = "batch_tests.rs"]
+mod batch_tests;
 #[path = "delivery.rs"]
 mod delivery;
 #[path = "index_state.rs"]
@@ -129,6 +135,8 @@ struct Job {
 }
 
 /// Resumable state for operations that have already performed an externally visible edit.
+// One stage lives per parked job, so the variant size difference costs nothing measurable.
+#[allow(clippy::large_enum_variant)]
 enum JobStage {
     /// The edit is settled; only its target project-check snapshot and reply remain.
     EditAwaitingCheck {
@@ -155,6 +163,9 @@ enum JobStage {
         /// Last time a matching check may affect the edit reply.
         deadline: tokio::time::Instant,
     },
+    /// A multi-file edit (`ide.edit {files}`) has written; only its one project check and the
+    /// per-file reply remain.
+    EditBatchAwaitingCheck(Box<batch_edit::BatchCheck>),
 }
 
 /// A retained outcome requiring exact binding ownership and fresh durable authorization on access.
@@ -554,6 +565,9 @@ struct Ledger {
     /// Bindings whose activation is being handed to another worktree: ingress refuses their new
     /// work until the handover settles, so nothing can queue against the old root meanwhile.
     handing_over: BTreeSet<BindingRef>,
+    /// Per active binding, the blocks `ide.read {items}` delivered, for the unchanged answer.
+    /// Cleared at the same points `feedback` is cleared.
+    read_memory: BTreeMap<BindingRef, super::batch::ReadMemory>,
     /// Pending `job-ready` registrations (OUTBOX §3.2) by result reference, with the epoch the
     /// fact is fenced at; taken by the job's settlement or by a read through its own reference.
     deferred: BTreeMap<String, (super::outbox::DeferSpec, super::outbox::JobEpoch)>,
@@ -573,6 +587,7 @@ impl Default for Ledger {
             feedback: BTreeMap::new(),
             delivered: BTreeMap::new(),
             handing_over: BTreeSet::new(),
+            read_memory: BTreeMap::new(),
             deferred: BTreeMap::new(),
         }
     }
@@ -1677,6 +1692,7 @@ impl WorkerHandle {
                     telemetry,
                     activity: BTreeMap::new(),
                     deferred_precise: BTreeMap::new(),
+                    symbol_batches: BTreeMap::new(),
                 }
                 .run(receiver)
                 .await
@@ -1853,6 +1869,7 @@ impl WorkerHandle {
             ledger.last_activity.remove(&binding);
             ledger.feedback.remove(&binding);
             ledger.delivered.remove(&binding);
+            ledger.read_memory.remove(&binding);
             let live = ledger.details.keys().cloned().collect::<BTreeSet<_>>();
             ledger
                 .deferred
@@ -2589,12 +2606,16 @@ struct Worker<'a> {
     /// keep running for the precise answer, by job reference, with their owning binding; at most
     /// [`approximate::MAX_DEFERRED_PER_SESSION`] per binding (symbol-graph-item r2 §5).
     deferred_precise: BTreeMap<String, BindingRef>,
+    /// Several-symbol jobs that answered their caller early, by job reference, with their entries
+    /// kept across attempts while the approximate and deferred ones re-run in precise mode
+    /// (batch-api-v1 §4); only references still in `deferred_precise` are kept.
+    symbol_batches: BTreeMap<String, batch_targets::SymbolBatch>,
 }
 
 impl<'a> Worker<'a> {
     /// Handles an explicit test start or a status request for a run the caller's own actor and
     /// channel started in this worktree; an unknown run id returns `invalid_detail` with the
-    /// `test:unknown_run` stage.
+    /// `test:unknown_run` stage. The `{targets}` form runs as one run in `batch_tests`.
     /// Runs inside the queued job. The `symbol` branch resolves references through the live
     /// language server before selecting tests, so its caller already holds a `pending` reply (see
     /// [`WorkerHandle::submit`]) and reads the started/no-tests line through `ide.inspect`; the other
@@ -2604,6 +2625,9 @@ impl<'a> Worker<'a> {
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        if job.parameters.get("targets").is_some() {
+            return self.batch_tests(job).await;
+        }
         let binding = job.invocation.binding_ref().clone();
         let authority = self.authority(&binding).await?;
         self.shared.active(&binding)?;
@@ -3254,6 +3278,9 @@ impl<'a> Worker<'a> {
                     note: None,
                     operation: edit_operation(&job.parameters),
                 },
+                Some(JobStage::EditBatchAwaitingCheck(check)) => {
+                    check.unknown_reply(&job.reference)
+                }
                 None => PeerReply::Error {
                     code: FailureCode::Internal,
                     detail: Some(crate::telemetry::adapters::default_stage(
@@ -3295,7 +3322,10 @@ impl<'a> Worker<'a> {
                             .as_str()?
                             .split_once('#')
                             .map(|(path, _)| path)
-                    })?;
+                    })
+                    // A multi-file edit names its first file; the operation's receipt keeps
+                    // every file's state for the retry that reconciles it.
+                    .or_else(|| job.parameters.get("files")?.get(0)?.get("path")?.as_str())?;
                 EditResult::new(
                     operation.to_owned(),
                     path.to_owned(),
@@ -3458,8 +3488,10 @@ impl<'a> Worker<'a> {
             }
         };
         // A symbol or graph call that meets a loading server answers its caller at once and
-        // keeps running for the precise answer (symbol-graph-item r2 §4-§5).
+        // keeps running for the precise answer (symbol-graph-item r2 §4-§5); the `{symbols}`
+        // form answers early per entry by itself (`batch_symbols`).
         if matches!(job.tool, AssistanceTool::Symbol | AssistanceTool::Graph)
+            && job.parameters.get("symbols").is_none()
             && (job.park_until.is_some() || matches!(result, Err(FailureCode::ProviderLoading)))
         {
             self.answer_while_loading(job).await;
@@ -5250,9 +5282,16 @@ impl<'a> Worker<'a> {
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        if let Some(JobStage::EditBatchAwaitingCheck(check)) = job
+            .stage
+            .take_if(|stage| matches!(stage, JobStage::EditBatchAwaitingCheck(_)))
+        {
+            return self.finish_batch_check(job, *check).await;
+        }
         if let Some(stage @ JobStage::EditAwaitingCheck { .. }) = job.stage.take() {
             let deadline = match &stage {
                 JobStage::EditAwaitingCheck { deadline, .. } => *deadline,
+                JobStage::EditBatchAwaitingCheck(check) => check.deadline,
             };
             let diagnostics = if *job.cancel.borrow() || tokio::time::Instant::now() >= deadline {
                 Some(EditDiagnostics::Unknown {})
@@ -5273,7 +5312,10 @@ impl<'a> Worker<'a> {
                 authority,
                 path,
                 ..
-            } = stage;
+            } = stage
+            else {
+                return Err(FailureCode::Internal);
+            };
             debug_assert_eq!(result.path, path);
             let source = result
                 .outcome
@@ -5296,6 +5338,9 @@ impl<'a> Worker<'a> {
                 Some(authority),
                 source,
             ));
+        }
+        if job.parameters.get("files").is_some() {
+            return self.edit_files(job).await;
         }
         if job.parameters.get("changes").is_some() {
             return self.edit_changes(job).await;
@@ -5558,6 +5603,7 @@ impl<'a> Worker<'a> {
                 None if tokio::time::Instant::now()
                     < match &stage {
                         JobStage::EditAwaitingCheck { deadline, .. } => *deadline,
+                        JobStage::EditBatchAwaitingCheck(check) => check.deadline,
                     } =>
                 {
                     job.stage = Some(stage);
@@ -5668,6 +5714,8 @@ impl<'a> Worker<'a> {
     /// Returns the matching generation's diagnostics without waiting; absence means the job parks.
     /// Missing feed state preserves the provider fallback, while a completed non-ready snapshot
     /// and a matching ready snapshot map to the same states used by the former bounded wait.
+    /// A multi-file stage has no single file of its own and yields its fallback-free `Unknown`;
+    /// its per-file stages are asked one by one instead.
     fn check_diagnostics(&self, stage: &JobStage) -> Option<EditDiagnostics> {
         use crate::checks::{CheckState, Severity};
         let JobStage::EditAwaitingCheck {
@@ -5678,7 +5726,10 @@ impl<'a> Worker<'a> {
             preexisting,
             language,
             ..
-        } = stage;
+        } = stage
+        else {
+            return Some(EditDiagnostics::Unknown {});
+        };
         let Some(feed) = self.shared.project_feed.as_ref() else {
             return Some(fallback.clone());
         };
@@ -5966,6 +6017,7 @@ impl<'a> Worker<'a> {
         if let Ok(mut ledger) = self.shared.ledger.lock() {
             ledger.feedback.remove(binding);
             ledger.delivered.remove(binding);
+            ledger.read_memory.remove(binding);
         }
     }
 
@@ -6601,6 +6653,12 @@ fn admitted_edit_source(
                 kind: ResultKind::Context | ResultKind::Read,
                 ..
             } => true,
+            // A multi-file edit retains only the post-write observations of the files it wrote.
+            PeerReply::Complete {
+                kind: ResultKind::EditBatch,
+                detail_ref,
+                ..
+            } => detail_ref.as_deref() == Some(reference),
             PeerReply::Edit { result, .. } => {
                 result.source_ref.as_deref() == Some(reference) && result.outcome.has_post_source()
             }
@@ -7627,6 +7685,14 @@ fn test_result_text(
     super::test_fact::terminal_fact(id, result, owns_detail).reply_text(id)
 }
 
+/// Appends a several-target run's per-target lines (batch-api-v1 §6), each bounded like a
+/// failure line; a single-target run has none.
+fn push_target_lines(text: &mut String, result: &super::tests::RunResult) {
+    for line in &result.targets {
+        text.push_str(&format!("\n  {}", test_text_line(line, 240)));
+    }
+}
+
 /// Renders one summary-less run: exit code, chosen environment, bounded output tail, rerun, and —
 /// only when that tail cut something, or the whole output already lives in the run's
 /// paged detail — the pointer to the full output.
@@ -7639,6 +7705,7 @@ fn command_result_text(id: u64, result: &super::tests::RunResult, owns_detail: b
     if let Some(label) = &result.environment_label {
         text.push_str(&format!(" · env {label}"));
     }
+    push_target_lines(&mut text, result);
     let tail = super::tests::output_tail(&result.output);
     if !tail.is_empty() {
         text.push_str("\n  output (tail):\n");
@@ -7677,6 +7744,7 @@ mod tool_reply_fix_tests {
             command: vec!["echo".into(), "hello".into()],
             rerun_dir: None,
             environment_label: None,
+            targets: Vec::new(),
         }
     }
 
@@ -10174,6 +10242,7 @@ mod stop_retry_tests {
             telemetry: None,
             activity: BTreeMap::new(),
             deferred_precise: BTreeMap::new(),
+            symbol_batches: BTreeMap::new(),
         }
     }
 

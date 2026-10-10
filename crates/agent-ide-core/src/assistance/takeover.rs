@@ -48,7 +48,7 @@ impl Worker<'_> {
         let Some(holder_binding) = self.binding_of_holder(&holder) else {
             return Ok(None);
         };
-        let Some(mut evidence) = self
+        let Some(evidence) = self
             .shared
             .bindings
             .lock()
@@ -57,18 +57,9 @@ impl Worker<'_> {
         else {
             return Ok(None);
         };
-        // The pending-work verdict and the fence are one critical section, as for a handover:
-        // work the holder submits while the takeover settles is refused at ingress.
-        let reason = {
-            let Ok(mut ledger) = self.shared.ledger.lock() else {
-                return Ok(None);
-            };
-            evidence.pending_work = self.pending_work(&ledger, &holder_binding, &job.reference);
-            let Some(reason) = carriers::assess(&evidence, std::time::Instant::now()) else {
-                return Ok(None);
-            };
-            ledger.handing_over.insert(holder_binding.clone());
-            reason
+        let Some(reason) = self.fence_stale_holder(&holder_binding, evidence, &job.reference)
+        else {
+            return Ok(None);
         };
         let last = self
             .activity
@@ -108,6 +99,42 @@ impl Worker<'_> {
             },
         );
         Ok(Some((Ok(activation), line)))
+    }
+
+    /// Decides whether `holder` may be taken over and, if so, fences it against new IDE work and
+    /// returns why; `None` leaves no fence.
+    ///
+    /// `evidence` is the holder's liveness snapshot read under the bindings lock; `current` is the
+    /// start job that asks. The pending-work verdict, [`carriers::assess`] and the fence are one
+    /// critical section of the ledger, as for a handover, so work the holder submits afterwards is
+    /// refused at ingress. Hooks take only the bindings lock, so the holder's evidence is read again
+    /// once the fence stands: a hook, a newly started call or a carrier change that landed after
+    /// the snapshot lifts the fence and returns `None`, and a holder that showed life is never
+    /// displaced. Whatever the holder sends after that second read is ordered after the takeover.
+    pub(super) fn fence_stale_holder(
+        &self,
+        holder: &BindingRef,
+        mut evidence: carriers::HolderEvidence,
+        current: &str,
+    ) -> Option<TakeoverReason> {
+        let reason = {
+            let mut ledger = self.shared.ledger.lock().ok()?;
+            evidence.pending_work = self.pending_work(&ledger, holder, current);
+            let reason = carriers::assess(&evidence, std::time::Instant::now())?;
+            ledger.handing_over.insert(holder.clone());
+            reason
+        };
+        let unchanged = self.shared.bindings.lock().ok().is_some_and(|guard| {
+            let fresh = guard.holder_evidence(holder);
+            fresh.last_seen == evidence.last_seen
+                && fresh.call_in_flight == evidence.call_in_flight
+                && fresh.carrier_ended == evidence.carrier_ended
+        });
+        if unchanged {
+            return Some(reason);
+        }
+        self.end_handover_fence(holder);
+        None
     }
 
     /// What IDE work of `holder` is still pending, in plain words, or `None`: uncertain cleanup,
