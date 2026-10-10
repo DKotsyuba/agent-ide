@@ -4,8 +4,8 @@ Revision 2 (2026-10-10). Canonical definition of the deferred-fact outbox that e
 owns, the carriers that deliver its facts, and the obligations of the modules that produce facts.
 Provider: M-026 "Session outbox and delivery". Consumers: M-024 (terminal test fact and plates),
 M-025 (precise answer after an approximate one), M-027 (pending batch items, multi-file edit
-checks, compaction signal). M-026 consumes M-024's `M024-M026-TEST-FACT` r1 (the test-finished
-body text).
+checks, compaction signal). M-026 consumes M-024's `M024-M026-TEST-FACT` r2
+(`docs/contracts/reply-hygiene-v1.md` §1: the test-finished text).
 
 Design basis, read for the evidence behind each rule:
 
@@ -38,7 +38,7 @@ The kind set is closed. Adding a kind is a contract revision.
 
 | Kind | Producer (module) | Subject form | `holds_turn` | Source-bearing | Body |
 |---|---|---|---|---|---|
-| `test-finished` | test run settlement; body text M-024 (`M024-M026-TEST-FACT` r1), push M-026 | `tests #N` | true | no | M-024 text, <= 1536 bytes: counts line, <= 8 `FAIL` lines, `rerun:`, `full output: ide.inspect <ref>` |
+| `test-finished` | test run settlement; text M-024 (`M024-M026-TEST-FACT` r2, `terminal_fact`), push M-026 | `tests #N` | true | no | M-024 `summary` + `detail`, <= 2000 bytes: counts, <= 8 `FAIL` entries, `rerun:`, `full output: ide.inspect <ref>` |
 | `edit-checked` | edit project check; single-file M-026, multi-file M-027 | `edit <operation_id>` | true | no | §3.3 |
 | `job-ready` | a job registered with `defer` (§3.2): an initial reply that went `pending` (M-026), a pending batch job (M-027), a precise answer after an approximate one (M-025) | `<tool> <target>` or `batch <detail_ref>: items i,j` | true, except **false** when the caller already got an approximate answer | yes for context/outline/read/symbol/graph/diff answers; no for edit, start, test | the job's final reply or final failure |
 | `lost-after-restart` | session re-activation after a daemon replacement (M-026) | `restart` | false | no | §10 |
@@ -83,7 +83,7 @@ pub(crate) struct FactDraft {
     pub failed: bool,                // ordering: failures first (§5)
     pub holds_turn: bool,            // §2
     pub source_bearing: bool,        // §2; detail then holds source-derived text
-    pub fence: Vec<FencedPath>,      // <= 16 paths the result depends on; empty = whole worktree
+    pub fence_paths: Vec<FencedPath>, // <= 16 paths the result depends on; empty = whole worktree
 }
 
 pub(crate) struct FencedPath { pub path: String, pub digest: Option<[u8; 32]> }
@@ -91,7 +91,7 @@ pub(crate) struct FencedPath { pub path: String, pub digest: Option<[u8; 32]> }
 pub(crate) struct DeferSpec {
     pub tool: AssistanceTool,
     pub target: String,              // <= 120 bytes; subject = "<tool> <target>"
-    pub fence: Vec<FencedPath>,      // M-025: definition file(s) only (§7)
+    pub fence_paths: Vec<FencedPath>, // M-025: definition file(s) only (§7)
     pub approximate_given: bool,     // true: holds_turn = false
 }
 
@@ -145,7 +145,7 @@ One fact:
   of §7.
 - Untrusted runner/checker text is sanitized as in `problems.rs` (control characters become
   spaces; `<` and `>` become `?`) so it cannot forge the `<agent-ide>` framing.
-- Per fact: summary line <= 256 bytes; whole fact <= 2048 bytes (a `test-finished` body <= 1536).
+- Per fact: summary line <= 256 bytes; whole fact <= 2048 bytes (a `test-finished` `summary` + `detail` <= 2000).
 - Per block on a hook carrier (PostToolUse, Stop reason, wake message): the whole model-visible
   text, ambient lines and legacy native feedback included, <= `MAX_FEEDBACK_BYTES` = 4096
   (`reply.rs:11`). Per reply piggyback: facts <= 4096 bytes in addition to the reply body; the
@@ -222,7 +222,7 @@ same session (a native hook and a reply, or a reply and a Stop hold) never both 
 
 ## 7. Source fencing and staleness
 
-- The staleness decision uses only the fact's `fence` (the producer chooses it) and the session's
+- The staleness decision uses only the fact's `fence_paths` (the producer chooses them) and the session's
   `JobEpoch`.
 - On a reply or `ide.inspect` the outbox compares each fenced path's current digest with the
   recorded one (a read under the live profile); a fenced path without a digest, or any path when
@@ -387,8 +387,11 @@ Replacement reply texts (no polling call, `assets/mcp/reply.jinja`):
 - `:338` edit with pending diagnostics:
   `edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: pending; the project check arrives by itself as an edit-checked fact`
 
-These texts are valid only together with M-026's `defer` and `edit-checked` delivery, so they
-land with it on `aw/e002-int`.
+- `ide.test` started-line suffix, both hosts:
+  `; the result arrives by itself in a later <agent-ide> block`
+
+These texts are valid only together with M-026's `defer`, `test-finished` and `edit-checked`
+delivery, so they land with it on `aw/e002-int`.
 
 One-sentence push wording M-024 may teach (skill, server instructions, tool descriptions):
 
@@ -466,20 +469,21 @@ no longer holds.
 
 ### 13.1 M-024 (plates, terminal test fact)
 
-- Provides `M024-M026-TEST-FACT` r1: the `test-finished` body (counts line or runner failure
-  reason, at most 8 `FAIL` lines, `rerun:`, `full output: ide.inspect <ref>`), sanitized, <= 1536
-  bytes, without `poll` or elapsed seconds. M-026 calls it at run settlement and pushes the fact.
+- Provides `M024-M026-TEST-FACT` r2: `terminal_fact(id, result, owns_detail) -> {summary, detail}`
+  (`summary` <= 256 bytes, `summary` + `detail` <= 2000 bytes, at most 8 `FAIL` entries, `rerun:`,
+  `full output: ide.inspect <ref>`), sanitized, without `poll` or elapsed seconds of a running
+  run. M-026 calls it at run settlement and pushes the fact with `fence_paths = []`.
 - Owns the started line and the status-reply text (`tests #N: running`, no seconds, no poll);
   does not edit the plate test-line plumbing that §4 retires.
-- Uses the §8.7 texts for pending replies and teaching.
+- Uses the §8.7 texts for pending replies, the started-line suffix and teaching.
 - Checks: one settled run yields exactly one delivered `test-finished` across a concurrent hook and
-  reply; the rendered body never contains `poll` and never exceeds 1536 bytes; no plate carries a
-  test line; a delivered fact makes `ide.stop` stop listing the run.
+  reply; the rendered text never contains `poll` and `summary` + `detail` never exceeds 2000
+  bytes; no plate carries a test line; a delivered fact makes `ide.stop` stop listing the run.
 
 ### 13.2 M-025 (precise answer after an approximate one)
 
 - Answers at once with a labelled approximate reply, then calls
-  `defer(reference, DeferSpec { tool, target, fence: definition file(s), approximate_given: true })`.
+  `defer(reference, DeferSpec { tool, target, fence_paths: definition file(s), approximate_given: true })`.
 - Records only the definition file(s) as the detail's source provenance if usage-file edits must
   not discard the answer.
 - Calls nothing extra on takeover: `release_binding_state` forgets the displaced session.
@@ -554,4 +558,5 @@ External changes this machine needs for agent-run runs (owner approval; not made
 - r2: M-024 answers (test line retired from the plate, test status reads stay, reply texts,
   collection on hand-off, teaching sentences); `SessionOutbox` trait with `defer`, `forget`,
   `context_epoch` and `RecordingOutbox`; M-025 definition-file fence and discard text;
-  `edit-checked` multi-file body; compaction signal; displacement; deployment list.
+  `edit-checked` multi-file body; compaction signal; displacement; deployment list; consumes
+  `M024-M026-TEST-FACT` r2 (`terminal_fact`, 2000-byte text).
