@@ -34,7 +34,7 @@ pub(crate) fn terminal_fact(id: u64, result: &RunResult, owns_detail: bool) -> T
 Mapping to the outbox draft: `kind = test-finished`, `subject = "tests #N"`, `summary` and
 `detail` as returned, `detail_ref` = the run's output detail when `owns_detail` (the run's owner
 only), `failed = failures > 0 || exit != 0 || stopped || no summary`, `holds_turn = true`,
-`source_bearing = false`, `fence_paths = []`. Settled-reply body = `tests #N: ` + `summary` +
+`source_bearing = false`, `fence = []` (whole worktree). Settled-reply body = `tests #N: ` + `summary` +
 `\n` + `detail`.
 
 ### 1.2 Text
@@ -67,14 +67,14 @@ Rules (each one is a unit test):
    in one `(+K more failed tests in the full output)` line.
 2. `rerun:` is always present. The command is the exact rerun line the reply carries today
    (`cd <dir> && env NAME=VALUE … <argv>` when the run had a directory or environment), cut with
-   `…` at 400 bytes on a character boundary.
+   `…` at 300 bytes on a character boundary.
 3. `full output: ide.inspect <detail_ref>` is present exactly when `owns_detail` and the run has a
    retained output.
-4. `summary` plus `detail` is at most 2000 bytes (the outbox adds its prefix and keeps the whole
-   fact within its 2048 bytes). When the text is longer, first drop the message lines from the last
-   `FAIL` entry backwards, then drop entries from the end (the `+K` count grows). Summary, `rerun:`
-   and `full output:` are never dropped; the worst case (256 + 408 + about 100 bytes plus eight
-   names of 120 bytes) fits.
+4. `summary` plus `detail` is at most 1536 bytes, the `test-finished` body limit of
+   session-outbox-v1 (§2, §3.4). When the text is longer, first drop the message lines from the
+   last `FAIL` entry backwards, then drop entries from the end (the `+K` count grows). Summary,
+   `rerun:` and `full output:` are never dropped: they take at most 256 + 308 + about 100 bytes,
+   which leaves about 870 bytes for `FAIL` entries.
 5. Every cut is on a UTF-8 character boundary. Control characters in runner-provided names,
    messages and excerpts are removed.
 6. No imperative sentence, no `poll`, and no elapsed seconds of a *running* run appear anywhere in
@@ -91,7 +91,7 @@ Rules (each one is a unit test):
 
 | Line | Text |
 |---|---|
-| started (reply only) | `tests #N: started — <argv> [(K tests selected)] (budget B s)`; a sentence about automatic delivery is added only as session-outbox-v1 gives it per host |
+| started (reply only) | `tests #N: started — <argv> [(K tests selected)] (budget B s); the result arrives by itself in a later <agent-ide> block` (the wording of session-outbox-v1 §8.7 for a pending result) |
 | second start while one is active | `tests #N: still running` |
 | `ide.test {status}` or inspect of `tests #N`, run still active | `tests #N: running` |
 | the same, run settled | the terminal text of rule 7 |
