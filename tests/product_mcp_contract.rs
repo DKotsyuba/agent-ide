@@ -440,6 +440,8 @@ fn assert_compact_envelope(reply: &Value) {
             "{reply}"
         ),
         ("complete", Some("graph")) => assert!(body.starts_with("graph: "), "{reply}"),
+        // OUTBOX-r3 §8.5: consolidated `ide.inspect` text is plain, with no header of its own.
+        ("complete", Some("inspect")) => assert!(!body.is_empty(), "{reply}"),
         // `<file>  (<n> lines, <lang>)` outline header.
         ("complete", Some("outline")) => {
             let header = body.lines().next().unwrap_or_default();
@@ -5953,11 +5955,12 @@ async fn claude_context_pages_survive_native_posts_but_not_real_edits() {
     daemon.wait().await.unwrap();
 }
 
-/// A pending edit is collectible: when its project check outlasts the inline wait, the edit
-/// answers `pending` and `ide.inspect` later returns the settled edit reply — never the silent
-/// `inspect:internal` a byte-overlong diagnostic message used to turn the whole detail into.
+/// OUTBOX-r3 §8.6: when an edit's project check outlasts the inline wait, the edit answers with
+/// its write and `diagnostics: pending` (never a whole-reply `pending`), the check arrives once as
+/// an `edit-checked` fact, and the edit's own reference later returns the settled reply — never
+/// the silent `inspect:internal` a byte-overlong diagnostic message used to turn it into.
 #[tokio::test]
-async fn a_pending_edit_is_collected_by_inspect_once_its_check_settles() {
+async fn a_slow_edit_check_answers_at_once_and_arrives_as_one_fact() {
     let fixture = ProductFixture::new(json!([]));
     // A rust check held past the inline wait, reporting one over-long multibyte message: 300
     // characters of "é" are 600 bytes, so a character-bound truncation used to leave a message
@@ -5997,11 +6000,40 @@ async fn a_pending_edit_is_collected_by_inspect_once_its_check_settles() {
                    "source_ref":source_ref,"content":"pub fn value() -> i32 { 7 }"}),
         )
         .await;
-    assert!(
-        matches!(edit["state"].as_str(), Some("pending" | "edit")),
-        "the held check parks the edit or settles inline: {edit}"
+    assert_eq!(
+        edit["state"], "edit",
+        "the held check never parks the reply: {edit}"
     );
-    let settled = actor.settle(&fixture, edit).await;
+    assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
+    assert_eq!(edit["diagnostics"]["state"], "pending", "{edit}");
+    let reference = edit["diagnostics"]["detail_ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let checked = actor
+        .call(&fixture, "ide.inspect", json!({"wait_ms":60000}))
+        .await;
+    let checked_text = checked["text"].as_str().unwrap_or_default();
+    assert!(
+        checked_text.starts_with("edit-checked edit pending-edit-1: 1 file"),
+        "{checked}"
+    );
+    for line in checked_text
+        .lines()
+        .filter(|line| line.trim_start().starts_with("new: "))
+    {
+        assert!(line.len() <= 200, "fact lines stay bounded: {checked}");
+    }
+    let again = actor.call(&fixture, "ide.inspect", json!({})).await;
+    assert!(
+        again["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("nothing ready yet")),
+        "the fact is handed over once: {again}"
+    );
+    let settled = actor
+        .call(&fixture, "ide.inspect", json!({"detail_ref":reference}))
+        .await;
     assert_eq!(settled["state"], "edit", "{settled}");
     assert_eq!(settled["result"]["outcome"], "replaced", "{settled}");
     assert!(
@@ -6065,7 +6097,26 @@ async fn a_pending_edit_under_a_capped_check_of_other_files_settles_unknown() {
                    "source_ref":source_ref,"content":"pub fn value() -> i32 { 7 }"}),
         )
         .await;
-    let settled = actor.settle(&fixture, edit).await;
+    // OUTBOX-r3 §8.6: the write answers at once; the check arrives as its fact.
+    assert_eq!(edit["diagnostics"]["state"], "pending", "{edit}");
+    let checked = actor
+        .call(&fixture, "ide.inspect", json!({"wait_ms":60000}))
+        .await;
+    assert_eq!(
+        checked["text"],
+        format!(
+            "edit-checked edit capped-edit-1: 1 file, diagnostics unknown\n  result: ide.inspect {}",
+            edit["diagnostics"]["detail_ref"].as_str().unwrap()
+        ),
+        "{checked}"
+    );
+    let settled = actor
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"detail_ref":edit["diagnostics"]["detail_ref"]}),
+        )
+        .await;
     assert_eq!(settled["state"], "edit", "{settled}");
     assert_eq!(settled["result"]["outcome"], "replaced", "{settled}");
     assert_eq!(
@@ -9020,24 +9071,20 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     };
     let result_text = completed["text"].as_str().unwrap();
     assert!(result_text.contains("FAIL tests::fails"), "{result_text}");
+    // OUTBOX-r3 §4/§6: a run's outcome is never a plate line, and a run read through its own
+    // handle is delivered, so no carrier repeats it as a `test-finished` fact.
     assert!(
-        carried_status(&completed)
-            .is_some_and(|status| status.contains("tests #1: 1 passed, 1 failed")),
-        "completion status plate must carry the test delta once: {completed}"
-    );
-    assert_eq!(
-        carried_status(&completed).and_then(|status| status.lines().nth(1)),
-        result_text.lines().next(),
-        "the result and completion plate use the same worker status snapshot"
+        carried_status(&completed).is_none_or(|status| !status.contains("tests #1")),
+        "a read run is not carried again: {completed}"
     );
     let repeated = actor.call(&fixture, "ide.test", json!({"status":1})).await;
     assert!(
-        carried_status(&repeated).is_none(),
-        "the completion plate must not repeat: {repeated}"
+        carried_status(&repeated).is_none_or(|status| !status.contains("tests #1")),
+        "the outcome must not repeat: {repeated}"
     );
     println!("ide.test start: {start_text}");
     println!("ide.test result: {result_text}");
-    println!("ide.test status: {}", carried_status(&completed).unwrap());
+    println!("ide.test status: {:?}", carried_status(&completed));
 
     // The runner keeps a 256 KiB tail, and ide.inspect must page that tail rather than shrink it.
     let verbose_start = actor
@@ -21181,6 +21228,156 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
     std::fs::remove_dir_all(base).unwrap();
 }
 
+/// OUTBOX-r3 §8.5: `ide.inspect {}` hands over the session's facts once, `wait_ms` returns on the
+/// first fact and its deadline cancels nothing, and `detail_refs` answers several references in
+/// order in one reply.
+#[tokio::test]
+async fn outbox_inspect_waits_lists_and_batches() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "outbox-inspect").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"outbox"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let text = |reply: &Value| reply["text"].as_str().unwrap_or_default().to_owned();
+    let empty = actor.call(&fixture, "ide.inspect", json!({})).await;
+    assert_eq!(empty["kind"], "inspect", "{empty}");
+    assert!(text(&empty).starts_with("nothing ready yet"), "{empty}");
+
+    // A run that outlives the inline window leaves a started line; one wait collects its fact.
+    let run = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c","sleep 7; echo first"]}),
+        )
+        .await;
+    assert!(text(&run).starts_with("tests #1: started"), "{run}");
+    let waited_from = tokio::time::Instant::now();
+    let waited = actor
+        .call(&fixture, "ide.inspect", json!({"wait_ms":30000}))
+        .await;
+    assert!(
+        text(&waited).starts_with("test-finished tests #1: "),
+        "{waited}"
+    );
+    assert!(waited_from.elapsed() < Duration::from_secs(25), "{waited}");
+    let again = actor.call(&fixture, "ide.inspect", json!({})).await;
+    let again = text(&again);
+    assert!(again.starts_with("nothing ready yet"), "{again}");
+    assert!(
+        again.contains("recently delivered:\n  test-finished tests #1: "),
+        "{again}"
+    );
+
+    // A short wait that ends first answers what is in flight and leaves the run running.
+    let second = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c","sleep 8; echo second"]}),
+        )
+        .await;
+    assert!(text(&second).starts_with("tests #2: started"), "{second}");
+    let short = actor
+        .call(&fixture, "ide.inspect", json!({"wait_ms":200}))
+        .await;
+    assert!(
+        text(&short).starts_with("nothing ready yet\nin flight: tests #2"),
+        "{short}"
+    );
+    let late = actor
+        .call(&fixture, "ide.inspect", json!({"wait_ms":30000}))
+        .await;
+    assert!(
+        text(&late).starts_with("test-finished tests #2: "),
+        "{late}"
+    );
+
+    // Several references in one reply, in order.
+    let batch = actor
+        .call(
+            &fixture,
+            "ide.inspect",
+            json!({"detail_refs":["tests #2","tests #1"]}),
+        )
+        .await;
+    let batch = text(&batch);
+    let second_at = batch.find("== tests #2 ==").expect("first section");
+    let first_at = batch.find("== tests #1 ==").expect("second section");
+    assert!(second_at < first_at, "{batch}");
+    assert!(batch.contains("second"), "{batch}");
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// OUTBOX-r3 §8.2: a Claude `ide.*` reply carries a finished run's `test-finished` fact once, at
+/// the start of what the model reads, with no plate test line; the call's own post hook and the
+/// next reply stay silent about it.
+#[tokio::test]
+async fn outbox_claude_reply_carries_a_finished_run_fact_once() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "outbox-claude").await;
+    let started = actor
+        .call_claude(&fixture, "ide.start", json!({"activation_id":"outbox"}))
+        .await;
+    let (started, _) = actor.settle_claude(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    // An explicit command that outlives the inline window leaves its caller a started line.
+    let run = actor
+        .call_claude(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c","sleep 7; echo done"]}),
+        )
+        .await;
+    assert!(
+        run["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("tests #1: started")),
+        "{run}"
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut carried = Vec::new();
+    for _ in 0..2 {
+        actor.next += 1;
+        let call = format!("call-{}", actor.next);
+        actor.claude_lifecycle(&fixture, "PreToolUse", &call).await;
+        let reply = actor
+            .mcp
+            .exchange(
+                json!({"jsonrpc":"2.0","id":actor.next,"method":"tools/call","params":{
+                "name":"ide.context","arguments":{"kind":"problems"},
+                "_meta":{"claudecode/toolUseId":call}}}),
+            )
+            .await;
+        let text = assert_claude_envelope(&reply).to_owned();
+        let post = actor
+            .claude_lifecycle_output(&fixture, "PostToolUse", &call)
+            .await;
+        assert!(post.status.success() && post.stdout.is_empty(), "{post:?}");
+        carried.push(text);
+    }
+    assert!(
+        carried[0].starts_with("<agent-ide>\ntest-finished tests #1: "),
+        "{}",
+        carried[0]
+    );
+    assert!(!carried[0].contains("poll"), "{}", carried[0]);
+    assert!(!carried[1].contains("tests #1"), "{}", carried[1]);
+    let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Claude keeps hook-only plate delivery: `ide.*` replies never carry the plate even while one is
 /// due, the withheld posts stay silent, and the still-due plate reaches the next native post (T28B).
 #[tokio::test]
@@ -21726,9 +21923,10 @@ async fn configured_product_environment_repeat_start_keeps_own_cache_and_binding
     daemon.wait().await.unwrap();
 }
 
-/// A repeated start that switches environments while a failed run's long status line is due
-/// still answers with its activation card: the environment notice joins the plate, which
-/// together exceed the feed's 256-byte block yet must not make the facade refuse the reply.
+/// A repeated start that switches environments while a failed run's long `test-finished` fact is
+/// due still answers with its activation card: the environment notice leads the plate and the
+/// fact follows it, which together exceed the feed's 256-byte block yet must not make the facade
+/// refuse the reply.
 #[tokio::test]
 async fn configured_product_environment_switch_plate_with_due_test_line_keeps_the_card() {
     use std::os::unix::fs::PermissionsExt;
@@ -21785,7 +21983,7 @@ async fn configured_product_environment_switch_plate_with_due_test_line_keeps_th
         )
         .await;
     assert_eq!(run["kind"], "test", "{run}");
-    // Let the failing run settle without polling it, so its status line stays due.
+    // Let the failing run settle without polling it, so its `test-finished` fact stays due.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let switched = actor
         .call_raw(
@@ -21804,10 +22002,8 @@ async fn configured_product_environment_switch_plate_with_due_test_line_keeps_th
         text.contains("python: environment now .venv-py314 (was .venv; selected)"),
         "{text}"
     );
-    assert!(
-        text.contains("tests #1: no test results (exit 1)"),
-        "{text}"
-    );
+    // OUTBOX-r3 §4: the settled run arrives as its fact after the plate, never as a plate line.
+    assert!(text.contains("\ntest-finished tests #1: exit 1"), "{text}");
     assert!(
         text.contains("environment: python .venv-py314 (3.14.3, selected)"),
         "{text}"

@@ -47,6 +47,9 @@ struct State {
     jobs: BTreeMap<u64, Job>,
     /// Last no-feed status plate delivered per worktree and starting binding.
     delivered_status: BTreeMap<(PathBuf, [u8; 32]), String>,
+    /// Called with a run's id right after its result is recorded (the session outbox's
+    /// `test-finished` producer); absent until the worker installs it.
+    on_settle: Option<Arc<dyn Fn(u64) + Send + Sync>>,
 }
 
 /// One job's worktree, command, timing, and optional completed report/output.
@@ -445,15 +448,48 @@ impl TestRuns {
             result.command = launch.rerun_command;
             result.rerun_dir = launch.rerun_dir;
             result.environment_label = launch.environment_label;
+            let mut on_settle = None;
             if let Ok(mut state) = registry.lock()
                 && let Some(job) = state.jobs.get_mut(&id)
             {
                 job.result = Some(result);
                 job.completed_at = Some(tokio::time::Instant::now());
+                on_settle = state.on_settle.clone();
+            }
+            // Outside the lock: the hook reads the settled run back through this registry.
+            if let Some(on_settle) = on_settle {
+                on_settle(id);
             }
             prune_completed(&registry, &root);
         });
         StartResult::Started(id)
+    }
+
+    /// Installs the hook called with each run's id once its result is recorded, replacing any
+    /// earlier one; the hook runs on the run's settle task, outside the registry lock.
+    pub fn on_settle(&self, hook: Arc<dyn Fn(u64) + Send + Sync>) {
+        if let Ok(mut state) = self.0.lock() {
+            state.on_settle = Some(hook);
+        }
+    }
+
+    /// Returns a settled run's result without observing it, for the outbox producer; `None`
+    /// while it runs or once it was pruned.
+    pub fn settled_result(&self, id: u64) -> Option<RunResult> {
+        self.0.lock().ok()?.jobs.get(&id)?.result.clone()
+    }
+
+    /// Marks a settled run collected: its outcome reached its owner `owner` (a delivered
+    /// `test-finished` fact), so `ide.stop` no longer lists it and it no longer pins idle exit.
+    /// Running, unknown or foreign runs are unchanged.
+    pub fn mark_observed(&self, id: u64, owner: &[u8; 32]) {
+        if let Ok(mut state) = self.0.lock()
+            && let Some(job) = state.jobs.get_mut(&id)
+            && job.result.is_some()
+            && &job.owner == owner
+        {
+            job.observed = true;
+        }
     }
 
     /// Marks `id` as an explicit command only when it belongs to `owner`; missing or foreign ids

@@ -162,7 +162,18 @@ fn validation_rejects_unknown_identity_and_requires_stable_operation_and_detail_
     assert!(validate_call(AssistanceTool::Inspect, json!({"detail_ref":"detail-1"})).is_ok());
     assert!(validate_call(AssistanceTool::Start, json!({"actor_id":"forged"})).is_err());
     assert!(validate_call(AssistanceTool::Stop, json!({"authority":"forged"})).is_err());
-    assert!(validate_call(AssistanceTool::Inspect, json!({})).is_err());
+    // OUTBOX-r3 §8.5: `{}` reads the session's facts; references and waits stay bounded.
+    assert!(validate_call(AssistanceTool::Inspect, json!({})).is_ok());
+    assert!(validate_call(AssistanceTool::Inspect, json!({"wait_ms":240000})).is_ok());
+    assert!(validate_call(AssistanceTool::Inspect, json!({"wait_ms":240001})).is_err());
+    assert!(
+        validate_call(
+            AssistanceTool::Inspect,
+            json!({"detail_refs":["a","b","c","d","e","f","g","h","i"]})
+        )
+        .is_err()
+    );
+    assert!(validate_call(AssistanceTool::Inspect, json!({"actor_id":"forged"})).is_err());
 }
 
 #[tokio::test]
