@@ -73,22 +73,17 @@ pub mod languages {
 
     /// Languages whose bundled module ships default-on in this release; the others compute in
     /// process. `AGENT_IDE_LANGUAGE_MODE=<id>=in_process` sends a shipped one back.
-    pub const SHIPPED_MODULES: [&str; 1] = ["python"];
+    pub const SHIPPED_MODULES: [&str; 0] = [];
 
     /// Each language's effect recipes: the only processes its module may ask the core to run.
-    pub static RECIPES: [(&str, &[agent_ide_core::modules::payload::EffectRecipe]); 1] =
-        [("python", agent_ide_lang_python::module::RECIPES)];
+    pub static RECIPES: [(&str, &[agent_ide_core::modules::payload::EffectRecipe]); 0] = [];
 
     /// Each language's module environment: the only variables its cleared module process (and
     /// `hello.config.env`) receives from the daemon.
     pub static MODULE_ENV: [(&str, &[&str]); 1] = [("rust", &["AGENT_IDE_RUST_TOOLCHAIN_DIR"])];
 
-    /// Each language's static install roots its interactive recipes may name (Python's standard
-    /// interpreter prefixes).
-    pub static INSTALL_ROOTS: [(&str, &[&str]); 1] = [(
-        "python",
-        &agent_ide_lang_python::module::INTERPRETER_PREFIXES,
-    )];
+    /// Each language's static install roots its interactive recipes may name.
+    pub static INSTALL_ROOTS: [(&str, &[&str]); 0] = [];
 
     /// Each language's host-side resolution of a worktree's accepted environments (Python's
     /// selected, pinned or discovered environments and their installation prefixes).
