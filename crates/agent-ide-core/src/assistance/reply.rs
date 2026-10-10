@@ -310,6 +310,9 @@ pub enum ResultKind {
     Graph,
     /// A background test run result from `ide.test`.
     Test,
+    /// The session's delivered facts or several references, gathered by one `ide.inspect` call
+    /// (`{}` or `detail_refs`, OUTBOX-r3 §8.5); plain text with no continuation of its own.
+    Inspect,
     /// The per-file outcome of a multi-file `ide.edit {files}` (batch-api-v1 §7); its text opens
     /// with `edit: applied …` or `edit: partial …`.
     EditBatch,

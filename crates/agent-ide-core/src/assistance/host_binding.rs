@@ -136,6 +136,14 @@ impl BindingRef {
         }
     }
 
+    /// Returns whether `other` rides the same host contract and trusted channel, whatever its
+    /// actor or generation: the sessions of one host session (a Claude main thread and its
+    /// subagents) share a channel, so a host-session-wide event such as a context compaction
+    /// reaches all of them.
+    pub(crate) fn same_channel(&self, other: &BindingRef) -> bool {
+        self.host == other.host && self.channel == other.channel
+    }
+
     /// Returns a stable opaque persistence key without exposing actor/channel fields or minting proof.
     /// The domain and length framing preserve distinct actor, channel, and generation identities.
     pub(crate) fn fingerprint(&self) -> [u8; 32] {

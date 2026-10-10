@@ -904,12 +904,90 @@ pub(crate) fn render_edit_reply(
     text
 }
 
+/// Builds the one `edit-checked` fact of a multi-file edit whose reply said `diagnostics:
+/// pending` (session-outbox-v1 §3.3).
+///
+/// `files` pairs each checked file with its project-check diagnostics in request order;
+/// `fences` are the written files with their post-write digests (at most 16). The summary is
+/// `<K> files, <N> new errors, <M> new warnings`, `<K> files, clean` or `<K> files, diagnostics
+/// unknown`; the detail has one line per file (at most 16, then `+K more files`) and at most
+/// eight `new:` lines, cut to the fact budget. New problems make the fact a failure, and their
+/// compiler text makes it source-bearing so it rides only reply-shaped carriers.
+pub(crate) fn edit_checked_draft(
+    operation_id: &str,
+    reference: &str,
+    files: &[(String, super::reply::EditDiagnostics)],
+    fences: Vec<super::outbox::FencedPath>,
+) -> super::outbox::FactDraft {
+    use super::outbox::{
+        FactDraft, FactKind, MAX_FACT_BYTES, MAX_SUBJECT_BYTES, MAX_SUMMARY_BYTES,
+    };
+    use super::reply::{EditDiagnostics, bounded_utf8_prefix};
+    let (mut errors, mut warnings, mut unknown) = (0usize, 0usize, false);
+    let mut lines = Vec::new();
+    let mut new_lines = Vec::new();
+    for (index, (path, diagnostics)) in files.iter().enumerate() {
+        let words = match diagnostics {
+            EditDiagnostics::CurrentClean { .. } => "clean".to_owned(),
+            EditDiagnostics::CurrentReported { messages, .. } => {
+                let fresh = messages
+                    .iter()
+                    .filter(|message| message.starts_with("new: "))
+                    .collect::<Vec<_>>();
+                let file_errors = fresh.iter().filter(|line| line.contains(" error")).count();
+                let file_warnings = fresh.len() - file_errors;
+                errors += file_errors;
+                warnings += file_warnings;
+                new_lines.extend(fresh.into_iter().cloned());
+                format!("{file_errors} new errors, {file_warnings} new warnings")
+            }
+            EditDiagnostics::NotAnalysed { .. } => "not analysed".to_owned(),
+            EditDiagnostics::Unknown {} | EditDiagnostics::Pending { .. } => {
+                unknown = true;
+                "unknown".to_owned()
+            }
+        };
+        if index < 16 {
+            lines.push(format!("  {path}: {words}"));
+        }
+    }
+    if files.len() > 16 {
+        lines.push(format!("  +{} more files", files.len() - 16));
+    }
+    lines.extend(new_lines.iter().take(8).map(|line| format!("  {line}")));
+    let summary = if errors + warnings > 0 {
+        format!(
+            "{} files, {errors} new errors, {warnings} new warnings",
+            files.len()
+        )
+    } else if unknown {
+        format!("{} files, diagnostics unknown", files.len())
+    } else {
+        format!("{} files, clean", files.len())
+    };
+    let summary = bounded_utf8_prefix(&summary, MAX_SUMMARY_BYTES);
+    let detail = (!lines.is_empty())
+        .then(|| bounded_utf8_prefix(&lines.join("\n"), MAX_FACT_BYTES - MAX_SUMMARY_BYTES - 64));
+    FactDraft {
+        kind: FactKind::EditChecked,
+        subject: bounded_utf8_prefix(&format!("edit {operation_id}"), MAX_SUBJECT_BYTES),
+        summary,
+        detail,
+        detail_ref: Some(reference.to_owned()),
+        failed: errors > 0,
+        holds_turn: true,
+        source_bearing: !new_lines.is_empty(),
+        fence_paths: fences,
+    }
+}
+
 /// Summarizes one multi-file edit's per-file project-check diagnostics.
 ///
 /// `files` pairs each checked file's path with its diagnostics; files never checked are left
-/// out by the caller. Returns the summary words for the first line (`clean`, `<n> new problems
-/// in <f> files`, `unknown`, `not analysed`, or `none` without any checked file), the per-file
-/// words in the same order, and at most eight `new:` problem lines across all files.
+/// out by the caller. Returns the summary words for the first line (`pending; …` while the check
+/// still runs, `clean`, `<n> new problems in <f> files`, `unknown`, `not analysed`, or `none`
+/// without any checked file), the per-file words in the same order, and at most eight `new:`
+/// problem lines across all files.
 pub(crate) fn summarize_diagnostics(
     files: &[(String, super::reply::EditDiagnostics)],
 ) -> (String, Vec<String>, Vec<String>) {
@@ -918,6 +996,7 @@ pub(crate) fn summarize_diagnostics(
     let mut new_lines = Vec::new();
     let (mut problems, mut problem_files, mut unknown, mut clean, mut elsewhere) =
         (0usize, 0usize, false, false, 0u32);
+    let mut pending = false;
     for (_, diagnostics) in files {
         words.push(match diagnostics {
             EditDiagnostics::CurrentClean { project_errors } => {
@@ -955,12 +1034,14 @@ pub(crate) fn summarize_diagnostics(
             }
             EditDiagnostics::NotAnalysed { .. } => "not analysed".to_owned(),
             EditDiagnostics::Pending { .. } => {
-                unknown = true;
+                pending = true;
                 "pending".to_owned()
             }
         });
     }
-    let summary = if problems > 0 {
+    let summary = if pending {
+        "pending; the project check arrives by itself as an edit-checked fact".to_owned()
+    } else if problems > 0 {
         format!("{problems} new problems in {problem_files} files")
     } else if unknown {
         "unknown".to_owned()
@@ -1509,6 +1590,65 @@ mod tests {
             validate_call(AssistanceTool::Symbol, json!({"usages":true})).is_err(),
             "the single form still needs its symbol"
         );
+    }
+
+    #[test]
+    fn edit_checked_facts_cover_every_file_within_the_outbox_budget() {
+        use crate::assistance::outbox::{
+            FactKind, FencedPath, JobEpoch, RecordingOutbox, SessionOutbox,
+        };
+        use crate::assistance::reply::EditDiagnostics;
+        let reported = |count: usize| EditDiagnostics::CurrentReported {
+            messages: (0..count)
+                .map(|line| format!("new: src/b.rs:{line}:1 error [E0001] {}", "é".repeat(80)))
+                .collect(),
+            delta: String::new(),
+            truncated: false,
+        };
+        let files = vec![
+            (
+                "src/a.rs".to_owned(),
+                EditDiagnostics::CurrentClean { project_errors: 0 },
+            ),
+            ("src/b.rs".to_owned(), reported(8)),
+            (
+                "docs/x.md".to_owned(),
+                EditDiagnostics::NotAnalysed { reason: "r".into() },
+            ),
+        ];
+        let fences = vec![FencedPath {
+            path: "src/a.rs".into(),
+            digest: Some([1; 32]),
+        }];
+        let draft = edit_checked_draft("op-7", "ref-9", &files, fences.clone());
+        assert_eq!(draft.kind, FactKind::EditChecked);
+        assert_eq!(draft.subject, "edit op-7");
+        assert_eq!(draft.summary, "3 files, 8 new errors, 0 new warnings");
+        assert!(draft.failed && draft.holds_turn && draft.source_bearing);
+        assert_eq!(draft.detail_ref.as_deref(), Some("ref-9"));
+        assert_eq!(draft.fence_paths, fences);
+        let detail = draft.detail.clone().unwrap();
+        assert!(
+            detail.starts_with("  src/a.rs: clean\n  src/b.rs: 8 new errors"),
+            "{detail}"
+        );
+        assert_eq!(draft.validate(), Ok(()), "{detail}");
+        let outbox = RecordingOutbox::default();
+        let session = crate::assistance::host_binding::BindingRef::fixture("editor", "channel", 1);
+        assert!(outbox.push(&[session], draft, JobEpoch::default()));
+
+        let clean = edit_checked_draft(
+            "op-8",
+            "ref-10",
+            &[(
+                "src/a.rs".to_owned(),
+                EditDiagnostics::CurrentClean { project_errors: 0 },
+            )],
+            Vec::new(),
+        );
+        assert_eq!(clean.summary, "1 files, clean");
+        assert!(!clean.failed && !clean.source_bearing);
+        assert_eq!(clean.validate(), Ok(()));
     }
 
     #[test]

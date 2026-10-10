@@ -77,6 +77,13 @@ pub(super) struct BatchCheck {
     authority: AuthorityStamp,
     /// Last instant a check result may still change the reply.
     pub(super) deadline: tokio::time::Instant,
+    /// The operation the `edit-checked` fact names.
+    operation_id: String,
+    /// The written files with their post-write digests, the fact's fence.
+    fences: Vec<crate::assistance::outbox::FencedPath>,
+    /// True once the caller got the reply with `diagnostics: pending`; the check's outcome is
+    /// then pushed as one `edit-checked` fact instead (session-outbox-v1 §8.6).
+    answered_early: bool,
 }
 
 impl BatchCheck {
@@ -220,7 +227,8 @@ impl Worker<'_> {
                 planned.into_iter().map(Some).collect(),
             )
             .await?;
-        self.schedule_batch_check(job, &binding, committed).await
+        self.schedule_batch_check(job, &binding, &operation_id, committed)
+            .await
     }
 
     /// Answers a call whose `operation_id` already has a receipt: a different request is a
@@ -243,7 +251,8 @@ impl Worker<'_> {
         let committed = self
             .commit_files(job, binding, operation_id, files, &existing, planned)
             .await?;
-        self.schedule_batch_check(job, binding, committed).await
+        self.schedule_batch_check(job, binding, operation_id, committed)
+            .await
     }
 
     /// Phase 1 for one file: observes it, admits its base and builds its candidate, writing
@@ -490,6 +499,21 @@ impl Worker<'_> {
         if reports.iter().all(|report| report.state.written()) {
             let _ = receipts.settle(operation_id).await;
         }
+        // Count this call's writes for the outbox's staleness labels before any check fact is
+        // registered, so the operation's own fact never labels its own writes.
+        let written_now = reports
+            .iter()
+            .filter(|report| {
+                matches!(
+                    report.state,
+                    FileState::Created | FileState::Replaced | FileState::Unchanged
+                )
+            })
+            .map(|report| report.path.clone())
+            .collect::<Vec<_>>();
+        if !written_now.is_empty() {
+            self.shared.outbox.note_edit(binding, &written_now);
+        }
         if unknown {
             self.unsettled_edits
                 .entry(binding.clone())
@@ -590,6 +614,7 @@ impl Worker<'_> {
         &mut self,
         job: &mut Job,
         binding: &BindingRef,
+        operation_id: &str,
         committed: Committed,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         let Committed {
@@ -657,6 +682,13 @@ impl Worker<'_> {
                 deadline,
             });
         }
+        let fences = sources
+            .iter()
+            .map(|source| crate::assistance::outbox::FencedPath {
+                path: source.path().display().to_string(),
+                digest: source.bytes().map(|bytes| *bytes.digest()),
+            })
+            .collect();
         let check = BatchCheck {
             reports,
             sources,
@@ -664,6 +696,9 @@ impl Worker<'_> {
             unchecked,
             authority,
             deadline: deadline.unwrap_or_else(tokio::time::Instant::now),
+            operation_id: operation_id.to_owned(),
+            fences,
+            answered_early: false,
         };
         self.finish_batch_check(job, check).await
     }
@@ -675,7 +710,7 @@ impl Worker<'_> {
     pub(super) async fn finish_batch_check(
         &mut self,
         job: &mut Job,
-        check: BatchCheck,
+        mut check: BatchCheck,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         let expired = *job.cancel.borrow() || tokio::time::Instant::now() >= check.deadline;
         let mut diagnostics = Vec::with_capacity(check.stages.len() + check.unchecked.len());
@@ -687,6 +722,7 @@ impl Worker<'_> {
                 Some(found) => diagnostics.push((path.clone(), found)),
                 None if expired => diagnostics.push((path.clone(), EditDiagnostics::Unknown {})),
                 None => {
+                    self.reply_batch_early(job, &mut check);
                     job.stage = Some(JobStage::EditBatchAwaitingCheck(Box::new(check)));
                     job.park_until = Some(tokio::time::Instant::now() + Duration::from_millis(250));
                     return Err(FailureCode::ProviderLoading);
@@ -694,11 +730,85 @@ impl Worker<'_> {
             }
         }
         diagnostics.extend(check.unchecked.iter().cloned());
+        if check.answered_early
+            && let Some(work) = self.shared.outbox.take_holding(&job.reference)
+        {
+            let draft = batch::edit_checked_draft(
+                &check.operation_id,
+                &job.reference,
+                &diagnostics,
+                check.fences.clone(),
+            );
+            let mut recipients = vec![work.owner];
+            recipients.extend(work.subscribers);
+            self.shared
+                .outbox
+                .push_draft(&recipients, draft, work.epoch);
+        }
         let reply = batch_reply(&job.reference, &check.reports, &diagnostics);
         let mut sources = check.sources;
         let first = (!sources.is_empty()).then(|| sources.remove(0));
         self.shared.add_edit_sources(&job.reference, sources);
         Ok((reply, Some(check.authority), first))
+    }
+
+    /// Answers a multi-file edit whose project check is still running with `diagnostics:
+    /// pending` shortly before its caller's inline window ends (session-outbox-v1 §8.6), as the
+    /// one-file edit does.
+    ///
+    /// Only a caller still waiting is answered, only once, and only when the session's outbox
+    /// can hold the check as in-flight work under the job's reference: the job stays parked on
+    /// its check, and [`Self::finish_batch_check`] then pushes one `edit-checked` fact for the
+    /// whole operation. Otherwise nothing changes and the final reply carries the diagnostics.
+    fn reply_batch_early(&self, job: &mut Job, check: &mut BatchCheck) {
+        if check.answered_early {
+            return;
+        }
+        let started = job.deadline.checked_sub(Duration::from_millis(
+            self.shared.launcher.limits.operation_ms,
+        ));
+        let due = started.is_none_or(|started| {
+            tokio::time::Instant::now() + super::delivery::EARLY_EDIT_REPLY_MARGIN
+                >= started + INLINE_REPLY_WAIT
+        });
+        let waiting = job
+            .stop_reply
+            .as_ref()
+            .is_some_and(|sender| !sender.is_closed());
+        let binding = job.invocation.binding_ref().clone();
+        if !due || !waiting || !self.shared.outbox.is_open(&binding) {
+            return;
+        }
+        let subject = format!("edit {}", check.operation_id);
+        if !self
+            .shared
+            .outbox
+            .begin_holding(&job.reference, &binding, &subject, check.deadline)
+        {
+            return;
+        }
+        let mut pending: Vec<(String, EditDiagnostics)> = check
+            .stages
+            .iter()
+            .filter_map(|stage| match stage {
+                JobStage::EditAwaitingCheck { path, .. } => Some((
+                    path.clone(),
+                    EditDiagnostics::Pending {
+                        detail_ref: job.reference.clone(),
+                    },
+                )),
+                JobStage::EditBatchAwaitingCheck(_) => None,
+            })
+            .collect();
+        pending.extend(check.unchecked.iter().cloned());
+        let reply = batch_reply(&job.reference, &check.reports, &pending);
+        if let Some(sender) = job.stop_reply.take() {
+            if sender.send(reply).is_err() {
+                let _ = self.shared.outbox.take_holding(&job.reference);
+                return;
+            }
+            check.answered_early = true;
+        }
     }
 
     /// Answers a rename whose `operation_id` already has a receipt without asking the language

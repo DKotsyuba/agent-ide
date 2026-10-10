@@ -314,13 +314,20 @@ async fn read_items_answer_unchanged_for_identical_bytes_until_change_force_comp
     daemon.wait().await.unwrap();
 }
 
-/// Without a compaction signal the unchanged answer is never given: a repeated items read
-/// returns the text.
+/// Without a compaction signal (an unknown context epoch, as on a channel that never delivered a
+/// native hook; the test seam stands in because every product actor binds through hooks) the
+/// unchanged answer is never given: a repeated items read returns the text.
+#[cfg(feature = "test-seams")]
 #[tokio::test]
 async fn read_items_never_answer_unchanged_without_a_compaction_signal() {
     let fixture = edit_fixture();
+    let epoch = fixture.base.join("context-epoch");
+    std::fs::write(&epoch, "unknown").unwrap();
     let home = enable_fake_rust_checks(&fixture, &fixture.base);
-    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let env = [("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE", epoch.to_str().unwrap())];
+    let mut daemon = fixture
+        .spawn_configured_daemon_with_env(Some(&home), false, Duration::from_secs(30), None, &env)
+        .await;
     let mut actor = ProductActor::new(&fixture, "read-no-signal").await;
     let started = actor
         .call(
@@ -991,6 +998,85 @@ async fn multi_file_edit_runs_one_project_check_and_reports_each_file() {
         .await;
     let next = actor.settle(&fixture, next).await;
     assert_eq!(next["result"]["outcome"], "replaced", "{next}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A multi-file edit whose one project check outlasts the inline window answers at once with
+/// every file written and `diagnostics: pending`; the check then reaches the agent as exactly one
+/// `edit-checked` fact for the whole operation (session-outbox-v1 §3.3, §8.6).
+#[tokio::test]
+async fn slow_multi_file_edit_check_arrives_as_one_edit_checked_fact() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(
+        fixture.root.join("src/a.rs"),
+        "pub fn f() -> i32 {\n    1\n}\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "src/a.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "slow check fixture"]);
+    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 12");
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "slow-batch-check").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"slow-batch-check"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let (read, _) = settled_read(
+        &mut actor,
+        &fixture,
+        json!({"items":[{"path":"src/lib.rs"},{"path":"src/a.rs"}]}),
+    )
+    .await;
+    let source_ref = read["detail_ref"].as_str().unwrap().to_owned();
+    let (edit, text) = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"operation_id":"slow-batch","source_ref":source_ref,"files":[
+            {"path":"src/lib.rs","changes":[{"lines":"1-1","content":"pub fn value() -> i32 { 8 }"}]},
+            {"path":"src/a.rs","changes":[{"lines":"2-2","content":"    2"}]}]}),
+    )
+    .await;
+    assert_eq!(
+        edit["kind"], "edit_batch",
+        "the check never parks the reply: {edit} {text}"
+    );
+    assert!(
+        text.starts_with("edit: applied 2 of 2 files; source_ref "),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "diagnostics: pending; the project check arrives by itself as an edit-checked fact"
+        ),
+        "{text}"
+    );
+    let checked = actor
+        .call(&fixture, "ide.inspect", json!({"wait_ms":60000}))
+        .await;
+    let checked_text = checked["text"].as_str().unwrap_or_default();
+    assert!(
+        checked_text.starts_with("edit-checked edit slow-batch: 2 files"),
+        "{checked}"
+    );
+    assert!(
+        checked_text.contains("src/lib.rs: ") && checked_text.contains("src/a.rs: "),
+        "{checked}"
+    );
+    let again = actor.call(&fixture, "ide.inspect", json!({})).await;
+    assert!(
+        again["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("nothing ready yet")),
+        "the fact is handed over once: {again}"
+    );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();

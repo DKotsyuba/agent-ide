@@ -45,6 +45,19 @@ pub(crate) const MAX_V2_FRAME_BYTES: usize = 160 * 1024;
 pub(crate) const MAX_ASSISTANCE_JSON_BYTES: usize = 144 * 1024;
 /// Maximum time to wait for an Assistance method reply after its request is written.
 const METHOD_DISPATCH_BUDGET: Duration = Duration::from_secs(10);
+
+/// Returns the reply budget of one method dispatch: [`METHOD_DISPATCH_BUDGET`], plus the call's
+/// own `wait_ms` when `method` is `inspect` (clamped to the outbox's 240 s maximum), so a bounded
+/// `ide.inspect` wait (OUTBOX-r3 §8.5) is never cut by the transport. `params` is the dispatch's
+/// `params_json` object; anything unreadable adds nothing.
+fn method_dispatch_budget(method: &str, params: &Value) -> Duration {
+    let wait = (method == "inspect")
+        .then(|| params.get("parameters")?.get("wait_ms")?.as_u64())
+        .flatten()
+        .unwrap_or(0)
+        .min(crate::assistance::outbox::MAX_WAIT_MS);
+    METHOD_DISPATCH_BUDGET + Duration::from_millis(wait)
+}
 /// Total connect, request, and acknowledgement budget when a Codex MCP opens its client lease.
 const CLIENT_LEASE_OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 /// Concurrent hook submissions one daemon serves, a lane of its own apart from the tool-call
@@ -779,6 +792,7 @@ pub async fn dispatch_method_if_running(
         AssistanceMethod::HookSubmit => return MethodDispatchTransportResult::Unavailable,
     };
     let version = request.method().wire_version();
+    let reply_budget = method_dispatch_budget(method, &params);
     let wire = json!({
         "version": version,
         "request_id": request.request_id(),
@@ -799,8 +813,7 @@ pub async fn dispatch_method_if_running(
         Ok(Err(_)) => return MethodDispatchTransportResult::OutcomeUnknown,
         Err(_) => return MethodDispatchTransportResult::WrittenTimedOut,
     }
-    let Some(reply_deadline) = tokio::time::Instant::now().checked_add(METHOD_DISPATCH_BUDGET)
-    else {
+    let Some(reply_deadline) = tokio::time::Instant::now().checked_add(reply_budget) else {
         return MethodDispatchTransportResult::OutcomeUnknown;
     };
     let Some(first_reply_deadline) =
@@ -1309,7 +1322,13 @@ async fn serve_accepted_connection(
                     let method = request.get("method").and_then(Value::as_str)
                         == Some("assistance.method_dispatch");
                     let budget = if method {
-                        METHOD_DISPATCH_BUDGET
+                        method_dispatch_budget(
+                            request
+                                .get("dispatch_method")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                            request.get("params_json").unwrap_or(&Value::Null),
+                        )
                     } else {
                         connection_deadline.duration_since(tokio::time::Instant::now())
                     };
@@ -1661,8 +1680,12 @@ async fn serve_assistance_request(
                 .ok_or_else(|| invalid_transport("invalid method parameters"))?,
             )
             .ok_or_else(|| invalid_transport("invalid method correlation"))?;
+            let budget = method_dispatch_budget(
+                required_string(object, "dispatch_method")?,
+                required_value(object, "params_json")?,
+            );
             let reply = tokio::time::timeout(
-                METHOD_DISPATCH_BUDGET,
+                budget,
                 dispatcher.dispatch(AssistanceDispatch::MethodDispatch(dispatch.clone())),
             )
             .await;
@@ -2205,6 +2228,28 @@ mod tests {
         assert!(
             METHOD_DISPATCH_BUDGET > crate::assistance::worker::INLINE_REPLY_WAIT,
             "the bridge must preserve the original invocation through the inline wait"
+        );
+    }
+
+    /// An `ide.inspect` wait extends the dispatch budget by itself, clamped; nothing else does.
+    #[test]
+    fn inspect_waits_extend_the_dispatch_budget() {
+        let waiting = json!({"parameters":{"wait_ms":30000}});
+        assert_eq!(
+            method_dispatch_budget("inspect", &waiting),
+            METHOD_DISPATCH_BUDGET + Duration::from_secs(30)
+        );
+        assert_eq!(
+            method_dispatch_budget("inspect", &json!({"parameters":{"wait_ms":u64::MAX}})),
+            METHOD_DISPATCH_BUDGET + Duration::from_secs(240)
+        );
+        assert_eq!(
+            method_dispatch_budget("read", &waiting),
+            METHOD_DISPATCH_BUDGET
+        );
+        assert_eq!(
+            method_dispatch_budget("inspect", &json!({})),
+            METHOD_DISPATCH_BUDGET
         );
     }
 

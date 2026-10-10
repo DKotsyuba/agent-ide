@@ -263,8 +263,11 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Inspect,
             json!({
                 "type": "object", "additionalProperties": false,
-                "required": ["detail_ref"],
-                "properties": {"detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."}}
+                "properties": {
+                    "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."},
+                    "detail_refs": {"type": "array", "minItems": 1, "maxItems": super::outbox::MAX_DETAIL_REFS, "items": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}, "description": "Several references answered in order in one reply; not with `detail_ref`."},
+                    "wait_ms": {"type": "integer", "minimum": 0, "maximum": super::outbox::MAX_WAIT_MS, "description": "Wait up to this long: with no reference, for the first result of this session; with references, for one of them to settle."}
+                }
             }),
         ),
         schema(
@@ -689,7 +692,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "offset",
         ],
         AssistanceTool::Diff => &["mode", "detail_ref", "provenance", "paths"],
-        AssistanceTool::Inspect => &["detail_ref"],
+        AssistanceTool::Inspect => &["detail_ref", "detail_refs", "wait_ms"],
         AssistanceTool::Stop => &["activation_id"],
         AssistanceTool::Edit => &[
             "operation_id",
@@ -1198,7 +1201,38 @@ pub fn validate_call(
         }
 
         AssistanceTool::Inspect => {
-            required_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
+            // OUTBOX-r3 §8.5: one reference, up to eight in order, or none (the session's facts),
+            // each with an optional bounded wait.
+            optional_string(object, "detail_ref", MAX_DETAIL_REF_BYTES)?;
+            if let Some(references) =
+                string_list(object, "detail_refs", super::outbox::MAX_DETAIL_REFS)?
+            {
+                if object.contains_key("detail_ref") {
+                    return Err(invalid_field(
+                        "detail_refs",
+                        FieldRule::OneOf("not together with detail_ref"),
+                    ));
+                }
+                if references.iter().any(|reference| {
+                    reference.len() > MAX_DETAIL_REF_BYTES
+                        || reference.chars().any(char::is_control)
+                }) {
+                    return Err(invalid_field(
+                        "detail_refs",
+                        FieldRule::TooLong(MAX_DETAIL_REF_BYTES),
+                    ));
+                }
+            }
+            if object.get("wait_ms").is_some_and(|value| {
+                value
+                    .as_u64()
+                    .is_none_or(|wait| wait > super::outbox::MAX_WAIT_MS)
+            }) {
+                return Err(invalid_field(
+                    "wait_ms",
+                    FieldRule::NonNegativeInteger(super::outbox::MAX_WAIT_MS),
+                ));
+            }
         }
         AssistanceTool::Stop => {
             optional_string(object, "activation_id", MAX_ACTIVATION_ID_BYTES)?;
@@ -4869,9 +4903,14 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
                 .to_string(),
         ),
         (
-            validate_call(AssistanceTool::Inspect, json!({})).unwrap_err(),
+            validate_call(
+                AssistanceTool::Inspect,
+                json!({"detail_ref":"a","detail_refs":["b"]}),
+            )
+            .unwrap_err(),
             AssistanceTool::Inspect,
-            "invalid bounded parameters: \"detail_ref\" is required".to_string(),
+            "invalid bounded parameters: \"detail_refs\" must be not together with detail_ref"
+                .to_string(),
         ),
         (
             validate_call(

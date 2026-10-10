@@ -339,11 +339,25 @@
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
+        },
+        "detail_refs": {
+          "description": "Several references answered in order in one reply; not with `detail_ref`.",
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "type": "array"
+        },
+        "wait_ms": {
+          "description": "Wait up to this long: with no reference, for the first result of this session; with references, for one of them to settle.",
+          "maximum": 240000,
+          "minimum": 0,
+          "type": "integer"
         }
       },
-      "required": [
-        "detail_ref"
-      ],
       "type": "object"
     },
     "name": "ide.inspect"

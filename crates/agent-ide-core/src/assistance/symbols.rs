@@ -728,15 +728,18 @@ impl Worker<'_> {
     }
 
     /// The session's context-compaction epoch (session-outbox-v1 §9.1), which gates the read
-    /// unchanged answer. `None` — the answer stays off — until the session outbox's worker
-    /// implementation reports one for `binding`.
+    /// unchanged answer: the outbox's counter for `binding`, `None` — the answer stays off —
+    /// while the session's channel never delivered a native hook.
     ///
     /// Test seam (never read by a release build): `AGENT_IDE_TEST_CONTEXT_EPOCH_FILE` names a
-    /// file whose trimmed content is the epoch, so product tests can simulate a compaction by
-    /// rewriting it.
-    fn context_epoch(&self, _binding: &BindingRef) -> Option<u64> {
-        let seam = crate::test_seams::var("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE")?;
-        std::fs::read_to_string(seam).ok()?.trim().parse().ok()
+    /// file whose trimmed content is the epoch and replaces the outbox's answer, so product tests
+    /// can simulate a compaction by rewriting it; content that is not a number stands for an
+    /// unknown epoch (`None`).
+    fn context_epoch(&self, binding: &BindingRef) -> Option<u64> {
+        match crate::test_seams::var("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE") {
+            Some(seam) => std::fs::read_to_string(seam).ok()?.trim().parse().ok(),
+            None => crate::assistance::outbox::SessionOutbox::context_epoch(&*self.shared, binding),
+        }
     }
 
     /// `ide.symbol {symbol, usages?, callers?, callees?, history?}`: the symbol card; the

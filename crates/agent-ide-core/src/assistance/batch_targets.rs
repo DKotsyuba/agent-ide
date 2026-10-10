@@ -445,7 +445,7 @@ mod tests {
     #[test]
     fn entry_states_read_their_first_line() {
         assert_eq!(
-            answered_state("approximate: rust-analyzer is still indexing; …\nsymbol: f"),
+            answered_state("approximate: the language server is still indexing; …\nsymbol: f"),
             EntryState::Approximate
         );
         assert_eq!(
