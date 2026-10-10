@@ -1190,6 +1190,7 @@ mod tests {
         use super::super::payload::{
             EffectRecipe, ExecutableSlot, Param, RunClass, SlotSource, Stdin,
         };
+        /// A fixture recipe `id` of `class` whose program is the `tool` slot, the home tool `sh`.
         const fn recipe(id: &'static str, class: RunClass) -> EffectRecipe {
             EffectRecipe {
                 id,
