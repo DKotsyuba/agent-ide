@@ -292,7 +292,7 @@ pub const FAULT_SEAM: &str = "AGENT_IDE_TEST_MODULE_FAULT";
 pub const FIXTURE_SEAM: &str = "AGENT_IDE_TEST_MODULE_FIXTURE";
 
 /// The kinds the serving loop acts out; any other kind belongs to a language's own seam (such as
-/// Python's `widen`), which must find its flag file still there.
+/// a checker's `widen`), which must find its flag file still there.
 const SERVE_FAULTS: [&str; 9] = [
     "exit",
     "stall",

@@ -379,7 +379,7 @@ pub fn relative_reference(from: &Path, reference: &str) -> Option<String> {
 }
 
 /// Static vocabulary with which a language's file references reach a file the reference does not
-/// spell exactly (`./button` for `button.tsx`). It is compiled descriptor data, not a language
+/// spell exactly (`./button` for `button.b`). It is compiled descriptor data, not a language
 /// computation: the core applies it to its own file listing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileProbe {
@@ -541,25 +541,25 @@ mod tests {
     /// the worktree or name a URL, absolute path or empty target.
     #[test]
     fn relative_references_normalize_inside_the_worktree() {
-        let from = Path::new("src/ui/App.tsx");
+        let from = Path::new("src/ui/App.b");
         let key = |reference| relative_reference(from, reference);
         assert_eq!(key("./Button"), Some("src/ui/Button".into()));
         assert_eq!(key("../lib/util.js"), Some("src/lib/util.js".into()));
-        assert_eq!(key("a/./b/../c.css"), Some("src/ui/a/c.css".into()));
+        assert_eq!(key("a/./b/../c.a"), Some("src/ui/a/c.a".into()));
         assert_eq!(key("../../x.js"), Some("x.js".into()));
         assert_eq!(key("../../../x.js"), None);
         assert_eq!(key("/abs/x.js"), None);
         assert_eq!(key("https://cdn/x.js"), None);
-        assert_eq!(key("data:text/javascript,1"), None);
+        assert_eq!(key("data:text/plain,1"), None);
         assert_eq!(key("//cdn/x.js"), None);
         assert_eq!(key("a\\b.js"), None);
         assert_eq!(key(""), None);
         assert_eq!(key("."), Some("src/ui".into()));
         assert_eq!(
-            relative_reference(Path::new("index.html"), "app.js"),
+            relative_reference(Path::new("index.a"), "app.js"),
             Some("app.js".into())
         );
-        assert_eq!(key("my file.css"), Some("src/ui/my file.css".into()));
+        assert_eq!(key("my file.a"), Some("src/ui/my file.a".into()));
     }
 
     /// An exact file wins; otherwise swaps, suffixes and index files are tried in that order and
@@ -608,7 +608,7 @@ mod tests {
                 }
             }
         }
-        let from = Path::new("src/a.tsx");
+        let from = Path::new("src/a.b");
         let rows: Vec<(String, Certainty)> = Probing
             .resolve(ns::FILE_REF, "./b?x#y", from, 32)
             .into_iter()
@@ -631,7 +631,7 @@ mod tests {
                 .resolve(ns::FILE_REF, "../../b", from, 32)
                 .is_empty()
         );
-        // A bare path is relative by default (an HTML URL); script languages override this.
+        // A bare path is relative by default (a markup URL); languages with bare package specifiers override this.
         assert_eq!(Probing.resolve(ns::FILE_REF, "pkg", from, 32).len(), 2);
         assert!(
             Probing
