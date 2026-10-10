@@ -1,6 +1,6 @@
 # Symbol and graph item v1 contract
 
-Revision: symbol-graph-item r1; tracked boundary id `symbol-graph-item`, revision 1. Provider: the
+Revision: symbol-graph-item r2; tracked boundary id `symbol-graph-item`, revision 2. Provider: the
 single-target symbol tools `ide.symbol {symbol}` and `ide.graph {symbol}`
 (`crates/agent-ide-core/src/assistance/symbols.rs`). Consumers: the batch forms
 `ide.symbol {symbols}` and `ide.graph {symbols}` ([batch API v1](batch-api-v1.md) §4-§5), which
@@ -27,12 +27,19 @@ entry and never re-implement it.
 | `precise(text)` | Final answer. | Nothing. |
 | `approximate(text)` | Labelled approximate answer (§4). | Calls the engine again in `precise` mode once the server is ready, and delivers that answer. |
 | `deferred` | No answer yet: the server is starting and the language has no exact source outline. | Same as `approximate`, but the caller received nothing for this entry. |
+| `unavailable(cause, text)` | Graph only: every requested direction of the root faulted (§6). `text` is the single form's reply. | Nothing. |
 | `failed(code, detail)` | Closed failure codes, unchanged (`unknown_symbol`, `ambiguous_symbol`, `provider_unavailable`, `source_unavailable`, …). | Nothing. |
 
-- The item text is exactly the single form's reply text for that address and those options. Rust
-  names are fixed when the provider lands; the semantics above change only with a new revision.
-- Batch framing, per-entry isolation, ordering, reply budget and the outbox subject of a batch are
-  the batch contract's. The single form's follow-up is §5.
+- The item text is exactly the single form's reply text for that address and those options, one
+  bounded block. Rust names are fixed when the provider lands; the semantics above change only
+  with a new revision.
+- The engine creates no reply, no `detail_ref`, no job and no outbox registration; its caller does.
+  A batch keeps one job and one `detail_ref` for all entries.
+- Batch framing, per-entry isolation, ordering, reply budget, the counting of approximate and
+  unavailable entries, and the follow-up of approximate or deferred entries are the batch
+  contract's. The batch re-runs those entries in `precise` mode inside its own job, and the
+  follow-up fact names the batch `detail_ref` and the entry indexes (session outbox v1 §13.3). The
+  single form's follow-up is §5.
 
 ## 2. Bare names
 
@@ -133,7 +140,7 @@ is never rendered as an absence of calls.
 |---|---|
 | Symbol card | `callers: unavailable (<cause>)` or `callees: unavailable (<cause>)` (unchanged) |
 | Graph root, one direction | that direction's section reads `callers: unavailable (<cause>)` (or `callees:`); its edges are not counted |
-| Graph root, every requested direction | single form: `graph: callers of <root> unavailable (<cause>)`; batch: the root is `unavailable (<cause>)` (batch API v1 §5) |
+| Graph root, every requested direction | outcome `unavailable`; single form: `graph: callers of <root> unavailable (<cause>)`; batch: the root is `unavailable (<cause>)` (batch API v1 §5) |
 | Deeper graph node | its row ends with ` (callers unavailable: <cause>)` (or `callees`) |
 
 - Causes, closed: `prepare call hierarchy request failed`, `incoming calls request failed`,
