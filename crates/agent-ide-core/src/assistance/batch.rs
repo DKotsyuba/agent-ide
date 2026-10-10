@@ -535,6 +535,21 @@ pub(crate) fn edit_request_digest(parameters: &Value) -> [u8; 32] {
     *hash.finalize().as_bytes()
 }
 
+/// Digest of a rename request (`operation_id`, `symbol`, `new_name`), the receipt key that
+/// lets a retry of a rename stopped midway finish it and a different rename under the same
+/// `operation_id` conflict.
+pub(crate) fn rename_request_digest(parameters: &Value) -> [u8; 32] {
+    let canonical = json!({
+        "operation_id": parameters.get("operation_id"),
+        "symbol": parameters.get("symbol"),
+        "new_name": parameters.get("new_name"),
+    });
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"changes-rename-request-v1");
+    hash.update(canonical.to_string().as_bytes());
+    *hash.finalize().as_bytes()
+}
+
 /// Why a file of a multi-file edit was not written.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NotWritten {

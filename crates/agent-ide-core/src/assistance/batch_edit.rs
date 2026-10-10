@@ -35,6 +35,32 @@ pub(super) struct Planned {
     note: Option<String>,
 }
 
+/// What one commit pass did, for the caller to answer from.
+pub(super) struct Committed {
+    /// Every requested file in request order with its state in this call.
+    reports: Vec<FileReport>,
+    /// Post-write observations of the files that now hold their candidate, request order.
+    sources: Vec<SourceObservation>,
+    /// Per written path, the problem identities the latest check reported before its write.
+    preexisting: BTreeMap<String, BTreeMap<String, u32>>,
+    /// Authority under which the files were written.
+    authority: AuthorityStamp,
+}
+
+/// The reply to a reused `operation_id` whose recorded request differs: nothing is written.
+fn conflicting_duplicate(operation_id: &str) -> PeerReply {
+    PeerReply::Complete {
+        kind: ResultKind::EditBatch,
+        text: format!(
+            "edit: conflicting_duplicate; operation_id {operation_id} already names a different \
+             multi-file edit; nothing written\n"
+        ),
+        detail_ref: None,
+        truncated: false,
+        continuation: false,
+    }
+}
+
 /// A multi-file edit parked after its writes, waiting for its one project check.
 pub(super) struct BatchCheck {
     /// Every requested file in request order with its write state and landing note.
@@ -184,15 +210,17 @@ impl Worker<'_> {
             settled: false,
             files: rows,
         };
-        self.commit_files(
-            job,
-            &binding,
-            &operation_id,
-            &files,
-            &receipt,
-            planned.into_iter().map(Some).collect(),
-        )
-        .await
+        let committed = self
+            .commit_files(
+                job,
+                &binding,
+                &operation_id,
+                &files,
+                &receipt,
+                planned.into_iter().map(Some).collect(),
+            )
+            .await?;
+        self.schedule_batch_check(job, &binding, committed).await
     }
 
     /// Answers a call whose `operation_id` already has a receipt: a different request is a
@@ -209,24 +237,13 @@ impl Worker<'_> {
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         if existing.request_digest != digest || existing.files.len() != files.len() {
             let authority = self.authority(binding).await.ok();
-            return Ok((
-                PeerReply::Complete {
-                    kind: ResultKind::EditBatch,
-                    text: format!(
-                        "edit: conflicting_duplicate; operation_id {operation_id} already names a \
-                         different multi-file edit; nothing written\n"
-                    ),
-                    detail_ref: None,
-                    truncated: false,
-                    continuation: false,
-                },
-                authority,
-                None,
-            ));
+            return Ok((conflicting_duplicate(operation_id), authority, None));
         }
         let planned = files.iter().map(|_| None).collect();
-        self.commit_files(job, binding, operation_id, files, &existing, planned)
-            .await
+        let committed = self
+            .commit_files(job, binding, operation_id, files, &existing, planned)
+            .await?;
+        self.schedule_batch_check(job, binding, committed).await
     }
 
     /// Phase 1 for one file: observes it, admits its base and builds its candidate, writing
@@ -330,17 +347,19 @@ impl Worker<'_> {
         }
     }
 
-    /// Phase 2: writes the files in request order against `receipt`, then schedules the one
-    /// project check and answers.
+    /// Phase 2: writes the files in request order against `receipt` and reports each file.
     ///
-    /// `planned[k]` is the phase 1 plan of file `k` in a new operation and `None` on a resume.
-    /// A file the receipt marks written, or whose bytes equal its recorded candidate, counts as
-    /// written earlier. On a resume an unwritten file is written only when its bytes equal its
-    /// recorded base and its recomputed candidate equals the recorded one; otherwise the commit
-    /// stops there as `changed after validation`. The first file that changed, failed or has an
-    /// unknown result stops the commit and every later file is `not reached`. No error after
-    /// the first write leaves this function: each becomes the file's state, so the reply always
-    /// says exactly what was written.
+    /// `planned[k]` is the plan of file `k`: from phase 1 in a new operation, recomputed by a
+    /// caller that resumes (a rename), or `None` to recompute it here from `files[k]` on a
+    /// resume. A file the receipt marks written counts as written earlier. A file without a plan
+    /// whose bytes equal its recorded candidate counts as written earlier too; otherwise its plan
+    /// is rebuilt with its current observation as the base. Every plan must match its receipt row
+    /// (base digest and candidate digest), so nothing is written that the operation did not
+    /// validate; a mismatch stops the commit there as `changed after validation`. The first file
+    /// that changed, failed or has an unknown result stops the commit and every later file is
+    /// `not reached`. No error after the first write leaves this function: each becomes the
+    /// file's state, so the caller can always say exactly what was written. A fully written
+    /// operation is settled; an unknown write keeps the binding unsettled for the handover guard.
     async fn commit_files(
         &mut self,
         job: &mut Job,
@@ -349,7 +368,7 @@ impl Worker<'_> {
         files: &[EditFile],
         receipt: &BatchReceipt,
         mut planned: Vec<Option<Planned>>,
-    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+    ) -> Result<Committed, FailureCode> {
         let authority = self.authority(binding).await?;
         let receipts = self.edits.batches();
         let mut reports: Vec<FileReport> = Vec::with_capacity(files.len());
@@ -368,6 +387,15 @@ impl Worker<'_> {
                 reports.push(report(FileState::NotWritten(NotWritten::NotReached), None));
                 continue;
             }
+            if row.written {
+                if let Ok((observed, _)) = self.observe(binding, file.path.clone().into()).await
+                    && observed.bytes().map(|bytes| *bytes.digest()) == Some(row.candidate)
+                {
+                    sources.push(observed);
+                }
+                reports.push(report(FileState::WrittenEarlier, None));
+                continue;
+            }
             let plan = match planned[index].take() {
                 Some(plan) => plan,
                 None => {
@@ -378,35 +406,17 @@ impl Worker<'_> {
                         reports.push(report(FileState::NotWritten(NotWritten::IoError), None));
                         continue;
                     };
-                    let current = observed.bytes().map(|bytes| *bytes.digest());
-                    if row.written || current == Some(row.candidate) {
-                        if current == Some(row.candidate) {
-                            sources.push(observed);
-                        }
-                        if !row.written {
-                            let _ = receipts.mark_written(operation_id, index).await;
-                        }
+                    if observed.bytes().map(|bytes| *bytes.digest()) == Some(row.candidate) {
+                        sources.push(observed);
+                        let _ = receipts.mark_written(operation_id, index).await;
                         reports.push(report(FileState::WrittenEarlier, None));
-                        continue;
-                    }
-                    if current != row.base {
-                        stopped = true;
-                        reports.push(report(
-                            FileState::NotWritten(NotWritten::ChangedAfterValidation),
-                            None,
-                        ));
                         continue;
                     }
                     match self
                         .plan_file(job, binding, index, file, Some((observed, bytes)))
                         .await
                     {
-                        Ok(Ok(plan))
-                            if *blake3::hash(plan.candidate.as_bytes()).as_bytes()
-                                == row.candidate =>
-                        {
-                            plan
-                        }
+                        Ok(Ok(plan)) => plan,
                         _ => {
                             stopped = true;
                             reports.push(report(
@@ -418,6 +428,16 @@ impl Worker<'_> {
                     }
                 }
             };
+            if plan.base.bytes().map(|bytes| *bytes.digest()) != row.base
+                || *blake3::hash(plan.candidate.as_bytes()).as_bytes() != row.candidate
+            {
+                stopped = true;
+                reports.push(report(
+                    FileState::NotWritten(NotWritten::ChangedAfterValidation),
+                    None,
+                ));
+                continue;
+            }
             preexisting.insert(
                 plan.path.clone(),
                 self.pre_edit_problem_keys(&authority, &plan.path),
@@ -476,8 +496,12 @@ impl Worker<'_> {
                 .or_default()
                 .insert(operation_id.to_owned());
         }
-        self.schedule_batch_check(job, binding, authority, reports, sources, preexisting)
-            .await
+        Ok(Committed {
+            reports,
+            sources,
+            preexisting,
+            authority,
+        })
     }
 
     /// Writes one planned file through Workspace's stale-safe path: authority, the base's edit
@@ -566,11 +590,14 @@ impl Worker<'_> {
         &mut self,
         job: &mut Job,
         binding: &BindingRef,
-        authority: AuthorityStamp,
-        reports: Vec<FileReport>,
-        sources: Vec<SourceObservation>,
-        mut preexisting: BTreeMap<String, BTreeMap<String, u32>>,
+        committed: Committed,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let Committed {
+            reports,
+            sources,
+            mut preexisting,
+            authority,
+        } = committed;
         let worktree = authority.worktree().worktree_path().to_path_buf();
         let deadline = job
             .deadline
@@ -673,4 +700,266 @@ impl Worker<'_> {
         self.shared.add_edit_sources(&job.reference, sources);
         Ok((reply, Some(check.authority), first))
     }
+
+    /// Answers a rename whose `operation_id` already has a receipt without asking the language
+    /// server: a different request is a conflicting duplicate, and a settled rename answers every
+    /// file as written earlier. Returns `None` when there is no receipt or the rename is only
+    /// partly written, so the caller recomputes the edit and resumes through
+    /// [`Self::commit_rename`].
+    pub(super) async fn settled_rename(
+        &mut self,
+        job: &mut Job,
+        binding: &BindingRef,
+        operation_id: &str,
+    ) -> Result<Option<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>)>, FailureCode>
+    {
+        let receipt = self.rename_receipt(job, operation_id).await?;
+        let digest = batch::rename_request_digest(&job.parameters);
+        match receipt {
+            Some(existing) if existing.request_digest != digest => {
+                let authority = self.authority(binding).await.ok();
+                Ok(Some((conflicting_duplicate(operation_id), authority, None)))
+            }
+            Some(existing) if existing.settled => {
+                let files = rename_files(&existing);
+                let planned = existing.files.iter().map(|_| None).collect();
+                let committed = self
+                    .commit_files(job, binding, operation_id, &files, &existing, planned)
+                    .await?;
+                Ok(Some(self.partial_rename(job, committed)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Writes one rename's files through the multi-file commit and answers it.
+    ///
+    /// `files` holds every file of the language server's edit with the observation its
+    /// candidate was built from, in commit order (the caller puts the symbol's own file last, so
+    /// a rename stopped midway still resolves its symbol on the retry); `note` is the rename's
+    /// summary line. A new rename records its receipt first; a partly written one resumes from
+    /// it, writing only files whose bytes still equal their recorded base and whose recomputed
+    /// candidate equals the recorded one. When every file ends written and at least one was
+    /// written now, the reply is the rename's usual `edit: renamed` reply (diagnostics of the
+    /// last file, `source_ref` an edit base for every written file); otherwise it is the
+    /// multi-file reply naming each file's state. A rename never waits for the project check.
+    pub(super) async fn commit_rename(
+        &mut self,
+        job: &mut Job,
+        binding: &BindingRef,
+        operation_id: &str,
+        files: Vec<RenameFile>,
+        note: String,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        let digest = batch::rename_request_digest(&job.parameters);
+        let receipt = match self.rename_receipt(job, operation_id).await? {
+            Some(existing) if existing.request_digest != digest => {
+                let authority = self.authority(binding).await.ok();
+                return Ok((conflicting_duplicate(operation_id), authority, None));
+            }
+            Some(existing) => existing,
+            None => {
+                let rows: Vec<BatchFile> = files
+                    .iter()
+                    .map(|file| BatchFile {
+                        path: file.path.clone(),
+                        base: file.base.bytes().map(|bytes| *bytes.digest()),
+                        candidate: *blake3::hash(file.candidate.as_bytes()).as_bytes(),
+                        written: false,
+                    })
+                    .collect();
+                match self
+                    .edits
+                    .batches()
+                    .prepare(operation_id, digest, &rows)
+                    .await
+                {
+                    Ok(BatchAdmission::Prepared) => BatchReceipt {
+                        request_digest: digest,
+                        settled: false,
+                        files: rows,
+                    },
+                    Ok(BatchAdmission::Existing(existing)) if existing.request_digest == digest => {
+                        existing
+                    }
+                    Ok(BatchAdmission::Existing(_)) => {
+                        let authority = self.authority(binding).await.ok();
+                        return Ok((conflicting_duplicate(operation_id), authority, None));
+                    }
+                    Err(_) => {
+                        job.failure_detail = Some("edit:batch_receipt_unavailable".to_owned());
+                        return Err(FailureCode::Internal);
+                    }
+                }
+            }
+        };
+        let mut by_path: BTreeMap<String, RenameFile> = files
+            .into_iter()
+            .map(|file| (file.path.clone(), file))
+            .collect();
+        let planned = receipt
+            .files
+            .iter()
+            .map(|row| {
+                by_path.remove(&row.path).map(|file| Planned {
+                    path: file.path,
+                    base: file.base,
+                    candidate: file.candidate,
+                    note: None,
+                })
+            })
+            .collect();
+        let edit_files = rename_files(&receipt);
+        let committed = self
+            .commit_files(job, binding, operation_id, &edit_files, &receipt, planned)
+            .await?;
+        let complete = committed
+            .reports
+            .iter()
+            .all(|report| report.state.written())
+            && committed
+                .reports
+                .iter()
+                .any(|report| report.state != FileState::WrittenEarlier);
+        if !complete {
+            return Ok(self.partial_rename(job, committed));
+        }
+        let Committed {
+            reports,
+            mut sources,
+            authority,
+            ..
+        } = committed;
+        let last = reports.last().ok_or(FailureCode::Internal)?;
+        let outcome = match last.state {
+            FileState::Created => ChangesEditOutcome::Created,
+            FileState::Unchanged => ChangesEditOutcome::Unchanged,
+            _ => ChangesEditOutcome::Replaced,
+        };
+        let diagnostics = self.file_diagnostics(job, binding, &last.path).await;
+        let result = EditResult {
+            operation_id: operation_id.to_owned(),
+            path: last.path.clone(),
+            outcome,
+            source_ref: Some(job.reference.clone()),
+        };
+        let first = (!sources.is_empty()).then(|| sources.remove(0));
+        self.shared.add_edit_sources(&job.reference, sources);
+        Ok((
+            PeerReply::Edit {
+                result,
+                diagnostics,
+                note: Some(note),
+                operation: Some("renamed".to_owned()),
+            },
+            Some(authority),
+            first,
+        ))
+    }
+
+    /// The multi-file reply of a rename that is not complete (or was written entirely by an
+    /// earlier call): every file's state, unknown diagnostics for the written ones, and a
+    /// `source_ref` covering the files that hold their candidate.
+    fn partial_rename(
+        &self,
+        job: &Job,
+        committed: Committed,
+    ) -> (PeerReply, Option<AuthorityStamp>, Option<SourceObservation>) {
+        let Committed {
+            reports,
+            mut sources,
+            authority,
+            ..
+        } = committed;
+        let diagnostics = reports
+            .iter()
+            .filter(|report| report.state.written())
+            .map(|report| (report.path.clone(), EditDiagnostics::Unknown {}))
+            .collect::<Vec<_>>();
+        let reply = batch_reply(&job.reference, &reports, &diagnostics);
+        let first = (!sources.is_empty()).then(|| sources.remove(0));
+        self.shared.add_edit_sources(&job.reference, sources);
+        (reply, Some(authority), first)
+    }
+
+    /// Loads the receipt of a rename's operation id after making sure its schema exists.
+    async fn rename_receipt(
+        &mut self,
+        job: &mut Job,
+        operation_id: &str,
+    ) -> Result<Option<BatchReceipt>, FailureCode> {
+        let receipts = self.edits.batches();
+        if !matches!(
+            receipts.install_schema().await,
+            Ok(crate::app::store::MigrationAdmission::Applied { .. }
+                | crate::app::store::MigrationAdmission::AlreadyApplied { .. })
+        ) {
+            job.failure_detail = Some("edit:batch_receipts_unavailable".to_owned());
+            return Err(FailureCode::Internal);
+        }
+        receipts.load(operation_id).await.map_err(|_| {
+            job.failure_detail = Some("edit:batch_receipt_unreadable".to_owned());
+            FailureCode::Internal
+        })
+    }
+
+    /// The language server's diagnostics for one just-written file, as a one-file edit reports
+    /// them without waiting for the project check: `unknown` when no exact provider answer
+    /// arrives before the edit's diagnostic deadline.
+    async fn file_diagnostics(
+        &mut self,
+        job: &mut Job,
+        binding: &BindingRef,
+        path: &str,
+    ) -> EditDiagnostics {
+        let Ok((observed, bytes)) = self.observe(binding, path.into()).await else {
+            return EditDiagnostics::Unknown {};
+        };
+        let Some(deadline) = edit_diagnostic_deadline(job.deadline) else {
+            return EditDiagnostics::Unknown {};
+        };
+        let original = std::mem::replace(&mut job.deadline, deadline);
+        let result = self
+            .semantic_context(
+                job,
+                &observed,
+                &bytes,
+                crate::intelligence::context::ContextQuery::File,
+            )
+            .await;
+        job.deadline = original;
+        match result {
+            Ok(Some(provider)) => EditDiagnostics::from_snapshot(
+                path.trim_start_matches("./"),
+                &provider.context,
+                &provider.diagnostics,
+            ),
+            _ => EditDiagnostics::Unknown {},
+        }
+    }
+}
+
+/// One file of a rename's language-server edit, ready to commit.
+pub(super) struct RenameFile {
+    /// Worktree-relative path.
+    pub(super) path: String,
+    /// The observation the candidate was built from; the write is checked against it.
+    pub(super) base: SourceObservation,
+    /// The file's bytes after the rename.
+    pub(super) candidate: String,
+}
+
+/// The commit's per-file requests of a rename receipt: whole-content replacements whose content
+/// is never recomputed from the request (a rename's candidates come from the language server),
+/// so a file without a fresh plan cannot be written and stops the commit honestly.
+fn rename_files(receipt: &BatchReceipt) -> Vec<EditFile> {
+    receipt
+        .files
+        .iter()
+        .map(|row| EditFile {
+            path: row.path.clone(),
+            source_ref: None,
+            body: EditBody::Replace(String::new()),
+        })
+        .collect()
 }

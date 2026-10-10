@@ -3419,7 +3419,13 @@ impl Worker<'_> {
     }
 
     /// `ide.edit {op:"rename", symbol, new_name}`: the language server computes the project-wide
-    /// edit; every touched file is written through the stale-safe edit path.
+    /// edit, every touched file's candidate is built before anything is written, and the files
+    /// are written through the multi-file commit (batch-api-v1 §7) with the symbol's own file
+    /// last. A file of the edit outside the worktree refuses the whole rename (`edit_refused`,
+    /// nothing written). A complete rename answers `edit: renamed` with a note listing every file
+    /// and its site count; one that stops midway answers the multi-file reply naming each file's
+    /// state, and a retry with the same `operation_id` resumes it. A settled or conflicting
+    /// `operation_id` answers from its receipt before the language server is asked.
     async fn rename_symbol(
         &mut self,
         job: &mut Job,
@@ -3443,6 +3449,11 @@ impl Worker<'_> {
             .file()
             .ok_or(FailureCode::UnknownSymbol)?
             .to_path_buf();
+        // A settled rename (or a different one under this id) answers from its receipt: its
+        // symbol may no longer exist under the old name.
+        if let Some(answer) = self.settled_rename(job, &binding, &operation_id).await? {
+            return Ok(answer);
+        }
         let (observed, bytes) = self.observe(&binding, file.clone()).await?;
         // Rename is server-only: while the server loads, park and retry before the address is
         // resolved, so a lexical outline never answers for it (not even `unknown_symbol`).
@@ -3492,56 +3503,47 @@ impl Worker<'_> {
             job.failure_detail = Some(format!("edit:rename_unsupported_edits:{}", found.name));
             return Err(FailureCode::ProviderUnavailable);
         }
+        // Every file of the server's edit is built before anything is written; a file outside
+        // the worktree refuses the whole rename instead of being skipped.
         let mut summary: Vec<(String, usize)> = Vec::new();
-        let mut last: Option<(PeerReply, Option<SourceObservation>)> = None;
-        for (index, file_edits) in grouped.files.iter().enumerate() {
-            let Ok(absolute) = file_edits.uri.to_file_path() else {
+        let mut files: Vec<batch_edit::RenameFile> = Vec::new();
+        let mut outside: Vec<String> = Vec::new();
+        for file_edits in &grouped.files {
+            let relative = file_edits.uri.to_file_path().ok().and_then(|absolute| {
+                absolute
+                    .strip_prefix(&worktree_root)
+                    .ok()
+                    .map(Path::to_path_buf)
+            });
+            let Some(relative) = relative else {
+                outside.push(file_edits.uri.to_string());
                 continue;
             };
-            let Ok(relative) = absolute.strip_prefix(&worktree_root) else {
-                continue;
-            };
-            let relative = relative.to_path_buf();
             let (observed, bytes) = self.observe(&binding, relative.clone()).await?;
             let source = observed_text(&observed, &bytes)?;
             let candidate = lang::edits::apply_text_edits(source, &file_edits.edits, &encoding)
                 .map_err(|_| FailureCode::Internal)?;
-            let request = EditRequest::new(
-                format!("{operation_id}/{index}"),
-                relative.display().to_string(),
-                &job.reference,
-                &candidate,
-            )
-            .map_err(|_| FailureCode::Internal)?;
-            let prepared = match self.edits.prepare(request.clone()).await {
-                Ok(PrepareAdmission::Prepared(prepared)) => prepared,
-                _ => return Err(FailureCode::Internal),
-            };
-            // Never await the project check per file: a parked rename would resume as one
-            // file's plain edit reply with the remaining files unwritten.
-            let (outcome, _, source) = self
-                .edit_with_source(job, request, prepared, observed, false)
-                .await?;
-            if let PeerReply::Edit { .. } = &outcome {
-                summary.push((relative.display().to_string(), file_edits.edits.len()));
-            }
-            last = Some((outcome, source));
+            let path = relative.display().to_string();
+            summary.push((path.clone(), file_edits.edits.len()));
+            files.push(batch_edit::RenameFile {
+                path,
+                base: observed,
+                candidate,
+            });
         }
-        // One rename answers once, as an edit reply the Edit tool accepts: the operation word
-        // names the rename, the note lists every touched file with its site count, bounded like
-        // every other list, and the diagnostics are the last written file's.
-        let Some((
-            PeerReply::Edit {
-                result,
-                diagnostics,
-                ..
-            },
-            source,
-        )) = last
-        else {
+        if !outside.is_empty() {
+            job.failure_detail = Some(format!(
+                "edit:refused: the rename also changes {} files outside the worktree ({}); \
+                 nothing written",
+                outside.len(),
+                crate::assistance::reply::bounded_utf8_prefix(&outside.join(", "), 256)
+            ));
+            return Err(FailureCode::EditRefused);
+        }
+        if files.is_empty() {
             job.failure_detail = Some("edit:rename_no_edits".to_owned());
             return Err(FailureCode::ProviderUnavailable);
-        };
+        }
         let sites: usize = summary.iter().map(|(_, count)| count).sum();
         let mut note = format!(
             "renamed {} → {new_name}; {sites} sites in {} files",
@@ -3563,17 +3565,12 @@ impl Worker<'_> {
                 note.push_str(&format!("; +{hidden} more"));
             }
         }
-        let authority = self.authority(&binding).await?;
-        Ok((
-            PeerReply::Edit {
-                result,
-                diagnostics,
-                note: Some(note),
-                operation: Some("renamed".to_owned()),
-            },
-            Some(authority),
-            source,
-        ))
+        // The symbol's own file goes last: if the commit stops midway, the retry still finds the
+        // symbol under its old name and resumes the rest.
+        let definition = file.display().to_string();
+        files.sort_by_key(|candidate| candidate.path == definition);
+        self.commit_rename(job, &binding, &operation_id, files, note)
+            .await
     }
 }
 

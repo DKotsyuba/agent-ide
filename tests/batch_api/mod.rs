@@ -635,3 +635,99 @@ async fn multi_file_edit_runs_one_project_check_and_reports_each_file() {
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
 }
+
+/// A rename across two files goes through the multi-file commit with the symbol's own file last:
+/// a native write that lands before that file's write (test seam) stops the rename with the other
+/// file written and the reply says so per file; after the file is restored, the same
+/// `operation_id` finishes the rename with the usual `edit: renamed` reply; once settled the same
+/// request answers from the receipt and a different rename under that id conflicts.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn rename_stopped_midway_reports_each_file_and_the_same_operation_id_finishes_it() {
+    let fixture = symbol_test_fixture();
+    let lib = "pub mod other;\npub fn helper() -> i32 {\n    1\n}\npub fn local() -> i32 {\n    helper()\n}\n";
+    std::fs::write(fixture.root.join("src/lib.rs"), lib).unwrap();
+    std::fs::write(
+        fixture.root.join("src/other.rs"),
+        "pub fn uses() -> i32 {\n    crate::helper()\n}\n",
+    )
+    .unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "src/other.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "rename fixture"]);
+    let (fault, _) = fault_flag(&fixture, "batch_edit_before_write_2", true);
+    let env = [("AGENT_IDE_TEST_FAULT", fault.as_str())];
+    let mut daemon = fixture
+        .spawn_configured_daemon_with_env(None, false, Duration::from_secs(30), None, &env)
+        .await;
+    let mut actor = ProductActor::new(&fixture, "rename-resume").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"rename-resume"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let warmup = actor
+        .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+        .await;
+    assert_eq!(actor.settle(&fixture, warmup).await["kind"], "outline");
+    let rename = json!({"operation_id":"rename-op","op":"rename","symbol":"src/lib.rs#helper","new_name":"assist"});
+
+    let (reply, text) = settled_edit(&mut actor, &fixture, rename.clone()).await;
+    assert_eq!(reply["kind"], "edit_batch", "{reply} {text}");
+    assert!(
+        text.starts_with(
+            "edit: partial — written 1 of 2; not written: 2 src/lib.rs (changed after validation)"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("  1 src/other.rs: replaced"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("src/other.rs")).unwrap(),
+        "pub fn uses() -> i32 {\n    crate::assist()\n}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap(),
+        format!("{lib}native\n"),
+        "the native bytes are never overwritten"
+    );
+
+    std::fs::write(fixture.root.join("src/lib.rs"), lib).unwrap();
+    let finished = actor.call(&fixture, "ide.edit", rename.clone()).await;
+    let finished = actor.settle(&fixture, finished).await;
+    assert_eq!(finished["state"], "edit", "{finished}");
+    assert_eq!(finished["operation"], "renamed", "{finished}");
+    assert!(
+        finished["note"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("renamed helper → assist; "),
+        "{finished}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap(),
+        lib.replace("helper", "assist")
+    );
+
+    let (again, text) = settled_edit(&mut actor, &fixture, rename.clone()).await;
+    assert_eq!(again["kind"], "edit_batch", "{again} {text}");
+    assert!(text.starts_with("edit: applied 2 of 2 files"), "{text}");
+    assert!(
+        text.contains("written earlier by this operation_id"),
+        "{text}"
+    );
+    let mut other = rename.clone();
+    other["new_name"] = json!("different");
+    let (_, text) = settled_edit(&mut actor, &fixture, other).await;
+    assert!(text.starts_with("edit: conflicting_duplicate"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap(),
+        lib.replace("helper", "assist")
+    );
+
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
