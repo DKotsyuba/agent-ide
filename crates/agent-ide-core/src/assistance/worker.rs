@@ -36,6 +36,8 @@ use crate::{
 };
 #[path = "links.rs"]
 mod links;
+#[path = "navigation.rs"]
+mod navigation;
 #[path = "providers.rs"]
 mod providers;
 #[path = "snapshots.rs"]

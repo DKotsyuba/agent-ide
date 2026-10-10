@@ -5,6 +5,7 @@
 //! renders the compact text the contract specifies. Results are retained with the source
 //! observation so a later `ide.edit` may name them as `source_ref`.
 
+use super::navigation::{classify_constructions, collapse_named, constructs};
 use super::*;
 use crate::intelligence::server::ProviderJob as _;
 use crate::lang::{
@@ -47,7 +48,7 @@ impl Worker<'_> {
                 .ok_or_else(|| missing_symbol(job, lexical))?
         } else {
             let name = symbol.name().ok_or(FailureCode::UnknownSymbol)?;
-            match outline.named(name).as_slice() {
+            match collapse_named(outline.named(name)).as_slice() {
                 [found] => (*found).clone(),
                 [] => return Err(missing_symbol(job, lexical)),
                 _ => return Err(FailureCode::UnknownSymbol),
@@ -813,7 +814,9 @@ impl Worker<'_> {
             Some(_) => outline.find(&symbol).cloned(),
             None => {
                 let name = symbol.name().unwrap_or_default();
-                let candidates = outline.named(name);
+                // A declaration and its impl blocks share one address: one definition, which
+                // resolves here instead of an ambiguity naming a single symbol.
+                let candidates = collapse_named(outline.named(name));
                 match candidates.len() {
                     1 => Some(candidates[0].clone()),
                     0 => None,
@@ -823,7 +826,6 @@ impl Worker<'_> {
                             .map(|candidate| candidate.path.to_string())
                             .collect::<Vec<_>>();
                         candidates.sort();
-                        candidates.dedup();
                         return self.ambiguous(job, &binding, &requested, candidates).await;
                     }
                 }
@@ -958,6 +960,14 @@ impl Worker<'_> {
                         references,
                     )
                     .await;
+                // Usages of a struct, enum or class say which rows build a value of it.
+                if constructs(found.kind) {
+                    classify_constructions(
+                        &mut card.usages,
+                        &found.name,
+                        found.kind == lang::SymbolKind::Enum,
+                    );
+                }
                 // Some servers answer references with an empty list when nothing names the symbol
                 // explicitly (a constructor is only ever called through its class); that zero
                 // must be reported, not silently omitted.
@@ -1148,7 +1158,7 @@ impl Worker<'_> {
         let found = match symbol.file() {
             Some(_) => outline.find(&symbol).cloned(),
             None => {
-                let candidates = outline.named(symbol.name().unwrap_or_default());
+                let candidates = collapse_named(outline.named(symbol.name().unwrap_or_default()));
                 match candidates.len() {
                     1 => Some(candidates[0].clone()),
                     0 => None,

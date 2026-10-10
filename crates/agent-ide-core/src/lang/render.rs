@@ -20,6 +20,9 @@ pub const MAX_DOC_CHARS: usize = 600;
 pub const MAX_GRAPH_NODES: usize = 60;
 /// Maximum unique edges retained by one call graph.
 pub const MAX_GRAPH_EDGES: usize = 120;
+/// Usage-row tag of a site that builds a value of the struct, enum or class (a lexical rule; the
+/// `~` makes the card print its heuristic-match legend). The card's usages line counts them.
+pub const CONSTRUCTION_TAG: &str = "construction ~";
 
 /// Direction in which one call-graph edge is rendered from its parent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -899,8 +902,17 @@ pub fn symbol_card_text(card: &SymbolCard) -> String {
             .map(|usage| usage.file.as_str())
             .collect::<std::collections::BTreeSet<_>>()
             .len();
+        let constructions = match card
+            .usages
+            .iter()
+            .filter(|usage| usage.tag.as_deref() == Some(CONSTRUCTION_TAG))
+            .count()
+        {
+            0 => String::new(),
+            count => format!("; {count} constructions"),
+        };
         out.push_str(&format!(
-            "usages: {} {counted} {} files (src {}, tests {}{dropped})\n",
+            "usages: {} {counted} {} files (src {}, tests {}{dropped}{constructions})\n",
             card.usages.len(),
             files,
             src.len(),
@@ -1233,6 +1245,39 @@ mod tests {
         );
         card.usages.truncate(MAX_USAGE_LINES);
         assert_eq!(hidden_usages_text(&card), None);
+    }
+
+    /// Construction rows are counted on the usages line and print their tag and the heuristic
+    /// legend; a card without them keeps the 0.10.8 line.
+    #[test]
+    fn symbol_card_counts_construction_sites() {
+        let usage = |line: u32, tag: Option<&str>| Usage {
+            file: "src/a.rs".into(),
+            line,
+            text: "let s = Store::new();".into(),
+            is_test: false,
+            tag: tag.map(str::to_owned),
+        };
+        let mut card = SymbolCard {
+            heading: "Store — struct, src/a.rs#Store (lines 1–3)".into(),
+            usages: vec![usage(7, Some(CONSTRUCTION_TAG)), usage(9, None)],
+            ..Default::default()
+        };
+        let text = symbol_card_text(&card);
+        assert!(
+            text.contains("usages: 2 in 1 files (src 2, tests 0; 1 constructions)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("src/a.rs:7  construction ~ let s = Store::new();"),
+            "{text}"
+        );
+        assert!(text.contains("(~ = heuristic match, not proven)"), "{text}");
+        card.usages[0].tag = None;
+        assert!(
+            symbol_card_text(&card).contains("usages: 2 in 1 files (src 2, tests 0)\n"),
+            "{text}"
+        );
     }
 
     /// A callers note replaces an empty callers list, and an explicitly answered zero prints

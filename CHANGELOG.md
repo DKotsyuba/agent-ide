@@ -2,7 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- `ide.symbol` usages of a struct, enum or class tag the rows that build a value of it (`Name {`, `Name(`, `Name::new(`, `new Name(`, an enum variant) as `construction ~`, list them first and count them on the usages line (`…; 9 constructions`). The rule is lexical and marked as a heuristic.
+
 ### Fixed
+
+- A bare name whose matches are one declaration and its impl blocks resolves in one `ide.symbol` or `ide.graph` call instead of `ambiguous_symbol: … matches 1 symbols`.
 
 - `ide.graph` no longer renders a failed call-hierarchy request as a graph with no calls: a root whose requests failed answers `graph: callers of <root> unavailable (<cause>)`, a failed direction beside an answered one prints `callers: unavailable (<cause>)`, and a deeper node carries `(callers unavailable: <cause>)` on its row. 0.10.8 answered `1 nodes, 0 edges`.
 

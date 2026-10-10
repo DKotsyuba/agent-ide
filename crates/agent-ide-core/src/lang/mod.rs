@@ -1047,7 +1047,9 @@ pub(crate) mod testing {
         /// An outline with no symbols, except for epsilon: it keeps each top-level server symbol
         /// the way epsilon's source outline reads a `sym <name>` … `end` block (kind `Other`,
         /// signature `sym <name>`, the lines of its range), as the opt-in contract of
-        /// [`LanguageSupport::outline_while_loading`] requires.
+        /// [`LanguageSupport::outline_while_loading`] requires. A server `STRUCT` symbol becomes
+        /// kind `Struct` and an `OBJECT` symbol kind `Impl` (the scripted `structImpl` session's
+        /// declaration and its impl block, which share one address).
         fn normalize(
             &self,
             file: &Path,
@@ -1065,7 +1067,11 @@ pub(crate) mod testing {
                                 Some(file.to_path_buf()),
                                 vec![symbol.name.clone()],
                             ),
-                            kind: SymbolKind::Other,
+                            kind: match symbol.kind {
+                                lsp::SymbolKind::STRUCT => SymbolKind::Struct,
+                                lsp::SymbolKind::OBJECT => SymbolKind::Impl,
+                                _ => SymbolKind::Other,
+                            },
                             signature: format!("sym {}", symbol.name),
                             name: symbol.name,
                             range,
@@ -1477,7 +1483,9 @@ pub(crate) mod testing {
     /// document symbols (one function, `a`), an empty reference list and an empty workspace-symbol
     /// list, and fails every call-hierarchy request with an error reply, so tests can drive the
     /// worker's real exchange-failure paths. `failing` additionally names requests
-    /// (`"documentSymbol"`, `"references"`, `"workspaceSymbol"`) that fail with an error reply.
+    /// (`"documentSymbol"`, `"references"`, `"workspaceSymbol"`) that fail with an error reply,
+    /// and `"structImpl"` makes document symbols answer a struct `a` and its impl block `a`
+    /// instead of the function (see [`fixture_struct_impl_symbols`]).
     ///
     /// The latest call for a binding wins, but only for the next session opened for it: a session
     /// that already exists keeps its script until it is released.
@@ -1527,6 +1535,19 @@ pub(crate) mod testing {
         }]
     }
 
+    /// The document symbols of a scripted `structImpl` session: a struct `a` over both lines of
+    /// `sym a\nend\n` and an impl block `a` over the same lines, which normalize to one address
+    /// with kinds `Struct` and `Impl`, the shape rust-analyzer gives a type and its `impl`.
+    #[allow(deprecated)]
+    pub(crate) fn fixture_struct_impl_symbols() -> Vec<async_lsp::lsp_types::DocumentSymbol> {
+        use async_lsp::lsp_types as lsp;
+        let mut declaration = fixture_document_symbols().remove(0);
+        declaration.kind = lsp::SymbolKind::STRUCT;
+        let mut implementation = declaration.clone();
+        implementation.kind = lsp::SymbolKind::OBJECT;
+        vec![declaration, implementation]
+    }
+
     /// Opens a live session against a scripted in-process language server (see
     /// [`fixture_serve_session`]).
     ///
@@ -1571,7 +1592,11 @@ pub(crate) mod testing {
                     ));
                 }
                 Ok(Some(lsp::DocumentSymbolResponse::Nested(
-                    fixture_document_symbols(),
+                    if failing.contains(&"structImpl") {
+                        fixture_struct_impl_symbols()
+                    } else {
+                        fixture_document_symbols()
+                    },
                 )))
             });
             router.request::<request::References, _>(move |_, _| async move {
