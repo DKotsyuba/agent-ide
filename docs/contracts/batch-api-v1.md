@@ -1,8 +1,19 @@
 # Batch API v1 contract
 
-Revision: batch-api-v1 r1 (proposed). Provider: the Assistance facade (`ide.read`, `ide.outline`, `ide.symbol`, `ide.graph`, `ide.test`, `ide.edit`). Consumers: coding agents; the teaching surface (tool descriptions, server instructions, skill, `ide.start` card), which must show exactly these shapes; the session outbox, which carries pending batch results and the multi-file edit's check. Vocabulary: [common](common.md); tool basics: [tools v0.4](tools-v0.4.md); edit receipts: [Changes v0.2](changes-v0.2.md).
+Revision: batch-api-v1 r1 (proposed); tracked boundary id `M027-M024-BATCH-FORMS`, revision 1. Provider: the Assistance facade (`ide.read`, `ide.outline`, `ide.symbol`, `ide.graph`, `ide.test`, `ide.edit`). Consumers: coding agents; the teaching surface (tool descriptions, server instructions, skill, `ide.start` card), which must show exactly these shapes; the session outbox, which carries pending batch results and the multi-file edit's check. Vocabulary: [common](common.md); tool basics: [tools v0.4](tools-v0.4.md); edit receipts: [Changes v0.2](changes-v0.2.md).
 
 Purpose: an agent names every file, symbol or range it needs in ONE call and gets everything back, and applies one logical change across several files in ONE `ide.edit` with ONE project check.
+
+Forms and caps at a glance (the canonical example of each is under its section):
+
+| Tool | Batch key | Entry forms | Caps | Other fields |
+|---|---|---|---|---|
+| `ide.read` | `items` | `{symbol}`, `{path}`, `{path, lines}` | 1–32 items, ≤16 files | `force` |
+| `ide.outline` | `paths` or `glob` | path strings; one pattern | ≤24 files | `kinds` |
+| `ide.symbol` | `symbols` | symbol strings | 1–8 | `usages`, `callers`, `callees`, `history` |
+| `ide.graph` | `symbols` | symbol strings | 1–8 roots | `direction`, `depth`, `tests` |
+| `ide.test` | `targets` | `{symbol}`, `{path}`, `{pattern}` | 1–8 | `budget_s` |
+| `ide.edit` | `files` | `{path, changes}`, `{path, create: true, content}`, `{path, content}`, each with an optional `source_ref` | 1–16 files, ≤32 changes per file, ≤128 changes, ≤128 KiB of `content` + `new` | `operation_id` (required), `source_ref` |
 
 ## 1. Common rules
 
@@ -10,6 +21,8 @@ Purpose: an agent names every file, symbol or range it needs in ONE call and get
 - A batch form uses a plural key. Sending a plural key together with its singular form (or two plural forms of one tool) is `invalid_parameters` naming the conflicting fields; nothing runs.
 - A malformed batch (wrong shape, over a cap, duplicate edit path) is refused as a whole. A well-formed item that fails (unknown symbol, missing file, range past the end) fails only itself, in place, and the rest are answered.
 - Results come back in request order. One batch call is one job with one `detail_ref`.
+- The JSON under each form heading below is that form's canonical valid example: it validates against the generated `schemas/tools.json`. Placeholders `…-58` stand for a real `source_ref`/`detail_ref` string and `…` inside `content` for real code.
+- New optional fields: only `force` (boolean, `ide.read {items}` only). There is no `budget` and no `detail` field.
 - The reply opens with ONE summary line (counts and per-item states), then whole blocks in request order. A block is never cut. Blocks that do not fit the reply envelope (64 KiB including the structured copy, about 30 KiB of text) are named in a footer with the exact call that fetches them. A single block larger than the whole envelope is delivered alone through ordinary byte paging, as today. There is no `budget` parameter.
 - Argument limit of the batch forms of `ide.read`, `ide.outline`, `ide.symbol` and `ide.graph`: 16 KiB of serialized JSON (single forms stay at 4 KiB). `ide.test` stays at 24 KiB and `ide.edit` at 136 KiB. Each entry keeps its existing bound (paths and symbol addresses at most 1024 bytes).
 - A batch that does not finish within the inline window (8 s) answers `pending` with its `detail_ref`; its complete result is then delivered once through the session outbox as a result fact. Source-bearing results are not pushed as hook text; they ride the next `ide.*` reply or `ide.inspect {}`. No reply asks the agent to poll.
@@ -43,31 +56,33 @@ source_ref: …-58 (valid for src/a.rs, src/b.rs, docs/api.md)
 - Item failures in place: `no such symbol: <address> — check ide.outline {"path":"<file>"}`, `no such file: <path>`, `not a readable text file: <path>`, `no such range: lines <a-b> is past the end of <path> (<n> lines)`.
 - Footer for cut items: `not included (over the reply budget): <items> — call ide.read {"items":[…]}` with the cut items exactly as requested.
 
-Unchanged answer. The IDE remembers, per session, the content digest of every block it delivered in an `items` read. When the same item is requested again and its bytes are identical, the block is replaced by one line:
+Unchanged answer. The IDE remembers, per session, the content digest of every block it delivered in an `items` read. When the same item is requested again and its bytes are identical, the block is replaced by exactly one line:
 
 ```text
-unchanged since your read …-41: src/c.rs#Parser/next (34 lines); add "force":true for the text
+unchanged since your read <ref>: <item> (<n> lines); add "force":true for the text
 ```
 
-- The reply's `source_ref` still covers that file, so an edit needs no re-read.
-- Any byte change, `force:true`, `ide.stop`, and an observed context compaction of the session reset the memory for that session. On a host where compaction is not observable, the unchanged answer is never given.
-- Only the `items` form answers unchanged; single-target reads are unchanged by this contract.
+- `<ref>` is the `detail_ref` of the earlier read that delivered the identical block. `<item>` is the item as requested: the symbol address for `{symbol}`, the path for `{path}`, `<path> lines <a-b>` for `{path, lines}`. `<n>` is the block's line count. Example: `unchanged since your read …-41: src/c.rs#Parser/next (34 lines); add "force":true for the text`.
+- It counts as `unchanged` in the summary line. The reply's `source_ref` still covers that file, so an edit needs no re-read.
+- `force:true` always returns the text. Any byte change, `ide.stop`, and an observed context compaction of the session reset the memory for that session.
+- It is enabled only on a host whose compaction the session outbox reports (Claude Code: `PreCompact` and `SessionStart` with `source: "compact"`). Everywhere else the unchanged answer is never given and the text is always returned.
+- Only the `items` form answers unchanged. Single-target reads and the legacy `symbols` / `path`+`ranges` forms never do.
 
 ## 3. `ide.outline {paths | glob}`
 
 ```json
-{"paths":["src/a.rs","src/b.rs"],"kinds":"function,struct"}
-{"glob":"crates/x/src/**/*.rs","kinds":"function"}
+{"paths":["src/a.rs","src/b.rs"],"kinds":"fn,struct"}
+{"glob":"crates/x/src/**/*.rs","kinds":"fn"}
 ```
 
-- `paths`: 1–24 files. `glob`: a worktree-relative pattern with `*` (within one path segment), `**` (any depth) and `?`; it never leaves the worktree or the allowed roots, follows no symlink out of them, skips the directories the name index skips (`target`, `node_modules`, `.git`, …) and matches regular files only. At most 24 files, sorted by path; more matches are reported as `+<n> more files; narrow the glob`.
+- `paths`: 1–24 files. `glob`: a worktree-relative pattern with `*` (within one path segment), `**` (any depth) and `?`; it never leaves the worktree or the allowed roots, follows no symlink out of them, skips the directories the name index skips (`.git`, `.hg`, `.venv`, `venv`, `node_modules`, `target`, `dist`) and matches regular files only. At most 24 files, sorted by path; more matches are reported as `+<n> more files; narrow the glob`.
 - `kinds` keeps its closed vocabulary and applies to every file.
 - Reply: `outline: <n> files — <k> outlined, <m> listed only` then one whole outline per file; a file that does not fit becomes `<path> (<lines> lines, <symbols> symbols) → ide.outline {"path":"<path>"}`.
 
 ## 4. `ide.symbol {symbols}`
 
 ```json
-{"symbols":["TranscriptQuery","src/a.rs#Store/transcript"],"usages":true,"callers":1}
+{"symbols":["src/domain/transcript.rs#TranscriptQuery","src/a.rs#Store/transcript"],"usages":true,"callers":1}
 ```
 
 - `symbols`: 1–8 entries. `usages`, `callers`, `callees` and `history` keep their meaning and apply to every entry.
@@ -181,7 +196,13 @@ The `rename` operation keeps its request and reply; it uses this commit, so a re
 - Validation of 16 files (formatter and syntax gate per file) can exceed the 8 s inline window (`worker.rs:68`) inside the 10 s method budget (`app.rs:47`); such an edit answers `pending` and its outcome is delivered as a fact.
 - Line drift: the 16 listed test failures are `MAX_LISTED_FAILURES` at `assistance/worker.rs:7509`. Every other cited line matches 004afb7, whose source is identical to `bbca32f`.
 
-## 10. Compatibility checks
+## 10. Ownership of the tool surface
+
+- This contract's provider edits only `tool_schemas()` property text and `validate_call` for the batch parameters above, plus the engines behind them. Tool-level descriptions (the tool doc comments), `SERVER_INSTRUCTIONS` and `SKILL.md` belong to the teaching surface's owner, finalised after this contract is agreed.
+- Property order in `schemas/tools.json` is alphabetical, because the schema is serialized from sorted JSON maps; it cannot list the plural key first. Batch-first teaching is carried by the descriptions, not by key order. Each new property's own description names its caps and states that it replaces the singular key.
+- `schemas/tools.json` is never hand-edited or hand-merged. Each branch regenerates it with `cargo xtask contract update` for its own gate, and integration regenerates it after every merge, followed by `cargo xtask contract check`.
+
+## 11. Compatibility checks
 
 - `schemas/tools.json` is regenerated (`cargo xtask contract update`) and `cargo xtask contract check` passes after every change to these shapes.
 - Every JSON example the teaching surface shows (descriptions, server instructions, skill, `ide.start` card) parses and validates against `schemas/tools.json`; a test enforces it.
