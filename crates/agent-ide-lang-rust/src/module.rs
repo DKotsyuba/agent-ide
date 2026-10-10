@@ -325,24 +325,340 @@ pub const RUSTFMT: EffectRecipe = EffectRecipe {
 };
 
 /// Every effect recipe the Rust module may name; the root registers them with the descriptor.
-pub const RECIPES: &[EffectRecipe] = &[CARGO_CHECK, XCODE_SELECT, RUSTFMT];
+pub const RECIPES: &[EffectRecipe] = &{
+    let mut all = [CARGO_CHECK; 3 + TEST_RECIPES.len()];
+    all[1] = XCODE_SELECT;
+    all[2] = RUSTFMT;
+    let mut index = 0;
+    while index < TEST_RECIPES.len() {
+        all[3 + index] = TEST_RECIPES[index];
+        index += 1;
+    }
+    all
+};
+
+/// `test` and the workspace selection of a `cargo test` run.
+const TEST: Arg = Arg::Literal("test");
+/// See [`TEST`].
+const WORKSPACE: Arg = Arg::Literal("--workspace");
+/// One package's manifest selection of a `cargo test` run.
+const MANIFEST: Arg = Arg::Literal("--manifest-path");
+/// The worktree-relative manifest, as the in-process selection names it.
+const MANIFEST_PATH: Arg = Arg::Param("manifest");
+/// The libtest separator.
+const RUNNER: Arg = Arg::Literal("--");
+/// Selection tokens after the separator (exact names or one module-path prefix).
+const FILTER: Arg = Arg::Each("filter");
+
+/// The `cargo test` runs: one recipe per argument shape [`crate::support`]'s `test_selection`
+/// builds (the workspace bare, with a prefix filter, exact names or a pattern; one integration
+/// test binary bare, with a filter or exact names; one package's `--test`, `--lib`, `--bins`,
+/// `--bin` or module-path filter). Each shape is two recipes: the home tool `cargo` and the
+/// pinned toolchain's (ids ending `_pinned`). [`test_effect`] takes the first shape an argument
+/// vector matches, so an exact shape comes before the filter shape its `--exact` would also fit,
+/// and the pattern shape, which any one word fits, after the binary shape.
+const TEST_SHAPES: [(&str, &str, &[Arg]); 12] = [
+    ("cargo_test", "cargo_test_pinned", &[TEST, WORKSPACE]),
+    (
+        "cargo_test_exact",
+        "cargo_test_exact_pinned",
+        &[TEST, WORKSPACE, RUNNER, Arg::Literal("--exact"), FILTER],
+    ),
+    (
+        "cargo_test_filter",
+        "cargo_test_filter_pinned",
+        &[TEST, WORKSPACE, RUNNER, FILTER],
+    ),
+    (
+        "cargo_test_binary",
+        "cargo_test_binary_pinned",
+        &[
+            TEST,
+            WORKSPACE,
+            Arg::Literal("--test"),
+            Arg::Param("target"),
+        ],
+    ),
+    (
+        "cargo_test_binary_exact",
+        "cargo_test_binary_exact_pinned",
+        &[
+            TEST,
+            WORKSPACE,
+            Arg::Literal("--test"),
+            Arg::Param("target"),
+            RUNNER,
+            Arg::Literal("--exact"),
+            FILTER,
+        ],
+    ),
+    (
+        "cargo_test_binary_filter",
+        "cargo_test_binary_filter_pinned",
+        &[
+            TEST,
+            WORKSPACE,
+            Arg::Literal("--test"),
+            Arg::Param("target"),
+            RUNNER,
+            FILTER,
+        ],
+    ),
+    (
+        "cargo_test_pattern",
+        "cargo_test_pattern_pinned",
+        &[TEST, WORKSPACE, Arg::Param("pattern")],
+    ),
+    (
+        "cargo_test_package_binary",
+        "cargo_test_package_binary_pinned",
+        &[
+            TEST,
+            MANIFEST,
+            MANIFEST_PATH,
+            Arg::Literal("--test"),
+            Arg::Param("target"),
+        ],
+    ),
+    (
+        "cargo_test_package_lib",
+        "cargo_test_package_lib_pinned",
+        &[TEST, MANIFEST, MANIFEST_PATH, Arg::Literal("--lib")],
+    ),
+    (
+        "cargo_test_package_bins",
+        "cargo_test_package_bins_pinned",
+        &[TEST, MANIFEST, MANIFEST_PATH, Arg::Literal("--bins")],
+    ),
+    (
+        "cargo_test_package_bin",
+        "cargo_test_package_bin_pinned",
+        &[
+            TEST,
+            MANIFEST,
+            MANIFEST_PATH,
+            Arg::Literal("--bin"),
+            Arg::Param("target"),
+        ],
+    ),
+    (
+        "cargo_test_package_filter",
+        "cargo_test_package_filter_pinned",
+        &[TEST, MANIFEST, MANIFEST_PATH, FILTER],
+    ),
+];
+
+/// The recipes of [`TEST_SHAPES`], each shape's home-tool recipe followed by its pinned one.
+const TEST_RECIPES: [EffectRecipe; 2 * TEST_SHAPES.len()] = {
+    let mut recipes = [CARGO_CHECK; 2 * TEST_SHAPES.len()];
+    let mut index = 0;
+    while index < TEST_SHAPES.len() {
+        let (id, pinned, args) = TEST_SHAPES[index];
+        recipes[2 * index] = test_run(id, "cargo", args);
+        recipes[2 * index + 1] = test_run(pinned, "toolchain_cargo", args);
+        index += 1;
+    }
+    recipes
+};
+
+/// The daemon variables a test run inherits in process that a module-planned run passes on
+/// when set (its environment is otherwise complete: the `PATH` of [`test_run`]).
+// ponytail: a fixed list; a variable outside it (e.g. CARGO_BUILD_JOBS) does not reach a
+// module-planned run, add it here and to MODULE_ENV when a project needs it.
+pub const TEST_ENV: [&str; 8] = [
+    "CARGO_HOME",
+    "CARGO_TARGET_DIR",
+    "DEVELOPER_DIR",
+    "HOME",
+    "RUSTFLAGS",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "TMPDIR",
+];
+
+/// An optional daemon value of `name` in a test run's environment.
+const fn passed(name: &'static str) -> EnvRule {
+    EnvRule::Param {
+        name,
+        param: name,
+        optional: true,
+    }
+}
+
+/// The complete environment of a [`test_run`].
+const TEST_RUN_ENV: &[EnvRule] = &[
+    EnvRule::SearchPath {
+        name: "PATH",
+        param: "bin",
+        fixed: &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"],
+    },
+    passed(TEST_ENV[0]),
+    passed(TEST_ENV[1]),
+    passed(TEST_ENV[2]),
+    passed(TEST_ENV[3]),
+    passed(TEST_ENV[4]),
+    passed(TEST_ENV[5]),
+    passed(TEST_ENV[6]),
+    passed(TEST_ENV[7]),
+];
+
+/// The paths of a [`test_run`]: the pinned cargo and the `PATH` directories before the system's.
+const TEST_RUN_PATHS: &[PathRule] = &[
+    PathRule {
+        param: "toolchain_cargo",
+        roles: &[PathRole::LauncherRoot, PathRole::HomeRelative],
+        existing_only: true,
+        read_root: false,
+    },
+    // Directories: `existing_only` admits files only, so the module names only existing ones.
+    PathRule {
+        param: "bin",
+        roles: &[PathRole::LauncherRoot, PathRole::HomeRelative],
+        existing_only: false,
+        read_root: false,
+    },
+];
+
+/// A `cargo test` recipe with `args`: `cargo` is the pinned toolchain's own (a path parameter
+/// under the toolchain root the root declares, or the user's home) or the home tool the core
+/// finds on its tool `PATH`, as in process. The core runs exactly the expanded specification
+/// as the `ide.test` job: `PATH` (the pinned toolchain's `bin` and the cargo home's
+/// `bin` first, then the system directories) and the set [`TEST_ENV`] variables.
+const fn test_run(id: &'static str, program: &'static str, args: &'static [Arg]) -> EffectRecipe {
+    EffectRecipe {
+        id,
+        program,
+        args,
+        env: TEST_RUN_ENV,
+        paths: TEST_RUN_PATHS,
+        executables: &[ExecutableSlot {
+            name: "cargo",
+            source: SlotSource::HomeTool("cargo"),
+        }],
+        stdin: Stdin::Null,
+        class: RunClass::Test,
+        timeout_ceiling_ms: 3_600_000,
+        capture_bytes: 64 << 20,
+        assets: &[],
+    }
+}
 
 /// The daemon variables a rustup-proxied formatter resolves its toolchain from.
 pub const FORMATTER_ENV: [&str; 3] = ["HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"];
 
 /// The daemon variables the Rust module receives (root composition data): the test toolchain,
-/// the developer-directory selection `xcode-select` honours and [`FORMATTER_ENV`].
-pub const MODULE_ENV: [&str; 5] = [
+/// [`FORMATTER_ENV`] and [`TEST_ENV`] (with the developer-directory selection `xcode-select`
+/// honours).
+pub const MODULE_ENV: [&str; 9] = [
     "AGENT_IDE_RUST_TOOLCHAIN_DIR",
+    "CARGO_HOME",
+    "CARGO_TARGET_DIR",
     "DEVELOPER_DIR",
     "HOME",
+    "RUSTFLAGS",
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
+    "TMPDIR",
 ];
 
-/// The recipe request of the in-process formatter's argument vector (`rustfmt --edition <e>`);
-/// `None` for any other shape, which the core then refuses.
+/// The recipe request of a `cargo test` argument vector the in-process selection builds: the
+/// first of [`TEST_RECIPES`] whose arguments it matches word for word (a literal equal, a
+/// parameter one token, a selection the remaining words), run by the pinned toolchain's cargo
+/// when [`crate::support`] pins one and the home tool otherwise; `None` for any other shape.
+fn test_effect(argv: &[String]) -> Option<EffectRequest> {
+    let (program, words) = argv.split_first()?;
+    if program != "cargo" {
+        return None;
+    }
+    let (&(mut id, pinned, _), mut params) = TEST_SHAPES
+        .iter()
+        .find_map(|shape| Some((shape, matched(shape.2, words)?)))?;
+    let mut bin = Vec::new();
+    match agent_ide_core::lang::LanguageSupport::test_toolchain(
+        &crate::support::RustSupport,
+        "cargo",
+    ) {
+        Some((cargo, directory)) => {
+            params.insert("toolchain_cargo".to_owned(), Param::Path(cargo));
+            bin.push(directory);
+            id = pinned;
+        }
+        None => {
+            params.insert("cargo".to_owned(), Param::Executable("cargo".to_owned()));
+        }
+    }
+    // The cargo home's `bin` (rustup's proxies) when it lies in the user's home the core admits
+    // it from.
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
+    if let (Some(cargo_home), Some(home)) = (cargo_home, agent_ide_core::userhome::user_home()) {
+        let cargo_bin = cargo_home.join("bin");
+        if cargo_bin.starts_with(&home) && cargo_bin.is_dir() {
+            bin.push(cargo_bin);
+        }
+    }
+    if !bin.is_empty() {
+        params.insert("bin".to_owned(), Param::Paths(bin));
+    }
+    for name in TEST_ENV {
+        if let Ok(value) = std::env::var(name) {
+            params.insert(name.to_owned(), Param::Token(value));
+        }
+    }
+    Some(EffectRequest {
+        recipe: id.to_owned(),
+        params,
+    })
+}
+
+/// The daemon's pinned test toolchain (`AGENT_IDE_RUST_TOOLCHAIN_DIR`), the root a
+/// module-planned test run's cargo and `bin` are admitted under (root composition data, the same
+/// for every worktree).
+pub fn toolchain_roots(_worktree: &Path) -> Vec<PathBuf> {
+    std::env::var_os("AGENT_IDE_RUST_TOOLCHAIN_DIR")
+        .map(PathBuf::from)
+        .into_iter()
+        .collect()
+}
+
+/// The parameters under which `args` expand to exactly `words`, or `None`: a literal must be
+/// the same word, a parameter takes one word and a selection ([`Arg::Each`], always last) the
+/// remaining words.
+fn matched(args: &[Arg], words: &[String]) -> Option<std::collections::BTreeMap<String, Param>> {
+    let mut params = std::collections::BTreeMap::new();
+    let mut rest = words;
+    for (index, arg) in args.iter().enumerate() {
+        match arg {
+            Arg::Literal(literal) => {
+                let (word, tail) = rest.split_first()?;
+                if word != literal {
+                    return None;
+                }
+                rest = tail;
+            }
+            Arg::Param(name) => {
+                let (word, tail) = rest.split_first()?;
+                params.insert((*name).to_owned(), Param::Token(word.clone()));
+                rest = tail;
+            }
+            Arg::Each(name) if index + 1 == args.len() && !rest.is_empty() => {
+                params.insert((*name).to_owned(), Param::Tokens(rest.to_vec()));
+                rest = &[];
+            }
+            _ => return None,
+        }
+    }
+    rest.is_empty().then_some(params)
+}
+
+/// The recipe request of an argument vector the in-process support builds: a `cargo test`
+/// selection ([`test_effect`]) or the formatter (`rustfmt --edition <e>`); `None` for any other
+/// shape, which the core then refuses.
 pub fn interactive_effect(argv: &[String]) -> Option<EffectRequest> {
+    if let Some(effect) = test_effect(argv) {
+        return Some(effect);
+    }
     let [program, flag, edition] = argv else {
         return None;
     };
@@ -797,6 +1113,10 @@ impl<S: ModuleServer> RustModule<S> {
             DescribeQuery::VerifyProvider { declaration } => reply(&verify_provider(declaration)),
             DescribeQuery::Checks { section } => reply(&describe_checks(section)),
             DescribeQuery::Presence { worktree } => reply(&RustChecks.is_present(&worktree)),
+            // Rust interprets no core-read project inputs; it reads its manifests in process.
+            DescribeQuery::ProjectInputs { .. } => {
+                Answer::error(ErrorCode::Unsupported, "rust interprets no project inputs")
+            }
         }
     }
 
@@ -1368,6 +1688,109 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every `cargo test` argument vector the in-process selection builds is a request of a
+    /// declared test recipe that the core expands to the same arguments run by the same cargo
+    /// (the pinned toolchain's when one is pinned, else the home tool); a selection word that
+    /// would be an option is refused and any other command has no request.
+    #[test]
+    fn test_selections_are_test_recipes() {
+        let base = Scratch::new("tests");
+        let tool = base.0.join("bin/cargo");
+        let programs = [("cargo".to_owned(), tool.clone())];
+        let home = agent_ide_core::userhome::user_home();
+        let roots = toolchain_roots(&base.0);
+        let admission = Admission {
+            worktree: &base.0,
+            cache_dir: &base.0.join("cache"),
+            read_denies: &[],
+            home: home.as_deref(),
+            launcher_roots: &roots,
+            developer_dirs: &[],
+            programs: &programs,
+            timeout: Duration::from_secs(600),
+        };
+        let pinned = RustSupport.test_toolchain("cargo");
+        let cargo = pinned.clone().map_or(tool, |(cargo, _)| cargo);
+        let words = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        for (line, recipe) in [
+            ("cargo test --workspace", "cargo_test"),
+            (
+                "cargo test --workspace -- crate::worker::tests::",
+                "cargo_test_filter",
+            ),
+            (
+                "cargo test --workspace -- --exact a::tests::x b::y",
+                "cargo_test_exact",
+            ),
+            ("cargo test --workspace --test lang", "cargo_test_binary"),
+            (
+                "cargo test --workspace --test lang -- tests::",
+                "cargo_test_binary_filter",
+            ),
+            (
+                "cargo test --workspace --test lang -- --exact t1 t2",
+                "cargo_test_binary_exact",
+            ),
+            ("cargo test --workspace lang::", "cargo_test_pattern"),
+            ("cargo test --workspace -x", "cargo_test_pattern"),
+            (
+                "cargo test --manifest-path crates/core/Cargo.toml --test it",
+                "cargo_test_package_binary",
+            ),
+            (
+                "cargo test --manifest-path Cargo.toml --lib",
+                "cargo_test_package_lib",
+            ),
+            (
+                "cargo test --manifest-path Cargo.toml --bins",
+                "cargo_test_package_bins",
+            ),
+            (
+                "cargo test --manifest-path Cargo.toml --bin tool",
+                "cargo_test_package_bin",
+            ),
+            (
+                "cargo test --manifest-path Cargo.toml assistance::worker::",
+                "cargo_test_package_filter",
+            ),
+        ] {
+            let argv = words(line);
+            let effect = interactive_effect(&argv).expect(line);
+            let recipe = match &pinned {
+                Some(_) => format!("{recipe}_pinned"),
+                None => recipe.to_owned(),
+            };
+            assert_eq!(effect.recipe, recipe, "{line}");
+            let spec = expand(RECIPES, &effect, &admission).expect(line);
+            assert_eq!(spec.program, cargo, "{line}");
+            assert_eq!(
+                spec.args,
+                argv[1..]
+                    .iter()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>(),
+                "{line}"
+            );
+            assert_eq!(spec.cwd, base.0, "{line}");
+            // The pinned toolchain's `bin` leads `PATH`, as in process.
+            let path = spec
+                .env
+                .iter()
+                .find(|(name, _)| name == "PATH")
+                .expect(line);
+            if let Some((_, bin)) = &pinned {
+                assert!(
+                    path.1.starts_with(&bin.display().to_string()),
+                    "{line}: {path:?}"
+                );
+            }
+        }
+        let option = interactive_effect(&words("cargo test --workspace -- --exact -x")).unwrap();
+        assert!(expand(RECIPES, &option, &admission).is_err());
+        assert!(interactive_effect(&words("cargo build --workspace")).is_none());
+        assert!(interactive_effect(&words("sh -c x")).is_none());
     }
 
     /// The core expands the probe to exactly `/usr/bin/xcode-select -p` with no environment, or

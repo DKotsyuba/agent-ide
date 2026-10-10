@@ -94,9 +94,12 @@ pub mod languages {
     )];
 
     /// Each language's host-side resolution of a worktree's accepted environments (Python's
-    /// selected, pinned or discovered environments and their installation prefixes).
-    pub static ENVIRONMENT_ROOTS: [(&str, agent_ide_core::modules::recipe::EnvironmentRoots); 1] =
-        [("python", agent_ide_lang_python::environment::accepted_roots)];
+    /// selected, pinned or discovered environments and their installation prefixes; Rust's pinned
+    /// test toolchain).
+    pub static ENVIRONMENT_ROOTS: [(&str, agent_ide_core::modules::recipe::EnvironmentRoots); 2] = [
+        ("python", agent_ide_lang_python::environment::accepted_roots),
+        ("rust", agent_ide_lang_rust::module::toolchain_roots),
+    ];
 
     /// Registers every bundled language for this process. Idempotent; call it before parsing a
     /// launcher configuration or mapping any path to a language.
