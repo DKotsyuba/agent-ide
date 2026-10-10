@@ -22,7 +22,7 @@ use super::super::{
     },
     reply::{EditDiagnostics, PeerReply},
     test_fact::terminal_fact,
-    tests::RunResult,
+    tests::{RunResult, summary_absent},
 };
 use super::{INLINE_REPLY_WAIT, Job, JobStage, Shared, Worker, edit_operation};
 use crate::changes::edit::EditResult;
@@ -153,7 +153,10 @@ fn test_fact(id: u64, result: &RunResult, owns_detail: bool) -> FactDraft {
         summary: fact.summary,
         detail: Some(fact.detail),
         detail_ref: owns_detail.then(|| result.detail_ref.clone()),
-        failed: result.report.failed > 0 || result.stopped || result.exit != Some(0),
+        failed: result.report.failed > 0
+            || result.stopped
+            || result.exit != Some(0)
+            || summary_absent(result),
         holds_turn: true,
         source_bearing: false,
         fence_paths: Vec::new(),
@@ -587,6 +590,35 @@ mod tests {
         let subscriber = test_fact(7, &result, false);
         assert_eq!(subscriber.detail_ref, None);
         assert!(!subscriber.detail.unwrap().contains("run-detail"));
+    }
+
+    /// A run that exits 0 but reported no recognised summary is not a pass: its fact is failed
+    /// (reply-hygiene-v1 §1.1), while a counted passing run and a budget stop keep their meaning.
+    #[test]
+    fn a_zero_exit_without_a_summary_is_a_failed_fact() {
+        let mut result = RunResult {
+            report: crate::lang::TestReport {
+                incomplete: true,
+                ..crate::lang::TestReport::default()
+            },
+            output: "hello\n".to_owned(),
+            output_paged: false,
+            elapsed: Duration::from_secs(1),
+            stopped: false,
+            exit: Some(0),
+            budget: Duration::from_secs(120),
+            detail_ref: "run-detail".to_owned(),
+            command: vec!["echo".to_owned(), "hello".to_owned()],
+            rerun_dir: None,
+            environment_label: None,
+            targets: Vec::new(),
+        };
+        assert!(test_fact(1, &result, true).failed);
+        result.report = crate::lang::TestReport {
+            passed: 3,
+            ..crate::lang::TestReport::default()
+        };
+        assert!(!test_fact(1, &result, true).failed);
     }
 
     /// Source-bearing answers carry no text in their fact; failures carry their first line.

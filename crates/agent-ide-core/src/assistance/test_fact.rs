@@ -135,6 +135,72 @@ struct Entry {
 /// the summary, the rerun line and the reference are never dropped. The result depends only on
 /// the arguments: no clock, no I/O.
 pub(crate) fn terminal_fact(_id: u64, result: &RunResult, owns_detail: bool) -> TerminalFact {
+    let summary = summary_text(result);
+    let tail = if summary_absent(result) {
+        output_tail_lines(&result.output)
+    } else {
+        Vec::new()
+    };
+    let entries = failure_entries(result);
+    let targets = target_lines(result);
+    let closing = closing_lines(result, owns_detail);
+
+    let mut shown = entries.len().min(MAX_FAILURES);
+    let mut messages = shown;
+    let mut tail_lines = tail.len();
+    let mut target_lines = targets.len();
+    loop {
+        let mut lines = Vec::new();
+        for (index, entry) in entries.iter().take(shown).enumerate() {
+            lines.push(format!("  FAIL {}", entry.name));
+            if index < messages
+                && let Some(message) = &entry.message
+            {
+                lines.push(format!("       {message}"));
+            }
+        }
+        if entries.len() > shown {
+            lines.push(format!(
+                "  (+{} more failed tests in the full output)",
+                entries.len() - shown
+            ));
+        }
+        lines.extend(targets.iter().take(target_lines).cloned());
+        if tail_lines > 0 {
+            lines.push("  output (tail):".to_owned());
+            lines.extend(
+                tail[tail.len() - tail_lines..]
+                    .iter()
+                    .map(|line| format!("    {line}")),
+            );
+        }
+        lines.extend(closing.iter().cloned());
+        let detail = lines.join("\n");
+        if summary.len() + detail.len() <= MAX_FACT_BYTES
+            || (shown == 0 && tail_lines == 0 && target_lines == 0)
+        {
+            return TerminalFact { summary, detail };
+        }
+        // Shrink in contract order: quoted output first (it is the least specific), then the
+        // target lines from the end, then the message lines from the last entry backwards, then
+        // whole entries from the end.
+        if tail_lines > 0 {
+            tail_lines -= 1;
+        } else if target_lines > 0 {
+            target_lines -= 1;
+        } else if messages > 0 {
+            messages -= 1;
+        } else {
+            shown -= 1;
+        }
+    }
+}
+
+/// Renders the one-line summary of the settled run `result`, cut to [`MAX_SUMMARY_BYTES`].
+///
+/// The settled reply body of a run without a recognised summary uses the same line, so the reply
+/// and the pushed fact open identically.
+pub(super) fn summary_text(result: &RunResult) -> String {
     let report = &result.report;
     let seconds = result.elapsed.as_secs();
     let counted = report.passed != 0 || report.failed != 0;
@@ -165,19 +231,22 @@ pub(crate) fn terminal_fact(_id: u64, result: &RunResult, owns_detail: bool) -> 
         base.push_str(" · env ");
         base.push_str(label);
     }
-    let summary = clean(&base, MAX_SUMMARY_BYTES);
+    clean(&base, MAX_SUMMARY_BYTES)
+}
 
-    let tail = if summary_absent(result) {
-        output_tail_lines(&result.output)
-    } else {
-        Vec::new()
-    };
-    let entries = failure_entries(result);
-    let targets: Vec<String> = result
+/// Renders one indented line per target of a several-target run, each cut to
+/// [`MAX_TARGET_LINE_BYTES`]; a single-target run has none.
+pub(super) fn target_lines(result: &RunResult) -> Vec<String> {
+    result
         .targets
         .iter()
         .map(|line| format!("  {}", clean(line, MAX_TARGET_LINE_BYTES)))
-        .collect();
+        .collect()
+}
+
+/// Renders the lines that end every settled text: `rerun:` always, and `full output:` exactly when
+/// the recipient `owns_detail` of a run that kept any output (reply-hygiene-v1 §1.2 rule 3).
+pub(super) fn closing_lines(result: &RunResult, owns_detail: bool) -> Vec<String> {
     let mut closing = vec![format!(
         "  rerun: {}",
         cut_with_ellipsis(&rerun_text(result), MAX_RERUN_BYTES)
@@ -185,56 +254,7 @@ pub(crate) fn terminal_fact(_id: u64, result: &RunResult, owns_detail: bool) -> 
     if owns_detail && (!result.output.is_empty() || result.output_paged) {
         closing.push(format!("  full output: ide.inspect {}", result.detail_ref));
     }
-
-    let mut shown = entries.len().min(MAX_FAILURES);
-    let mut messages = shown;
-    let mut tail_lines = tail.len();
-    let mut target_lines = targets.len();
-    loop {
-        let mut lines = Vec::new();
-        if tail_lines > 0 {
-            lines.push("  output (tail):".to_owned());
-            lines.extend(
-                tail[tail.len() - tail_lines..]
-                    .iter()
-                    .map(|line| format!("    {line}")),
-            );
-        }
-        for (index, entry) in entries.iter().take(shown).enumerate() {
-            lines.push(format!("  FAIL {}", entry.name));
-            if index < messages
-                && let Some(message) = &entry.message
-            {
-                lines.push(format!("       {message}"));
-            }
-        }
-        if entries.len() > shown {
-            lines.push(format!(
-                "  (+{} more failed tests in the full output)",
-                entries.len() - shown
-            ));
-        }
-        lines.extend(targets.iter().take(target_lines).cloned());
-        lines.extend(closing.iter().cloned());
-        let detail = lines.join("\n");
-        if summary.len() + detail.len() <= MAX_FACT_BYTES
-            || (shown == 0 && tail_lines == 0 && target_lines == 0)
-        {
-            return TerminalFact { summary, detail };
-        }
-        // Shrink in contract order: quoted output first (it is the least specific), then the
-        // target lines from the end, then the message lines from the last entry backwards, then
-        // whole entries from the end.
-        if tail_lines > 0 {
-            tail_lines -= 1;
-        } else if target_lines > 0 {
-            target_lines -= 1;
-        } else if messages > 0 {
-            messages -= 1;
-        } else {
-            shown -= 1;
-        }
-    }
+    closing
 }
 
 /// Collects the failing tests of `result` that a fact may show: the first [`MAX_FAILURES`] ones

@@ -6110,29 +6110,7 @@ impl<'a> Worker<'a> {
         if self.uncertain.contains(binding) {
             return Err(FailureCode::Internal);
         }
-        let mut text = if revoked {
-            "Assistance stopped for this binding; compatible shared peers remain eligible"
-                .to_owned()
-        } else {
-            // Nothing was active to stop: no grant was ever held, or its authority was already
-            // released (E013 item 6) — starting just to stop would be waste.
-            "nothing active for this binding; its workspace authority was already released"
-                .to_owned()
-        };
-        if !uncollected.is_empty() {
-            text.push_str(
-                "\nuncollected test runs in this binding — their results were never read; each \
-                 still answers ide.inspect {\"detail_ref\":\"tests #N\"}:",
-            );
-            for run in uncollected {
-                text.push_str("\n  ");
-                text.push_str(run);
-            }
-        }
-        if let Some(undelivered) = undelivered {
-            text.push('\n');
-            text.push_str(undelivered);
-        }
+        let text = stop_text(revoked, uncollected, undelivered);
         Ok((
             PeerReply::Complete {
                 kind: ResultKind::Stop,
@@ -7664,6 +7642,40 @@ pub(super) fn rerun_text(result: &super::tests::RunResult) -> String {
     }
 }
 
+/// Renders the `ide.stop` reply text.
+///
+/// `revoked` says whether an active grant was released; otherwise nothing was active (no grant was
+/// ever held, or its authority was already released — starting just to stop would be waste).
+/// `uncollected` names the test runs the binding started and never read, each still answering
+/// `ide.inspect`, and `undelivered` is the session outbox's stop flush when it still held facts.
+/// The text states what happened and never invites the agent to wait or ask again.
+pub(super) fn stop_text(
+    revoked: bool,
+    uncollected: &[String],
+    undelivered: Option<&str>,
+) -> String {
+    let mut text = if revoked {
+        "Assistance stopped for this binding; compatible shared peers remain eligible".to_owned()
+    } else {
+        "nothing active for this binding; its workspace authority was already released".to_owned()
+    };
+    if !uncollected.is_empty() {
+        text.push_str(
+            "\nuncollected test runs in this binding — their results were never read; each \
+             still answers ide.inspect {\"detail_ref\":\"tests #N\"}:",
+        );
+        for run in uncollected {
+            text.push_str("\n  ");
+            text.push_str(run);
+        }
+    }
+    if let Some(undelivered) = undelivered {
+        text.push('\n');
+        text.push_str(undelivered);
+    }
+    text
+}
+
 /// Renders the settled reply body of run `id`.
 ///
 /// A run with a recognised outcome (counts, a budget stop or a failed runner) reads exactly as
@@ -7685,38 +7697,26 @@ fn test_result_text(
     super::test_fact::terminal_fact(id, result, owns_detail).reply_text(id)
 }
 
-/// Appends a several-target run's per-target lines (batch-api-v1 §6), each bounded like a
-/// failure line; a single-target run has none.
-fn push_target_lines(text: &mut String, result: &super::tests::RunResult) {
-    for line in &result.targets {
-        text.push_str(&format!("\n  {}", test_text_line(line, 240)));
-    }
-}
-
-/// Renders one summary-less run: exit code, chosen environment, bounded output tail, rerun, and —
-/// only when that tail cut something, or the whole output already lives in the run's
-/// paged detail — the pointer to the full output.
+/// Renders one summary-less run: the shared summary line (exit code, duration, environment label),
+/// the per-target lines, the runner output's bounded tail of up to 4 KiB, and the same `rerun:` and
+/// `full output:` lines the pushed fact ends with ([`super::test_fact::closing_lines`]).
+///
+/// Only the quoted output differs from the pushed fact, which quotes a shorter tail
+/// (reply-hygiene-v1 §1.2 rule 7).
 fn command_result_text(id: u64, result: &super::tests::RunResult, owns_detail: bool) -> String {
-    let seconds = result.elapsed.as_secs();
-    let exit = result
-        .exit
-        .map_or_else(|| "unknown".to_owned(), |code| code.to_string());
-    let mut text = format!("tests #{id}: exit {exit}, {seconds} s");
-    if let Some(label) = &result.environment_label {
-        text.push_str(&format!(" · env {label}"));
+    let mut text = format!("tests #{id}: {}", super::test_fact::summary_text(result));
+    for line in super::test_fact::target_lines(result) {
+        text.push('\n');
+        text.push_str(&line);
     }
-    push_target_lines(&mut text, result);
     let tail = super::tests::output_tail(&result.output);
     if !tail.is_empty() {
         text.push_str("\n  output (tail):\n");
         text.push_str(&tail);
     }
-    text.push_str(&format!("\n  rerun: {}", rerun_text(result)));
-    if owns_detail && (tail.len() < result.output.len() || result.output_paged) {
-        text.push_str(&format!(
-            "\n  full output: ide.inspect {}",
-            result.detail_ref
-        ));
+    for line in super::test_fact::closing_lines(result, owns_detail) {
+        text.push('\n');
+        text.push_str(&line);
     }
     text
 }
@@ -7835,6 +7835,36 @@ mod tool_reply_fix_tests {
             reply.contains("full output: ide.inspect test-detail"),
             "{reply}"
         );
+    }
+
+    /// For a run without a recognised summary the settled reply body and the pushed fact differ
+    /// only in the quoted output tail (reply-hygiene-v1 §1.2 rule 7): same summary, same
+    /// per-target lines cut at 160 bytes, same `rerun:` and `full output:` lines for the owner
+    /// and for a subscriber.
+    #[test]
+    fn summaryless_reply_and_fact_differ_only_in_the_output_tail() {
+        /// Returns `text` without its `output (tail):` block, so only the shared lines remain.
+        fn without_tail(text: &str) -> String {
+            match (text.find("\n  output (tail):"), text.find("\n  rerun:")) {
+                (Some(from), Some(to)) => format!("{}{}", &text[..from], &text[to..]),
+                _ => text.to_owned(),
+            }
+        }
+        for output in ["short\n", ""] {
+            let mut result = command_result(output.into());
+            result.targets = vec!["x".repeat(300), "path tests/cli.rs: passed".into()];
+            for owns_detail in [true, false] {
+                let reply = test_result_text(5, &result, owns_detail, true);
+                let fact =
+                    super::super::test_fact::terminal_fact(5, &result, owns_detail).reply_text(5);
+                assert_eq!(without_tail(&reply), without_tail(&fact), "{reply}\n{fact}");
+                assert_eq!(
+                    reply.contains("full output:"),
+                    owns_detail && !output.is_empty(),
+                    "{reply}"
+                );
+            }
+        }
     }
 
     /// Keeps 0–3 visible in descriptions as well as JSON schema bounds for hosts that drop bounds.
