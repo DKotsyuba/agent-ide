@@ -49,9 +49,15 @@ fn pyright_provider(cache_namespace: &str) -> Value {
 
 /// A `.venv` in `dir` whose `bin/python` links the accepted `AGENT_IDE_PYTHON` interpreter.
 fn python_venv_at(dir: &Path) {
+    python_venv_named(dir, ".venv");
+}
+
+/// A virtual environment `name` in `dir` whose `bin/python` links the accepted
+/// `AGENT_IDE_PYTHON` interpreter.
+fn python_venv_named(dir: &Path, name: &str) {
     let python = PathBuf::from(std::env::var_os("AGENT_IDE_PYTHON").unwrap());
     assert!(python.is_file(), "approved Python interpreter is available");
-    let venv = dir.join(".venv");
+    let venv = dir.join(name);
     let interpreter = venv.join("bin/python");
     std::fs::create_dir_all(interpreter.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&python, &interpreter).unwrap();
@@ -310,7 +316,7 @@ fn python_edit_fixture(cache: &str) -> Fixture {
             "tests/test_helper.py",
             "from helper import double\n\n\ndef test_double():\n    assert double(2) == 4\n",
         ),
-        (".gitignore", "__pycache__/\n.venv/\n"),
+        (".gitignore", "__pycache__/\n.venv/\n.venv-alt/\n"),
         ("pytest/__init__.py", ""),
         ("pytest/__main__.py", PYTEST_STAND_IN),
         ("black/__init__.py", ""),
@@ -330,15 +336,20 @@ fn python_edit_fixture(cache: &str) -> Fixture {
         "black",
     ]);
     fixture.git(&["commit", "--quiet", "-m", "edit fixture"]);
+    // A second environment the transcript selects explicitly over the discovered `.venv`.
+    python_venv_named(&fixture.root, ".venv-alt");
     fixture
 }
 
-/// The changing calls whose replies must not depend on where Python computes: the start card
-/// (the selected environment), a formatted replace, an insert, a test run in the selected
+/// The changing calls whose replies must not depend on where Python computes: a start that
+/// selects the second environment `.venv-alt` over the discovered `.venv` (its card), a formatted replace, an insert, a test run in the selected
 /// environment, a project-wide rename, the read that shows the results and the task diff.
 fn edit_calls() -> Vec<(&'static str, Value)> {
     vec![
-        ("ide.start", json!({"activation_id":"parity-start"})),
+        (
+            "ide.start",
+            json!({"activation_id":"parity-start-env","environment":{"python":".venv-alt"}}),
+        ),
         (
             "ide.edit",
             json!({"operation_id":"parity-replace","op":"replace","symbol":"helper.py#double",
@@ -407,7 +418,8 @@ async fn run_edit_transcript(
 }
 
 /// Python's changing answers are the same in module mode and in process, each on its own fresh
-/// copy of one committed fixture: the start card's selected environment, a replace formatted by
+/// copy of one committed fixture: an explicitly selected second environment (the start card, and
+/// the test run that uses its interpreter), a replace formatted by
 /// the project formatter, an insert, a project-wide rename (an edit proposal the core applies),
 /// the reads of their results, a pytest run in the selected environment and the task diff. The
 /// module run hosts Pyright in a module; nothing either daemon started survives it.
@@ -427,7 +439,8 @@ async fn python_module_edits_match_in_process() {
         "def added() -> int:",
         "from helper import twice",
         "tests #1: 1 passed, 0 failed",
-        "environment: python .venv (3.14.3",
+        "environment: python .venv-alt",
+        "rerun: <root>/.venv-alt/bin/python -m pytest",
     ] {
         assert!(joined.contains(expected), "{expected}:\n{joined}");
     }

@@ -316,6 +316,44 @@ async fn parity_fronts_on_one_daemon_use_distinct_call_ids() {
     }
 }
 
+/// A front stand-in: answers `initialize`; refuses the first `ide.start` as unavailable and
+/// answers the next as pending (`ide.inspect` then settles it to an activation); answers anything
+/// else complete; as `codex-hook` it accepts the hook.
+const FAKE_FRONT: &str = r#"#!/bin/sh
+if [ "$1" = codex-hook ]; then cat >/dev/null; exit 0; fi
+starts=0
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  [ -z "$id" ] && continue
+  case "$line" in
+    *'"initialize"'*) reply='{}' ;;
+    *'"ide.start"'*)
+      starts=$((starts + 1))
+      if [ "$starts" = 1 ]; then
+        reply='{"structuredContent":{"state":"unavailable","reason":"host_binding"}}'
+      else
+        reply='{"structuredContent":{"state":"pending","detail_ref":"start-1"}}'
+      fi ;;
+    *'"ide.inspect"'*) reply='{"structuredContent":{"state":"complete","kind":"activation","text":"ok"}}' ;;
+    *) reply='{"structuredContent":{"state":"complete","kind":"stop","text":"ok"}}' ;;
+  esac
+  printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$reply"
+done
+"#;
+
+/// A start that first answers unavailable and then pending settles to its activation: the
+/// harness repeats the idempotent start and settles the pending reply through `ide.inspect`.
+#[tokio::test]
+async fn parity_session_settles_a_late_activation() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = parity::Fixture::new(&[("a.css", ".a {}\n")], json!([]));
+    let front = fixture.base.join("fake-front");
+    std::fs::write(&front, FAKE_FRONT).unwrap();
+    std::fs::set_permissions(&front, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let session = parity::Session::start_with(&fixture, front).await;
+    session.close(&fixture).await;
+}
+
 /// The parity harness runs the same calls on two fresh daemons, with and without the fallback
 /// switch, and finds them equal; CSS runs as a module by default exactly when it ships as one.
 #[tokio::test]

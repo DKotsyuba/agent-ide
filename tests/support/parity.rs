@@ -342,8 +342,16 @@ impl Drop for Daemon {
 }
 
 /// The daemon's own `health` answer on `fixture`'s endpoint (`"ok"` when healthy), read over its
-/// framed IPC socket independently of any MCP front.
+/// framed IPC socket independently of any MCP front; a daemon that does not answer within 10 s
+/// fails the caller (whose fixture and daemon still clean up).
 pub async fn health(fixture: &Fixture) -> String {
+    tokio::time::timeout(Duration::from_secs(10), exchange_health(fixture))
+        .await
+        .expect("the daemon answers its health check within 10 s")
+}
+
+/// One framed `health` exchange on `fixture`'s endpoint.
+async fn exchange_health(fixture: &Fixture) -> String {
     let mut stream = UnixStream::connect(fixture.runtime.join("agent-ide.sock"))
         .await
         .unwrap();
@@ -415,12 +423,21 @@ pub struct Session {
     input: ChildStdin,
     /// Its stdout.
     output: BufReader<ChildStdout>,
+    /// The binary serving the front and its hooks.
+    program: PathBuf,
 }
 
 impl Session {
     /// Starts and initializes an MCP front and activates the fixture.
     pub async fn start(fixture: &Fixture) -> Self {
-        let mut child = Command::new(binary())
+        Self::start_with(fixture, binary()).await
+    }
+
+    /// [`Session::start`] with `program` serving the front and its hooks. The start is repeated
+    /// (the same activation id, so it is idempotent) until it settles to an activation, for at
+    /// most 30 s; a pending start is settled through `ide.inspect` like every pending reply.
+    pub async fn start_with(fixture: &Fixture, program: PathBuf) -> Self {
+        let mut child = Command::new(&program)
             .env("TOKIO_WORKER_THREADS", "1")
             .env("AGENT_IDE_HOST_ATTACHMENT", ATTACHMENT)
             .args(["mcp", "--runtime-dir"])
@@ -435,6 +452,7 @@ impl Session {
             input: child.stdin.take().unwrap(),
             output: BufReader::new(child.stdout.take().unwrap()),
             child,
+            program,
         };
         let initialized = session
             .exchange(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
@@ -444,14 +462,17 @@ impl Session {
         session
             .send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
             .await;
-        let start = session
-            .call(
-                fixture,
-                "ide.start",
-                json!({"activation_id":"parity-start"}),
-            )
-            .await;
-        assert_eq!(start["kind"], "activation", "{start}");
+        let arguments = json!({"activation_id":"parity-start"});
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut start = session.call(fixture, "ide.start", arguments.clone()).await;
+        while start["kind"] != "activation" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ide.start did not settle to an activation within 30 s: {start}"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            start = session.call(fixture, "ide.start", arguments.clone()).await;
+        }
         session
     }
 
@@ -488,7 +509,7 @@ impl Session {
 
     /// Submits one Codex hook for `call`.
     async fn hook(&self, fixture: &Fixture, phase: &str, call: &str) {
-        let mut child = Command::new(binary())
+        let mut child = Command::new(&self.program)
             .env("TOKIO_WORKER_THREADS", "1")
             .env("AGENT_IDE_HOST_ATTACHMENT", ATTACHMENT)
             .args(["codex-hook", "--runtime-dir"])
