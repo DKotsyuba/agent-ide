@@ -60,20 +60,30 @@ mod tests {
         assert!(!block.starts_with('\n') && !block.ends_with('\n'));
     }
 
-    /// Every example in the block is a JSON object, and the block names no more than one example
-    /// per tool line.
+    /// Every example in the block is a JSON object that the facade accepts as the argument of
+    /// the tool named on its line: the same validation a live call goes through, over the schemas
+    /// that `schemas/tools.json` snapshots.
     #[test]
-    fn every_example_is_a_json_object() {
+    fn every_example_validates_against_the_tool_schemas() {
+        let schemas = crate::assistance::facade::tool_schemas();
         let mut examples = 0;
         for line in signature_block()
             .lines()
             .filter(|line| line.starts_with("ide."))
         {
-            let (_, rest) = line.split_once(' ').unwrap();
+            let (name, rest) = line.split_once(' ').unwrap();
+            let schema = schemas
+                .iter()
+                .find(|schema| schema.name == name)
+                .unwrap_or_else(|| panic!("unknown tool {name}"));
             for example in rest.split(" or ") {
                 let value: serde_json::Value = serde_json::from_str(example)
                     .unwrap_or_else(|error| panic!("{example}: {error}"));
                 assert!(value.is_object(), "{example}");
+                assert!(
+                    crate::assistance::facade::validate_call(schema.tool, value).is_ok(),
+                    "{name} {example}"
+                );
                 examples += 1;
             }
         }

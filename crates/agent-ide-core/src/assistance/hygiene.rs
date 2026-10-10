@@ -11,8 +11,10 @@
 
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
+
 use super::{
-    facade::{SERVER_INSTRUCTIONS, StdioFacade, tool_schemas},
+    facade::{AssistanceTool, SERVER_INSTRUCTIONS, StdioFacade, tool_schemas, validate_call},
     signature_card::signature_block,
     test_fact::{running_line, started_line, still_running_line},
 };
@@ -181,4 +183,146 @@ fn the_guard_flags_polling_and_allows_its_negation() {
     assert!(violations(Tier::Teaching, "so never poll for them; do not poll").is_empty());
     assert!(!violations(Tier::Teaching, "poll ide.inspect").is_empty());
     assert!(!violations(Tier::Teaching, "never poll, then poll again").is_empty());
+}
+
+/// Returns the byte length of the balanced JSON object that `text` starts with, ignoring braces
+/// inside strings, or `None` when it never closes.
+fn balanced_object_len(text: &str) -> Option<usize> {
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    for (index, character) in text.char_indices() {
+        if in_string {
+            match (escaped, character) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Collects every `ide.<tool> {…}` example in `text`: the tool and the JSON object that follows
+/// its name.
+fn examples_in(text: &str) -> Vec<(AssistanceTool, String)> {
+    let mut found = Vec::new();
+    for schema in tool_schemas() {
+        let marker = format!("{} {{", schema.name);
+        let mut from = 0;
+        while let Some(at) = text[from..].find(&marker) {
+            let start = from + at + marker.len() - 1;
+            let length = balanced_object_len(&text[start..])
+                .unwrap_or_else(|| panic!("an unclosed {} example", schema.name));
+            found.push((schema.tool, text[start..start + length].to_owned()));
+            from = start + length;
+        }
+    }
+    found
+}
+
+/// Reports why an example does not hold, or `None` when it does.
+///
+/// A complete example must pass the facade's own argument validation. An abbreviated one (it
+/// holds `…` in place of an array or an object) must still be an object whose every top-level
+/// key is a property of the tool's schema.
+fn example_problem(tool: AssistanceTool, example: &str) -> Option<String> {
+    let schema = tool_schemas()
+        .into_iter()
+        .find(|schema| schema.tool == tool)
+        .expect("every tool has a schema");
+    if let Ok(value) = serde_json::from_str::<Value>(&example.replace('…', "x")) {
+        return validate_call(tool, value)
+            .err()
+            .map(|error| format!("refused: {error:?}"));
+    }
+    if !example.contains('…') {
+        return Some("not JSON".to_owned());
+    }
+    let sketch = example.replace("[…]", "[]").replace("{…}", "{}");
+    let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(&sketch) else {
+        return Some("not a JSON object even with its placeholders emptied".to_owned());
+    };
+    let properties = schema.input_schema["properties"]
+        .as_object()
+        .expect("schemas list properties");
+    fields
+        .keys()
+        .find(|key| !properties.contains_key(*key))
+        .map(|key| format!("`{key}` is not a property of {}", schema.name))
+}
+
+/// Every `ide.<tool> {…}` example the teaching text shows — the server instructions, the tool
+/// descriptions, the skill and the `ide.start` signature block — is an argument object of that
+/// tool: complete examples pass the facade's validation, abbreviated ones use only schema
+/// properties. The schemas validated against are the ones `schemas/tools.json` snapshots.
+#[test]
+fn teaching_examples_validate_against_the_tool_schemas() {
+    let mut teaching = vec![(
+        "SERVER_INSTRUCTIONS".to_owned(),
+        SERVER_INSTRUCTIONS.to_owned(),
+    )];
+    for tool in StdioFacade::described_tool_router().list_all() {
+        teaching.push((
+            format!("{} description", tool.name),
+            tool.description.as_deref().unwrap_or_default().to_owned(),
+        ));
+    }
+    teaching.push((
+        "ide.start signature block".to_owned(),
+        signature_block().to_owned(),
+    ));
+    teaching.push((
+        "SKILL.md".to_owned(),
+        file_surface("skills/agent-ide/SKILL.md", Tier::Teaching).text,
+    ));
+    let mut checked = 0;
+    let mut problems = Vec::new();
+    for (name, text) in teaching {
+        for (tool, example) in examples_in(&text) {
+            checked += 1;
+            if let Some(problem) = example_problem(tool, &example) {
+                problems.push(format!("{name}: {} {example}: {problem}", tool.mcp_name()));
+            }
+        }
+    }
+    assert!(checked >= 40, "only {checked} examples found");
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// The extractor finds balanced objects across strings and braces in strings, and the checker
+/// refuses an unknown key, an invalid value and a non-object.
+#[test]
+fn the_example_checker_refuses_what_a_live_call_refuses() {
+    let text = r#"use ide.read {"items":[{"path":"a{b"}]} then ide.inspect {"wait_ms": 5} now"#;
+    let found = examples_in(text);
+    assert_eq!(found.len(), 2);
+    assert!(found.contains(&(
+        AssistanceTool::Read,
+        r#"{"items":[{"path":"a{b"}]}"#.to_owned()
+    )));
+    assert!(found.contains(&(AssistanceTool::Inspect, r#"{"wait_ms": 5}"#.to_owned())));
+    assert_eq!(
+        example_problem(AssistanceTool::Inspect, r#"{"wait_ms": 5}"#),
+        None
+    );
+    assert!(example_problem(AssistanceTool::Inspect, r#"{"wait": 5}"#).is_some());
+    assert!(example_problem(AssistanceTool::Inspect, r#"{"wait_ms": "soon"}"#).is_some());
+    assert!(example_problem(AssistanceTool::Edit, r#"{"files":[…],"unknown":1}"#).is_some());
+    assert_eq!(
+        example_problem(AssistanceTool::Edit, r#"{"files":[…]}"#),
+        None
+    );
+    assert!(example_problem(AssistanceTool::Inspect, "{wait_ms: 5}").is_some());
 }

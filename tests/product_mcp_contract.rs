@@ -6079,6 +6079,82 @@ async fn a_slow_edit_check_answers_at_once_and_arrives_as_one_fact() {
     daemon.wait().await.unwrap();
 }
 
+/// Reply hygiene (M024-M027-REPLY-HYGIENE r2, M024-M026 outbox texts): every real reply of a batch
+/// read, a batch edit whose project check outlasts the call, and the two inspections that hand
+/// over its fact states what happened and never invites polling, in its text and carried status.
+#[tokio::test]
+async fn pending_and_batch_replies_never_invite_polling() {
+    let fixture = ProductFixture::new(json!([]));
+    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 12");
+    write_problems_count(&fixture.root, "1");
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "hygiene-batch").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"hygiene"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let mut seen = vec![started.clone()];
+
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"items":[{"path":"src/lib.rs","lines":"1-2"},{"path":"missing.rs"}]}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let source_ref = read["detail_ref"].as_str().unwrap().to_owned();
+    seen.push(read);
+    let edit = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"hygiene-1","source_ref":source_ref,
+                   "files":[{"path":"src/lib.rs","changes":[{"lines":"1-1","content":"pub fn value() -> i32 { 7 }"}]}]}),
+        )
+        .await;
+    assert!(
+        edit["text"].as_str().is_some_and(
+            |text| text.contains("diagnostics: pending; the project check arrives by itself")
+        ),
+        "{edit}"
+    );
+    seen.push(edit);
+    let checked = actor
+        .call(&fixture, "ide.inspect", json!({"wait_ms":60000}))
+        .await;
+    assert!(
+        checked["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("edit-checked edit hygiene-1: ")),
+        "{checked}"
+    );
+    seen.push(checked);
+    seen.push(actor.call(&fixture, "ide.inspect", json!({})).await);
+    for reply in &seen {
+        let shown = format!(
+            "{} {}",
+            reply["text"].as_str().unwrap_or_default(),
+            reply["status"].as_str().unwrap_or_default()
+        )
+        .to_lowercase();
+        for banned in [
+            "poll",
+            "every few seconds",
+            "in a few seconds",
+            "until it completes",
+            "again every",
+        ] {
+            assert!(!shown.contains(banned), "{banned}: {reply}");
+        }
+    }
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A pending edit whose project check was capped with none of this file's problems retained
 /// settles as `unknown`: an empty `current_reported` is not a closed reply, and it used to turn
 /// the whole detail into `inspect:internal` (a Python project with thousands of errors).

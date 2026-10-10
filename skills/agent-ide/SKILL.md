@@ -5,6 +5,19 @@ description: Use Agent IDE `ide.*` tools for understanding and changing source c
 
 # Agent IDE
 
+## Recipe: few calls, no waiting
+
+1. `ide.start`; its reply ends with the exact call forms. End every task with `ide.stop`.
+2. Orient on the files in play: `ide.outline {"paths":["src/a.rs","src/b.rs"]}` or `ide.outline {"glob":"src/**/*.rs"}`.
+3. Plan the change, then read everything in ONE call: `ide.read {"items":[{"symbol":"src/a.rs#Store/get"},{"path":"src/b.rs","lines":"10-40"}]}`.
+4. Find what must change, one call each: `ide.graph {"symbols":["src/a.rs#f"],"direction":"callers"}` for call sites, `ide.symbol {"symbols":["Kind"]}` for construction sites.
+5. Apply the whole change with ONE `ide.edit {"operation_id":"add-field-1","source_ref":"…","files":[{"path":"src/a.rs","changes":[{"old":"x: 0,","new":"x: 0,\ny: 0,"}]}]}`: everything is validated before the first write, and one project check runs.
+6. Run what matters with ONE `ide.test {"targets":[{"symbol":"src/a.rs#parse"},{"pattern":"roles_"}]}`.
+7. Results of long work are pushed to you in `<agent-ide>` blocks after your next tool call or when you end your turn; with nothing else to do, make one `ide.inspect {"wait_ms":120000}` call.
+8. Review with `ide.diff`, then `ide.stop`.
+
+What it saves: 26 single-hunk `ide.edit` calls cost 26 turns of about 260 k tokens of context each, and one `files` edit costs one. 36 turns spent only waiting for a test result were about a fifth of one run's input; a pushed result costs none.
+
 Agent IDE exposes the lifecycle tools `ide.start`, `ide.context`, `ide.diff`,
 `ide.inspect`, `ide.stop`, `ide.edit`, the symbol tools `ide.outline`, `ide.read`,
 `ide.symbol`, `ide.graph`, and `ide.test`. Use this workflow whenever they are offered and the
@@ -67,7 +80,7 @@ and cost a fraction of the context:
   `--brand`): `ide.symbol` answers a name card with every defining file, `ide.read` reads the
   first definition; the `symbols` batch form takes file paths only.
 - A file no IDE language reads (`Cargo.toml`, a shell script, a template, a log, Markdown, YAML)
-  answers `unsupported_file: <path>` from `ide.outline`, `ide.read {symbol}`, `ide.symbol` and
+  answers `unsupported_file: <path>` from `ide.outline`, `ide.read` of a `symbol`, `ide.symbol` and
   `ide.graph`, but `ide.read` still returns its text in every form without an outline:
   `{"path":…}` (whole file), `{"path":…,"lines":…}`, `{"path":…,"ranges":[…]}` or a bare path
   in `symbols` — numbered, with a `note: no code analysis for this format` line. A symbol
@@ -105,9 +118,10 @@ The single-call edit forms use the same symbol paths:
 - `ide.edit {"operation_id":"…","op":"replace","symbol":"src/x.rs#Type/method","content":"…"}`
   — new body for the symbol; `content` is the whole symbol including its doc comment and
   attributes.
-- `ide.edit {"operation_id":"…","op":"insert","symbol":"src/x.rs#Type/anchor","where":"before"|"after"|"first"|"last","content":"…"}`
-  — a new symbol placed relative to the anchor (`first`/`last` inside a container such as an
-  impl, class or module); indentation follows the neighbours.
+- `ide.edit {"operation_id":"…","op":"insert","symbol":"src/x.rs#Type/anchor","where":"after","content":"…"}`
+  — a new symbol placed relative to the anchor (`where` is `before`, `after`, `first` or `last`;
+  `first`/`last` inside a container such as an impl, class or module); indentation follows the
+  neighbours.
 - `ide.edit {"operation_id":"…","op":"delete","symbol":"…"}` — removes the symbol with its header.
 - `ide.edit {"operation_id":"…","op":"rename","symbol":"…","new_name":"…"}` — project-wide rename
   by the language server (it waits while the server loads); the first line reads
@@ -157,7 +171,7 @@ field through its type. A `provider_loading` error means the language server is 
 the workspace and the call was not answered; continue with other work (`ide.symbol` and
 `ide.graph` answer at once meanwhile).
 While it loads — and when it is unavailable (its workspace failed to load) or its
-documentSymbols request failed — `ide.outline`, `ide.read {symbol}` and symbol edits of a
+documentSymbols request failed — `ide.outline`, `ide.read` of a `symbol` and symbol edits of a
 Rust file may already answer from the lexical outline (the reply says `outline: from
 source, exact (<server> still indexing; no need to repeat)` while it loads, `outline:
 from source, exact (<server> unavailable; no need to repeat)` when it failed, `outline:
@@ -214,11 +228,11 @@ loading — `ide.context {"kind":"problems"}` shows the project check.
    `not a git repository: no git data`.
 2. Before an edit, prefer `ide.outline` the file (or `ide.symbol` the target) for its skeleton,
    then `ide.read` the exact symbol or line range you are about to change — its `source_ref` is
-   the bounded reference `ide.edit` needs. `ide.context {path}` with no `byte_offset` still works
+   the bounded reference `ide.edit` needs. `ide.context` with only a `path` still works
    and still mints a usable `source_ref` (its first line is a hint toward `ide.outline`/
-   `ide.read`); `ide.context {path, byte_offset}` answers definitions/references at that
-   exact position when needed. Path-only context is the file text; use `ide.symbol` or
-   `ide.read {symbol}` when definitions or references are needed.
+   `ide.read`); `ide.context` with `path` and `byte_offset` answers definitions/references at
+   that exact position when needed. Path-only context is the file text; use `ide.symbol` or
+   `ide.read` of a `symbol` when definitions or references are needed.
 3. Prefer `ide.edit` (symbol, `lines`, `changes` or new-file form) whenever it is offered.
    Native host editing — the model's own file-edit tool (Claude's editor, Codex
    `apply_patch`, etc.) — remains available when `ide.edit` is inactive, unavailable, refused
@@ -258,9 +272,9 @@ loading — `ide.context {"kind":"problems"}` shows the project check.
    `(+K more failed tests in the full output)`), a `rerun:` line that reproduces the run
    (`cd <dir> && env NAME=VALUE … <argv>` when `cwd` or `env` was given) and `full output:
    ide.inspect <detail_ref>`; the reply of a run that ends inside the call reads the same.
-   `ide.test {"status":N}` and `ide.inspect` of a test-run handle (`tests #N`, `tests-N`,
-   `#N`, `N`) read one run on demand (`tests #N: running` while it runs); a worktree keeps at
-   most four finished runs. After `ide.stop`, `ide.test {"status":N}` is refused; its reply
+   `ide.test` with a `status` run number and `ide.inspect` of a test-run handle (`tests #N`,
+   `tests-N`, `#N`, `N`) read one run on demand (`tests #N: running` while it runs); a worktree
+   keeps at most four finished runs. After `ide.stop`, the `status` form is refused; its reply
    names `ide.inspect {"detail_ref":"tests #N"}` as the way to read that run, which still
    answers. Known pytest, cargo test, vitest/jest, and go test summaries are parsed from
    output regardless of whether the command called the runner directly or through a wrapper.
@@ -280,7 +294,7 @@ loading — `ide.context {"kind":"problems"}` shows the project check.
    path inventory is separate from the hunks a page delivers. A hunk larger than one reply
    arrives in parts labelled `hunk N of T, lines A-B of L; continues on the next page`, the
    final one `; last part`; a single line too long for any reply becomes a notice with the
-   `ide.read {path, lines}` that shows it, and paging continues past it. When retention is
+   `ide.read` of that `path` and `lines` that shows it, and paging continues past it. When retention is
    full, a page says to recapture the remaining lines instead of offering a continuation.
    Capture limits direct you to narrower `paths` or native Git. With `"provenance": true` the
    header's `current_tree` line says what the capture established; call `ide.diff` again

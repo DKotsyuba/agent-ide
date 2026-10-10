@@ -4640,7 +4640,8 @@ impl StdioFacade {
 impl StdioFacade {
     /// Activate Agent IDE for this project — once per task, before any other ide.* call. Returns
     /// a project card: languages with sizes, the build/check/test/lint commands, layout by
-    /// directory, entry points and docs. Use it to orient instead of reading README, {manifests_head}
+    /// directory, entry points and docs, then the exact batch call forms (do not print the tool
+    /// catalog). Use it to orient instead of reading README, {manifests_head}
     /// {manifests_tail}. Then use ide.outline / ide.symbol instead of native file reads. End the
     /// task with ide.stop.
     #[tool(name = "ide.start", input_schema = tool_schemas()[0].input_schema.as_object().expect("tool schema is an object").clone(),
@@ -4681,10 +4682,12 @@ impl StdioFacade {
         self.call(AssistanceTool::Diff, parameters, context).await
     }
 
-    /// Skeleton of a file (every symbol with signature, doc line and line numbers, members
-    /// indented, tests collapsed) or of a directory (files with line counts and first doc line).
-    /// A fraction of the cost of reading the file — use it before any native read of a source
-    /// file longer than a screen. Answers inline on a warm language server; a cold one answers
+    /// Skeletons of several files in ONE call: `ide.outline {"paths":["src/a.rs","src/b.rs"]}`
+    /// (up to 24) or `ide.outline {"glob":"src/**/*.rs"}`; a single `path` (a file, or a
+    /// directory: files with line counts and first doc line) still works. Each file: every
+    /// symbol with signature, doc line and line numbers, members indented, tests collapsed. A
+    /// fraction of the cost of reading the file — use it before any native read of a source file
+    /// longer than a screen. Answers inline on a warm language server; a cold one answers
     /// `pending` and the result arrives by itself.
     #[tool(name = "ide.outline", input_schema = tool_schemas()[6].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
@@ -4697,9 +4700,12 @@ impl StdioFacade {
             .await
     }
 
-    /// Body of one symbol (`file#Owner/name`) or an explicit line range, numbered, with its doc
-    /// header. The precise replacement for reading a whole file when you already know what you
-    /// need; its `source_ref` is what a full-file ide.edit is based on.
+    /// Read every body and range you need in ONE call:
+    /// `ide.read {"items":[{"symbol":"src/a.rs#Store/get"},{"path":"src/b.rs","lines":"10-40"}]}`
+    /// (up to 32 items across 16 files; one `source_ref` covers them all; an item unchanged since
+    /// your last read of it may answer `unchanged since your read`, and `"force":true` returns the
+    /// text). The single `symbol`, or `path` with `lines`, still works. Numbered bodies with doc
+    /// headers replace reading whole files; the `source_ref` is what ide.edit is based on.
     #[tool(name = "ide.read", input_schema = tool_schemas()[7].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn read(
@@ -4710,11 +4716,14 @@ impl StdioFacade {
         self.call(AssistanceTool::Read, parameters, context).await
     }
 
-    /// Symbol card for `file#Owner/name` or a bare name: resolved signature, doc, definition
-    /// location, usages split src/tests with the source line, callers and callees as full symbol
-    /// paths, and with `history: true` the last commits touching the definition. Language-server
-    /// accurate — replaces grep for usages and reading files to find callers. A bare name with
-    /// several matches returns the candidate paths.
+    /// Symbol cards for several symbols in ONE call:
+    /// `ide.symbol {"symbols":["src/a.rs#Store/get","Kind"],"usages":true,"callers":1}` (up to 8);
+    /// a single `symbol` still works. Each card: resolved signature, doc, definition location,
+    /// usages split src/tests with the source line (construction sites tagged), callers and
+    /// callees as full symbol paths, and with `history: true` the last commits touching the
+    /// definition. Language-server accurate — replaces grep for usages and reading files to find
+    /// callers. Before adding a field or changing a constructor, list the construction sites
+    /// here. A bare name with several matches returns the candidate paths.
     #[tool(name = "ide.symbol", input_schema = tool_schemas()[8].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn symbol(
@@ -4725,10 +4734,12 @@ impl StdioFacade {
         self.call(AssistanceTool::Symbol, parameters, context).await
     }
 
-    /// Bounded call graph around one symbol: callers, callees or both, depth 1–3, at most 60
-    /// nodes, every node a full symbol path, cycles marked `(seen)`, tests collapsed into `+N tests` per parent (set `tests: true` to list them). Use
-    /// it to see the blast radius before changing a function or to trace how a call reaches a
-    /// symbol, instead of chained greps.
+    /// Call graphs for several roots in ONE call:
+    /// `ide.graph {"symbols":["src/a.rs#f","src/b.rs#g"],"direction":"callers","depth":1}` (up to
+    /// 8); a single `symbol` still works. Bounded: callers, callees or both, depth 1–3, at most
+    /// 60 nodes, every node a full symbol path, cycles marked `(seen)`, tests collapsed into
+    /// `+N tests` per parent (set `tests: true` to list them). Before changing a signature, list
+    /// its call sites here (`direction: callers`) instead of chained greps.
     #[tool(name = "ide.graph", input_schema = tool_schemas()[9].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn graph(
@@ -4739,13 +4750,15 @@ impl StdioFacade {
         self.call(AssistanceTool::Graph, parameters, context).await
     }
 
-    /// Run tests selected by `symbol` (the tests that reference it), by `path`, by name
-    /// `pattern`, or an explicit `command`; one background run per worktree under `budget_s`.
+    /// Run several targets as ONE run:
+    /// `ide.test {"targets":[{"symbol":"src/a.rs#parse"},{"path":"tests/cli.rs"},{"pattern":"roles_"}]}`
+    /// (up to 8), or a single target: `symbol` (the tests that reference it), `path`, name
+    /// `pattern` or an explicit `command`; one background run per worktree under `budget_s`.
     /// Explicit commands may set a worktree-relative `cwd` and bounded inherited-environment
     /// overrides through `env`; their argv is limited to 16 KiB in total.
     /// Returns the pass/fail line with an exact rerun command; a run that outlasts the call
     /// answers `started` and its outcome (counts, up to eight failing tests, the rerun command,
-    /// the full-output reference) arrives by itself in an <agent-ide> block. Full output is paged
+    /// the full-output reference) arrives by itself in an `<agent-ide>` block. Full output is paged
     /// through ide.inspect (`status` re-reads a run). Known runner summaries are parsed regardless
     /// of how the runner was launched; otherwise the result includes the exit code and bounded
     /// output tail. Use it instead of running the test command in a shell: bounded selection and
@@ -4761,7 +4774,7 @@ impl StdioFacade {
     }
 
     /// Read what Agent IDE holds for you. Results of long work (test runs, project checks after
-    /// edits, answers that were pending) are pushed to you in an <agent-ide> block, so never poll
+    /// edits, answers that were pending) are pushed to you in an `<agent-ide>` block, so never poll
     /// for them. `{}` hands over everything ready now; `{"wait_ms": 120000}` waits once for the
     /// next result when you have nothing else to do; `detail_refs` answers several references in
     /// one call; `detail_ref` reads one result or its next page (outline, symbol, graph, diff,
@@ -4791,11 +4804,14 @@ impl StdioFacade {
         self.call(AssistanceTool::Stop, parameters, context).await
     }
 
-    /// Edit by symbol: `op` replace / insert / delete / rename on `file#Owner/name` (rename is
-    /// project-wide), or replace a `path` + `lines` range, or a full-file rewrite based on a
-    /// `source_ref`. Formats the result with the project formatter, runs the project check
-    /// ({project_checks}) and returns this file's errors and warnings in the reply; a check that
-    /// outlasts the call answers `diagnostics: pending` and its outcome arrives by itself.
+    /// Apply one logical change across files in ONE call:
+    /// `ide.edit {"operation_id":"add-field-1","source_ref":"…","files":[{"path":"src/a.rs","changes":[{"old":"x: 0,","new":"x: 0,\ny: 0,"}]},{"path":"src/new.rs","create":true,"content":"fn new() {}\n"}]}`
+    /// (up to 16 files). Everything is validated before the first write, and one project check
+    /// ({project_checks}) runs on the final state. The single-file forms still work: a `changes`
+    /// list, `op` replace / insert / delete / rename on `file#Owner/name` (rename is
+    /// project-wide), a `path` + `lines` range, or a full-file rewrite based on a `source_ref`.
+    /// Formats with the project formatter and returns errors and warnings in the reply; a check
+    /// that outlasts the call answers `diagnostics: pending` and its outcome arrives by itself.
     /// Prefer it over native edit/write for source: no line matching, no separate check step.
     #[tool(name = "ide.edit", input_schema = tool_schemas()[5].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false))]
@@ -4810,16 +4826,15 @@ impl StdioFacade {
 
 /// Connect-time instructions the host shows the model next to the tool list: the one-paragraph
 /// case for the IDE over native file tools, and the two rules every reply relies on.
-pub(super) const SERVER_INSTRUCTIONS: &str = "Agent IDE: language-server-backed tools for source work. \
-Call ide.start once per task, then prefer the ide.* tools over native file tools for source: \
-ide.outline instead of reading a file, ide.symbol / ide.graph instead of grep for usages and \
-callers, ide.read for one symbol's body, ide.edit for changes (formatted and project-checked in \
-the same reply), ide.test to run exactly the tests that matter, ide.diff to review, then \
-ide.stop at the end of the task. Symbols are addressed as `file#Owner/name`. Results of long \
-work (test runs, project checks after edits, answers that were pending) are pushed to you in an \
-<agent-ide> block after your next tool call or when you end your turn, so never poll for them; \
-if you have nothing else to do, call ide.inspect {\"wait_ms\": 120000} once. Native read/edit \
-tools remain available for non-source files and as a fallback.";
+pub(super) const SERVER_INSTRUCTIONS: &str = "Agent IDE: language-server-backed source tools. \
+Call ide.start once per task and ide.stop at the end. Prefer ide.* over native tools for \
+source: plan first, then read everything in ONE ide.read {\"items\":[…]}; ide.outline / \
+ide.symbol / ide.graph instead of reading files and grep; ONE ide.edit {\"files\":[…]} per \
+logical change, with one project check; ide.test for the tests that matter. Symbols are \
+`file#Owner/name`. Results of long work (test runs, project checks, pending answers) are pushed \
+to you in an <agent-ide> block after your next tool call or when you end your turn, so never \
+poll for them; with nothing else to do, call ide.inspect {\"wait_ms\": 120000} once. Native \
+tools remain for non-source files and as a fallback.";
 
 /// Ensures diagnostics hide both launch attachments and populated host metadata in either format.
 #[test]
