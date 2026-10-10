@@ -22,7 +22,7 @@ use super::{
         EffectRequest, Field, FileDocRequest, FileVerdict, FormatPlanRequest, InsertSiteRequest,
         LinkageCoverage, LinkageQuery, Location, MAX_RESOLVE_CANDIDATES, Param, ProjectQuery,
         ResolveAnswer, ResolveCandidate, SourceAnalysis, SourceField, SourceRef, SourceText,
-        SyntaxQuery, TestFacts, TestParseRequest, TestPlanQuery, decode, encode,
+        SyntaxQuery, TestFacts, TestParseRequest, TestPlanQuery, TestRun, decode, encode,
     },
     serve::{Answer, Effects, Incoming, ModuleServer, ServeError},
 };
@@ -89,14 +89,15 @@ impl SupportServer {
         }
     }
 
-    /// The adapter whose formatter and syntax-probe plans become requests of the language's
-    /// declared recipes through `plans`.
+    /// The adapter whose formatter, syntax-probe and test-run plans become requests of the
+    /// language's declared recipes through `plans`.
     pub fn with_effect_plans(mut self, plans: EffectPlans) -> Self {
         self.plans = Some(plans);
         self
     }
 
-    /// The effect request of one formatter or probe argument vector.
+    /// The effect request of one formatter, probe or test-run argument vector; the generic `argv`
+    /// request (which the core refuses) when `plans` has none.
     fn plan(&self, argv: &[String]) -> EffectRequest {
         self.plans
             .and_then(|plans| plans(argv))
@@ -293,6 +294,14 @@ impl SupportServer {
                 TestPlanQuery::Selection { project, target } => {
                     encode(&support.test_selection(&project, &target))
                 }
+                TestPlanQuery::Run { project, target } => encode(
+                    &support
+                        .test_selection(&project, &target)
+                        .map(|selection| TestRun {
+                            effect: self.plan(&selection.command),
+                            tests: selection.tests,
+                        }),
+                ),
                 TestPlanQuery::TestIds {
                     file,
                     outline_paths,

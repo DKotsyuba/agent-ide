@@ -626,7 +626,7 @@ async fn observe_typescript_inputs(
         ));
     };
     let reading = (worktree.clone(), relative.clone(), roots.clone());
-    let mut observed = tokio::task::spawn_blocking(move || {
+    let observed = tokio::task::spawn_blocking(move || {
         let (worktree, relative, roots) = reading;
         let path_proof = proof(worktree.worktree_path(), &roots);
         crate::profile::ObservedInputs::read_candidates(&worktree, &relative, &path_proof)
@@ -634,63 +634,74 @@ async fn observe_typescript_inputs(
     .await
     .map_err(|_| FailureCode::Internal)?
     .map_err(|rejection| reject(job, rejection))?;
-    // References are followed one round at a time; nesting is refused, so two suffice.
-    for _ in 0..4 {
-        let verdict = match agent_ide_core::modules::calls::project_inputs(
-            crate::LANGUAGE,
-            worktree.worktree_path(),
-            &relative,
-            observed.inputs.clone(),
-        )
-        .await
-        {
-            Some(Ok(verdict)) => verdict,
-            Some(Err(failure)) => {
-                job.set_stage_failure(
-                    &FailureCode::ProviderUnavailable,
-                    &format!("typescript: {failure}"),
-                );
-                return Err(FailureCode::ProviderUnavailable);
+    // The module interprets what the core read; a file it asks for next is read by the core
+    // alone (path proof, bounds), here synchronously: a few bounded configuration files.
+    // ponytail: blocking reads on the worker, at most the resolution budget (8 MiB); move to
+    // the blocking pool if a project ever chains many large `references` targets.
+    let initial = observed.inputs.clone();
+    let state = std::sync::Mutex::new(observed);
+    let refusal = std::sync::Mutex::new(None::<crate::profile::ResolutionRejection>);
+    let path_proof = proof(worktree.worktree_path(), &roots);
+    let verdict = agent_ide_core::modules::calls::project_inputs(
+        crate::LANGUAGE,
+        worktree.worktree_path(),
+        &relative,
+        initial,
+        |path: &Path| {
+            let mut state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match state.read_referenced(&worktree, &[path.to_path_buf()], &path_proof) {
+                Ok(()) => state.inputs.last().cloned(),
+                Err(rejection) => {
+                    *refusal
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rejection);
+                    None
+                }
             }
-            None => return Err(FailureCode::Internal),
-        };
-        match verdict {
-            agent_ide_core::modules::payload::InputsVerdict::Accepted => {
-                return ProjectResolutionInputsV1::from_accepted(
-                    worktree, document, &bundle, &observed,
-                )
+        },
+    )
+    .await;
+    let observed = state
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let verdict = match verdict {
+        Some(Ok(verdict)) => verdict,
+        Some(Err(failure)) => {
+            job.set_stage_failure(
+                &FailureCode::ProviderUnavailable,
+                &format!("typescript: {failure}"),
+            );
+            return Err(FailureCode::ProviderUnavailable);
+        }
+        None => return Err(FailureCode::Internal),
+    };
+    match verdict {
+        agent_ide_core::modules::payload::InputsVerdict::Accepted => {
+            ProjectResolutionInputsV1::from_accepted(worktree, document, &bundle, &observed)
                 .map_err(|_| {
                     job.set_failure_detail(TYPESCRIPT_INPUTS_CHANGED.to_owned());
                     FailureCode::ResolutionUnverified
-                });
-            }
-            agent_ide_core::modules::payload::InputsVerdict::Rejected { file, reason } => {
-                return Err(reject(
-                    job,
-                    crate::profile::ResolutionRejection { file, reason },
-                ));
-            }
-            agent_ide_core::modules::payload::InputsVerdict::Need { paths } => {
-                let (reading, roots) = (worktree.clone(), roots.clone());
-                observed = tokio::task::spawn_blocking(move || {
-                    let path_proof = proof(reading.worktree_path(), &roots);
-                    observed
-                        .read_referenced(&reading, &paths, &path_proof)
-                        .map(|()| observed)
                 })
-                .await
-                .map_err(|_| FailureCode::Internal)?
-                .map_err(|rejection| reject(job, rejection))?;
-            }
         }
+        agent_ide_core::modules::payload::InputsVerdict::Rejected { file, reason } => {
+            // The core's own refusal of a file it was asked to read keeps its reason.
+            let rejection = refusal
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .filter(|rejection| rejection.file == file)
+                .unwrap_or(crate::profile::ResolutionRejection { file, reason });
+            Err(reject(job, rejection))
+        }
+        agent_ide_core::modules::payload::InputsVerdict::Need { .. } => Err(reject(
+            job,
+            crate::profile::ResolutionRejection {
+                file: None,
+                reason: "project references were not settled".to_owned(),
+            },
+        )),
     }
-    Err(reject(
-        job,
-        crate::profile::ResolutionRejection {
-            file: None,
-            reason: "project references were not settled within four reads".to_owned(),
-        },
-    ))
 }
 
 impl TypeScriptBackend {

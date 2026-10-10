@@ -507,13 +507,26 @@ pub fn expand_staged(
                     .ok_or_else(|| Refusal::Missing((*name).to_owned()))?
                     .into(),
             ),
-            Arg::Each(name) => args.extend(
-                paths
-                    .get(name)
-                    .into_iter()
-                    .flatten()
-                    .map(|path| path.clone().into_os_string()),
-            ),
+            Arg::Each(name) => match effect.params.get(*name) {
+                Some(Param::Tokens(tokens)) => {
+                    for token in tokens {
+                        if token.is_empty() || token.contains('\0') || token.starts_with('-') {
+                            return Err(Refusal::WrongKind((*name).to_owned()));
+                        }
+                        args.push(token.into());
+                    }
+                }
+                // Admitted paths (none when the optional list is absent); any other kind would
+                // be dropped silently and widen the run, so it is refused.
+                Some(Param::Paths(_) | Param::Path(_)) | None => args.extend(
+                    paths
+                        .get(name)
+                        .into_iter()
+                        .flatten()
+                        .map(|path| path.clone().into_os_string()),
+                ),
+                Some(_) => return Err(Refusal::WrongKind((*name).to_owned())),
+            },
             Arg::Joined(prefix, name) => args.push(
                 format!(
                     "{prefix}{}",
@@ -1160,6 +1173,79 @@ mod tests {
             max_output_bytes: 64 << 20,
         };
         assert_eq!(spec, expected);
+    }
+
+    /// Tokens expand in order where the template says `Each`; an empty token, one with NUL or
+    /// one that could become an option (`-…`) is refused, as are tokens where one value goes and
+    /// a single token or scalar where a list goes; an absent list expands to nothing.
+    #[test]
+    fn tokens_expand_as_positional_arguments_only() {
+        const RUN: EffectRecipe = EffectRecipe {
+            id: "test",
+            program: "runner",
+            args: &[
+                Arg::Literal("run"),
+                Arg::Literal("--"),
+                Arg::Each("selection"),
+            ],
+            env: &[],
+            paths: &[],
+            executables: &[ExecutableSlot {
+                name: "runner",
+                source: SlotSource::HomeTool("runner"),
+            }],
+            stdin: Stdin::Null,
+            class: RunClass::Test,
+            timeout_ceiling_ms: 600_000,
+            capture_bytes: 8 << 20,
+            assets: &[],
+        };
+        let layout = Layout::new("tokens");
+        let programs = [("runner".to_owned(), PathBuf::from("/usr/bin/true"))];
+        let admission = layout.admission(&programs, &[], &[]);
+        let request = |tokens: &[&str]| EffectRequest {
+            recipe: "test".into(),
+            params: BTreeMap::from([
+                ("runner".into(), Param::Executable("runner".into())),
+                (
+                    "selection".into(),
+                    Param::Tokens(tokens.iter().map(|token| (*token).to_owned()).collect()),
+                ),
+            ]),
+        };
+        let spec = expand(&[RUN], &request(&["tests/a.py::one", "b c"]), &admission).unwrap();
+        assert_eq!(spec.args, ["run", "--", "tests/a.py::one", "b c"]);
+        for bad in ["", "-k", "a\0b"] {
+            assert_eq!(
+                expand(&[RUN], &request(&["ok", bad]), &admission),
+                Err(Refusal::WrongKind("selection".into())),
+                "{bad:?}"
+            );
+        }
+        // A single token or scalar where the list goes is refused, never dropped (which would
+        // run every test); an absent list stays empty.
+        for value in [Param::Token("tests/a.py".into()), Param::Scalar(1)] {
+            let mut request = request(&["one"]);
+            request.params.insert("selection".into(), value);
+            assert_eq!(
+                expand(&[RUN], &request, &admission),
+                Err(Refusal::WrongKind("selection".into()))
+            );
+        }
+        let mut absent = request(&["one"]);
+        absent.params.remove("selection");
+        assert_eq!(
+            expand(&[RUN], &absent, &admission).unwrap().args,
+            ["run", "--"]
+        );
+        const SINGLE: EffectRecipe = EffectRecipe {
+            args: &[Arg::Param("selection")],
+            ..RUN
+        };
+        assert_eq!(
+            expand(&[SINGLE], &request(&["one"]), &admission),
+            Err(Refusal::WrongKind("selection".into()))
+        );
     }
 
     /// A root outside its rule, an undeclared parameter, an undeclared slot and a linker name

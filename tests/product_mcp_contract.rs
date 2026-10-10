@@ -11840,10 +11840,9 @@ async fn configured_product_links_css_html_and_python_names() {
         .await;
     let started = actor.settle(&fixture, started).await;
     assert!(
-        started["text"]
-            .as_str()
-            .unwrap()
-            .contains("\nlinks: class, id, style-variable facts from typescript, css, html"),
+        started["text"].as_str().unwrap().contains(
+            "\nlinks: class, id, file-ref, style-variable facts from typescript, css, html"
+        ),
         "{started}"
     );
     let symbol = async |actor: &mut ProductActor, requested: &str| {
@@ -11985,7 +11984,7 @@ async fn product_start_prewarms_the_name_index() {
     // The prewarm starts before the card; a small tree may already be indexed when it renders.
     let first = started["text"].as_str().unwrap();
     assert!(
-        first.contains("\nlinks: class, id, style-variable facts from css, html"),
+        first.contains("\nlinks: class, id, style-variable, file-ref facts from css, html"),
         "{first}"
     );
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -12010,7 +12009,9 @@ async fn product_start_prewarms_the_name_index() {
     let again = next.settle(&fixture, again).await;
     let text = again["text"].as_str().unwrap_or_else(|| panic!("{again}"));
     assert!(
-        text.contains("links: class, id, style-variable facts from css, html (indexed 3 files, "),
+        text.contains(
+            "links: class, id, style-variable, file-ref facts from css, html (indexed 3 files, "
+        ),
         "{text}"
     );
     next.call(&fixture, "ide.stop", json!({})).await;
@@ -12125,7 +12126,9 @@ async fn product_second_worktree_inherits_the_name_index() {
         .unwrap_or_else(|| panic!("{started}"));
     assert!(text.contains("root: "), "{text}");
     assert!(
-        text.contains("links: class, id, style-variable facts from css, html (indexed 3 files, "),
+        text.contains(
+            "links: class, id, style-variable, file-ref facts from css, html (indexed 3 files, "
+        ),
         "{text}"
     );
     // The card must carry the inherited index's rows. Whether it answers inline or first as

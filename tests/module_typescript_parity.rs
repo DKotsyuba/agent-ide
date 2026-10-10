@@ -556,7 +556,10 @@ async fn node_transcript(env: &[(&str, &str)]) -> (Vec<String>, String) {
         json!({"command":["node","--test","--test-reporter=tap","test/fail.test.mjs"]}),
     ] {
         let (reply, _) = run_tests(&mut session, &fixture, arguments.clone()).await;
-        replies.push(line_for(&fixture, "ide.test", &arguments, &reply));
+        // Node reports the canonical spelling of the fixture root (`/private/var/…`).
+        let canonical = fixture.root.canonicalize().unwrap().display().to_string();
+        replies
+            .push(line_for(&fixture, "ide.test", &arguments, &reply).replace(&canonical, "<root>"));
     }
     let rename = json!({"operation_id":"rename-port","op":"rename","symbol":"src/index.js#PORT","new_name":"LISTEN_PORT"});
     let reply = session.call(&fixture, "ide.edit", rename.clone()).await;

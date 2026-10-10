@@ -2522,7 +2522,7 @@ impl<'a> Worker<'a> {
             let mut explicit_command = false;
             let mut command_cwd = root.clone();
             let mut command_env = Vec::new();
-            let (argv, language, selected_count) = if let Some(path) = job
+            let (argv, language, selected_count, admitted) = if let Some(path) = job
                 .parameters
                 .get("path")
                 .and_then(Value::as_str)
@@ -2560,7 +2560,7 @@ impl<'a> Worker<'a> {
                         None,
                     ));
                 }
-                match test_selection(&root, crate::lang::TestTarget::File(target))
+                match test_selection(&root, crate::lang::TestTarget::File(target), budget)
                     .await
                     .map_err(|failure| symbols::module_failure(job, &failure))?
                 {
@@ -2579,9 +2579,13 @@ impl<'a> Worker<'a> {
                     Err(_) => return Err(FailureCode::ProviderUnavailable),
                 }
             } else if let Some(pattern) = job.parameters.get("pattern").and_then(Value::as_str) {
-                match test_selection(&root, crate::lang::TestTarget::Pattern(pattern.to_owned()))
-                    .await
-                    .map_err(|failure| symbols::module_failure(job, &failure))?
+                match test_selection(
+                    &root,
+                    crate::lang::TestTarget::Pattern(pattern.to_owned()),
+                    budget,
+                )
+                .await
+                .map_err(|failure| symbols::module_failure(job, &failure))?
                 {
                     Ok(selection) => selection,
                     Err(crate::lang::LangError::Unsupported(message)) => return Ok((
@@ -2637,7 +2641,7 @@ impl<'a> Worker<'a> {
                     return Err(FailureCode::ProviderUnavailable);
                 };
                 explicit_command = true;
-                (argv, language, None)
+                (argv, language, None, None)
             } else if let Some(symbol) = job
                 .parameters
                 .get("symbol")
@@ -2711,8 +2715,8 @@ impl<'a> Worker<'a> {
                     .await
                     .map_err(|failure| symbols::module_failure(job, &failure))?
                     .ok_or(FailureCode::ProviderUnavailable)?;
-                let selection = match crate::modules::calls::test_selection(
-                    language, &root, &project, &target,
+                let selection = match crate::modules::calls::test_run(
+                    language, &root, &project, &target, budget,
                 )
                 .await
                 .map_err(|failure| symbols::module_failure(job, &failure))?
@@ -2751,7 +2755,7 @@ impl<'a> Worker<'a> {
                 } else {
                     format!("{} tests selected", selection.tests.len())
                 });
-                (selection.command, language, count)
+                (selection.command, language, count, selection.spec)
             } else {
                 return Ok((
                     PeerReply::Error {
@@ -2777,32 +2781,53 @@ impl<'a> Worker<'a> {
             if own_run.is_none() {
                 // The command environment is the language's computation, resolved before the
                 // run starts (in process or by its module).
-                let resolution = super::tests::resolve_command(
-                    &root,
-                    if explicit_command {
-                        &command_cwd
-                    } else {
-                        &root
-                    },
-                    &argv,
-                    (!explicit_command).then_some(language),
-                )
-                .await
-                .map_err(|failure| symbols::module_failure(job, &failure))?;
-                let start = self.shared.test_runs.start_with_options(
-                    root.clone(),
-                    argv.clone(),
-                    &binding,
-                    super::tests::TestCommandOptions {
-                        cwd: command_cwd,
-                        env: command_env,
-                        language,
-                        command_language: (!explicit_command).then_some(language),
-                        budget,
-                        detail_ref: job.reference.clone(),
-                        resolution,
-                    },
-                );
+                let start = match admitted {
+                    // A module-planned run is exactly the specification the core admitted from
+                    // the language's declared test recipe: its program, arguments, directory
+                    // and complete environment, with no command environment of the language.
+                    Some(spec) => {
+                        let label = super::tests::command_environment_label(&root, &root, language)
+                            .await
+                            .map_err(|failure| symbols::module_failure(job, &failure))?;
+                        self.shared.test_runs.start_admitted(
+                            root.clone(),
+                            spec,
+                            &binding,
+                            language,
+                            budget,
+                            job.reference.clone(),
+                            label,
+                        )
+                    }
+                    None => {
+                        let resolution = super::tests::resolve_command(
+                            &root,
+                            if explicit_command {
+                                &command_cwd
+                            } else {
+                                &root
+                            },
+                            &argv,
+                            (!explicit_command).then_some(language),
+                        )
+                        .await
+                        .map_err(|failure| symbols::module_failure(job, &failure))?;
+                        self.shared.test_runs.start_with_options(
+                            root.clone(),
+                            argv.clone(),
+                            &binding,
+                            super::tests::TestCommandOptions {
+                                cwd: command_cwd,
+                                env: command_env,
+                                language,
+                                command_language: (!explicit_command).then_some(language),
+                                budget,
+                                detail_ref: job.reference.clone(),
+                                resolution,
+                            },
+                        )
+                    }
+                };
                 match start {
                     StartResult::Started(id) => {
                         if explicit_command {
@@ -7363,8 +7388,17 @@ async fn detect_test_language(
 async fn test_selection(
     root: &Path,
     target: crate::lang::TestTarget,
+    budget: Duration,
 ) -> Result<
-    Result<(Vec<String>, crate::lang::Language, Option<String>), crate::lang::LangError>,
+    Result<
+        (
+            Vec<String>,
+            crate::lang::Language,
+            Option<String>,
+            Option<crate::checks::runner::RunSpec>,
+        ),
+        crate::lang::LangError,
+    >,
     crate::modules::contract::ModuleUnavailable,
 > {
     let projects = test_projects(root).await?;
@@ -7383,13 +7417,13 @@ async fn test_selection(
         )));
     };
     let selection =
-        match crate::modules::calls::test_selection(*language, root, project, &target).await? {
+        match crate::modules::calls::test_run(*language, root, project, &target, budget).await? {
             Ok(selection) => selection,
             Err(error) => return Ok(Err(error)),
         };
     let count = (!selection.tests.is_empty())
         .then_some(format!("{} tests selected", selection.tests.len()));
-    Ok(Ok((selection.command, *language, count)))
+    Ok(Ok((selection.command, *language, count, selection.spec)))
 }
 
 /// Formats an argv vector for the compact test status line without shell interpretation.

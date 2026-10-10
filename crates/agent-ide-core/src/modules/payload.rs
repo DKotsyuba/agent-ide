@@ -21,7 +21,7 @@ use crate::{
     checks::CheckRequest,
     lang::{
         InsertSite, InsertWhere, LangError, LanguageProject, Outline, ProbePrograms, SymbolKind,
-        SymbolPath, SyntaxVerdict, TestSelection, TestTarget,
+        SymbolPath, SyntaxVerdict, TestId, TestSelection, TestTarget,
         environment::{CommandEnv, EnvSelection, ResolvedEnv},
     },
 };
@@ -592,6 +592,14 @@ pub enum TestPlanQuery {
         /// The target.
         target: TestTarget,
     },
+    /// The run of `test_selection` as a recipe request; answers [`RunAnswer`]. The core runs
+    /// module-planned tests only this way (an explicit `ide.test` command keeps its own path).
+    Run {
+        /// The project.
+        project: Box<LanguageProject>,
+        /// The target.
+        target: TestTarget,
+    },
     /// `test_id` for each outline path of `file`; answers `Vec<String>` in the same order.
     TestIds {
         /// Root-relative file.
@@ -603,6 +611,20 @@ pub enum TestPlanQuery {
 
 /// Answer of [`TestPlanQuery::Selection`].
 pub type SelectionAnswer = Result<TestSelection, LangError>;
+
+/// A selected test run as a finite recipe request: the tests it runs and the run of one of the
+/// language's declared test recipes, which the core alone admits and expands.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestRun {
+    /// The selected tests.
+    pub tests: Vec<TestId>,
+    /// The recipe request that runs them.
+    pub effect: EffectRequest,
+}
+
+/// Answer of [`TestPlanQuery::Run`].
+pub type RunAnswer = Result<TestRun, LangError>;
 
 /// `test_parse`: runner output as attachments; answers [`TestReport`](crate::lang::TestReport).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -673,6 +695,9 @@ pub enum Param {
     Executable(String),
     /// A literal argument or environment value.
     Token(String),
+    /// Positional argument tokens (a test selection), expanded in order by [`Arg::Each`]: each
+    /// non-empty, without NUL and not starting with `-`, so it can never become an option.
+    Tokens(Vec<String>),
     /// Environment entries whose names must match the recipe's [`EnvRule::Pattern`].
     Env(BTreeMap<String, String>),
     /// A bounded scalar.
@@ -724,7 +749,8 @@ pub enum Arg {
     Literal(&'static str),
     /// The value of a named [`Param::Path`] (admitted), [`Param::Token`] or [`Param::Scalar`].
     Param(&'static str),
-    /// Every admitted value of a named [`Param::Paths`], in order.
+    /// Every admitted value of a named [`Param::Paths`], or every token of a named
+    /// [`Param::Tokens`], in order.
     Each(&'static str),
     /// `--flag=<value>`-style concatenation of a literal prefix and a named parameter.
     Joined(&'static str, &'static str),
@@ -906,6 +932,8 @@ pub enum RunClass {
     Interactive,
     /// Project checks; never holds the interactive lane.
     Background,
+    /// A module-planned test run: an `ide.test` job under the call's own budget.
+    Test,
 }
 
 /// A finite effect recipe, compiled into the root's language descriptor as data. The module
@@ -975,15 +1003,26 @@ pub enum DescribeQuery {
         worktree: PathBuf,
     },
     /// The language's interpretation of the project files the core read for `document` (exact
-    /// reads, path admission and bounds stay with the core); answers [`InputsVerdict`]. Stateless:
-    /// the core repeats the query with more inputs while the verdict asks for them.
+    /// reads, path admission, bounds, digests and re-observation stay with the core); answers
+    /// [`InputsVerdict`]. Stateless: the core repeats it with more inputs while the verdict
+    /// asks for them, at most [`MAX_INPUT_ROUNDS`] times. File contents travel as byte
+    /// attachments of the same message, never inside this control body.
     ProjectInputs {
         /// Worktree-relative document.
         document: PathBuf,
-        /// Every input read so far.
+        /// Every input read so far, at most [`MAX_PROJECT_INPUTS`].
         inputs: Vec<ProjectInput>,
     },
 }
+
+/// Most inputs one [`DescribeQuery::ProjectInputs`] carries.
+pub const MAX_PROJECT_INPUTS: usize = 256;
+/// Most paths one [`InputsVerdict::Need`] asks for.
+pub const MAX_NEEDED_PATHS: usize = 64;
+/// Longest [`InputsVerdict::Rejected`] reason, in bytes.
+pub const MAX_INPUTS_REASON: usize = 512;
+/// Most [`DescribeQuery::ProjectInputs`] rounds for one document.
+pub const MAX_INPUT_ROUNDS: usize = 8;
 
 /// One project file the core read for a language's interpretation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -993,10 +1032,11 @@ pub struct ProjectInput {
     pub path: PathBuf,
     /// Exact byte length.
     pub bytes: u64,
-    /// BLAKE3 digest of the bytes, hex.
+    /// BLAKE3 digest of the bytes, lowercase hex.
     pub blake3: String,
-    /// The text, for a file the language parses; `None` for one it only fingerprints.
-    pub contents: Option<String>,
+    /// The id of the attachment carrying the exact bytes, for a file the language parses;
+    /// `None` for one it only fingerprints.
+    pub contents: Option<u32>,
 }
 
 /// What a language makes of the project inputs read so far.
@@ -1007,16 +1047,43 @@ pub enum InputsVerdict {
     Accepted,
     /// Further files must be read (and the query repeated with them).
     Need {
-        /// Worktree-relative paths, in the order the language wants them.
+        /// Worktree-relative paths, in the order the language wants them, at most
+        /// [`MAX_NEEDED_PATHS`].
         paths: Vec<PathBuf>,
     },
     /// The document cannot be served from these inputs.
     Rejected {
         /// The input the refusal concerns, if one.
         file: Option<PathBuf>,
-        /// Short plain-words reason.
+        /// Short plain-words reason, at most [`MAX_INPUTS_REASON`] bytes.
         reason: String,
     },
+}
+
+impl InputsVerdict {
+    /// Whether the verdict keeps its bounds: at most [`MAX_NEEDED_PATHS`] relative paths
+    /// without `..`, a reason of at most [`MAX_INPUTS_REASON`] bytes without control characters.
+    pub fn bounded(&self) -> bool {
+        let relative = |path: &Path| {
+            !path.as_os_str().is_empty()
+                && path
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_)))
+        };
+        match self {
+            Self::Accepted => true,
+            Self::Need { paths } => {
+                !paths.is_empty()
+                    && paths.len() <= MAX_NEEDED_PATHS
+                    && paths.iter().all(|path| relative(path))
+            }
+            Self::Rejected { file, reason } => {
+                reason.len() <= MAX_INPUTS_REASON
+                    && !reason.chars().any(char::is_control)
+                    && file.as_deref().is_none_or(relative)
+            }
+        }
+    }
 }
 
 /// One accepted executable as the launcher declares it.

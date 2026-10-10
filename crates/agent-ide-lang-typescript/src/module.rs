@@ -433,6 +433,28 @@ const fn interactive(
     }
 }
 
+/// A test run: a home tool selecting `files` (positional tokens) and, when named, one pattern.
+const fn test_run(
+    id: &'static str,
+    program: &'static str,
+    args: &'static [Arg],
+    env: &'static [EnvRule],
+) -> EffectRecipe {
+    EffectRecipe {
+        id,
+        program,
+        args,
+        env,
+        paths: &[],
+        executables: HOME_TOOLS,
+        stdin: Stdin::Null,
+        class: RunClass::Test,
+        timeout_ceiling_ms: 600_000,
+        capture_bytes: 16 << 20,
+        assets: &[],
+    }
+}
+
 const NPX_ENV: [EnvRule; 2] = tool_env("npx");
 const NODE_TOOL_ENV: [EnvRule; 2] = tool_env("node");
 
@@ -461,6 +483,61 @@ pub const RECIPES: &[EffectRecipe] = &[
         ],
         &PATH_ENV,
     ),
+    test_run(
+        "test-node",
+        "node",
+        &[Arg::Literal("--test"), Arg::Each("files")],
+        &NODE_TOOL_ENV,
+    ),
+    test_run(
+        "test-node-named",
+        "node",
+        &[
+            Arg::Literal("--test"),
+            Arg::Joined("--test-name-pattern=", "pattern"),
+            Arg::Each("files"),
+        ],
+        &NODE_TOOL_ENV,
+    ),
+    test_run(
+        "test-vitest",
+        "npx",
+        &[
+            Arg::Literal("vitest"),
+            Arg::Literal("run"),
+            Arg::Each("files"),
+        ],
+        &NPX_ENV,
+    ),
+    test_run(
+        "test-vitest-named",
+        "npx",
+        &[
+            Arg::Literal("vitest"),
+            Arg::Literal("run"),
+            Arg::Each("files"),
+            Arg::Literal("-t"),
+            Arg::Param("pattern"),
+        ],
+        &NPX_ENV,
+    ),
+    test_run(
+        "test-jest",
+        "npx",
+        &[Arg::Literal("jest"), Arg::Each("files")],
+        &NPX_ENV,
+    ),
+    test_run(
+        "test-jest-named",
+        "npx",
+        &[
+            Arg::Literal("jest"),
+            Arg::Each("files"),
+            Arg::Literal("-t"),
+            Arg::Param("pattern"),
+        ],
+        &NPX_ENV,
+    ),
     interactive(
         "ts-probe-tool",
         "node",
@@ -479,7 +556,52 @@ pub const RECIPES: &[EffectRecipe] = &[
 pub fn interactive_effect(argv: &[String]) -> Option<EffectRequest> {
     let words: Vec<&str> = argv.iter().map(String::as_str).collect();
     let token = |value: &str| Param::Token(value.to_owned());
+    let files =
+        |files: &[&str]| Param::Tokens(files.iter().map(|file| (*file).to_owned()).collect());
     let (recipe, params): (&str, Vec<(&str, Param)>) = match words.as_slice() {
+        ["node", "--test", pattern, rest @ ..] if pattern.starts_with("--test-name-pattern=") => (
+            "test-node-named",
+            vec![
+                ("node", Param::Executable("node".to_owned())),
+                ("pattern", token(&pattern["--test-name-pattern=".len()..])),
+                ("files", files(rest)),
+            ],
+        ),
+        ["node", "--test", rest @ ..] => (
+            "test-node",
+            vec![
+                ("node", Param::Executable("node".to_owned())),
+                ("files", files(rest)),
+            ],
+        ),
+        ["npx", runner @ ("vitest" | "jest"), rest @ ..] => {
+            let rest = if *runner == "vitest" {
+                match rest {
+                    ["run", rest @ ..] => rest,
+                    _ => return None,
+                }
+            } else {
+                rest
+            };
+            let (selected, pattern) = match rest {
+                [selected @ .., "-t", pattern] => (selected, Some(*pattern)),
+                _ => (rest, None),
+            };
+            let recipe = match (*runner, pattern.is_some()) {
+                ("vitest", false) => "test-vitest",
+                ("vitest", true) => "test-vitest-named",
+                (_, false) => "test-jest",
+                (_, true) => "test-jest-named",
+            };
+            let mut params = vec![
+                ("npx", Param::Executable("npx".to_owned())),
+                ("files", files(selected)),
+            ];
+            if let Some(pattern) = pattern {
+                params.push(("pattern", token(pattern)));
+            }
+            (recipe, params)
+        }
         ["npx", "prettier", "--stdin-filepath", file] => (
             "prettier-npx",
             vec![
@@ -733,9 +855,36 @@ fn describe(request: &Incoming) -> Answer {
         Ok(DescribeQuery::Presence { worktree }) => {
             reply(encode(&TypeScriptChecks.is_present(&worktree)))
         }
-        Ok(DescribeQuery::ProjectInputs { document, inputs }) => reply(encode(
-            &crate::profile::interpret_inputs(&document, &inputs),
-        )),
+        Ok(DescribeQuery::ProjectInputs { document, inputs }) => {
+            let mut files = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                let text = match input.contents {
+                    Some(id) => match request.attachment(id) {
+                        Some(attachment) => Some(attachment.bytes.clone()),
+                        None => {
+                            return Answer::error(ErrorCode::InvalidRequest, "input bytes missing");
+                        }
+                    },
+                    None => None,
+                };
+                let Ok(blake3) = blake3::Hash::from_hex(&input.blake3) else {
+                    return Answer::error(ErrorCode::InvalidRequest, "input digest");
+                };
+                // Bytes the core described are the bytes it sent.
+                if text.as_ref().is_some_and(|bytes| {
+                    bytes.len() as u64 != input.bytes || blake3::hash(bytes) != blake3
+                }) {
+                    return Answer::error(ErrorCode::InvalidRequest, "input bytes differ");
+                }
+                files.push(crate::profile::InputFile {
+                    path: input.path,
+                    bytes: input.bytes,
+                    blake3,
+                    text,
+                });
+            }
+            reply(encode(&crate::profile::interpret_inputs(&document, &files)))
+        }
         Err(error) => Answer::error(ErrorCode::InvalidRequest, error),
     }
 }
@@ -1158,6 +1307,18 @@ mod tests {
                 "a.tsx",
             ],
             vec!["node", "-e", probe, module_text.as_str(), "a.mjs"],
+            vec!["node", "--test"],
+            vec!["node", "--test", "test/a.test.mjs", "test/b.test.mjs"],
+            vec![
+                "node",
+                "--test",
+                "--test-name-pattern=adds|sub tracts",
+                "test/a.test.mjs",
+            ],
+            vec!["npx", "vitest", "run", "src/a.test.ts"],
+            vec!["npx", "vitest", "run", "src/a.test.ts", "-t", "x y"],
+            vec!["npx", "jest", "src/a.test.ts"],
+            vec!["npx", "jest", "src/a.test.ts", "-t", "-leading dash"],
         ] {
             let argv: Vec<String> = argv.into_iter().map(str::to_owned).collect();
             let effect = interactive_effect(&argv).expect("a recipe request");

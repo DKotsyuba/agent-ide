@@ -206,7 +206,7 @@ impl Launcher for ExecutionLauncher {
         })
     }
 
-    /// Waits up to [`EXIT_GRACE`] for a voluntary exit (without reaping), then tears the owned
+    /// Waits up to `EXIT_GRACE` for a voluntary exit (without reaping), then tears the owned
     /// group down and reaps; a proven reap releases the admission slot.
     async fn reap(&mut self, process: Self::Process) -> Result<(), Cause> {
         let until = tokio::time::Instant::now() + EXIT_GRACE;

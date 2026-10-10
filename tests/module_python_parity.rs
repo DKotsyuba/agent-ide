@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use parity::{Daemon, Fixture, LANGUAGE_MODE, Node, ProcessIdentity, Session, line};
+use parity::{Daemon, Fixture, LANGUAGE_MODE, Node, ProcessIdentity, Session, line_for};
 use serde_json::{Value, json};
 
 /// The in-process fallback of the Python module.
@@ -49,9 +49,15 @@ fn pyright_provider(cache_namespace: &str) -> Value {
 
 /// A `.venv` in `dir` whose `bin/python` links the accepted `AGENT_IDE_PYTHON` interpreter.
 fn python_venv_at(dir: &Path) {
+    python_venv_named(dir, ".venv");
+}
+
+/// A virtual environment `name` in `dir` whose `bin/python` links the accepted
+/// `AGENT_IDE_PYTHON` interpreter.
+fn python_venv_named(dir: &Path, name: &str) {
     let python = PathBuf::from(std::env::var_os("AGENT_IDE_PYTHON").unwrap());
     assert!(python.is_file(), "approved Python interpreter is available");
-    let venv = dir.join(".venv");
+    let venv = dir.join(name);
     let interpreter = venv.join("bin/python");
     std::fs::create_dir_all(interpreter.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&python, &interpreter).unwrap();
@@ -63,6 +69,17 @@ fn python_venv_at(dir: &Path) {
         ),
     )
     .unwrap();
+}
+
+/// The accepted Pyright's own CLI module (beside its language server).
+fn pyright_cli() -> PathBuf {
+    let pyright = std::env::var("AGENT_IDE_PYRIGHT").unwrap();
+    Path::new(&pyright)
+        .parent()
+        .and_then(Path::parent)
+        .map(|bin| bin.join("lib/node_modules/pyright/dist/pyright.js"))
+        .map(|cli| std::fs::canonicalize(&cli).unwrap_or(cli))
+        .expect("the pyright CLI module sits beside the language server")
 }
 
 /// A Python fixture with a cross-file call, a class method, a type error, a `.venv`, the real
@@ -79,6 +96,7 @@ fn python_fixture(cache: &str, main: Option<&str>) -> Fixture {
                 "def double(x: int) -> int:\n    return x * 2\n",
             ),
             ("main.py", main),
+            ("style.css", ".btn { color: red; }\n"),
             (
                 "pyrightconfig.json",
                 "{\"include\": [\"main.py\", \"helper.py\"]}\n",
@@ -86,13 +104,7 @@ fn python_fixture(cache: &str, main: Option<&str>) -> Fixture {
         ],
         json!([pyright_provider(cache)]),
     );
-    let pyright = std::env::var("AGENT_IDE_PYRIGHT").unwrap();
-    let pyright_cli = Path::new(&pyright)
-        .parent()
-        .and_then(Path::parent)
-        .map(|bin| bin.join("lib/node_modules/pyright/dist/pyright.js"))
-        .map(|cli| std::fs::canonicalize(&cli).unwrap_or(cli))
-        .expect("the pyright CLI module sits beside the language server");
+    let pyright_cli = pyright_cli();
     let mut config: Value =
         serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
     config["project_checks"] = json!({
@@ -119,10 +131,10 @@ fn calls() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// Polls Python's problems page until its check lands and `done` holds (or 30 s pass).
+/// Polls Python's problems page until its check lands and `done` holds (or 120 s pass).
 async fn problems(session: &mut Session, fixture: &Fixture, done: impl Fn(&str) -> bool) -> String {
     let mut text = String::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
         let reply = session
             .call(
@@ -151,6 +163,30 @@ fn provider_module(daemon: &mut Daemon) -> Option<Node> {
     })
 }
 
+/// After a Python fault: the same daemon still runs, answers its own health check `ok`, and an
+/// unrelated language (CSS) still answers on it.
+async fn assert_daemon_healthy(
+    session: &mut Session,
+    fixture: &Fixture,
+    daemon: &Daemon,
+    pid: libc::pid_t,
+    fault: &str,
+) {
+    assert_eq!(daemon.pid(), pid, "{fault}: same daemon");
+    assert_eq!(
+        parity::health(fixture).await,
+        "ok",
+        "{fault}: daemon health"
+    );
+    let css = session
+        .call(fixture, "ide.outline", json!({"path":"style.css"}))
+        .await;
+    assert!(
+        css["kind"] == "outline" && css["text"].as_str().unwrap_or_default().contains(".btn"),
+        "{fault}: an unrelated language answers on the same daemon: {css}"
+    );
+}
+
 /// The `module python checker` child, if one runs.
 fn checker_module(daemon: &mut Daemon) -> Option<Node> {
     daemon
@@ -172,7 +208,7 @@ async fn run_transcript(
     let mut replies = Vec::new();
     for (tool, arguments) in calls() {
         let reply = session.call(fixture, tool, arguments.clone()).await;
-        replies.push(line(tool, &arguments, &reply));
+        replies.push(line_for(fixture, tool, &arguments, &reply));
     }
     replies.push(problems(&mut session, fixture, |_| true).await);
     let module = provider_module(&mut daemon);
@@ -224,18 +260,216 @@ async fn python_module_matches_in_process_answers() {
     }
 }
 
+/// A stand-in for pytest run as `<venv>/bin/python -m pytest` from the worktree root: it imports
+/// each selected test file, calls its `test_*` functions and prints pytest's failure lines and
+/// summary, deterministically (a fixed duration), so the transcript compares the core's test
+/// selection, run and parse in both modes without depending on an installed pytest.
+const PYTEST_STAND_IN: &str = r#"import importlib.util, sys
+files, failed, passed = [], [], 0
+for arg in sys.argv[1:]:
+    if arg.startswith("-") or arg == "no:cacheprovider":
+        continue
+    path = arg.split("::")[0]
+    if path not in files:
+        files.append(path)
+for path in files:
+    spec = importlib.util.spec_from_file_location(path.replace("/", "_")[:-3], path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for name in sorted(dir(module)):
+        if name.startswith("test_"):
+            try:
+                getattr(module, name)()
+                passed += 1
+            except AssertionError as error:
+                failed.append(f"FAILED {path}::{name} - AssertionError: {error}")
+print("\n".join(failed))
+print(f"=== {len(failed)} failed, {passed} passed in 0.01s ===" if failed else f"=== {passed} passed in 0.01s ===")
+sys.exit(1 if failed else 0)
+"#;
+
+/// A stand-in for black run as `<venv>/bin/python -m black -q -` (or over files): it strips
+/// trailing whitespace from every line, so a formatted edit is visibly formatted.
+const BLACK_STAND_IN: &str = r#"import sys
+def fmt(text):
+    return "".join(line.rstrip() + "\n" for line in text.splitlines())
+if "-" in sys.argv[1:]:
+    sys.stdout.write(fmt(sys.stdin.read()))
+else:
+    for path in [a for a in sys.argv[1:] if not a.startswith("-")]:
+        with open(path) as f:
+            text = f.read()
+        with open(path, "w") as f:
+            f.write(fmt(text))
+"#;
+
+/// [`python_fixture`] plus a test file, black configured as the formatter, and the
+/// [`PYTEST_STAND_IN`] and [`BLACK_STAND_IN`] modules, committed.
+fn python_edit_fixture(cache: &str) -> Fixture {
+    let fixture = python_fixture(cache, None);
+    for (path, text) in [
+        (
+            "pyproject.toml",
+            "[project]\nname = \"parity\"\n\n[tool.black]\nline-length = 88\n",
+        ),
+        (
+            "tests/test_helper.py",
+            "from helper import double\n\n\ndef test_double():\n    assert double(2) == 4\n",
+        ),
+        (".gitignore", "__pycache__/\n.venv/\n.venv-alt/\n"),
+        ("pytest/__init__.py", ""),
+        ("pytest/__main__.py", PYTEST_STAND_IN),
+        ("black/__init__.py", ""),
+        ("black/__main__.py", BLACK_STAND_IN),
+    ] {
+        let path = fixture.root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    fixture.git(&[
+        "add",
+        "--",
+        ".gitignore",
+        "pyproject.toml",
+        "tests",
+        "pytest",
+        "black",
+    ]);
+    fixture.git(&["commit", "--quiet", "-m", "edit fixture"]);
+    // A second environment the transcript selects explicitly over the discovered `.venv`.
+    python_venv_named(&fixture.root, ".venv-alt");
+    fixture
+}
+
+/// The changing calls whose replies must not depend on where Python computes: a start that
+/// selects the second environment `.venv-alt` over the discovered `.venv` (its card), a formatted replace, an insert, a test run in the selected
+/// environment, a project-wide rename, the read that shows the results and the task diff.
+fn edit_calls() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "ide.start",
+            json!({"activation_id":"parity-start-env","environment":{"python":".venv-alt"}}),
+        ),
+        (
+            "ide.edit",
+            json!({"operation_id":"parity-replace","op":"replace","symbol":"helper.py#double",
+                "content":"def double(x: int) -> int:   \n    return x + x   \n"}),
+        ),
+        ("ide.read", json!({"path":"helper.py"})),
+        (
+            "ide.edit",
+            json!({"operation_id":"parity-insert","op":"insert","symbol":"main.py#run","where":"after",
+                "content":"def added() -> int:\n    return double(3)\n"}),
+        ),
+        ("ide.test", json!({"path":"tests/test_helper.py"})),
+        (
+            "ide.edit",
+            json!({"operation_id":"parity-rename","op":"rename","symbol":"helper.py#double","new_name":"twice"}),
+        ),
+        ("ide.read", json!({"path":"main.py"})),
+        ("ide.diff", json!({"mode":"head"})),
+    ]
+}
+
+/// The transcript of [`edit_calls`] on a fresh [`python_edit_fixture`] and daemon with `env`,
+/// with the Pyright-hosting module seen and the daemon.
+async fn run_edit_transcript(
+    cache: &str,
+    env: &[(&str, &str)],
+) -> (Vec<String>, Option<Node>, Daemon, Fixture) {
+    let fixture = python_edit_fixture(cache);
+    let mut daemon = Daemon::start(&fixture, env).await;
+    let mut session = Session::start(&fixture).await;
+    // Edits wait for a warm server, as an agent would after reading.
+    let warm = session
+        .call(&fixture, "ide.symbol", json!({"symbol":"helper.py#double"}))
+        .await;
+    assert_eq!(warm["kind"], "symbol", "{warm}");
+    let mut replies = Vec::new();
+    for (tool, arguments) in edit_calls() {
+        let mut reply = session.call(&fixture, tool, arguments.clone()).await;
+        // A test run starts in the background: its settled status is the answer.
+        if tool == "ide.test" {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while reply["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(": started") || text.contains(": running"))
+            {
+                assert!(Instant::now() < deadline, "the test run settles: {reply}");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                reply = session
+                    .call(&fixture, "ide.test", json!({"status": 1}))
+                    .await;
+            }
+        }
+        replies.push(line_for(&fixture, tool, &arguments, &reply));
+    }
+    // The start card names where Python computes; every other byte must agree.
+    let mode = if env.is_empty() {
+        "\nmodules: python module"
+    } else {
+        "\nmodules: python in process (fallback)"
+    };
+    assert!(replies[0].contains(mode), "{}", replies[0]);
+    replies[0] = replies[0].replace(mode, "\nmodules: <mode>");
+    let module = provider_module(&mut daemon);
+    session.close(&fixture).await;
+    (replies, module, daemon, fixture)
+}
+
+/// Python's changing answers are the same in module mode and in process, each on its own fresh
+/// copy of one committed fixture: an explicitly selected second environment (the start card, and
+/// the test run that uses its interpreter), a replace formatted by
+/// the project formatter, an insert, a project-wide rename (an edit proposal the core applies),
+/// the reads of their results, a pytest run in the selected environment and the task diff. The
+/// module run hosts Pyright in a module; nothing either daemon started survives it.
+#[tokio::test]
+#[ignore = "requires accepted AGENT_IDE_PYRIGHT, AGENT_IDE_NODE and AGENT_IDE_PYTHON environments"]
+async fn python_module_edits_match_in_process() {
+    let (in_process, module, daemon, fixture) =
+        run_edit_transcript("module-edit-parity-cache", &[IN_PROCESS]).await;
+    assert!(module.is_none(), "in process no module hosts Pyright");
+    drop(daemon);
+    drop(fixture);
+    let (moduled, module, mut daemon, fixture) =
+        run_edit_transcript("module-edit-parity-cache", &[]).await;
+    assert!(module.is_some(), "a module hosts Pyright");
+    let joined = moduled.join("\n");
+    for expected in [
+        "def added() -> int:",
+        "from helper import twice",
+        "tests #1: 1 passed, 0 failed",
+        "environment: python .venv-alt",
+        "rerun: <root>/.venv-alt/bin/python -m pytest",
+    ] {
+        assert!(joined.contains(expected), "{expected}:\n{joined}");
+    }
+    assert!(
+        joined.contains("2\t    return x + x\nsource_ref"),
+        "the formatter stripped the trailing blanks:\n{joined}"
+    );
+    parity::assert_parity(&in_process, &moduled);
+    let owned = daemon.tree().all();
+    drop(daemon);
+    drop(fixture);
+    for id in owned {
+        assert!(id.gone().await, "{id:?} survived its daemon");
+    }
+}
+
 /// Replaces `M-011 pilot_python_analyzer_faults_are_typed_and_restart`: a stall past the module
 /// budget, a malformed reply and a `kill -9` of the Pyright-hosting module in the middle of a
 /// call each answer that call with a typed `provider_unavailable` naming
 /// `module_unavailable (bundled.python:…)`, and the next call starts a fresh module and answers,
-/// on the same daemon; a `kill -9` while idle is noticed before the next call. Neither the
-/// failed module nor its Pyright survives.
+/// on the same daemon; a `kill -9` while idle is noticed before the next call, and a `kill -9`
+/// of the Pyright inside an idle module answers the next call typed as the module's provider
+/// failure. Neither the failed module nor its Pyright survives.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT, AGENT_IDE_NODE and AGENT_IDE_PYTHON environments and a test-seams build"]
 async fn python_analyzer_faults_are_typed_and_restart() {
     let fixture = python_fixture("module-fault-cache", None);
     let usages = json!({"symbol":"helper.py#double"});
-    for fault in ["stall", "malformed", "kill", "kill-idle"] {
+    for fault in ["stall", "malformed", "kill", "kill-idle", "kill-pyright"] {
         let flag = fixture.base.join(format!("module-fault-{fault}"));
         let seam = match fault {
             "malformed" => format!("malformed:semantic:{}", flag.display()),
@@ -276,6 +510,23 @@ async fn python_analyzer_faults_are_typed_and_restart() {
                 assert!(first.id.gone().await, "the killed module is reaped");
                 std::fs::remove_file(&flag).unwrap();
                 None
+            }
+            "kill-pyright" => {
+                // The module's own Pyright dies while the module idles: the next call that needs
+                // it answers typed, naming the module's provider.
+                let pyright = first.children[0].0;
+                // SAFETY: the exact Pyright identity captured as a child of this test's module.
+                unsafe { libc::kill(pyright.pid, libc::SIGKILL) };
+                assert!(pyright.gone().await, "the killed Pyright is reaped");
+                std::fs::remove_file(&flag).unwrap();
+                let reply = session.call(&fixture, "ide.symbol", usages.clone()).await;
+                assert!(
+                    reply
+                        .to_string()
+                        .contains("module_unavailable (bundled.python:provider:"),
+                    "the refusal names the module's provider: {reply}"
+                );
+                Some(reply)
             }
             _ => Some(session.call(&fixture, "ide.symbol", usages.clone()).await),
         };
@@ -331,7 +582,7 @@ async fn python_analyzer_faults_are_typed_and_restart() {
                 "{fault}: the failed module's Pyright survived"
             );
         }
-        assert_eq!(daemon.pid(), daemon_pid, "{fault}: same daemon");
+        assert_daemon_healthy(&mut session, &fixture, &daemon, daemon_pid, fault).await;
         session.close(&fixture).await;
         drop(daemon);
     }
@@ -360,13 +611,23 @@ async fn python_checker_faults_are_typed_and_restart() {
     ] {
         let flag = fixture.base.join(format!("module-check-{fault}"));
         std::fs::write(&flag, "").unwrap();
+        // Sources no earlier daemon checked: a result recorded for the same inputs would answer
+        // without running the faulted check at all.
+        std::fs::write(
+            fixture.root.join("main.py"),
+            format!("def before_{fault}() -> int:\n    return \"bad\"\n"),
+        )
+        .unwrap();
         let seam = match fault {
             "malformed" => format!("malformed:check_plan:{}", flag.display()),
             "widen" => format!("widen:check_plan:{}", flag.display()),
             _ => format!("stall:check_plan:{}", flag.display()),
         };
+        // Only the stall needs a short module budget; a real check of this fixture can take
+        // longer than 3 s, which would time the other faults out before they show.
+        let budget = if fault == "stall" { "3000" } else { "60000" };
         let mut daemon =
-            Daemon::start(&fixture, &[(FAULT_SEAM, &seam), (BUDGET_SEAM, "3000")]).await;
+            Daemon::start(&fixture, &[(FAULT_SEAM, &seam), (BUDGET_SEAM, budget)]).await;
         let daemon_pid = daemon.pid();
         let mut session = Session::start(&fixture).await;
         if fault == "kill" {
@@ -401,14 +662,15 @@ async fn python_checker_faults_are_typed_and_restart() {
             landed.contains("python: ready"),
             "{fault}: the next check lands:\n{landed}"
         );
-        assert_eq!(daemon.pid(), daemon_pid, "{fault}: same daemon");
+        assert_daemon_healthy(&mut session, &fixture, &daemon, daemon_pid, fault).await;
         session.close(&fixture).await;
         drop(daemon);
     }
 }
 
-/// A Pyright JSON report above 2 MiB (and far above the old 8 MiB control-frame shape, as raw
-/// attachment bytes) lands through the checker module with the same counts as in process.
+/// A Pyright JSON report measured above 2 MiB (and far above the old 8 MiB control-frame shape,
+/// as raw attachment bytes) lands through the checker module with exactly its measured error
+/// count, and the page equals the in-process one.
 #[tokio::test]
 #[ignore = "requires accepted AGENT_IDE_PYRIGHT, AGENT_IDE_NODE and AGENT_IDE_PYTHON environments"]
 async fn python_check_report_over_two_mib_lands() {
@@ -421,6 +683,34 @@ async fn python_check_report_over_two_mib_lands() {
         ));
     }
     let fixture = python_fixture("module-large-cache", Some(&main));
+    // Checking 12,000 functions takes longer than the small fixtures' 10 s check budget.
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&fixture.config).unwrap()).unwrap();
+    config["project_checks"]["check_timeout_s"] = json!(120);
+    std::fs::write(&fixture.config, config.to_string()).unwrap();
+    // The report the checker reads, measured directly with the same CLI and interpreter: well
+    // over 2 MiB, with a known nonzero error count both modes must land.
+    let report = std::process::Command::new(std::env::var("AGENT_IDE_NODE").unwrap())
+        .arg(pyright_cli())
+        .args(["--outputjson", "--project"])
+        .arg(&fixture.root)
+        .arg("--pythonpath")
+        .arg(fixture.root.join(".venv/bin/python"))
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    let measured: Value = serde_json::from_slice(&report.stdout).unwrap();
+    let errors = measured["summary"]["errorCount"].as_u64().unwrap();
+    eprintln!(
+        "large report: {} bytes, {errors} errors",
+        report.stdout.len()
+    );
+    assert!(
+        report.stdout.len() > 2 * 1024 * 1024,
+        "{} bytes",
+        report.stdout.len()
+    );
+    assert!(errors >= 12_000, "{errors} errors");
     let mut pages = Vec::new();
     for env in [&[IN_PROCESS][..], &[]] {
         let daemon = Daemon::start(&fixture, env).await;
@@ -429,7 +719,10 @@ async fn python_check_report_over_two_mib_lands() {
             text.contains("python: ready")
         })
         .await;
-        assert!(page.contains("python: ready"), "{page}");
+        assert!(
+            page.contains(&format!("python: ready; errors: {errors};")),
+            "the whole report landed: {page}"
+        );
         pages.push(page);
         session.close(&fixture).await;
         drop(daemon);
@@ -581,6 +874,6 @@ async fn python_analyzer_crash_loop_exhausts_the_restart_budget() {
         provider_module(&mut daemon).is_none(),
         "no fifth module started"
     );
-    assert_eq!(daemon.pid(), daemon_pid, "same daemon");
+    assert_daemon_healthy(&mut session, &fixture, &daemon, daemon_pid, "crash loop").await;
     session.close(&fixture).await;
 }

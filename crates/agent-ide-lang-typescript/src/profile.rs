@@ -16,13 +16,13 @@ use std::{
 
 use agent_ide_core::{
     assistance::host_binding::ActiveBindingUse,
-    modules::payload::{InputsVerdict, ProjectInput},
     execution::{
         AdmissionClass, AdmissionController, BackendReapCapability, BackendRelease, CommandKind,
         ControlledCommand, OwnedProtocolChild, OwnerId, ProcessError, ProviderLeaseAdmission,
         ProviderLeaseError, ProviderLeaseRegistry, ProviderViewLease, QueueTicket,
         ReapedProtocolProcess, ValidatedExecutionRequest, WaitedProtocolChild, WorkspaceAuthority,
     },
+    modules::{calls::ReadInput, payload::InputsVerdict},
     workspace::{
         authority::WorktreeRef,
         observation::{
@@ -1160,7 +1160,7 @@ pub struct ObservedInputs {
     /// Budget left, in bytes.
     remaining: usize,
     /// Everything read so far, in reading order.
-    pub inputs: Vec<ProjectInput>,
+    pub inputs: Vec<ReadInput>,
 }
 
 /// Whether `interpret_inputs` parses the file (every input but the Yarn and pnpm lockfiles, which
@@ -1260,13 +1260,10 @@ impl ObservedInputs {
                     ),
                 )
             })?;
-        self.inputs.push(ProjectInput {
+        self.inputs.push(ReadInput {
             path: observed.path().to_path_buf(),
-            bytes: observed.length(),
-            blake3: observed.digest().to_hex().to_string(),
-            contents: parsed_input(&path)
-                .then(|| String::from_utf8(observed.contents().to_vec()).ok())
-                .flatten(),
+            bytes: observed.contents().to_vec(),
+            parse: parsed_input(&path),
         });
         if self.inputs.len() > MAX_RESOLUTION_FILES {
             return Err(ResolutionRejection::chain(format!(
@@ -1281,16 +1278,40 @@ impl ObservedInputs {
         let mut files: Vec<_> = self
             .inputs
             .iter()
-            .filter_map(|input| {
-                Some(ProjectResolutionFileV1 {
-                    path: input.path.clone(),
-                    blake3: blake3::Hash::from_hex(&input.blake3).ok()?,
-                    bytes: input.bytes,
-                })
+            .map(|input| ProjectResolutionFileV1 {
+                path: input.path.clone(),
+                blake3: blake3::hash(&input.bytes),
+                bytes: input.bytes.len() as u64,
             })
             .collect();
         files.sort_by(|left, right| left.path.cmp(&right.path));
         files
+    }
+}
+
+/// One project file as the interpretation sees it: its identity, and its text when the language
+/// parses it (the lockfiles it only fingerprints carry none).
+#[derive(Clone, Debug)]
+pub struct InputFile {
+    /// Worktree-relative path.
+    pub path: PathBuf,
+    /// Exact byte length.
+    pub bytes: u64,
+    /// Digest of the bytes.
+    pub blake3: blake3::Hash,
+    /// The bytes, for a parsed file.
+    pub text: Option<Vec<u8>>,
+}
+
+impl From<&ReadInput> for InputFile {
+    /// The view of a file the core read: parsed files carry their bytes.
+    fn from(input: &ReadInput) -> Self {
+        Self {
+            path: input.path.clone(),
+            bytes: input.bytes.len() as u64,
+            blake3: blake3::hash(&input.bytes),
+            text: input.parse.then(|| input.bytes.clone()),
+        }
     }
 }
 
@@ -1299,7 +1320,7 @@ impl ObservedInputs {
 /// checked in path order, then the `references` targets they name (answering
 /// [`InputsVerdict::Need`] until all were read), then the chain as a whole. The same function
 /// answers in process and in the module.
-pub fn interpret_inputs(document: &Path, inputs: &[ProjectInput]) -> InputsVerdict {
+pub fn interpret_inputs(document: &Path, inputs: &[InputFile]) -> InputsVerdict {
     match interpret(document, inputs) {
         Ok(verdict) => verdict,
         Err(rejection) => InputsVerdict::Rejected {
@@ -1310,10 +1331,7 @@ pub fn interpret_inputs(document: &Path, inputs: &[ProjectInput]) -> InputsVerdi
 }
 
 /// [`interpret_inputs`] with the refusal as the profile's own error.
-fn interpret(
-    document: &Path,
-    inputs: &[ProjectInput],
-) -> Result<InputsVerdict, ResolutionRejection> {
+fn interpret(document: &Path, inputs: &[InputFile]) -> Result<InputsVerdict, ResolutionRejection> {
     let language_id = typescript_language_id(document)
         .ok_or_else(|| ResolutionRejection::chain("unsupported source extension"))?;
     let parent = document
@@ -1325,14 +1343,14 @@ fn interpret(
             candidates.insert(directory.join(filename));
         }
     }
-    let by_path: BTreeMap<&Path, &ProjectInput> = inputs
+    let by_path: BTreeMap<&Path, &InputFile> = inputs
         .iter()
         .map(|input| (input.path.as_path(), input))
         .collect();
-    let shape = |input: &ProjectInput, membership| {
+    let shape = |input: &InputFile, membership| {
         validate_resolution_shape(
             &input.path,
-            input.contents.as_deref().unwrap_or_default().as_bytes(),
+            input.text.as_deref().unwrap_or_default(),
             language_id,
             document,
             membership,
@@ -1373,7 +1391,7 @@ fn interpret(
         .iter()
         .map(|input| ProjectResolutionFileV1 {
             path: input.path.clone(),
-            blake3: blake3::Hash::from_hex(&input.blake3).unwrap_or_else(|_| blake3::hash(b"")),
+            blake3: input.blake3,
             bytes: input.bytes,
         })
         .collect();
@@ -1396,7 +1414,14 @@ fn observe_resolution_files(
 ) -> Result<Vec<ProjectResolutionFileV1>, ResolutionRejection> {
     let mut observed = ObservedInputs::read_candidates(worktree, document, path_proof)?;
     loop {
-        match interpret_inputs(document, &observed.inputs) {
+        match interpret_inputs(
+            document,
+            &observed
+                .inputs
+                .iter()
+                .map(InputFile::from)
+                .collect::<Vec<_>>(),
+        ) {
             InputsVerdict::Accepted => return Ok(observed.files()),
             InputsVerdict::Rejected { file, reason } => {
                 return Err(ResolutionRejection { file, reason });

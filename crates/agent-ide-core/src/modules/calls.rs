@@ -25,16 +25,17 @@ use super::{
     payload::{
         AnalysisScopeRequest, AnalyzeSource, AnchorBatch, CheckSelectionAnswer, CommandEnvAnswer,
         DetectAnswer, EffectRequest, EnvironmentsAnswer, Field, FileDocRequest, FileVerdict,
-        FormatPlanRequest, InsertSiteAnswer, InsertSiteRequest, ProjectQuery, SelectionAnswer,
-        SourceAnalysis, SourceField, SourceRef, SourceText, SyntaxQuery, TestFacts,
-        TestParseRequest, TestPlanQuery, TestToolchainAnswer, encode,
+        FormatPlanRequest, InputsVerdict, InsertSiteAnswer, InsertSiteRequest, MAX_INPUT_ROUNDS,
+        MAX_PROJECT_INPUTS, ProjectInput, ProjectQuery, SourceAnalysis, SourceField, SourceRef,
+        SourceText, SyntaxQuery, TestFacts, TestParseRequest, TestPlanQuery, TestToolchainAnswer,
+        encode,
     },
     router::ModuleHost,
     wire::Attachment,
 };
 use crate::lang::{
     InsertSite, InsertWhere, LangError, Language, LanguageProject, Outline, ProbePrograms,
-    SymbolPath, SyntaxVerdict, TestReport, TestSelection, TestTarget, environment,
+    SymbolPath, SyntaxVerdict, TestReport, TestTarget, environment,
 };
 
 /// The daemon's module routing, installed once at startup.
@@ -200,6 +201,127 @@ async fn analyze(
     Ok(analysis)
 }
 
+/// One project file the core read for a language's interpretation: its exact bytes (already
+/// admitted and read by the core), and whether the language parses them or only fingerprints them.
+#[derive(Clone, Debug)]
+pub struct ReadInput {
+    /// Worktree-relative path.
+    pub path: PathBuf,
+    /// The exact bytes read.
+    pub bytes: Vec<u8>,
+    /// The language parses the contents (they travel as an attachment); otherwise only the
+    /// length and digest do.
+    pub parse: bool,
+}
+
+/// The language's interpretation of the project files read for `document`: `None` when the
+/// language computes in process (the caller interprets them itself), otherwise its module's
+/// verdict over `inputs`, repeated while the module asks for more files. Each requested path is
+/// read only through `read` (the core's own admission and exact read; `None` refuses the
+/// document), at most [`MAX_INPUT_ROUNDS`] rounds and [`MAX_PROJECT_INPUTS`] inputs; a verdict
+/// beyond its bounds is ill-typed: the instance is retired and the call answers its typed
+/// malformed fault.
+pub async fn project_inputs(
+    language: Language,
+    worktree: &Path,
+    document: &Path,
+    inputs: Vec<ReadInput>,
+    read: impl FnMut(&Path) -> Option<ReadInput>,
+) -> Option<Routed<InputsVerdict>> {
+    let host = module(language)?;
+    let ask = |query: super::payload::DescribeQuery, attachments: Vec<Attachment>| {
+        let host = host.clone();
+        async move {
+            host.request_valid(
+                language,
+                worktree,
+                Capability::Describe,
+                encode(&query),
+                attachments,
+                InputsVerdict::bounded,
+            )
+            .await
+        }
+    };
+    Some(negotiate_inputs(language, document, inputs, read, ask).await)
+}
+
+/// The rounds of [`project_inputs`] over `ask` (one `describe` request).
+async fn negotiate_inputs<F, Fut>(
+    language: Language,
+    document: &Path,
+    mut inputs: Vec<ReadInput>,
+    mut read: impl FnMut(&Path) -> Option<ReadInput>,
+    ask: F,
+) -> Routed<InputsVerdict>
+where
+    F: Fn(super::payload::DescribeQuery, Vec<Attachment>) -> Fut,
+    Fut: std::future::Future<Output = Routed<InputsVerdict>>,
+{
+    let rejected = |file: Option<&Path>, reason: &str| InputsVerdict::Rejected {
+        file: file.map(Path::to_path_buf),
+        reason: reason.to_owned(),
+    };
+    for _ in 0..MAX_INPUT_ROUNDS {
+        if inputs.len() > MAX_PROJECT_INPUTS {
+            return Ok(rejected(None, "too many project inputs"));
+        }
+        let mut attachments = Vec::new();
+        let described = inputs
+            .iter()
+            .map(|input| ProjectInput {
+                path: input.path.clone(),
+                bytes: input.bytes.len() as u64,
+                blake3: blake3::hash(&input.bytes).to_hex().to_string(),
+                contents: input.parse.then(|| {
+                    let id = attachments.len() as u32 + 1;
+                    attachments.push(Attachment::octets(id, input.bytes.clone()));
+                    id
+                }),
+            })
+            .collect();
+        let query = super::payload::DescribeQuery::ProjectInputs {
+            document: document.to_path_buf(),
+            inputs: described,
+        };
+        let verdict = ask(query, attachments).await?;
+        if !verdict.bounded() {
+            return Err(malformed(language));
+        }
+        let InputsVerdict::Need { paths } = verdict else {
+            return Ok(verdict);
+        };
+        for path in paths {
+            if inputs.iter().any(|input| input.path == path) {
+                return Ok(rejected(Some(&path), "asked again for a file already read"));
+            }
+            match read(&path) {
+                Some(input) => inputs.push(input),
+                None => {
+                    return Ok(rejected(
+                        Some(&path),
+                        "a needed project file is not readable",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(rejected(None, "project inputs need too many rounds"))
+}
+
+/// The typed fault of a module answer the core cannot use.
+fn malformed(language: Language) -> ModuleUnavailable {
+    ModuleUnavailable {
+        module_id: super::contract::ModuleId::bundled(language.name()),
+        module_version: env!("CARGO_PKG_VERSION").to_owned(),
+        role: super::contract::Role::Analyzer,
+        stage: super::contract::Stage::Decode,
+        cause: super::contract::Cause::Malformed,
+        instance: None,
+        retry_after_ms: None,
+    }
+}
+
 /// The linkage anchors of `path` with `text`: `Ok(None)` when `language` computes in process
 /// (the caller extracts its name facts itself); in module mode one `analyze_source` anchors
 /// batch, validated against the request's source and the coverage the module declared in its
@@ -259,31 +381,6 @@ fn field<T>(value: Field<T>, default: T) -> T {
         Field::Available(value) => value,
         _ => default,
     }
-}
-
-/// The language's interpretation of the project `inputs` read for `document`: `None` when the
-/// language computes in process (the caller interprets them itself), otherwise its module's
-/// verdict.
-pub async fn project_inputs(
-    language: Language,
-    worktree: &Path,
-    document: &Path,
-    inputs: Vec<super::payload::ProjectInput>,
-) -> Option<Routed<super::payload::InputsVerdict>> {
-    let host = module(language)?;
-    Some(
-        host.request(
-            language,
-            worktree,
-            Capability::Describe,
-            encode(&super::payload::DescribeQuery::ProjectInputs {
-                document: document.to_path_buf(),
-                inputs,
-            }),
-            Vec::new(),
-        )
-        .await,
-    )
 }
 
 /// `LanguageSupport::detect`.
@@ -552,29 +649,70 @@ pub async fn insert_site(
     }
 }
 
-/// `LanguageSupport::test_selection`.
-pub async fn test_selection(
+/// A selected test run: the tests it runs, its argument vector (program first), and for a
+/// module-planned run the specification the core expanded and admitted from one of the
+/// language's declared test recipes, which is exactly what runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedRun {
+    /// The selected tests.
+    pub tests: Vec<crate::lang::TestId>,
+    /// Argv, program first.
+    pub command: Vec<String>,
+    /// The admitted run of a module-planned selection; `None` in process.
+    pub spec: Option<crate::checks::runner::RunSpec>,
+}
+
+/// The run of `LanguageSupport::test_selection` within `budget`: in process the language's own
+/// argument vector; in module mode the module's request of one of the language's declared test
+/// recipes (class `test`), expanded and admitted by the core (any other request is refused,
+/// never run).
+pub async fn test_run(
     language: Language,
     worktree: &Path,
     project: &LanguageProject,
     target: &TestTarget,
-) -> Routed<Result<TestSelection, LangError>> {
-    match module(language) {
-        None => Ok(language.support().test_selection(project, target)),
-        Some(host) => {
-            host.request::<SelectionAnswer>(
-                language,
-                worktree,
-                Capability::TestPlan,
-                encode(&TestPlanQuery::Selection {
-                    project: Box::new(project.clone()),
-                    target: target.clone(),
-                }),
-                Vec::new(),
-            )
-            .await
-        }
-    }
+    budget: std::time::Duration,
+) -> Routed<Result<PlannedRun, LangError>> {
+    let Some(host) = module(language) else {
+        return Ok(language
+            .support()
+            .test_selection(project, target)
+            .map(|selection| PlannedRun {
+                tests: selection.tests,
+                command: selection.command,
+                spec: None,
+            }));
+    };
+    let run: super::payload::RunAnswer = host
+        .request(
+            language,
+            worktree,
+            Capability::TestPlan,
+            encode(&TestPlanQuery::Run {
+                project: Box::new(project.clone()),
+                target: target.clone(),
+            }),
+            Vec::new(),
+        )
+        .await?;
+    let Ok(run) = run else {
+        return Ok(Err(run.unwrap_err()));
+    };
+    let spec = admitted(
+        language,
+        worktree,
+        &run.effect,
+        super::payload::RunClass::Test,
+        budget,
+    )?;
+    Ok(Ok(PlannedRun {
+        tests: run.tests,
+        command: std::iter::once(spec.program.as_os_str())
+            .chain(spec.args.iter().map(std::ffi::OsString::as_os_str))
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect(),
+        spec: Some(spec),
+    }))
 }
 
 /// `LanguageSupport::test_id` of one outline path.
@@ -675,9 +813,57 @@ fn stdin_run(
     effect: Option<EffectRequest>,
     configured: &[&Path],
 ) -> Routed<Option<StdinRun>> {
-    let Some(effect) = effect else {
-        return Ok(None);
+    match effect {
+        Some(effect) => admitted_with(
+            language,
+            worktree,
+            &effect,
+            super::payload::RunClass::Interactive,
+            std::time::Duration::from_secs(10),
+            configured,
+        )
+        .map(|spec| Some(StdinRun::Spec(spec))),
+        None => Ok(None),
+    }
+}
+
+/// Expands `effect` under the core's interactive admission (see [`stdin_run`]) with `timeout`; a
+/// request outside the language's declared recipes of `class` is refused as `policy_refused`.
+fn admitted(
+    language: Language,
+    worktree: &Path,
+    effect: &EffectRequest,
+    class: super::payload::RunClass,
+    timeout: std::time::Duration,
+) -> Routed<crate::checks::runner::RunSpec> {
+    admitted_with(language, worktree, effect, class, timeout, &[])
+}
+
+/// [`admitted`] with `configured`: operator-declared programs of the launcher configuration (a
+/// probe's Node and package), admitted as roots beside the declared install roots.
+fn admitted_with(
+    language: Language,
+    worktree: &Path,
+    effect: &EffectRequest,
+    class: super::payload::RunClass,
+    timeout: std::time::Duration,
+    configured: &[&Path],
+) -> Routed<crate::checks::runner::RunSpec> {
+    let refused = || ModuleUnavailable {
+        module_id: super::contract::ModuleId::bundled(language.name()),
+        module_version: env!("CARGO_PKG_VERSION").to_owned(),
+        role: super::contract::Role::Analyzer,
+        stage: super::contract::Stage::Decode,
+        cause: super::contract::Cause::PolicyRefused,
+        instance: None,
+        retry_after_ms: None,
     };
+    if !super::recipe::declared(language.name())
+        .iter()
+        .any(|recipe| recipe.id == effect.recipe && recipe.class == class)
+    {
+        return Err(refused());
+    }
     let recipes = super::recipe::declared(language.name());
     let path = tool_path();
     let programs: Vec<(String, PathBuf)> = recipes
@@ -706,19 +892,9 @@ fn stdin_run(
         launcher_roots: &roots,
         developer_dirs: &developer_dirs,
         programs: &programs,
-        timeout: std::time::Duration::from_secs(10),
+        timeout,
     };
-    super::recipe::expand(recipes, &effect, &admission)
-        .map(|spec| Some(StdinRun::Spec(spec)))
-        .map_err(|_| ModuleUnavailable {
-            module_id: super::contract::ModuleId::bundled(language.name()),
-            module_version: env!("CARGO_PKG_VERSION").to_owned(),
-            role: super::contract::Role::Analyzer,
-            stage: super::contract::Stage::Decode,
-            cause: super::contract::Cause::PolicyRefused,
-            instance: None,
-            retry_after_ms: None,
-        })
+    super::recipe::expand(recipes, effect, &admission).map_err(|_| refused())
 }
 
 /// `LanguageSupport::format_stdin_command`.
@@ -823,6 +999,176 @@ pub async fn not_analysed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A module-planned test run may name only a declared recipe of class `test`, and a
+    /// formatter or probe only an interactive one: anything else is refused before expansion.
+    #[test]
+    fn effects_are_admitted_only_from_their_own_class() {
+        use super::super::payload::{
+            EffectRecipe, ExecutableSlot, Param, RunClass, SlotSource, Stdin,
+        };
+        const fn recipe(id: &'static str, class: RunClass) -> EffectRecipe {
+            EffectRecipe {
+                id,
+                program: "tool",
+                args: &[],
+                env: &[],
+                paths: &[],
+                executables: &[ExecutableSlot {
+                    name: "tool",
+                    source: SlotSource::HomeTool("sh"),
+                }],
+                stdin: Stdin::Null,
+                class,
+                timeout_ceiling_ms: 1000,
+                capture_bytes: 1024,
+                assets: &[],
+            }
+        }
+        static RECIPES: [EffectRecipe; 2] = [
+            recipe("fmt", RunClass::Interactive),
+            recipe("run", RunClass::Test),
+        ];
+        static DECLARED: [(&str, &[EffectRecipe]); 1] = [("gamma", &RECIPES)];
+        crate::lang::testing::install();
+        super::super::recipe::declare(&DECLARED);
+        let gamma = crate::lang::testing::GAMMA;
+        let request = |id: &str| EffectRequest {
+            recipe: id.to_owned(),
+            params: [("tool".to_owned(), Param::Executable("tool".into()))].into(),
+        };
+        let worktree = std::env::temp_dir();
+        let second = std::time::Duration::from_secs(1);
+        for (id, class) in [("fmt", RunClass::Test), ("run", RunClass::Interactive)] {
+            let refused = admitted(gamma, &worktree, &request(id), class, second).unwrap_err();
+            assert_eq!(refused.cause, super::super::contract::Cause::PolicyRefused);
+        }
+        let spec = admitted(gamma, &worktree, &request("run"), RunClass::Test, second).unwrap();
+        assert!(spec.program.ends_with("sh"));
+        assert!(
+            admitted(
+                gamma,
+                &worktree,
+                &request("fmt"),
+                RunClass::Interactive,
+                second
+            )
+            .is_ok()
+        );
+    }
+
+    /// Project inputs: a contents file travels as an attachment whose length and digest the
+    /// query names, a fingerprinted one without; a needed file is read through the core's own
+    /// reader and the query repeated; an unreadable needed file, a repeated request, an endless
+    /// series of requests and too many inputs refuse the document; a verdict beyond its bounds is
+    /// the module's malformed fault.
+    #[tokio::test]
+    async fn project_inputs_rounds_are_bounded_and_read_by_the_core() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        crate::lang::testing::install();
+        let language = crate::lang::testing::ALPHA;
+        let input = |path: &str, parse: bool| ReadInput {
+            path: path.into(),
+            bytes: format!("{path} \"\\\n\u{1}").into_bytes(),
+            parse,
+        };
+        let rounds = AtomicUsize::new(0);
+        let script = |verdicts: Vec<InputsVerdict>| {
+            let rounds = &rounds;
+            move |query: super::super::payload::DescribeQuery, attachments: Vec<Attachment>| {
+                let round = rounds.fetch_add(1, Ordering::Relaxed);
+                let super::super::payload::DescribeQuery::ProjectInputs { inputs, .. } = query
+                else {
+                    panic!("a project-inputs query");
+                };
+                for input in &inputs {
+                    if let Some(id) = input.contents {
+                        let bytes = &attachments[id as usize - 1].bytes;
+                        assert_eq!(bytes.len() as u64, input.bytes);
+                        assert_eq!(blake3::hash(bytes).to_hex().as_str(), input.blake3);
+                    }
+                }
+                let verdict = verdicts.get(round).cloned().unwrap_or(InputsVerdict::Need {
+                    paths: vec![format!("more-{round}").into()],
+                });
+                async move { Ok(verdict) }
+            }
+        };
+        let need = |path: &str| InputsVerdict::Need {
+            paths: vec![path.into()],
+        };
+        let doc = Path::new("doc.x");
+        let verdict = negotiate_inputs(
+            language,
+            doc,
+            vec![input("a.cfg", true), input("b.lock", false)],
+            |path| Some(input(path.to_str().unwrap(), true)),
+            script(vec![need("c.cfg"), InputsVerdict::Accepted]),
+        )
+        .await;
+        assert_eq!(verdict.unwrap(), InputsVerdict::Accepted);
+        assert_eq!(rounds.swap(0, Ordering::Relaxed), 2);
+        let refused =
+            |verdict: Routed<InputsVerdict>| matches!(verdict, Ok(InputsVerdict::Rejected { .. }));
+        assert!(refused(
+            negotiate_inputs(language, doc, vec![], |_| None, script(vec![need("x")])).await
+        ));
+        rounds.store(0, Ordering::Relaxed);
+        assert!(refused(
+            negotiate_inputs(
+                language,
+                doc,
+                vec![input("a.cfg", true)],
+                |path| Some(input(path.to_str().unwrap(), true)),
+                script(vec![need("a.cfg")]),
+            )
+            .await
+        ));
+        rounds.store(0, Ordering::Relaxed);
+        assert!(refused(
+            negotiate_inputs(
+                language,
+                doc,
+                vec![],
+                |path| Some(input(path.to_str().unwrap(), false)),
+                script(vec![]),
+            )
+            .await
+        ));
+        assert_eq!(rounds.swap(0, Ordering::Relaxed), MAX_INPUT_ROUNDS);
+        let many = (0..=MAX_PROJECT_INPUTS)
+            .map(|index| input(&format!("f{index}"), false))
+            .collect();
+        assert!(refused(
+            negotiate_inputs(language, doc, many, |_| None, script(vec![])).await
+        ));
+        assert_eq!(rounds.swap(0, Ordering::Relaxed), 0, "nothing was asked");
+        for unbounded in [
+            InputsVerdict::Need { paths: vec![] },
+            InputsVerdict::Need {
+                paths: vec!["../out".into()],
+            },
+            InputsVerdict::Need {
+                paths: (0..=super::super::payload::MAX_NEEDED_PATHS)
+                    .map(|index| format!("p{index}").into())
+                    .collect(),
+            },
+            InputsVerdict::Rejected {
+                file: None,
+                reason: "x".repeat(super::super::payload::MAX_INPUTS_REASON + 1),
+            },
+            InputsVerdict::Rejected {
+                file: None,
+                reason: "line\nbreak".into(),
+            },
+        ] {
+            rounds.store(0, Ordering::Relaxed);
+            let fault = negotiate_inputs(language, doc, vec![], |_| None, script(vec![unbounded]))
+                .await
+                .unwrap_err();
+            assert_eq!(fault.cause, super::super::contract::Cause::Malformed);
+        }
+    }
 
     /// Only an answer that computed every requested field is a cacheable fact: a warming or
     /// unsupported field (whose in-process default the caller substitutes) never is, nor is an
