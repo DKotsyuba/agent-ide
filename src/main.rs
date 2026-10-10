@@ -648,7 +648,7 @@ async fn serve_bundled_module(language: &str, role: &str) -> ExitCode {
     // task wraps it with its provider and checks.
     let support = SupportServer::new(registered, env!("CARGO_PKG_VERSION"));
     let served = match language {
-        "python" => agent_ide_lang_python::module::serve(role).await,
+        "python" => serve_stdio(support, role).await,
         "rust" => serve_stdio(support, role).await,
         "typescript" => serve_stdio(support, role).await,
         "html" => serve_stdio(support, role).await,
