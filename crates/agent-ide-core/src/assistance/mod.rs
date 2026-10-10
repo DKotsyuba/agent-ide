@@ -60,3 +60,13 @@ pub mod telemetry;
 
 /// Owns explicitly requested background test runs for the daemon lifetime.
 pub mod tests;
+
+/// Renders the deterministic, byte-bounded terminal text of one settled test run.
+pub(crate) mod test_fact;
+
+/// Holds the call-signature block that ends every `ide.start` reply.
+pub(crate) mod signature_card;
+
+/// Guards that no reply, plate, fact, description or instruction invites polling.
+#[cfg(test)]
+mod hygiene;

@@ -110,7 +110,6 @@ impl TestRuns {
                 result: None,
                 completed_at: None,
                 observed: false,
-                retired: false,
             },
         );
         drop(state);

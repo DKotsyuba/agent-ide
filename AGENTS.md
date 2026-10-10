@@ -76,9 +76,10 @@ unit tests enforce both rules.
   edit twice; edits are validated against the exact `source_ref` bytes and
   refused together with nothing written when addresses overlap or do not match.
 - Replies are written for agents: bounded pages with `detail_ref` continuation,
-  closed vocabularies, `isError` on every business refusal, `pending` polls via
-  `ide.inspect`, honest `unavailable`/`outcome_unknown` results — never
-  fabricated success. A failed IDE never vetoes native host tools.
+  closed vocabularies, `isError` on every business refusal, results of long work
+  pushed in `<agent-ide>` blocks (never a poll prompt; `ide.inspect` reads them
+  early), honest `unavailable`/`outcome_unknown` results — never fabricated
+  success. A failed IDE never vetoes native host tools.
 - The resident daemon lives in a shared per-repository rendezvous
   `/private/tmp/ai-r-<hash>` keyed by the canonical Git common directory; hook
   keys live in `/private/tmp/ai-k-<hash>`. Ownership and staleness are checked

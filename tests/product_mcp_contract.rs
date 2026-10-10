@@ -528,12 +528,12 @@ fn assert_claude_envelope(reply: &Value) -> &str {
 /// source reference; refusal prose is never parsed as one. Unset fields are simply absent from
 /// the returned object, matching `serde_json::Value`'s null-on-missing-key indexing.
 fn claude_fields(text: &str) -> Value {
-    /// Returns the bounded token starting at `text`, ending at the first space, `;`, `\n`, `.` or
-    /// the string end; every identifier this parser extracts (`reason`, `code`, `outcome`,
+    /// Returns the bounded token starting at `text`, ending at the first space, `;`, `\n`, `.`, `)`
+    /// or the string end; every identifier this parser extracts (`reason`, `code`, `outcome`,
     /// `detail_ref`, `source_ref`) is itself a single space-free token, so this stops exactly where
     /// the surrounding sentence resumes.
     fn token(text: &str) -> &str {
-        let end = text.find([' ', ';', '\n', '.']).unwrap_or(text.len());
+        let end = text.find([' ', ';', '\n', '.', ')']).unwrap_or(text.len());
         text[..end].trim()
     }
     /// Returns the bounded token immediately following the first occurrence of `marker`, if any.
@@ -6097,6 +6097,82 @@ async fn a_slow_edit_check_answers_at_once_and_arrives_as_one_fact() {
     daemon.wait().await.unwrap();
 }
 
+/// Reply hygiene (M024-M027-REPLY-HYGIENE r2, M024-M026 outbox texts): every real reply of a batch
+/// read, a batch edit whose project check outlasts the call, and the two inspections that hand
+/// over its fact states what happened and never invites polling, in its text and carried status.
+#[tokio::test]
+async fn pending_and_batch_replies_never_invite_polling() {
+    let fixture = ProductFixture::new(json!([]));
+    let home = enable_fake_rust_checks_holding(&fixture, &fixture.base, "sleep 12");
+    write_problems_count(&fixture.root, "1");
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "hygiene-batch").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"hygiene"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let mut seen = vec![started.clone()];
+
+    let read = actor
+        .call(
+            &fixture,
+            "ide.read",
+            json!({"items":[{"path":"src/lib.rs","lines":"1-2"},{"path":"missing.rs"}]}),
+        )
+        .await;
+    let read = actor.settle(&fixture, read).await;
+    let source_ref = read["detail_ref"].as_str().unwrap().to_owned();
+    seen.push(read);
+    let edit = actor
+        .call(
+            &fixture,
+            "ide.edit",
+            json!({"operation_id":"hygiene-1","source_ref":source_ref,
+                   "files":[{"path":"src/lib.rs","changes":[{"lines":"1-1","content":"pub fn value() -> i32 { 7 }"}]}]}),
+        )
+        .await;
+    assert!(
+        edit["text"].as_str().is_some_and(
+            |text| text.contains("diagnostics: pending; the project check arrives by itself")
+        ),
+        "{edit}"
+    );
+    seen.push(edit);
+    let checked = actor
+        .call(&fixture, "ide.inspect", json!({"wait_ms":60000}))
+        .await;
+    assert!(
+        checked["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("edit-checked edit hygiene-1: ")),
+        "{checked}"
+    );
+    seen.push(checked);
+    seen.push(actor.call(&fixture, "ide.inspect", json!({})).await);
+    for reply in &seen {
+        let shown = format!(
+            "{} {}",
+            reply["text"].as_str().unwrap_or_default(),
+            reply["status"].as_str().unwrap_or_default()
+        )
+        .to_lowercase();
+        for banned in [
+            "poll",
+            "every few seconds",
+            "in a few seconds",
+            "until it completes",
+            "again every",
+        ] {
+            assert!(!shown.contains(banned), "{banned}: {reply}");
+        }
+    }
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// A pending edit whose project check was capped with none of this file's problems retained
 /// settles as `unknown`: an empty `current_reported` is not a closed reply, and it used to turn
 /// the whole detail into `inspect:internal` (a Python project with thousands of errors).
@@ -9089,8 +9165,8 @@ async fn configured_product_test_runs_in_background_and_reports_failures() {
     );
     assert_eq!(
         start_text.trim_end(),
-        "tests #1: started — cargo test --manifest-path Cargo.toml --lib (budget 120 s); poll: call \
-         ide.test with {\"status\": 1}",
+        "tests #1: started — cargo test --manifest-path Cargo.toml --lib (budget 120 s); the result \
+         arrives by itself in a later <agent-ide> block",
         "{start_text}"
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
@@ -14474,6 +14550,29 @@ async fn configured_product_activation_reply_includes_the_project_card() {
         text.contains("\nservers: rust not started; outline, read and edit answer from source; the first symbol or graph call starts it and answers approximately at once · typescript not started; the first symbol or graph call starts it and its answer follows as a fact"),
         "{text}"
     );
+    // start-index-state §1: the call-signature block ends the reply, after the card and its
+    // servers line, within 2 KiB, with one example per batch form and the required stop.
+    let (card, signature) = text
+        .split_once("\n\ncall forms (")
+        .unwrap_or_else(|| panic!("no signature block: {text}"));
+    assert!(card.contains("\nservers: "), "{text}");
+    assert!(!card.contains("ide.read {\"items\""), "{text}");
+    let signature = format!("call forms ({signature}");
+    assert!(signature.len() <= 2048, "{} bytes", signature.len());
+    for form in [
+        "ide.read {\"items\"",
+        "ide.outline {\"paths\"",
+        "ide.symbol {\"symbols\"",
+        "ide.graph {\"symbols\"",
+        "ide.test {\"targets\"",
+        "ide.edit {\"operation_id\"",
+        "ide.inspect {\"wait_ms\"",
+    ] {
+        assert!(signature.contains(form), "{form}: {signature}");
+    }
+    assert!(signature.contains("\"files\":["), "{signature}");
+    assert!(text.ends_with("End the task with ide.stop."), "{text}");
+    assert!(!signature.contains("poll"), "{signature}");
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     actor.mcp.close().await;
@@ -21839,6 +21938,67 @@ async fn outbox_claude_reply_carries_a_finished_run_fact_once() {
     assert!(!carried[0].contains("poll"), "{}", carried[0]);
     assert!(!carried[1].contains("tests #1"), "{}", carried[1]);
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A test run that is still running adds nothing to any later reply or plate: no running line, no
+/// elapsed seconds, no instruction. Its outcome then arrives once, as the terminal fact of
+/// M024-M026-TEST-FACT (counts, the failing test, the rerun line and the output reference), and a
+/// call after it carries nothing about the run.
+#[tokio::test]
+async fn a_running_test_adds_no_plate_line_and_one_terminal_fact_follows() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "running-no-plate").await;
+    let started = actor
+        .call(&fixture, "ide.start", json!({"activation_id":"running"}))
+        .await;
+    let started = actor.settle(&fixture, started).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+    let text = |reply: &Value| reply["text"].as_str().unwrap_or_default().to_owned();
+    let run = actor
+        .call(
+            &fixture,
+            "ide.test",
+            json!({"command":["/bin/sh","-c","sleep 14; echo 'test result: FAILED. 0 passed; 1 failed; 0 ignored'; exit 1"]}),
+        )
+        .await;
+    assert!(text(&run).starts_with("tests #1: started"), "{run}");
+    assert!(!text(&run).contains("poll"), "{run}");
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let reply = actor
+            .call(&fixture, "ide.context", json!({"kind":"problems"}))
+            .await;
+        let carried = carried_status(&reply).unwrap_or_default();
+        for seen in [carried.to_owned(), text(&reply)] {
+            assert!(
+                !seen.contains("tests #1") && !seen.contains("poll"),
+                "a running test must not show up: {reply}"
+            );
+        }
+    }
+    let waited = actor
+        .call(&fixture, "ide.inspect", json!({"wait_ms":30000}))
+        .await;
+    let fact = text(&waited);
+    assert!(fact.starts_with("test-finished tests #1: "), "{fact}");
+    assert!(fact.contains("\n  rerun: "), "{fact}");
+    assert!(!fact.contains("poll"), "{fact}");
+    let after = actor
+        .call(&fixture, "ide.context", json!({"kind":"problems"}))
+        .await;
+    assert!(
+        !text(&after).contains("tests #1")
+            && !carried_status(&after)
+                .unwrap_or_default()
+                .contains("tests #1"),
+        "the outcome must not repeat: {after}"
+    );
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     actor.mcp.close().await;
     daemon.kill().await.unwrap();

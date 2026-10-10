@@ -2661,13 +2661,7 @@ impl<'a> Worker<'a> {
             if job_status.result.is_some() {
                 self.shared.settled_test_reply(id, &binding, &job_status)
             } else {
-                (
-                    format!(
-                        "tests #{id}: running {} s; poll: call ide.test with {{\"status\": {id}}}",
-                        job_status.age.as_secs()
-                    ),
-                    None,
-                )
+                (super::test_fact::running_line(id), None)
             }
         } else {
             let mut explicit_command = false;
@@ -2920,8 +2914,8 @@ impl<'a> Worker<'a> {
             // An explicit `command` is often a stand-in shell line rather than a runner, so the
             // job that starts one holds itself open inside the inline reply window: the starting
             // call itself then answers the settled result — one call instead of a
-            // start/poll/inspect round trip — and only a run that outlasts the window keeps the
-            // started line and the poll protocol. A resumed job finds its own run back by its
+            // start/inspect round trip — and only a run that outlasts the window answers the
+            // started line and gets its result pushed. A resumed job finds its own run back by its
             // detail reference, never spawning the command a second time.
             let mut own_run = if explicit_command {
                 self.shared.test_runs.started_run(&job.reference, &binding)
@@ -2994,18 +2988,14 @@ impl<'a> Worker<'a> {
                         started_id = Some(id);
                         own_run = self.shared.test_runs.get(&root, id, &binding);
                     }
-                    StartResult::Running(id, age) => {
+                    StartResult::Running(id, _) => {
                         // A second session asking for the busy worktree's run receives its own
                         // `test-finished` fact when that run settles (OUTBOX §12).
                         self.shared.test_subscribed(id, &binding);
                         return Ok((
                             PeerReply::Complete {
                                 kind: ResultKind::Test,
-                                text: format!(
-                                    "tests #{id}: still running ({} s); poll: call ide.test with \
-                                     {{\"status\": {id}}}",
-                                    age.as_secs()
-                                ),
+                                text: super::test_fact::still_running_line(id),
                                 detail_ref: None,
                                 truncated: false,
                                 continuation: false,
@@ -3069,16 +3059,14 @@ impl<'a> Worker<'a> {
                     // The caller leaves with a started line: the outcome is pushed once as a
                     // `test-finished` fact (OUTBOX §2).
                     self.shared.test_started(id, &binding, budget);
-                    let selected =
-                        selected_count.map_or_else(String::new, |summary| format!(" ({summary})"));
                     return Ok((
                         PeerReply::Complete {
                             kind: ResultKind::Test,
-                            text: format!(
-                                "tests #{id}: started — {}{selected} (budget {} s); poll: call \
-                                 ide.test with {{\"status\": {id}}}",
-                                display_argv(&argv),
-                                budget.as_secs()
+                            text: super::test_fact::started_line(
+                                id,
+                                &display_argv(&argv),
+                                selected_count.as_deref(),
+                                budget.as_secs(),
                             ),
                             detail_ref: Some(job.reference.clone()),
                             truncated: false,
@@ -4354,6 +4342,9 @@ impl<'a> Worker<'a> {
             text.push_str("\n\n");
             text.push_str(&card);
         }
+        // The call-signature block always ends the reply, after the card and its servers line.
+        text.push_str("\n\n");
+        text.push_str(super::signature_card::signature_block());
         Ok((
             PeerReply::Complete {
                 kind: ResultKind::Activation,
@@ -6272,29 +6263,11 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                     .settled_test_reply(status.id, &request.binding, &status)
                     .0
             } else {
-                format!(
-                    "tests #{id}: running {} s; poll: call ide.test with {{\"status\": {id}}}",
-                    status.age.as_secs()
-                )
+                super::test_fact::running_line(id)
             };
             return Ok(PeerReply::Complete {
                 kind: ResultKind::Test,
                 text,
-                detail_ref: None,
-                truncated: false,
-                continuation: false,
-            });
-        }
-        // A poll-hint string (`… ide.test … {"status": N}`) is what every running-test line ends
-        // with; a first-time caller can mistake it for a detail_ref. Answer with the exact call
-        // it names instead of a generic invalid_detail.
-        if let Some(id) = poll_hint_run(&request.reference) {
-            return Ok(PeerReply::Complete {
-                kind: ResultKind::Test,
-                text: format!(
-                    "tests #{id}: that text is the poll hint, not a detail_ref; call ide.test \
-                     with {{\"status\": {id}}} to read this run's status"
-                ),
                 detail_ref: None,
                 truncated: false,
                 continuation: false,
@@ -6538,9 +6511,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
     // Whether this very inspection hands a retained terminal job result to its caller (QW-4): the
     // inspection path itself says so, whatever the result is (a cached failed read is delivered
     // too), unlike a refused retrieval, a test-run status or a result still `pending`.
-    let retrieved = result.is_ok()
-        && test_run_handle(&request.reference).is_none()
-        && poll_hint_run(&request.reference).is_none();
+    let retrieved = result.is_ok() && test_run_handle(&request.reference).is_none();
     let reply = result.unwrap_or_else(|failure| PeerReply::Error {
         code: failure.code,
         detail: Some(failure.stage),
@@ -6628,26 +6599,6 @@ pub(crate) fn test_run_handle(reference: &str) -> Option<u64> {
         .unwrap_or(rest);
     (rest.bytes().all(|byte| byte.is_ascii_digit()) && !rest.is_empty())
         .then(|| rest.parse::<u64>().ok())
-        .flatten()
-        .filter(|id| *id > 0)
-}
-
-/// Recognizes a poll-hint string an agent mistakenly passed as a `detail_ref` — text naming
-/// `ide.test` and a `"status": N` argument, whatever words surround them — and returns that run
-/// number, so `ide.inspect` can answer with the exact call instead of `invalid_detail`.
-fn poll_hint_run(reference: &str) -> Option<u64> {
-    const MARKER: &str = "\"status\":";
-    if !reference.contains("ide.test") {
-        return None;
-    }
-    let rest = &reference[reference.find(MARKER)? + MARKER.len()..];
-    let digits: &str = rest.trim_start();
-    let end = digits
-        .char_indices()
-        .find(|(_, character)| !character.is_ascii_digit())
-        .map_or(digits.len(), |(at, _)| at);
-    (end > 0)
-        .then(|| digits[..end].parse::<u64>().ok())
         .flatten()
         .filter(|id| *id > 0)
 }
@@ -7705,11 +7656,10 @@ fn missing_runner_text(program: &str, error: &str, not_found: bool, root: &Path)
     )
 }
 
-/// Failed tests listed in a run's reply; the rest are counted and live in the full output.
-const MAX_LISTED_FAILURES: usize = 16;
-
 /// The rerun line's command: `cd <dir> && ` first when the run used a working directory.
-fn rerun_text(result: &super::tests::RunResult) -> String {
+///
+/// Shared with [`super::test_fact::terminal_fact`], which cuts it to its own limit.
+pub(super) fn rerun_text(result: &super::tests::RunResult) -> String {
     let command = display_argv(&result.command);
     match &result.rerun_dir {
         Some(dir) => format!(
@@ -7720,7 +7670,14 @@ fn rerun_text(result: &super::tests::RunResult) -> String {
     }
 }
 
-/// Renders the bounded parsed test result and actionable rerun/detail references.
+/// Renders the settled reply body of run `id`.
+///
+/// A run with a recognised outcome (counts, a budget stop or a failed runner) reads exactly as
+/// the pushed terminal fact does ([`super::test_fact::terminal_fact`]). A run without any
+/// recognised summary keeps its exit status with the runner output's bounded tail of up to 4 KiB
+/// ([`command_result_text`]); the pushed fact quotes a shorter tail. `owns_detail` says whether
+/// the caller started the run and may read its full output. The last parameter is unused: the
+/// text no longer depends on whether the run came from an explicit command.
 fn test_result_text(
     id: u64,
     result: &super::tests::RunResult,
@@ -7731,39 +7688,7 @@ fn test_result_text(
     if super::tests::summary_absent(result) {
         return command_result_text(id, result, owns_detail);
     }
-    let report = &result.report;
-    let mut text = super::tests::result_line(id, result);
-    for failure in report.failures.iter().take(MAX_LISTED_FAILURES) {
-        text.push_str(&format!("\n  FAIL {}", test_text_line(&failure.name, 160)));
-        if let Some((path, line)) = &failure.location {
-            text.push_str(&format!(
-                "\n       {}:{}  {}",
-                test_text_line(&path.display().to_string(), 128),
-                line,
-                test_text_line(&failure.message, 240)
-            ));
-        } else {
-            text.push_str(&format!(
-                "\n       {}",
-                test_text_line(&failure.message, 240)
-            ));
-        }
-    }
-    if report.failures.len() > MAX_LISTED_FAILURES {
-        text.push_str(&format!(
-            "\n  (+{} more failed tests in the full output)",
-            report.failures.len() - MAX_LISTED_FAILURES
-        ));
-    }
-    push_target_lines(&mut text, result);
-    text.push_str(&format!("\n  rerun: {}", rerun_text(result)));
-    if owns_detail {
-        text.push_str(&format!(
-            "\n  full output: ide.inspect {}",
-            result.detail_ref
-        ));
-    }
-    text
+    super::test_fact::terminal_fact(id, result, owns_detail).reply_text(id)
 }
 
 /// Appends a several-target run's per-target lines (batch-api-v1 §6), each bounded like a
@@ -7802,7 +7727,7 @@ fn command_result_text(id: u64, result: &super::tests::RunResult, owns_detail: b
     text
 }
 
-/// Checks the bounded command reply, poll-hint parsing and the user-facing relationship limits.
+/// Checks the bounded command reply and the user-facing relationship limits.
 #[cfg(test)]
 mod tool_reply_fix_tests {
     use super::*;
@@ -7916,17 +7841,6 @@ mod tool_reply_fix_tests {
             reply.contains("full output: ide.inspect test-detail"),
             "{reply}"
         );
-    }
-
-    /// Recognizes the prose poll hint without mistaking other `status` text for a run handle.
-    #[test]
-    fn poll_hint_points_to_the_status_call() {
-        assert_eq!(
-            poll_hint_run("poll: call ide.test with {\"status\": 12}"),
-            Some(12)
-        );
-        assert_eq!(poll_hint_run("ide.test {\"status\": 0}"), None);
-        assert_eq!(poll_hint_run("ide.inspect {\"status\": 12}"), None);
     }
 
     /// Keeps 0–3 visible in descriptions as well as JSON schema bounds for hosts that drop bounds.
@@ -13655,8 +13569,8 @@ mod stop_retry_tests {
         while worker
             .shared
             .test_runs
-            .status_line(&fixture.root)
-            .is_some_and(|line| line.contains("running"))
+            .get(&fixture.root, 1, &binding)
+            .is_some_and(|status| status.result.is_none())
         {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -13772,7 +13686,7 @@ mod stop_retry_tests {
             "{completed}"
         );
 
-        // A still-running run's handle answers with the running line and the poll hint.
+        // A still-running run's handle answers with the bare running line.
         let sleep_started = loop {
             match worker.shared.test_runs.start(
                 fixture.root.clone(),
@@ -13794,13 +13708,9 @@ mod stop_retry_tests {
         let PeerReply::Complete { text, .. } = &running else {
             panic!("handle alias must answer, got {running:?}")
         };
-        assert!(
-            text.starts_with("tests #2: running")
-                && text.ends_with("poll: call ide.test with {\"status\": 2}"),
-            "{text}"
-        );
+        assert_eq!(text, "tests #2: running");
 
-        // A run that cannot be found gets a distinct invalid-detail stage, not a useless poll hint.
+        // A run that cannot be found gets a distinct invalid-detail stage.
         let unknown = inspect("tests-9".into()).await;
         assert_eq!(
             unknown,
