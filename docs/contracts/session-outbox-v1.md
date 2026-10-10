@@ -1,11 +1,11 @@
-# Session outbox and delivery v1 contract (OUTBOX-r2)
+# Session outbox and delivery v1 contract (OUTBOX-r3)
 
-Revision 2 (2026-10-10). Canonical definition of the deferred-fact outbox that every IDE session
+Revision 3 (2026-10-10); only the M-024 boundary changed from r2 (see the revision history). Canonical definition of the deferred-fact outbox that every IDE session
 owns, the carriers that deliver its facts, and the obligations of the modules that produce facts.
 Provider: M-026 "Session outbox and delivery". Consumers: M-024 (terminal test fact and plates),
 M-025 (precise answer after an approximate one), M-027 (pending batch items, multi-file edit
-checks, compaction signal). M-026 consumes M-024's `M024-M026-TEST-FACT` r2
-(`docs/contracts/reply-hygiene-v1.md` §1: the test-finished text).
+checks, compaction signal). M-026 consumes M-024's `M024-M026-TEST-FACT` r3
+(`docs/contracts/reply-hygiene-v1.md@cc925867` §1: the test-finished text).
 
 Design basis, read for the evidence behind each rule:
 
@@ -38,7 +38,7 @@ The kind set is closed. Adding a kind is a contract revision.
 
 | Kind | Producer (module) | Subject form | `holds_turn` | Source-bearing | Body |
 |---|---|---|---|---|---|
-| `test-finished` | test run settlement; text M-024 (`M024-M026-TEST-FACT` r2, `terminal_fact`), push M-026 | `tests #N` | true | no | M-024 `summary` + `detail`, <= 2000 bytes: counts, <= 8 `FAIL` entries, `rerun:`, `full output: ide.inspect <ref>` |
+| `test-finished` | test run settlement; text M-024 (`M024-M026-TEST-FACT` r3, `terminal_fact`), push M-026 | `tests #N` | true | no | M-024 `summary` (<= 256 bytes) + `detail`, together <= 1536 bytes: counts, <= 8 `FAIL` entries, `rerun:` (<= 300 bytes), `full output: ide.inspect <ref>` |
 | `edit-checked` | edit project check; single-file M-026, multi-file M-027 | `edit <operation_id>` | true | no | §3.3 |
 | `job-ready` | a job registered with `defer` (§3.2): an initial reply that went `pending` (M-026), a pending batch job (M-027), a precise answer after an approximate one (M-025) | `<tool> <target>` or `batch <detail_ref>: items i,j` | true, except **false** when the caller already got an approximate answer | yes for context/outline/read/symbol/graph/diff answers; no for edit, start, test | the job's final reply or final failure |
 | `lost-after-restart` | session re-activation after a daemon replacement (M-026) | `restart` | false | no | §10 |
@@ -145,7 +145,7 @@ One fact:
   of §7.
 - Untrusted runner/checker text is sanitized as in `problems.rs` (control characters become
   spaces; `<` and `>` become `?`) so it cannot forge the `<agent-ide>` framing.
-- Per fact: summary line <= 256 bytes; whole fact <= 2048 bytes (a `test-finished` `summary` + `detail` <= 2000).
+- Per fact: summary line <= 256 bytes; whole fact <= 2048 bytes (a `test-finished` `summary` + `detail` <= 1536).
 - Per block on a hook carrier (PostToolUse, Stop reason, wake message): the whole model-visible
   text, ambient lines and legacy native feedback included, <= `MAX_FEEDBACK_BYTES` = 4096
   (`reply.rs:11`). Per reply piggyback: facts <= 4096 bytes in addition to the reply body; the
@@ -469,15 +469,16 @@ no longer holds.
 
 ### 13.1 M-024 (plates, terminal test fact)
 
-- Provides `M024-M026-TEST-FACT` r2: `terminal_fact(id, result, owns_detail) -> {summary, detail}`
-  (`summary` <= 256 bytes, `summary` + `detail` <= 2000 bytes, at most 8 `FAIL` entries, `rerun:`,
-  `full output: ide.inspect <ref>`), sanitized, without `poll` or elapsed seconds of a running
-  run. M-026 calls it at run settlement and pushes the fact with `fence_paths = []`.
+- Provides `M024-M026-TEST-FACT` r3: `terminal_fact(id, result, owns_detail) -> {summary, detail}`
+  (`summary` <= 256 bytes, `summary` + `detail` <= 1536 bytes, at most 8 `FAIL` entries plus a
+  `+K` line, `rerun:` <= 300 bytes, `full output: ide.inspect <ref>` for the owner only),
+  sanitized, without `poll` or elapsed seconds of a running run. M-026 calls it at run settlement
+  and pushes the fact with `fence_paths = []`, rendering `detail` verbatim.
 - Owns the started line and the status-reply text (`tests #N: running`, no seconds, no poll);
   does not edit the plate test-line plumbing that §4 retires.
 - Uses the §8.7 texts for pending replies, the started-line suffix and teaching.
 - Checks: one settled run yields exactly one delivered `test-finished` across a concurrent hook and
-  reply; the rendered text never contains `poll` and `summary` + `detail` never exceeds 2000
+  reply; the rendered text never contains `poll` and `summary` + `detail` never exceeds 1536
   bytes; no plate carries a test line; a delivered fact makes `ide.stop` stop listing the run.
 
 ### 13.2 M-025 (precise answer after an approximate one)
@@ -559,4 +560,8 @@ External changes this machine needs for agent-run runs (owner approval; not made
   collection on hand-off, teaching sentences); `SessionOutbox` trait with `defer`, `forget`,
   `context_epoch` and `RecordingOutbox`; M-025 definition-file fence and discard text;
   `edit-checked` multi-file body; compaction signal; displacement; deployment list; consumes
-  `M024-M026-TEST-FACT` r2 (`terminal_fact`, 2000-byte text).
+  `M024-M026-TEST-FACT` r2 (`terminal_fact`, 2000-byte text). Tracked at r2 (commit `eaf8c9e2`)
+  for M-025 and M-027.
+- r3: M-024 boundary only (`session-outbox-v1-m024`): consumes `M024-M026-TEST-FACT` r3
+  (`reply-hygiene-v1.md@cc925867` §1): `summary` + `detail` <= 1536 bytes, `rerun:` <= 300 bytes,
+  `detail` rendered verbatim (§2, §3.4, §13.1). Sections for M-025 and M-027 are unchanged.
