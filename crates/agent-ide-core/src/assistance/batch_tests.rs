@@ -196,10 +196,10 @@ impl Worker<'_> {
                     Some(job.reference.clone()),
                 )
             }
-            StartResult::Running(id, age) => {
+            StartResult::Running(id, _) => {
                 // One run per worktree: this session receives the live run's own result.
                 self.shared.test_subscribed(id, &binding);
-                complete(running_line(id, age), None)
+                complete(running_line(id), None)
             }
             StartResult::Failed { error, .. } => complete(
                 format!(
@@ -377,14 +377,11 @@ fn started_line(id: u64, targets: usize, runs: usize, budget: Duration) -> Strin
     )
 }
 
-/// The reply of a several-target start while the worktree's run `id` (running `age`) is live:
-/// nothing new starts, and the live run's result reaches this session too.
-fn running_line(id: u64, age: Duration) -> String {
-    format!(
-        "tests #{id}: still running ({} s); nothing new started — its result arrives by itself \
-         as a test-finished fact",
-        age.as_secs()
-    )
+/// The reply of a several-target start while the worktree's run `id` is live, exactly the
+/// hygiene text `tests #N: still running` (no seconds on unfinished work, M024-M027-REPLY-HYGIENE
+/// r2 §2); nothing new starts and the live run's result reaches this session too.
+fn running_line(id: u64) -> String {
+    format!("tests #{id}: still running")
 }
 
 /// The outcome line of a target its language cannot run: the single form's refusal text, or
@@ -495,6 +492,8 @@ mod tests {
              as a test-finished fact"
         );
         crate::assistance::batch::assert_no_polling(&started);
-        crate::assistance::batch::assert_no_polling(&running_line(4, Duration::from_secs(12)));
+        let running = running_line(4);
+        assert_eq!(running, "tests #4: still running");
+        crate::assistance::batch::assert_no_polling(&running);
     }
 }

@@ -6080,8 +6080,9 @@ async fn a_slow_edit_check_answers_at_once_and_arrives_as_one_fact() {
 }
 
 /// Reply hygiene (M024-M027-REPLY-HYGIENE r2, M024-M026 outbox texts): every real reply of a batch
-/// read, a batch edit whose project check outlasts the call, and the two inspections that hand
-/// over its fact states what happened and never invites polling, in its text and carried status.
+/// read, a batch edit whose project check outlasts the call, the two inspections that hand over its
+/// fact and the `ide.stop` reply states what happened and never invites polling, in its text and
+/// carried status.
 #[tokio::test]
 async fn pending_and_batch_replies_never_invite_polling() {
     let fixture = ProductFixture::new(json!([]));
@@ -6132,6 +6133,8 @@ async fn pending_and_batch_replies_never_invite_polling() {
     );
     seen.push(checked);
     seen.push(actor.call(&fixture, "ide.inspect", json!({})).await);
+    // The stop reply is read after a call too: it is held to the same rule.
+    seen.push(actor.call(&fixture, "ide.stop", json!({})).await);
     for reply in &seen {
         let shown = format!(
             "{} {}",
@@ -6149,7 +6152,6 @@ async fn pending_and_batch_replies_never_invite_polling() {
             assert!(!shown.contains(banned), "{banned}: {reply}");
         }
     }
-    actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();
