@@ -25,9 +25,10 @@ use super::{
     payload::{
         AnalysisScopeRequest, AnalyzeSource, AnchorBatch, CheckSelectionAnswer, CommandEnvAnswer,
         DetectAnswer, EffectRequest, EnvironmentsAnswer, Field, FileDocRequest, FileVerdict,
-        FormatPlanRequest, InsertSiteAnswer, InsertSiteRequest, ProjectQuery, SelectionAnswer,
-        SourceAnalysis, SourceField, SourceRef, SourceText, SyntaxQuery, TestFacts,
-        TestParseRequest, TestPlanQuery, TestToolchainAnswer, encode,
+        FormatPlanRequest, InputsVerdict, InsertSiteAnswer, InsertSiteRequest, MAX_INPUT_ROUNDS,
+        MAX_PROJECT_INPUTS, ProjectInput, ProjectQuery, SelectionAnswer, SourceAnalysis,
+        SourceField, SourceRef, SourceText, SyntaxQuery, TestFacts, TestParseRequest,
+        TestPlanQuery, TestToolchainAnswer, encode,
     },
     router::ModuleHost,
     wire::Attachment,
@@ -198,6 +199,125 @@ async fn analyze(
         cache.insert(key, analysis.clone());
     }
     Ok(analysis)
+}
+
+/// One project file the core read for a language's interpretation: its exact bytes (already
+/// admitted and read by the core), and whether the language parses them or only fingerprints them.
+#[derive(Clone, Debug)]
+pub struct ReadInput {
+    /// Worktree-relative path.
+    pub path: PathBuf,
+    /// The exact bytes read.
+    pub bytes: Vec<u8>,
+    /// The language parses the contents (they travel as an attachment); otherwise only the
+    /// length and digest do.
+    pub parse: bool,
+}
+
+/// The language's interpretation of the project files read for `document`: `None` when the
+/// language computes in process (the caller interprets them itself), otherwise its module's
+/// verdict over `inputs`, repeated while the module asks for more files. Each requested path is
+/// read only through `read` (the core's own admission and exact read; `None` refuses the
+/// document), at most [`MAX_INPUT_ROUNDS`] rounds and [`MAX_PROJECT_INPUTS`] inputs; a verdict
+/// beyond its bounds is the module's typed malformed fault.
+pub async fn project_inputs(
+    language: Language,
+    worktree: &Path,
+    document: &Path,
+    inputs: Vec<ReadInput>,
+    read: impl FnMut(&Path) -> Option<ReadInput>,
+) -> Option<Routed<InputsVerdict>> {
+    let host = module(language)?;
+    let ask = |query: super::payload::DescribeQuery, attachments: Vec<Attachment>| {
+        let host = host.clone();
+        async move {
+            host.request(
+                language,
+                worktree,
+                Capability::Describe,
+                encode(&query),
+                attachments,
+            )
+            .await
+        }
+    };
+    Some(negotiate_inputs(language, document, inputs, read, ask).await)
+}
+
+/// The rounds of [`project_inputs`] over `ask` (one `describe` request).
+async fn negotiate_inputs<F, Fut>(
+    language: Language,
+    document: &Path,
+    mut inputs: Vec<ReadInput>,
+    mut read: impl FnMut(&Path) -> Option<ReadInput>,
+    ask: F,
+) -> Routed<InputsVerdict>
+where
+    F: Fn(super::payload::DescribeQuery, Vec<Attachment>) -> Fut,
+    Fut: std::future::Future<Output = Routed<InputsVerdict>>,
+{
+    let rejected = |file: Option<&Path>, reason: &str| InputsVerdict::Rejected {
+        file: file.map(Path::to_path_buf),
+        reason: reason.to_owned(),
+    };
+    for _ in 0..MAX_INPUT_ROUNDS {
+        if inputs.len() > MAX_PROJECT_INPUTS {
+            return Ok(rejected(None, "too many project inputs"));
+        }
+        let mut attachments = Vec::new();
+        let described = inputs
+            .iter()
+            .map(|input| ProjectInput {
+                path: input.path.clone(),
+                bytes: input.bytes.len() as u64,
+                blake3: blake3::hash(&input.bytes).to_hex().to_string(),
+                contents: input.parse.then(|| {
+                    let id = attachments.len() as u32 + 1;
+                    attachments.push(Attachment::octets(id, input.bytes.clone()));
+                    id
+                }),
+            })
+            .collect();
+        let query = super::payload::DescribeQuery::ProjectInputs {
+            document: document.to_path_buf(),
+            inputs: described,
+        };
+        let verdict = ask(query, attachments).await?;
+        if !verdict.bounded() {
+            return Err(malformed(language));
+        }
+        let InputsVerdict::Need { paths } = verdict else {
+            return Ok(verdict);
+        };
+        for path in paths {
+            if inputs.iter().any(|input| input.path == path) {
+                return Ok(rejected(Some(&path), "asked again for a file already read"));
+            }
+            match read(&path) {
+                Some(input) => inputs.push(input),
+                None => {
+                    return Ok(rejected(
+                        Some(&path),
+                        "a needed project file is not readable",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(rejected(None, "project inputs need too many rounds"))
+}
+
+/// The typed fault of a module answer the core cannot use.
+fn malformed(language: Language) -> ModuleUnavailable {
+    ModuleUnavailable {
+        module_id: super::contract::ModuleId::bundled(language.name()),
+        module_version: env!("CARGO_PKG_VERSION").to_owned(),
+        role: super::contract::Role::Analyzer,
+        stage: super::contract::Stage::Decode,
+        cause: super::contract::Cause::Malformed,
+        instance: None,
+        retry_after_ms: None,
+    }
 }
 
 /// The linkage anchors of `path` with `text`: `Ok(None)` when `language` computes in process
@@ -787,6 +907,119 @@ pub async fn not_analysed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Project inputs: a contents file travels as an attachment whose length and digest the
+    /// query names, a fingerprinted one without; a needed file is read through the core's own
+    /// reader and the query repeated; an unreadable needed file, a repeated request, an endless
+    /// series of requests and too many inputs refuse the document; a verdict beyond its bounds is
+    /// the module's malformed fault.
+    #[tokio::test]
+    async fn project_inputs_rounds_are_bounded_and_read_by_the_core() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        crate::lang::testing::install();
+        let language = crate::lang::testing::ALPHA;
+        let input = |path: &str, parse: bool| ReadInput {
+            path: path.into(),
+            bytes: format!("{path} \"\\\n\u{1}").into_bytes(),
+            parse,
+        };
+        let rounds = AtomicUsize::new(0);
+        let script = |verdicts: Vec<InputsVerdict>| {
+            let rounds = &rounds;
+            move |query: super::super::payload::DescribeQuery, attachments: Vec<Attachment>| {
+                let round = rounds.fetch_add(1, Ordering::Relaxed);
+                let super::super::payload::DescribeQuery::ProjectInputs { inputs, .. } = query
+                else {
+                    panic!("a project-inputs query");
+                };
+                for input in &inputs {
+                    if let Some(id) = input.contents {
+                        let bytes = &attachments[id as usize - 1].bytes;
+                        assert_eq!(bytes.len() as u64, input.bytes);
+                        assert_eq!(blake3::hash(bytes).to_hex().as_str(), input.blake3);
+                    }
+                }
+                let verdict = verdicts.get(round).cloned().unwrap_or(InputsVerdict::Need {
+                    paths: vec![format!("more-{round}").into()],
+                });
+                async move { Ok(verdict) }
+            }
+        };
+        let need = |path: &str| InputsVerdict::Need {
+            paths: vec![path.into()],
+        };
+        let doc = Path::new("doc.x");
+        let verdict = negotiate_inputs(
+            language,
+            doc,
+            vec![input("a.cfg", true), input("b.lock", false)],
+            |path| Some(input(path.to_str().unwrap(), true)),
+            script(vec![need("c.cfg"), InputsVerdict::Accepted]),
+        )
+        .await;
+        assert_eq!(verdict.unwrap(), InputsVerdict::Accepted);
+        assert_eq!(rounds.swap(0, Ordering::Relaxed), 2);
+        let refused =
+            |verdict: Routed<InputsVerdict>| matches!(verdict, Ok(InputsVerdict::Rejected { .. }));
+        assert!(refused(
+            negotiate_inputs(language, doc, vec![], |_| None, script(vec![need("x")])).await
+        ));
+        rounds.store(0, Ordering::Relaxed);
+        assert!(refused(
+            negotiate_inputs(
+                language,
+                doc,
+                vec![input("a.cfg", true)],
+                |path| Some(input(path.to_str().unwrap(), true)),
+                script(vec![need("a.cfg")]),
+            )
+            .await
+        ));
+        rounds.store(0, Ordering::Relaxed);
+        assert!(refused(
+            negotiate_inputs(
+                language,
+                doc,
+                vec![],
+                |path| Some(input(path.to_str().unwrap(), false)),
+                script(vec![]),
+            )
+            .await
+        ));
+        assert_eq!(rounds.swap(0, Ordering::Relaxed), MAX_INPUT_ROUNDS);
+        let many = (0..=MAX_PROJECT_INPUTS)
+            .map(|index| input(&format!("f{index}"), false))
+            .collect();
+        assert!(refused(
+            negotiate_inputs(language, doc, many, |_| None, script(vec![])).await
+        ));
+        assert_eq!(rounds.swap(0, Ordering::Relaxed), 0, "nothing was asked");
+        for unbounded in [
+            InputsVerdict::Need { paths: vec![] },
+            InputsVerdict::Need {
+                paths: vec!["../out".into()],
+            },
+            InputsVerdict::Need {
+                paths: (0..=super::super::payload::MAX_NEEDED_PATHS)
+                    .map(|index| format!("p{index}").into())
+                    .collect(),
+            },
+            InputsVerdict::Rejected {
+                file: None,
+                reason: "x".repeat(super::super::payload::MAX_INPUTS_REASON + 1),
+            },
+            InputsVerdict::Rejected {
+                file: None,
+                reason: "line\nbreak".into(),
+            },
+        ] {
+            rounds.store(0, Ordering::Relaxed);
+            let fault = negotiate_inputs(language, doc, vec![], |_| None, script(vec![unbounded]))
+                .await
+                .unwrap_err();
+            assert_eq!(fault.cause, super::super::contract::Cause::Malformed);
+        }
+    }
 
     /// Only an answer that computed every requested field is a cacheable fact: a warming or
     /// unsupported field (whose in-process default the caller substitutes) never is, nor is an
