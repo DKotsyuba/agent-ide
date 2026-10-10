@@ -927,7 +927,8 @@ impl HostBindingGuard {
 
     /// Buffers a native pre-hook or records a per-tool/batch post for a channel-bound invocation.
     ///
-    /// Duplicate pre-hooks and post-before-MCP lifecycles prevent later MCP validation.
+    /// Post-before-MCP lifecycles prevent later MCP validation. The same pre delivered twice (one
+    /// handler registered twice) is idempotent and never rejects its call.
     /// For an already active binding, a complete Pre/Post without MCP also coalesces one
     /// native-change hint. Failed commands and edit/delete/rename lifecycles use the same hint;
     /// tool payloads are never interpreted as proof of effects.
@@ -985,14 +986,13 @@ impl HostBindingGuard {
             return BindingStatus::Unavailable(BindingUnavailable::CapacityExceeded);
         }
         match event.phase {
-            HookPhase::Pre
-                if self.pre_observed.contains(&invocation)
-                    || self.settling.contains_key(&invocation) =>
-            {
-                self.pre_observed.remove(&invocation);
-                self.settling.remove(&invocation);
-                self.record_replay(&invocation, ReplayDisposition::Rejected)
-                    .expect("the checked rejection scope has capacity");
+            // A handler registered twice (a plugin beside a hand-merged hooks.json, or a harness
+            // beside the user's hooks.json) delivers every pre twice with the same identity. The
+            // pending pre stays pending, and a pre whose call was already validated is a silent
+            // replay; neither rejects the call (T-010), and a true replay of a settled or
+            // rejected call is still refused above.
+            HookPhase::Pre if self.pre_observed.contains(&invocation) => BindingStatus::PreObserved,
+            HookPhase::Pre if self.settling.contains_key(&invocation) => {
                 BindingStatus::Unavailable(BindingUnavailable::Replay)
             }
             HookPhase::Pre => {
@@ -2215,9 +2215,65 @@ mod tests {
         }
     }
 
+    /// T-010 regression: with one agent-ide handler registered twice (Codex loads the user's
+    /// hooks.json beside a harness's or plugin's own entries), every hook arrives twice. Every
+    /// managed call is still admitted, a native lifecycle yields exactly one observation, and a
+    /// consumed call id stays a refused replay.
+    #[test]
+    fn a_handler_registered_twice_keeps_every_call_working() {
+        let mut guard = HostBindingGuard::default();
+        let channel = channel("doubled-handlers");
+        assert!(matches!(
+            guard.establish_managed_codex_start(codex_candidate("actor", "start"), channel.clone()),
+            BindingStatus::Validated(_)
+        ));
+        for call in ["read-1", "read-2", "read-3"] {
+            for _ in 0..2 {
+                assert!(matches!(
+                    guard.observe_hook(codex_hook("PreToolUse", "actor", call), channel.clone()),
+                    BindingStatus::PreObserved
+                ));
+            }
+            assert!(
+                matches!(
+                    guard.validate_managed_codex_active(
+                        codex_candidate("actor", call),
+                        channel.clone()
+                    ),
+                    BindingStatus::Validated(_)
+                ),
+                "{call}"
+            );
+            for _ in 0..2 {
+                assert!(matches!(
+                    guard.observe_hook(codex_hook("PostToolUse", "actor", call), channel.clone()),
+                    BindingStatus::Unavailable(BindingUnavailable::Replay)
+                ));
+            }
+        }
+        for _ in 0..2 {
+            assert!(matches!(
+                guard.observe_hook(codex_hook("PreToolUse", "actor", "bash"), channel.clone()),
+                BindingStatus::PreObserved
+            ));
+        }
+        assert!(matches!(
+            guard.observe_hook(codex_hook("PostToolUse", "actor", "bash"), channel.clone()),
+            BindingStatus::NativeObserved(_)
+        ));
+        assert!(!matches!(
+            guard.observe_hook(codex_hook("PostToolUse", "actor", "bash"), channel.clone()),
+            BindingStatus::NativeObserved(_)
+        ));
+        assert!(matches!(
+            guard.validate_managed_codex_active(codex_candidate("actor", "read-1"), channel),
+            BindingStatus::Unavailable(BindingUnavailable::Replay)
+        ));
+    }
+
     /// Pins the managed pairing state machine (T29B §4): managed MCP admission consumes its
-    /// paired exact pre-observation and silences its own post, while duplicate pres, completed
-    /// call IDs, conflicting settling state and pre-less native posts stay rejected.
+    /// paired exact pre-observation (delivered once or twice) and silences its own post, while
+    /// completed call IDs, conflicting settling state and pre-less native posts stay rejected.
     #[test]
     fn managed_codex_admission_consumes_a_paired_pre_and_keeps_rejections() {
         let mut guard = HostBindingGuard::default();
@@ -2251,21 +2307,34 @@ mod tests {
             ),
             BindingStatus::Unavailable(BindingUnavailable::Replay)
         ));
-        // A duplicated pre-event poisons the invocation permanently, for hooks and admission alike.
+        // A pre delivered twice (one handler registered twice, T-010) stays one pending pre:
+        // admission still validates the call, its posts are silent, and the consumed call id
+        // is then refused as a replay.
+        for _ in 0..2 {
+            assert!(matches!(
+                guard.observe_hook(
+                    codex_hook("PreToolUse", "actor-a", "call-2"),
+                    channel.clone()
+                ),
+                BindingStatus::PreObserved
+            ));
+        }
         assert!(matches!(
-            guard.observe_hook(
-                codex_hook("PreToolUse", "actor-a", "call-2"),
+            guard.validate_managed_codex_active(
+                codex_candidate("actor-a", "call-2"),
                 channel.clone()
             ),
-            BindingStatus::PreObserved
+            BindingStatus::Validated(_)
         ));
-        assert!(matches!(
-            guard.observe_hook(
-                codex_hook("PreToolUse", "actor-a", "call-2"),
-                channel.clone()
-            ),
-            BindingStatus::Unavailable(BindingUnavailable::Replay)
-        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                guard.observe_hook(
+                    codex_hook("PostToolUse", "actor-a", "call-2"),
+                    channel.clone()
+                ),
+                BindingStatus::Unavailable(BindingUnavailable::Replay)
+            ));
+        }
         assert!(matches!(
             guard.validate_managed_codex_active(
                 codex_candidate("actor-a", "call-2"),
@@ -2699,13 +2768,25 @@ mod tests {
             BindingStatus::PreObserved
         ));
         assert!(matches!(
+            duplicate.observe_hook(event.clone(), duplicate_channel.clone()),
+            BindingStatus::PreObserved
+        ));
+        // The same pre delivered twice (one handler registered twice, T-010) is one pre: the
+        // start binds, a third copy after validation is a silent replay, and the post settles.
+        assert!(matches!(
+            duplicate.establish_start_claude("duplicate-call", duplicate_channel.clone()),
+            BindingStatus::Validated(_)
+        ));
+        assert!(matches!(
             duplicate.observe_hook(event, duplicate_channel.clone()),
             BindingStatus::Unavailable(BindingUnavailable::Replay)
         ));
-        // The duplicated pre was rejected as replay evidence, so the call names that cause.
         assert!(matches!(
-            duplicate.establish_start_claude("duplicate-call", duplicate_channel),
-            BindingStatus::Unavailable(BindingUnavailable::Replay)
+            duplicate.observe_hook(
+                claude_post("session", Some("child"), "duplicate-call"),
+                duplicate_channel
+            ),
+            BindingStatus::Settled(_)
         ));
     }
 

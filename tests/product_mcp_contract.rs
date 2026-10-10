@@ -1466,15 +1466,28 @@ async fn binary_codex_hooks_bind_exact_parallel_actors_and_stop_before_workspace
         restarted["result"]["structuredContent"]["code"],
         "host_binding"
     );
-    // Duplicate and premature post observations cannot be repaired by a subsequent MCP call.
-    for (call, second_phase) in [("duplicate", "PreToolUse"), ("early-post", "PostToolUse")] {
-        hook(&runtime, "PreToolUse", "session_id", "root", call).await;
-        hook(&runtime, second_phase, "session_id", "root", call).await;
-        boundary(
-            &root.exchange(host_call("root", call, "ide.start")).await,
-            "host_binding",
-        );
+    // The same pre delivered twice (one handler registered twice) is one pre and admits its
+    // call (T-010); a premature post cannot be repaired by a subsequent MCP call.
+    for _ in 0..2 {
+        hook(&runtime, "PreToolUse", "session_id", "root", "duplicate").await;
     }
+    let doubled = root
+        .exchange(host_call("root", "duplicate", "ide.start"))
+        .await;
+    assert_compact_envelope(&doubled);
+    assert_ne!(
+        doubled["result"]["structuredContent"]["code"],
+        "host_binding"
+    );
+    hook(&runtime, "PostToolUse", "session_id", "root", "duplicate").await;
+    hook(&runtime, "PreToolUse", "session_id", "root", "early-post").await;
+    hook(&runtime, "PostToolUse", "session_id", "root", "early-post").await;
+    boundary(
+        &root
+            .exchange(host_call("root", "early-post", "ide.start"))
+            .await,
+        "host_binding",
+    );
     // MCP-before-pre is permanently rejected for that exact invocation.
     boundary(
         &root

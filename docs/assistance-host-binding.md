@@ -236,8 +236,9 @@ installed path shell-quoted) — the placeholder-only example is
 [`docs/examples/codex-hooks.json`](examples/codex-hooks.json). The owner merges the two handlers
 into the existing `PreToolUse`/`PostToolUse` arrays of `~/.codex/hooks.json` preserving existing
 entries, then reviews and trusts both definitions through Codex's normal UI; the product never
-writes `hooks.json` or any host configuration, and duplicate agent-ide handlers must not be
-registered (duplicate pre-events are rejected as replays).
+writes `hooks.json` or any host configuration. A handler registered twice (for example the
+user's `hooks.json` beside a harness's own entries) delivers every event twice; the daemon
+treats the identical second pre as the same pending pre, so every call keeps working (T-010).
 
 Claude Code 2.1.280 is the tested target. Its example config includes exact `PreToolUse`,
 `PostToolUse`, `PostToolUseFailure`, and `PermissionDenied` commands; older Claude versions
@@ -382,8 +383,9 @@ commands: actor/call/phase are sufficient triggers; command text, paths and tool
 are never trusted as effects. `take_native_change_hint` consumes that bounded hint after
 a fresh liveness check. The worker invalidates old detail immediately, then reconciles only
 registered paths on the next MCP invocation. A binding keeps at most 256 distinct registered paths (a budget of its own, independent of the retained results limit); when the set is full, the least recently read path is evicted to make room, so a read is never refused for it. An evicted path is only no longer refreshed on native hints: an edit built on its retained read is judged by the file's bytes as always — still matching, it applies; changed, it meets the ordinary `stale_source` answer, which asks for a re-read.
-Duplicate pre-hooks, premature post-hooks and MCP-before-pre ordering reject that
-invocation for subsequent MCP validation in the remaining daemon lifetime; late hooks cannot repair it. Explicit stop revokes the
+Premature post-hooks and MCP-before-pre ordering reject that
+invocation for subsequent MCP validation in the remaining daemon lifetime; late hooks cannot repair it. The
+same pre delivered twice (one handler registered twice) counts as one pre. Explicit stop revokes the
 exact binding and rejects its pending pre-hooks before any Workspace handoff could occur.
 Post settlement for already validated calls can still complete. A fresh explicit start
 is required after stop; another actor's binding is unaffected.
