@@ -649,27 +649,29 @@ pub async fn insert_site(
     }
 }
 
-/// A selected test run: the tests it runs and its argument vector, program first. `admitted`
-/// marks a module-planned run, whose program and arguments the core expanded from one of the
-/// language's declared test recipes (so its program is never replaced afterwards).
+/// A selected test run: the tests it runs, its argument vector (program first), and for a
+/// module-planned run the specification the core expanded and admitted from one of the
+/// language's declared test recipes, which is exactly what runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannedRun {
     /// The selected tests.
     pub tests: Vec<crate::lang::TestId>,
     /// Argv, program first.
     pub command: Vec<String>,
-    /// The core expanded `command` from a declared recipe.
-    pub admitted: bool,
+    /// The admitted run of a module-planned selection; `None` in process.
+    pub spec: Option<crate::checks::runner::RunSpec>,
 }
 
-/// The run of `LanguageSupport::test_selection`: in process the language's own argument
-/// vector; in module mode the module's request of one of the language's declared test recipes,
-/// expanded by the core (a request outside them is refused, never run).
+/// The run of `LanguageSupport::test_selection` within `budget`: in process the language's own
+/// argument vector; in module mode the module's request of one of the language's declared test
+/// recipes (class `test`), expanded and admitted by the core (any other request is refused,
+/// never run).
 pub async fn test_run(
     language: Language,
     worktree: &Path,
     project: &LanguageProject,
     target: &TestTarget,
+    budget: std::time::Duration,
 ) -> Routed<Result<PlannedRun, LangError>> {
     let Some(host) = module(language) else {
         return Ok(language
@@ -678,7 +680,7 @@ pub async fn test_run(
             .map(|selection| PlannedRun {
                 tests: selection.tests,
                 command: selection.command,
-                admitted: false,
+                spec: None,
             }));
     };
     let run: super::payload::RunAnswer = host
@@ -696,14 +698,20 @@ pub async fn test_run(
     let Ok(run) = run else {
         return Ok(Err(run.unwrap_err()));
     };
-    let spec = admitted(language, worktree, &run.effect)?;
+    let spec = admitted(
+        language,
+        worktree,
+        &run.effect,
+        super::payload::RunClass::Test,
+        budget,
+    )?;
     Ok(Ok(PlannedRun {
         tests: run.tests,
         command: std::iter::once(spec.program.as_os_str())
             .chain(spec.args.iter().map(std::ffi::OsString::as_os_str))
             .map(|part| part.to_string_lossy().into_owned())
             .collect(),
-        admitted: true,
+        spec: Some(spec),
     }))
 }
 
@@ -805,20 +813,42 @@ fn stdin_run(
     effect: Option<EffectRequest>,
 ) -> Routed<Option<StdinRun>> {
     match effect {
-        Some(effect) => {
-            admitted(language, worktree, &effect).map(|spec| Some(StdinRun::Spec(spec)))
-        }
+        Some(effect) => admitted(
+            language,
+            worktree,
+            &effect,
+            super::payload::RunClass::Interactive,
+            std::time::Duration::from_secs(10),
+        )
+        .map(|spec| Some(StdinRun::Spec(spec))),
         None => Ok(None),
     }
 }
 
-/// Expands `effect` under the core's interactive admission (see [`stdin_run`]); a request
-/// outside the language's declared recipes is refused as `policy_refused`.
+/// Expands `effect` under the core's interactive admission (see [`stdin_run`]) with `timeout`; a
+/// request outside the language's declared recipes of `class` is refused as `policy_refused`.
 fn admitted(
     language: Language,
     worktree: &Path,
     effect: &EffectRequest,
+    class: super::payload::RunClass,
+    timeout: std::time::Duration,
 ) -> Routed<crate::checks::runner::RunSpec> {
+    let refused = || ModuleUnavailable {
+        module_id: super::contract::ModuleId::bundled(language.name()),
+        module_version: env!("CARGO_PKG_VERSION").to_owned(),
+        role: super::contract::Role::Analyzer,
+        stage: super::contract::Stage::Decode,
+        cause: super::contract::Cause::PolicyRefused,
+        instance: None,
+        retry_after_ms: None,
+    };
+    if !super::recipe::declared(language.name())
+        .iter()
+        .any(|recipe| recipe.id == effect.recipe && recipe.class == class)
+    {
+        return Err(refused());
+    }
     let recipes = super::recipe::declared(language.name());
     let path = tool_path();
     let programs: Vec<(String, PathBuf)> = recipes
@@ -845,17 +875,9 @@ fn admitted(
         launcher_roots: &roots,
         developer_dirs: &developer_dirs,
         programs: &programs,
-        timeout: std::time::Duration::from_secs(10),
+        timeout,
     };
-    super::recipe::expand(recipes, effect, &admission).map_err(|_| ModuleUnavailable {
-        module_id: super::contract::ModuleId::bundled(language.name()),
-        module_version: env!("CARGO_PKG_VERSION").to_owned(),
-        role: super::contract::Role::Analyzer,
-        stage: super::contract::Stage::Decode,
-        cause: super::contract::Cause::PolicyRefused,
-        instance: None,
-        retry_after_ms: None,
-    })
+    super::recipe::expand(recipes, effect, &admission).map_err(|_| refused())
 }
 
 /// `LanguageSupport::format_stdin_command`.
@@ -952,6 +974,63 @@ pub async fn not_analysed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A module-planned test run may name only a declared recipe of class `test`, and a
+    /// formatter or probe only an interactive one: anything else is refused before expansion.
+    #[test]
+    fn effects_are_admitted_only_from_their_own_class() {
+        use super::super::payload::{
+            EffectRecipe, ExecutableSlot, Param, RunClass, SlotSource, Stdin,
+        };
+        const fn recipe(id: &'static str, class: RunClass) -> EffectRecipe {
+            EffectRecipe {
+                id,
+                program: "tool",
+                args: &[],
+                env: &[],
+                paths: &[],
+                executables: &[ExecutableSlot {
+                    name: "tool",
+                    source: SlotSource::HomeTool("sh"),
+                }],
+                stdin: Stdin::Null,
+                class,
+                timeout_ceiling_ms: 1000,
+                capture_bytes: 1024,
+                assets: &[],
+            }
+        }
+        static RECIPES: [EffectRecipe; 2] = [
+            recipe("fmt", RunClass::Interactive),
+            recipe("run", RunClass::Test),
+        ];
+        static DECLARED: [(&str, &[EffectRecipe]); 1] = [("gamma", &RECIPES)];
+        crate::lang::testing::install();
+        super::super::recipe::declare(&DECLARED);
+        let gamma = crate::lang::testing::GAMMA;
+        let request = |id: &str| EffectRequest {
+            recipe: id.to_owned(),
+            params: [("tool".to_owned(), Param::Executable("tool".into()))].into(),
+        };
+        let worktree = std::env::temp_dir();
+        let second = std::time::Duration::from_secs(1);
+        for (id, class) in [("fmt", RunClass::Test), ("run", RunClass::Interactive)] {
+            let refused = admitted(gamma, &worktree, &request(id), class, second).unwrap_err();
+            assert_eq!(refused.cause, super::super::contract::Cause::PolicyRefused);
+        }
+        let spec = admitted(gamma, &worktree, &request("run"), RunClass::Test, second).unwrap();
+        assert!(spec.program.ends_with("sh"));
+        assert!(
+            admitted(
+                gamma,
+                &worktree,
+                &request("fmt"),
+                RunClass::Interactive,
+                second
+            )
+            .is_ok()
+        );
+    }
 
     /// Project inputs: a contents file travels as an attachment whose length and digest the
     /// query names, a fingerprinted one without; a needed file is read through the core's own

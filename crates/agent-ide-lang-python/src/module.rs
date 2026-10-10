@@ -338,20 +338,48 @@ const TEST_RECIPES: [EffectRecipe; 6] = [
 ];
 
 /// A test-run recipe: `program` is the `interpreter` path parameter (admitted under
-/// [`INTERPRETER_ROLES`]) or a home tool slot of the same name. The core takes its program and
-/// arguments and runs them as an `ide.test` job in the language's environment.
+/// [`INTERPRETER_ROLES`]) or a home tool slot of the same name. The core runs exactly the
+/// expanded specification as the `ide.test` job: its complete environment is `HOME`, `PATH`
+/// (an activated environment's `bin` first, then the system directories) and, for an
+/// environment's own interpreter, `VIRTUAL_ENV`.
 const fn test_run(id: &'static str, program: &'static str, args: &'static [Arg]) -> EffectRecipe {
     EffectRecipe {
         id,
         program,
         args,
-        env: &[],
-        paths: &[PathRule {
-            param: "interpreter",
-            roles: INTERPRETER_ROLES,
-            existing_only: false,
-            read_root: false,
-        }],
+        env: &[
+            EnvRule::Home { name: "HOME" },
+            EnvRule::SearchPath {
+                name: "PATH",
+                param: "bin",
+                fixed: &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"],
+            },
+            EnvRule::Param {
+                name: "VIRTUAL_ENV",
+                param: "venv",
+                optional: true,
+            },
+        ],
+        paths: &[
+            PathRule {
+                param: "interpreter",
+                roles: INTERPRETER_ROLES,
+                existing_only: false,
+                read_root: false,
+            },
+            PathRule {
+                param: "venv",
+                roles: INTERPRETER_ROLES,
+                existing_only: true,
+                read_root: false,
+            },
+            PathRule {
+                param: "bin",
+                roles: INTERPRETER_ROLES,
+                existing_only: true,
+                read_root: false,
+            },
+        ],
         executables: HOME_TOOLS,
         stdin: Stdin::Null,
         class: RunClass::Test,
@@ -426,8 +454,22 @@ fn test_effect(words: &[&str]) -> Option<EffectRequest> {
     let words = words.strip_suffix(&crate::support::PYTEST_FLAGS[..])?;
     let path = |value: &str| Param::Path(PathBuf::from(value));
     let tool = |name: &str| Param::Executable(name.to_owned());
+    let mut activation = Vec::new();
     let (base, program, rest) = match words {
         [interpreter, "-m", "pytest", rest @ ..] if interpreter.starts_with('/') => {
+            // An environment's own interpreter runs activated, as in process: its `bin` first on
+            // `PATH` and `VIRTUAL_ENV` naming it.
+            let bin = Path::new(interpreter).parent();
+            if let Some(venv) = bin
+                .and_then(Path::parent)
+                .filter(|venv| venv.join("pyvenv.cfg").is_file())
+            {
+                activation.push(("venv", Param::Path(venv.to_path_buf())));
+                activation.push((
+                    "bin",
+                    Param::Paths(bin.into_iter().map(Path::to_path_buf).collect()),
+                ));
+            }
             ("pytest-module", ("interpreter", path(interpreter)), rest)
         }
         ["uv", "run", "pytest", rest @ ..] => ("pytest-uv", ("uv", tool("uv")), rest),
@@ -451,6 +493,7 @@ fn test_effect(words: &[&str]) -> Option<EffectRequest> {
         recipe,
         params: [program, selection]
             .into_iter()
+            .chain(activation)
             .map(|(name, value)| (name.to_owned(), value))
             .collect(),
     })
