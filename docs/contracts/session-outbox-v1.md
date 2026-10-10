@@ -1,9 +1,11 @@
-# Session outbox and delivery v1 contract (OUTBOX-r1)
+# Session outbox and delivery v1 contract (OUTBOX-r2)
 
-Revision 1 (2026-10-10). Canonical definition of the deferred-fact outbox that every IDE session
+Revision 2 (2026-10-10). Canonical definition of the deferred-fact outbox that every IDE session
 owns, the carriers that deliver its facts, and the obligations of the modules that produce facts.
 Provider: M-026 "Session outbox and delivery". Consumers: M-024 (terminal test fact and plates),
-M-025 (precise answer after an approximate one), M-027 (pending batch items).
+M-025 (precise answer after an approximate one), M-027 (pending batch items, multi-file edit
+checks, compaction signal). M-026 consumes M-024's `M024-M026-TEST-FACT` r1 (the test-finished
+body text).
 
 Design basis, read for the evidence behind each rule:
 
@@ -21,11 +23,11 @@ always means "handed to a host carrier once" (the caveat at `worker.rs` `NativeF
 
 | Term | Meaning |
 |---|---|
-| Session | One `BindingRef` (host + actor + trusted channel + generation, `host_binding.rs:96`). Created by `ide.start`, ended by `ide.stop`, a daemon restart or MCP EOF. |
+| Session | One `BindingRef` (host + actor + trusted channel + generation, `host_binding.rs:96`). Created by `ide.start`, ended by `ide.stop`, displacement (stale-lease takeover), a daemon restart or MCP EOF. |
 | Actor | Claude: `agent_id`, else `session_id` (main thread). Codex: `threadId` / `agent_id`. |
 | Outbox | Per-session, in-memory, bounded queue of facts plus a short delivered history. Lives in the daemon worker beside the `Ledger`. |
 | Fact | One state change the agent did not receive in the reply of the call that caused it (§2). |
-| Ambient line | The existing status plate (check counts), git and environment notices (EYES-r2 §6). Not an outbox fact; it shares the block (§4). |
+| Ambient line | The status plate (check counts), git and environment notices (EYES-r2 §6). Not an outbox fact; it shares the block (§4). |
 | Carrier | A path that hands text to the model: reply piggyback, PostToolUse hook, Stop/SubagentStop hold, wake message, `ide.inspect`. |
 | Hand-off | The single point at which a carrier counts a fact as delivered (§6). |
 | Holding fact | A fact with `holds_turn = true` (§2). Only holding facts may hold a Stop or wake an idle agent. |
@@ -34,12 +36,12 @@ always means "handed to a host carrier once" (the caveat at `worker.rs` `NativeF
 
 The kind set is closed. Adding a kind is a contract revision.
 
-| Kind | Producer (module) | Subject form | `holds_turn` | Source-bearing | Notes |
+| Kind | Producer (module) | Subject form | `holds_turn` | Source-bearing | Body |
 |---|---|---|---|---|---|
-| `test-finished` | test run settlement (text: M-024, push: M-026) | `tests #N` | true | no | One per run per recipient binding. |
-| `edit-checked` | edit project check (M-026; batch edit: M-027) | `edit <operation_id> <path>[ +K files]` | true | no | Replaces the whole-reply `pending` of `ide.edit` (§8.4). |
-| `job-ready` | any submitted job whose initial reply was `pending` (M-026), a pending batch job (M-027), or a precise answer after an approximate one (M-025) | `<tool> <target>` or `batch <detail_ref>: items i,j` | true, except **false** for a precise-after-approximate answer | yes for context/outline/read/symbol/graph/diff answers; no for edit, start, test | The model-visible body of a source-bearing fact never rides a hook carrier (§7). |
-| `lost-after-restart` | session re-activation after a daemon replacement (M-026) | `restart` | false | no | At most one per actor per replacement (§10). |
+| `test-finished` | test run settlement; body text M-024 (`M024-M026-TEST-FACT` r1), push M-026 | `tests #N` | true | no | M-024 text, <= 1536 bytes: counts line, <= 8 `FAIL` lines, `rerun:`, `full output: ide.inspect <ref>` |
+| `edit-checked` | edit project check; single-file M-026, multi-file M-027 | `edit <operation_id>` | true | no | §3.3 |
+| `job-ready` | a job registered with `defer` (§3.2): an initial reply that went `pending` (M-026), a pending batch job (M-027), a precise answer after an approximate one (M-025) | `<tool> <target>` or `batch <detail_ref>: items i,j` | true, except **false** when the caller already got an approximate answer | yes for context/outline/read/symbol/graph/diff answers; no for edit, start, test | the job's final reply or final failure |
+| `lost-after-restart` | session re-activation after a daemon replacement (M-026) | `restart` | false | no | §10 |
 
 `holds_turn` is true exactly when the call that requested the work returned **no** answer for this
 subject: a `pending` reply, a `tests #N: started` reply, `diagnostics: pending` on an edit, or a
@@ -49,11 +51,28 @@ or wake an agent: the agent already has an answer.
 Ambient lines (check status, `git: HEAD moved`, environment notices) keep their EYES-r2 rules,
 never hold a turn and never wake an agent.
 
-## 3. Envelope and size budget
+## 3. Interface, envelope and size budget
 
-A producer submits a draft; the outbox assigns the sequence and fence:
+### 3.1 The narrow in-daemon interface
+
+Producers use one worker-internal trait. The real outbox implements it; a recorder with the same
+interface serves boundary tests of every consumer.
 
 ```rust
+/// The only in-daemon seam between fact producers and the session outbox.
+pub(crate) trait SessionOutbox: Send + Sync {
+    /// Queues one fact for each recipient session; false when no recipient is active.
+    fn push(&self, recipients: &[BindingRef], draft: FactDraft, epoch: JobEpoch) -> bool;
+    /// Makes the final reply (or final failure) of the job behind `reference` one job-ready fact
+    /// for the job's owning binding. Idempotent per reference: a second call changes nothing.
+    fn defer(&self, reference: &str, spec: DeferSpec) -> bool;
+    /// Drops every undelivered fact of `binding` silently (displacement); `ide.stop` flushes
+    /// into its reply first (§11).
+    fn forget(&self, binding: &BindingRef);
+    /// Per-session compaction counter (§9.1); None when this channel has no native hook stream.
+    fn context_epoch(&self, binding: &BindingRef) -> Option<u64>;
+}
+
 /// Producer input; the outbox adds seq, fence and delivery state.
 pub(crate) struct FactDraft {
     pub kind: FactKind,              // closed enum, §2
@@ -64,19 +83,56 @@ pub(crate) struct FactDraft {
     pub failed: bool,                // ordering: failures first (§5)
     pub holds_turn: bool,            // §2
     pub source_bearing: bool,        // §2; detail then holds source-derived text
-    pub fence_paths: Vec<String>,    // <= 8 worktree-relative paths the result depends on; empty = whole worktree
+    pub fence: Vec<FencedPath>,      // <= 16 paths the result depends on; empty = whole worktree
 }
 
-impl Outbox {
-    /// Queues one fact for each recipient session; returns false when no recipient is active.
-    pub(crate) fn push(&self, recipients: &[BindingRef], draft: FactDraft, job_epoch: JobEpoch) -> bool;
+pub(crate) struct FencedPath { pub path: String, pub digest: Option<[u8; 32]> }
+
+pub(crate) struct DeferSpec {
+    pub tool: AssistanceTool,
+    pub target: String,              // <= 120 bytes; subject = "<tool> <target>"
+    pub fence: Vec<FencedPath>,      // M-025: definition file(s) only (§7)
+    pub approximate_given: bool,     // true: holds_turn = false
 }
+
+/// Test-only recorder: stores every call in order; `set_context_epoch` drives §9.1 in tests.
+#[cfg(test)]
+pub(crate) struct RecordingOutbox { /* calls: Mutex<Vec<OutboxCall>>, epochs: Mutex<..> */ }
 ```
 
-Exact type names may change in implementation; the semantics above may not. `JobEpoch` is the
-fence captured by the worker when the job **started executing** (§7), never by the producer later.
+`JobEpoch` is the fence the worker captured when the job **started executing** (`Job.native_epoch`
+plus the session's `ide.edit` counter); `defer` takes it from the job itself. Exact type names may
+change in implementation; the semantics above may not. After the Epic freeze, M-026's first commit
+on `aw/e002-int` is `assistance/outbox.rs` with these types, the trait and `RecordingOutbox`, so
+consumers code and test against the real interface.
 
-Rendered form, one fact:
+### 3.2 `defer` semantics
+
+- The inline-wait timeout of `WorkerHandle::submit` (`worker.rs:1660`) calls `defer` with
+  `approximate_given = false`; M-025 calls it for a job whose caller already got an approximate
+  reply, with `approximate_given = true`. Otherwise both paths are identical.
+- Exactly one `job-ready` fact per deferred job, to the owning binding, when the job settles. Its
+  body is the final reply; a final failure becomes a `failed = true` fact whose summary names the
+  failure code. Source-derived text never rides a hook carrier (§7).
+- Reading the job through its own `detail_ref` before any carrier delivers the fact marks the fact
+  delivered.
+- Coalescing key `(binding, kind, subject)` = `(binding, tool, target)` for `job-ready` (§5).
+
+### 3.3 `edit-checked` body (single- and multi-file)
+
+```text
+edit-checked edit <operation_id>: <K> files, <N> new errors, <M> new warnings[ <label>]
+  <path>: <E> errors, <W> warnings (+<n> new)          (one line per file, at most 16, then +K more files)
+  new: <path>:<line>: <message>                        (at most 8 lines, message <= 160 bytes, sanitized)
+```
+
+The summary says `clean` when nothing is new and `unknown (check did not finish)` at the
+`EDIT_CHECK_WAIT` deadline. Fence: the written files with their post-write digests. The whole
+fact stays <= 2048 bytes.
+
+### 3.4 Rendered form and budgets
+
+One fact:
 
 ```text
 <kind> <subject>: <summary>[ <staleness label>]
@@ -84,14 +140,12 @@ Rendered form, one fact:
   ...
 ```
 
-Rules:
-
 - Labelled data only. No imperative sentences; no `poll`; no elapsed seconds. Permitted neutral
-  reference lines: `rerun: <exact call>` and `full output: ide.inspect {"detail_ref":"<ref>"}`.
+  reference lines: `rerun: <exact call>`, `full output: ide.inspect <ref>`, and the discard line
+  of §7.
 - Untrusted runner/checker text is sanitized as in `problems.rs` (control characters become
   spaces; `<` and `>` become `?`) so it cannot forge the `<agent-ide>` framing.
-- Per fact: summary line <= 256 bytes; whole fact <= 2048 bytes. A test fact carries at most 8
-  `FAIL` lines.
+- Per fact: summary line <= 256 bytes; whole fact <= 2048 bytes (a `test-finished` body <= 1536).
 - Per block on a hook carrier (PostToolUse, Stop reason, wake message): the whole model-visible
   text, ambient lines and legacy native feedback included, <= `MAX_FEEDBACK_BYTES` = 4096
   (`reply.rs:11`). Per reply piggyback: facts <= 4096 bytes in addition to the reply body; the
@@ -111,15 +165,21 @@ Block framing (unchanged envelope, EYES-r2 §6):
 </agent-ide>
 ```
 
-## 4. Composition with the ambient plate
+## 4. Composition with the ambient plate; the test line is retired
 
-Ambient lines come first, then facts. The plate keeps its own emission and dedup rules
-(`problems.rs:537` `next_block_when_with_test_status`, `feed/mod.rs:116`); the outbox does not
-re-implement them. Facts use the same `<agent-ide>` block: when both are due on one carrier they
-are emitted as one block. The plate stays <= 256 bytes (`feed/mod.rs:15`); facts fit after it.
+Ambient lines come first, then facts, in one `<agent-ide>` block per carrier. The plate keeps its
+own emission and dedup rules (`problems.rs:537`, `feed/mod.rs:116`) and stays <= 256 bytes
+(`feed/mod.rs:15`).
 
-From this revision the running test line is not an ambient line: a test run contributes nothing
-while running, and its outcome arrives once as `test-finished` (M-024 obligation, §12.1).
+In the integrated build **no test line rides the plate** on any carrier, including the settled
+post of an `ide.*` call (T22B). A test run contributes nothing while running; its outcome arrives
+once as `test-finished`. M-026 removes the plate test-line plumbing as part of its carrier work:
+`append_test_status` and the test-status parameter of `next_block_when_with_test_status`
+(`problems.rs:104`, `:537`), `test_delivered`, `attach_test_plate` and `test_status_snapshot`
+(`assembly.rs:365`, `:399`), and the plate uses of `TestRuns::status_line_for_binding`,
+`mark_status_delivered`, `mark_feed_status_delivered` (`tests.rs:597-675`). The settled post keeps
+carrying ambient lines and due facts. M-024 owns only the text: the started line, the status-reply
+text and the `test-finished` body.
 
 ## 5. Ordering and coalescing
 
@@ -127,9 +187,10 @@ while running, and its outcome arrives once as `test-finished` (M-024 obligation
   number is not rendered.
 - Within one block: facts with `failed = true` first, then ascending `seq`. A carrier delivers a
   prefix of that order; it never skips a fact to fit a later one.
-- Coalescing key `(kind, subject)`: a new undelivered fact with the same key replaces the older
-  undelivered one (the newer `seq` wins). `test-finished` and `job-ready` are terminal, so at most
-  one exists per run or job; `edit-checked` is one per `operation_id`.
+- Coalescing key `(binding, kind, subject)`: a new undelivered fact with the same key replaces the
+  older undelivered one (the newer `seq` wins); the older job's `detail_ref` stays readable.
+  `test-finished` is one per run per recipient; `edit-checked` one per `operation_id`; `job-ready`
+  one per `(tool, target)`.
 - Bound: at most 32 undelivered facts per session. On overflow the oldest fact with
   `holds_turn = false` is dropped first, then the oldest holding fact; each drop is counted and
   the next block ends with `(N older facts dropped; ide.inspect {} lists recent ones)`.
@@ -148,9 +209,12 @@ same session (a native hook and a reply, or a reply and a Stop hold) never both 
 | Wake message | The host transport reported accepted (Claude inbox receipt `held`/`delivered`) or ambiguous (frames written, no receipt) | Definite refusal, unavailable route, session gone |
 | `ide.inspect` | The inspect reply reached a live receiver | Same as reply piggyback |
 
-- Delivering a job's result through its own `detail_ref` (an `ide.inspect {"detail_ref": …}` of a
-  pending job, or the settled reply itself) marks that job's fact delivered, so it is never pushed
-  afterwards.
+- Delivering a job's result through its own reference (the settled reply, `ide.inspect` of its
+  `detail_ref`, `ide.test {"status": N}` or `ide.inspect "tests #N"` of a settled run) marks that
+  job's fact delivered, so it is never pushed afterwards.
+- Handing a `test-finished` fact to the run's **owner** marks the run observed (collected), exactly
+  as a delivered terminal plate line does today (`tests.rs:637`, `:669`): `ide.stop` no longer
+  lists it as uncollected and it no longer pins idle exit. A subscriber's hand-off does not.
 - An ambiguous hand-off is never retried; the fact stays recoverable (below).
 - History: the outbox keeps the summary lines of the last 16 delivered facts per session.
   `ide.inspect {}` lists them when no fact is undelivered (§8.5), and their `detail_ref`s stay
@@ -158,20 +222,25 @@ same session (a native hook and a reply, or a reply and a Stop hold) never both 
 
 ## 7. Source fencing and staleness
 
-- `JobEpoch` = the session's native epoch (`Ledger.native_epoch`, `worker.rs:515`) plus the
-  session's `ide.edit` counter, both captured when the job began executing.
-- At hand-off the fact is **stale** when the native epoch advanced (a possible-writer native tool
-  ran, `problems.rs:72` `may_write`) or an `ide.edit` after `JobEpoch` touched a fenced path (any
-  path when `fence_paths` is empty).
-- Non-source facts (`test-finished`, `edit-checked`) are never suppressed for staleness; they get
-  the label `(ran before your later edits to a.rs, b.rs)` when the edited paths are known, else
+- The staleness decision uses only the fact's `fence` (the producer chooses it) and the session's
+  `JobEpoch`.
+- On a reply or `ide.inspect` the outbox compares each fenced path's current digest with the
+  recorded one (a read under the live profile); a fenced path without a digest, or any path when
+  the fence is empty, compares through the `ide.edit` counter and native epoch.
+- On a hook carrier (PostToolUse, Stop, wake) no file is read (T36B-r, `worker.rs:1954`): a fact is
+  stale when the native epoch advanced (a possible-writer native tool ran, `problems.rs:72`) or an
+  `ide.edit` after `JobEpoch` touched a fenced path (any path for an empty fence).
+- Non-source facts (`test-finished`, `edit-checked`) are never suppressed; they get the label
+  `(ran before your later edits to a.rs, b.rs)` when the changed paths are known, else
   `(ran before later changes)`. At most 3 paths are named, then `+K`.
-- Source-bearing facts on a hook carrier (PostToolUse, Stop, wake) carry **only** the summary
-  line and its `detail_ref`, never source-derived text (T36B-r: the hook boundary cannot re-prove
-  source authority, `worker.rs:1954`). A stale one is labelled `(files changed since)`.
-- When a source-bearing body is delivered through a reply or `ide.inspect`, the existing re-proof
-  applies (`source_matches`, `worker.rs:6412`); a changed file yields
-  `discarded: file changed; repeat` instead of the body.
+- Source-bearing facts on a hook carrier carry **only** the summary line and the `detail_ref`
+  line, never source-derived text; a stale one is labelled `(files changed since)`.
+- A source-bearing body delivered by a reply or `ide.inspect` whose fenced path changed is
+  replaced by `discarded: <path> changed; repeat <tool> <target>`. M-025 fences only the
+  definition file(s), so edits to usage files never discard its answer. The body's own delivery
+  re-proof uses the source and provenance the producer recorded on the job's detail
+  (`worker.rs:6412`), so a producer that records only the definition file is not discarded by a
+  usage-file change there either.
 
 ## 8. Carriers
 
@@ -182,8 +251,8 @@ same session (a native hook and a reply, or a reply and a Stop hold) never both 
 | Reply piggyback | yes | yes | yes | yes |
 | PostToolUse hook | yes | yes (P4) | yes, when hooks trusted | yes (P6) |
 | Stop hold | yes | yes (P3) | `codex exec` yes (P5); TUI unverified (probe Q2) | yes (P5b) |
-| SubagentStop hold | yes | foreground subagents only (P1); see §8.3 | not wired in r1 (unprobed) | not wired in r1 (unprobed) |
-| Wake message | main session only, via session registry | never | Codex Desktop only, route unavailable in r1 (§8.4) | never |
+| SubagentStop hold | yes | foreground subagents only (P1); see §8.3 | not wired in r2 (unprobed) | not wired in r2 (unprobed) |
+| Wake message | main session only, via session registry | never | Codex Desktop only, route unavailable in r2 (§8.4) | never |
 | `ide.inspect {}` + `wait_ms` | yes | yes | yes | yes |
 
 Claude `ide.*` replies never carried the ambient plate (EYES-r2 §6); they **do** carry outbox
@@ -196,7 +265,7 @@ facts, because source-bearing answers must ride a reply or `ide.inspect`.
   `status` field of `structuredContent`, exactly like the plate).
 - A paired native PostToolUse/PostToolUseFailure hook carries due facts inside the existing hook
   deadline (250 ms, `codex_hook.rs:32`, `src/main.rs:2090`). It reads in-memory state only.
-- Both carriers apply §3 budgets and §6 hand-off.
+- Both carriers apply §3.4 budgets and §6 hand-off.
 
 ### 8.3 Stop / SubagentStop hold (agent ending its turn)
 
@@ -228,10 +297,10 @@ Decision, in order:
 
 Transport: the hold uses its own daemon lane (bounded to 16 concurrent holds) and a hook-side
 deadline of hold cap + 5 s, never the 4-connection native hook lane (`app.rs:54`) or the 250 ms
-hook deadline. A hold beyond the lane bound releases at once. Host configuration: the Claude
-plugin `hooks/hooks.json` gains `Stop` and `SubagentStop` entries and the managed Codex fragment
-(`src/main.rs:1875`) gains a `Stop` entry, each with `timeout: 330`. agent-run deployments copy
-these entries into their own plugin and harness hook configuration (probe report §3 item 6).
+hook deadline. A hold beyond the lane bound releases at once. Host configuration ships from this
+repository (§16): the Claude plugin `hooks/hooks.json` gains `Stop` and `SubagentStop` entries,
+and the managed Codex fragment (`src/main.rs:1875`) gains a `Stop` entry, each with
+`timeout: 330`.
 
 ### 8.4 Wake message (agent idle)
 
@@ -260,7 +329,7 @@ pub(crate) struct WakeTarget { pub host: HostKind, pub session_id: String, pub a
 pub(crate) enum WakeOutcome { Accepted, Ambiguous, Refused, Unavailable }
 ```
 
-Routes behind the interface in r1:
+Routes behind the interface in r2:
 
 - **Claude main session** (actor == session_id). Follow agent-run `delivery/claude.rs`: resolve
   `~/.claude/sessions/<pid>.json` by `sessionId`; require `kind == "interactive"` and
@@ -274,26 +343,31 @@ Routes behind the interface in r1:
   to the session would reach a different actor (async report §9.1, safety rule 8).
 - **Claude headless** (no interactive registry entry): Unavailable. A new turn after the result
   frame breaks agent-run's runtime contract (P2).
-- **Codex Desktop**: Unavailable in r1. agent-run reaches threads through
+- **Codex Desktop**: Unavailable in r2. agent-run reaches threads through
   `send_message_to_thread` from a signed-Node frontend that holds `CODEX_APP_TOOLS_PIPE_PATH`
   (`agent-run/assets/desktop-transport.cjs`); whether the managed agent-ide MCP can use that pipe
-  is probe Q6.
+  is probe Q6. The Codex idle cover is the Stop hold plus `wait_ms`.
 - **Codex exec, app-server, TUI**: Unavailable; covered by the Stop hold and `wait_ms`.
 
-### 8.5 `ide.inspect` consolidation
+### 8.5 `ide.inspect` consolidation; test status reads stay
 
 Input schema (all fields optional, at most one of `detail_ref` and `detail_refs`):
 
 | Field | Meaning |
 |---|---|
 | none (`{}`) | Every undelivered fact of this session, full bodies included (source-bearing bodies re-proved, §7); marks them delivered. With nothing undelivered: one line per in-flight job of the session (subject only, no elapsed time) and the summaries of the last 16 delivered facts. |
-| `detail_ref` | Unchanged meaning (pending job, page continuation, test handle). |
-| `detail_refs` | 1-8 references, answered in order within the reply budget, summary first. |
+| `detail_ref` | Unchanged meaning (pending job, page continuation, test handle `tests #N`). |
+| `detail_refs` | 1-8 references (test handles included), answered in order within the reply budget, summary first. |
 | `wait_ms` | 0-240000, clamped. With `{}`: return as soon as one fact is undelivered, or at the deadline. With refs: return as soon as any named reference settles. A deadline reply says `nothing ready yet` and lists in-flight jobs; it never cancels a job. |
 
 `wait_ms` is served by the MCP facade as a loop of daemon inspections, each bounded below the
 10 s method budget (`app.rs:47`). 240 s stays under the Codex 300 s default tool timeout (P7);
 Claude is verified to 180 s (P8) and 240 s is probe Q8.
+
+`ide.test {"status": N}` and `ide.inspect "tests #N"` stay, with identical answers, and are not
+deprecated in this Epic: an on-demand read of one run. A running run answers `tests #N: running`
+(no elapsed seconds, no poll hint); a settled run answers the `test-finished` body. Reading a
+settled run marks its fact delivered (§6). Neither is taught as a way to wait.
 
 ### 8.6 `ide.edit` and its project check
 
@@ -301,8 +375,25 @@ Claude is verified to 180 s (P8) and 240 s is probe Q8.
 window (`INLINE_REPLY_WAIT`, `worker.rs:68`), the diagnostics are in the reply as today; otherwise
 the reply carries `diagnostics: pending` (the reserved `EditDiagnostics::Pending`, `reply.rs:355`)
 and the check continues up to `EDIT_CHECK_WAIT` (90 s, `worker.rs:61`). Its outcome, or
-`unknown` at that deadline, becomes one `edit-checked` holding fact. An edit reply is never a
-whole-reply `pending` because of its check.
+`unknown` at that deadline, becomes one `edit-checked` holding fact (§3.3). An edit reply is never
+a whole-reply `pending` because of its check.
+
+### 8.7 Reply wording and teaching sentences
+
+Replacement reply texts (no polling call, `assets/mcp/reply.jinja`):
+
+- `:79` pending placeholder:
+  `pending: the result arrives by itself in a later <agent-ide> block (detail_ref {{ detail_ref }})`
+- `:338` edit with pending diagnostics:
+  `edit: {{ outcome }}; path {{ result.path }}; source_ref {{ result.source_ref }}; diagnostics: pending; the project check arrives by itself as an edit-checked fact`
+
+These texts are valid only together with M-026's `defer` and `edit-checked` delivery, so they
+land with it on `aw/e002-int`.
+
+One-sentence push wording M-024 may teach (skill, server instructions, tool descriptions):
+
+- Claude: `Results of long work (test runs, project checks after edits, answers that were pending) are pushed to you in an <agent-ide> block after your next tool call or when you end your turn, so never poll for them; if you have nothing else to do, call ide.inspect {"wait_ms": 120000} once.`
+- Codex: `Results of long work (test runs, project checks after edits, answers that were pending) are pushed to you in an <agent-ide> block at the top of your next ide.* reply, after your next tool call, or when you end your turn, so never poll for them; if you have nothing else to do, call ide.inspect {"wait_ms": 120000} once.`
 
 ## 9. Agent state
 
@@ -317,6 +408,24 @@ Tracked per session from host events only; it is advisory and never authorizes a
 A wake additionally requires the host's own idle signal where one exists (Claude registry
 `status == "idle"`).
 
+### 9.1 Compaction signal
+
+`context_epoch(binding)` is a per-session counter that rises when the host compacts or clears the
+agent's context, so a consumer (M-027's "unchanged since your read") never claims text the model
+no longer holds.
+
+- Claude: the plugin `hooks/hooks.json` gains `PreCompact` (matcher empty: manual and auto) and
+  `SessionStart` with matcher `compact|clear`. Both events are in Claude Code 2.1.294.
+- Codex: the managed fragment gains `PreCompact`. The event name is in codex-cli 0.160.1's hook
+  set (binary inspection), live behaviour is probe Q9.
+- An event raises the counter of every live session of that host session (main actor and its
+  subagents), because the payload may not name the subagent; this errs towards re-sending.
+- `None` means the channel never delivered a native hook (Codex with absent or untrusted hooks,
+  or an agent-run Codex harness without the hook entries): no compaction can be observed there,
+  and the consumer must not assume the model still holds an earlier read. `Some(n)` assumes the
+  installed hook configuration is the one shipped with this binary (`agent-ide doctor` flags a
+  plugin version mismatch); §16 lists the agent-run copies that must follow.
+
 ## 10. Restart
 
 - The outbox is in memory and dies with the daemon. Facts are not persisted: they describe
@@ -327,19 +436,21 @@ A wake additionally requires the host's own idle signal where one exists (Claude
 - When that actor re-activates after a replacement (the existing recovery path,
   `docs/assistance-host-binding.md` "Restart recovery"), the new daemon queues one
   `lost-after-restart` fact: `restart: the IDE restarted; results not delivered before it may be
-  lost: tests #3 (before restart), edit op-7 src/a.rs`. The subjects are labelled "before
-  restart" because new numbering starts again. A hook that delivered one of them before the
-  restart is invisible to the facade, hence "may be".
+  lost: tests #3 (before restart), edit op-7`. The subjects are labelled "before restart" because
+  new numbering starts again. A hook that delivered one of them before the restart is invisible to
+  the facade, hence "may be".
 - Stale `detail_ref`s keep today's answer ("issued before the IDE restarted; re-read").
 
-## 11. `ide.stop`
+## 11. `ide.stop` and displacement
 
 - The stop reply carries every undelivered fact as its summary line (and `detail_ref` line),
   bounded to 2048 bytes, after the existing uncollected-runs list (`worker.rs:1711`). The outbox
   of that session is then dropped.
-- After stop nothing is pushed for that session: no hook, no hold (a Stop hook finds no active
-  session and releases), no wake. A test run that settles after stop stays readable through
-  `ide.inspect "tests #N"` as today.
+- A displaced session (stale-lease takeover or any committed revoke) is dropped silently through
+  `forget`, called from `release_binding_state` (`worker.rs:5838`); nobody can receive a flush.
+- After stop or displacement nothing is pushed for that session: no hook, no hold (a Stop hook
+  finds no active session and releases), no wake. A test run that settles after stop stays
+  readable through `ide.inspect "tests #N"` as today.
 
 ## 12. Several actors
 
@@ -351,38 +462,47 @@ A wake additionally requires the host's own idle signal where one exists (Claude
 - Claude subagents are separate actors with separate outboxes; a SubagentStop hold delivers only
   the subagent's facts.
 
-## 13. Consumer obligations
+## 13. Consumer obligations and compatibility checks
 
 ### 13.1 M-024 (plates, terminal test fact)
 
-- Provide the `test-finished` text: summary `P passed, F failed[, S skipped]` (or the runner's
-  failure reason), at most 8 `FAIL <name>` lines, a `rerun:` line and a `full output:` line,
-  within §3 budgets, sanitized, without `poll` or elapsed seconds.
-- Stop emitting running-test lines as ambient lines; the started line stays in the `ide.test`
-  reply only.
-- Wording of `pending` replies may say the result arrives automatically only together with
-  M-026's `job-ready` delivery (integration order).
-- Compatibility checks: one settled run yields exactly one delivered `test-finished` across a
-  concurrent hook and reply; the rendered fact never contains `poll` and never exceeds 2048 bytes.
+- Provides `M024-M026-TEST-FACT` r1: the `test-finished` body (counts line or runner failure
+  reason, at most 8 `FAIL` lines, `rerun:`, `full output: ide.inspect <ref>`), sanitized, <= 1536
+  bytes, without `poll` or elapsed seconds. M-026 calls it at run settlement and pushes the fact.
+- Owns the started line and the status-reply text (`tests #N: running`, no seconds, no poll);
+  does not edit the plate test-line plumbing that §4 retires.
+- Uses the §8.7 texts for pending replies and teaching.
+- Checks: one settled run yields exactly one delivered `test-finished` across a concurrent hook and
+  reply; the rendered body never contains `poll` and never exceeds 1536 bytes; no plate carries a
+  test line; a delivered fact makes `ide.stop` stop listing the run.
 
 ### 13.2 M-025 (precise answer after an approximate one)
 
-- The approximate answer is the initial reply, labelled approximate. The precise answer is one
-  `job-ready` fact: `holds_turn = false`, `source_bearing = true`, `fence_paths` = the files the
-  answer is built from, `detail_ref` = the precise answer.
-- Compatibility checks: a hook carrier shows only the summary line and `detail_ref`, never source
-  text; `ide.inspect {}` returns the precise body; a fenced file edited before delivery yields
-  `discarded: file changed; repeat`; the fact never holds a Stop or wakes.
+- Answers at once with a labelled approximate reply, then calls
+  `defer(reference, DeferSpec { tool, target, fence: definition file(s), approximate_given: true })`.
+- Records only the definition file(s) as the detail's source provenance if usage-file edits must
+  not discard the answer.
+- Calls nothing extra on takeover: `release_binding_state` forgets the displaced session.
+- Checks against `RecordingOutbox` and the real outbox: exactly one `job-ready` per job to the
+  owner, including a final failure; a hook carrier shows no source text; `ide.inspect {}` returns
+  the precise body; a definition-file edit yields
+  `discarded: <path> changed; repeat ide.symbol <target>`, a usage-file edit does not; a second
+  `defer` for the same reference changes nothing; the fact never holds a Stop or wakes.
 
-### 13.3 M-027 (pending batch items)
+### 13.3 M-027 (pending batch items, multi-file edits, compaction)
 
-- Items still pending when a batch reply is sent are left to the outbox: one `job-ready` fact per
-  pending job, subject `batch <detail_ref>: items i,j` naming at most 32 item indexes,
-  `holds_turn = true`, `source_bearing` by tool.
-- A multi-file `ide.edit` produces one `edit-checked` fact per `operation_id` covering all files.
+- Calls `defer` for each pending batch job: one `job-ready` fact per job, subject
+  `batch <detail_ref>: items i,j` (at most 32 indexes), `holds_turn = true`, `source_bearing` by
+  tool.
+- A multi-file `ide.edit` yields one `edit-checked` fact per `operation_id` in the §3.3 format,
+  fenced by the written files and their post-write digests, never a whole-reply `pending`.
+- Reads `context_epoch(binding)` (§9.1) for its "unchanged since your read" dedupe and treats
+  `None` as "no compaction knowledge".
 - Retrieving items with `ide.inspect {"detail_refs": […]}` marks their facts delivered.
-- Compatibility checks: a batch with two pending items yields one fact naming both; reading them
-  by `detail_refs` before any carrier runs leaves nothing to push.
+- Checks: a batch with two pending items yields one fact naming both; reading them by
+  `detail_refs` before any carrier runs leaves nothing to push; a multi-file edit yields exactly
+  one `edit-checked` fact with per-file counts and at most 8 `new:` lines; a recorded compaction
+  changes `context_epoch`.
 
 ## 14. Excluded
 
@@ -402,3 +522,36 @@ facts across daemon restarts.
 | Q6 | Does Codex Desktop hand `CODEX_APP_TOOLS_PIPE_PATH` to the managed agent-ide MCP, and can it call `send_message_to_thread` without a signed-Node frontend? | §8.4 Codex route |
 | Q7 | A user frame to an `idle` interactive Claude session starts exactly one turn; to a `busy` one it is held | §8.4 |
 | Q8 | A 240 s MCP call on Claude (180 s verified) and inside a Codex code-mode `exec` script | §8.5 |
+| Q9 | Claude `PreCompact`/`SessionStart(compact)` and Codex `PreCompact` payloads: fire once per compaction, name the subagent or only the session | §9.1 |
+
+## 16. Deployment of host hook configuration
+
+Shipped from this repository:
+
+- `hooks/hooks.json` (Claude plugin, installed by `self-install` to
+  `<prefix>/share/agent-ide/plugin/current`): adds `Stop`, `SubagentStop` (timeout 330),
+  `PreCompact` and `SessionStart` (matcher `compact|clear`), all to `claude-hook.sh`.
+- `agent-ide codex-hooks print` (`src/main.rs:1875`): adds `Stop` (timeout 330) and `PreCompact`.
+- `scripts/install-local.sh` keeps printing the operator lines; they name the new events.
+
+External changes this machine needs for agent-run runs (owner approval; not made by M-026):
+
+1. `~/.agent-run/config.toml` `[harnesses.claude-code].plugins` lists a hand-made copy
+   `~/.agent-run/plugins/agent-ide-hooks` (plugin.json version 0.3.16; hooks.json without Stop,
+   SubagentStop, PreCompact or SessionStart), not the installer output. Either point it at
+   `<prefix>/share/agent-ide/plugin/current`, as the installer already instructs (this also loads
+   the agent-ide skill into agent-run Claude runs), or replace the copy's `hooks/hooks.json` with
+   the shipped one after each install. Restart agent-run afterwards.
+2. `~/.agent-run/config.toml` gains two `[[harnesses.codex.hooks]]` entries with
+   `command = ["<prefix>/bin/agent-ide", "codex-hook", "--managed"]`: `event = "Stop"` and
+   `event = "PreCompact"`. agent-run writes them with timeout 600 and trust hashes
+   (`agent-run-adapters/src/plugins.rs` `hook_groups`, `event_label`), so no timeout field is
+   needed.
+
+## Revision history
+
+- r1 (commit `06352778`): initial contract.
+- r2: M-024 answers (test line retired from the plate, test status reads stay, reply texts,
+  collection on hand-off, teaching sentences); `SessionOutbox` trait with `defer`, `forget`,
+  `context_epoch` and `RecordingOutbox`; M-025 definition-file fence and discard text;
+  `edit-checked` multi-file body; compaction signal; displacement; deployment list.
