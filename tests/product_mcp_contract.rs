@@ -11715,7 +11715,7 @@ async fn configured_product_symbol_pages_long_usage_and_candidate_lists() {
     let ambiguous = actor.settle(&fixture, ambiguous).await;
     let reference = ambiguous["detail_ref"].as_str().unwrap().to_owned();
     let text = ambiguous["text"].as_str().unwrap();
-    assert!(text.starts_with("22 candidates for dup:\n"), "{text}");
+    assert!(text.contains("\n22 candidates for dup:\n"), "{text}");
     assert!(
         text.contains(&format!("  … 2 more (ide.inspect {reference})\n")),
         "{text}"
@@ -15718,7 +15718,7 @@ async fn configured_product_edit_in_a_package_without_environment_reports_server
         context["text"]
             .as_str()
             .unwrap()
-            .contains("libs/contracts/mod.py:2:12 error "),
+            .contains("libs/contracts/mod.py:2:12 libs/contracts/mod.py#value:2 (L2) error "),
         "context diagnostics carry their location: {context}"
     );
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
