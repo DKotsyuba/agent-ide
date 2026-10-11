@@ -637,7 +637,7 @@ mod tests {
         let rendered = render(reply, Envelope::WithStructured).unwrap();
         let text = text_of(&rendered);
         assert!(
-            text.starts_with("edit: renamed; path src/lib.rs; source_ref source-after-edit"),
+            text.starts_with("edit: renamed; path src/lib.rs; diagnostics: current_clean"),
             "{text}"
         );
         assert!(
@@ -1723,7 +1723,8 @@ mod tests {
                     truncated: false,
                 },
                 "current_reported",
-                "ide.edit",
+                // The reported problems follow the first line; no file-version reference.
+                "cannot find value `missing`",
             ),
             (
                 EditDiagnostics::CurrentClean { project_errors: 0 },

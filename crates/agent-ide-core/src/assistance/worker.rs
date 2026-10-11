@@ -11013,7 +11013,7 @@ mod stop_retry_tests {
                     note: Some(note),
                     ..
                 } if reference == "line-edit"
-                    && note == "lines after 2 moved +1"
+                    && note.ends_with("\nlines after 2 moved +1")
             ),
             "{reply:?}"
         );
@@ -14223,7 +14223,9 @@ mod stop_retry_tests {
         .await
         .unwrap();
         assert!(
-            read.starts_with("a.gamma#card/btn  (lines 2–4)\n2\t  sym btn\n3\t  #top\n4\t  end\n"),
+            read.starts_with(
+                "a.gamma#card/btn  (3 lines; file lines 2-4)\n1\t  sym btn\n2\t  #top\n3\t  end\n"
+            ),
             "{read}"
         );
         assert_eq!(
@@ -14550,7 +14552,7 @@ mod stop_retry_tests {
                     text.starts_with("job-ready ide.read a.gamma#card/btn: ready\n"),
                     "{text}"
                 );
-                assert!(text.contains("2\t  sym btn"), "{text}");
+                assert!(text.contains("1\t  sym btn"), "{text}");
             }
         }
         std::fs::write(

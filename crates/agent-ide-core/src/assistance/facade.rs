@@ -660,8 +660,7 @@ impl ParameterError {
                     .to_string()
             }
             Self::EditTarget => {
-                "ide.edit takes one form: `symbol` with `op`, or `path` with `lines` and \
-                 `source_ref` — not both"
+                "ide.edit takes one form: `symbol` with `op`, or `path` with `lines` — not both"
                     .to_string()
             }
             Self::ChangesTarget => {
@@ -5198,8 +5197,7 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Edit,
-            "ide.edit takes one form: `symbol` with `op`, or `path` with `lines` and \
-             `source_ref` — not both"
+            "ide.edit takes one form: `symbol` with `op`, or `path` with `lines` — not both"
                 .to_string(),
         ),
         (

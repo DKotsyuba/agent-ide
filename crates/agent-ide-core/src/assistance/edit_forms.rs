@@ -143,6 +143,13 @@ fn wrap_symbol(object: &mut Map<String, Value>) {
     let Some(file) = symbol.as_str().and_then(file_of) else {
         return;
     };
+    // A `path` naming another file is the two-targets mix; the legacy validation refuses it.
+    if object
+        .get("path")
+        .is_some_and(|path| path.as_str() != Some(file.as_str()))
+    {
+        return;
+    }
     let mut entry = Map::new();
     for field in ["symbol", "op", "where", "content"] {
         if let Some(value) = object.remove(field) {

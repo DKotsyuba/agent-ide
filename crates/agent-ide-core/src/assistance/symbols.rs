@@ -3432,6 +3432,15 @@ impl Worker<'_> {
             candidate_map.as_ref(),
             &echoes,
         );
+        // The net line movement stays a fact line: the reply's retained detail uses it to refuse
+        // a later `lines` edit that names a file-version reference older than this edit.
+        let first_changed = changes.iter().map(|change| change.base.start).min();
+        if let Some(shift) =
+            first_changed.and_then(|line| line_shift_note(&source, &candidate, line))
+        {
+            note.push('\n');
+            note.push_str(&shift);
+        }
         if let Some(note_line) = pre_existing {
             note.push('\n');
             note.push_str(&note_line);
