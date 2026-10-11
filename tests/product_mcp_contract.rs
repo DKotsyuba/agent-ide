@@ -12482,8 +12482,10 @@ async fn configured_product_links_css_html_and_python_names() {
             "symbol: ##main — element id, 1 element, 2 usages in 2 files (css, html)\ndefinitions:\n"
         ) && main_card.contains(
             "  index.html#main#main (L4)  [html] <main id=\"main\" class=\"layout\">  (lines 4–8)\n"
-        ) && main_card.contains("index.html#main#main:3 (L6)")
-            && main_card.contains("(L7)  [css] #main { display: block; }\n"),
+        ) && main_card.contains(
+            "  index.html#main#main:3 (L6)  [html] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n"
+        ) && main_card
+            .contains("  styles.css##main:1 (L7)      [css] #main { display: block; }\n"),
         "{main_card}"
     );
     assert_eq!(
