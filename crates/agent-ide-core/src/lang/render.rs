@@ -97,6 +97,9 @@ pub struct CallGraph {
     /// the cause rendered in parentheses. A failed request is reported where it happened and is
     /// never rendered as an absence of calls.
     pub faults: std::collections::BTreeMap<(usize, GraphDirection), String>,
+    /// Tagged symbol addresses (`file#unit (L123)`) by node `(file, line)`; a node with one is
+    /// printed as that address in place of its raw path and `file:line`.
+    pub addresses: LocationAddresses,
 }
 
 impl CallGraph {
@@ -108,6 +111,15 @@ impl CallGraph {
             collapsed_tests: Default::default(),
             capped: false,
             faults: Default::default(),
+            addresses: Default::default(),
+        }
+    }
+
+    /// The node as the graph names it: its tagged address when resolved, else the raw path.
+    fn node_name(&self, node: &GraphNode) -> String {
+        match self.addresses.get(&(node.file.clone(), node.line)) {
+            Some(address) => address.clone(),
+            None => node.path.clone(),
         }
     }
 
@@ -187,11 +199,14 @@ pub fn call_graph_text(graph: &CallGraph, direction: &str, depth: u8) -> String 
         _ => &[GraphDirection::Callers],
     };
     if let Some(cause) = graph.root_unavailable(directions) {
-        return format!("graph: {subject} of {} unavailable ({cause})\n", root.path);
+        return format!(
+            "graph: {subject} of {} unavailable ({cause})\n",
+            graph.node_name(root)
+        );
     }
     let mut out = format!(
         "graph: {subject} of {} (depth {depth}, {} nodes, {} edges)\n",
-        root.path,
+        graph.node_name(root),
         graph.nodes.len(),
         graph.edges.len()
     );
@@ -233,9 +248,14 @@ fn render_graph_children(
         out.push_str(&format!(
             "{}{arrow} {}",
             "  ".repeat(level as usize),
-            node.path
+            graph.node_name(node)
         ));
-        if !node.file.is_empty() {
+        // A resolved address already carries the file and the absolute line.
+        if !node.file.is_empty()
+            && !graph
+                .addresses
+                .contains_key(&(node.file.clone(), node.line))
+        {
             out.push_str(&format!("  {}:{}", node.file, node.line));
         }
         if let Some(tag) = &node.tag {
@@ -503,6 +523,150 @@ mod graph_tests {
         assert!(text.contains("(depth 2, 4 nodes, 3 edges)"), "{text}");
         assert_eq!(text.matches("[test]").count(), 2, "{text}");
     }
+}
+
+/// One candidate row of a bare-name answer: `<address>  <kind>  <signature>  (lines a–b)`.
+pub fn candidate_row(unit: &super::address::Unit) -> String {
+    let kind = match unit.kind {
+        super::address::UnitKind::Symbol(kind) => kind.name(),
+        super::address::UnitKind::Region(_) => "region",
+    };
+    format!(
+        "{}  {kind}  {}  (lines {})",
+        unit.address, unit.signature, unit.span
+    )
+}
+
+/// Kind filter of [`address_outline_text`]: the selected symbol kinds, whether regions show, and
+/// the caller's raw list for the footer.
+pub struct OutlineFilter<'a> {
+    /// Selected closed kind names that parsed.
+    pub kinds: &'a [SymbolKind],
+    /// The list named `region`, so file-level regions are shown.
+    pub regions: bool,
+    /// The raw comma list, printed back unchanged.
+    pub requested: &'a str,
+}
+
+/// Renders a file as one row per unit in file order, regions included:
+/// `<first>–<last>  <address>  <signature>  // <doc>` (regions have no signature; blank `@after`
+/// regions are skipped; a test module is one row ending `[N tests collapsed]`). `filter` limits
+/// symbols to the selected kinds (a container of a selected member stays for context, tests stay
+/// whole) and hides regions unless it asks for them.
+pub fn address_outline_text(
+    outline: &Outline,
+    map: &super::address::AddressMap,
+    filter: Option<&OutlineFilter<'_>>,
+) -> String {
+    use super::address::UnitKind;
+
+    let units = map.units();
+    // Parent of each unit by depth, then keep flags propagated from selected kinds upward.
+    let mut parent = vec![None; units.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    for (i, unit) in units.iter().enumerate() {
+        while stack
+            .last()
+            .is_some_and(|&top| units[top].depth >= unit.depth)
+        {
+            stack.pop();
+        }
+        parent[i] = stack.last().copied();
+        stack.push(i);
+    }
+    let mut keep: Vec<bool> = units
+        .iter()
+        .map(|unit| match (filter, unit.kind) {
+            (None, _) => true,
+            (Some(f), UnitKind::Region(_)) => f.regions,
+            (Some(f), UnitKind::Symbol(kind)) => {
+                kind == SymbolKind::Test || f.kinds.contains(&kind)
+            }
+        })
+        .collect();
+    for i in (0..units.len()).rev() {
+        if keep[i]
+            && let Some(p) = parent[i]
+            && matches!(units[p].kind, UnitKind::Symbol(_))
+        {
+            keep[p] = true;
+        }
+    }
+    let mut out = format!(
+        "{}  ({} lines, {})\n",
+        outline.file.display(),
+        outline.line_count,
+        outline.language
+    );
+    let (mut symbols, mut regions, mut tests, mut total) = (0usize, 0usize, 0usize, 0usize);
+    let mut collapsed_until = 0u32;
+    for (i, unit) in units.iter().enumerate() {
+        if unit.span.start <= collapsed_until && matches!(unit.kind, UnitKind::Symbol(_)) {
+            continue;
+        }
+        match unit.kind {
+            UnitKind::Region(_) => {
+                if unit.blank {
+                    continue;
+                }
+                if keep[i] {
+                    regions += 1;
+                    out.push_str(&format!("{}  {}\n", unit.span, unit.address));
+                }
+            }
+            UnitKind::Symbol(SymbolKind::Test) => {
+                // A test module or function: count it and its members, print one collapsed line.
+                let members = units
+                    .iter()
+                    .filter(|other| {
+                        matches!(other.kind, UnitKind::Symbol(_))
+                            && other.span.start >= unit.span.start
+                            && other.span.end <= unit.span.end
+                    })
+                    .count();
+                collapsed_until = unit.span.end;
+                tests += members;
+                out.push_str(&format!(
+                    "{}  {}  {} [{members} tests collapsed]\n",
+                    unit.span, unit.address, unit.signature
+                ));
+            }
+            UnitKind::Symbol(_) => {
+                total += 1;
+                if keep[i] {
+                    symbols += 1;
+                    let doc = unit
+                        .doc
+                        .as_deref()
+                        .map(|doc| first_line(doc, 72))
+                        .filter(|doc| !doc.is_empty())
+                        .map(|doc| format!("  // {doc}"))
+                        .unwrap_or_default();
+                    out.push_str(&format!(
+                        "{}  {}  {}{doc}\n",
+                        unit.span, unit.address, unit.signature
+                    ));
+                }
+            }
+        }
+    }
+    let region_note = if regions > 0 {
+        format!(", {regions} regions")
+    } else {
+        String::new()
+    };
+    match filter {
+        None => out.push_str(&format!("  ({symbols} symbols{region_note}")),
+        Some(f) => out.push_str(&format!(
+            "  ({total} symbols; showing {symbols}{region_note} by kinds {}",
+            f.requested
+        )),
+    }
+    if tests > 0 {
+        out.push_str(&format!("; {tests} tests collapsed"));
+    }
+    out.push_str(")\n");
+    out
 }
 
 /// Renders a file skeleton: one declaration line per symbol, members indented, tests collapsed.
@@ -789,10 +953,22 @@ pub struct Usage {
     pub tag: Option<String>,
 }
 
+/// Printed locations by `(file, line)`: the tagged address `file#unit:N (L123)` that replaces
+/// `file:line` in a row when the location resolved.
+pub type LocationAddresses = std::collections::BTreeMap<(String, u32), String>;
+
+/// A row's location text: the resolved address with its absolute line, else `file:line`.
+fn location_text(addresses: &LocationAddresses, file: &str, line: u32) -> String {
+    addresses
+        .get(&(file.to_owned(), line))
+        .cloned()
+        .unwrap_or_else(|| format!("{file}:{line}"))
+}
+
 impl Usage {
     /// The row as printed, with its location padded to `width`.
-    fn row(&self, width: usize) -> String {
-        let location = format!("{}:{}", self.file, self.line);
+    fn row(&self, width: usize, addresses: &LocationAddresses) -> String {
+        let location = location_text(addresses, &self.file, self.line);
         match &self.tag {
             Some(tag) => format!("  {location:<width$}  {tag} {}\n", self.text),
             None => format!("  {location:<width$}  {}\n", self.text),
@@ -851,6 +1027,10 @@ pub struct SymbolCard {
     /// Lines printed after the usages as they are (`links:` section, `unavailable for:`, index
     /// state).
     pub links: Vec<String>,
+    /// Tagged position addresses of usage rows, replacing `file:line` where resolved.
+    pub usage_addresses: LocationAddresses,
+    /// Tagged symbol addresses of caller and callee rows, replacing `file:line` where resolved.
+    pub call_addresses: LocationAddresses,
 }
 
 /// Renders the card with the fixed ceilings.
@@ -922,11 +1102,11 @@ pub fn symbol_card_text(card: &SymbolCard) -> String {
             .usages
             .iter()
             .take(MAX_USAGE_LINES)
-            .map(|usage| usage.file.len() + 1 + usage.line.to_string().len())
+            .map(|usage| location_text(&card.usage_addresses, &usage.file, usage.line).len())
             .max()
             .unwrap_or(0);
         for usage in src.iter().chain(tests.iter()).take(MAX_USAGE_LINES) {
-            out.push_str(&usage.row(width));
+            out.push_str(&usage.row(width, &card.usage_addresses));
         }
         let hidden = card.usages.len().saturating_sub(MAX_USAGE_LINES);
         if hidden > 0 {
@@ -961,7 +1141,7 @@ pub fn symbol_card_text(card: &SymbolCard) -> String {
             card.callers_note.as_deref().unwrap_or_default()
         ));
     } else {
-        render_calls(&mut out, "callers", &card.callers);
+        render_calls(&mut out, "callers", &card.callers, &card.call_addresses);
     }
     if card.callees_note.is_some() && card.callees.is_empty() {
         out.push_str(&format!(
@@ -969,7 +1149,7 @@ pub fn symbol_card_text(card: &SymbolCard) -> String {
             card.callees_note.as_deref().unwrap_or_default()
         ));
     } else {
-        render_calls(&mut out, "callees", &card.callees);
+        render_calls(&mut out, "callees", &card.callees, &card.call_addresses);
     }
     if card.history_unavailable {
         out.push_str(&format!(
@@ -1001,22 +1181,26 @@ pub fn hidden_usages_text(card: &SymbolCard) -> Option<String> {
     let mut out = format!("usages {}–{total} of {total}:\n", MAX_USAGE_LINES + 1);
     let width = hidden
         .iter()
-        .map(|usage| usage.file.len() + 1 + usage.line.to_string().len())
+        .map(|usage| location_text(&card.usage_addresses, &usage.file, usage.line).len())
         .max()
         .unwrap_or(0);
     for usage in hidden {
-        out.push_str(&usage.row(width));
+        out.push_str(&usage.row(width, &card.usage_addresses));
     }
     Some(out)
 }
 
-fn render_calls(out: &mut String, label: &str, calls: &[Call]) {
+fn render_calls(out: &mut String, label: &str, calls: &[Call], addresses: &LocationAddresses) {
     if calls.is_empty() {
         return;
     }
     out.push_str(&format!("{label}: {}\n", calls.len()));
     for call in calls.iter().take(MAX_CALL_LINES) {
-        out.push_str(&format!("  {}  {}:{}\n", call.name, call.file, call.line));
+        match addresses.get(&(call.file.clone(), call.line)) {
+            // The symbol address names the node and carries its file and absolute line.
+            Some(address) => out.push_str(&format!("  {address}\n")),
+            None => out.push_str(&format!("  {}  {}:{}\n", call.name, call.file, call.line)),
+        }
     }
     if calls.len() > MAX_CALL_LINES {
         out.push_str(&format!("  … {} more\n", calls.len() - MAX_CALL_LINES));

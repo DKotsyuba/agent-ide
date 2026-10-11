@@ -690,6 +690,47 @@ pub fn problems_text_with_rechecks(
     language: Option<Language>,
     offset: u32,
 ) -> String {
+    problems_text_addressed(
+        snapshots,
+        rechecks,
+        language,
+        offset,
+        &crate::lang::render::LocationAddresses::new(),
+    )
+}
+
+/// The `(file, line)` of every problem [`problems_text_addressed`] prints on the page at
+/// `offset`, in print order, so a caller can resolve their addresses first.
+pub fn page_locations(
+    snapshots: &[ProblemSnapshot],
+    language: Option<Language>,
+    offset: u32,
+) -> Vec<(String, u32)> {
+    snapshots
+        .iter()
+        .filter(|snapshot| language.is_none_or(|selected| snapshot.language == selected))
+        .filter(|snapshot| {
+            !matches!(
+                snapshot.state,
+                CheckState::Unavailable(UnavailableReason::Disabled)
+            )
+        })
+        .flat_map(|snapshot| &snapshot.problems)
+        .skip(offset as usize)
+        .take(PROBLEMS_PAGE_SIZE as usize)
+        .map(|problem| (problem.path.clone(), problem.line))
+        .collect()
+}
+
+/// [`problems_text_with_rechecks`] with position addresses: a problem whose `(path, line)` is in
+/// `addresses` prints `path:line:column <address (L123)> severity [code] message`.
+pub fn problems_text_addressed(
+    snapshots: &[ProblemSnapshot],
+    rechecks: &[(Language, Recheck)],
+    language: Option<Language>,
+    offset: u32,
+    addresses: &crate::lang::render::LocationAddresses,
+) -> String {
     let matched: Vec<&ProblemSnapshot> = snapshots
         .iter()
         .filter(|snapshot| language.is_none_or(|selected| snapshot.language == selected))
@@ -733,7 +774,7 @@ pub fn problems_text_with_rechecks(
                 skipped -= 1;
             } else if rendered < PROBLEMS_PAGE_SIZE {
                 rendered += 1;
-                lines.push(problem_line(problem));
+                lines.push(problem_line(problem, addresses));
             } else {
                 more = true;
             }
@@ -803,7 +844,7 @@ fn state_line(snapshot: &ProblemSnapshot, recheck: Option<Recheck>) -> String {
 /// passes through [`sanitized_code`] rather than [`untrusted_line`] directly, so it also gets a
 /// length cap. All other textual fields pass through [`untrusted_line`]; the numeric fields come
 /// from the typed snapshot.
-fn problem_line(problem: &Problem) -> String {
+fn problem_line(problem: &Problem, addresses: &crate::lang::render::LocationAddresses) -> String {
     let severity = match problem.severity {
         Severity::Error => "error",
         Severity::Warning => "warning",
@@ -813,8 +854,12 @@ fn problem_line(problem: &Problem) -> String {
         .as_deref()
         .map(|code| format!(" [{}]", sanitized_code(code)))
         .unwrap_or_default();
+    let address = addresses
+        .get(&(problem.path.clone(), problem.line))
+        .map(|address| format!(" {address}"))
+        .unwrap_or_default();
     format!(
-        "{}:{}:{} {severity}{code} {}",
+        "{}:{}:{}{address} {severity}{code} {}",
         untrusted_line(&problem.path),
         problem.line,
         problem.column,

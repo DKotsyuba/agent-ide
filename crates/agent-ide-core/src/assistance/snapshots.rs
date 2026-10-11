@@ -857,6 +857,9 @@ fn render_diff_provenance(
             text.push_str(&format!("file: {:?}\n", hunk.path()));
             current = Some(hunk.path());
         }
+        if let Some(address) = result.hunk_address(hunk) {
+            text.push_str(&format!("@ {address}\n"));
+        }
         text.push_str(&result.hunk_part_label(hunk, more_available));
         if let Some(notice) = hunk.line_notice() {
             text.push_str(notice);
@@ -980,6 +983,9 @@ fn render_diff_compact(
         if current != Some(hunk.path()) {
             text.push_str(&format!("file: {:?}\n", hunk.path()));
             current = Some(hunk.path());
+        }
+        if let Some(address) = result.hunk_address(hunk) {
+            text.push_str(&format!("@ {address}\n"));
         }
         text.push_str(&result.hunk_part_label(
             hunk,
@@ -1293,6 +1299,7 @@ impl Worker<'_> {
         .with_untracked_notes(notes.clone(), patch_paths)
         .with_degraded(degraded);
         drop(runner);
+        let hunk_lines = self.diff_hunk_addresses(job, &composed).await;
         let (result, reply) = fit_diff_page(
             mode,
             authority.epoch(),
@@ -1330,6 +1337,7 @@ impl Worker<'_> {
                         .with_untracked(untracked.clone())
                         .with_untracked_notes(notes.clone(), patch_paths)
                         .with_degraded(degraded)
+                        .with_hunk_addresses(&hunk_lines)
                 })
                 .unwrap_or_else(|| crate::changes::DiffResult::unavailable(&scope))
             },
@@ -1577,6 +1585,13 @@ impl Worker<'_> {
         // The initial page goes through the same whole-page fitting path as every later expansion,
         // so it is proven to fit the serialized envelope here instead of being cut mid-hunk later
         // by the generic `PeerReply::encode` shrink.
+        let probe = crate::changes::compose_diff(
+            &scope,
+            &comparison,
+            evidence.clone(),
+            crate::changes::DiffSelectionBudget::bounded(budget.max_hunks, budget.max_bytes),
+        );
+        let hunk_lines = self.diff_hunk_addresses(job, &probe).await;
         let (result, reply) = fit_diff_page(
             mode,
             authority.epoch(),
@@ -1591,6 +1606,7 @@ impl Worker<'_> {
                     evidence.clone(),
                     crate::changes::DiffSelectionBudget::bounded(max_hunks, budget.max_bytes),
                 )
+                .with_hunk_addresses(&hunk_lines)
             },
         )
         .map_err(|code| {

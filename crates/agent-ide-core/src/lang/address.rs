@@ -445,6 +445,8 @@ pub struct Unit {
     pub signature: String,
     /// First doc paragraph.
     pub doc: Option<String>,
+    /// A region whose lines are all blank (such rows are not printed in outlines).
+    pub blank: bool,
 }
 
 /// An address resolved to lines and bytes.
@@ -617,7 +619,10 @@ impl AddressMap {
         let mut units: Vec<Unit> = Vec::new();
         let mut counters: std::collections::HashMap<Vec<String>, u32> = Default::default();
         let mut prev_text: Option<String> = None;
-        let mut paths: Vec<SymbolPath> = Vec::with_capacity(flat.len());
+        let paths: Vec<SymbolPath> = flat
+            .iter()
+            .map(|f| SymbolPath::new(Some(file.clone()), f.names.clone()))
+            .collect();
         for (_, item) in items {
             match item {
                 Item::Region(r) => {
@@ -659,6 +664,11 @@ impl AddressMap {
                         symbol: None,
                         signature: String::new(),
                         doc: None,
+                        blank: (r.span.start..=r.span.end).all(|line| {
+                            lines
+                                .get(line as usize - 1)
+                                .is_none_or(|text| text.trim().is_empty())
+                        }),
                     });
                 }
                 Item::Symbol(top) => {
@@ -667,7 +677,6 @@ impl AddressMap {
                     loop {
                         let f = &flat[i];
                         let segments = seg_of(i);
-                        paths.push(SymbolPath::new(Some(file.clone()), f.names.clone()));
                         units.push(Unit {
                             address: Address::new(Some(file.clone()), segments, None),
                             kind: UnitKind::Symbol(f.symbol.kind),
@@ -676,6 +685,7 @@ impl AddressMap {
                             symbol: Some(i),
                             signature: f.symbol.signature.clone(),
                             doc: f.symbol.doc.clone(),
+                            blank: false,
                         });
                         i += 1;
                         if i >= flat.len() || flat[i].depth == 0 {
@@ -762,6 +772,43 @@ impl AddressMap {
     /// File this map describes.
     pub fn file(&self) -> &std::path::Path {
         &self.file
+    }
+
+    /// The outline symbol behind symbol unit `unit`; `None` for a region or a map built without
+    /// an outline ([`Self::build_parts`]).
+    pub fn symbol_of(&self, unit: usize) -> Option<&Symbol> {
+        let index = self.units.get(unit)?.symbol?;
+        let mut order = 0usize;
+        let mut found = None;
+        for top in &self.outline.as_ref()?.symbols {
+            top.walk(&mut |symbol| {
+                if order == index {
+                    found = Some(symbol);
+                }
+                order += 1;
+            });
+        }
+        found
+    }
+
+    /// The canonical address of outline symbol `symbol` (matched by path, kind and lines), as the
+    /// text results print it; `None` for a map built without an outline or a foreign symbol.
+    pub fn address_of(&self, symbol: &Symbol) -> Option<String> {
+        let mut order = 0usize;
+        let mut index = None;
+        for top in &self.outline.as_ref()?.symbols {
+            top.walk(&mut |candidate| {
+                if index.is_none() && candidate == symbol {
+                    index = Some(order);
+                }
+                order += 1;
+            });
+        }
+        let index = index?;
+        self.units
+            .iter()
+            .find(|unit| unit.symbol == Some(index))
+            .map(|unit| unit.address.to_string())
     }
 
     /// The unit named by `path` (symbols and regions; a region is the one-segment `@imports`).

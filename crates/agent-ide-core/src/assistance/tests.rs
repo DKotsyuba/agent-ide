@@ -999,6 +999,7 @@ async fn run_child_capped(
         }
     }
     report.incomplete |= stopped || status.is_none();
+    address_failures(root, &mut report).await;
     RunResult {
         report,
         output,
@@ -1013,6 +1014,51 @@ async fn run_child_capped(
         environment_label: None,
         targets: Vec::new(),
     }
+}
+
+/// Failures of one run that get a position address.
+const ADDRESSED_FAILURES: usize = 8;
+/// Wall-clock budget of the address lookups of one settled run.
+const ADDRESS_LOOKUP_BUDGET: Duration = Duration::from_millis(1500);
+
+/// Replaces each failure's `file:line` location by its position address with the absolute line
+/// (`src/a.rs#tests/it_works:3 (L40)`), put in front of the message: the address names the
+/// failing test (or the helper holding the assertion) and the line inside it. Best effort and
+/// bounded: it reads at most [`ADDRESSED_FAILURES`] failures through the languages' source
+/// outlines, never a language server, and leaves a failure it cannot resolve untouched.
+async fn address_failures(root: &std::path::Path, report: &mut TestReport) {
+    use crate::lang::address::AddressMap;
+
+    let lookup = async {
+        let mut maps: BTreeMap<PathBuf, Option<AddressMap>> = BTreeMap::new();
+        for failure in report.failures.iter_mut().take(ADDRESSED_FAILURES) {
+            let Some((path, line)) = failure.location.clone() else {
+                continue;
+            };
+            let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+            if !maps.contains_key(&relative) {
+                let map = async {
+                    let language = Language::for_path(&relative)?;
+                    let source = std::fs::read_to_string(root.join(&relative)).ok()?;
+                    let outline = crate::modules::calls::outline_from_source(
+                        language, root, &relative, &source,
+                    )
+                    .await
+                    .ok()??;
+                    Some(AddressMap::build(&outline, &source))
+                }
+                .await;
+                maps.insert(relative.clone(), map);
+            }
+            if let Some(Some(map)) = maps.get(&relative)
+                && let Some(address) = map.address_at(&relative, line)
+            {
+                failure.message = format!("{address} (L{line})  {}", failure.message);
+                failure.location = None;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(ADDRESS_LOOKUP_BUDGET, lookup).await;
 }
 
 /// Builds the empty-output report returned by the async runner helper after spawn failure.

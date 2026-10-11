@@ -218,14 +218,18 @@ produced for a bare name.
 ### 7.4 Worker glue (`assistance/addressing.rs`)
 
 - `address_map(job, observed, bytes) -> Result<(Arc<AddressMap>, Option<Lexical>), FailureCode>`:
-  `outline_of` followed by `AddressMap::build`, cached per binding by file, exact source revision
-  and outline origin. The failure codes are `outline_of`'s.
-- `position_addresses(job, &[(file, line)]) -> Vec<Option<String>>`: best effort for result
-  rendering. It outlines each distinct file through the existing `scanned_outline`, never waits for
-  a loading server beyond the lexical/source outline, spends at most 1.5 s and 16 files per reply,
-  and answers `None` for a location it did not resolve. A result then prints that location without
-  an address and appends one line `addresses: omitted for N locations (<reason>)`; it never prints a
-  guessed address.
+  `outline_of` followed by `AddressMap::build`. The map is a pure O(lines) function of the outline
+  and the source, so it is rebuilt per call rather than cached. The failure codes are
+  `outline_of`'s.
+- `position_addresses(job, &[(file, line)]) -> Addresses`: best effort for result rendering. It
+  outlines each distinct file through the existing `scanned_outline`, never parks the job for a
+  loading server (the lexical or source outline answers or the file is skipped), spends at most
+  1.5 s and 16 files per reply, and answers `None` for a location it did not resolve. A result
+  then prints that location in its old `file:line` form and appends one line
+  `addresses: omitted for N locations (<reason>)`; it never prints a guessed address.
+- `locate_line(job, binding, text)` turns a `path:line[:col]` input of `ide.symbol` or `ide.graph`
+  into the canonical address of the enclosing symbol; a line in a region refuses `unknown_symbol`
+  and names the region address.
 
 ## 8. What results print
 
@@ -237,12 +241,12 @@ row that names a location keeps its full address verbatim, as a single copyable 
 |---|---|
 | `ide.outline` | one row per unit in file order, regions included: `<first>–<last>  <address>  <signature>  // <doc>` (regions have no signature; `@after/…` rows appear only when they hold a non-blank line; collapsed tests keep `[N tests collapsed]`); header `<file>  (<L> lines, <language>)`; footer counts symbols and regions. `kinds` filtering hides regions unless the list contains `region`. |
 | Bare-name search (`ide.symbol`, `ide.graph`, batch entries) | `<N> candidates for <name>:` then one row per candidate `<symbol address>  <kind>  <signature>  (lines a–b)`, at most 20 and the rest behind the reply's `detail_ref`. Not an error. A single candidate answers the card as today. |
-| `unknown_symbol` | adds `near:` with at most 5 symbol addresses (§7.2 `near`). |
-| Compiler and checker diagnostics, post-edit diagnostics, problems | `<path>:<line>:<col> <position address> <severity> [<code>] <message>`; the 256-byte bound of a diagnostic line applies to the whole row and clips the message first. |
-| Failing tests | `FAIL <runner name>  <test symbol address>` when the runner name maps to a test unit of a file in the run, and the assertion site `<path>:<line>  <position address>  <message>`. |
-| Callers, callees, graph nodes | the node's symbol address in place of the raw outline path (canonical, regions possible for module-level callers) beside `file:line`; a node that is a use site prints a position address. |
-| Usages | `<path>:<line>  <position address>  <text>` (M-030 may elide the repeated file in this dense list). |
-| Diff | one line before each hunk's patch: `@ <position address of the hunk's first changed line in the changed file>`; a deleted file prints `@ <path> (deleted)`; the patch bytes stay exact. |
+| `unknown_symbol` | for an explicit `file#path` the reply adds `near:` with at most 5 symbol addresses (§7.2 `near`). |
+| Compiler and checker diagnostics, post-edit diagnostics, problems | `<path>:<line>:<col> <position address> (L<line>) <severity> [<code>] <message>`; the 256-byte bound of a diagnostic line applies to the whole row and clips the message first. A row whose file has no outline keeps the old form. |
+| Failing tests | the assertion site replaces `<path>:<line>  <message>` by `<position address> (L<line>)  <message>`, so the failing test (or helper) and the line inside it are one copyable text; the `FAIL <runner name>` line is unchanged. At most 8 failures are addressed, from the languages' source outlines, within 1.5 s. |
+| Callers, callees, graph nodes | `<symbol address> (L<line>)` in place of the raw outline path and `file:line` (canonical, regions possible for module-level callers); a node that did not resolve keeps both. |
+| Usages | server-backed rows print `<position address> (L<line>)  <text>` in place of `path:line`; rows from the name index (cross-language usages) keep `path:line`. |
+| Diff | one line before each hunk's patch: `@ <position address> (L<line>)` of the hunk's first changed line in the changed (working-tree) file; a deleted file prints `@ <path> (deleted)`; the patch bytes stay exact. The first page of a diff carries the lines; pages reached through `ide.inspect` do not yet. |
 | `ide.symbol` / `ide.graph` / `ide.read` / `ide.edit` input | every form of §2; a location resolves to its enclosing unit and the reply echoes the canonical address it used. |
 
 ## 9. Stability after edits

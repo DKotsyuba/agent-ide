@@ -5,7 +5,7 @@ use super::{
     facade::{AssistanceTool, FeedbackDelta, render_reply},
     host_binding::{ActiveBindingUse, BindingRef, HostBindingGuard, ValidatedInvocation},
     launcher::{LaunchTarget, LauncherConfig},
-    problems::{ProblemSource, ProjectProblemFeed, parse_language, problems_text_with_rechecks},
+    problems::{self, ProblemSource, ProjectProblemFeed, parse_language, problems_text_addressed},
     reply::{
         EditDiagnostics, ExecutionProfileCause, FailureCode, MAX_NO_SUCH_FILE_PATH_BYTES,
         PeerReply, ResultKind, bounded_utf8_prefix,
@@ -34,6 +34,8 @@ use crate::{
         store::WorkspaceStore,
     },
 };
+#[path = "addressing.rs"]
+mod addressing;
 #[path = "approximate.rs"]
 mod approximate;
 #[path = "batch_edit.rs"]
@@ -5094,6 +5096,14 @@ impl<'a> Worker<'a> {
                 )
                 .expect("fixed feedback envelope is bounded")
             });
+        let diagnostic_map = if diagnostics
+            .as_ref()
+            .is_some_and(|found| !found.diagnostics.is_empty())
+        {
+            self.optional_address_map(job, &observed, &bytes).await
+        } else {
+            None
+        };
         let diagnostic_text = diagnostics.as_ref().map_or_else(
             || "diagnostics_freshness: unknown\ndiagnostic_count: unknown\nfeedback_delta: none".to_owned(),
             |diagnostics| {
@@ -5102,9 +5112,10 @@ impl<'a> Worker<'a> {
                     .iter()
                     .take(8)
                     .map(|diagnostic| {
-                        super::reply::diagnostic_line(
+                        super::reply::diagnostic_line_at(
                             &observed.path().to_string_lossy(),
                             diagnostic,
+                            diagnostic_map.as_deref(),
                         )
                     })
                     .collect::<Vec<_>>();
@@ -5280,7 +5291,29 @@ impl<'a> Worker<'a> {
                 } else {
                     source.rechecks(authority.worktree().worktree_path())
                 };
-                problems_text_with_rechecks(&snapshots, &rechecks, language, offset)
+                let locations = problems::page_locations(&snapshots, language, offset);
+                let located = self
+                    .position_addresses(
+                        job,
+                        &locations
+                            .iter()
+                            .map(|(file, line)| (PathBuf::from(file), *line))
+                            .collect::<Vec<_>>(),
+                    )
+                    .await;
+                let mut addresses = crate::lang::render::LocationAddresses::new();
+                for (index, (file, line)) in locations.iter().enumerate() {
+                    if let Some(tag) = located.tag(index, *line) {
+                        addresses.insert((file.clone(), *line), tag);
+                    }
+                }
+                let mut text =
+                    problems_text_addressed(&snapshots, &rechecks, language, offset, &addresses);
+                if let Some(note) = located.note() {
+                    text.push('\n');
+                    text.push_str(&note);
+                }
+                text
             }
             None => "checks disabled".to_owned(),
         };
@@ -5577,11 +5610,19 @@ impl<'a> Worker<'a> {
                             .await;
                         job.deadline = original;
                         let diagnostics = match result {
-                            Ok(Some(provider)) => EditDiagnostics::from_snapshot(
-                                request.path.trim_start_matches("./"),
-                                &provider.context,
-                                &provider.diagnostics,
-                            ),
+                            Ok(Some(provider)) => {
+                                let map = if provider.diagnostics.diagnostics.is_empty() {
+                                    None
+                                } else {
+                                    self.optional_address_map(job, &observed, &bytes).await
+                                };
+                                EditDiagnostics::from_snapshot(
+                                    request.path.trim_start_matches("./"),
+                                    &provider.context,
+                                    &provider.diagnostics,
+                                    map.as_deref(),
+                                )
+                            }
                             Ok(None) | Err(_) => EditDiagnostics::Unknown {},
                         };
                         (Some(observed), diagnostics)
@@ -14157,7 +14198,7 @@ mod stop_retry_tests {
             )
             .await,
             Ok(
-                "a.gamma  (5 lines, gamma)\n    1  sym card\n    2    sym btn\n  (2 symbols)\n"
+                "a.gamma  (5 lines, gamma)\n1–5  a.gamma#card  sym card\n2–4  a.gamma#card/btn  sym btn\n  (2 symbols)\n"
                     .into()
             )
         );
