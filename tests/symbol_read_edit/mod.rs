@@ -183,7 +183,13 @@ async fn edits_by_address_need_no_source_ref_and_name_the_changed_lines() {
     let (_, text) = call(&mut actor, &fixture, "ide.edit", json!({"path":FILE,"add_import":statement})).await;
     assert!(text.contains("#@imports") && text.contains("  added"), "{text}");
     let added = on_disk(&fixture);
-    assert!(added.contains(&format!("use std::fmt;\n{statement}\n")), "{added}");
+    // The project formatter runs on the result and may sort the imports, so only their presence
+    // in the imports block is asserted.
+    assert!(
+        added.contains(&format!("{statement}\n")) && added.contains("use std::fmt;\n"),
+        "{added}"
+    );
+    assert_eq!(added.matches("use std::").count(), 2, "{added}");
     let (reply, text) = call(&mut actor, &fixture, "ide.edit", json!({"path":FILE,"add_import":statement})).await;
     assert!(text.contains("  unchanged") || reply["result"]["outcome"] == "unchanged", "{text}");
     assert_eq!(on_disk(&fixture), added, "an import already present is not added twice");
