@@ -117,6 +117,33 @@ fn symbol_address_contract_every_line_has_one_address() {
     assert!(map.at_line(0).is_none());
 }
 
+/// harness-reply-v1 r4 (consumed): a row that names a location prints the unit's full canonical
+/// address verbatim as one copyable text, with no state-label prefix and no `Next:` line.
+#[test]
+fn harness_reply_contract_candidate_rows_keep_the_full_address_verbatim() {
+    let (_, map) = file(0);
+    for unit in map.units() {
+        let row = agent_ide_core::lang::render::candidate_row(unit);
+        let address = unit.address.to_string();
+        assert!(row.starts_with(&format!("{address}  ")), "{row}");
+        assert!(
+            !row.contains("Next:") && !row.starts_with("complete") && !row.contains('\n'),
+            "{row}"
+        );
+        // Copying the printed address back resolves to the same unit.
+        let printed = row.split("  ").next().unwrap();
+        assert_eq!(
+            map.resolve(&address_of(printed)).unwrap().span,
+            unit.span,
+            "{row}"
+        );
+    }
+}
+
+fn address_of(text: &str) -> Address {
+    address(text)
+}
+
 /// A server may report symbol lines past the end of the file (or an empty file with symbols):
 /// the map still covers every real line and never panics.
 #[test]
