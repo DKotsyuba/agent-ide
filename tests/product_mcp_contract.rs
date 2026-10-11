@@ -11232,8 +11232,7 @@ async fn configured_product_batch_overlapping_changes_refuse_naming_both_ranges(
     assert_eq!(
         batch_without_status_plate(&refused_text),
         "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  2 of 2 changes refused, nothing written — \
-         changes 1 and 2 overlap (base lines 1–2 and 2–3); merge them or narrow the ranges. \
-         Fix the named changes and retry with the same operation_id",
+         changes 1 and 2 overlap (base lines 1–2 and 2–3); merge them or narrow the ranges\n",
         "{refused_text}"
     );
     assert_eq!(
@@ -11398,8 +11397,7 @@ async fn configured_product_batch_cannot_address_a_symbol_an_earlier_change_woul
     assert_eq!(
         batch_without_status_plate(&refused_text),
         "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 2 changes refused, nothing written — \
-         change 2: no symbol src/batch.rs#gamma; check ide.outline {\"path\":\"src/batch.rs\"}. \
-         Fix the named changes and retry with the same operation_id",
+         change 2: no symbol src/batch.rs#gamma; check ide.outline {\"path\":\"src/batch.rs\"}\n",
         "{refused_text}"
     );
     assert_eq!(
@@ -11447,8 +11445,7 @@ async fn configured_product_batch_lines_past_end_refuses_naming_the_file_length(
     assert_eq!(
         batch_without_status_plate(&refused_text),
         "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 1 changes refused, nothing written — \
-         change 1: lines 9 is past the end of src/batch.rs (7 lines); re-read the file. \
-         Fix the named changes and retry with the same operation_id",
+         change 1: lines 9 is past the end of src/batch.rs (7 lines); re-read the file\n",
         "{refused_text}"
     );
     assert_eq!(
@@ -11755,8 +11752,7 @@ async fn configured_product_batch_python_syntax_gate_refuses_writes_and_proceeds
         batch_without_status_plate(&refused_text),
         "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 1 changes refused, nothing written — \
          change 1 produced a syntax error at line 5: \"invalid syntax\" (candidate lines 3-6: \
-         \"\\n\\ndef broken(:\\n    return 2\"); candidate not written. Fix the named changes \
-         and retry with the same operation_id",
+         \"\\n\\ndef broken(:\\n    return 2\"); candidate not written\n",
         "{refused_text}"
     );
     assert_eq!(
