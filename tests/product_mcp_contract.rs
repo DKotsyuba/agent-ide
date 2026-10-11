@@ -10707,7 +10707,8 @@ async fn configured_product_batch_old_not_found_refuses_and_retries_the_same_ope
         batch_without_status_plate(&retried_text),
         format!(
             "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#@header:1 (L1)  replaced \
-             (3 lines → 1)\n  src/batch.rs#second (L3-5)  replaced (3 lines → 3)\n\
+             (3 lines → 1); was:\n    1\tpub fn first() -> i32 {{\n    2\t    1\n    3\t}}\n\
+             \x20 src/batch.rs#second (L3-5)  replaced (3 lines → 3)\n\
              lines after 1 moved -2",
             batch_diagnostics_segment(&retried)
         ),
@@ -10892,7 +10893,7 @@ async fn configured_product_batch_terminator_old_empty_lines_and_same_line_inser
         batch_without_status_plate(&edit_text),
         format!(
             "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#alpha:2 (L2)  replaced \
-             (1 lines → 1)\n  src/batch.rs#beta:1  deleted (1 lines)\nlines after 2 moved -1",
+             (1 lines → 1)\n  src/batch.rs#beta:1  deleted (1 lines); was:\n    4\t\nlines after 2 moved -1",
             batch_diagnostics_segment(&edit)
         ),
         "{edit_text}"
@@ -11729,7 +11730,8 @@ async fn configured_product_batch_ranges_read_then_edit_by_those_lines_without_r
         batch_without_status_plate(&edit_text),
         format!(
             "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#alpha:2 (L6)  replaced \
-             (1 lines → 1)\n  src/batch.rs#beta:2 (L10)  replaced (1 lines → 1)",
+             (1 lines → 1); was:\n    6\t    helper(1)\n  src/batch.rs#beta:2 (L10)  \
+             replaced (1 lines → 1); was:\n    10\t    helper(2)",
             batch_diagnostics_segment(&edit)
         ),
         "{edit_text}"
@@ -11925,7 +11927,7 @@ async fn configured_product_batch_legacy_single_change_replies_stay_byte_identic
         batch_without_status_plate(&lines_text),
         format!(
             "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#alpha:2 (L2)  replaced \
-             (1 lines → 1)",
+             (1 lines → 1); was:\n    2\t    1",
             batch_diagnostics_segment(&lines)
         ),
         "{lines_text}"
