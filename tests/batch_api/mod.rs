@@ -482,7 +482,7 @@ async fn symbol_and_graph_answer_several_symbols_in_one_reply() {
         "{text}"
     );
     let missing = text
-        .find("error: unknown_symbol")
+        .find("No symbol matches the requested address.")
         .expect("failed entry in place");
     let caller = text.find(single_text.trim_end()).unwrap_or_else(|| {
         panic!("the caller block equals the single form's text:\n{single_text}\n---\n{text}")
@@ -578,7 +578,8 @@ async fn outline_answers_several_paths_or_a_bounded_glob() {
             .unwrap_or_else(|| panic!("{needle}: {text}"))
     };
     assert!(
-        at("beta") < at("no_such_file") && at("no_such_file") < at("alpha"),
+        at("beta") < at("This path does not exist in the worktree.")
+            && at("This path does not exist in the worktree.") < at("alpha"),
         "{text}"
     );
 

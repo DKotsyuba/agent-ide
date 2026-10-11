@@ -4796,7 +4796,9 @@ fn claude_envelope_reconnect_retry_hint_survives_in_content_text() {
     };
     assert!(text.text.contains(REROOT_LATE_PRE_HINT), "{}", text.text);
     assert!(
-        text.text.contains("or call ide.start without root"),
+        text.text.contains(
+            "Repair: session re-rooted to the requested root; call ide.start without root"
+        ),
         "{}",
         text.text
     );
@@ -6128,7 +6130,12 @@ mod managed_claude_front_tests {
                 }
                 // Any other refusal is not proof of an older daemon: nothing sent, memory kept.
                 _ => {
-                    assert!(!sent && text.contains("(hooks_not_delivered)"), "{text}");
+                    assert!(
+                        !sent
+                            && text
+                                == "The IDE received no host event for this session.\nRepair: Call ide.start in this project.",
+                        "{text}"
+                    );
                     assert_eq!(reconnect.remembered_tags(None).len(), 1);
                 }
             }
@@ -6203,7 +6210,10 @@ mod managed_claude_front_tests {
             ),
             peer
         );
-        assert!(text.contains("(never_activated)"), "{text}");
+        assert!(
+            text == "This session has no IDE activation yet.\nRepair: Call ide.start in this project.",
+            "{text}"
+        );
     }
 
     /// After a replacement a call announces the remembered tags; on `recovery_needed` the front
@@ -6318,7 +6328,10 @@ mod managed_claude_front_tests {
             ),
             peer
         );
-        assert!(text.contains("host_binding"), "{text}");
+        assert_eq!(
+            text,
+            "This session has no IDE activation yet.\nRepair: Call ide.start in this project."
+        );
     }
 
     /// F-02: against an older daemon that identifies no actor, the single remembered activation
@@ -6375,7 +6388,8 @@ mod managed_claude_front_tests {
             );
             assert_eq!(*asked.lock().unwrap(), [remembered], "{text}");
             assert_eq!(
-                text.contains("other_repository: bound to /repo, asked /other"),
+                text.starts_with("Other agents still use the bound repository; nothing moved.")
+                    && text.contains("Bound repository: /repo; requested root: /other"),
                 remembered,
                 "{text}"
             );

@@ -1638,6 +1638,16 @@ mod tests {
         for (code, detail, expected) in [
             (
                 FailureCode::UnknownSymbol,
+                "symbol:region: src/lib.rs:3 is file-level code at src/lib.rs#@imports, not a symbol; read it with ide.read",
+                "No symbol matches the requested address.\nRepair: List the file's addresses with ide.outline.\n  src/lib.rs:3 is file-level code at src/lib.rs#@imports, not a symbol; read it with ide.read\n",
+            ),
+            (
+                FailureCode::UnknownSymbol,
+                "symbol:line_past_end: src/lib.rs:99 is past the end of the file",
+                "No symbol matches the requested address.\nRepair: List the file's addresses with ide.outline.\n  src/lib.rs:99 is past the end of the file\n",
+            ),
+            (
+                FailureCode::UnknownSymbol,
                 "edit:range_past_end: line 17 is past the end of src/a.rs (3 lines)",
                 "No symbol matches the requested address.\nRepair: List the file's addresses with ide.outline.\n  line 17 is past the end of src/a.rs (3 lines)\n",
             ),

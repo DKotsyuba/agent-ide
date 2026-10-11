@@ -584,7 +584,8 @@ fn assert_claude_envelope(reply: &Value) -> &str {
 /// longer sends `structuredContent` to Claude, so tests read the same facts the model itself
 /// receives instead of the typed JSON copy. Only successful edits can advertise a post-read
 /// source reference; refusal prose is never parsed as one. Unset fields are simply absent from
-/// the returned object, matching `serde_json::Value`'s null-on-missing-key indexing.
+/// the returned object, matching `serde_json::Value`'s null-on-missing-key indexing. Refusals
+/// retain the exact original model text alongside reconstructed facts, including any status plate.
 fn claude_fields(tool: &str, text: &str) -> Value {
     /// Returns the bounded token starting at `text`, ending at the first space, `;`, `\n`, `.`, `)`
     /// or the string end; every identifier this parser extracts (`reason`, `code`, `outcome`,
@@ -722,11 +723,11 @@ fn claude_fields(tool: &str, text: &str) -> Value {
             None
         };
         if head == "These arguments do not match the tool schema." {
-            return json!({"state":"invalid_parameters"});
+            return json!({"state":"invalid_parameters","text":original});
         }
         return code.map_or_else(
-            || json!({"state":"unavailable","reason":"host_binding"}),
-            |code| json!({"state":"error","code":code}),
+            || json!({"state":"unavailable","reason":"host_binding","text":original}),
+            |code| json!({"state":"error","code":code,"text":original}),
         );
     }
     if text.starts_with("The result arrives by itself") {
@@ -1271,7 +1272,7 @@ async fn binary_routes_methods_to_typed_missing_peer_and_survives_daemon_loss() 
         lost["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("daemon transport is unavailable")
+            .contains("The IDE connection is unavailable.")
     );
     mcp.close().await;
     std::fs::remove_dir_all(runtime).unwrap();
@@ -1579,10 +1580,27 @@ fn operator_cargo_home(namespace: &Path) -> PathBuf {
     }
 }
 
-/// Checks a closed host boundary response and proves private launch/input fields were not rendered.
+/// Checks a closed host boundary response against its independent structured host-binding oracle
+/// or the exact expected prose, and proves private launch/input fields were not rendered.
 fn boundary(response: &Value, expected: &str) {
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains(expected), "{response}");
+    if expected == "host_binding" {
+        assert_eq!(
+            response["result"]["structuredContent"],
+            json!({"state":"unavailable","reason":"host_binding"}),
+            "{response}"
+        );
+        assert_ne!(response["result"]["isError"], json!(true), "{response}");
+        assert!(
+            text.lines()
+                .nth(1)
+                .is_some_and(|line| line.starts_with("Repair: ")),
+            "{response}"
+        );
+        assert!(!text.contains("host_binding"), "{response}");
+    } else {
+        assert!(text.contains(expected), "{response}");
+    }
     for private in [
         "private-host-channel",
         "must-never-leave-hook",
@@ -1713,7 +1731,7 @@ async fn binary_codex_hooks_bind_exact_parallel_actors_and_stop_before_workspace
         &root
             .exchange(host_call("root", "daemon-lost", "ide.start"))
             .await,
-        "daemon transport is unavailable",
+        "The IDE connection is unavailable.",
     );
     tokio::join!(root.close(), child.close());
     std::fs::remove_dir_all(runtime).unwrap();
@@ -2515,7 +2533,7 @@ async fn binary_renders_typed_lifecycle_replies_without_transport_errors() {
         (
             host_call("actor", "stopped", "ide.stop"),
             json!({"state":"host_stopped"}),
-            "host_stopped: host binding released; no workspace authority was created",
+            "Host binding released.",
         ),
     ];
     for (call, expected, text) in replies {
@@ -4393,7 +4411,7 @@ async fn managed_codex_context_after_crash_requires_start_and_republishes_route(
     assert_eq!(reply["reason"], "host_binding", "{reply}");
     assert_eq!(
         reply["retry"],
-        "daemon restarted; call ide.start first, then repeat this call with fresh references"
+        "daemon restarted; call ide.start in this project"
     );
     assert!(
         discover(&root, &identity).is_some(),
@@ -5226,7 +5244,7 @@ async fn managed_claude_root_child_rendezvous_shared_daemon_survives_eof() {
         .await;
     assert_eq!(
         claude_fields("ide.start", assert_claude_envelope(&unbound)),
-        json!({"state":"unavailable","reason":"host_binding"}),
+        json!({"state":"unavailable","reason":"host_binding","text":assert_claude_envelope(&unbound)}),
         "{unbound}"
     );
     assert_eq!(std::fs::read(&attachment_path).unwrap(), first_attachment);
@@ -5265,7 +5283,7 @@ async fn managed_claude_root_child_rendezvous_shared_daemon_survives_eof() {
         .await;
     assert_eq!(
         claude_fields("ide.start", assert_claude_envelope(&denied)),
-        json!({"state":"unavailable","reason":"host_binding"}),
+        json!({"state":"unavailable","reason":"host_binding","text":assert_claude_envelope(&denied)}),
         "{denied}"
     );
 
@@ -5482,13 +5500,13 @@ async fn managed_claude_moved_session_reroots_into_an_allowed_root() {
     let rerooted_text = assert_claude_envelope(&rerooted);
     assert!(
         rerooted_text.starts_with(
-            "The IDE received no host event for this session.\nRepair: Call ide.start in this project."
+            "The IDE received no host event for this session.\nRepair: session re-rooted to the requested root; repeat this call"
         ),
         "{rerooted_text}"
     );
     assert!(
         rerooted_text
-            .ends_with("; retry: session re-rooted to the requested root; repeat this call once"),
+            .ends_with("Repair: session re-rooted to the requested root; repeat this call"),
         "{rerooted_text}"
     );
     assert!(
@@ -6889,10 +6907,11 @@ async fn binary_and_unreadable_files_refuse_softly_naming_a_native_tool() {
             json!({"symbols":[path]}),
         ] {
             let (reply, text) = settled_read(&mut actor, &fixture, arguments.clone()).await;
-            let soft = reply["code"] == "source_unavailable" && text.contains("native tool")
+            let native_tool = text.contains("native tool") || text.contains("native file tool");
+            let soft = reply["code"] == "source_unavailable" && native_tool
                 || reply["kind"] == "read"
                     && text.contains("not a readable text file")
-                    && text.contains("native tool");
+                    && native_tool;
             if !soft {
                 refusals.push(format!("{arguments}: {reply} {text}"));
             }
@@ -10433,7 +10452,8 @@ async fn configured_product_address_outline_path_line_and_near() {
     let (near, near_text) = batch_settle_with_text(&mut actor, &fixture, near).await;
     assert_eq!(near["code"], "unknown_symbol", "{near}");
     assert!(
-        near_text.contains("near: ") && near_text.contains("src/lib.rs#Service/work"),
+        near_text.starts_with("No symbol matches the requested address.\nRepair: ")
+            && near_text.contains("src/lib.rs#Service/work"),
         "an unknown member lists the addresses near it: {near_text}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
@@ -12674,9 +12694,9 @@ async fn product_outline_and_read_report_no_such_file() {
     .await;
     assert_eq!(unreadable["code"], "source_unavailable", "{unreadable}");
     assert!(
-        text.contains("read:source_unavailable")
+        text.starts_with("The requested source could not be read safely.")
             && text.contains("escape.rs")
-            && text.contains("Retry ide.read"),
+            && text.contains("Repair: Read it with a native tool."),
         "{text}"
     );
     actor.next += 1;
@@ -15032,11 +15052,11 @@ async fn plain_directory_activates_and_answers_without_git_data() {
     );
     let diff_text = diff["result"]["content"][0]["text"].as_str().unwrap();
     assert!(
-        diff_text.contains("diff:not_a_git_repository"),
+        diff_text.starts_with("This directory is not a Git repository."),
         "{diff_text}"
     );
     assert!(
-        diff_text.contains("not a git repository: no git data"),
+        diff_text.contains("Repair: Review the files with native tools."),
         "{diff_text}"
     );
     actor.next += 1;
@@ -15056,7 +15076,7 @@ async fn plain_directory_activates_and_answers_without_git_data() {
         task_diff["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("not a git repository: no git data"),
+            .contains("Repair: Review the files with native tools."),
         "{task_diff}"
     );
 
@@ -18245,13 +18265,8 @@ async fn configured_product_reports_a_second_actor_on_one_worktree_as_a_conflict
             "{refused}"
         );
         let text = refused["result"]["content"][0]["text"].as_str().unwrap();
-        let expected_tool = if tool == "ide.edit" {
-            "ide.edit"
-        } else {
-            "ide.test"
-        };
         assert!(
-            text.starts_with(&format!("refused: read_only ({expected_tool});")),
+            text.starts_with("This activation started with read_only: true;"),
             "{index}: {text}"
         );
         assert!(
@@ -18259,7 +18274,7 @@ async fn configured_product_reports_a_second_actor_on_one_worktree_as_a_conflict
             "{index}: {text}"
         );
         assert!(
-            text.contains("current writer: activation"),
+            text.contains("Current writer: activation"),
             "{index}: {text}"
         );
         assert!(text.contains("last activity"), "{index}: {text}");
@@ -18296,7 +18311,7 @@ async fn configured_product_reports_a_second_actor_on_one_worktree_as_a_conflict
     assert!(writer_text.contains("since"), "{writer_text}");
     assert!(writer_text.contains("last activity"), "{writer_text}");
     assert!(
-        writer_text.contains("Start with {\"read_only\": true} to read alongside"),
+        writer_text.contains("Repair: Call ide.start with {\"read_only\":true} to read alongside."),
         "{writer_text}"
     );
 
@@ -20440,7 +20455,7 @@ async fn configured_product_claude_activates_a_reader_then_stops() {
         stale_detail["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("host_binding"),
+            .contains("This IDE session is not active.\nRepair: Call ide.start in this project."),
         "{stale_detail}"
     );
 
@@ -20509,7 +20524,7 @@ async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
         conflict["text"]
             .as_str()
             .unwrap()
-            .starts_with("refused: read_only (ide.edit);"),
+            .starts_with("This activation started with read_only: true;"),
         "{conflict}"
     );
     if let Some(reference) = detail_ref.as_str() {
@@ -20521,7 +20536,7 @@ async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
                 conflict["text"]
                     .as_str()
                     .unwrap()
-                    .starts_with("refused: read_only (ide.edit);"),
+                    .starts_with("This activation started with read_only: true;"),
                 "{conflict}"
             );
         }
@@ -23439,7 +23454,9 @@ async fn configured_product_environment_repeat_start_keeps_own_cache_and_binding
     );
     let text = invalid["result"]["content"][0]["text"].as_str().unwrap();
     assert!(
-        text.contains("choose one of the listed candidates or \"auto\""),
+        text.contains("Repair: Select one listed project environment with ide.start.")
+            && text.contains(".venv-absent")
+            && text.contains("candidates .venv, .venv-py314"),
         "{text}"
     );
     assert!(!text.contains("detail_ref"), "{text}");
@@ -23963,7 +23980,7 @@ async fn managed_claude_lost_edit_reply_is_reported_and_never_resent() {
     repeat["id"] = json!(next);
     let text = assert_claude_envelope(&mcp.exchange(repeat).await).to_owned();
     assert!(
-        text.contains("host_binding (replay)") && !text.contains("missing_pre"),
+        text == "This exact call was already processed.\nRepair: Send a new tool call.",
         "{text}"
     );
     claude_read_ok(&mut mcp, &fixture.root, &mut next, session, None).await;
@@ -24079,7 +24096,7 @@ async fn managed_claude_stopped_actor_is_never_recovered() {
     repeat["id"] = json!(next);
     let repeated = assert_claude_envelope(&mcp.exchange(repeat).await).to_owned();
     assert!(
-        repeated.contains("host_binding (replay)") && !repeated.contains("missing_pre"),
+        repeated == "This exact call was already processed.\nRepair: Send a new tool call.",
         "{repeated}"
     );
     let done_stop = claude_settled_call(
@@ -24349,7 +24366,7 @@ async fn managed_claude_recovery_waits_for_a_late_pre_and_keeps_a_reader() {
     )
     .await;
     assert!(
-        claude_text(&edit).starts_with("refused: read_only (ide.edit)"),
+        claude_text(&edit).starts_with("This activation started with read_only: true;"),
         "{edit}"
     );
     assert!(!fixture.root.join("src/new.rs").exists());

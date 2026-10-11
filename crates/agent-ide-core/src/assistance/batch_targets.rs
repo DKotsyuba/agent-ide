@@ -727,7 +727,10 @@ mod tests {
             },
             AssistanceTool::Symbol,
         );
-        assert!(text.starts_with("error: unknown_symbol"), "{text}");
+        assert_eq!(
+            text,
+            "No symbol matches the requested address.\nRepair: List the file's addresses with ide.outline.\n"
+        );
         assert!(text.ends_with('\n'));
     }
 }

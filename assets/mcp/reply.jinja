@@ -88,7 +88,7 @@ The result arrives by itself in an <agent-ide> block. Result reference: {{ detai
 {{ refusal("The source is " ~ code.source_too_large.size ~ " bytes; the read limit is " ~ code.source_too_large.ceiling ~ " bytes.", "Read it in pieces with a native tool.") }}
 {%- elif code == "edit_refused" -%}
 {{ refusal("Edit refused; nothing was written.", "Correct the named changes and repeat with the same operation_id.", refusal_excerpt) }}
-{%- elif code == "unknown_symbol" and (resolution_detail is startingwith("symbol:near:") or resolution_detail is startingwith("edit:range_past_end:")) -%}
+{%- elif code == "unknown_symbol" and (resolution_detail is startingwith("symbol:near:") or resolution_detail is startingwith("symbol:region:") or resolution_detail is startingwith("symbol:line_past_end:") or resolution_detail is startingwith("edit:range_past_end:")) -%}
 {{ refusal("No symbol matches the requested address.", "List the file's addresses with ide.outline.", resolution_message) }}
 {%- elif code == "unknown_symbol" -%}
 {{ refusal("No symbol matches the requested address.", "List the file's addresses with ide.outline.") }}

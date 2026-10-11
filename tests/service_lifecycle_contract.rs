@@ -44,10 +44,17 @@ fn unique_path(label: &str) -> PathBuf {
         ))
 }
 
-/// Runs one fixed local Git subcommand against `root` with all user/system configuration excluded.
+/// Runs one fixed local Git subcommand against `root` with user/system configuration excluded,
+/// preserving only the selected temporary-directory environment for Git subprocess scratch.
 fn git(root: &Path, args: &[&str]) {
-    let output = std::process::Command::new("/usr/bin/git")
-        .env_clear()
+    let mut command = std::process::Command::new("/usr/bin/git");
+    command.env_clear();
+    for name in ["TMPDIR", "TMP", "TEMP"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let output = command
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .arg("-C")
@@ -89,7 +96,9 @@ fn add_worktree(repo: &Path, branch: &str) -> PathBuf {
 ///
 /// The key is `candidate`'s canonical git common directory, independently rediscovered through the
 /// real `git` binary; a `candidate` outside any repository falls back to itself, exactly like the
-/// product code. This never inspects product internals, only its documented external contract.
+/// product code. The parent is the documented nonempty Claude rendezvous override, or the
+/// legacy default when unset or empty. This never calls the product resolver, keeping the
+/// black-box path assertion independent of its implementation.
 fn expected_runtime_path(candidate: &Path) -> PathBuf {
     let candidate = std::fs::canonicalize(candidate).unwrap();
     let output = std::process::Command::new("/usr/bin/git")
@@ -105,7 +114,10 @@ fn expected_runtime_path(candidate: &Path) -> PathBuf {
         candidate
     };
     let hash = blake3::hash(key.as_os_str().as_bytes());
-    std::fs::canonicalize("/private/tmp")
+    let parent = std::env::var_os("AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT")
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| PathBuf::from("/private/tmp"), PathBuf::from);
+    std::fs::canonicalize(parent)
         .unwrap()
         .join(format!("ai-r-{}", &hash.to_hex().as_str()[..16]))
 }
