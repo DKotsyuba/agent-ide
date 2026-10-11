@@ -24,8 +24,10 @@ impl Worker<'_> {
     /// success the call is rewritten to the equivalent `files` request and delegated to
     /// [`Self::edit_files`], so its reply, receipt and project check are that pipeline's.
     ///
-    /// The file text is read here and written there, so a concurrent change between the two
-    /// overwrites it; the write itself stays stale-safe only against the second observation.
+    /// The file text is read in [`Self::patch_files`] and written by `edit_files`; every
+    /// replacement carries the digest of the bytes its hunks were applied to, so a file that
+    /// changed in between is refused as changed while the edit was applied, never overwritten
+    /// (symbol-read-edit-v1 section 3.2 rule 6).
     pub(super) async fn edit_patch(
         &mut self,
         job: &mut Job,
@@ -46,6 +48,27 @@ impl Worker<'_> {
                 return Ok((PeerReply::InvalidParameters { message }, authority, None));
             }
         };
+        let files = self.patch_files(job, &binding, parsed).await?;
+        job.parameters = json!({"operation_id": operation_id, "files": files});
+        self.edit_files(job).await
+    }
+
+    /// Turns the parsed patch operations into the `files` entries of the equivalent multi-file
+    /// edit: an `Add File` is a creation; an `Update File` is a whole-content replacement
+    /// computed from the file's current bytes, carrying `expect`, the blake3 hex digest of those
+    /// bytes, so the write is refused if the file no longer has them.
+    ///
+    /// # Errors
+    ///
+    /// [`FailureCode::EditRefused`] (detail recorded on `job`) for a missing file or a hunk that
+    /// does not match, quoting the nearest text; observation failures propagate. Nothing is
+    /// written either way.
+    pub(super) async fn patch_files(
+        &mut self,
+        job: &mut Job,
+        binding: &BindingRef,
+        parsed: Vec<PatchFile>,
+    ) -> Result<Vec<serde_json::Value>, FailureCode> {
         let mut files = Vec::with_capacity(parsed.len());
         for file in parsed {
             match file {
@@ -54,7 +77,7 @@ impl Worker<'_> {
                 }
                 PatchFile::Update { path, hunks } => {
                     let (observed, bytes) = self
-                        .observe(&binding, std::path::PathBuf::from(&path))
+                        .observe(binding, std::path::PathBuf::from(&path))
                         .await?;
                     if no_such_file(observed.state(), &path).is_some() {
                         return Err(refuse(job, format!("{path} does not exist")));
@@ -92,8 +115,7 @@ impl Worker<'_> {
                 }
             }
         }
-        job.parameters = json!({"operation_id": operation_id, "files": files});
-        self.edit_files(job).await
+        Ok(files)
     }
 }
 

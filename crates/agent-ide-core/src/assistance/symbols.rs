@@ -5354,7 +5354,8 @@ const MAX_CHANGE_ROWS: usize = 12;
 /// `map` is the address map of the edited text; without one (a language with no outline) the
 /// lines are named `path:12-16`. A deleted symbol keeps the address it had, other deletions name
 /// the address now holding the join point. `echoes` pairs a change index with the old lines a
-/// window edit replaced (no remembered read), printed under its line as `; was:`. Past
+/// change replaced when the agent has no read of them to rely on (a window edit with no remembered
+/// read of those lines, or any file-numbered `lines` edit), printed under its line as `; was:`. Past
 /// [`MAX_CHANGE_ROWS`] lines the rest is counted as `+<k> more`. Landing ranges are mapped
 /// through `align` when the formatter moved lines.
 fn changed_rows(

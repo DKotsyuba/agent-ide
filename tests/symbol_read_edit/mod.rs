@@ -663,3 +663,87 @@ async fn lines_edits_echo_and_locations_address_units_and_regions() {
     );
     finished(actor, daemon, &fixture).await;
 }
+
+/// A file with a small function and a `big` one whose numbered text is larger than one reply
+/// page. Unit lines of `big`: 1 is its header, 2-6001 the repeated `let`, 6002-6003 its tail.
+fn paged_source() -> String {
+    format!(
+        "pub fn small() -> u32 {{\n    1\n}}\n\npub fn big() -> u32 {{\n{}    7\n}}\n",
+        "    let a = 1;\n".repeat(6000)
+    )
+}
+
+/// Starts a daemon with a known context epoch (the window guard remembers nothing without one)
+/// and an actor warmed on [`paged_source`].
+#[cfg(feature = "test-seams")]
+async fn paged_started(name: &'static str) -> (ProductFixture, OwnedDaemon, ProductActor) {
+    let fixture = batch_edit_fixture(&paged_source());
+    let epoch = fixture.base.join("context-epoch");
+    std::fs::write(&epoch, "1").unwrap();
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let env = [("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE", epoch.to_str().unwrap())];
+    let daemon = fixture
+        .spawn_configured_daemon_with_env(Some(&home), false, Duration::from_secs(30), None, &env)
+        .await;
+    let actor = batch_started_actor(&fixture, name, FILE).await;
+    (fixture, daemon, actor)
+}
+
+/// A unit read that is cut into pages counts as read only up to the last row its first page
+/// delivered: a window edit of a row on a later page is unguarded and echoes what it replaces,
+/// although the unit is unchanged since the read (symbol-read-edit-v1 §3.2 rule 3).
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn a_paged_read_guards_only_the_rows_it_delivered() {
+    let (fixture, daemon, mut actor) = paged_started("sre-paged").await;
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"symbol":"src/batch.rs#big"}),
+    )
+    .await;
+    assert!(
+        text.contains("page 1;") && !text.contains("\n5990\t"),
+        "the read must be cut before row 5990: {}",
+        &text[..text.len().min(300)]
+    );
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":"src/batch.rs#big:5990-5990","content":"    let a = 2;"}),
+    )
+    .await;
+    assert!(text.contains("; was:\n    5990\t    let a = 1;"), "{text}");
+    finished(actor, daemon, &fixture).await;
+}
+
+/// A batch read remembers a unit only when its block is delivered in the reply: a block cut from
+/// the reply leaves its unit unguarded, so a window edit there echoes what it replaces.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn a_batch_read_guards_only_the_blocks_it_delivered() {
+    let (fixture, daemon, mut actor) = paged_started("sre-batch-cut").await;
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"symbols":["src/batch.rs#small","src/batch.rs#big"]}),
+    )
+    .await;
+    assert!(
+        text.contains("1\tpub fn small() -> u32 {") && !text.contains("src/batch.rs#big  ("),
+        "the big block must be cut: {}",
+        &text[..text.len().min(400)]
+    );
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":"src/batch.rs#big:100-100","content":"    let a = 2;"}),
+    )
+    .await;
+    assert!(text.contains("; was:\n    100\t    let a = 1;"), "{text}");
+    finished(actor, daemon, &fixture).await;
+}

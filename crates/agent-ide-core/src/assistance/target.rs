@@ -224,7 +224,9 @@ impl Worker<'_> {
     /// reports its own refusal); otherwise the numbered unit reply (see [`read_unit`]).
     ///
     /// A file no IDE language reads has no map, so its locations and addresses answer the
-    /// outline's own refusal. The read is remembered for the window-edit guard.
+    /// outline's own refusal. The unit lines the reply's first page delivered (all of them when
+    /// the reply is complete, see [`delivered_last`]) are remembered for the window-edit guard;
+    /// lines on later pages count as read only once they are delivered and read again.
     pub(super) async fn read_by_address(
         &mut self,
         job: &mut Job,

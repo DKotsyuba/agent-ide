@@ -11037,6 +11037,64 @@ mod stop_retry_tests {
         );
     }
 
+    /// The `files` entries an `apply_patch` body is turned into pin the bytes the hunks were
+    /// applied to: when the file changes after the patch was planned (the window between the
+    /// patch's read and the multi-file write), writing those entries is refused as changed
+    /// while the edit was applied and the other writer's bytes stay (symbol-read-edit-v1 section
+    /// 3.2 rule 6). This is the production wiring of `expect`, not just the write-time check.
+    #[tokio::test]
+    async fn a_planned_patch_is_refused_when_the_file_changes_before_the_write() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        let source = "sym card\nsym btn\nmark\nend\nend\n";
+        std::fs::write(fixture.root.join("a.gamma"), source).unwrap();
+        git_commit(&fixture.root, "planned patch fixture");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        worker.edits.install_schema().await.unwrap();
+        let (binding, _authority) =
+            activate_worktree(&mut worker, "line-actor", "plan-start").await;
+        let invocation = production_call(&worker, "line-actor", "plan-patch");
+        let (mut job, _cancel) = tool_job(
+            &fixture.root,
+            invocation,
+            "plan-patch",
+            AssistanceTool::Edit,
+            serde_json::json!({}),
+        );
+        let parsed = crate::assistance::patch::parse_patch(
+            "*** Begin Patch\n*** Update File: a.gamma\n@@\n-mark\n+MARK\n*** End Patch\n",
+        )
+        .unwrap();
+        let files = worker
+            .patch_files(&mut job, &binding, parsed)
+            .await
+            .unwrap();
+        // Another writer changes the file after the plan and before the write.
+        let theirs = "sym card\nsym btn\nmark\nend\nend\n// theirs\n";
+        std::fs::write(fixture.root.join("a.gamma"), theirs).unwrap();
+        job.parameters = serde_json::json!({"operation_id":"plan-patch-op","files":files});
+        let refused = worker.edit(&mut job).await;
+        assert!(
+            matches!(refused, Err(FailureCode::EditRefused)),
+            "a changed file is refused"
+        );
+        assert!(
+            job.failure_detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("changed while the edit was applied"),
+            "{:?}",
+            job.failure_detail
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("a.gamma")).unwrap(),
+            theirs
+        );
+    }
+
     /// A line-range edit applies only on a retained same-path observation whose bytes are still
     /// current, reports its net line movement, and never writes on a refused base; the
     /// symbol form validates an explicit `source_ref` the same way and stays optional.
