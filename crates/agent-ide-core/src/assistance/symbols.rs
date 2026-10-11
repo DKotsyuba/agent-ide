@@ -3279,15 +3279,34 @@ impl Worker<'_> {
             for request in &requests {
                 match request {
                     ChangeRequest::Import { add: true, .. } => {
-                        sites.insert(
-                            (imports_path(), lang::InsertWhere::After),
-                            map.insert_site(
+                        // After the last import line of the file's `@imports` region; a file
+                        // with no imports gets the map's own placement (after its header).
+                        let imports_end = map
+                            .units()
+                            .iter()
+                            .filter(|unit| {
+                                unit.kind
+                                    == lang::address::UnitKind::Region(
+                                        lang::address::RegionKind::Imports,
+                                    )
+                            })
+                            .map(|unit| unit.span.end)
+                            .max();
+                        let site = match imports_end {
+                            Some(end) => Ok(lang::InsertSite {
+                                line: end + 1,
+                                indent: String::new(),
+                                blank_before: 0,
+                                blank_after: 0,
+                            }),
+                            None => map.insert_site(
                                 &source,
                                 outline.language.support(),
                                 &region_address("@imports"),
                                 lang::InsertWhere::After,
                             ),
-                        );
+                        };
+                        sites.insert((imports_path(), lang::InsertWhere::After), site);
                     }
                     ChangeRequest::Symbol {
                         requested,

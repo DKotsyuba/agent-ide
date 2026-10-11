@@ -11012,17 +11012,11 @@ mod stop_retry_tests {
                     },
                     note: Some(note),
                     ..
-                } if reference == "line-edit"
-                    && note.ends_with("\nlines after 2 moved +1")
+                // This drives the worker directly with the single `lines` form (the facade
+                // rewrites it to `changes` in production), so only the movement fact is the note.
+                } if reference == "line-edit" && note == "lines after 2 moved +1"
             ),
-            "{}",
-            match &reply {
-                PeerReply::Edit { result, note, .. } => format!(
-                    "outcome {:?}, source_ref {:?}, note {note:?}",
-                    result.outcome, result.source_ref
-                ),
-                other => format!("{other:?}"),
-            }
+            "{reply:?}"
         );
         assert_eq!(
             std::fs::read_to_string(fixture.root.join("a.gamma")).unwrap(),

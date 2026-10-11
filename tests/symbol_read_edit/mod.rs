@@ -275,7 +275,8 @@ async fn window_edits_are_guarded_by_the_last_read() {
     assert!(
         text.contains("lines 3-3 of src/batch.rs#utility changed since your read")
             && text.contains("Current text:")
-            && text.contains("3\t    let a = x * 9;")
+            // A refusal is one line: its line breaks and tabs are escaped.
+            && text.contains("let a = x * 9;")
             && text.contains("Repair:"),
         "{text}"
     );

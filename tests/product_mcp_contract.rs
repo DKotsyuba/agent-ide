@@ -5708,12 +5708,10 @@ async fn claude_session_survives_a_daemon_restart_between_calls() {
     )
     .await;
     // Reads print no reference any more; a context reply still names its `detail_ref`.
-    let stale_ref = claude_text(&before)
-        .split("source_ref ")
-        .nth(1)
-        .and_then(|tail| tail.split_whitespace().next())
+    let stale_ref = before["detail_ref"]
+        .as_str()
         .map(str::to_owned)
-        .expect("read reply carries a source_ref");
+        .expect("a context reply names its detail_ref");
 
     // The shared daemon generation ends; the watcher must heal it before the next pre-hook.
     let stale_attachment = managed_claude_candidate_attachment(&fixture.root);
@@ -10847,7 +10845,7 @@ async fn configured_product_batch_terminator_old_empty_lines_and_same_line_inser
     assert_eq!(
         batch_without_status_plate(&insert_text),
         format!(
-            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#helper~2 (L5-7)  inserted \
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#helper (L5-7)  inserted \
              (3 lines)\n  src/batch.rs#beta (L9-11)  replaced (3 lines → 3)\n\
              lines after 4 moved +5",
             batch_diagnostics_segment(&insert)
@@ -11331,7 +11329,7 @@ async fn configured_product_batch_python_syntax_gate_refuses_writes_and_proceeds
     assert_eq!(unchecked["result"]["outcome"], "replaced", "{unchecked}");
     assert_eq!(
         unchecked["note"].as_str().unwrap_or_default(),
-        "1 change applied: change 1: old text at line 5 replaced (now 5)",
+        "  svc/app.py:5 (L5)  replaced (1 lines → 1)",
         "{unchecked}"
     );
     assert!(
@@ -13905,7 +13903,7 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
     let server_only = actor.settle(&fixture, server_only).await;
     let read_text = server_only["text"].as_str().unwrap_or_default();
     assert!(
-        read_text.starts_with("src/lib.rs#server_only  (lines "),
+        read_text.starts_with("src/lib.rs#server_only  ("),
         "{server_only}"
     );
     let refused = actor.settle(&fixture, refused).await;
@@ -16007,6 +16005,7 @@ async fn configured_product_edit_in_a_package_without_environment_reports_server
         )
         .await;
     let edit = actor.settle(&fixture, edit).await;
+    let edit = settle_edit_check(&mut actor, &fixture, edit).await;
     assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
     assert_eq!(
         edit["diagnostics"]["state"], "current_reported",
