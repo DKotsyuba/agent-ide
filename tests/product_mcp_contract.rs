@@ -9989,33 +9989,34 @@ async fn configured_product_address_outline_path_line_and_near() {
         };
         assert!(text.contains(expected), "{location}: {reply}");
     }
-    let region = actor
-        .call(
-            &fixture,
-            "ide.symbol",
-            json!({"symbol":"src/lib.rs:3","usages":false,"callers":0}),
-        )
-        .await;
-    let region = actor.settle(&fixture, region).await;
+    // The refusal text (not the settled structured value, which carries only the code) names the
+    // region and the near addresses.
+    let region = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.symbol",
+        json!({"symbol":"src/lib.rs:3","usages":false,"callers":0}),
+    )
+    .await;
+    let (region, region_text) = batch_settle_with_text(&mut actor, &fixture, region).await;
     assert_eq!(region["code"], "unknown_symbol", "{region}");
     assert!(
-        region.to_string().contains("src/lib.rs#@imports"),
-        "{region}"
+        region_text.contains("src/lib.rs#@imports"),
+        "a line in a region names the region address: {region_text}"
     );
 
-    let near = actor
-        .call(
-            &fixture,
-            "ide.symbol",
-            json!({"symbol":"src/lib.rs#Service/wrok"}),
-        )
-        .await;
-    let near = actor.settle(&fixture, near).await;
+    let near = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.symbol",
+        json!({"symbol":"src/lib.rs#Service/wrok"}),
+    )
+    .await;
+    let (near, near_text) = batch_settle_with_text(&mut actor, &fixture, near).await;
     assert_eq!(near["code"], "unknown_symbol", "{near}");
-    let near_text = near.to_string();
     assert!(
         near_text.contains("near: ") && near_text.contains("src/lib.rs#Service/work"),
-        "an unknown member lists the addresses near it: {near}"
+        "an unknown member lists the addresses near it: {near_text}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
