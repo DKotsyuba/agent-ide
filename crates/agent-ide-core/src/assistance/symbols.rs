@@ -306,7 +306,7 @@ impl Worker<'_> {
         let total = lang::line_count(source);
         // A start past the end is a success that says so; an end past it is clamped.
         if let Some(range) = range
-            && range.end > total
+            && range.start > total
         {
             let authority = self.finish_symbol_job(job, &binding, &observed).await?;
             let text = nothing_at(total, range);

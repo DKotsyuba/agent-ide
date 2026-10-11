@@ -112,7 +112,7 @@ pub(super) fn read_unit(
         .take((last - first + 1) as usize)
         .enumerate()
     {
-        let number = first as usize + index + span.start as usize - 1;
+        let number = first as usize + index;
         text.push_str(&format!("{number:>width$}\t{row}"));
         if !row.ends_with('\n') {
             text.push('\n');
