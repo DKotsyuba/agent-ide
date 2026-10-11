@@ -50,7 +50,7 @@ to the M-028 address or M-029 read/edit modules and follows their contracts).
 | Presentation-degraded fallbacks | `content.rs:490` | 2 lines | 2 lines | trimmed (no label) |
 | Batch refusal shapes | `batch.rs:35` `ITEM_SHAPE`, `batch.rs:584` `FILE_SHAPE` | quoted `source_ref` | no `source_ref` | trimmed |
 | Context target refusals | `facade.rs:678`, `facade.rs:681` | 2 lines | 2 lines | kept (name the one missing field) |
-| Diff trailer and no-change line | `snapshots.rs` `render_diff_text`, `incremental_diff_reply` | n/a | new | rewritten: `unchanged since your last diff: K hunks`, `no changes since your last diff`; exact and degraded captures share the filter, returning hunks are new again, and continuation delivery counts as seen |
+| Diff trailer and no-change line | `snapshots.rs` `render_diff_compact`, `incremental_diff_reply` | n/a | new | rewritten: `unchanged since your last diff: K hunks`, `no changes since your last diff`; exact and degraded captures share the filter, returning hunks are new again, and continuation delivery counts as seen |
 | Diff provenance `current_tree` lines | `snapshots.rs:27` | 2 long lines | unchanged | kept: only printed with `provenance: true` |
 
 ## Hook plates and outbox facts
