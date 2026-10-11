@@ -355,11 +355,7 @@ fn attach_reply_plate(
     let mut fitting = reply.clone();
     let plate = feed.next_block_when(fingerprint, |plate| {
         loop {
-            if super::content::fits_with_status(
-                &fitting,
-                plate,
-                super::content::reply_envelope(),
-            ) {
+            if super::content::fits_with_status(&fitting, plate, super::content::reply_envelope()) {
                 return true;
             }
             if !fitting.shrink_text() {

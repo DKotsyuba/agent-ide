@@ -5021,7 +5021,10 @@ fn advertised_text_never_teaches_waiting() {
         advertised.push_str(&serde_json::to_string(&tool).unwrap());
     }
     for banned in ["wait_ms", "nothing else to do", "wait once"] {
-        assert!(!advertised.contains(banned), "advertised text names {banned}");
+        assert!(
+            !advertised.contains(banned),
+            "advertised text names {banned}"
+        );
     }
     assert!(validate_call(AssistanceTool::Inspect, json!({"wait_ms": 5})).is_ok());
 }
@@ -5032,11 +5035,19 @@ fn advertised_text_never_teaches_waiting() {
 /// (M-030 T-003), which tighten this test.
 #[test]
 fn catalog_stays_within_the_budgets() {
-    assert!(SERVER_INSTRUCTIONS.len() <= 700, "{}", SERVER_INSTRUCTIONS.len());
+    assert!(
+        SERVER_INSTRUCTIONS.len() <= 700,
+        "{}",
+        SERVER_INSTRUCTIONS.len()
+    );
     let facade = StdioFacade::new(std::path::PathBuf::from("/nonexistent-runtime"));
     for tool in facade.router.list_all() {
         let description = tool.description.as_deref().unwrap_or_default().len();
-        assert!(description <= 2048, "{} description {description} B", tool.name);
+        assert!(
+            description <= 2048,
+            "{} description {description} B",
+            tool.name
+        );
     }
 }
 
@@ -5056,14 +5067,21 @@ fn per_host_catalogs_differ_only_by_the_declared_subset() {
     assert_eq!(names(CatalogHost::Claude).len(), 11);
     let codex = names(CatalogHost::Codex);
     assert_eq!(codex.len(), 9, "{codex:?}");
-    assert!(!codex.iter().any(|name| name == "ide.context" || name == "ide.graph"));
+    assert!(
+        !codex
+            .iter()
+            .any(|name| name == "ide.context" || name == "ide.graph")
+    );
     let inspect = CatalogHost::Codex
         .catalog(facade.router.list_all())
         .into_iter()
         .find(|tool| tool.name == "ide.inspect")
         .unwrap();
     for property in ["kind", "language", "offset", "detail_ref", "detail_refs"] {
-        assert!(inspect.input_schema["properties"].get(property).is_some(), "{property}");
+        assert!(
+            inspect.input_schema["properties"].get(property).is_some(),
+            "{property}"
+        );
     }
     assert!(!CatalogHost::Codex.instructions().contains("ide.graph"));
     assert!(CatalogHost::Claude.instructions().contains("ide.graph"));

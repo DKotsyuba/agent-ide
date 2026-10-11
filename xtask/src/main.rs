@@ -453,7 +453,9 @@ fn contract_host(root: &Path, update: bool, host: &str, snapshot: &str) -> Resul
             format!("contract snapshot {snapshot} absent: run `cargo xtask contract update` and commit it")
         })?;
         let expected: Value = serde_json::from_str(&text).map_err(|_| {
-            format!("{snapshot} is not valid JSON; regenerate it with `cargo xtask contract update`")
+            format!(
+                "{snapshot} is not valid JSON; regenerate it with `cargo xtask contract update`"
+            )
         })?;
         if tools != expected {
             return Err(format!(

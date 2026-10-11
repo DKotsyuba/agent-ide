@@ -108,8 +108,14 @@ async fn codex_snapshot_matches_the_codex_catalog() {
     let result = tools_for("codex").await;
     let tools = result["tools"].as_array().cloned().unwrap();
     assert_eq!(tools.len(), 9, "{result}");
-    let names: Vec<_> = tools.iter().filter_map(|tool| tool["name"].as_str()).collect();
-    assert!(!names.contains(&"ide.context") && !names.contains(&"ide.graph"), "{names:?}");
+    let names: Vec<_> = tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"ide.context") && !names.contains(&"ide.graph"),
+        "{names:?}"
+    );
     let expected: Value =
         serde_json::from_str(include_str!("../schemas/tools-codex.json")).unwrap();
     assert_eq!(

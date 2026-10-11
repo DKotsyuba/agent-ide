@@ -20,8 +20,8 @@ use agent_ide::assistance::{
     assembly::ProductDispatcher,
     codex_rendezvous::ManagedCodexPublisher,
     facade::{
-        CatalogHost, DaemonCurrencyNote, EvictFn, ReestablishFn, RerootFn, RerootOutcome, SharedCodexPublisher,
-        SharedDaemonNote, StdioFacade,
+        CatalogHost, DaemonCurrencyNote, EvictFn, ReestablishFn, RerootFn, RerootOutcome,
+        SharedCodexPublisher, SharedDaemonNote, StdioFacade,
     },
     host_binding::HostKind,
     launcher::{AcceptedExecutable, LauncherConfig},
@@ -3849,10 +3849,28 @@ mod tests {
                 if runtime_dir == Path::new("/private/tmp/runtime")
         ));
         assert!(matches!(
-            command(args(&["mcp", "--runtime-dir", "/private/tmp/runtime", "--host", "codex"])),
-            Ok(Command::Mcp { host: CatalogHost::Codex, .. })
+            command(args(&[
+                "mcp",
+                "--runtime-dir",
+                "/private/tmp/runtime",
+                "--host",
+                "codex"
+            ])),
+            Ok(Command::Mcp {
+                host: CatalogHost::Codex,
+                ..
+            })
         ));
-        assert!(command(args(&["mcp", "--runtime-dir", "/private/tmp/runtime", "--host", "zcode"])).is_err());
+        assert!(
+            command(args(&[
+                "mcp",
+                "--runtime-dir",
+                "/private/tmp/runtime",
+                "--host",
+                "zcode"
+            ]))
+            .is_err()
+        );
         assert!(matches!(
             command(args(&["claude-hook"])),
             Ok(Command::ManagedClaudeHook)
