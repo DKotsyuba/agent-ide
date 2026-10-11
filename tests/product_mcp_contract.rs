@@ -441,7 +441,9 @@ fn assert_compact_envelope(reply: &Value) {
         ("complete", Some("symbol")) => assert!(
             body.starts_with("symbol: ")
                 || body.starts_with("symbols: ")
-                || body.starts_with("ambiguous_symbol: ")
+                || body
+                    .split_once(" candidates for ")
+                    .is_some_and(|(count, _)| count.parse::<u32>().is_ok())
                 || (text.starts_with("page ") && !text.starts_with("page 1;")),
             "{reply}"
         ),
@@ -9749,7 +9751,7 @@ async fn configured_product_symbol_card_answers_requested_callees() {
     let work = card(&mut actor, "src/lib.rs#Service/work").await;
     let work_text = work["text"].as_str().unwrap_or_default();
     assert!(
-        work_text.contains("callees: 1\n  src/lib.rs#Service/helper  src/lib.rs:4\n"),
+        work_text.contains("callees: 1\n  src/lib.rs#Service/helper (L4)\n"),
         "the method's callee must be listed: {work_text}"
     );
     let idle = card(&mut actor, "src/lib.rs#idle").await;
@@ -9852,7 +9854,7 @@ async fn configured_product_symbol_card_answers_callees_alongside_default_caller
     let reply = actor.settle(&fixture, reply).await;
     let text = reply["text"].as_str().unwrap_or_default();
     assert!(
-        text.contains("callees: 1\n  src/lib.rs#Service/helper  src/lib.rs:4\n"),
+        text.contains("callees: 1\n  src/lib.rs#Service/helper (L4)\n"),
         "the callee must still be listed with default callers requested too: {text}"
     );
     assert!(
@@ -11756,8 +11758,9 @@ async fn configured_product_symbol_pages_long_usage_and_candidate_lists() {
         .flat_map(|page| page.lines())
         .filter(|line| line.ends_with("target();"))
         .map(|line| {
-            let location = line.split_whitespace().next().unwrap();
-            location.rsplit(':').next().unwrap().parse().unwrap()
+            // `<address> (L<line>)  target();`: the absolute line is the (L..) tag.
+            let tag = line.split_once("(L").unwrap().1;
+            tag.split(')').next().unwrap().parse().unwrap()
         })
         .collect();
     lines.sort_unstable();
@@ -11773,7 +11776,7 @@ async fn configured_product_symbol_pages_long_usage_and_candidate_lists() {
     let ambiguous = actor.settle(&fixture, ambiguous).await;
     let reference = ambiguous["detail_ref"].as_str().unwrap().to_owned();
     let text = ambiguous["text"].as_str().unwrap();
-    assert!(text.contains("dup matches 22 symbols"), "{text}");
+    assert!(text.contains("\n22 candidates for dup:\n"), "{text}");
     assert!(
         text.contains(&format!("  … 2 more (ide.inspect {reference})\n")),
         "{text}"
@@ -11786,7 +11789,12 @@ async fn configured_product_symbol_pages_long_usage_and_candidate_lists() {
         rest_text.contains("; complete\ncandidates 21–22 of 22:\n"),
         "{rest_text}"
     );
-    assert_eq!(rest_text.matches("dup\n").count(), 2, "{rest_text}");
+    // Each remaining candidate row is `<address>  fn  <signature>  (lines a–b)`.
+    assert_eq!(
+        rest_text.matches("/dup  fn  pub fn dup()").count(),
+        2,
+        "{rest_text}"
+    );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
@@ -12024,9 +12032,15 @@ async fn product_style_sheets_answer_symbol_tools_without_a_server() {
         .call(&fixture, "ide.outline", json!({"path":"styles.css"}))
         .await;
     let outline = actor.settle(&fixture, outline).await;
-    assert_eq!(
-        outline["text"],
-        "styles.css  (8 lines, css)\n    2  .btn\n    6  @media (min-width: 40em)\n    7    .card .btn\n  (3 symbols)\n",
+    let outline_text = outline["text"].as_str().unwrap();
+    assert!(
+        outline_text.starts_with("styles.css  (8 lines, css)\n")
+            && outline_text.contains("  styles.css#.btn  .btn\n")
+            && outline_text
+                .contains("  styles.css#@media (min-width: 40em)  @media (min-width: 40em)\n")
+            && outline_text
+                .contains("  styles.css#@media (min-width: 40em)/.card .btn  .card .btn\n")
+            && outline_text.contains("(3 symbols"),
         "{outline}"
     );
 
@@ -12183,11 +12197,11 @@ async fn configured_product_links_css_html_and_python_names() {
          \x20 (~ = heuristic match, not proven)\n\
          unavailable for: python\n"
     );
-    assert_eq!(
-        symbol(&mut actor, "btn").await,
-        "ambiguous_symbol: btn matches 2 symbols; repeat ide.symbol with one exact path:\n\
-         \x20 app.py#btn\n\
-         \x20 .btn  (class name: 3 rules, 4 usages)\n"
+    let candidates = symbol(&mut actor, "btn").await;
+    assert!(
+        candidates.starts_with("2 candidates for btn:\n  app.py#btn  ")
+            && candidates.ends_with("\n  .btn  (class name: 3 rules, 4 usages)\n"),
+        "a bare name lists every candidate with its address, never an ambiguity error: {candidates}"
     );
     let button = symbol(&mut actor, "src/Button.tsx#Button").await;
     assert!(
@@ -12209,16 +12223,16 @@ async fn configured_product_links_css_html_and_python_names() {
     };
     assert_eq!(
         graph(&mut actor, "styles.css#.btn", "callers").await,
-        "graph: callers of styles.css#.btn (depth 2, 5 nodes, 4 edges)\n\
-         \x20 ⇢ index.html#main#main  index.html:4 [html]\n\
-         \x20 ⇢ src/Button.tsx#Button  src/Button.tsx:1 [typescript]\n\
-         \x20   ← src/App.tsx#App  src/App.tsx:2\n\
-         \x20 ⇢ src/Menu.tsx#Menu  src/Menu.tsx:2 [typescript]\n"
+        "graph: callers of styles.css#.btn (L2) (depth 2, 5 nodes, 4 edges)\n\
+         \x20 ⇢ index.html#main#main (L4) [html]\n\
+         \x20 ⇢ src/Button.tsx#Button (L1) [typescript]\n\
+         \x20   ← src/App.tsx#App (L2)\n\
+         \x20 ⇢ src/Menu.tsx#Menu (L2) [typescript]\n"
     );
     assert_eq!(
         graph(&mut actor, "src/Button.tsx#Button", "callees").await,
-        "graph: callees of src/Button.tsx#Button (depth 2, 2 nodes, 1 edges)\n\
-         \x20 ⇢ .btn  styles.css:2 [class name]\n"
+        "graph: callees of src/Button.tsx#Button (L1) (depth 2, 2 nodes, 1 edges)\n\
+         \x20 ⇢ styles.css#.btn (L2) [class name]\n"
     );
     let read = actor
         .call(&fixture, "ide.read", json!({"symbol":".btn"}))
@@ -12353,8 +12367,8 @@ async fn product_graph_names_use_sites_the_server_cannot_outline() {
     let graph = actor.settle(&fixture, graph).await;
     assert_eq!(
         graph["text"].as_str().unwrap_or_default(),
-        "graph: callers of frontend/src/Layout.css#.header (depth 2, 2 nodes, 1 edges)\n\
-         \x20 ⇢ frontend/src/Layout.tsx#Layout  frontend/src/Layout.tsx:3 [typescript]\n",
+        "graph: callers of frontend/src/Layout.css#.header (L1) (depth 2, 2 nodes, 1 edges)\n\
+         \x20 ⇢ frontend/src/Layout.tsx#Layout (L3) [typescript]\n",
         "{graph}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
@@ -12490,7 +12504,7 @@ async fn product_index_reads_stay_outside_the_binding_budget() {
             "links: 1 class name used here",
         ),
         ("ide.read", json!({"symbol":".btn"}), ".btn {"),
-        ("ide.outline", json!({"path":"page01.html"}), "(1 symbols)"),
+        ("ide.outline", json!({"path":"page01.html"}), "(1 symbols"),
         ("ide.outline", json!({"path":"styles.css"}), ".btn"),
         (
             "ide.symbol",
@@ -13043,7 +13057,11 @@ async fn configured_product_rust_lexical_outline_matches_the_server() {
         };
         assert_eq!(
             server_text,
-            render::outline_text(&lexical),
+            render::address_outline_text(
+                &lexical,
+                &agent_ide::lang::address::AddressMap::build(&lexical, &source),
+                None
+            ),
             "{file}: the lexical outline must equal the server's"
         );
         assert!(!server_text.contains("outline: from source"), "{file}");
@@ -13650,7 +13668,7 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
         let text = settled["text"].as_str().unwrap_or_default();
         // Three symbols for a file with two functions is the server's answer; the lexical
         // outline of the same file reports two and marks itself lexical.
-        if settled["kind"] == "outline" && text.contains("(3 symbols)") {
+        if settled["kind"] == "outline" && text.contains("(3 symbols") {
             break settled;
         }
         assert!(
@@ -13940,7 +13958,7 @@ async fn configured_product_unavailable_rust_symbol_tools_answer_from_the_lexica
         let text = settled["text"].as_str().unwrap_or_default();
         // Three symbols for a file with two functions is the server's answer; the lexical
         // outline of the same file reports two and marks itself lexical.
-        if settled["kind"] == "outline" && text.contains("(3 symbols)") {
+        if settled["kind"] == "outline" && text.contains("(3 symbols") {
             break settled;
         }
         assert!(
@@ -15324,7 +15342,7 @@ async fn configured_product_pyright_symbol_tools_and_edit() {
     assert!(!text.contains("return \"hello\""), "{symbol}");
     assert!(text.contains("usages: 1 in 1 files"), "{symbol}");
     assert!(
-        text.contains("main.py:9  return Greeter(\"world\").method()"),
+        text.contains("main.py#caller:2 (L9)  return Greeter(\"world\").method()"),
         "{symbol}"
     );
     // pyright has no call hierarchy: the card says so instead of printing nothing, and a
@@ -15741,7 +15759,8 @@ async fn configured_product_edit_in_a_package_without_environment_reports_server
     assert!(
         messages.iter().any(|message| {
             let message = message.as_str().unwrap();
-            message.starts_with("libs/contracts/mod.py:2:12 error ")
+            message
+                .starts_with("libs/contracts/mod.py:2:12 libs/contracts/mod.py#value:2 (L2) error ")
                 && message.contains("not assignable")
         }),
         "the type error carries path:line:col severity: {edit}"
@@ -15763,7 +15782,7 @@ async fn configured_product_edit_in_a_package_without_environment_reports_server
         context["text"]
             .as_str()
             .unwrap()
-            .contains("libs/contracts/mod.py:2:12 error "),
+            .contains("libs/contracts/mod.py:2:12 libs/contracts/mod.py#value:2 (L2) error "),
         "context diagnostics carry their location: {context}"
     );
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
@@ -16486,7 +16505,7 @@ async fn configured_product_typescript_symbol_tools_and_edit() {
     );
     assert!(!text.contains("return \"hello\""), "{symbol}");
     assert!(
-        text.contains("fixture.ts#caller  fixture.ts:4") && text.contains("new Greeter().method()"),
+        text.contains("fixture.ts#caller (L4)") && text.contains("new Greeter().method()"),
         "{symbol}"
     );
     let read = actor

@@ -436,11 +436,13 @@ impl EditDiagnostics {
     /// Current semantic context, matching source/generation/version identities, and an explicit
     /// clean or reported readiness are all required. Unavailable, stale, lexical, unversioned, or
     /// unready snapshots return [`Self::Unknown`]. Messages name `path`, the worktree-relative
-    /// edited file (see [`diagnostic_line`]).
+    /// edited file (see [`diagnostic_line_at`]); `map` is the address map of the edited text, when
+    /// the caller has one, and puts each message's position address in its row.
     pub(crate) fn from_snapshot(
         path: &str,
         context: &crate::intelligence::context::ContextResult,
         diagnostics: &crate::intelligence::session::DiagnosticSnapshot,
+        map: Option<&crate::lang::address::AddressMap>,
     ) -> Self {
         use crate::intelligence::freshness::{DiagnosticReadiness, Freshness};
 
@@ -464,7 +466,7 @@ impl EditDiagnostics {
                     .diagnostics
                     .iter()
                     .take(8)
-                    .map(|diagnostic| diagnostic_line(path, diagnostic))
+                    .map(|diagnostic| diagnostic_line_at(path, diagnostic, map))
                     .collect::<Vec<String>>();
                 Self::CurrentReported {
                     delta: format!(
@@ -507,9 +509,26 @@ impl EditDiagnostics {
 
 /// Renders one language-server diagnostic as `path:line:col severity [code] message` (1-based
 /// position, severity omitted when the server sent none), bounded to 256 UTF-8 bytes.
+#[cfg(test)]
 pub(crate) fn diagnostic_line(path: &str, diagnostic: &async_lsp::lsp_types::Diagnostic) -> String {
+    diagnostic_line_at(path, diagnostic, None)
+}
+
+/// [`diagnostic_line`] with the position address of the diagnostic's line after the location,
+/// `path:line:col file#unit:N (L123) severity [code] message`, when `map` resolves it. The
+/// 256-byte bound covers the whole row and clips the message first.
+pub(crate) fn diagnostic_line_at(
+    path: &str,
+    diagnostic: &async_lsp::lsp_types::Diagnostic,
+    map: Option<&crate::lang::address::AddressMap>,
+) -> String {
     use async_lsp::lsp_types::{DiagnosticSeverity, NumberOrString};
 
+    let line = diagnostic.range.start.line + 1;
+    let address = map
+        .and_then(|map| map.address_at(Path::new(path), line))
+        .map(|address| format!("{address} (L{line}) "))
+        .unwrap_or_default();
     let severity = match diagnostic.severity {
         Some(DiagnosticSeverity::ERROR) => "error ",
         Some(DiagnosticSeverity::WARNING) => "warning ",
@@ -524,8 +543,7 @@ pub(crate) fn diagnostic_line(path: &str, diagnostic: &async_lsp::lsp_types::Dia
     };
     bounded_utf8_prefix(
         &format!(
-            "{path}:{}:{} {severity}{code}{}",
-            diagnostic.range.start.line + 1,
+            "{path}:{line}:{} {address}{severity}{code}{}",
             diagnostic.range.start.character + 1,
             diagnostic.message
         ),

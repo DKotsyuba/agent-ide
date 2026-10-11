@@ -174,15 +174,22 @@ impl Worker<'_> {
         }
         let (outline, _, lexical) = self.outline_of(job, &observed, &bytes).await?;
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
+        let map = lang::address::AddressMap::build(&outline, observed_text(&observed, &bytes)?);
         let mut text = match job.parameters.get("kinds").and_then(Value::as_str) {
             Some(requested) => {
-                let kinds: Vec<lang::SymbolKind> = requested
-                    .split(',')
-                    .filter_map(lang::SymbolKind::from_name)
+                let names: Vec<&str> = requested.split(',').map(str::trim).collect();
+                let kinds: Vec<lang::SymbolKind> = names
+                    .iter()
+                    .filter_map(|name| lang::SymbolKind::from_name(name))
                     .collect();
-                render::filtered_outline_text(&outline, &kinds, requested)
+                let filter = render::OutlineFilter {
+                    kinds: &kinds,
+                    regions: names.contains(&"region"),
+                    requested,
+                };
+                render::address_outline_text(&outline, &map, Some(&filter))
             }
-            None => render::outline_text(&outline),
+            None => render::address_outline_text(&outline, &map, None),
         };
         if let Some(why) = lexical.as_ref()
             && let Some(note) = self.lexical_note(job, observed.path(), why)
@@ -759,6 +766,7 @@ impl Worker<'_> {
             .as_str()
             .ok_or(FailureCode::UnknownSymbol)?
             .to_owned();
+        let requested = Box::pin(self.locate_line(job, &binding, &requested)).await?;
         let symbol = SymbolPath::parse(&requested).map_err(|_| FailureCode::UnknownSymbol)?;
         let want_usages = job
             .parameters
@@ -805,7 +813,17 @@ impl Worker<'_> {
                     }
                     Ok(located) => {
                         let mut candidates = match located {
-                            Located::One(file) => vec![format!("{}#{name}", file.display())],
+                            Located::One(file) => {
+                                let authority = self.authority(&binding).await?;
+                                match Box::pin(self.scanned_map(job, &authority, &file)).await {
+                                    Some(map) => map
+                                        .named(&name)
+                                        .into_iter()
+                                        .map(|u| render::candidate_row(&map.units()[u]))
+                                        .collect(),
+                                    None => vec![format!("{}#{name}", file.display())],
+                                }
+                            }
                             Located::Many(candidates) => candidates,
                         };
                         candidates.extend(indexed.iter().map(links::candidate));
@@ -825,7 +843,7 @@ impl Worker<'_> {
         let (observed, bytes) = self.observe(&binding, file.clone()).await?;
         let (outline, worktree_root, lexical) = self.outline_of(job, &observed, &bytes).await?;
         let found = match symbol.file() {
-            Some(_) => outline.find(&symbol).cloned(),
+            Some(_) => find_symbol(&outline, observed_text(&observed, &bytes)?, &symbol),
             None => {
                 let name = symbol.name().unwrap_or_default();
                 // A declaration and its impl blocks share one address: one definition, which
@@ -835,29 +853,35 @@ impl Worker<'_> {
                     1 => Some(candidates[0].clone()),
                     0 => None,
                     _ => {
-                        let mut candidates = candidates
-                            .iter()
-                            .map(|candidate| candidate.path.to_string())
-                            .collect::<Vec<_>>();
-                        candidates.sort();
+                        let candidates = in_file_candidates(
+                            &outline,
+                            observed_text(&observed, &bytes)?,
+                            symbol.name().unwrap_or_default(),
+                        );
                         return self.ambiguous(job, &binding, &requested, candidates).await;
                     }
                 }
             }
         }
-        .ok_or_else(|| missing_symbol(job, lexical.clone()))?;
+        .ok_or_else(|| {
+            missing_symbol_near(job, lexical.clone(), &outline, &observed, &bytes, &symbol)
+        })?;
         let source = observed_text(&observed, &bytes)?;
+        // The card echoes the canonical address (`~k` form for a duplicate), not the raw path.
+        let address = lang::address::AddressMap::build(&outline, source)
+            .address_of(&found)
+            .unwrap_or_else(|| found.path.to_string());
         let mut card = SymbolCard {
             heading: format!(
                 "{} — {}, {} (lines {})",
                 found.name,
                 found.kind.name(),
-                found.path,
+                address,
                 found.range
             ),
             signature: Some(found.signature.clone()),
             doc: found.doc.clone(),
-            definition: Some(format!("{}  (lines {})", found.path, found.range)),
+            definition: Some(format!("{}  (lines {})", address, found.range)),
             ..Default::default()
         };
         if self.session_server(observed.path()).is_none() {
@@ -1122,6 +1146,7 @@ impl Worker<'_> {
                 card.history = history_lines(&worktree_root, &file, found.range).await;
             }
         }
+        Box::pin(self.address_card_rows(job, &mut card)).await;
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
         if card.usages.len() > render::MAX_USAGE_LINES {
             card.more_detail = Some(job.reference.clone());
@@ -1156,6 +1181,7 @@ impl Worker<'_> {
             .as_str()
             .ok_or(FailureCode::UnknownSymbol)?
             .to_owned();
+        let requested = Box::pin(self.locate_line(job, &binding, &requested)).await?;
         let symbol = SymbolPath::parse(&requested).map_err(|_| FailureCode::UnknownSymbol)?;
         let file = match symbol.file() {
             Some(file) => file.to_path_buf(),
@@ -1176,29 +1202,24 @@ impl Worker<'_> {
         let (observed, bytes) = self.observe(&binding, file.clone()).await?;
         let (outline, worktree_root, lexical) = self.outline_of(job, &observed, &bytes).await?;
         let found = match symbol.file() {
-            Some(_) => outline.find(&symbol).cloned(),
+            Some(_) => find_symbol(&outline, observed_text(&observed, &bytes)?, &symbol),
             None => {
                 let candidates = collapse_named(outline.named(symbol.name().unwrap_or_default()));
                 match candidates.len() {
                     1 => Some(candidates[0].clone()),
                     0 => None,
                     _ => {
-                        return self
-                            .ambiguous(
-                                job,
-                                &binding,
-                                &requested,
-                                candidates
-                                    .iter()
-                                    .map(|candidate| candidate.path.to_string())
-                                    .collect(),
-                            )
-                            .await;
+                        let rows = in_file_candidates(
+                            &outline,
+                            observed_text(&observed, &bytes)?,
+                            symbol.name().unwrap_or_default(),
+                        );
+                        return self.ambiguous(job, &binding, &requested, rows).await;
                     }
                 }
             }
         }
-        .ok_or_else(|| missing_symbol(job, lexical))?;
+        .ok_or_else(|| missing_symbol_near(job, lexical, &outline, &observed, &bytes, &symbol))?;
         // A server whose call hierarchy answers nothing for constructors and partial answers for
         // everything else would make the walk below render a misleading graph; answer the fact.
         let depth = job
@@ -1478,6 +1499,7 @@ impl Worker<'_> {
                 break;
             }
         }
+        Box::pin(self.address_graph_nodes(job, &mut graph)).await;
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
         let text = render::call_graph_text(&graph, &direction, depth);
         let (reply, page) =
@@ -1557,7 +1579,7 @@ impl Worker<'_> {
     /// the outline came from the text alone (replies then say so in one compact line; an
     /// address it does not contain waits for the server while it loads — see
     /// [`missing_symbol`]).
-    async fn outline_of(
+    pub(super) async fn outline_of(
         &mut self,
         job: &mut Job,
         observed: &SourceObservation,
@@ -1941,12 +1963,36 @@ impl Worker<'_> {
                 Err(FailureCode::UnknownSymbol)
             }
             1 => Ok(Located::One(matches.remove(0).0)),
-            _ => Ok(Located::Many(
-                matches
-                    .into_iter()
-                    .map(|(_, candidate, _)| candidate)
-                    .collect(),
-            )),
+            _ => {
+                // Candidate rows carry the canonical address; a declaration and its impl blocks
+                // collapse to one, so a name that is one definition still answers its card.
+                let files: std::collections::BTreeSet<std::path::PathBuf> =
+                    matches.iter().map(|found| found.0.clone()).collect();
+                let mut rows: Vec<(std::path::PathBuf, String)> = Vec::new();
+                let mut complete = true;
+                for file in files {
+                    match Box::pin(self.scanned_map(job, &authority, &file)).await {
+                        Some(map) => rows.extend(
+                            map.named(name)
+                                .into_iter()
+                                .map(|u| (file.clone(), render::candidate_row(&map.units()[u]))),
+                        ),
+                        None => complete = false,
+                    }
+                }
+                if complete && rows.len() == 1 {
+                    Ok(Located::One(rows.remove(0).0))
+                } else if complete && !rows.is_empty() {
+                    Ok(Located::Many(rows.into_iter().map(|row| row.1).collect()))
+                } else {
+                    Ok(Located::Many(
+                        matches
+                            .into_iter()
+                            .map(|(_, candidate, _)| candidate)
+                            .collect(),
+                    ))
+                }
+            }
         }
     }
 
@@ -1955,7 +2001,7 @@ impl Worker<'_> {
     /// lexical one answered while the server loads, so no call-hierarchy walk starts from it),
     /// falling back to the language's text outline when the server cannot answer, or `None`
     /// when it cannot be read or outlined.
-    async fn scanned_outline(
+    pub(super) async fn scanned_outline(
         &mut self,
         job: &mut Job,
         authority: &AuthorityStamp,
@@ -1999,10 +2045,7 @@ impl Worker<'_> {
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         let authority = self.authority(binding).await?;
         self.shared.active(binding)?;
-        let mut text = format!(
-            "ambiguous_symbol: {requested} matches {} symbols; repeat ide.symbol with one exact path:\n",
-            candidates.len()
-        );
+        let mut text = format!("{} candidates for {requested}:\n", candidates.len());
         for candidate in candidates.iter().take(MAX_CANDIDATE_LINES) {
             text.push_str(&format!("  {candidate}\n"));
         }
@@ -2287,6 +2330,32 @@ pub(super) fn inside_test(outline: &Outline, line: u32) -> bool {
 /// Candidates an ambiguity reply prints before the rest moves behind its `detail_ref`.
 const MAX_CANDIDATE_LINES: usize = 20;
 
+/// The symbol `path` names in `outline`: the legacy name match first, then the canonical address
+/// forms (`~k` duplicates, `%` escapes, a trailing `:N` window) through the address map.
+fn find_symbol(outline: &Outline, source: &str, path: &SymbolPath) -> Option<lang::Symbol> {
+    if let Some(found) = outline.find(path) {
+        return Some(found.clone());
+    }
+    let lang::address::Parsed::Address(address) =
+        lang::address::Address::parse(&path.to_string()).ok()?
+    else {
+        return None;
+    };
+    let map = lang::address::AddressMap::build(outline, source);
+    let unit = map.resolve(&address).ok()?.unit;
+    map.symbol_of(unit).cloned()
+}
+
+/// Candidate rows of a bare name inside one outlined file: every definition named `name`, one
+/// row each with its canonical address (declaration and impl blocks collapsed), in file order.
+fn in_file_candidates(outline: &Outline, source: &str, name: &str) -> Vec<String> {
+    let map = lang::address::AddressMap::build(outline, source);
+    map.named(name)
+        .into_iter()
+        .map(|u| render::candidate_row(&map.units()[u]))
+        .collect()
+}
+
 /// Where a bare name resolved to.
 pub(super) enum Located {
     One(std::path::PathBuf),
@@ -2535,6 +2604,37 @@ pub(super) fn missing_symbol(job: &mut Job, lexical: Option<Lexical>) -> Failure
             FailureCode::ProviderLoading
         }
     }
+}
+
+/// [`missing_symbol`] for an address the outline of `observed` does not contain: when the answer
+/// is `unknown_symbol`, the failure detail `symbol:near:<a>, <b>` lists up to five units near the
+/// requested address (same last name elsewhere, or siblings under its owner) so the next call
+/// can name one exactly.
+pub(super) fn missing_symbol_near(
+    job: &mut Job,
+    lexical: Option<Lexical>,
+    outline: &Outline,
+    observed: &SourceObservation,
+    bytes: &[u8],
+    symbol: &SymbolPath,
+) -> FailureCode {
+    let code = missing_symbol(job, lexical);
+    if code == FailureCode::UnknownSymbol
+        && let Ok(source) = observed_text(observed, bytes)
+        && let Ok(lang::address::Parsed::Address(address)) =
+            lang::address::Address::parse(&symbol.to_string())
+    {
+        let map = lang::address::AddressMap::build(outline, source);
+        let near: Vec<String> = map
+            .near(&address)
+            .into_iter()
+            .map(|u| map.units()[u].address.to_string())
+            .collect();
+        if !near.is_empty() {
+            job.failure_detail = Some(format!("symbol:near:{}", near.join(", ")));
+        }
+    }
+    code
 }
 
 /// Byte offset of the symbol's name on its declaration line, for position-based requests.

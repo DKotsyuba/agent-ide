@@ -1144,11 +1144,19 @@ impl Worker<'_> {
             .await;
         job.deadline = original;
         match result {
-            Ok(Some(provider)) => EditDiagnostics::from_snapshot(
-                path.trim_start_matches("./"),
-                &provider.context,
-                &provider.diagnostics,
-            ),
+            Ok(Some(provider)) => {
+                let map = if provider.diagnostics.diagnostics.is_empty() {
+                    None
+                } else {
+                    self.optional_address_map(job, &observed, &bytes).await
+                };
+                EditDiagnostics::from_snapshot(
+                    path.trim_start_matches("./"),
+                    &provider.context,
+                    &provider.diagnostics,
+                    map.as_deref(),
+                )
+            }
             _ => EditDiagnostics::Unknown {},
         }
     }

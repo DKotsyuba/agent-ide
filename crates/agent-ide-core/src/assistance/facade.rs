@@ -306,7 +306,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root."},
                     "paths": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_OUTLINE_FILES, "items": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "description": "Several files in ONE call instead of `path`: up to 24 worktree-relative paths, outlined in request order behind one summary line; a file past the reply budget is listed in one line with its exact call."},
                     "glob": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Every file matching this worktree-relative pattern in ONE call instead of `path`: `*` within a segment, `?` one character, `**` any directories (e.g. `crates/x/src/**/*.rs`); at most 24 files in path order, never outside the worktree, skipping hidden and build directories."},
-                    "kinds": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol)(,(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol))*$", "description": "Comma list over the closed symbol-kind vocabulary; keeps a symbol whose kind is selected or a descendant's is, so a container of a selected member still shows."}
+                    "kinds": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol|region)(,(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol|region))*$", "description": "Comma list over the closed symbol-kind vocabulary; keeps a symbol whose kind is selected or a descendant's is, so a container of a selected member still shows. `region` also lists file-level regions (@header, @imports, ...)."}
                 }
             }),
         ),
@@ -851,9 +851,9 @@ pub fn validate_call(
                 .get("kinds")
                 .and_then(Value::as_str)
                 .is_some_and(|kinds| {
-                    kinds
-                        .split(',')
-                        .any(|kind| crate::lang::SymbolKind::from_name(kind).is_none())
+                    kinds.split(',').any(|kind| {
+                        kind != "region" && crate::lang::SymbolKind::from_name(kind).is_none()
+                    })
                 })
             {
                 return Err(invalid_field(
