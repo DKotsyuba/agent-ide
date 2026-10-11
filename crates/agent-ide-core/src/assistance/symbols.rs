@@ -4882,7 +4882,9 @@ fn resolve_changes_with(
                             address: ChangeAddress::Insert {
                                 path: anchor,
                                 anchor: "@imports".to_owned(),
-                                where_: "after".to_owned(),
+                                // Marks the import form: a plain insert next to the region
+                                // keeps the verb `inserted`.
+                                where_: "import".to_owned(),
                             },
                         }),
                         Err(_) => refusal.push(
@@ -5313,7 +5315,11 @@ fn changed_rows(
         let now = now.map(|range| align.map_or(range, |align| align.map_range(range)));
         let old_lines = change.base.len();
         let label = match &change.address {
-            ChangeAddress::Insert { anchor, .. } if anchor == "@imports" => "added",
+            ChangeAddress::Insert { anchor, where_, .. }
+                if anchor == "@imports" && where_ == "import" =>
+            {
+                "added"
+            }
             ChangeAddress::Symbol(address) if address.ends_with("#@imports") => {
                 match change.action {
                     ChangeAction::Replace(_) => "unchanged",
