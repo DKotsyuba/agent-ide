@@ -12414,7 +12414,7 @@ async fn product_style_sheets_answer_symbol_tools_without_a_server() {
         symbol["text"],
         "symbol: .btn — symbol, styles.css#.btn (lines 2–4)\nsignature: .btn\n\
          definition styles.css#.btn  (lines 2–4)\n\
-         defines: class name btn — also styles.css:7 .card .btn, theme.scss:1 .btn\n\
+         defines: class name btn — also styles.css#@media (min-width: 40em)/.card .btn (L7), theme.scss#.btn (L1)\n\
          usages: 0 indexed in 0 files (src 0, tests 0)\n\
          links: 1 style variable used here\n\
          \x20 --brand  → no indexed declaration\n\
@@ -12538,17 +12538,19 @@ async fn configured_product_links_css_html_and_python_names() {
             "symbol: ##main — element id, 1 element, 2 usages in 2 files (css, html)\ndefinitions:\n"
         ) && main_card.contains(
             "  index.html#main#main (L4)  [html] <main id=\"main\" class=\"layout\">  (lines 4–8)\n"
-        ) && main_card.contains("index.html#main#main:3 (L6)")
-            && main_card.contains("(L7)  [css] #main { display: block; }\n"),
+        ) && main_card.contains(
+            "  index.html#main#main:3 (L6)  [html] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n"
+        ) && main_card
+            .contains("  styles.css##main:1 (L7)      [css] #main { display: block; }\n"),
         "{main_card}"
     );
     assert_eq!(
         symbol(&mut actor, ".btn").await,
         "symbol: .btn — class name, 3 rules, 4 usages in 3 files (typescript, css, html)\n\
          definitions:\n\
-         \x20 styles.css#.btn (L2)         [css] .btn  (lines 2–4)\n\
+         \x20 styles.css#.btn (L2)          [css] .btn  (lines 2–4)\n\
          \x20 styles.css#.layout .btn (L6)  [css] .layout .btn  (lines 6)\n\
-         \x20 theme.scss#.btn (L2)         [css] .btn  (lines 2–4)\n\
+         \x20 theme.scss#.btn (L2)          [css] .btn  (lines 2–4)\n\
          usages: 4 indexed in 3 files (src 4, tests 0)\n\
          \x20 index.html#main#main:2 (L5)   [html] <button class=\"btn btn-primary\">Save</button>\n\
          \x20 index.html#main#main:3 (L6)   [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\

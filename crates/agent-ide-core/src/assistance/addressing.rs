@@ -14,7 +14,7 @@ use std::time::Instant;
 /// Files one reply may outline for position addresses.
 pub(super) const MAX_ADDRESS_FILES: usize = 16;
 
-/// Wall-clock budget of one reply for position addresses.
+/// Wall-clock budget of one reply for server outlines; later files use the source outline.
 pub(super) const ADDRESS_BUDGET: Duration = Duration::from_millis(1500);
 
 /// Position addresses of a list of `(file, line)` locations, in request order.
@@ -298,9 +298,10 @@ impl Worker<'_> {
     /// Position addresses for `locations` (relative file, 1-based line) for result rendering.
     ///
     /// Best effort and bounded: each distinct file is outlined once through `scanned_outline`
-    /// (never parking the job for a loading server: the lexical or source outline answers or the
-    /// file is skipped), at most [`MAX_ADDRESS_FILES`] files and [`ADDRESS_BUDGET`] per call. A
-    /// location it could not resolve answers `None`; no address is ever guessed.
+    /// (never parking the job for a loading server), at most [`MAX_ADDRESS_FILES`] files per
+    /// call. Once [`ADDRESS_BUDGET`] is spent, or when the server cannot outline a file, the
+    /// file is outlined from its language's source outline instead, which gives the same
+    /// addresses. A location neither outline resolves answers `None`; no address is guessed.
     pub(super) async fn position_addresses(
         &mut self,
         job: &mut Job,
@@ -322,11 +323,18 @@ impl Worker<'_> {
                 let map = if maps.len() >= MAX_ADDRESS_FILES {
                     out.reason.get_or_insert("file limit");
                     None
-                } else if started.elapsed() >= ADDRESS_BUDGET {
-                    out.reason.get_or_insert("time limit");
-                    None
                 } else {
-                    let found = Box::pin(self.scanned_map(job, &authority, file)).await;
+                    let served = if started.elapsed() >= ADDRESS_BUDGET {
+                        None
+                    } else {
+                        Box::pin(self.scanned_map(job, &authority, file)).await
+                    };
+                    let found = match served {
+                        Some(map) => Some(map),
+                        None => lexical_map(authority.worktree().worktree_path(), file)
+                            .await
+                            .map(Arc::new),
+                    };
                     if found.is_none() {
                         out.reason.get_or_insert("no outline for the file");
                     }

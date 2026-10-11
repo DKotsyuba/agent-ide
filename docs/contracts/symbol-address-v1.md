@@ -223,10 +223,11 @@ produced for a bare name.
   `outline_of`'s.
 - `position_addresses(job, &[(file, line)]) -> Addresses`: best effort for result rendering. It
   outlines each distinct file through the existing `scanned_outline`, never parks the job for a
-  loading server (the lexical or source outline answers or the file is skipped), spends at most
-  1.5 s and 16 files per reply, and answers `None` for a location it did not resolve. A result
-  then prints that location in its old `file:line` form and appends one line
-  `addresses: omitted for N locations (<reason>)`; it never prints a guessed address.
+  loading server, spends at most 1.5 s on server outlines and outlines at most 16 files per
+  reply. A file whose server outline is not ready in time, or not available, is outlined from the
+  language's source outline instead (section 9.1: the same addresses). Only a location neither
+  outline resolves answers `None`; a result then prints it in its old `file:line` form and appends
+  one line `addresses: omitted for N locations (<reason>)`. It never prints a guessed address.
 - `locate_line(job, binding, text)` turns a `path:line[:col]` input of `ide.symbol` or `ide.graph`
   into the canonical address of the enclosing symbol; a line in a region refuses `unknown_symbol`
   and names the region address.
