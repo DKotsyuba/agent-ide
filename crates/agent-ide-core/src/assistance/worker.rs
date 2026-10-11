@@ -8004,6 +8004,9 @@ fn selection(parameters: &Value) -> [u8; 32] {
     let mut selected = parameters.clone();
     if let Some(object) = selected.as_object_mut() {
         object.remove("detail_ref");
+        // Whether a diff answered only what changed since the last one does not change which
+        // diff a reference continues.
+        object.remove("since_last");
     }
     *blake3::hash(selected.to_string().as_bytes()).as_bytes()
 }

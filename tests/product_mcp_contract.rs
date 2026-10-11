@@ -621,6 +621,10 @@ fn claude_fields(tool: &str, text: &str) -> Value {
         "ide.context" => Some("context"),
         "ide.diff" => Some("diff"),
         "ide.stop" => Some("stop"),
+        // A continuation or a settled pending answer: its text says what it continues.
+        "ide.inspect" if text.contains("call forms (") => Some("activation"),
+        "ide.inspect" if text.starts_with("mode: ") || text.starts_with("diff (") => Some("diff"),
+        "ide.inspect" if !text.starts_with("tests #") => Some("context"),
         _ => None,
     };
     if let Some(kind) = kind {
@@ -19710,13 +19714,13 @@ async fn claude_context_problems_then_edit_keeps_unchanged_source() {
             "ide.edit",
             json!({
                 "operation_id":"after-reobserve", "path":"fastapi/utils.py",
-                "content":"edited again\n"
+                "content":"edited_again = 1\n"
             }),
         )
         .await;
     let (edit, _) = actor.settle_claude(&fixture, edit).await;
     assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
-    assert_eq!(std::fs::read(&path).unwrap(), b"edited again\n");
+    assert_eq!(std::fs::read(&path).unwrap(), b"edited_again = 1\n");
 
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
@@ -19998,7 +20002,6 @@ async fn configured_product_claude_activates_a_reader_then_stops() {
     )
     .await;
     assert_eq!(context["kind"], "context", "{context}");
-    let source_ref = context["detail_ref"].as_str().unwrap().to_owned();
     let edited = claude_operation(
         &mut first,
         &fixture,
@@ -20006,7 +20009,6 @@ async fn configured_product_claude_activates_a_reader_then_stops() {
         json!({
             "operation_id":"claude-edit-1",
             "path":"tracked.txt",
-            "source_ref":source_ref,
             "content":"claude-edit\n"
         }),
     )

@@ -593,7 +593,7 @@ async fn worktree_start_flow(
         .to_owned();
     // A fast activation now completes inline; a slow one still answers `pending` and is polled.
     assert!(
-        text.starts_with("pending:") || text.starts_with("complete"),
+        text.starts_with("pending:") || text.starts_with("activated:"),
         "{} {pending}",
         worktree.display()
     );
@@ -627,7 +627,7 @@ async fn worktree_start_flow(
             .to_owned();
     }
     assert!(
-        text.starts_with("complete"),
+        text.starts_with("activated:"),
         "{} {text}",
         worktree.display()
     );
