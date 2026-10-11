@@ -12492,9 +12492,9 @@ async fn configured_product_links_css_html_and_python_names() {
         symbol(&mut actor, ".btn").await,
         "symbol: .btn — class name, 3 rules, 4 usages in 3 files (typescript, css, html)\n\
          definitions:\n\
-         \x20 styles.css#.btn (L2)         [css] .btn  (lines 2–4)\n\
+         \x20 styles.css#.btn (L2)          [css] .btn  (lines 2–4)\n\
          \x20 styles.css#.layout .btn (L6)  [css] .layout .btn  (lines 6)\n\
-         \x20 theme.scss#.btn (L2)         [css] .btn  (lines 2–4)\n\
+         \x20 theme.scss#.btn (L2)          [css] .btn  (lines 2–4)\n\
          usages: 4 indexed in 3 files (src 4, tests 0)\n\
          \x20 index.html#main#main:2 (L5)   [html] <button class=\"btn btn-primary\">Save</button>\n\
          \x20 index.html#main#main:3 (L6)   [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
