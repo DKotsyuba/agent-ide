@@ -137,6 +137,16 @@ pub struct DiffHunk {
 }
 
 impl DiffHunk {
+    /// Returns a process-local identity of this hunk's path and exact bytes, so a later diff can
+    /// tell which hunks the caller already holds. Not stable across processes or releases.
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.path.hash(&mut hasher);
+        self.patch.hash(&mut hasher);
+        hasher.finish()
+    }
+
     /// Returns the 0-based position of this hunk in the unbounded raw hunk stream.
     pub const fn index(&self) -> usize {
         self.index
@@ -455,9 +465,32 @@ pub struct DiffResult {
     untracked_text_files: usize,
     /// Printed `@ <address>` line of the hunks that have one, by hunk index (symbol-address-v1).
     hunk_addresses: std::collections::BTreeMap<usize, String>,
+    /// Selected hunks dropped by [`Self::without_seen_hunks`] because the caller already holds
+    /// them from its previous diff; zero for a full diff.
+    unchanged_hunks: usize,
 }
 
 impl DiffResult {
+    /// Drops every selected hunk whose [`DiffHunk::fingerprint`] `seen` accepts, remembering how
+    /// many were dropped (see [`Self::unchanged_hunks`]).
+    ///
+    /// Used by the default `ide.diff`, which answers only what changed since the activation's
+    /// previous diff. Counts, inventory and continuation describe the whole capture and stay as
+    /// they are; only the delivered hunks shrink, so the hunk addresses of the survivors keep
+    /// their entries.
+    pub fn without_seen_hunks(mut self, seen: impl Fn(u64) -> bool) -> Self {
+        let before = self.selected_hunks.len();
+        self.selected_hunks.retain(|hunk| !seen(hunk.fingerprint()));
+        self.unchanged_hunks = self.unchanged_hunks + before - self.selected_hunks.len();
+        self
+    }
+
+    /// Returns how many selected hunks the caller already held from its previous diff and
+    /// [`Self::without_seen_hunks`] left out of this result.
+    pub const fn unchanged_hunks(&self) -> usize {
+        self.unchanged_hunks
+    }
+
     /// Attaches separately captured untracked names to a plain diff result and updates its count.
     ///
     /// The caller must already have authorized and confined these paths; this method only stores
@@ -692,6 +725,7 @@ impl DiffResult {
             degraded: None,
             untracked_text_files: 0,
             hunk_addresses: Default::default(),
+            unchanged_hunks: 0,
             truncated_output: false,
             overflow_hunks: 0,
             overflow_bytes: 0,
@@ -937,6 +971,7 @@ pub fn compose_plain_diff_page(
         degraded: None,
         untracked_text_files: 0,
         hunk_addresses: Default::default(),
+        unchanged_hunks: 0,
         detail_cursor: next_hunk
             .filter(|_| !operation.is_empty() && generation > 0)
             .map(|next| DiffDetailCursor::new_plain(expected_scope, operation, generation, next)),
@@ -1010,6 +1045,7 @@ fn compose_diff_at(
             degraded: None,
             untracked_text_files: 0,
             hunk_addresses: Default::default(),
+            unchanged_hunks: 0,
             truncated_output: false,
             overflow_hunks: 0,
             overflow_bytes: 0,
@@ -1125,6 +1161,7 @@ fn compose_diff_at(
             .filter(|path| !path.patch().is_empty())
             .count(),
         hunk_addresses: Default::default(),
+        unchanged_hunks: 0,
         name_only: evidence
             .untracked_paths()
             .iter()

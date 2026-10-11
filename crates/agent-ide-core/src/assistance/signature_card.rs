@@ -13,15 +13,15 @@
 const MAX_SIGNATURE_BYTES: usize = 2048;
 
 /// The signature block text, without a leading or trailing newline.
-const SIGNATURE_BLOCK: &str = r#"call forms (JSON arguments; plan first, then read and edit in few calls):
-ide.read {"items":[{"symbol":"src/a.rs#Store/get"},{"path":"src/b.rs","lines":"10-40"},{"path":"docs/api.md"}]}
-ide.outline {"paths":["src/a.rs","src/b.rs"],"kinds":"fn,struct"} or {"glob":"crates/x/src/**/*.rs"}
-ide.symbol {"symbols":["src/a.rs#Store/get","src/b.rs#Kind"],"usages":true,"callers":1}
-ide.graph {"symbols":["src/a.rs#f","src/b.rs#g"],"direction":"callers","depth":1}
+const SIGNATURE_BLOCK: &str = r#"call forms (JSON arguments): find an address, read the symbol, edit it
+ide.outline {"paths":["src/a.rs","src/b.rs"]} or {"glob":"crates/x/src/**/*.rs"}
+ide.symbol {"symbols":["src/a.rs#Store/get","src/b.rs#Kind"],"callers":1}
+ide.read {"items":[{"symbol":"src/a.rs#Store/get"},{"symbol":"src/a.rs#Store/get:3-5"},{"symbol":"src/a.rs#@imports"}]}
+ide.edit {"symbol":"src/a.rs#Store/get","content":"fn get() {}"} or {"symbol":"src/a.rs#Store/get","old":"x: 0,","new":"x: 1,"}
+ide.edit {"files":[{"path":"src/a.rs","changes":[{"symbol":"src/a.rs#Store/get","old":"x: 0,","new":"x: 1,"}]},{"path":"src/new.rs","create":true,"content":"fn new() {}\n"}]}
 ide.test {"targets":[{"symbol":"src/a.rs#parse"},{"path":"tests/cli.rs"},{"pattern":"roles_"}]}
-ide.edit {"operation_id":"add-field-1","source_ref":"<from ide.read>","files":[{"path":"src/a.rs","changes":[{"old":"x: 0,","new":"x: 0,\ny: 0,"}]},{"path":"src/new.rs","create":true,"content":"fn new() {}\n"}]}
 ide.inspect {"detail_refs":["<ref>","<ref>"]} or {}
-Read everything you need in one ide.read, change several files in one ide.edit (one project check). Results of long work arrive by themselves in an <agent-ide> block after your next tool call or when you end your turn; never wait for them. End the task with ide.stop."#;
+Addresses: src/a.rs#Type/method:7 (L123) is printed by every result; path:line from grep works too. Results of long work arrive by themselves in an <agent-ide> block; never wait for them. End the task with ide.stop."#;
 
 /// Returns the call-signature block that follows the project card in an `ide.start` reply.
 ///
@@ -46,10 +46,10 @@ mod tests {
             "ide.outline {\"paths\"",
             "{\"glob\"",
             "ide.symbol {\"symbols\"",
-            "ide.graph {\"symbols\"",
             "ide.test {\"targets\"",
-            "ide.edit {\"operation_id\"",
+            "ide.edit {\"symbol\"",
             "\"files\"",
+            "#@imports",
             "ide.inspect {\"detail_refs\"",
         ] {
             assert!(block.contains(form), "{form}");
@@ -87,6 +87,6 @@ mod tests {
                 examples += 1;
             }
         }
-        assert_eq!(examples, 9);
+        assert_eq!(examples, 10);
     }
 }

@@ -1,17 +1,17 @@
 {
   "name": "agent-ide",
   "version": "0.10.8",
-  "description": "Agent IDE coding-companion skill exposing the bounded ide.start/context/diff/inspect/stop/edit/outline/read/symbol/graph/test workflow for active-session source edits.",
+  "description": "Agent IDE coding-companion skill: find a symbol address, read the symbol, replace it or edit lines inside it, with the ide.start/diff/inspect/stop/edit/outline/read/symbol/test tools.",
   "author": {
     "name": "DKotsyuba"
   },
   "homepage": "https://github.com/DKotsyuba/agent-ide",
   "repository": "https://github.com/DKotsyuba/agent-ide",
-  "skills": "./skills/",
+  "skills": "./skills/codex/",
   "interface": {
     "displayName": "Agent IDE",
     "shortDescription": "Bounded ide.* workflow for active-session source edits",
-    "longDescription": "Loads the agent-ide skill so a coder subagent uses the eleven bounded ide.* tools (start, context, diff, inspect, stop, edit, outline, read, symbol, graph, test) when the Agent IDE MCP tools are active, with fail-open native fallback when they are not.",
+    "longDescription": "Loads the agent-ide skill so a coder subagent works by symbol address with the nine ide.* tools (start, diff, inspect, stop, edit, outline, read, symbol, test) when the Agent IDE MCP tools are active, with fail-open native fallback when they are not.",
     "developerName": "DKotsyuba",
     "category": "Development",
     "capabilities": ["Interactive"],

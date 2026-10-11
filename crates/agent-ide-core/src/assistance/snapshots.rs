@@ -896,6 +896,10 @@ const fn mode_label(mode: DiffMode) -> &'static str {
 /// Largest number of untracked/conflicted names shown inline before "+N more".
 const MAX_INLINE_DIFF_NAMES: usize = 5;
 
+/// Most hunk fingerprints one binding remembers for the default incremental `ide.diff`; past it
+/// the memory restarts, so the next diff is simply a full one.
+const MAX_SEEN_DIFF_HUNKS: usize = 4096;
+
 /// Renders one bounded `label: name, name (+N more)` line, or an empty string for no paths.
 fn bounded_names_line(label: &str, paths: &[crate::workspace::git::PathStatus]) -> String {
     if paths.is_empty() {
@@ -975,6 +979,12 @@ fn render_diff_compact(
         text.push_str(&format!(" ({note})"));
     }
     text.push('\n');
+    if result.unchanged_hunks() > 0 {
+        text.push_str(&format!(
+            "unchanged since your last diff: {} hunks\n",
+            result.unchanged_hunks()
+        ));
+    }
     text.push_str(&bounded_names_line("untracked", result.untracked()));
     text.push_str(&bounded_names_line("conflicted", result.conflicts()));
     text.push_str(&render_inventory(result));
@@ -1464,6 +1474,14 @@ impl Worker<'_> {
             _ => return Err(FailureCode::Internal),
         };
         let provenance = job.parameters["provenance"].as_bool().unwrap_or(false);
+        // A call that named no `mode` answers only what changed since this activation's previous
+        // diff; naming `mode` (even `head`) always answers the whole diff.
+        let incremental = job.parameters["since_last"].as_bool().unwrap_or(false);
+        let seen_before: BTreeSet<u64> = if incremental {
+            self.diff_seen.get(&binding).cloned().unwrap_or_default()
+        } else {
+            BTreeSet::new()
+        };
         let selected: Vec<PathBuf> = job.parameters["paths"]
             .as_array()
             .into_iter()
@@ -1607,6 +1625,7 @@ impl Worker<'_> {
                     crate::changes::DiffSelectionBudget::bounded(max_hunks, budget.max_bytes),
                 )
                 .with_hunk_addresses(&hunk_lines)
+                .without_seen_hunks(|fingerprint| seen_before.contains(&fingerprint))
             },
         )
         .map_err(|code| {
@@ -1628,6 +1647,35 @@ impl Worker<'_> {
             }
             code
         })?;
+        // Remember what this page delivered, so the next default diff skips it; a diff whose
+        // every hunk the caller already holds answers with one short line.
+        let mut reply = reply;
+        let delivered = result
+            .selected_hunks()
+            .iter()
+            .map(crate::changes::DiffHunk::fingerprint);
+        let seen = self.diff_seen.entry(binding.clone()).or_default();
+        if seen.len() + result.selected_hunks().len() > MAX_SEEN_DIFF_HUNKS {
+            seen.clear();
+        }
+        seen.extend(delivered);
+        if incremental
+            && result.unchanged_hunks() > 0
+            && result.selected_hunks().is_empty()
+            && result.overflow_hunks() == 0
+        {
+            reply = PeerReply::Complete {
+                kind: ResultKind::Diff,
+                text: format!(
+                    "diff ({}): no changes since your last diff ({} hunks unchanged)\n",
+                    mode_label(mode),
+                    result.unchanged_hunks()
+                ),
+                detail_ref: Some(reference.clone()),
+                truncated: false,
+                continuation: false,
+            };
+        }
         // T36B: retain the bounded provenance of every path this diff represents — each
         // delivered path plus its rename source — independently of the disposable pagination
         // state, so cached delivery must prove each under the live profile before it hands

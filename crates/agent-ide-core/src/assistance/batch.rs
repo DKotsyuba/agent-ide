@@ -582,7 +582,7 @@ pub(crate) const MAX_EDIT_TEXT_BYTES: usize = 128 * 1024;
 
 /// The closed entry shape a `files` entry must have, quoted in its refusal.
 const FILE_SHAPE: &str = "an array of 1 to 16 entries, each with \"path\" and exactly one of \
-\"changes\" or \"content\" (\"create\":true only with \"content\"), plus an optional \"source_ref\"";
+\"changes\" or \"content\" (\"create\":true only with \"content\")";
 
 /// Validates one `ide.edit {operation_id, source_ref?, files}` request object.
 ///
@@ -602,7 +602,7 @@ pub(crate) fn validate_edit_files(object: &Map<String, Value>) -> Result<(), Par
     {
         return Err(invalid_field(
             "files",
-            FieldRule::OneOf("used only with \"operation_id\" and an optional \"source_ref\""),
+            FieldRule::OneOf("used only with an optional \"operation_id\""),
         ));
     }
     let operation_id = object

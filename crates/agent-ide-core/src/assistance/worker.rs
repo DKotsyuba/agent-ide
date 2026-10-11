@@ -1702,6 +1702,7 @@ impl WorkerHandle {
                     next_revoke_retry: None,
                     registered: BTreeMap::new(),
                     baselines: BTreeMap::new(),
+                    diff_seen: BTreeMap::new(),
                     heads: BTreeMap::new(),
                     source_sequence: 0,
                     uncertain: std::collections::BTreeSet::new(),
@@ -2588,6 +2589,10 @@ struct Worker<'a> {
     registered: BTreeMap<BindingRef, RegisteredPaths>,
     /// Durable partial activation baselines retained for same-binding diff provenance.
     baselines: BTreeMap<BindingRef, crate::workspace::git::BaselineContext>,
+    /// Per binding: fingerprints of the diff hunks already delivered to the caller, so the next
+    /// default `ide.diff` answers only what changed since. Bounded (see `snapshots`); dropped with
+    /// the binding.
+    diff_seen: BTreeMap<BindingRef, BTreeSet<u64>>,
     /// Per binding: when `HEAD` was last probed, successfully or not, and the checked-out branch or
     /// detached commit last read (first by its start); a failed read keeps the earlier reading.
     heads: BTreeMap<
@@ -5092,15 +5097,15 @@ impl<'a> Worker<'a> {
                     diagnostics.diagnostics.len().to_string()
                 };
                 FeedbackDelta::new(
-                    format!("Provider reported {count} diagnostics for this source generation."),
+                    format!("{count} diagnostics reported for this file."),
                     format!(
                         "source_sequence={}; provider_generation={:?}; document_version={:?}",
                         observed.sequence(),
                         diagnostics.generation,
                         diagnostics.document_version
                     ),
-                    "Review the bounded diagnostic messages in the latest context result.",
-                    "provisional push; source and generation matched; unversioned counts are lower bounds",
+                    "Read the flagged symbols with ide.read and fix them.",
+                    "provisional; unversioned counts are lower bounds",
                     Some(job.reference.clone()),
                 )
                 .expect("fixed feedback envelope is bounded")
@@ -6087,6 +6092,7 @@ impl<'a> Worker<'a> {
         self.leases.remove(binding);
         self.registered.remove(binding);
         self.baselines.remove(binding);
+        self.diff_seen.remove(binding);
         self.heads.remove(binding);
         if let Ok(mut activated) = self.shared.activated.lock() {
             activated.remove(&binding.fingerprint());
@@ -10350,6 +10356,7 @@ mod stop_retry_tests {
             next_revoke_retry: None,
             registered: BTreeMap::new(),
             baselines: BTreeMap::new(),
+            diff_seen: BTreeMap::new(),
             heads: BTreeMap::new(),
             source_sequence: 0,
             admission: Arc::new(Mutex::new(admission_controller())),

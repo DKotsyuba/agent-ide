@@ -9,9 +9,8 @@ Contract:
 - Byte-identical to the retired manual formatter; tests in `src/assistance/content.rs` assert
   exact wording, ordering, references, and the serialized reply budget.
 - Every reference must be defined for the state branch that reads it (strict undefined fails
-  the render instead of silently dropping a fact): `result.source_ref` is present for every
-  success outcome because `EditResult::new` enforces it, `detail_ref` serializes as `null`
-  rather than being omitted.
+  the render instead of silently dropping a fact): `detail_ref` serializes as `null` rather
+  than being omitted.
 - Untrusted reply text (`text`, `messages`, refs) is bound as data only; it is never
   template source and auto-escaping stays off because the carrier is plain text.
 - Whitespace discipline: every block tag carries both trim modifiers and all lines are
@@ -82,7 +81,7 @@ pending: the result arrives by itself in a later <agent-ide> block (detail_ref {
 {%- endif -%}
 {%- if state == "error" -%}
 {%- if code == "resolution_unverified" -%}
-error: resolution_unverified (context:resolution); {{ resolution_detail if resolution_detail else "the project configuration did not prove this file belongs to the project" }}. Fix the project configuration, then retry ide.context
+error: resolution_unverified (context:resolution); {{ resolution_detail if resolution_detail else "the project configuration did not prove this file belongs to the project" }}. Fix the project configuration, then retry the call
 {%- elif code.no_such_file is defined -%}
 error: no_such_file: {{ code.no_such_file }}{% if resolution_detail %} ({{ resolution_detail }}){% else %} (read:no_such_file){% endif %}; this path does not exist in the worktree. Fix the path, or use ide.symbol with a bare name to find it
 {%- elif code.unsupported_file is defined -%}
@@ -90,7 +89,7 @@ error: unsupported_file: {{ code.unsupported_file }}{% if resolution_detail %} (
 {%- elif code is mapping -%}
 error: source_too_large (read:source_too_large); source is {{ code.source_too_large.size }} bytes, over the {{ code.source_too_large.ceiling }} byte read limit. Read it in pieces with native tools
 {%- elif code == "unknown_symbol" and resolution_detail is startingwith("edit:range_past_end:") -%}
-error: unknown_symbol (edit:range_past_end); {{ resolution_message }}. Re-read the range with ide.read and retry with a fresh source_ref
+error: unknown_symbol (edit:range_past_end); {{ resolution_message }}. Re-read the symbol with ide.read, then retry
 {%- elif code == "edit_refused" -%}
 error: edit_refused (edit:refused); {{ resolution_message }}. Fix the named changes and retry with the same operation_id
 {%- elif code == "unknown_symbol" and resolution_detail is startingwith("symbol:near:") -%}
@@ -110,17 +109,17 @@ error: invalid_detail ({{ resolution_detail }}); choose one of the listed candid
 {%- elif code == "invalid_detail" -%}
 error: invalid_detail{% if resolution_detail %} ({{ resolution_detail }}){% else %} (inspect:detail_unknown){% endif %}; {% if resolution_detail == "inspect:detail_expired" %}this detail_ref has expired{% else %}this detail_ref was never issued{% endif %}; repeat the original ide.* call to get a fresh one, or continue with native tools
 {%- elif code == "source_unavailable" and resolution_detail is startingwith("inspect:source_changed:") -%}
-error: source_unavailable (inspect:source_changed); {{ resolution_message }} changed since this result was captured. Call ide.context with this path again for fresh bytes
+error: source_unavailable (inspect:source_changed); {{ resolution_message }} changed since this result was captured. Read it again with ide.read
 {%- elif code == "source_unavailable" and resolution_detail == "inspect:source_changed" -%}
-error: source_unavailable (inspect:source_changed); the source changed since this result was captured. Call ide.context again for fresh bytes
+error: source_unavailable (inspect:source_changed); the source changed since this result was captured. Read it again with ide.read
 {%- elif code == "source_unavailable" and resolution_detail == "diff:not_a_git_repository" -%}
 error: source_unavailable (diff:not_a_git_repository); not a git repository: no git data
 {%- elif code == "source_unavailable" and resolution_detail is startingwith("context:source_changed:") -%}
-error: source_unavailable (context:source_changed); {{ resolution_message }} changed since it was read. Re-read it with ide.context, then retry with the new source_ref
+error: source_unavailable (context:source_changed); {{ resolution_message }} changed since it was read. Re-read it with ide.read, then retry
 {%- elif code == "source_unavailable" and (resolution_detail == "context:source_changed" or resolution_detail == "inspect:source_stale") -%}
-error: source_unavailable ({{ resolution_detail }}); the source changed since it was read. Re-read it with ide.context, then retry with the new source_ref
+error: source_unavailable ({{ resolution_detail }}); the source changed since it was read. Re-read it with ide.read, then retry
 {%- elif code == "source_unavailable" and resolution_detail is startingwith("context:observation_failed:") -%}
-error: source_unavailable (context:observation_failed); {{ resolution_message }} could not be read through the confined reader. Retry ide.context, or continue with native tools
+error: source_unavailable (context:observation_failed); {{ resolution_message }} could not be read through the confined reader. Retry the call, or continue with native tools
 {%- elif code == "source_unavailable" and resolution_detail is startingwith("read:line_range:") -%}
 error: source_unavailable (read:line_range); {{ resolution_message }}
 {%- elif code == "source_unavailable" and resolution_detail is startingwith("read:not_text:") -%}
@@ -134,7 +133,7 @@ error: source_unavailable (diff:activation_commit_unknown); the start commit of 
 {%- elif code == "source_unavailable" and resolution_detail is startingwith("diff:") -%}
 error: source_unavailable ({{ resolution_detail }}); Git evidence for this comparison became unusable. Call ide.diff again
 {%- elif code == "source_unavailable" -%}
-error: source_unavailable{% if resolution_detail %} ({{ resolution_detail }}){% else %} (context:source_unavailable){% endif %}; the requested source could not be read. Retry ide.context, or continue with native tools
+error: source_unavailable{% if resolution_detail %} ({{ resolution_detail }}){% else %} (context:source_unavailable){% endif %}; the requested source could not be read. Retry the call, or continue with native tools
 {%- elif code == "outside_allowed_roots" and resolution_detail is startingwith("start:root_absent") -%}
 error: outside_allowed_roots ({{ resolution_detail }}); the requested root does not exist yet, so it cannot be activated; create it below the named ancestor or start from that ancestor, otherwise continue with native tools
 {%- elif code == "outside_allowed_roots" and resolution_detail is startingwith("start:worktree_unresolved") -%}
@@ -206,9 +205,9 @@ error: provider_unavailable (context:no_server); no language server is configure
 {%- elif code == "provider_unavailable" and resolution_detail is startingwith("context:") -%}
 error: provider_unavailable ({{ resolution_detail }}); the language server could not provide this result. Retry the same ide.* call later, or continue with native tools
 {%- elif code == "provider_unavailable" and resolution_detail is endingwith("answer from source)") -%}
-error: provider_unavailable ({{ resolution_detail }}); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {"kind":"problems"} shows the project check)
+error: provider_unavailable ({{ resolution_detail }}); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.inspect {"kind":"problems"} shows the project check)
 {%- elif code == "provider_unavailable" and resolution_detail is endingwith("use native reads)") -%}
-error: provider_unavailable ({{ resolution_detail }}); the language server cannot answer semantic requests. No source outline answers either; use native reads. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {"kind":"problems"} shows the project check)
+error: provider_unavailable ({{ resolution_detail }}); the language server cannot answer semantic requests. No source outline answers either; use native reads. Retry later; if it keeps failing, fix what stops the project from loading (ide.inspect {"kind":"problems"} shows the project check)
 {%- elif code == "provider_unavailable" -%}
 error: provider_unavailable{% if resolution_detail %} ({{ resolution_detail }}){% else %} (provider:unavailable){% endif %}; no language server result is available for this request. Continue with native tools
 {%- elif code == "deadline" and resolution_detail == "stop:deadline" -%}
@@ -237,9 +236,9 @@ error: capacity (diff:single_line); one diff line exceeds the reply envelope; {{
 {%- elif resolution_detail == "diff:reply_inventory" -%}
 error: capacity (diff:reply_inventory); the path inventory exceeds the reply envelope; narrow ide.diff with paths
 {%- elif resolution_detail == "worker:queue_full" or resolution_detail == "inspect:queue_full" -%}
-error: capacity ({{ resolution_detail }}); the request queue is full; wait for pending work, then retry
+error: capacity ({{ resolution_detail }}); the request queue is full; retry the call
 {%- elif resolution_detail == "worker:result_store_full" -%}
-error: capacity (worker:result_store_full); the result store is full of pending or protected results; wait for pending work or stop an activation retaining results
+error: capacity (worker:result_store_full); the result store is full of pending or protected results; stop an activation retaining results, then retry
 {%- elif resolution_detail == "worker:actor_share_full" -%}
 error: capacity (worker:actor_share_full); you can free all your own settled, unpinned results; any remaining capacity is held by other active actors
 {%- elif resolution_detail == "diff:too_large" -%}
@@ -288,43 +287,16 @@ error: {{ code }}{% if resolution_detail %} ({{ resolution_detail }}){% endif %}
 {%- if state == "invalid_parameters" -%}
 {{ text }}
 {%- endif -%}
-{%- if state == "complete" and kind == "activation" -%}
-complete activation: {{ text }}
-Next: use ide.outline a file or ide.symbol a name
+{%- if state == "complete" and (kind == "activation" or kind == "stop") -%}
+{{ text }}
 {%- endif -%}
-{%- if state == "complete" and kind == "context" -%}
-complete context: {{ text }}
-{%- if truncated and detail_ref and continuation -%}
-{{ "\n" }}Output is truncated; use ide.inspect with detail_ref {{ detail_ref }} before editing
-{%- elif truncated and detail_ref -%}
-{{ "\n" }}Output is incomplete; use ide.edit with source_ref {{ detail_ref }} when available, otherwise use the native editor
-{%- elif truncated -%}
-{{ "\n" }}Output is incomplete; use ide.edit when available, otherwise use the native editor
-{%- elif detail_ref -%}
-{{ "\n" }}Diagnostics are exactly as reported; use ide.edit with source_ref {{ detail_ref }} when available, otherwise use the native editor
-{%- endif -%}
-{%- endif -%}
-{%- if state == "complete" and (kind == "outline" or kind == "read" or kind == "symbol" or kind == "graph" or kind == "test" or kind == "inspect") -%}
+{%- if state == "complete" and (kind == "context" or kind == "diff" or kind == "outline" or kind == "read" or kind == "symbol" or kind == "graph" or kind == "test" or kind == "inspect") -%}
 {{ text }}
 {%- if truncated and detail_ref and continuation -%}
-{{ "\n" }}Output is truncated; use ide.inspect with detail_ref {{ detail_ref }} for the next page
+{{ "\n" }}Cut; ide.inspect {"detail_ref":"{{ detail_ref }}"} continues
 {%- elif truncated -%}
-{{ "\n" }}Output is incomplete
+{{ "\n" }}Cut; nothing more to fetch
 {%- endif -%}
-{%- endif -%}
-{%- if state == "complete" and kind == "diff" -%}
-complete diff: {{ text }}
-{%- if truncated and detail_ref and continuation -%}
-{{ "\n" }}Output is truncated; use ide.inspect with detail_ref {{ detail_ref }}
-{%- elif truncated -%}
-{{ "\n" }}Output is incomplete; stop or review the available hunks safely with native tools
-{%- else -%}
-{{ "\n" }}Next: use ide.stop
-{%- endif -%}
-{%- endif -%}
-{%- if state == "complete" and kind == "stop" -%}
-complete stop: {{ text }}
-Workspace authority is released; native edits remain on disk
 {%- endif -%}
 {%- if state == "edit" and result.outcome in ("created", "replaced", "unchanged") -%}
 {%- set outcome = operation or result.outcome -%}
@@ -332,9 +304,9 @@ Workspace authority is released; native edits remain on disk
 edit: {{ outcome }}; path {{ result.path }}; diagnostics: current_reported ({{ diagnostics.delta }}){{ " [truncated]" if diagnostics.truncated else "" }}
 {{ diagnostics.messages|join("\n") }}
 {%- elif diagnostics.state == "current_clean" -%}
-edit: {{ outcome }}; path {{ result.path }}; diagnostics: current_clean{% if diagnostics.project_errors is defined and diagnostics.project_errors %} for this file; the project check reports {{ diagnostics.project_errors }} errors in other files. Next: use ide.context with kind problems{% else %}. Next: use ide.diff{% endif %}
+edit: {{ outcome }}; path {{ result.path }}; diagnostics: current_clean{% if diagnostics.project_errors is defined and diagnostics.project_errors %} for this file; the project check reports {{ diagnostics.project_errors }} errors in other files (ide.inspect {"kind":"problems"}){% endif %}
 {%- elif diagnostics.state == "unknown" -%}
-edit: {{ outcome }}; path {{ result.path }}; diagnostics: unknown. Next: use ide.context with kind problems
+edit: {{ outcome }}; path {{ result.path }}; diagnostics: unknown (ide.inspect {"kind":"problems"} shows the project check)
 {%- elif diagnostics.state == "not_analysed" -%}
 edit: {{ outcome }}; path {{ result.path }}; diagnostics: not_analysed ({{ diagnostics.reason }})
 {%- elif diagnostics.state == "pending" -%}
@@ -345,14 +317,14 @@ edit: {{ outcome }}; path {{ result.path }}; diagnostics: pending; the project c
 {%- if state == "edit_batch" -%}
 {{ text }}
 {%- if truncated -%}
-{{ "\n" }}Output is incomplete
+{{ "\n" }}Cut; nothing more to fetch
 {%- endif -%}
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "stale_source" -%}
-edit: stale_source; path {{ result.path }}. No write occurred — this file changed or the source_ref missed part of its read. Re-read with ide.read and inspect every page before retrying{% if note %}{{ "\n" }}{{ note }}{% endif %}
+edit: stale_source; path {{ result.path }}. No write occurred; the file changed. Re-read the symbol with ide.read, then retry{% if note %}{{ "\n" }}{{ note }}{% endif %}
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "conflicting_duplicate" -%}
-edit: conflicting_duplicate; path {{ result.path }}. No write occurred; use ide.context to inspect the target before a new operation_id
+edit: conflicting_duplicate; path {{ result.path }}. No write occurred; read the target with ide.read before using a new operation_id
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "unsafe_target" -%}
 edit: unsafe_target; path {{ result.path }}. No write occurred — the target is a symlink or special file the IDE may not write. Continue with native tools

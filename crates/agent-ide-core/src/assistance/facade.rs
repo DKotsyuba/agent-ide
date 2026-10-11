@@ -222,7 +222,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
         environment_languages.join("|")
     );
     let environment_description = format!(
-        "Pick the current environment per language, optionally per project root (`{example_language}:packages/alpha`). Value: a candidate the start card lists, or a path to one (relative to that root, or absolute), or `auto` to return to the default. Kept for this worktree until changed. Only languages whose card shows an environment line accept a choice."
+        "Environment per language, optionally per root (`{example_language}:packages/alpha`): a candidate the start card lists, a path to one, or `auto`."
     );
     [
         schema(
@@ -230,8 +230,8 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
-                    "activation_id": {"type": "string", "minLength": 1, "maxLength": MAX_ACTIVATION_ID_BYTES, "description": "Any stable id for this activation (e.g. the task name); repeating it returns the same activation. Optional: a start that names none derives a stable id from this session, so repeating it also returns the same activation."},
-                    "root": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Absolute working directory to activate; defaults to the host's project directory. Must lie below a configured allowed root."},
+                    "activation_id": {"type": "string", "minLength": 1, "maxLength": MAX_ACTIVATION_ID_BYTES, "description": "Stable id for this activation; repeating it returns the same activation. Optional."},
+                    "root": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Absolute directory to activate, below an allowed root; defaults to the host's project directory."},
                     "read_only": {"type": "boolean", "default": false, "description": "Start as a reader; the default is the one writer allowed per worktree."},
                     "environment": {"type": "object", "maxProperties": 8, "propertyNames": {"pattern": environment_pattern}, "additionalProperties": {"type": "string", "minLength": 1, "maxLength": 1024}, "description": environment_description}
                 }
@@ -255,7 +255,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Diff,
             json!({
                 "type": "object", "additionalProperties": false,
-                "properties": {"paths": {"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1,"maxLength":1024},"description":"Limit capture and hunk budgets to these worktree-relative files or directories; literal paths only, no absolute paths or .. segments."}, "mode": {"type":"string","enum":["head","staged","unstaged","task"],"default":"head","description":"`head`: everything not yet committed; `staged` / `unstaged`: only that part; `task`: everything changed since activation, including commits."}, "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."}, "provenance": {"type": "boolean", "default": false, "description": "Return the exact worktree/comparison identity header instead of the compact default; no hashes appear otherwise."}}
+                "properties": {"paths": {"type":"array","minItems":1,"maxItems":16,"items":{"type":"string","minLength":1,"maxLength":1024},"description":"Worktree-relative files or directories to limit the diff to; literal paths only."}, "mode": {"type":"string","enum":["head","staged","unstaged","task"],"description":"The whole diff: `head` (uncommitted), `staged`, `unstaged` or `task` (since activation). Omit for only what changed since your last diff."}, "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."}, "provenance": {"type": "boolean", "default": false, "description": "Return the exact worktree and comparison identity header instead of the compact default."}}
             }),
         ),
         schema(
@@ -282,25 +282,25 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
-                    "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Optional. Name an edit to make a retry safe: repeating the id never applies the edit twice. Omitted, a fresh id is used."},
-                    "op": {"type": "string", "enum": ["replace", "insert", "delete", "rename"], "default": "replace", "description": "Symbol operation. replace: new body for `symbol` (or for `path`+`lines`); insert: new symbol placed `where` relative to `symbol`; delete: remove `symbol` with its header; rename: rename `symbol` project-wide to `new_name`."},
-                    "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Address `file#Owner/name`, a window `file#Owner/name:3-5` (lines counted from the symbol's first line) or a region `file#@imports`."},
-                    "old": {"type": "string", "minLength": 1, "description": "Exact text to replace with `new`; it must occur exactly once in the scope (`symbol`'s unit or window, else the whole `path`). Aliases: `old_string`."},
-                    "new": {"type": "string", "description": "The replacement for `old`; empty deletes the match. Aliases: `new_string`."},
+                    "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Optional name that makes a retry safe: repeating it never applies the edit twice."},
+                    "op": {"type": "string", "enum": ["replace", "insert", "delete", "rename"], "default": "replace", "description": "replace (default), insert (placed by `where`), delete or rename (to `new_name`, project-wide) the `symbol`."},
+                    "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Address `src/a.rs#Type/method`, a window `…/method:3-5` (lines of the symbol) or a region `src/a.rs#@imports`."},
+                    "old": {"type": "string", "minLength": 1, "description": "Exact text to replace with `new`; it must occur once in the scope (the `symbol`, else the whole `path`)."},
+                    "new": {"type": "string", "description": "The replacement for `old`; empty deletes the match."},
                     "old_string": {"type": "string", "minLength": 1, "description": "Alias of `old`."},
                     "new_string": {"type": "string", "description": "Alias of `new`."},
                     "file_path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Alias of `path`."},
-                    "add_import": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "With `path`: one import statement, written as in the file, added after the other imports (nothing happens if it is already there)."},
+                    "add_import": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "With `path`: an import statement as written in the file; added after the other imports."},
                     "remove_import": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "With `path`: the import statement to remove, as written in the file."},
                     "where": {"type": "string", "enum": ["before", "after", "first", "last"], "description": "For insert: before/after the anchor symbol, or first/last member of a container anchor."},
                     "new_name": {"type": "string", "minLength": 1, "maxLength": 128, "description": "For rename: the new identifier, applied project-wide."},
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES},
-                    "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "With `path`: inclusive 1-based line range to replace."},
-                    "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Deprecated and never needed: the current text is the base of every edit. A supplied value is still checked against the file."},
+                    "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "With `path`: file lines `a-b` to replace; for code prefer a `symbol` or a window."},
+                    "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Deprecated; omit."},
                     "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES, "description": "Replacement or inserted code, including the symbol's doc comment and attributes."},
-                    "changes": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "additionalProperties": false, "properties": {"lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "op": {"type": "string", "enum": ["replace", "insert", "delete"]}, "where": {"type": "string", "enum": ["before", "after", "first", "last"]}, "content": {"type": "string"}, "old": {"type": "string", "minLength": 1}, "new": {"type": "string"}, "within": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "add_import": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "remove_import": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}}, "description": "1–32 changes to ONE file (named by `path`), each addressed by exactly one of `lines`, `symbol` (an address, a `:N-M` window or an `@` region), `old` (with `symbol` or `within` to scope it), `add_import` or `remove_import`; every address resolves against the file's current text before anything is applied, and overlapping or unmatched addresses are refused together with nothing written. `lines` numbers are the current file's, never shifted by other changes (empty `content` deletes the range); `old` must match exactly once and `new` replaces exactly the matched bytes, terminators included (`\"\"` deletes the match)."}},
-                    "patch": {"type": "string", "minLength": 1, "maxLength": super::batch::MAX_EDIT_TEXT_BYTES, "description": "A Codex apply_patch body (`*** Begin Patch` … `*** End Patch` with Add File and Update File sections), applied atomically across files. Use it alone; delete and move are not supported."},
-                    "files": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_EDIT_FILES, "items": {"type": "object", "additionalProperties": false, "required": ["path"], "properties": {"path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}, "changes": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object"}}, "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES}, "create": {"type": "boolean"}}}, "description": "One logical change across up to 16 files in ONE call, with only `operation_id` and an optional default `source_ref` beside it: each entry is {\"path\",\"changes\":[…]} (exactly the one-file `changes` entries), {\"path\",\"create\":true,\"content\"} (a new file) or {\"path\",\"content\"} (whole new content), with its own optional `source_ref`; at most 128 changes and 128 KiB of text in all. Every file is validated before the first write and any refusal writes nothing; files are written in order, one project check runs on the result, a partial write is reported per file, and the same `operation_id` resumes the rest."}
+                    "changes": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "additionalProperties": false, "properties": {"lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "op": {"type": "string", "enum": ["replace", "insert", "delete"]}, "where": {"type": "string", "enum": ["before", "after", "first", "last"]}, "content": {"type": "string"}, "old": {"type": "string", "minLength": 1}, "new": {"type": "string"}, "within": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "add_import": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "remove_import": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}}, "description": "Up to 32 changes to the file `path`: each is `symbol` with `content` or `old`/`new`, `lines`, `add_import` or `remove_import`. All apply or none."}},
+                    "patch": {"type": "string", "minLength": 1, "maxLength": super::batch::MAX_EDIT_TEXT_BYTES, "description": "A Codex apply_patch body (Add File, Update File), applied atomically. Use it alone."},
+                    "files": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_EDIT_FILES, "items": {"type": "object", "additionalProperties": false, "required": ["path"], "properties": {"path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}, "changes": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object"}}, "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES}, "create": {"type": "boolean"}}}, "description": "Up to 16 files in one call: {path, changes}, {path, create:true, content} or {path, content}. All apply or none; one project check runs."}
                 }
             }),
         ),
@@ -310,9 +310,9 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "type": "object", "additionalProperties": false,
                 "properties": {
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root."},
-                    "paths": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_OUTLINE_FILES, "items": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "description": "Several files in ONE call instead of `path`: up to 24 worktree-relative paths, outlined in request order behind one summary line; a file past the reply budget is listed in one line with its exact call."},
-                    "glob": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Every file matching this worktree-relative pattern in ONE call instead of `path`: `*` within a segment, `?` one character, `**` any directories (e.g. `crates/x/src/**/*.rs`); at most 24 files in path order, never outside the worktree, skipping hidden and build directories."},
-                    "kinds": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol|region)(,(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol|region))*$", "description": "Comma list over the closed symbol-kind vocabulary; keeps a symbol whose kind is selected or a descendant's is, so a container of a selected member still shows. `region` also lists file-level regions (@header, @imports, ...)."}
+                    "paths": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_OUTLINE_FILES, "items": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "description": "Up to 24 worktree-relative files, outlined in request order."},
+                    "glob": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Worktree-relative pattern (`*`, `?`, `**`), e.g. `crates/x/src/**/*.rs`; at most 24 files."},
+                    "kinds": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol|region)(,(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol|region))*$", "description": "Comma list of symbol kinds to keep (a container of a match still shows); `region` also lists @header, @imports."}
                 }
             }),
         ),
@@ -321,13 +321,13 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
-                    "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`; returns its body with the doc header."},
-                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root; alone it reads the whole file, with `lines` or `ranges` those lines."},
-                    "lines": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$", "description": "Inclusive 1-based line range: `120-180`, `120-` (to the end) or `120`. An end past the file is clamped."},
-                    "symbols": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "description": "Several bodies in one reply, request order, one `source_ref` valid for every file included: `[\"src/a.rs#Foo/bar\",\"src/b.rs#qux\"]`. Unknown symbols are reported per item without failing the rest; a bare file path reads the text of a file no IDE language reads."},
-                    "ranges": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$"}, "description": "Several line ranges of `path` in one reply, request order, with the same numbered gutter and one `source_ref`."},
-                    "items": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_READ_ITEMS, "items": {"type": "object", "additionalProperties": false, "properties": {"symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "lines": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$"}}}, "description": "Everything to read in ONE call, up to 32 items over at most 16 files, instead of `symbol`, `path`, `lines`, `symbols` or `ranges`: each item is exactly one of {\"symbol\":\"src/a.rs#Foo/bar\"}, {\"path\":\"docs/x.md\"} (the whole file) or {\"path\":\"src/b.rs\",\"lines\":\"10-40\"}. The reply opens with a summary line, then one block per item in request order; a failed item fails only itself, and one `source_ref` is valid for every file whose items were all delivered."},
-                    "force": {"type": "boolean", "default": false, "description": "With `items`: return the text of an item even when its bytes are unchanged since your earlier read."}
+                    "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Address `src/a.rs#Type/method`, a window `…:3-5`, a region `src/a.rs#@imports` or `path:line`; returns doc and body."},
+                    "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Non-code file relative to the project root; alone the whole file, with `lines` or `ranges` those lines."},
+                    "lines": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$", "description": "With `path`: `120-180`, `120-` (to the end) or `120`; an end past the file is clamped."},
+                    "symbols": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "description": "Several addresses in one reply, request order; a failed one fails only itself."},
+                    "ranges": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$"}, "description": "Several line ranges of the non-code file `path` in one reply."},
+                    "items": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_READ_ITEMS, "items": {"type": "object", "additionalProperties": false, "properties": {"symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "lines": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$"}}}, "description": "Up to 32 reads in one call: {symbol} (address, window or `path:line`), or {path} / {path, lines} for non-code files."},
+                    "force": {"type": "boolean", "default": false, "description": "With `items`: return an item's text even when unchanged since your last read of it."}
                 }
             }),
         ),
@@ -336,10 +336,10 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
-                    "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`, or a bare name to search the project."},
-                    "symbols": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_SYMBOL_ENTRIES, "items": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "description": "Several cards in ONE call instead of `symbol`: up to 8 symbol paths or bare names, answered in request order behind one summary line, each exactly as `symbol` would answer it with the same options; a failed entry fails only itself."},
+                    "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Address `src/a.rs#Type/method`, or a bare name to search the project."},
+                    "symbols": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_SYMBOL_ENTRIES, "items": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "description": "Up to 8 addresses or bare names in one call, request order; a failed one fails only itself."},
                     "usages": {"type": "boolean", "default": true, "description": "Include usages (src/tests split, with source lines)."},
-                    "callers": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1, "description": "Callers to list, 0–3 (0 = none); use ide.graph for deeper trees."},
+                    "callers": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1, "description": "Caller levels to list, 0–3 (0 = none)."},
                     "callees": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0, "description": "Callees to list, 0–3 (0 = none)."},
                     "history": {"type": "boolean", "default": false, "description": "Include the last commits touching the definition (opt-in)."}
                 }
@@ -350,8 +350,8 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
-                    "symbol": {"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES, "description":"Symbol path `file#Owner/name`, or a bare name to search the project."},
-                    "symbols": {"type":"array", "minItems":1, "maxItems":super::batch::MAX_SYMBOL_ENTRIES, "items":{"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES}, "description":"Several roots in ONE call instead of `symbol`: up to 8 symbol paths or bare names, one section per root in request order behind one summary line, each exactly as `symbol` would answer it with the same options; a failed root fails only itself."},
+                    "symbol": {"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES, "description":"Address `src/a.rs#Type/method`, or a bare name to search the project."},
+                    "symbols": {"type":"array", "minItems":1, "maxItems":super::batch::MAX_SYMBOL_ENTRIES, "items":{"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES}, "description":"Up to 8 addresses or bare names in one call, request order; a failed one fails only itself."},
                     "direction": {"type":"string", "enum":["callers", "callees", "both"], "default":"callers", "description":"`callers`: who calls it (blast radius); `callees`: what it calls; `both`."},
                     "depth": {"type":"integer", "minimum":1, "maximum":3, "default":2, "description":"Levels to expand; 2 is usually enough."},
                     "tests": {"type":"boolean", "default":false, "description":"Show test symbols as nodes (marked `[test]`) instead of collapsing them into one `+N tests` line per parent."}
@@ -363,15 +363,15 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
-                    "symbol": {"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES, "description":"Run the tests that reference this symbol (`file#Owner/name`)."},
+                    "symbol": {"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES, "description":"Run the tests that reference this address (`src/a.rs#Type/method`)."},
                     "path": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"Run the tests in this file or directory."},
                     "pattern": {"type":"string", "minLength":1, "maxLength":MAX_TEXT_BYTES, "description":"Run tests whose name matches this substring (runner filter)."},
                     "command": {"type":"array", "minItems":1, "maxItems":64, "items":{"type":"string", "maxLength":MAX_COMMAND_BYTES}, "description":"Explicit argv to run instead of the detected runner; all argument bytes together are limited to 16 KiB."},
                     "cwd": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"Working directory relative to the worktree root; must resolve inside the worktree. Only with `command`."},
-                    "env": {"type":"object", "maxProperties":MAX_ENV_ENTRIES, "additionalProperties":{"type":"string", "maxLength":MAX_ENV_VALUE_BYTES}, "description":"Environment variables added to the inherited environment for this explicit command. Only with `command`; names are bounded environment identifiers."},
+                    "env": {"type":"object", "maxProperties":MAX_ENV_ENTRIES, "additionalProperties":{"type":"string", "maxLength":MAX_ENV_VALUE_BYTES}, "description":"Variables added to the inherited environment; only with `command`."},
                     "status": {"type":"integer", "minimum":1, "description":"Re-read run number N (from `tests #N`) instead of starting one."},
                     "budget_s": {"type":"integer", "minimum":1, "maximum":600, "default":120, "description":"Seconds before the run is stopped and reported as timed out."},
-                    "targets": {"type":"array", "minItems":1, "maxItems":super::batch::MAX_TEST_TARGETS, "items":{"type":"object", "additionalProperties":false, "minProperties":1, "maxProperties":1, "properties":{"symbol":{"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES}, "path":{"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES}, "pattern":{"type":"string", "minLength":1, "maxLength":MAX_TEXT_BYTES}}}, "description":"Several targets as ONE run instead of `symbol`/`path`/`pattern`: up to 8 entries, each exactly one of `{\"symbol\":…}`, `{\"path\":…}` or `{\"pattern\":…}`; symbol targets of one language share one runner invocation, the others run one after another in the same run; `budget_s` covers the whole run. One result with a line per target and one rerun line."}
+                    "targets": {"type":"array", "minItems":1, "maxItems":super::batch::MAX_TEST_TARGETS, "items":{"type":"object", "additionalProperties":false, "minProperties":1, "maxProperties":1, "properties":{"symbol":{"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES}, "path":{"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES}, "pattern":{"type":"string", "minLength":1, "maxLength":MAX_TEXT_BYTES}}}, "description":"Up to 8 targets in one run, each {symbol}, {path} or {pattern}; one result line per target and one rerun line."}
                 }
             }),
         ),
@@ -804,6 +804,8 @@ pub fn validate_call(
     tool: AssistanceTool,
     mut parameters: Value,
 ) -> Result<ValidatedCall, ParameterError> {
+    // `ide.inspect {"kind":"problems"}` is the Codex spelling of the `ide.context` problems call.
+    let tool = fold_inspect_problems(tool, &parameters);
     let batch_key = super::batch::batch_key(tool, &parameters);
     let size = serde_json::to_vec(&parameters)
         .ok()
@@ -1590,6 +1592,12 @@ pub fn validate_call(
     }
     if tool == AssistanceTool::Diff {
         let object = parameters.as_object_mut().expect("validated object");
+        // A diff that names no `mode` answers only what changed since the activation's previous
+        // diff (`since_last`, set here and never accepted from the model); naming a mode, even
+        // `head`, answers the whole diff.
+        if !object.contains_key("mode") && !object.contains_key("detail_ref") {
+            object.insert("since_last".to_owned(), json!(true));
+        }
         object.entry("mode").or_insert(json!("head"));
         object.entry("provenance").or_insert(json!(false));
     }
@@ -2191,15 +2199,15 @@ impl FeedbackDelta {
         })
     }
 
-    /// Renders the model-facing fact, next action and freshness without exposing internal evidence provenance.
+    /// Renders the model-facing fact, its next action and its freshness qualifier on one line,
+    /// then the continuation call when a detail reference exists, without exposing internal
+    /// evidence provenance.
     pub fn render(&self) -> String {
-        let mut rendered = format!(
-            "Fact: {}\nNext: {}\nFreshness: {}",
-            self.fact, self.next_action, self.freshness
-        );
+        let mut rendered = format!("{} {} ({})", self.fact, self.next_action, self.freshness);
         if let Some(detail_ref) = &self.detail_ref {
-            rendered.push_str("\nDetail: ");
-            rendered.push_str(detail_ref);
+            rendered.push_str(&format!(
+                "\nide.inspect {{\"detail_ref\":\"{detail_ref}\"}}"
+            ));
         }
         rendered
     }
@@ -4769,12 +4777,9 @@ impl StdioFacade {
 
 #[tool_router]
 impl StdioFacade {
-    /// Activate Agent IDE for this project — once per task, before any other ide.* call. Returns
-    /// a project card: languages with sizes, the build/check/test/lint commands, layout by
-    /// directory, entry points and docs, then the exact batch call forms (do not print the tool
-    /// catalog). Use it to orient instead of reading README, {manifests_head}
-    /// {manifests_tail}. Then use ide.outline / ide.symbol instead of native file reads. End the
-    /// task with ide.stop.
+    /// Activate Agent IDE once per task, before any other ide.* call. Returns the project card:
+    /// languages, build and test commands, layout, entry points, docs and the call forms. Use it
+    /// instead of reading README, {manifests_head} {manifests_tail}. End the task with ide.stop.
     #[tool(name = "ide.start", input_schema = tool_schemas()[0].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn start(
@@ -4785,10 +4790,9 @@ impl StdioFacade {
         self.call(AssistanceTool::Start, parameters, context).await
     }
 
-    /// Bounded source with current diagnostics for one `path`, or with `kind: "problems"` the
-    /// project's latest check results (errors and warnings by file, paged). Use `problems` to
-    /// see what is broken right now instead of running the build yourself; use `path` before or
-    /// after editing a file natively.
+    /// Source of one `path` with its current diagnostics, or with `kind: "problems"` the
+    /// project's latest check problems (paged). Use `problems` to see what is broken instead of
+    /// running the build; read code by symbol with ide.read.
     #[tool(name = "ide.context", input_schema = tool_schemas()[1].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn context(
@@ -4800,9 +4804,9 @@ impl StdioFacade {
             .await
     }
 
-    /// Diff of what this task changed in the working tree (`head`, `staged`, `unstaged` or `task`),
-    /// paged. Review it before finishing or handing off, instead of running `git diff` in a
-    /// shell.
+    /// What changed since your last diff (the first call: everything uncommitted), paged. A `mode`
+    /// (`head`, `staged`, `unstaged`, `task`) asks for the whole diff of that kind. Review it
+    /// before finishing instead of running `git diff`.
     #[tool(name = "ide.diff", input_schema = tool_schemas()[2].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn diff(
@@ -4813,13 +4817,10 @@ impl StdioFacade {
         self.call(AssistanceTool::Diff, parameters, context).await
     }
 
-    /// Skeletons of several files in ONE call: `ide.outline {"paths":["src/a.rs","src/b.rs"]}`
-    /// (up to 24) or `ide.outline {"glob":"src/**/*.rs"}`; a single `path` (a file, or a
-    /// directory: files with line counts and first doc line) still works. Each file: every
-    /// symbol with signature, doc line and line numbers, members indented, tests collapsed. A
-    /// fraction of the cost of reading the file — use it before any native read of a source file
-    /// longer than a screen. Answers inline on a warm language server; a cold one answers
-    /// `pending` and the result arrives by itself.
+    /// Skeleton of files: every symbol and region (`@header`, `@imports`) with its address,
+    /// signature, doc line and line numbers. Far cheaper than reading a file. Give `paths` (up to
+    /// 24) or a `glob`; `path` takes one file or a directory. Addresses look like
+    /// `src/a.rs#Type/method` and feed ide.read and ide.edit.
     #[tool(name = "ide.outline", input_schema = tool_schemas()[6].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn outline(
@@ -4831,12 +4832,10 @@ impl StdioFacade {
             .await
     }
 
-    /// Read every body and range you need in ONE call:
-    /// `ide.read {"items":[{"symbol":"src/a.rs#Store/get"},{"path":"src/b.rs","lines":"10-40"}]}`
-    /// (up to 32 items across 16 files; one `source_ref` covers them all; an item unchanged since
-    /// your last read of it may answer `unchanged since your read`, and `"force":true` returns the
-    /// text). The single `symbol`, or `path` with `lines`, still works. Numbered bodies with doc
-    /// headers replace reading whole files; the `source_ref` is what ide.edit is based on.
+    /// Read code by address: `src/a.rs#Type/method` returns doc and body numbered from 1,
+    /// `…/method:3-5` a window, `src/a.rs#@imports` or `#@header` a region, `path:line` (from
+    /// grep) the enclosing symbol. Read many at once with `items`. Use `path` and `lines` only
+    /// for non-code files.
     #[tool(name = "ide.read", input_schema = tool_schemas()[7].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn read(
@@ -4847,14 +4846,10 @@ impl StdioFacade {
         self.call(AssistanceTool::Read, parameters, context).await
     }
 
-    /// Symbol cards for several symbols in ONE call:
-    /// `ide.symbol {"symbols":["src/a.rs#Store/get","Kind"],"usages":true,"callers":1}` (up to 8);
-    /// a single `symbol` still works. Each card: resolved signature, doc, definition location,
-    /// usages split src/tests with the source line (construction sites tagged), callers and
-    /// callees as full symbol paths, and with `history: true` the last commits touching the
-    /// definition. Language-server accurate — replaces grep for usages and reading files to find
-    /// callers. Before adding a field or changing a constructor, list the construction sites
-    /// here. A bare name with several matches returns the candidate paths.
+    /// Cards for symbols: signature, doc, address, usages (src and tests, with source lines),
+    /// callers and callees as addresses, and with `history` the last commits. Takes addresses or
+    /// bare names (several matches list their addresses). Replaces grep for usages and callers;
+    /// list the construction sites before changing a constructor.
     #[tool(name = "ide.symbol", input_schema = tool_schemas()[8].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn symbol(
@@ -4865,12 +4860,8 @@ impl StdioFacade {
         self.call(AssistanceTool::Symbol, parameters, context).await
     }
 
-    /// Call graphs for several roots in ONE call:
-    /// `ide.graph {"symbols":["src/a.rs#f","src/b.rs#g"],"direction":"callers","depth":1}` (up to
-    /// 8); a single `symbol` still works. Bounded: callers, callees or both, depth 1–3, at most
-    /// 60 nodes, every node a full symbol path, cycles marked `(seen)`, tests collapsed into
-    /// `+N tests` per parent (set `tests: true` to list them). Before changing a signature, list
-    /// its call sites here (`direction: callers`) instead of chained greps.
+    /// Call graph of symbols: callers, callees or both, depth 1–3, at most 60 nodes, every node
+    /// an address, tests collapsed. List a signature's call sites here before changing it.
     #[tool(name = "ide.graph", input_schema = tool_schemas()[9].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn graph(
@@ -4881,19 +4872,10 @@ impl StdioFacade {
         self.call(AssistanceTool::Graph, parameters, context).await
     }
 
-    /// Run several targets as ONE run:
-    /// `ide.test {"targets":[{"symbol":"src/a.rs#parse"},{"path":"tests/cli.rs"},{"pattern":"roles_"}]}`
-    /// (up to 8), or a single target: `symbol` (the tests that reference it), `path`, name
-    /// `pattern` or an explicit `command`; one background run per worktree under `budget_s`.
-    /// Explicit commands may set a worktree-relative `cwd` and bounded inherited-environment
-    /// overrides through `env`; their argv is limited to 16 KiB in total.
-    /// Returns the pass/fail line with an exact rerun command; a run that outlasts the call
-    /// answers `started` and its outcome (counts, up to eight failing tests, the rerun command,
-    /// the full-output reference) arrives by itself in an `<agent-ide>` block. Full output is paged
-    /// through ide.inspect (`status` re-reads a run). Known runner summaries are parsed regardless
-    /// of how the runner was launched; otherwise the result includes the exit code and bounded
-    /// output tail. Use it instead of running the test command in a shell: bounded selection and
-    /// output.
+    /// Run tests as one run: `targets` of `{symbol}`, `{path}` or `{pattern}` (up to 8), or one
+    /// `symbol` (the tests that reference it), `path`, `pattern` or explicit `command`. Returns
+    /// the pass/fail line with a rerun command; a longer run answers `started` and its outcome
+    /// arrives by itself in an `<agent-ide>` block. Use it instead of a shell.
     #[tool(name = "ide.test", input_schema = tool_schemas()[10].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false))]
     async fn test(
@@ -4904,11 +4886,10 @@ impl StdioFacade {
         self.call(AssistanceTool::Test, parameters, context).await
     }
 
-    /// Read what Agent IDE holds for you. Results of long work (test runs, project checks after
-    /// edits, answers that were pending) are pushed to you in an `<agent-ide>` block, so never poll
-    /// for them. `{}` hands over everything ready now; `detail_refs` answers several references
-    /// in one call; `detail_ref` reads one result or its next page (outline, symbol, graph, diff,
-    /// test output).
+    /// Read what Agent IDE holds for you. Results of long work (test runs, project checks,
+    /// pending answers) arrive by themselves in an `<agent-ide>` block, so never poll for them.
+    /// `{}` hands over everything ready now; `detail_ref` or `detail_refs` read results or their
+    /// next pages.
     #[tool(name = "ide.inspect", input_schema = tool_schemas()[3].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn inspect(
@@ -4921,9 +4902,8 @@ impl StdioFacade {
     }
 
     /// End this task's IDE session; edited files stay on disk. Required when the task ends or
-    /// before handing off: it frees the worktree's writer slot at once. Lists up to eight test
-    /// runs started in this binding whose results were never collected, and flushes results not
-    /// yet delivered. Call it once.
+    /// before handing off: frees the writer slot, lists uncollected test runs and flushes
+    /// undelivered results. Call it once.
     #[tool(name = "ide.stop", input_schema = tool_schemas()[4].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false))]
     async fn stop(
@@ -4934,15 +4914,12 @@ impl StdioFacade {
         self.call(AssistanceTool::Stop, parameters, context).await
     }
 
-    /// Apply one logical change across files in ONE call:
-    /// `ide.edit {"operation_id":"add-field-1","source_ref":"…","files":[{"path":"src/a.rs","changes":[{"old":"x: 0,","new":"x: 0,\ny: 0,"}]},{"path":"src/new.rs","create":true,"content":"fn new() {}\n"}]}`
-    /// (up to 16 files). Everything is validated before the first write, and one project check
-    /// ({project_checks}) runs on the final state. The single-file forms still work: a `changes`
-    /// list, `op` replace / insert / delete / rename on `file#Owner/name` (rename is
-    /// project-wide), a `path` + `lines` range, or a full-file rewrite based on a `source_ref`.
-    /// Formats with the project formatter and returns errors and warnings in the reply; a check
-    /// that outlasts the call answers `diagnostics: pending` and its outcome arrives by itself.
-    /// Prefer it over native edit/write for source: no line matching, no separate check step.
+    /// Edit by address. Replace a symbol with its new doc and body:
+    /// `{"symbol":"src/a.rs#Type/method","content":"…"}`. Change inside it with `old`/`new`
+    /// scoped to the symbol, or `content` for a window `…/method:3-5`. Also `op`
+    /// insert/delete/rename, `add_import`/`remove_import`, `files` for several files and `patch`
+    /// for apply_patch. All changes apply or none; the reply is immediate and the project check
+    /// ({project_checks}) arrives by itself.
     #[tool(name = "ide.edit", input_schema = tool_schemas()[5].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false))]
     async fn edit(
@@ -4956,26 +4933,24 @@ impl StdioFacade {
 
 /// Connect-time instructions the host shows the model next to the tool list: the one-paragraph
 /// case for the IDE over native file tools, and the two rules every reply relies on.
-pub(super) const SERVER_INSTRUCTIONS: &str = "Agent IDE: language-server-backed source tools. \
-Call ide.start once per task and ide.stop at the end. Prefer ide.* over native tools for \
-source: plan first, then read everything in ONE ide.read {\"items\":[…]}; ide.outline / \
-ide.symbol / ide.graph instead of reading files and grep; ONE ide.edit {\"files\":[…]} per \
-logical change, with one project check; ide.test for the tests that matter. Symbols are \
-`file#Owner/name`. Results of long work (test runs, project checks, pending answers) are pushed \
-to you in an <agent-ide> block after your next tool call or when you end your turn, so never \
-poll for them or wait. Native tools remain for non-source files and as a fallback.";
+pub(super) const SERVER_INSTRUCTIONS: &str = "Agent IDE: language-server source tools. Call \
+ide.start once per task, ide.stop at the end. Work on code by address `file#Type/method` \
+(every result prints them; `path:line` from grep works too): ide.outline lists a file's \
+addresses, ide.read reads doc and body, ide.edit replaces a symbol or lines inside it, \
+ide.symbol and ide.graph find usages and callers, ide.test runs tests. Results of long work \
+arrive by themselves in an <agent-ide> block, so never poll or wait. Native tools stay for \
+non-code files.";
 
 /// The Codex server paragraph: the same rules without the two tools its catalog omits
 /// (`ide.graph` and `ide.context`; callers and callees come from `ide.symbol`, project problems
 /// from `ide.inspect {"kind":"problems"}`).
-pub(super) const SERVER_INSTRUCTIONS_CODEX: &str = "Agent IDE: language-server-backed source tools. \
-Call ide.start once per task and ide.stop at the end. Prefer ide.* over native tools for \
-source: plan first, then read everything in ONE ide.read {\"items\":[…]}; ide.outline / \
-ide.symbol instead of reading files and grep; ONE ide.edit {\"files\":[…]} per logical \
-change, with one project check; ide.test for the tests that matter. Symbols are \
-`file#Owner/name`. Results of long work (test runs, project checks, pending answers) are pushed \
-to you in an <agent-ide> block after your next tool call or when you end your turn, so never \
-poll for them or wait. Native tools remain for non-source files and as a fallback.";
+pub(super) const SERVER_INSTRUCTIONS_CODEX: &str = "Agent IDE: language-server source tools. Call \
+ide.start once per task, ide.stop at the end. Work on code by address `file#Type/method` \
+(every result prints them; `path:line` from grep works too): ide.outline lists a file's \
+addresses, ide.read reads doc and body, ide.edit replaces a symbol or lines inside it (or \
+takes an apply_patch body), ide.symbol finds usages and callers, ide.test runs tests, \
+ide.inspect {\"kind\":\"problems\"} lists project problems. Results of long work arrive by \
+themselves in an <agent-ide> block, so never poll or wait. Native tools stay for non-code files.";
 
 /// Which per-host catalog `tools/list` and the connect-time instructions answer with.
 ///
@@ -5011,19 +4986,20 @@ impl CatalogHost {
 
     /// Projects the full tool list onto this host's catalog.
     ///
-    /// Claude keeps every tool unchanged. Codex drops `ide.context` and `ide.graph` and lets
-    /// `ide.inspect` also serve the project problems (`kind`, `language`, `offset`, exactly the
-    /// `ide.context` problems parameters, which `ide.inspect` folds into that tool on arrival).
+    /// Every advertised schema is slimmed ([`slim_schema`]) and omits the legacy aliases and the
+    /// deprecated `source_ref` (the validator still accepts them), so the model reads only the
+    /// symbol-first forms. Claude keeps every tool. Codex drops `ide.context` and `ide.graph` and
+    /// lets `ide.inspect` also serve the project problems (`kind`, `language`, `offset`, exactly
+    /// the `ide.context` problems parameters, which `ide.inspect` folds into that tool on arrival).
     pub fn catalog(self, tools: Vec<rmcp::model::Tool>) -> Vec<rmcp::model::Tool> {
-        if self == Self::Claude {
-            return tools;
-        }
         let problems = tool_schemas()[1].input_schema["properties"].clone();
         tools
             .into_iter()
-            .filter(|tool| !matches!(&*tool.name, "ide.context" | "ide.graph"))
+            .filter(|tool| {
+                self == Self::Claude || !matches!(&*tool.name, "ide.context" | "ide.graph")
+            })
             .map(|mut tool| {
-                if &*tool.name == "ide.inspect" {
+                if self == Self::Codex && &*tool.name == "ide.inspect" {
                     let mut schema = (*tool.input_schema).clone();
                     if let Some(Value::Object(properties)) = schema.get_mut("properties") {
                         for name in ["kind", "language", "offset"] {
@@ -5039,9 +5015,53 @@ impl CatalogHost {
                         .into(),
                     );
                 }
+                let mut schema = (*tool.input_schema).clone();
+                if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+                    for legacy in ["file_path", "old_string", "new_string", "source_ref"] {
+                        properties.remove(legacy);
+                    }
+                }
+                let mut schema = Value::Object(schema);
+                slim_schema(&mut schema);
+                if let Value::Object(schema) = schema {
+                    tool.input_schema = std::sync::Arc::new(schema);
+                }
                 tool
             })
             .collect()
+    }
+}
+
+/// Removes the bound keywords (`minLength`, `maxLength`, `minItems`, `maxItems`, `maxProperties`,
+/// `pattern`, `propertyNames`) from a schema node and everything below it.
+///
+/// The advertised schema only guides the model; the facade's own validator enforces every bound
+/// on arrival, so listing them again costs tokens on every connect for no gain. Walks only schema
+/// nodes (`properties` values, `items`, `additionalProperties`), so a property that is itself
+/// called `pattern` survives.
+fn slim_schema(schema: &mut Value) {
+    let Value::Object(node) = schema else {
+        return;
+    };
+    for keyword in [
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "maxProperties",
+        "pattern",
+        "propertyNames",
+    ] {
+        node.remove(keyword);
+    }
+    if let Some(Value::Object(properties)) = node.get_mut("properties") {
+        properties.remove("source_ref");
+        properties.values_mut().for_each(slim_schema);
+    }
+    for child in ["items", "additionalProperties"] {
+        if let Some(child) = node.get_mut(child) {
+            slim_schema(child);
+        }
     }
 }
 
@@ -5089,23 +5109,40 @@ fn advertised_text_never_teaches_waiting() {
 
 /// The advertised catalog stays inside the harness-reply-v1 byte budgets: every tool description
 /// under the 2048-byte Claude clipping limit and the server paragraph under 700 bytes. The
-/// 600/160-byte description limits and the catalog totals arrive with the rewritten descriptions
-/// (M-030 T-003), which tighten this test.
+/// 600-byte description limit, the 160-byte property limit and the per-host catalog totals of
+/// harness-reply-v1 section 3.
 #[test]
 fn catalog_stays_within_the_budgets() {
-    assert!(
-        SERVER_INSTRUCTIONS.len() <= 700,
-        "{}",
-        SERVER_INSTRUCTIONS.len()
-    );
-    let facade = StdioFacade::new(std::path::PathBuf::from("/nonexistent-runtime"));
-    for tool in facade.router.list_all() {
-        let description = tool.description.as_deref().unwrap_or_default().len();
+    for (host, paragraph, total_limit) in [
+        (CatalogHost::Claude, SERVER_INSTRUCTIONS, 15 * 1024),
+        (CatalogHost::Codex, SERVER_INSTRUCTIONS_CODEX, 13 * 1024),
+    ] {
         assert!(
-            description <= 2048,
-            "{} description {description} B",
-            tool.name
+            paragraph.len() <= 700,
+            "{host:?} paragraph {}",
+            paragraph.len()
         );
+        let facade = StdioFacade::new(std::path::PathBuf::from("/nonexistent-runtime"));
+        let mut total = 0;
+        for tool in host.catalog(facade.router.list_all()) {
+            let description = tool.description.as_deref().unwrap_or_default().len();
+            assert!(
+                description <= 600,
+                "{host:?} {} description {description} B",
+                tool.name
+            );
+            let properties = tool.input_schema["properties"].as_object().unwrap();
+            for (name, property) in properties {
+                let text = property["description"].as_str().unwrap_or_default().len();
+                assert!(
+                    text <= 160,
+                    "{host:?} {}.{name} description {text} B",
+                    tool.name
+                );
+            }
+            total += serde_json::to_string(&tool).unwrap().len();
+        }
+        assert!(total <= total_limit, "{host:?} catalog {total} B");
     }
 }
 

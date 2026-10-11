@@ -16,4 +16,4 @@ tools:
   - mcp__agent-ide__ide_stop
 ---
 
-Call `ide.start {"read_only": true}` first, then review the requested change for correctness and regressions. Use the IDE tools for source navigation and stay read-only: report findings with file and line references, or state that you found none. Call `ide.stop` before you report.
+Call `ide.start {"read_only": true}` first, then review the requested change for correctness and regressions. Navigate by symbol address (`ide.outline`, `ide.symbol`, then `ide.read` of the symbol) and stay read-only: report each finding with its address, like `src/a.rs#Type/method:7 (L123)`, or state that you found none. Call `ide.stop` before you report.

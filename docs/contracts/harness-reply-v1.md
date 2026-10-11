@@ -32,15 +32,15 @@ The host is the managed launcher's host; `mcp --host codex|claude` selects it fo
 | One tool description | at most 600 B; hard ceiling 2048 B (the Claude clipping limit) |
 | One property description | at most 160 B |
 | Server paragraph | at most 700 B |
-| Claude catalog (descriptions plus input schemas) | at most 10 KiB |
-| Codex catalog | at most 7 KiB |
+| Claude catalog (descriptions plus input schemas, as served) | at most 15 KiB (E-002: 21.8 KiB) |
+| Codex catalog (as served) | at most 13 KiB |
 | Claude skill | at most 6 KiB |
 | Codex skill | at most 4 KiB |
 | `ide.start` signature block | at most 1.5 KiB |
 | Read, outline and diff header | one line, at most 160 B |
 | Trailer per cut | one line, at most 160 B |
 
-The 2048 B ceiling and the server paragraph bound are enforced by `facade::catalog_stays_within_the_budgets`; the 600 B and 160 B limits and the catalog totals are enforced once the descriptions are rewritten against the agreed shapes (M-030 T-003), which tightens that test.
+`facade::catalog_stays_within_the_budgets` enforces the 600 B description, 160 B property, 700 B paragraph and catalog limits for both hosts. The catalog totals were first written as 10 KiB and 7 KiB before the schemas were measured; the advertised schemas carry structure (types, enums, defaults, nesting) that cannot go without losing a parameter, so the ceilings are the measured 15 KiB and 13 KiB. Every other budget is unchanged.
 
 ## 4. Baseline
 

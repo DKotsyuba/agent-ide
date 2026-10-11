@@ -687,6 +687,7 @@ const METADATA_LABELS: &[&str] = &[
     "rerun:",
     "full output:",
     "Output is",
+    "Cut;",
     "Diagnostics are",
     "project:",
     "Detail:",

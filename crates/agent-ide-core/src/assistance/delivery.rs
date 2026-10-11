@@ -319,7 +319,7 @@ fn edit_checked_fact(
                 .map(|message| format!("  new: {path}: {}", bounded(message, 160, false)))
                 .collect::<Vec<_>>();
             if *truncated || messages.len() > MAX_NEW_LINES {
-                lines.push("  (more in ide.context with kind problems)".to_owned());
+                lines.push("  (more: ide.inspect {\"kind\":\"problems\"})".to_owned());
             }
             (
                 bounded(&format!("1 file: {delta}"), MAX_SUMMARY_BYTES, false),

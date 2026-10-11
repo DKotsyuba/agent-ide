@@ -21,7 +21,9 @@ use super::{
         ReadCounts, ReadForm, ReadItem, edit_checked_draft, read_follow_up, read_summary,
         summarize_diagnostics, unchanged_line,
     },
-    facade::{AssistanceTool, SERVER_INSTRUCTIONS, StdioFacade, tool_schemas, validate_call},
+    facade::{
+        AssistanceTool, CatalogHost, SERVER_INSTRUCTIONS, StdioFacade, tool_schemas, validate_call,
+    },
     reply::EditDiagnostics,
     signature_card::signature_block,
     test_fact::{running_line, started_line, still_running_line},
@@ -45,6 +47,31 @@ const NEGATED_POLL: [&str; 5] = [
     "never poll",
     "no polling",
     "not poll",
+];
+
+/// The old forms no model-facing text may teach once the IDE is symbol-first (M-030 T-012),
+/// lowercase and matched after whitespace is collapsed: waiting advice, the file-version
+/// reference, labelled replies and `Next:` lines, the old truncation trailers, the retired
+/// `ide.context` read habit and line-first examples.
+const STALE_FORMS: [&str; 18] = [
+    "wait_ms",
+    "source_ref",
+    "nothing else to do",
+    "wait once",
+    "next: use",
+    "complete activation",
+    "complete context",
+    "complete diff",
+    "complete stop",
+    "output is truncated",
+    "output is incomplete",
+    "fresh bytes",
+    "retry with the new",
+    "ide.context",
+    "\"lines\":\"",
+    "\\\"lines\\\":\\\"",
+    "bounded diagnostic messages in the latest context",
+    "latest context result",
 ];
 
 /// Which half of the rule a surface falls under.
@@ -101,6 +128,67 @@ fn violations(tier: Tier, text: &str) -> Vec<&'static str> {
         .copied()
         .filter(|phrase| text.contains(phrase))
         .collect()
+}
+
+/// Returns the stale forms `text` of the source `name` teaches. The `ide.context` tool may name
+/// itself, and nothing else may name it.
+fn stale_forms(name: &str, text: &str) -> Vec<&'static str> {
+    let text = normalised(text);
+    STALE_FORMS
+        .iter()
+        .copied()
+        .filter(|form| !(*form == "ide.context" && name.contains("ide.context")))
+        .filter(|form| text.contains(form))
+        .collect()
+}
+
+/// Every text a model reads while using the IDE that the symbol-first audit governs: both
+/// server paragraphs, both advertised catalogs (descriptions and schemas, as served), the
+/// signature block, both skills with their agent files, the reviewer agent, the plugin
+/// manifests and the reply template, plus every governed reply and teaching surface.
+fn symbol_first_sources() -> Vec<(String, String)> {
+    let mut sources = vec![
+        (
+            "SERVER_INSTRUCTIONS".to_owned(),
+            SERVER_INSTRUCTIONS.to_owned(),
+        ),
+        (
+            "SERVER_INSTRUCTIONS_CODEX".to_owned(),
+            CatalogHost::Codex.instructions().to_owned(),
+        ),
+        (
+            "ide.start signature block".to_owned(),
+            signature_block().to_owned(),
+        ),
+    ];
+    for host in [CatalogHost::Claude, CatalogHost::Codex] {
+        for tool in host.catalog(StdioFacade::described_tool_router().list_all()) {
+            sources.push((
+                format!("{host:?} {} as served", tool.name),
+                serde_json::to_string(&tool).expect("a tool serializes"),
+            ));
+        }
+    }
+    for path in [
+        "skills/agent-ide/SKILL.md",
+        "skills/agent-ide/agents/openai.yaml",
+        "skills/codex/agent-ide/SKILL.md",
+        "skills/codex/agent-ide/agents/openai.yaml",
+        "agents/ide-reviewer.md",
+        ".claude-plugin/plugin.json",
+        ".codex-plugin/plugin.json",
+        "assets/mcp/reply.jinja",
+    ] {
+        sources.push((path.to_owned(), file_surface(path, Tier::Teaching).text));
+    }
+    // The governed reply surfaces; the raw schemas are covered above as served.
+    sources.extend(
+        surfaces()
+            .into_iter()
+            .filter(|surface| !surface.name.ends_with("input schema"))
+            .map(|surface| (surface.name, surface.text)),
+    );
+    sources
 }
 
 /// Returns the repository root, two levels above this crate.
@@ -400,6 +488,46 @@ fn reply_surfaces_never_invite_polling() {
     assert!(found.is_empty(), "{found:#?}");
 }
 
+/// No model-facing text teaches an old form: every source of [`symbol_first_sources`] is free of
+/// [`STALE_FORMS`] (the audit of M-030 T-012; `docs/model-text-inventory.md` lists the sources).
+#[test]
+fn model_text_teaches_only_the_symbol_workflow() {
+    let mut found = Vec::new();
+    for (name, text) in symbol_first_sources() {
+        for form in stale_forms(&name, &text) {
+            found.push(format!("{name}: teaches `{form}`"));
+        }
+    }
+    assert!(found.is_empty(), "{found:#?}");
+}
+
+/// The stale-form guard flags each retired form, also across a line wrap, lets the `ide.context`
+/// tool name itself and passes the symbol-first wording.
+#[test]
+fn the_stale_form_guard_catches_every_retired_form() {
+    for form in STALE_FORMS {
+        let wrapped = form.replacen(' ', "\n    ", 1);
+        let name = if form == "ide.context" {
+            "ide.diff"
+        } else {
+            "x"
+        };
+        assert_eq!(
+            stale_forms(name, &format!("see {wrapped} here")),
+            [form],
+            "{form}"
+        );
+    }
+    assert!(stale_forms("Claude ide.context as served", "ide.context reads a path").is_empty());
+    assert!(
+        stale_forms(
+            "x",
+            "Read src/a.rs#Type/method:7 (L123) with ide.read; results arrive by themselves"
+        )
+        .is_empty()
+    );
+}
+
 /// The seconds detector finds counts of every spelling and ignores run numbers, ids and words
 /// that merely start with `s`; the literal extractor reads a format string with its
 /// continuations and placeholders.
@@ -560,7 +688,7 @@ fn teaching_examples_validate_against_the_tool_schemas() {
             }
         }
     }
-    assert!(checked >= 40, "only {checked} examples found");
+    assert!(checked >= 8, "only {checked} examples found");
     assert!(problems.is_empty(), "{problems:#?}");
 }
 

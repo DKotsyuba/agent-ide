@@ -1049,6 +1049,17 @@ async fn plain_diff_fallback_parses_real_hunks_without_exact_capture() {
         result.untracked().is_empty(),
         "plain diff names no untracked paths"
     );
+    // The default incremental diff drops the hunks the caller already holds, by fingerprint,
+    // and says how many; a fingerprint nobody holds drops nothing.
+    let held = result.selected_hunks()[0].fingerprint();
+    let unchanged = result
+        .clone()
+        .without_seen_hunks(|fingerprint| fingerprint == held);
+    assert!(unchanged.selected_hunks().is_empty());
+    assert_eq!(unchanged.unchanged_hunks(), 1);
+    let fresh = result.without_seen_hunks(|_| false);
+    assert_eq!(fresh.selected_hunks().len(), 1);
+    assert_eq!(fresh.unchanged_hunks(), 0);
 }
 
 /// A changed file whose name Git C-quotes in the `diff --git` header (a tab, a non-ASCII byte), or

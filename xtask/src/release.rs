@@ -31,7 +31,7 @@ const INSTALLER: &str = "install.sh";
 /// Upper bound for a manifest read from a directory or a published release.
 const MANIFEST_MAX_BYTES: u64 = 16384;
 /// Checkout files copied verbatim into the bundle (paths are identical on both sides).
-const COPIED: [&str; 11] = [
+const COPIED: [&str; 13] = [
     "install.sh",
     "README.md",
     "docs/release.md",
@@ -43,11 +43,13 @@ const COPIED: [&str; 11] = [
     "hooks/claude-hook.sh",
     "skills/agent-ide/SKILL.md",
     "skills/agent-ide/agents/openai.yaml",
+    "skills/codex/agent-ide/SKILL.md",
+    "skills/codex/agent-ide/agents/openai.yaml",
 ];
 /// Bundle files that are made executable after copying.
 const EXECUTABLES: [&str; 3] = ["agent-ide", "install.sh", "hooks/claude-hook.sh"];
 /// The complete archive file set, bundle-relative and in byte order.
-const BUNDLE_FILES: [&str; 16] = [
+const BUNDLE_FILES: [&str; 18] = [
     ".agents/plugins/marketplace.json",
     ".claude-plugin/marketplace.json",
     ".claude-plugin/plugin.json",
@@ -64,6 +66,8 @@ const BUNDLE_FILES: [&str; 16] = [
     "metadata.json",
     "skills/agent-ide/SKILL.md",
     "skills/agent-ide/agents/openai.yaml",
+    "skills/codex/agent-ide/SKILL.md",
+    "skills/codex/agent-ide/agents/openai.yaml",
 ];
 /// The Codex marketplace catalog written into the bundle, byte for byte.
 const CODEX_MARKETPLACE: &str = "{\n  \"name\": \"agent-ide\",\n  \"interface\": {\"displayName\": \"Agent IDE\"},\n  \"plugins\": [\n    {\n      \"name\": \"agent-ide\",\n      \"source\": {\"source\": \"local\", \"path\": \"./\"}\n    }\n  ]\n}\n";

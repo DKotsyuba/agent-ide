@@ -512,6 +512,10 @@ fn assert_compact_envelope(reply: &Value) {
                 assert!(!title.is_empty() && details.ends_with(')'), "{reply}");
             }
         }
+        // Unlabelled replies (harness-reply-v1 R2): the text is the delivery itself.
+        ("complete", Some("activation" | "context" | "diff" | "stop")) => {
+            assert!(!body.is_empty(), "{reply}")
+        }
         ("invalid_parameters", _) => {
             // The `apply_patch` body refusals keep their own wording (symbol-read-edit-v1 §5).
             assert!(
@@ -565,7 +569,7 @@ fn assert_claude_envelope(reply: &Value) -> &str {
 /// receives instead of the typed JSON copy. Only successful edits can advertise a post-read
 /// source reference; refusal prose is never parsed as one. Unset fields are simply absent from
 /// the returned object, matching `serde_json::Value`'s null-on-missing-key indexing.
-fn claude_fields(text: &str) -> Value {
+fn claude_fields(tool: &str, text: &str) -> Value {
     /// Returns the bounded token starting at `text`, ending at the first space, `;`, `\n`, `.`, `)`
     /// or the string end; every identifier this parser extracts (`reason`, `code`, `outcome`,
     /// `detail_ref`, `source_ref`) is itself a single space-free token, so this stops exactly where
@@ -610,25 +614,22 @@ fn claude_fields(text: &str) -> Value {
             "result":{"outcome":outcome,"source_ref":source_ref},
         });
     }
-    for kind in ["activation", "context", "diff", "stop"] {
-        let Some(rest) = text.strip_prefix(&format!("complete {kind}: ")) else {
-            continue;
-        };
-        let continuation = rest.contains("\nOutput is truncated; use ide.inspect");
-        let truncated = continuation || rest.contains("\nOutput is incomplete;");
-        let detail_ref = after(rest, "detail_ref ").or_else(|| after(rest, "source_ref "));
-        let body_end = [
-            "\nNext: use ide.outline a file or ide.symbol a name",
-            "\nOutput is truncated;",
-            "\nOutput is incomplete;",
-            "\nDiagnostics are exactly as reported;",
-            "\nNext: use ide.stop",
-            "\nWorkspace authority is released",
-        ]
-        .into_iter()
-        .filter_map(|marker| rest.find(marker))
-        .min()
-        .unwrap_or(rest.len());
+    // Complete replies carry no label (harness-reply-v1 R2): the tool that was called names the
+    // kind, and a cut ends with one `Cut; …` trailer line.
+    let kind = match tool {
+        "ide.start" => Some("activation"),
+        "ide.context" => Some("context"),
+        "ide.diff" => Some("diff"),
+        "ide.stop" => Some("stop"),
+        _ => None,
+    };
+    if let Some(kind) = kind {
+        let rest = text;
+        let continuation = rest.contains("\nCut; ide.inspect {");
+        let truncated = continuation || rest.contains("\nCut; nothing more to fetch");
+        let detail_ref = after(rest, "{\"detail_ref\":\"")
+            .map(|reference| reference.split('"').next().unwrap_or(reference));
+        let body_end = rest.find("\nCut; ").unwrap_or(rest.len());
         return json!({
             "state":"complete","kind":kind,"text":&rest[..body_end],
             "truncated":truncated,"continuation":continuation,"detail_ref":detail_ref,
@@ -2261,7 +2262,7 @@ async fn binary_active_native_hooks_accept_edits_deletes_renames_and_failed_comm
     hook(&runtime, "PreToolUse", "session_id", "actor", "start").await;
     boundary(
         &mcp.exchange(host_call("actor", "start", "ide.start")).await,
-        "complete activation",
+        "End the task with ide.stop.",
     );
     assert_eq!(
         post_ack(&runtime, "actor", "start").await["state"],
@@ -3240,7 +3241,10 @@ impl ProductActor {
             .claude_lifecycle_output(fixture, "PostToolUse", &call)
             .await;
         assert!(post.status.success() && post.stderr.is_empty());
-        (claude_fields(assert_claude_envelope(&reply)), post.stdout)
+        (
+            claude_fields(name, assert_claude_envelope(&reply)),
+            post.stdout,
+        )
     }
     /// Runs one native Claude tool's Pre/Post hooks and returns the post hook's stdout.
     ///
@@ -3545,7 +3549,7 @@ async fn managed_claude_call(
     )
     .await;
     assert!(post.status.success() && post.stderr.is_empty());
-    claude_fields(assert_claude_envelope(&reply))
+    claude_fields(name, assert_claude_envelope(&reply))
 }
 
 /// Runs one managed Claude hook whose shell `cwd` is `cwd` while `CLAUDE_PROJECT_DIR` stays
@@ -3602,7 +3606,7 @@ async fn managed_claude_call_from(
     )
     .await;
     assert!(post.status.success() && post.stderr.is_empty());
-    claude_fields(assert_claude_envelope(&reply))
+    claude_fields(name, assert_claude_envelope(&reply))
 }
 
 /// Polls one pending managed Claude start through hook-paired `ide.inspect` calls until it settles.
@@ -3678,7 +3682,7 @@ async fn managed_claude_modern_call(
     )
     .await;
     assert!(post.status.success() && post.stderr.is_empty());
-    claude_fields(assert_claude_envelope(&reply))
+    claude_fields(name, assert_claude_envelope(&reply))
 }
 
 /// Lists live short managed runtime directories so EOF cleanup can be observed at the product edge.
@@ -5073,7 +5077,7 @@ async fn managed_claude_root_child_rendezvous_shared_daemon_survives_eof() {
         )
         .await;
     assert_eq!(
-        claude_fields(assert_claude_envelope(&unbound)),
+        claude_fields("ide.start", assert_claude_envelope(&unbound)),
         json!({"state":"unavailable","reason":"host_binding"}),
         "{unbound}"
     );
@@ -5112,7 +5116,7 @@ async fn managed_claude_root_child_rendezvous_shared_daemon_survives_eof() {
         )
         .await;
     assert_eq!(
-        claude_fields(assert_claude_envelope(&denied)),
+        claude_fields("ide.start", assert_claude_envelope(&denied)),
         json!({"state":"unavailable","reason":"host_binding"}),
         "{denied}"
     );
@@ -5671,7 +5675,7 @@ async fn claude_call_with_a_late_pre_hook_is_served_not_refused() {
     })
     .await
     .expect("late-pre call answers within the deadline");
-    let fields = claude_fields(assert_claude_envelope(&reply));
+    let fields = claude_fields("ide.read", assert_claude_envelope(&reply));
     let text = fields["text"].as_str().unwrap_or_default();
     assert!(
         text.contains("pub fn value() -> i32") && !text.contains("source_ref"),
@@ -6041,7 +6045,7 @@ async fn claude_context_pages_survive_native_posts_but_not_real_edits() {
         refused_text.contains("error: source_unavailable")
             && refused_text.contains("inspect:source_changed")
             && refused_text.contains("\"claude-pages.py\" changed since this result was captured")
-            && refused_text.contains("Call ide.context with this path again for fresh bytes"),
+            && refused_text.contains("Read it again with ide.read"),
         "{refused_text}"
     );
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
@@ -10658,8 +10662,11 @@ async fn batch_wait_semantic_outline(
 /// project checks can run at all (a Seatbelt-denied host answers `unknown` for every edit).
 fn batch_diagnostics_segment(edit: &Value) -> String {
     match edit["diagnostics"]["state"].as_str().unwrap_or_default() {
-        "current_clean" => "diagnostics: current_clean. Next: use ide.diff".to_owned(),
-        "unknown" => "diagnostics: unknown. Next: use ide.context with kind problems".to_owned(),
+        "current_clean" => "diagnostics: current_clean".to_owned(),
+        "unknown" => {
+            "diagnostics: unknown (ide.inspect {\"kind\":\"problems\"} shows the project check)"
+                .to_owned()
+        }
         "not_analysed" => format!(
             "diagnostics: not_analysed ({})",
             edit["diagnostics"]["reason"].as_str().unwrap_or_default()
@@ -11835,7 +11842,7 @@ async fn configured_product_batch_read_budget_footer_duplicate_and_unknown_symbo
          duplicates shown once: src/big.rs#huge_a\n\
          not included (over the reply budget): src/big.rs#huge_b — call ide.read \
          {{\"symbols\":[\"src/big.rs#huge_b\"]}}\n\n\
-         Output is incomplete"
+         Cut; nothing more to fetch"
     ));
     assert_eq!(read_text, expected, "{read_text}");
     // The cut symbol's body is not in the reply, and the footer's exact call fetches it in full.
@@ -15096,9 +15103,8 @@ async fn configured_product_activation_reply_includes_the_project_card() {
         "ide.read {\"items\"",
         "ide.outline {\"paths\"",
         "ide.symbol {\"symbols\"",
-        "ide.graph {\"symbols\"",
         "ide.test {\"targets\"",
-        "ide.edit {\"operation_id\"",
+        "ide.edit {\"symbol\"",
         "ide.inspect {\"detail_refs\"",
     ] {
         assert!(signature.contains(form), "{form}: {signature}");
@@ -18433,7 +18439,7 @@ async fn configured_product_pending_context_job_completes_and_native_hook_delive
     assert_eq!(full["kind"], "context", "{full}");
     let text = full["text"].as_str().unwrap();
     assert!(
-        text.contains("Provider reported 1 diagnostics") && text.contains("reportReturnType"),
+        text.contains("1 diagnostics reported for this file") && text.contains("reportReturnType"),
         "{full}"
     );
 
@@ -22441,7 +22447,7 @@ async fn outbox_claude_stop_flushes_undelivered_facts() {
         )
         .await;
     let text = assert_claude_envelope(&reply).to_owned();
-    assert!(text.starts_with("complete stop: "), "{text}");
+    assert!(!text.starts_with("complete"), "{text}");
     assert_eq!(
         text.matches("\ntest-finished tests #1: ").count(),
         1,
@@ -22614,7 +22620,7 @@ async fn eyes_claude_method_replies_never_carry_the_plate() {
             .await;
         let text = assert_claude_envelope(&reply);
         assert!(!text.starts_with("<agent-ide>"), "{text}");
-        if text.starts_with("complete context: rust: ready; errors: 2") {
+        if text.starts_with("rust: ready; errors: 2") {
             break text.to_owned();
         }
         assert!(
@@ -22623,10 +22629,7 @@ async fn eyes_claude_method_replies_never_carry_the_plate() {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
-    assert!(
-        problems.starts_with("complete context: rust: ready; errors: 2"),
-        "{problems}"
-    );
+    assert!(problems.starts_with("rust: ready; errors: 2"), "{problems}");
 
     // The plate was never consumed by a method reply: the next native post hook delivers it.
     let first = await_eyes_result(&mut actor, &fixture).await;
@@ -22669,7 +22672,7 @@ async fn eyes_claude_native_post_delivers_due_first_check_plate_once() {
                 "name":name,"arguments":arguments,"_meta":{"claudecode/toolUseId":call}}}),
             )
             .await;
-        (claude_fields(assert_claude_envelope(&reply)), call)
+        (claude_fields(name, assert_claude_envelope(&reply)), call)
     }
 
     let fixture = ProductFixture::new(json!([]));
@@ -23805,7 +23808,7 @@ async fn claude_settled_text(
         .await;
         assert!(post.status.success());
         let text = assert_claude_envelope(&reply).to_owned();
-        let fields = claude_fields(&text);
+        let fields = claude_fields(&name, &text);
         if fields["state"] != "pending" {
             return text;
         }
@@ -23985,7 +23988,7 @@ async fn managed_claude_recovery_waits_for_a_late_pre_and_keeps_a_reader() {
     })
     .await
     .unwrap();
-    let read = claude_fields(assert_claude_envelope(&reply));
+    let read = claude_fields("ide.read", assert_claude_envelope(&reply));
     let read =
         settle_managed_claude_start(&mut mcp, &fixture.root, &mut next, session, None, &read).await;
     assert!(claude_text(&read).contains("pub fn value()"), "{read}");

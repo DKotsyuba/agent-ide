@@ -488,12 +488,12 @@ impl PresentationReceipt {
                      Presentation degraded (presentation_failed). {recovery}{diagnostics}"
                 )
             }
-            Self::Stop => "complete stop: presentation degraded (presentation_failed)\n\
-                 Workspace authority is released; native edits remain on disk"
-                .to_owned(),
+            Self::Stop => {
+                "presentation degraded (presentation_failed); the workspace is released".to_owned()
+            }
             Self::Activation => {
-                "complete activation: presentation degraded (presentation_failed)\n\
-                 The workspace is active; repeat ide.start with the same activation_id for the project card"
+                "presentation degraded (presentation_failed); the workspace is active, repeat \
+                 ide.start with the same activation_id for the project card"
                     .to_owned()
             }
         };
@@ -656,7 +656,7 @@ mod tests {
         );
         assert!(
             text.contains(
-                "diagnostics: current_clean. Next: use ide.diff\n\
+                "diagnostics: current_clean\n\
                  renamed c → cee; 3 sites in 2 files: src/lib.rs (2), tests/x.rs (1)"
             ),
             "{text}"
@@ -1030,27 +1030,27 @@ mod tests {
             ),
             (
                 "inspect:source_changed",
-                "error: source_unavailable (inspect:source_changed); the source changed since this result was captured. Call ide.context again for fresh bytes",
+                "error: source_unavailable (inspect:source_changed); the source changed since this result was captured. Read it again with ide.read",
             ),
             (
                 "inspect:source_changed:\"src/main.rs\"",
-                "error: source_unavailable (inspect:source_changed); \"src/main.rs\" changed since this result was captured. Call ide.context with this path again for fresh bytes",
+                "error: source_unavailable (inspect:source_changed); \"src/main.rs\" changed since this result was captured. Read it again with ide.read",
             ),
             (
                 "inspect:source_changed:\"src/main.rs\"",
-                "error: source_unavailable (inspect:source_changed); \"src/main.rs\" changed since this result was captured. Call ide.context with this path again for fresh bytes",
+                "error: source_unavailable (inspect:source_changed); \"src/main.rs\" changed since this result was captured. Read it again with ide.read",
             ),
             (
                 "context:source_changed",
-                "error: source_unavailable (context:source_changed); the source changed since it was read. Re-read it with ide.context, then retry with the new source_ref",
+                "error: source_unavailable (context:source_changed); the source changed since it was read. Re-read it with ide.read, then retry",
             ),
             (
                 "context:source_changed:\"src/main.rs\"",
-                "error: source_unavailable (context:source_changed); \"src/main.rs\" changed since it was read. Re-read it with ide.context, then retry with the new source_ref",
+                "error: source_unavailable (context:source_changed); \"src/main.rs\" changed since it was read. Re-read it with ide.read, then retry",
             ),
             (
                 "context:observation_failed:\"src/main.rs\"",
-                "error: source_unavailable (context:observation_failed); \"src/main.rs\" could not be read through the confined reader. Retry ide.context, or continue with native tools",
+                "error: source_unavailable (context:observation_failed); \"src/main.rs\" could not be read through the confined reader. Retry the call, or continue with native tools",
             ),
             (
                 "read:line_range:file has 249 lines; requested 286-334",
@@ -1089,7 +1089,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&bare),
-            "error: source_unavailable (context:source_unavailable); the requested source could not be read. Retry ide.context, or continue with native tools"
+            "error: source_unavailable (context:source_unavailable); the requested source could not be read. Retry the call, or continue with native tools"
         );
     }
 
@@ -1489,7 +1489,7 @@ mod tests {
             (
                 FailureCode::UnknownSymbol,
                 "edit:range_past_end: line 17 is past the end of src/a.rs (3 lines)",
-                "error: unknown_symbol (edit:range_past_end); line 17 is past the end of src/a.rs (3 lines). Re-read the range with ide.read and retry with a fresh source_ref",
+                "error: unknown_symbol (edit:range_past_end); line 17 is past the end of src/a.rs (3 lines). Re-read the symbol with ide.read, then retry",
             ),
             (
                 FailureCode::ProviderUnavailable,
@@ -1539,27 +1539,27 @@ mod tests {
             (
                 FailureCode::ProviderUnavailable,
                 "symbol:provider_unavailable (fixtureserver: workspace load failed; outline and read answer from source)",
-                "error: provider_unavailable (symbol:provider_unavailable (fixtureserver: workspace load failed; outline and read answer from source)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
+                "error: provider_unavailable (symbol:provider_unavailable (fixtureserver: workspace load failed; outline and read answer from source)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.inspect {\"kind\":\"problems\"} shows the project check)",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "read:provider_unavailable (fixtureserver: transport gone; outline and read answer from source)",
-                "error: provider_unavailable (read:provider_unavailable (fixtureserver: transport gone; outline and read answer from source)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
+                "error: provider_unavailable (read:provider_unavailable (fixtureserver: transport gone; outline and read answer from source)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.inspect {\"kind\":\"problems\"} shows the project check)",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "symbol:provider_unavailable (fixtureserver: references request failed; outline and read answer from source)",
-                "error: provider_unavailable (symbol:provider_unavailable (fixtureserver: references request failed; outline and read answer from source)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
+                "error: provider_unavailable (symbol:provider_unavailable (fixtureserver: references request failed; outline and read answer from source)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.inspect {\"kind\":\"problems\"} shows the project check)",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "outline:provider_unavailable (fixtureserver: documentSymbols request failed; use native reads)",
-                "error: provider_unavailable (outline:provider_unavailable (fixtureserver: documentSymbols request failed; use native reads)); the language server cannot answer semantic requests. No source outline answers either; use native reads. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
+                "error: provider_unavailable (outline:provider_unavailable (fixtureserver: documentSymbols request failed; use native reads)); the language server cannot answer semantic requests. No source outline answers either; use native reads. Retry later; if it keeps failing, fix what stops the project from loading (ide.inspect {\"kind\":\"problems\"} shows the project check)",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "symbol:provider_unavailable (fixtureserver-plain: workspace load failed; use native reads)",
-                "error: provider_unavailable (symbol:provider_unavailable (fixtureserver-plain: workspace load failed; use native reads)); the language server cannot answer semantic requests. No source outline answers either; use native reads. Retry later; if it keeps failing, fix what stops the project from loading (ide.context {\"kind\":\"problems\"} shows the project check)",
+                "error: provider_unavailable (symbol:provider_unavailable (fixtureserver-plain: workspace load failed; use native reads)); the language server cannot answer semantic requests. No source outline answers either; use native reads. Retry later; if it keeps failing, fix what stops the project from loading (ide.inspect {\"kind\":\"problems\"} shows the project check)",
             ),
             (
                 FailureCode::InvalidDetail,
@@ -1673,7 +1673,7 @@ mod tests {
         let rendered = render(reply, Envelope::WithStructured).unwrap();
         let text = text_of(&rendered);
         assert!(call_tool_result_fits(&rendered), "{text}");
-        assert!(text.contains("resolution_unverified") && text.contains("ide.context"));
+        assert!(text.contains("resolution_unverified") && text.contains("retry the call"));
         assert!(text.contains("tsconfig.json") && text.contains("src/outside.ts"));
         assert!(!text.contains("native"));
         assert_eq!(rendered.structured_content, Some(expected));
@@ -1743,9 +1743,9 @@ mod tests {
             (
                 EditDiagnostics::CurrentClean { project_errors: 0 },
                 "current_clean",
-                "ide.diff",
+                "current_clean",
             ),
-            (EditDiagnostics::Unknown {}, "unknown", "ide.context"),
+            (EditDiagnostics::Unknown {}, "unknown", "ide.inspect"),
             (
                 EditDiagnostics::Pending {
                     detail_ref: "diagnostic-detail".into(),
@@ -1797,17 +1797,14 @@ mod tests {
         assert!(
             text.ends_with(
                 "diagnostics: current_clean for this file; the project check reports 7 errors in \
-                 other files. Next: use ide.context with kind problems"
+                 other files (ide.inspect {\"kind\":\"problems\"})"
             ),
             "{text}"
         );
         let passing = successful_edit_reply(EditDiagnostics::CurrentClean { project_errors: 0 });
         let rendered = render(passing, Envelope::TextOnly).unwrap();
         let text = text_of(&rendered);
-        assert!(
-            text.ends_with("diagnostics: current_clean. Next: use ide.diff"),
-            "{text}"
-        );
+        assert!(text.ends_with("diagnostics: current_clean"), "{text}");
     }
 
     /// Names the changed file or incomplete read and directs the caller to the newest usable reference.
@@ -1822,10 +1819,10 @@ mod tests {
         let rendered = render(reply, Envelope::TextOnly).unwrap();
         let text = text_of(&rendered);
         assert!(text.contains("No write occurred"));
-        assert!(text.contains("this file changed or the source_ref missed part of its read"));
+        assert!(text.contains("the file changed"));
         assert!(
-            text.contains("Re-read with ide.read and inspect every page before retrying")
-                && !text.contains("newest source_ref"),
+            text.contains("Re-read the symbol with ide.read, then retry")
+                && !text.contains("source_ref"),
             "{text}"
         );
     }
@@ -1881,12 +1878,10 @@ mod tests {
         }
     }
 
-    /// Closes the T14B gap where a Claude reader, which never sees `structuredContent`, would have
-    /// no way to learn the `source_ref` a later `ide.edit` needs: unlike Diff, Context's
-    /// `detail_ref` names the exact same-binding source an `ide.edit` `source_ref` must match, so
-    /// it belongs in the compact text whenever it is `Some`, truncated or not, continuation or not.
+    /// Edits need no file-version reference, so a Context reply never teaches one: it is the
+    /// bare text, plus a single cut trailer when the text is incomplete.
     #[test]
-    fn context_text_always_carries_its_edit_source_ref() {
+    fn context_text_never_carries_a_source_ref() {
         for (truncated, continuation) in [(false, false), (true, false)] {
             let rendered = render(
                 PeerReply::Complete {
@@ -1901,9 +1896,10 @@ mod tests {
             .unwrap();
             let text = text_of(&rendered);
             assert!(
-                text.contains("source_ref live-source-detail") && text.contains("ide.edit"),
+                !text.contains("source_ref") && !text.contains("live-source-detail"),
                 "{text}"
             );
+            assert_eq!(text.contains("Cut;"), truncated, "{text}");
         }
     }
 
@@ -1922,7 +1918,7 @@ mod tests {
         )
         .unwrap();
         let text = text_of(&rendered);
-        assert_eq!(text, "complete context: beta: unavailable:env_missing");
+        assert_eq!(text, "beta: unavailable:env_missing");
     }
 
     /// Keeps a page's final source newline separate from the continuation instruction.
@@ -1941,7 +1937,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&rendered),
-            "complete context: page 1; bytes 0-2 of 4\n\nx\n\nOutput is truncated; use ide.inspect with detail_ref next-page before editing"
+            "page 1; bytes 0-2 of 4\n\nx\n\nCut; ide.inspect {\"detail_ref\":\"next-page\"} continues"
         );
         let without_trailing_newline = render(
             PeerReply::Complete {
@@ -1956,7 +1952,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&without_trailing_newline),
-            "complete context: x\nOutput is truncated; use ide.inspect with detail_ref next-page before editing"
+            "x\nCut; ide.inspect {\"detail_ref\":\"next-page\"} continues"
         );
     }
 
@@ -1997,12 +1993,14 @@ mod tests {
         )
         .unwrap();
         assert!(
-            text_of(&context).contains("incomplete") && !text_of(&context).contains("ide.inspect")
+            text_of(&context).contains("nothing more to fetch")
+                && !text_of(&context).contains("ide.inspect")
         );
         assert!(
-            text_of(&diff).contains("stop or review") && !text_of(&diff).contains("ide.inspect")
+            text_of(&diff).contains("nothing more to fetch")
+                && !text_of(&diff).contains("ide.inspect")
         );
-        assert!(text_of(&paged).contains("ide.inspect with detail_ref page-detail"));
+        assert!(text_of(&paged).contains("ide.inspect {\"detail_ref\":\"page-detail\"}"));
     }
 
     /// Sends duplicate-edit recovery through the IDE context path with a fresh operation identity.
@@ -2020,7 +2018,7 @@ mod tests {
         )
         .unwrap();
         let text = text_of(&rendered);
-        assert!(text.contains("use ide.context") && text.contains("new operation_id"));
+        assert!(text.contains("with ide.read") && text.contains("new operation_id"));
         assert!(!text.contains("native tools"));
     }
 
@@ -2082,7 +2080,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            text_of(&rendered).starts_with(&format!("{plate}\ncomplete context: alpha: ready")),
+            text_of(&rendered).starts_with(&format!("{plate}\nalpha: ready")),
             "{}",
             text_of(&rendered)
         );
@@ -2121,7 +2119,7 @@ mod tests {
         };
         assert!(call_tool_result_fits(&rendered));
         assert!(
-            text_of(&rendered).starts_with(&format!("{plate}\ncomplete context:")),
+            text_of(&rendered).starts_with(&format!("{plate}\n")),
             "{}",
             text_of(&rendered)
         );
