@@ -883,7 +883,9 @@ mod tests {
         }
     }
 
-    /// Covers every non-edit state and result kind with one compact structured projection.
+    /// Covers every non-edit state and result kind with one compact projection; refusals have
+    /// a bounded natural head and repair while the structured oracle retains its closed tags.
+    /// Feedback and complete bodies arrive byte-exactly rather than being replaced by an ack.
     #[test]
     fn every_reply_state_has_one_compact_text_block_and_equal_structured_content() {
         let replies = vec![
@@ -939,13 +941,34 @@ mod tests {
         ];
         for reply in replies {
             let expected = serde_json::to_value(&reply).unwrap();
-            let rendered = render(reply, Envelope::WithStructured).unwrap();
+            let rendered = render(reply, Envelope::WithStructured)
+                .unwrap_or_else(|| panic!("missing projection for {expected:?}"));
             let text = text_of(&rendered);
             assert!(!text.starts_with('{') && !text.contains("\"state\""));
-            for field in ["reason", "code"] {
-                if let Some(value) = expected[field].as_str() {
-                    assert!(text.contains(value));
-                }
+            if matches!(expected["state"].as_str(), Some("feedback" | "complete")) {
+                assert_eq!(Some(text), expected["text"].as_str(), "{expected:?}");
+            }
+            if matches!(
+                expected["state"].as_str(),
+                Some("unavailable" | "error" | "invalid_parameters")
+            ) {
+                let lines = text.lines().collect::<Vec<_>>();
+                assert!(lines[0].len() <= 160, "{text}");
+                assert!(
+                    lines[1].starts_with("Repair:") && lines[1].len() <= 120,
+                    "{text}"
+                );
+                assert_eq!(
+                    lines
+                        .iter()
+                        .filter(|line| line.starts_with("Repair:"))
+                        .count(),
+                    1
+                );
+                assert!(
+                    !text.starts_with("error:") && !text.starts_with("unavailable:"),
+                    "{text}"
+                );
             }
             assert_eq!(rendered.structured_content, Some(expected.clone()));
             assert_eq!(
@@ -2296,8 +2319,8 @@ mod tests {
         )
         .unwrap();
         let text = text_of(&newline_path);
-        assert!(text.contains("no_such_file: src/li\\ng.rs"), "{text}");
-        assert!(!text.contains('\n'), "{text}");
+        assert_eq!(text.lines().nth(2), Some("  src/li\\ng.rs"), "{text}");
+        assert_eq!(text.lines().count(), 3, "{text}");
         assert_eq!(
             newline_path.structured_content.unwrap()["code"]["no_such_file"],
             "src/li\ng.rs"

@@ -61,6 +61,21 @@ Contract:
 {{ refusal("The host could not bind this IDE call.", "Repeat the call as a new tool invocation.") }}
 {%- endif -%}
 {%- endif -%}
+{%- if state == "hook_observed" -%}
+Hook retained.
+{%- endif -%}
+{%- if state == "hook_settled" -%}
+Hook settled.
+{%- endif -%}
+{%- if state == "native_hook_observed" -%}
+Event retained.
+{%- endif -%}
+{%- if state == "feedback" -%}
+{{ text }}
+{%- endif -%}
+{%- if state == "host_stopped" -%}
+Host binding released.
+{%- endif -%}
 {%- if state == "pending" -%}
 The result arrives by itself in an <agent-ide> block. Result reference: {{ detail_ref }}
 {%- endif -%}

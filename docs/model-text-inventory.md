@@ -47,7 +47,7 @@ That record keeps unadvertised protocol compatibility without model idle-wait ad
 
 | Source | Where | Before | After | Status |
 |---|---|---|---|---|
-| Reply template (G) | `assets/mcp/reply.jinja` | 37,119 | 23,046 | rewritten: bounded natural refusals; no `complete <kind>:` labels, no `Next:` lines, one `Cut; …` trailer; stale writes repeat the call, while an explicitly supplied stale legacy reference keeps its own repair note |
+| Reply template (G) | `assets/mcp/reply.jinja` | 37,119 | 23,375 | rewritten: bounded natural refusals; no `complete <kind>:` labels, no `Next:` lines, one `Cut; …` trailer; short hook acknowledgements and exact feedback; pinned read/edit receipts retained |
 | Read, outline, symbol headers and per-item lines | `batch.rs`, `symbols.rs` (M-029/M-028) | n/a | n/a | owned |
 | Edit reply lines and refusals with `Repair:` | `batch.rs`, `batch_edit.rs`, `edit_forms.rs` (M-029) | n/a | n/a | owned |
 | Generic refusals | `reply.jinja` typed branches, `content.rs` `refusal_text`, `facade.rs` transport fallbacks | reason-code labels and alternative actions | head ≤160 UTF-8 bytes, one Repair ≤120 bytes, optional quoted excerpt ≤60 lines/4 KiB | rewritten: current units, held-writer facts and uncertain stop outcomes remain data; reconnect hints replace the repair |
