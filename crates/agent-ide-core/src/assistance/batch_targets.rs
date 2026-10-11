@@ -155,7 +155,7 @@ fn compose_symbols(
                 truncated: true,
                 continuation: false,
             },
-            content::Envelope::WithStructured,
+            content::reply_envelope(),
         )
     };
     let included = (1..=entries.len())
@@ -486,7 +486,7 @@ impl Worker<'_> {
                     truncated: true,
                     continuation: false,
                 },
-                content::Envelope::WithStructured,
+                content::reply_envelope(),
             )
         };
         let full = |index: usize, count: usize| {

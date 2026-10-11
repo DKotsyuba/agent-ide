@@ -747,7 +747,7 @@ fn diff_page_fits(
             &diff_page_reply(
                 mode, epoch, reference, provenance, later, candidate, retained,
             ),
-            content::Envelope::WithStructured,
+            content::reply_envelope(),
         )
     })
 }
@@ -779,7 +779,7 @@ pub(super) fn diff_capacity_detail(
         &candidate.inventory_only(),
         false,
     );
-    if content::fits(&metadata, content::Envelope::WithStructured) {
+    if content::fits(&metadata, content::reply_envelope()) {
         candidate.line_capacity_detail()
     } else {
         "diff:reply_inventory".to_owned()

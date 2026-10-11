@@ -108,8 +108,23 @@ impl Mcp {
     /// version and client capabilities in `_meta`, so the caller's own first frame opens the
     /// session and proves the modern lifecycle on the raw wire (MCP-02).
     async fn start_raw(runtime: &Path, attachment: Option<&str>) -> Self {
+        Self::start_raw_with(runtime, attachment, false).await
+    }
+
+    /// Starts the raw session without the structured-reply test seam, so replies are exactly what
+    /// a production binary sends: one text block and no `structuredContent` (harness-reply-v1 R1).
+    async fn start_raw_text_only(runtime: &Path, attachment: Option<&str>) -> Self {
+        Self::start_raw_with(runtime, attachment, true).await
+    }
+
+    /// Shared body of [`Self::start_raw`]; `text_only` removes the structured-reply seam that
+    /// `.cargo/config.toml` sets for every product test.
+    async fn start_raw_with(runtime: &Path, attachment: Option<&str>, text_only: bool) -> Self {
         let mut command = Command::new(product_binary());
         command.env("TOKIO_WORKER_THREADS", "1");
+        if text_only {
+            command.env_remove("AGENT_IDE_TEST_STRUCTURED_REPLIES");
+        }
         command
             .args(["mcp", "--runtime-dir"])
             .arg(runtime)
@@ -300,8 +315,13 @@ impl Mcp {
             .args(["mcp", "--auto-launcher-template"])
             .arg(template)
             .current_dir(cwd);
+        // An empty value removes the variable instead of setting it.
         for (name, value) in evidence {
-            command.env(name, value);
+            if value.is_empty() {
+                command.env_remove(name);
+            } else {
+                command.env(name, value);
+            }
         }
         command
             .stdin(Stdio::piped())
@@ -324,12 +344,14 @@ impl Mcp {
     }
 
     /// Starts the auto-mode MCP as the live ZCode child runs: `ZCODE_*` evidence, no
-    /// `CLAUDE_PROJECT_DIR`, the workspace directory as the captured candidate.
+    /// `CLAUDE_PROJECT_DIR`, the workspace directory as the captured candidate. It also drops the
+    /// structured-reply seam, so its replies are the production text-only carrier.
     async fn start_managed_auto(template: &Path, cwd: &Path) -> Self {
         Self::start_managed_auto_with(
             template,
             cwd,
             &[
+                ("AGENT_IDE_TEST_STRUCTURED_REPLIES", ""),
                 ("ZCODE_APP_VERSION", "3.14.3"),
                 ("ZCODE_ENV", "production"),
                 ("ZCODE_PROCESS_LABEL", "local-1"),
@@ -1102,11 +1124,11 @@ async fn binary_routes_methods_to_typed_missing_peer_and_survives_daemon_loss() 
     std::fs::remove_dir_all(runtime).unwrap();
 }
 
-/// A modern Codex session (2026-07-28, no `initialize`) still receives the `structuredContent`
-/// duplicate: the Codex contract is selected from per-request `_meta`, never from the handshake,
-/// and ordinary calls route to the typed daemon reply exactly as the legacy twin above.
+/// A modern Codex session (2026-07-28, no `initialize`) receives one text block and no
+/// `structuredContent` (harness-reply-v1 R1): the Codex contract is selected from per-request
+/// `_meta`, never from the handshake, and Codex shows only `structuredContent` when present.
 #[tokio::test]
-async fn modern_codex_call_keeps_structured_content_without_initialize() {
+async fn modern_codex_call_is_text_only_without_initialize() {
     let runtime = runtime();
     let mut daemon = Command::new(product_binary())
         .args(["daemon", "--runtime-dir"])
@@ -1134,7 +1156,7 @@ async fn modern_codex_call_keeps_structured_content_without_initialize() {
     })
     .await
     .unwrap();
-    let mut mcp = Mcp::start_raw(&runtime, Some("private-host-channel")).await;
+    let mut mcp = Mcp::start_raw_text_only(&runtime, Some("private-host-channel")).await;
     let response = mcp
         .exchange(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
             "name":"ide.diff","arguments":{},
@@ -1142,9 +1164,19 @@ async fn modern_codex_call_keeps_structured_content_without_initialize() {
         }}))
         .await;
     assert_ne!(response["result"]["isError"], json!(true), "{response}");
+    assert!(
+        response["result"].get("structuredContent").is_none(),
+        "{response}"
+    );
     assert_eq!(
-        response["result"]["structuredContent"],
-        json!({"state":"unavailable","reason":"host_binding"}),
+        response["result"]["content"].as_array().map(Vec::len),
+        Some(1),
+        "{response}"
+    );
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("unavailable: host_binding")),
         "{response}"
     );
     daemon.kill().await.unwrap();
@@ -7366,8 +7398,7 @@ async fn managed_auto_zcode_host_reroots_like_claude() {
     let mut mcp = Mcp::start_managed_auto(&fixture.config, &workspace).await;
 
     // A call carrying no supported host metadata can never correlate: it names the closed cause.
-    // (An unrecognized host is not known to misuse `structuredContent`, so this call keeps both
-    // projections; only a recognized Claude call is text-only.)
+    // (Every host, recognized or not, receives one text block and no `structuredContent`.)
     let unrecognized = mcp
         .exchange(
             json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
@@ -7380,9 +7411,8 @@ async fn managed_auto_zcode_host_reroots_like_claude() {
         "unavailable: host_binding (host_unrecognized); this host did not identify the call in a supported format. Continue with native tools",
         "{unrecognized}"
     );
-    assert_eq!(
-        unrecognized["result"]["structuredContent"],
-        json!({"state":"unavailable","reason":"host_binding"}),
+    assert!(
+        unrecognized["result"].get("structuredContent").is_none(),
         "{unrecognized}"
     );
 

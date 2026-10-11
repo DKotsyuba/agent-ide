@@ -349,10 +349,9 @@ impl ContextPageState {
                 truncated: continuation || self.source_truncated,
                 continuation,
             };
-            // Same host-unaware conservative sizing as `snapshots::fit_diff_page` (T14B): this
-            // daemon path never learns which MCP host will receive the page, so it stays sized to
-            // fit even alongside the structured JSON copy.
-            if content::fits(&reply, content::Envelope::WithStructured) {
+            // Same sizing as `snapshots::fit_diff_page`: every host receives the compact text
+            // block alone (harness-reply-v1), so the page fits as text only.
+            if content::fits(&reply, content::reply_envelope()) {
                 let next = continuation.then(|| Self {
                     delivered: self.delivered + snapped,
                     page: self.page + 1,
@@ -952,14 +951,13 @@ impl Shared {
             feedback.text.clone()
         };
         // Rendering runs the real shrink loop; keep it off the ledger lock so a large reply never
-        // holds up unrelated bindings. This traces the typed structured value regardless of which
-        // host actually receives the call, so it always renders with the structured envelope (T14B).
-        let survives = render_reply(reply.clone(), content::Envelope::WithStructured)
-            .structured_content
-            .as_ref()
-            .and_then(|value| value.get("text"))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|text| text.contains(&fact));
+        // holds up unrelated bindings. Every host receives the compact text block alone
+        // (harness-reply-v1), so the fact must survive in that text.
+        let survives = render_reply(reply.clone(), content::Envelope::TextOnly)
+            .content
+            .first()
+            .and_then(|block| block.as_text())
+            .is_some_and(|block| block.text.contains(&fact));
         if !survives {
             return;
         }

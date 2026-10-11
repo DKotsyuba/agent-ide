@@ -3621,9 +3621,13 @@ impl StdioFacade {
             );
             return CallToolResult::error(vec![ContentBlock::text(error.message(tool))]);
         }
+        // harness-reply-v1 R1: every host, recognized or not, receives the compact text block
+        // alone; a host shows `structuredContent` in place of it when present, so none is sent.
+        // Only the test seam (`content::reply_envelope`) keeps the typed copy as a test oracle,
+        // and never for Claude.
         let envelope = match parse_host_kind(&context.meta) {
             Ok(HostKind::Claude) => content::Envelope::TextOnly,
-            _ => content::Envelope::WithStructured,
+            _ => content::reply_envelope(),
         };
         // Starts and stops are ordered with actor recovery and lease recovery, so a delayed
         // start reply can never re-remember an actor after its own stop.

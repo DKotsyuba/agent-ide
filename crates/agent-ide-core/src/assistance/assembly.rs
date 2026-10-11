@@ -343,7 +343,7 @@ async fn with_git_notice(
 /// Attaches the due status plate to one reply-delivered host's terminal reply (T28B).
 ///
 /// The plate is marked delivered only once it was actually attached: the whole reply is fitted
-/// into the exact final MCP carrier the host reads (`Envelope::WithStructured`), shrinking only
+/// into the exact final MCP carrier the host reads (`content::reply_envelope()`), shrinking only
 /// owner text, and a plate that cannot fit beside any (possibly shrunk) body stays due for the
 /// next terminal reply. The fitting decision and the delivery record are one atomic feed step.
 fn attach_reply_plate(
@@ -358,7 +358,7 @@ fn attach_reply_plate(
             if super::content::fits_with_status(
                 &fitting,
                 plate,
-                super::content::Envelope::WithStructured,
+                super::content::reply_envelope(),
             ) {
                 return true;
             }
@@ -1399,7 +1399,7 @@ impl ProductDispatcher {
                                 && super::content::fits_with_status(
                                     &reply,
                                     plate,
-                                    super::content::Envelope::WithStructured,
+                                    super::content::reply_envelope(),
                                 )
                         })
                         .await;
@@ -1424,7 +1424,7 @@ impl ProductDispatcher {
                             super::content::fits_with_status(
                                 &reply,
                                 block,
-                                super::content::Envelope::WithStructured,
+                                super::content::reply_envelope(),
                             )
                         },
                     );

@@ -539,7 +539,7 @@ impl Worker<'_> {
                     truncated: true,
                     continuation: false,
                 },
-                content::Envelope::WithStructured,
+                content::reply_envelope(),
             )
         };
         let source_line = |delivered: &[usize]| {

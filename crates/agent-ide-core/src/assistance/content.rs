@@ -15,16 +15,30 @@ const REPLY_TEMPLATE: &str = include_str!("../../../../assets/mcp/reply.jinja");
 /// Selects whether a projected [`CallToolResult`] also carries the duplicate typed
 /// `structuredContent` copy alongside the compact `content` text block.
 ///
-/// The Codex host reads only `structuredContent`, so its acceptance evidence needs
-/// [`Self::WithStructured`]. The Claude host instead hands `structuredContent` straight to its
-/// model in place of `content`, defeating the compact renderer (T14B); the managed Claude MCP
-/// therefore projects [`Self::TextOnly`], so the model sees only the deterministic compact text.
+/// Both hosts show the model `structuredContent` in place of `content` when it is present, which
+/// defeats the compact renderer and doubles the reply bytes. Every production reply therefore
+/// uses [`Self::TextOnly`] (harness-reply-v1 R1); [`Self::WithStructured`] is reachable only
+/// through the `AGENT_IDE_TEST_STRUCTURED_REPLIES` test seam (see [`reply_envelope`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Envelope {
     /// Omits `structuredContent` entirely; the compact `content` text is the only carrier.
     TextOnly,
     /// Carries both the compact `content` text and the complete typed `structuredContent` copy.
+    /// Selected only by the test seam, so the product tests keep the typed reply as their oracle.
     WithStructured,
+}
+
+/// Returns the envelope every non-Claude reply is sized and carried in.
+///
+/// Always [`Envelope::TextOnly`] (harness-reply-v1 R1), for recognized and unrecognized hosts
+/// alike. Only a `test-seams` build with `AGENT_IDE_TEST_STRUCTURED_REPLIES=1` (set for the
+/// workspace tests by `.cargo/config.toml`) selects [`Envelope::WithStructured`]; a release build
+/// never reads the seam.
+pub(crate) fn reply_envelope() -> Envelope {
+    match crate::test_seams::var("AGENT_IDE_TEST_STRUCTURED_REPLIES").as_deref() {
+        Some("1") => Envelope::WithStructured,
+        _ => Envelope::TextOnly,
+    }
 }
 
 /// Renders one validated reply and shrinks only owner text until the final MCP envelope fits.
