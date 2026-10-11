@@ -8419,6 +8419,75 @@ async fn configured_product_task_diff_includes_committed_and_uncommitted_changes
     daemon.wait().await.unwrap();
 }
 
+/// A diff that names no mode answers only what changed since the activation's previous diff: the
+/// first call is whole, a repeat on an unchanged tree is one short line, a later change shows only
+/// its own hunk, and naming a mode always answers the whole diff.
+#[tokio::test]
+async fn configured_product_default_diff_answers_only_what_changed_since_the_last_diff() {
+    let fixture = ProductFixture::new(json!([]));
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "since-last-diff").await;
+    let start = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"since-last-diff"}),
+        )
+        .await;
+    let started = actor.settle(&fixture, start).await;
+    assert_eq!(started["kind"], "activation", "{started}");
+
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub fn value() -> i32 { 8 }\npub fn caller() -> i32 { value() }\n",
+    )
+    .unwrap();
+    let first = actor.call(&fixture, "ide.diff", json!({})).await;
+    let first = actor.settle(&fixture, first).await;
+    let first_text = first["text"].as_str().unwrap();
+    assert!(
+        first_text.contains("+pub fn value() -> i32 { 8 }"),
+        "{first_text}"
+    );
+
+    let again = actor.call(&fixture, "ide.diff", json!({})).await;
+    let again = actor.settle(&fixture, again).await;
+    let again_text = again["text"].as_str().unwrap();
+    assert!(
+        again_text.contains("no changes since your last diff"),
+        "{again_text}"
+    );
+    assert!(!again_text.contains("+pub fn value"), "{again_text}");
+
+    std::fs::write(fixture.root.join("tracked.txt"), "changed after the diff\n").unwrap();
+    let later = actor.call(&fixture, "ide.diff", json!({})).await;
+    let later = actor.settle(&fixture, later).await;
+    let later_text = later["text"].as_str().unwrap();
+    assert!(
+        later_text.contains("+changed after the diff")
+            && later_text.contains("unchanged since your last diff: 1 hunks")
+            && !later_text.contains("+pub fn value"),
+        "{later_text}"
+    );
+
+    let whole = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let whole = actor.settle(&fixture, whole).await;
+    let whole_text = whole["text"].as_str().unwrap();
+    assert!(
+        whole_text.contains("+pub fn value() -> i32 { 8 }")
+            && whole_text.contains("+changed after the diff"),
+        "{whole_text}"
+    );
+
+    let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
+    assert_eq!(stopped["kind"], "stop", "{stopped}");
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Reads every bounded task-diff continuation page for a changeset larger than one page.
 #[tokio::test]
 async fn configured_product_task_diff_paginates_until_every_hunk_is_read() {
@@ -11738,11 +11807,9 @@ async fn configured_product_batch_ranges_read_then_edit_by_those_lines_without_r
     let source_ref = read["detail_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&read_text),
-        format!(
-            "read: 2 items in 1 files — 2 delivered, 0 unchanged, 0 not included, 0 failed\n\
-             src/batch.rs  (lines 5–7)\n5\tpub fn alpha() -> i32 {{\n6\t    helper(1)\n7\t}}\n\
-             src/batch.rs  (lines 9–11)\n 9\tpub fn beta() -> i32 {{\n10\t    helper(2)\n11\t}}\n"
-        ),
+        "read: 2 items in 1 files — 2 delivered, 0 unchanged, 0 not included, 0 failed\n\
+         src/batch.rs  (lines 5–7)\n5\tpub fn alpha() -> i32 {\n6\t    helper(1)\n7\t}\n\
+         src/batch.rs  (lines 9–11)\n 9\tpub fn beta() -> i32 {\n10\t    helper(2)\n11\t}\n",
         "{read_text}"
     );
 
@@ -11837,13 +11904,13 @@ async fn configured_product_batch_read_budget_footer_duplicate_and_unknown_symbo
     for number in 1..=huge_a_end {
         expected.push_str(&format!("{number:>width$}\t{}\n", lines[number - 1]));
     }
-    expected.push_str(&format!(
-        "no such symbol: src/big.rs#missing — check ide.outline {{\"path\":\"src/big.rs\"}}\n\
+    expected.push_str(
+        "no such symbol: src/big.rs#missing — check ide.outline {\"path\":\"src/big.rs\"}\n\
          duplicates shown once: src/big.rs#huge_a\n\
          not included (over the reply budget): src/big.rs#huge_b — call ide.read \
-         {{\"symbols\":[\"src/big.rs#huge_b\"]}}\n\n\
-         Cut; nothing more to fetch"
-    ));
+         {\"symbols\":[\"src/big.rs#huge_b\"]}\n\n\
+         Cut; nothing more to fetch",
+    );
     assert_eq!(read_text, expected, "{read_text}");
     // The cut symbol's body is not in the reply, and the footer's exact call fetches it in full.
     assert!(!read_text.contains("let other_159"), "{read_text}");
@@ -18997,7 +19064,11 @@ async fn diff_retention_full_split_page_fits_its_actual_trailer() {
     assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
     for _ in 0..16 {
         let page = actor
-            .call(&fixture, "ide.diff", json!({"paths":["packed.txt"]}))
+            .call(
+                &fixture,
+                "ide.diff",
+                json!({"mode":"head","paths":["packed.txt"]}),
+            )
             .await;
         let page = actor.settle(&fixture, page).await;
         assert_eq!(page["continuation"], true, "{page}");
@@ -19007,7 +19078,7 @@ async fn diff_retention_full_split_page_fits_its_actual_trailer() {
             .call(
                 &fixture,
                 "ide.diff",
-                json!({"paths":["packed.txt"],"provenance":provenance}),
+                json!({"mode":"head","paths":["packed.txt"],"provenance":provenance}),
             )
             .await;
         let page = actor.settle(&fixture, page).await;
@@ -19312,7 +19383,7 @@ async fn diff_single_line_notice_keeps_later_changes_reachable() {
         .call(
             &fixture,
             "ide.diff",
-            json!({"paths":["src/long.rs","z-last.txt"]}),
+            json!({"mode":"head","paths":["src/long.rs","z-last.txt"]}),
         )
         .await;
     let mut page = actor.settle(&fixture, first).await;
