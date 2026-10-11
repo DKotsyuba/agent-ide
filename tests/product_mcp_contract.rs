@@ -10954,7 +10954,8 @@ async fn configured_product_batch_terminator_old_empty_lines_and_same_line_inser
         batch_without_status_plate(&insert_text),
         format!(
             "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#helper (L5-7)  inserted \
-             (3 lines)\n  src/batch.rs#beta (L9-11)  replaced (3 lines → 3)\n\
+             (3 lines)\n  src/batch.rs#beta (L9-11)  replaced (3 lines → 3); was:\n    \
+             4\tpub fn beta() -> i32 {{\n    5\t    2\n    6\t}}\n\
              lines after 4 moved +5",
             batch_diagnostics_segment(&insert)
         ),
