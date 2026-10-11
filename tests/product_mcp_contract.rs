@@ -550,6 +550,13 @@ fn claude_fields(text: &str) -> Value {
             .map(|index| token(&text[index + marker.len()..]))
     }
 
+    // A delivered fact (an `edit-checked` status plate) may precede the reply proper; the reply's
+    // own facts follow it. The unparsed fallback below keeps the whole text.
+    let original = text;
+    let text = text
+        .strip_prefix("<agent-ide>\n")
+        .and_then(|rest| rest.split_once("</agent-ide>\n"))
+        .map_or(text, |(_, reply)| reply);
     if let Some(rest) = text.strip_prefix("unavailable: ") {
         return json!({"state":"unavailable","reason":token(rest)});
     }
@@ -597,7 +604,7 @@ fn claude_fields(text: &str) -> Value {
             "truncated":truncated,"continuation":continuation,"detail_ref":detail_ref,
         });
     }
-    json!({"text":text})
+    json!({"text":original})
 }
 
 /// Calls one managed Codex tool using only trusted request metadata for actor and sandbox identity.
@@ -6284,7 +6291,8 @@ async fn an_edit_to_an_undeclared_rust_module_is_not_analysed() {
                        "source_ref":context["detail_ref"],"content":content}),
             )
             .await;
-        actor.settle(&fixture, edit).await
+        let edit = actor.settle(&fixture, edit).await;
+        settle_edit_check(&mut actor, &fixture, edit).await
     };
     let orphan = edit("src/orphan.rs", "orphan-create", "pub fn orphan() {}\n").await;
     assert_eq!(orphan["result"]["outcome"], "created", "{orphan}");
@@ -6399,6 +6407,7 @@ printf '{"reason":"build-finished","success":true}\n'
         )
         .await;
     let edited = actor.settle(&fixture, edited).await;
+    let edited = settle_edit_check(&mut actor, &fixture, edited).await;
     assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
     assert_eq!(
         edited["diagnostics"]["state"], "current_reported",
@@ -6466,26 +6475,22 @@ async fn a_full_file_edit_without_source_ref_creates_only_a_missing_file() {
         content
     );
 
-    let before = std::fs::read(fixture.root.join("src/lib.rs")).unwrap();
-    let refused = actor
+    // symbol-read-edit-v1 E10: a whole-file `content` edit of an existing file needs no
+    // `source_ref`; it replaces the current bytes.
+    let replaced = actor
         .call(
             &fixture,
             "ide.edit",
             json!({"operation_id":"create-existing","path":"src/lib.rs",
-                   "content":"pub fn clobbered() {}\n"}),
+                   "content":"pub fn replaced() {}\n"}),
         )
         .await;
-    let refused = actor.settle(&fixture, refused).await;
-    assert_eq!(refused["state"], "invalid_parameters", "{refused}");
+    let replaced = actor.settle(&fixture, replaced).await;
+    assert_eq!(replaced["state"], "edit", "{replaced}");
+    assert_eq!(replaced["result"]["outcome"], "replaced", "{replaced}");
     assert_eq!(
-        refused["text"],
-        "invalid bounded parameters: \"source_ref\" is required to replace an existing file: \
-         read it first (ide.read)",
-        "{refused}"
-    );
-    assert_eq!(
-        std::fs::read(fixture.root.join("src/lib.rs")).unwrap(),
-        before
+        std::fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap(),
+        "pub fn replaced() {}\n"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
@@ -10131,7 +10136,62 @@ async fn batch_settle_with_text(
         .await;
         delay = delay.saturating_mul(2).min(PRODUCT_SETTLE_MAX_DELAY);
     }
+    // An edit answers at once with `diagnostics: pending` (symbol-read-edit-v1 §3.3); its own
+    // reference returns the settled reply once the project check has finished.
+    let mut polls = 0;
+    while reply.0["state"] == "edit" && reply.0["diagnostics"]["state"] == "pending" {
+        assert!(
+            tokio::time::Instant::now() < deadline && polls < PRODUCT_SETTLE_MAX_POLLS,
+            "edit check did not settle: {}",
+            reply.0
+        );
+        let reference = reply.0["diagnostics"]["detail_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        tokio::time::sleep(PRODUCT_SETTLE_INITIAL_DELAY).await;
+        polls += 1;
+        let next = batch_call_with_text(
+            actor,
+            fixture,
+            "ide.inspect",
+            json!({"detail_ref":reference}),
+        )
+        .await;
+        if next.0["state"] == "edit" || next.0["state"] == "pending" {
+            reply = next;
+        }
+    }
     reply
+}
+
+/// An edit reply whose diagnostics are still `pending` settled through its own reference
+/// (symbol-read-edit-v1 §3.3); any other reply is returned unchanged.
+async fn settle_edit_check(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    mut edit: Value,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+    while edit["state"] == "edit" && edit["diagnostics"]["state"] == "pending" {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "edit check did not settle: {edit}"
+        );
+        let reference = edit["diagnostics"]["detail_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        tokio::time::sleep(PRODUCT_SETTLE_INITIAL_DELAY).await;
+        let next = actor
+            .call(fixture, "ide.inspect", json!({"detail_ref":reference}))
+            .await;
+        let next = actor.settle(fixture, next).await;
+        if next["state"] == "edit" {
+            edit = next;
+        }
+    }
+    edit
 }
 
 /// Starts one actor over `fixture` and warms the analyzer until `path`'s outline answers from
@@ -11877,9 +11937,11 @@ async fn product_outline_and_read_report_no_such_file() {
         )
         .await;
     actor.lifecycle(&fixture, "PostToolUse", &call).await;
-    assert_eq!(
-        old_text_edit["result"]["content"][0]["text"],
-        "invalid bounded parameters: \"source_ref\" is required for an old-text change; re-read this file with ide.read and retry with the new source_ref",
+    // symbol-read-edit-v1: an old-text change needs no `source_ref`; the current bytes are the base.
+    assert!(
+        old_text_edit["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("edit: replaced; path real.rs")),
         "{old_text_edit}"
     );
     daemon.kill().await.unwrap();
@@ -15595,6 +15657,7 @@ async fn configured_product_nested_python_packages_are_listed_checked_and_edited
         )
         .await;
     let edit = actor.settle(&fixture, edit).await;
+    let edit = settle_edit_check(&mut actor, &fixture, edit).await;
     assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
     assert_eq!(
         edit["diagnostics"]["state"], "current_clean",

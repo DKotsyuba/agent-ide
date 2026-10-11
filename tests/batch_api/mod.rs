@@ -1108,7 +1108,17 @@ async fn multi_file_edit_runs_one_project_check_and_reports_each_file() {
             .and_then(|line| line.split_once("; diagnostics: "))
             .map(|(_, words)| words.to_owned())
     };
-    assert_eq!(summary(&retried), summary(&text), "{retried}");
+    // The first reply may be the immediate `pending` one (the check arrives as a fact); the
+    // retry then answers the settled diagnostics, which are never pending.
+    let first_pending = summary(&text).is_some_and(|words| words.starts_with("pending"));
+    if first_pending {
+        assert!(
+            summary(&retried).is_some_and(|words| !words.starts_with("pending")),
+            "{retried}"
+        );
+    } else {
+        assert_eq!(summary(&retried), summary(&text), "{retried}");
+    }
     assert!(!retried.contains("no checked language"), "{retried}");
     for (index, name) in ["src/lib.rs", "src/a.rs", "src/b.rs"].iter().enumerate() {
         let words = |text: &str| {
@@ -1124,7 +1134,9 @@ async fn multi_file_edit_runs_one_project_check_and_reports_each_file() {
             )),
             "{retried}"
         );
-        assert_eq!(words(&retried), words(&text), "{name}: {retried}");
+        if !first_pending {
+            assert_eq!(words(&retried), words(&text), "{name}: {retried}");
+        }
     }
     let edit_ref = reply["source_ref"].as_str().unwrap().to_owned();
     let next = actor
