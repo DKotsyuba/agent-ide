@@ -21,17 +21,18 @@ pub struct RegionRules {
     pub import_prefixes: &'static [&'static str],
     /// Line prefixes of attribute or decorator lines that belong to the statement below them.
     pub attribute_prefixes: &'static [&'static str],
-    /// Skip a leading `pub` / `pub(crate)` before testing `import_prefixes` (Rust).
+    /// Skip a leading `pub` / `pub(crate)`-style visibility word before testing
+    /// `import_prefixes`.
     pub visibility_prefix: bool,
-    /// An import statement ends only at a line ending in `;` (Rust, CSS); otherwise at depth 0.
+    /// An import statement ends only at a line ending in `;`; otherwise at bracket depth 0.
     pub semicolon_imports: bool,
-    /// Blocks continue while the next line is indented deeper (Python).
+    /// Blocks continue while the next line is indented deeper than the block's first line.
     pub indentation_blocks: bool,
-    /// A block is a run of non-blank lines (HTML).
+    /// A block is a run of non-blank lines.
     pub blank_line_blocks: bool,
-    /// Line prefix of the block that becomes `@main` (Python `if __name__`).
+    /// Line prefix of the block that becomes `@main` (an entry-point guard).
     pub main_marker: Option<&'static str>,
-    /// A leading triple-quoted string is part of the header (Python module docstring).
+    /// A leading triple-quoted string is part of the header (a module docstring).
     pub docstring_header: bool,
 }
 
@@ -57,7 +58,7 @@ pub enum RawKind {
     Header,
     /// One run of import statements.
     Imports,
-    /// The Python `__main__` block.
+    /// The entry-point guard block (`main_marker`).
     Main,
     /// A top-level statement block.
     Code,
@@ -272,7 +273,7 @@ fn depth_delta(line: &str, rules: &RegionRules) -> i32 {
         }
         match c {
             '"' | '\'' | '`' => {
-                // A Rust lifetime or label (`'a`) has no closing quote; treat it as plain text.
+                // A lifetime or label marker (`'a`) has no closing quote; treat it as plain text.
                 if c != '\'' || line[at + 1..].contains('\'') {
                     quote = Some(c);
                 }
@@ -421,7 +422,7 @@ fn leader(lines: &[&str], start: usize, end: usize, rules: &RegionRules) -> Stri
 mod tests {
     use super::*;
 
-    const RUST: RegionRules = RegionRules {
+    const BRACED: RegionRules = RegionRules {
         line_comments: &["//"],
         block_comment: Some(("/*", "*/")),
         header_prefixes: &["#![", "#!"],
@@ -448,7 +449,7 @@ mod tests {
         let src = "//! doc\n#![allow(x)]\n\nuse a::b;\n// c\nuse c::{\n    d,\n};\n\nthread_local! {\n    static X: u8 = 1;\n}\n";
         use RawKind::*;
         assert_eq!(
-            kinds(src, &RUST),
+            kinds(src, &BRACED),
             vec![
                 (Header, 1, 3, String::new()),
                 (Imports, 4, 8, String::new()),
@@ -463,7 +464,7 @@ mod tests {
         let src = "use a; // note\nuse b; /* c */\n\nfn_call();\n";
         use RawKind::*;
         assert_eq!(
-            kinds(src, &RUST),
+            kinds(src, &BRACED),
             vec![
                 (Imports, 1, 2, String::new()),
                 (After, 3, 3, String::new()),
@@ -474,7 +475,7 @@ mod tests {
 
     #[test]
     fn leader_rules() {
-        let l = |s: &str| leader(&[s], 0, 0, &RUST);
+        let l = |s: &str| leader(&[s], 0, 0, &BRACED);
         assert_eq!(l("module.exports = {"), "module.exports");
         assert_eq!(l("if TYPE_CHECKING:"), "if TYPE_CHECKING");
         assert_eq!(l("sys.path.insert(0, root)"), "sys.path.insert");

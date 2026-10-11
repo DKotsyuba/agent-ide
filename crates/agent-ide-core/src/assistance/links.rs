@@ -1039,7 +1039,7 @@ impl Worker<'_> {
 impl Worker<'_> {
     /// The bridge candidate lines of an ambiguity list, each followed by the addresses (with
     /// absolute lines) of up to two of its definitions when their files resolve:
-    /// `.btn  (class name: 3 rules, 4 usages)  styles.css#.btn (L2), theme.scss#.btn (L1)`.
+    /// `<name>  (<kind>: 3 definitions, 4 usages)  <file>#<name> (L2), <file>#<name> (L1)`.
     /// Lines whose definitions do not resolve keep the plain [`candidate`] form.
     pub(super) async fn candidate_rows(
         &mut self,
