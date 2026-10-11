@@ -23886,3 +23886,6 @@ async fn failed_stop_is_retried_by_the_daemon_without_another_call() {
 
 /// Batch forms (batch-api-v1) against the real daemon, sharing this file's fixtures.
 mod batch_api;
+
+/// Boundary tests of `symbol-read-edit-v1` against the real daemon, sharing this file's fixtures.
+mod symbol_read_edit;
