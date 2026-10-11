@@ -217,6 +217,14 @@ Unresolved managed hooks stay silent to Claude and record a closed, path-free er
 With zero open leases and no running check the daemon stops after `idle_timeout_s`, closes its
 socket, and removes its runtime directory; the caches remain.
 
+`AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT` can replace the default temporary parent for the shared runtime,
+key hints and manual or automatic hint collection. Supply the same existing absolute normalized
+directory to MCP servers, hooks and daemons. Invalid relative, traversing or unresolved overrides
+refuse runtime resolution and manual collection; automatic collection skips them without using
+the default parent. Unset or empty overrides retain `/private/tmp`. Keep the parent short enough
+for Unix socket paths. This operator setting does not change private child ownership, no-follow
+checks, identity fencing or locking.
+
 Scheduling: triggers are a successful `ide.start`, Claude post hooks for `Edit`, `Write`,
 `MultiEdit`, `NotebookEdit`, and `Bash`, and a completed `ide.edit`. A trigger that names the
 changed file — a writer post's retained `tool_input.file_path` (`notebook_path` for

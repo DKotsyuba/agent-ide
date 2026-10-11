@@ -65,6 +65,16 @@ hook key cache `/private/tmp/ai-k-…`) and the persistent check caches under
 macOS and Claude; phase 2 adds warm LSP, a launchd per-user service, subagent attach, TypeScript
 checks, and the Codex active block.
 
+For an isolated Claude runtime, `AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT` selects an existing absolute,
+normalized temporary parent for both `ai-r-…` runtimes and `ai-k-…` hints. MCP servers, hooks and
+daemons must inherit the same value. Unset or empty values preserve `/private/tmp`; relative,
+traversing or unresolvable values fail without falling back. Manual hint collection uses the
+same parent, and automatic collection skips an invalid parent. Choose a short parent for Unix
+socket paths; private child ownership, no-follow validation and locking remain unchanged.
+Codex has its separate `AGENT_IDE_CODEX_RENDEZVOUS_ROOT` override. Fixture and toolchain scratch
+uses `TMPDIR`, `TMP` and `TEMP`, and the persistent product home can be isolated with
+`AGENT_IDE_HOME`.
+
 ## Session outbox and delivery (OUTBOX-r3)
 
 [OUTBOX-r3](contracts/session-outbox-v1.md) makes long work deliver its own result, so no agent
