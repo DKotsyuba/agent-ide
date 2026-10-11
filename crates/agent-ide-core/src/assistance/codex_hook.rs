@@ -552,13 +552,15 @@ mod tests {
 
     /// Distinguishes short Unix-socket test paths within this process.
     static NEXT_RUNTIME: AtomicU64 = AtomicU64::new(0);
-    /// Returns one short private-runtime-shaped path beneath writable `/private/tmp`.
+    /// Returns one short private-runtime-shaped path beneath the canonical environment-selected temporary parent.
     fn runtime(prefix: &str) -> PathBuf {
-        PathBuf::from(format!(
-            "/private/tmp/{prefix}-{}-{}",
-            std::process::id(),
-            NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed)
-        ))
+        std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "{prefix}-{}-{}",
+                std::process::id(),
+                NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed)
+            ))
     }
 
     /// Proves valid hook transport hits the real 250 ms boundary without consulting locked SQLite.

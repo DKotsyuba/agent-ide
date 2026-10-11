@@ -8110,13 +8110,15 @@ mod stop_retry_tests {
         root: std::path::PathBuf,
     }
     impl Fixture {
-        /// Creates real directories beneath `/private/tmp`, avoiding Darwin's `/tmp` symlink alias.
+        /// Creates real directories beneath the canonical environment-selected temporary parent.
         fn new() -> Self {
-            let base = std::path::PathBuf::from(format!(
-                "/private/tmp/worker-stop-retry-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+            let base = std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!(
+                    "worker-stop-retry-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
             let root = base.join("worktree");
             std::fs::create_dir_all(&root).unwrap();
             assert!(
