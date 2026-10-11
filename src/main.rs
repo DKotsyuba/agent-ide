@@ -20,7 +20,7 @@ use agent_ide::assistance::{
     assembly::ProductDispatcher,
     codex_rendezvous::ManagedCodexPublisher,
     facade::{
-        DaemonCurrencyNote, EvictFn, ReestablishFn, RerootFn, RerootOutcome, SharedCodexPublisher,
+        CatalogHost, DaemonCurrencyNote, EvictFn, ReestablishFn, RerootFn, RerootOutcome, SharedCodexPublisher,
         SharedDaemonNote, StdioFacade,
     },
     host_binding::HostKind,
@@ -140,7 +140,7 @@ async fn main() -> ExitCode {
             .await;
             ExitCode::SUCCESS
         }
-        Ok(Command::Mcp { runtime_dir }) => {
+        Ok(Command::Mcp { runtime_dir, host }) => {
             let facade = match std::env::var("AGENT_IDE_HOST_ATTACHMENT") {
                 Ok(attachment) => {
                     match StdioFacade::with_host_attachment(runtime_dir, attachment) {
@@ -150,7 +150,8 @@ async fn main() -> ExitCode {
                 }
                 Err(std::env::VarError::NotPresent) => StdioFacade::new(runtime_dir),
                 Err(std::env::VarError::NotUnicode(_)) => return fail(AppError::InvalidResponse),
-            };
+            }
+            .with_catalog_host(host);
             match serve_server(facade, stdio()).await {
                 Ok(service) => match service.waiting().await {
                     Ok(_) => ExitCode::SUCCESS,
@@ -437,7 +438,11 @@ enum Command {
     /// Serves health and finite Assistance dispatch until interrupted or killed.
     Daemon { runtime_dir: PathBuf },
     /// Serves the static six-tool MCP surface on stdio without creating local runtime state.
-    Mcp { runtime_dir: PathBuf },
+    Mcp {
+        runtime_dir: PathBuf,
+        /// Catalog advertised to the host; `claude` unless `--host` selects another (export).
+        host: CatalogHost,
+    },
     /// Owns one private daemon and serves the same static six-tool surface until stdio ends.
     ManagedMcp {
         /// Absolute one-target launcher template rebound to this process and captured candidate.
@@ -874,6 +879,21 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
             return Ok(Command::CodexHooksPrint);
         }
     }
+    // `mcp --runtime-dir DIR --host claude|codex` serves (and exports) one host's catalog.
+    if let [mode, flag, value, host_flag, host] = arguments.as_slice()
+        && mode == "mcp"
+        && flag == "--runtime-dir"
+        && host_flag == "--host"
+    {
+        let host = host
+            .to_str()
+            .and_then(CatalogHost::parse)
+            .ok_or(AppError::InvalidResponse)?;
+        return Ok(Command::Mcp {
+            runtime_dir: PathBuf::from(value),
+            host,
+        });
+    }
     let [mode, flag, value] = arguments.as_slice() else {
         return Err(AppError::InvalidResponse);
     };
@@ -901,7 +921,10 @@ fn command(arguments: impl Iterator<Item = OsString>) -> Result<Command, AppErro
     match mode.to_str() {
         Some("daemon") => Ok(Command::Daemon { runtime_dir }),
         Some("doctor") => Ok(Command::Doctor { runtime_dir }),
-        Some("mcp") => Ok(Command::Mcp { runtime_dir }),
+        Some("mcp") => Ok(Command::Mcp {
+            runtime_dir,
+            host: CatalogHost::Claude,
+        }),
         Some("codex-hook") => Ok(Command::CodexHook { runtime_dir }),
         Some("claude-hook") => Ok(Command::ClaudeHook { runtime_dir }),
         _ => Err(AppError::InvalidResponse),
@@ -3822,8 +3845,14 @@ mod tests {
         ));
         assert!(matches!(
             command(args(&["mcp", "--runtime-dir", "/private/tmp/runtime"])),
-            Ok(Command::Mcp { runtime_dir }) if runtime_dir == Path::new("/private/tmp/runtime")
+            Ok(Command::Mcp { runtime_dir, host: CatalogHost::Claude })
+                if runtime_dir == Path::new("/private/tmp/runtime")
         ));
+        assert!(matches!(
+            command(args(&["mcp", "--runtime-dir", "/private/tmp/runtime", "--host", "codex"])),
+            Ok(Command::Mcp { host: CatalogHost::Codex, .. })
+        ));
+        assert!(command(args(&["mcp", "--runtime-dir", "/private/tmp/runtime", "--host", "zcode"])).is_err());
         assert!(matches!(
             command(args(&["claude-hook"])),
             Ok(Command::ManagedClaudeHook)

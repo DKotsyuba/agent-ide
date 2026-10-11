@@ -107,7 +107,8 @@ unchanged unless a change is the point of the task.
 ## Where the contract snapshot lives
 
 `schemas/tools.json` is the tools array of the real built binary's
-`tools/list` result. After any change to the tool surface in
+`tools/list` result (the Claude catalog, eleven tools); `schemas/tools-codex.json`
+is the Codex catalog (`mcp --host codex`, nine tools). After any change to the tool surface in
 `crates/agent-ide-core/src/assistance/facade.rs`, run `cargo xtask contract
 update`, review the diff, and commit it together with the source change; CI
 and the gate fail on drift.

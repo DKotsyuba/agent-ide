@@ -2757,6 +2757,9 @@ pub struct StdioFacade {
     /// Only the managed Codex constructor sets this. Publication never activates anything and is
     /// skipped entirely when the trusted request metadata lacks a root session or actor.
     publisher: Option<SharedCodexPublisher>,
+    /// Which per-host catalog `tools/list` and the server paragraph answer with. Calls validate
+    /// the full eleven-tool surface for every host regardless of this choice.
+    catalog_host: CatalogHost,
     /// Generated static tool router; independent of daemon availability.
     router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
@@ -2769,6 +2772,7 @@ impl StdioFacade {
             attachment: None,
             reconnect: None,
             publisher: None,
+            catalog_host: CatalogHost::Claude,
             router: Self::described_tool_router(),
         }
     }
@@ -2784,6 +2788,7 @@ impl StdioFacade {
             attachment: None,
             reconnect: None,
             publisher: None,
+            catalog_host: CatalogHost::Claude,
             router: Self::described_tool_router(),
         }
     }
@@ -2799,6 +2804,7 @@ impl StdioFacade {
             attachment: Some(attachment),
             reconnect: None,
             publisher: None,
+            catalog_host: CatalogHost::Claude,
             router: Self::described_tool_router(),
         })
     }
@@ -2819,6 +2825,7 @@ impl StdioFacade {
             attachment: None,
             reconnect: Some(ManagedConnection::new(runtime_dir, attachment, reestablish)),
             publisher: Some(publisher),
+            catalog_host: CatalogHost::Codex,
             router: Self::described_tool_router(),
         })
     }
@@ -2838,6 +2845,7 @@ impl StdioFacade {
             attachment: None,
             reconnect: Some(ManagedConnection::new(runtime_dir, attachment, reestablish)),
             publisher: None,
+            catalog_host: CatalogHost::Claude,
             router: Self::described_tool_router(),
         })
     }
@@ -2868,8 +2876,16 @@ impl StdioFacade {
                 note,
             )),
             publisher: None,
+            catalog_host: CatalogHost::Claude,
             router: Self::described_tool_router(),
         })
+    }
+
+    /// Selects the per-host catalog this facade advertises (export and tests; the managed Codex
+    /// constructor already selects [`CatalogHost::Codex`]).
+    pub fn with_catalog_host(mut self, host: CatalogHost) -> Self {
+        self.catalog_host = host;
+        self
     }
 
     /// Gives this managed facade the authority to force-replace a wedged daemon through `evict`
@@ -3593,6 +3609,7 @@ impl StdioFacade {
         parameters: Value,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
+        let tool = fold_inspect_problems(tool, &parameters);
         let stage_parameters = parameters.clone();
         let call_started = std::time::Instant::now();
         let host_kind = parse_host_kind(&context.meta).ok();
@@ -4890,6 +4907,95 @@ logical change, with one project check; ide.test for the tests that matter. Symb
 to you in an <agent-ide> block after your next tool call or when you end your turn, so never \
 poll for them or wait. Native tools remain for non-source files and as a fallback.";
 
+/// The Codex server paragraph: the same rules without the two tools its catalog omits
+/// (`ide.graph` and `ide.context`; callers and callees come from `ide.symbol`, project problems
+/// from `ide.inspect {"kind":"problems"}`).
+pub(super) const SERVER_INSTRUCTIONS_CODEX: &str = "Agent IDE: language-server-backed source tools. \
+Call ide.start once per task and ide.stop at the end. Prefer ide.* over native tools for \
+source: plan first, then read everything in ONE ide.read {\"items\":[…]}; ide.outline / \
+ide.symbol instead of reading files and grep; ONE ide.edit {\"files\":[…]} per logical \
+change, with one project check; ide.test for the tests that matter. Symbols are \
+`file#Owner/name`. Results of long work (test runs, project checks, pending answers) are pushed \
+to you in an <agent-ide> block after your next tool call or when you end your turn, so never \
+poll for them or wait. Native tools remain for non-source files and as a fallback.";
+
+/// Which per-host catalog `tools/list` and the connect-time instructions answer with.
+///
+/// Both catalogs describe the same server: every tool and parameter ever advertised stays
+/// accepted by the call validator (`ide.context`, `ide.graph`, `wait_ms`); the choice only
+/// changes what the host is shown, because Codex loads every schema at once and pays for each.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CatalogHost {
+    /// Claude, Claude-compatible launchers and an unmanaged `mcp`: all eleven tools.
+    #[default]
+    Claude,
+    /// Managed Codex: nine tools; no `ide.context` or `ide.graph`.
+    Codex,
+}
+
+impl CatalogHost {
+    /// Parses the `--host` export flag value: `claude` or `codex`; anything else is `None`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            _ => None,
+        }
+    }
+
+    /// Returns the connect-time instructions this host's model reads next to the tool list.
+    pub fn instructions(self) -> &'static str {
+        match self {
+            Self::Claude => SERVER_INSTRUCTIONS,
+            Self::Codex => SERVER_INSTRUCTIONS_CODEX,
+        }
+    }
+
+    /// Projects the full tool list onto this host's catalog.
+    ///
+    /// Claude keeps every tool unchanged. Codex drops `ide.context` and `ide.graph` and lets
+    /// `ide.inspect` also serve the project problems (`kind`, `language`, `offset`, exactly the
+    /// `ide.context` problems parameters, which `ide.inspect` folds into that tool on arrival).
+    pub fn catalog(self, tools: Vec<rmcp::model::Tool>) -> Vec<rmcp::model::Tool> {
+        if self == Self::Claude {
+            return tools;
+        }
+        let problems = tool_schemas()[1].input_schema["properties"].clone();
+        tools
+            .into_iter()
+            .filter(|tool| !matches!(&*tool.name, "ide.context" | "ide.graph"))
+            .map(|mut tool| {
+                if &*tool.name == "ide.inspect" {
+                    let mut schema = (*tool.input_schema).clone();
+                    if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+                        for name in ["kind", "language", "offset"] {
+                            properties.insert(name.to_owned(), problems[name].clone());
+                        }
+                    }
+                    tool.input_schema = std::sync::Arc::new(schema);
+                    tool.description = Some(
+                        format!(
+                            "{} `{{\"kind\":\"problems\"}}` lists the project check problems.",
+                            tool.description.as_deref().unwrap_or_default()
+                        )
+                        .into(),
+                    );
+                }
+                tool
+            })
+            .collect()
+    }
+}
+
+/// Folds `ide.inspect {"kind":"problems",…}` into the `ide.context` problems request it stands
+/// for, so the Codex catalog can omit `ide.context`; every other call passes through unchanged.
+fn fold_inspect_problems(tool: AssistanceTool, parameters: &Value) -> AssistanceTool {
+    match (tool, parameters.get("kind")) {
+        (AssistanceTool::Inspect, Some(_)) => AssistanceTool::Context,
+        _ => tool,
+    }
+}
+
 /// Ensures diagnostics hide both launch attachments and populated host metadata in either format.
 #[test]
 fn debug_redacts_trusted_transport_and_host_metadata() {
@@ -4934,6 +5040,46 @@ fn catalog_stays_within_the_budgets() {
     }
 }
 
+/// Claude advertises all eleven tools; Codex nine (no `ide.context`, no `ide.graph`), its
+/// `ide.inspect` also takes the problems parameters and its paragraph names neither dropped tool,
+/// while the validator keeps accepting every tool and `ide.inspect {"kind":"problems"}` folds into
+/// the `ide.context` request.
+#[test]
+fn per_host_catalogs_differ_only_by_the_declared_subset() {
+    let facade = StdioFacade::new(std::path::PathBuf::from("/nonexistent-runtime"));
+    let names = |host: CatalogHost| {
+        host.catalog(facade.router.list_all())
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(CatalogHost::Claude).len(), 11);
+    let codex = names(CatalogHost::Codex);
+    assert_eq!(codex.len(), 9, "{codex:?}");
+    assert!(!codex.iter().any(|name| name == "ide.context" || name == "ide.graph"));
+    let inspect = CatalogHost::Codex
+        .catalog(facade.router.list_all())
+        .into_iter()
+        .find(|tool| tool.name == "ide.inspect")
+        .unwrap();
+    for property in ["kind", "language", "offset", "detail_ref", "detail_refs"] {
+        assert!(inspect.input_schema["properties"].get(property).is_some(), "{property}");
+    }
+    assert!(!CatalogHost::Codex.instructions().contains("ide.graph"));
+    assert!(CatalogHost::Claude.instructions().contains("ide.graph"));
+    assert_eq!(CatalogHost::parse("codex"), Some(CatalogHost::Codex));
+    assert_eq!(CatalogHost::parse("zcode"), None);
+    assert!(validate_call(AssistanceTool::Graph, json!({"symbol": "a#b"})).is_ok());
+    assert_eq!(
+        fold_inspect_problems(AssistanceTool::Inspect, &json!({"kind": "problems"})),
+        AssistanceTool::Context
+    );
+    assert_eq!(
+        fold_inspect_problems(AssistanceTool::Inspect, &json!({"detail_ref": "x"})),
+        AssistanceTool::Inspect
+    );
+}
+
 /// Private catalog cache lifetime in milliseconds for modern MCP requests (SEP-2549).
 const TOOLS_LIST_TTL_MS: u64 = 60_000;
 
@@ -4965,10 +5111,11 @@ impl rmcp::ServerHandler for StdioFacade {
             rmcp::model::Implementation::new("agent-ide", env!("CARGO_PKG_VERSION"))
                 .with_title("Agent IDE"),
         )
-        .with_instructions(SERVER_INSTRUCTIONS)
+        .with_instructions(self.catalog_host.instructions())
     }
 
-    /// Serves the static eleven-tool catalog, with private cache hints for modern requests only.
+    /// Serves the static per-host catalog (eleven tools for Claude, nine for Codex), with private
+    /// cache hints for modern requests only.
     ///
     /// The catalog is static per binary, but a short private TTL keeps a client from holding
     /// stale schemas across an upgrade; `ttlMs` and `cacheScope` stay absent for legacy sessions
@@ -4979,7 +5126,8 @@ impl rmcp::ServerHandler for StdioFacade {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, rmcp::ErrorData> {
-        let mut result = ListToolsResult::with_all_items(self.router.list_all());
+        let mut result =
+            ListToolsResult::with_all_items(self.catalog_host.catalog(self.router.list_all()));
         if modern_request(&context) {
             result = result
                 .with_ttl_ms(TOOLS_LIST_TTL_MS)

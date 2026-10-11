@@ -186,6 +186,7 @@ fn standard(root: &Path) -> Result<()> {
         "family.toml",
         ".family/origin.json",
         "schemas/tools.json",
+        "schemas/tools-codex.json",
         "docs/MCP_RESPONSE_STANDARD.md",
         "docs/FAMILY_CONTRACT.md",
         "docs/qualification.md",
@@ -335,7 +336,7 @@ fn check(root: &Path) -> Result<()> {
 }
 
 /// Builds the binary, performs the MCP handshake and returns the raw `tools/list` response line.
-fn tools_list_line(root: &Path) -> Result<String> {
+fn tools_list_line(root: &Path, host: &str) -> Result<String> {
     run(root, "cargo", &["build", "--locked", "--bin", "agent-ide"])?;
     let binary = target_dir(root).join("debug/agent-ide");
     let runtime =
@@ -344,6 +345,7 @@ fn tools_list_line(root: &Path) -> Result<String> {
     command
         .args(["mcp", "--runtime-dir"])
         .arg(&runtime)
+        .args(["--host", host])
         .env("TOKIO_WORKER_THREADS", "1")
         .env_remove("AGENT_IDE_HOST_ATTACHMENT")
         .stdin(Stdio::piped())
@@ -416,36 +418,51 @@ fn reap(mut child: Child) {
 /// `tools/list` result. The snapshot is rendered with `serde_json::to_string_pretty`; `check`
 /// compares parsed values, so formatting alone is never drift.
 fn contract(root: &Path, update: bool) -> Result<()> {
-    let reply = tools_list_line(root)?;
+    for (host, snapshot) in CONTRACT_SNAPSHOTS {
+        contract_host(root, update, host, snapshot)?;
+    }
+    Ok(())
+}
+
+/// The per-host catalog snapshots: the `--host` value the binary exports and the file holding it.
+const CONTRACT_SNAPSHOTS: [(&str, &str); 2] = [
+    ("claude", "schemas/tools.json"),
+    ("codex", "schemas/tools-codex.json"),
+];
+
+/// Compares (or writes) one host's snapshot against `mcp --host <host>`'s `tools/list` result.
+fn contract_host(root: &Path, update: bool, host: &str, snapshot: &str) -> Result<()> {
+    let reply = tools_list_line(root, host)?;
     let response: Value = serde_json::from_str(&reply)?;
     let tools = response
         .get("result")
         .and_then(|result| result.get("tools"))
         .cloned()
         .ok_or("tools/list reply has no result.tools")?;
-    let path = root.join("schemas/tools.json");
+    let path = root.join(snapshot);
     if update {
         fs::create_dir_all(path.parent().ok_or("snapshot parent missing")?)?;
         fs::write(
             &path,
             format!("{}\n", serde_json::to_string_pretty(&tools)?),
         )?;
-        println!("contract: schemas/tools.json updated");
+        println!("contract: {snapshot} updated");
         Ok(())
     } else {
-        let text = fs::read_to_string(&path).map_err(
-            |_| "contract snapshot absent: run `cargo xtask contract update` and commit it",
-        )?;
-        let snapshot: Value = serde_json::from_str(&text)
-            .map_err(|_| "schemas/tools.json is not valid JSON; regenerate it with `cargo xtask contract update`")?;
-        if tools != snapshot {
-            return Err(
-                "contract drift: the binary's tools/list differs from schemas/tools.json; \
+        let text = fs::read_to_string(&path).map_err(|_| {
+            format!("contract snapshot {snapshot} absent: run `cargo xtask contract update` and commit it")
+        })?;
+        let expected: Value = serde_json::from_str(&text).map_err(|_| {
+            format!("{snapshot} is not valid JSON; regenerate it with `cargo xtask contract update`")
+        })?;
+        if tools != expected {
+            return Err(format!(
+                "contract drift: the binary's {host} tools/list differs from {snapshot}; \
                  run `cargo xtask contract update` and review the diff"
-                    .into(),
-            );
+            )
+            .into());
         }
-        println!("contract: schemas/tools.json matches the binary");
+        println!("contract: {snapshot} matches the binary");
         Ok(())
     }
 }

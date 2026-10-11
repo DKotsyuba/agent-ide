@@ -28,11 +28,17 @@ fn runtime() -> PathBuf {
 /// Starts the shipping binary, performs the initialize handshake, and returns the `tools/list`
 /// result — the same spawn shape `tests/product_mcp_contract.rs` uses.
 async fn tools() -> Value {
+    tools_for("claude").await
+}
+
+/// Same as [`tools`] for the catalog `mcp --host <host>` advertises (`claude` or `codex`).
+async fn tools_for(host: &str) -> Value {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agent-ide"));
     command
         .env("TOKIO_WORKER_THREADS", "1")
         .args(["mcp", "--runtime-dir"])
         .arg(runtime())
+        .args(["--host", host])
         .env_remove("AGENT_IDE_HOST_ATTACHMENT")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -88,6 +94,24 @@ async fn snapshot_matches_the_binary_tools_list() {
     let tools = result["tools"].as_array().cloned().unwrap();
     assert_eq!(tools.len(), 11, "{result}");
     let expected: Value = serde_json::from_str(include_str!("../schemas/tools.json")).unwrap();
+    assert_eq!(
+        serde_json::to_value(&tools).unwrap(),
+        expected,
+        "contract drift: run `cargo xtask contract update` and review the diff"
+    );
+}
+
+/// Verifies the Codex snapshot equals the Codex catalog: nine tools, no `ide.context` and no
+/// `ide.graph`, with `ide.inspect` also serving the project problems.
+#[tokio::test]
+async fn codex_snapshot_matches_the_codex_catalog() {
+    let result = tools_for("codex").await;
+    let tools = result["tools"].as_array().cloned().unwrap();
+    assert_eq!(tools.len(), 9, "{result}");
+    let names: Vec<_> = tools.iter().filter_map(|tool| tool["name"].as_str()).collect();
+    assert!(!names.contains(&"ide.context") && !names.contains(&"ide.graph"), "{names:?}");
+    let expected: Value =
+        serde_json::from_str(include_str!("../schemas/tools-codex.json")).unwrap();
     assert_eq!(
         serde_json::to_value(&tools).unwrap(),
         expected,
