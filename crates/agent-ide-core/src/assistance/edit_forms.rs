@@ -103,10 +103,17 @@ fn normalize_entries(object: &mut Map<String, Value>) {
 
 /// The file part of `symbol` (`src/a.rs` of `src/a.rs#Foo`), when it has one.
 fn file_of(symbol: &str) -> Option<String> {
-    symbol
-        .split_once('#')
-        .map(|(file, _)| file.to_owned())
-        .filter(|file| !file.is_empty())
+    if let Some((file, _)) = symbol.split_once('#') {
+        return Some(file.to_owned()).filter(|file| !file.is_empty());
+    }
+    // A relative `path:line` location (what grep prints) names its file too; it addresses the
+    // unit or region holding the line, resolved against the file's map by the worker.
+    match crate::lang::address::Address::parse(symbol) {
+        Ok(crate::lang::address::Parsed::Location { file, .. }) if !file.is_absolute() => {
+            Some(file.display().to_string())
+        }
+        _ => None,
+    }
 }
 
 /// E3/E4: `old`/`new` (and `symbol` as the scope) become one `changes` entry.
@@ -208,6 +215,11 @@ mod tests {
         assert_eq!(
             normalized(json!({"symbol":"a.rs#F","op":"delete"})),
             json!({"path":"a.rs","changes":[{"symbol":"a.rs#F","op":"delete"}]})
+        );
+        // A relative `path:line` location names its file and stays the entry's address.
+        assert_eq!(
+            normalized(json!({"symbol":"src/a.rs:9","content":"z"})),
+            json!({"path":"src/a.rs","changes":[{"symbol":"src/a.rs:9","content":"z"}]})
         );
         assert_eq!(
             normalized(json!({"path":"a.rs","lines":"1-2","source_ref":"s","content":"z"})),

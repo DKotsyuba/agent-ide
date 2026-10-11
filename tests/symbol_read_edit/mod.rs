@@ -614,3 +614,52 @@ async fn a_stale_source_ref_is_refused_and_an_open_window_reaches_the_unit_end()
     assert_eq!(on_disk(&fixture), ORIGINAL.replace("a * 2", "a * 7"));
     finished(actor, daemon, &fixture).await;
 }
+
+/// A file-numbered `lines` edit echoes the old lines it replaces, and an edit by a relative
+/// `path:line` replaces the whole unit or region that holds the line (symbol-read-edit-v1 §1).
+#[tokio::test]
+async fn lines_edits_echo_and_locations_address_units_and_regions() {
+    let (fixture, daemon, mut actor) = started("sre-lines").await;
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"path":FILE,"lines":"9-9","content":"    a * 4"}),
+    )
+    .await;
+    assert!(
+        text.contains("(L9)  replaced (1 lines → 1); was:\n    9\t    a * 2"),
+        "{text}"
+    );
+    assert_eq!(on_disk(&fixture), ORIGINAL.replace("a * 2", "a * 4"));
+    // A location inside a function replaces that whole function.
+    reset(&fixture);
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":"src/batch.rs:9","content":"pub fn utility(x: u32) -> u32 {\n    x\n}"}),
+    )
+    .await;
+    assert!(
+        text.contains("src/batch.rs#utility (L6-8)  replaced (5 lines → 3)"),
+        "{text}"
+    );
+    assert!(!on_disk(&fixture).contains("Doubles"));
+    // A location inside a region replaces the region.
+    reset(&fixture);
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":"src/batch.rs:2","content":"use std::io;"}),
+    )
+    .await;
+    assert!(text.contains("#@imports"), "{text}");
+    let after = on_disk(&fixture);
+    assert!(
+        after.contains("use std::io;") && !after.contains("use std::fmt;"),
+        "{after}"
+    );
+    finished(actor, daemon, &fixture).await;
+}

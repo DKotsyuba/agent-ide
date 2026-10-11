@@ -379,6 +379,8 @@ impl Worker<'_> {
         // is what the continuation footer must name.
         let mut items: Vec<(String, Option<usize>, ReadItem)> = Vec::new();
         let mut duplicates: Vec<String> = Vec::new();
+        // The unit reads of delivered-or-cut blocks, by item index, for the window-edit guard.
+        let mut unit_reads: Vec<(usize, target::UnitRead)> = Vec::new();
         let mut seen: Vec<ReadItem> = Vec::new();
         for item in requested {
             if seen.contains(&item) {
@@ -468,7 +470,8 @@ impl Worker<'_> {
                     let found = legacy.as_ref().and_then(|symbol| outline.find(symbol));
                     let block = match (unit, found) {
                         (Some((text, read)), _) => {
-                            self.remember_unit_read(&binding, read);
+                            // Remembered below, only if this block is delivered in the reply.
+                            unit_reads.push((items.len(), read));
                             (text, Some(index))
                         }
                         (None, Some(found)) => {
@@ -664,6 +667,14 @@ impl Worker<'_> {
             return Ok((reply, authority, Some(files[file].1.clone())));
         }
         let (text, delivered) = compose(&prefix(included));
+        // The window-edit guard knows only the units whose blocks this reply carries in full;
+        // a cut block's lines were never delivered.
+        for (index, read) in unit_reads {
+            if index < included {
+                let last = read.last;
+                self.remember_unit_read(&binding, read, last);
+            }
+        }
         // Remember the blocks this reply carries in full, so their repeat can answer unchanged.
         if epoch.is_some()
             && let Ok(mut ledger) = self.shared.ledger.lock()
@@ -3370,7 +3381,7 @@ impl Worker<'_> {
         // The light window guard: a window edit whose lines changed since this session's last
         // read of the unit is refused with the unit's current text; with no remembered read the
         // edit applies and the reply echoes the replaced lines.
-        let echoes = match outline.as_ref() {
+        let mut echoes = match outline.as_ref() {
             Some(outline) => {
                 let map = lang::address::AddressMap::build(outline, &source);
                 let binding = job.invocation.binding_ref().clone();
@@ -3383,6 +3394,24 @@ impl Worker<'_> {
             }
             None => Vec::new(),
         };
+        // A file-numbered `lines` entry has no unit to guard against: it echoes the old lines it
+        // replaces, so numbers copied from stale grep output are visible at once.
+        let total_lines = lang::line_count(&source);
+        for (index, request) in requests.iter().enumerate() {
+            if let ChangeRequest::Lines { range, .. } = request
+                && range.start <= total_lines
+            {
+                echoes.push((
+                    index,
+                    super::target::numbered_rows(
+                        &source,
+                        range.start,
+                        range.end.min(total_lines),
+                        8,
+                    ),
+                ));
+            }
+        }
         let changes =
             match resolve_changes_with(&source, outline.as_ref(), path, &requests, &site_of) {
                 Ok(changes) => changes,
@@ -4634,6 +4663,16 @@ fn unit_range_of(
     outline: Option<&Outline>,
     map: Option<&lang::address::AddressMap>,
 ) -> Result<LineRange, UnitMiss> {
+    // A `path:line` location names the unit or region that holds the line, whole
+    // (symbol-read-edit-v1 §1).
+    if let Ok(lang::address::Parsed::Location { file, line, .. }) =
+        lang::address::Address::parse(requested)
+    {
+        return match map.and_then(|map| map.at_line(line).map(|located| (map, located))) {
+            Some((map, located)) if file == Path::new(path) => Ok(map.units()[located.unit].span),
+            _ => Err(UnitMiss::Unknown),
+        };
+    }
     let parsed = match lang::address::Address::parse(requested) {
         Ok(lang::address::Parsed::Address(address)) => Some(address),
         _ => None,

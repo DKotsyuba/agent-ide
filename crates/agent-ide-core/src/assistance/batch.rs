@@ -788,6 +788,16 @@ pub(crate) enum EditBody {
     Create(String),
     /// `content` alone: the whole new content of an existing file.
     Replace(String),
+    /// A whole-content replacement computed from bytes the worker read earlier (an applied
+    /// `apply_patch`): it is written only while the file still has those bytes, `digest` being
+    /// their blake3 hex. A file that changed meanwhile is refused as changed while the edit was
+    /// applied. Only the worker builds it (the `expect` key is never accepted from a caller).
+    ReplaceIfUnchanged {
+        /// The new whole content.
+        content: String,
+        /// Blake3 hex digest of the bytes `content` was computed from.
+        digest: String,
+    },
 }
 
 /// One `files` entry of a validated multi-file edit, in request order.
@@ -824,7 +834,13 @@ pub(crate) fn edit_files_request(parameters: &Value) -> Option<(String, Vec<Edit
             let body = match (entry.get("changes"), entry.get("content")) {
                 (Some(changes), None) => EditBody::Changes(changes.as_array()?.clone()),
                 (None, Some(content)) if create => EditBody::Create(content.as_str()?.to_owned()),
-                (None, Some(content)) => EditBody::Replace(content.as_str()?.to_owned()),
+                (None, Some(content)) => match entry.get("expect").and_then(Value::as_str) {
+                    Some(digest) => EditBody::ReplaceIfUnchanged {
+                        content: content.as_str()?.to_owned(),
+                        digest: digest.to_owned(),
+                    },
+                    None => EditBody::Replace(content.as_str()?.to_owned()),
+                },
                 _ => return None,
             };
             Some(EditFile {

@@ -62,7 +62,13 @@ impl Worker<'_> {
                     let source = observed_text(&observed, &bytes)?.to_owned();
                     match apply_hunks(&source, &hunks) {
                         Ok(applied) => {
-                            files.push(json!({"path": path, "content": applied.text}));
+                            // The write is refused if the file no longer has the bytes the hunks
+                            // were applied to (`expect` is the digest of those bytes).
+                            files.push(json!({
+                                "path": path,
+                                "content": applied.text,
+                                "expect": blake3::hash(&bytes).to_hex().to_string(),
+                            }));
                         }
                         Err(miss) => {
                             let lines: Vec<&str> = source.lines().collect();

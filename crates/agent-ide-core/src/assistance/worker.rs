@@ -10971,6 +10971,72 @@ mod stop_retry_tests {
         }
     }
 
+    /// A whole-content replacement built by `apply_patch` carries the digest of the bytes its
+    /// hunks were applied to: a file that changed since is refused as changed while the edit was
+    /// applied and stays untouched, while a matching digest writes (symbol-read-edit-v1 §3.2
+    /// rule 6).
+    #[tokio::test]
+    async fn a_patch_replacement_is_refused_when_the_file_changed_meanwhile() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        let source = "sym card\nsym btn\nmark\nend\nend\n";
+        std::fs::write(fixture.root.join("a.gamma"), source).unwrap();
+        git_commit(&fixture.root, "patch fixture");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        worker.edits.install_schema().await.unwrap();
+        let (_binding, _authority) =
+            activate_worktree(&mut worker, "line-actor", "patch-start").await;
+        let stale = blake3::hash(b"sym card\nsym other\nend\n")
+            .to_hex()
+            .to_string();
+        let invocation = production_call(&mut worker, "line-actor", "patch-stale");
+        let (mut job, _cancel) = tool_job(
+            &fixture.root,
+            invocation,
+            "patch-stale",
+            AssistanceTool::Edit,
+            serde_json::json!({"operation_id":"patch-stale-op","files":[
+                {"path":"a.gamma","content":"patched\n","expect":stale}]}),
+        );
+        let refused = worker.edit(&mut job).await;
+        assert!(
+            matches!(refused, Err(FailureCode::EditRefused)),
+            "a changed file is refused"
+        );
+        assert!(
+            job.failure_detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("changed while the edit was applied"),
+            "{:?}",
+            job.failure_detail
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("a.gamma")).unwrap(),
+            source
+        );
+        let fresh = blake3::hash(source.as_bytes()).to_hex().to_string();
+        let reply = run_edit(
+            &mut worker,
+            &fixture.root,
+            "patch-fresh",
+            serde_json::json!({"operation_id":"patch-fresh-op","files":[
+                {"path":"a.gamma","content":"patched\n","expect":fresh}]}),
+        )
+        .await;
+        assert!(
+            matches!(reply, PeerReply::EditBatch { .. }),
+            "an unchanged file is written"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("a.gamma")).unwrap(),
+            "patched\n"
+        );
+    }
+
     /// A line-range edit applies only on a retained same-path observation whose bytes are still
     /// current, reports its net line movement, and never writes on a refused base; the
     /// symbol form validates an explicit `source_ref` the same way and stays optional.

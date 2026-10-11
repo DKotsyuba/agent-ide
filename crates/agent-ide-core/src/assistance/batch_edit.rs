@@ -393,6 +393,24 @@ impl Worker<'_> {
                     note: None,
                 }))
             }
+            EditBody::ReplaceIfUnchanged { content, digest } => {
+                observed_text(&observed, &bytes)?;
+                // The content was computed from bytes read before this plan: a file that
+                // changed in between is refused, never overwritten (symbol-read-edit-v1 §3.2
+                // rule 6).
+                if blake3::hash(&bytes).to_hex().as_str() != digest.as_str() {
+                    return Ok(Err(format!(
+                        "{label}: edit refused: {path} changed while the edit was applied; \
+                         repeat the call"
+                    )));
+                }
+                Ok(Ok(Planned {
+                    path,
+                    base,
+                    candidate: content.clone(),
+                    note: None,
+                }))
+            }
             EditBody::Changes(entries) => {
                 match self
                     .changes_candidate(job, &observed, &bytes, &path, entries)
