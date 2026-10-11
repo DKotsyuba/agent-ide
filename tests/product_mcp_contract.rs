@@ -484,12 +484,18 @@ fn assert_compact_envelope(reply: &Value) {
                 || header.contains(" has no code symbols; ")
                 || header.ends_with("  (empty file)"))
             {
-                let (title, details) = header.split_once("  (lines ").expect("read symbol header");
+                // `<title>  (lines A–B)` for a range, `<address>  (<n> lines; file lines A-B)` for
+                // a unit and `<address>:A-B  (lines A-B of <n>; file lines C-D)` for a window.
+                let (title, details) = header.split_once("  (").expect("read symbol header");
                 assert!(!title.is_empty() && details.ends_with(')'), "{reply}");
             }
         }
         ("invalid_parameters", _) => {
-            assert!(text.starts_with("invalid bounded parameters:"), "{reply}")
+            // The `apply_patch` body refusals keep their own wording (symbol-read-edit-v1 §5).
+            assert!(
+                text.starts_with("invalid bounded parameters:") || text.starts_with("patch: "),
+                "{reply}"
+            )
         }
         _ => assert!(text.starts_with(state), "{reply}"),
     }
@@ -5636,7 +5642,7 @@ async fn claude_call_with_a_late_pre_hook_is_served_not_refused() {
     let fields = claude_fields(assert_claude_envelope(&reply));
     let text = fields["text"].as_str().unwrap_or_default();
     assert!(
-        text.contains("pub fn value() -> i32") && text.contains("source_ref: "),
+        text.contains("pub fn value() -> i32") && !text.contains("source_ref"),
         "the late-pre read must be served, not refused: {reply}"
     );
     mcp.close().await;
@@ -5697,14 +5703,16 @@ async fn claude_session_survives_a_daemon_restart_between_calls() {
         next,
         "restart-session",
         None,
-        "ide.read",
-        json!({"path":"src/lib.rs","lines":"1-2"}),
+        "ide.context",
+        json!({"path":"src/lib.rs"}),
     )
     .await;
+    // Reads print no reference any more; a context reply still names its `detail_ref`.
     let stale_ref = claude_text(&before)
-        .split("source_ref: ")
+        .split("source_ref ")
         .nth(1)
-        .map(|tail| tail.trim().to_owned())
+        .and_then(|tail| tail.split_whitespace().next())
+        .map(str::to_owned)
         .expect("read reply carries a source_ref");
 
     // The shared daemon generation ends; the watcher must heal it before the next pre-hook.
@@ -10249,12 +10257,14 @@ async fn configured_product_batch_read_then_edit_reports_landings_and_bytes() {
     let edit = actor.settle(&fixture, edit).await;
     assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
     let note = edit["note"].as_str().unwrap_or_default();
+    // The changed lines are named by address (`src/util.rs#second (L5-7)` when the file's map
+    // is available, `src/util.rs:5-7 (L5-7)` otherwise) with their absolute lines.
     assert!(
-        note.contains("change 1: lines 1 replaced (now 1)"),
+        note.contains("src/util.rs") && note.contains("(L1)  replaced (1 lines → 1)"),
         "{edit}"
     );
     assert!(
-        note.contains("change 2: old text at line 5 replaced (now 5–7)"),
+        note.contains("(L5-7)  replaced (3 lines → 3)"),
         "{edit}"
     );
     assert_eq!(
@@ -10588,12 +10598,11 @@ async fn configured_product_batch_old_not_found_refuses_and_retries_the_same_ope
     )
     .await;
     let (retried, retried_text) = batch_settle_with_text(&mut actor, &fixture, retried).await;
-    let edit_ref = retried["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&retried_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {edit_ref}; {}\n2 changes applied: \
-             change 1: lines 1–3 replaced (now 1); change 2: old text at line 5 replaced (now 3–5)\n\
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#@header:1 (L1)  replaced \
+             (3 lines → 1)\n  src/batch.rs#second (L3-5)  replaced (3 lines → 3)\n\
              lines after 1 moved -2",
             batch_diagnostics_segment(&retried)
         ),
@@ -10668,12 +10677,11 @@ async fn configured_product_batch_old_ambiguous_lists_both_lines_and_within_retr
     )
     .await;
     let (scoped, scoped_text) = batch_settle_with_text(&mut actor, &fixture, scoped).await;
-    let edit_ref = scoped["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&scoped_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {edit_ref}; {}\n1 change applied: \
-             change 1: old text at line 10 replaced (now 10)",
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#beta:2 (L10)  replaced \
+             (1 lines → 1)",
             batch_diagnostics_segment(&scoped)
         ),
         "{scoped_text}"
@@ -10778,9 +10786,8 @@ async fn configured_product_batch_terminator_old_empty_lines_and_same_line_inser
     assert_eq!(
         batch_without_status_plate(&edit_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {edit_ref}; {}\n2 changes applied: \
-             change 1: old text at line 2 replaced (now 2); change 2: lines 4 deleted\n\
-             lines after 2 moved -1",
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#alpha:2 (L2)  replaced \
+             (1 lines → 1)\n  src/batch.rs#beta:1  deleted (1 lines)\nlines after 2 moved -1",
             batch_diagnostics_segment(&edit)
         ),
         "{edit_text}"
@@ -10836,14 +10843,13 @@ async fn configured_product_batch_terminator_old_empty_lines_and_same_line_inser
     )
     .await;
     let (insert, insert_text) = batch_settle_with_text(&mut actor, &fixture, insert).await;
-    let insert_ref = insert["result"]["source_ref"].as_str().unwrap();
     assert_eq!(insert["result"]["outcome"], "replaced", "{insert}");
     assert_eq!(
         batch_without_status_plate(&insert_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {insert_ref}; {}\n2 changes applied: \
-             change 1: src/batch.rs#beta inserted before #beta (now 5–7); change 2: lines 4–6 \
-             replaced (now 9–11)\nlines after 4 moved +5",
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#helper~2 (L5-7)  inserted \
+             (3 lines)\n  src/batch.rs#beta (L9-11)  replaced (3 lines → 3)\n\
+             lines after 4 moved +5",
             batch_diagnostics_segment(&insert)
         ),
         "{insert_text}"
@@ -11029,13 +11035,12 @@ async fn configured_product_batch_rust_syntax_gate_refuses_and_notes_pre_existin
     )
     .await;
     let (applied, applied_text) = batch_settle_with_text(&mut actor, &fixture, applied).await;
-    let broken_edit_ref = applied["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&applied_text),
         format!(
-            "edit: replaced; path src/broken.rs; source_ref {broken_edit_ref}; {}\n1 change \
-             applied: change 1: old text at line 2 replaced (now 2)\nnote: src/broken.rs already \
-             had a syntax error (line 5) before this edit; edit applied",
+            "edit: replaced; path src/broken.rs; {}\n  src/broken.rs:2 (L2)  replaced \
+             (1 lines → 1)\nnote: src/broken.rs already had a syntax error (line 5) before this \
+             edit; edit applied",
             batch_diagnostics_segment(&applied)
         ),
         "{applied_text}"
@@ -11271,12 +11276,10 @@ async fn configured_product_batch_python_syntax_gate_refuses_writes_and_proceeds
     .await;
     let (written, written_text) = batch_settle_with_text(&mut actor, &fixture, written).await;
     assert_eq!(written["result"]["outcome"], "replaced", "{written}");
-    let python_ref = written["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&written_text),
         format!(
-            "edit: replaced; path svc/app.py; source_ref {python_ref}; {}\n1 change applied: \
-             change 1: old text at line 5 replaced (now 5)",
+            "edit: replaced; path svc/app.py; {}\n  svc/app.py:5 (L5)  replaced (1 lines → 1)",
             batch_diagnostics_segment(&written)
         ),
         "{written_text}"
@@ -11442,12 +11445,10 @@ async fn configured_product_batch_typescript_syntax_gate_refuses_and_writes() {
     .await;
     let (written, written_text) = batch_settle_with_text(&mut actor, &fixture, written).await;
     assert_eq!(written["result"]["outcome"], "replaced", "{written}");
-    let written_ref = written["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&written_text),
         format!(
-            "edit: replaced; path app.ts; source_ref {written_ref}; {}\n1 change applied: \
-             change 1: old text at line 5 replaced (now 5)",
+            "edit: replaced; path app.ts; {}\n  app.ts#renamed:1 (L5)  replaced (1 lines → 1)",
             batch_diagnostics_segment(&written)
         ),
         "{written_text}"
@@ -11555,12 +11556,10 @@ async fn configured_product_batch_typescript_gate_uses_the_configured_package() 
     .await;
     let (written, written_text) = batch_settle_with_text(&mut actor, &fixture, written).await;
     assert_eq!(written["result"]["outcome"], "replaced", "{written}");
-    let written_ref = written["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&written_text),
         format!(
-            "edit: replaced; path app.ts; source_ref {written_ref}; {}\n1 change applied: \
-             change 1: old text at line 5 replaced (now 5)",
+            "edit: replaced; path app.ts; {}\n  app.ts#renamed:1 (L5)  replaced (1 lines → 1)",
             batch_diagnostics_segment(&written)
         ),
         "{written_text}"
@@ -11600,8 +11599,7 @@ async fn configured_product_batch_ranges_read_then_edit_by_those_lines_without_r
         format!(
             "read: 2 items in 1 files — 2 delivered, 0 unchanged, 0 not included, 0 failed\n\
              src/batch.rs  (lines 5–7)\n5\tpub fn alpha() -> i32 {{\n6\t    helper(1)\n7\t}}\n\
-             src/batch.rs  (lines 9–11)\n 9\tpub fn beta() -> i32 {{\n10\t    helper(2)\n11\t}}\n\
-             source_ref: {source_ref}\n"
+             src/batch.rs  (lines 9–11)\n 9\tpub fn beta() -> i32 {{\n10\t    helper(2)\n11\t}}\n"
         ),
         "{read_text}"
     );
@@ -11622,12 +11620,11 @@ async fn configured_product_batch_ranges_read_then_edit_by_those_lines_without_r
     )
     .await;
     let (edit, edit_text) = batch_settle_with_text(&mut actor, &fixture, edit).await;
-    let edit_ref = edit["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&edit_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {edit_ref}; {}\n2 changes applied: \
-             change 1: lines 6 replaced (now 6); change 2: lines 10 replaced (now 10)",
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#alpha:2 (L6)  replaced \
+             (1 lines → 1)\n  src/batch.rs#beta:2 (L10)  replaced (1 lines → 1)",
             batch_diagnostics_segment(&edit)
         ),
         "{edit_text}"
@@ -11688,20 +11685,18 @@ async fn configured_product_batch_read_budget_footer_duplicate_and_unknown_symbo
     let (read, read_text) = batch_settle_with_text(&mut actor, &fixture, read).await;
     assert_eq!(read["kind"], "read", "{read}");
     assert_eq!(read["truncated"], true, "{read}");
-    let source_ref = read["detail_ref"].as_str().unwrap();
-    // The delivered block renders with the same numbered gutter as every read.
+    // The delivered block renders the unit with the same numbered gutter as every read.
     let huge_a_end = 383usize;
     let width = huge_a_end.to_string().len();
     let mut expected = format!(
         "read: 3 items in 1 files — 1 delivered, 0 unchanged, 1 not included, 1 failed\n\
-         src/big.rs#huge_a  (lines 1–{huge_a_end})\n"
+         src/big.rs#huge_a  ({huge_a_end} lines; file lines 1-{huge_a_end})\n"
     );
     for number in 1..=huge_a_end {
         expected.push_str(&format!("{number:>width$}\t{}\n", lines[number - 1]));
     }
     expected.push_str(&format!(
         "no such symbol: src/big.rs#missing — check ide.outline {{\"path\":\"src/big.rs\"}}\n\
-         source_ref: {source_ref}\n\
          duplicates shown once: src/big.rs#huge_a\n\
          not included (over the reply budget): src/big.rs#huge_b — call ide.read \
          {{\"symbols\":[\"src/big.rs#huge_b\"]}}\n\n\
@@ -11752,12 +11747,12 @@ async fn configured_product_batch_legacy_single_change_replies_stay_byte_identic
     )
     .await;
     let (insert, insert_text) = batch_settle_with_text(&mut actor, &fixture, insert).await;
-    let insert_ref = insert["result"]["source_ref"].as_str().unwrap();
     assert_eq!(insert["operation"], "inserted", "{insert}");
     assert_eq!(
         batch_without_status_plate(&insert_text),
         format!(
-            "edit: inserted; path src/batch.rs; source_ref {insert_ref}; {}\nlines after 4 moved +4",
+            "edit: inserted; path src/batch.rs; {}\n  src/batch.rs#added:1 (L5)  inserted \
+             (1 lines)\nlines after 4 moved +4",
             batch_diagnostics_segment(&insert)
         ),
         "{insert_text}"
@@ -11784,11 +11779,11 @@ async fn configured_product_batch_legacy_single_change_replies_stay_byte_identic
     )
     .await;
     let (replace, replace_text) = batch_settle_with_text(&mut actor, &fixture, replace).await;
-    let replace_ref = replace["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&replace_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {replace_ref}; {}",
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#beta (L9-11)  replaced \
+             (3 lines → 3)",
             batch_diagnostics_segment(&replace)
         ),
         "{replace_text}"
@@ -11821,11 +11816,11 @@ async fn configured_product_batch_legacy_single_change_replies_stay_byte_identic
     )
     .await;
     let (lines, lines_text) = batch_settle_with_text(&mut actor, &fixture, lines).await;
-    let lines_ref = lines["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&lines_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {lines_ref}; {}",
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#alpha:2 (L2)  replaced \
+             (1 lines → 1)",
             batch_diagnostics_segment(&lines)
         ),
         "{lines_text}"
@@ -12331,7 +12326,7 @@ async fn product_style_sheets_answer_symbol_tools_without_a_server() {
     let text = read["text"].as_str().unwrap();
     assert!(
         text.starts_with(
-            "styles.css#@media (min-width: 40em)/.card .btn  (lines 7)\n7\t  .card .btn { padding: 0; }\n"
+            "styles.css#@media (min-width: 40em)/.card .btn  (1 lines; file lines 7-7)\n1\t  .card .btn { padding: 0; }\n"
         ),
         "{read}"
     );
@@ -13342,7 +13337,12 @@ async fn configured_product_rust_lexical_outline_matches_the_server() {
                 .await;
             let read = actor.settle(&fixture, read).await;
             let text = read["text"].as_str().unwrap_or_default();
-            let header = format!("{address}  (lines {})\n", symbol.range);
+            let header = format!(
+                "{address}  ({} lines; file lines {}-{})\n",
+                symbol.range.len(),
+                symbol.range.start,
+                symbol.range.end
+            );
             assert!(
                 text.starts_with(&header),
                 "{file}: {symbol:?} expected {header:?}, got {text}"
@@ -17582,7 +17582,8 @@ async fn configured_product_rust_delete_does_not_report_cached_flycheck_diagnost
     assert_eq!(deleted["state"], "edit", "{deleted}");
     assert_eq!(deleted["operation"], "deleted", "{deleted}");
     assert!(
-        !deleted.to_string().contains("cold_probe"),
+        // The change line names the address the deleted symbol had; the diagnostics must not.
+        !deleted["diagnostics"].to_string().contains("cold_probe"),
         "a deleted function's cached flycheck warning must not be current: {deleted}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
@@ -19817,16 +19818,16 @@ async fn configured_product_claude_activates_a_reader_then_stops() {
     .await;
     assert_eq!(edited["state"], "edit", "{edited}");
     assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
-    let edited_source_ref = edited["result"]["source_ref"]
-        .as_str()
-        .expect("a successful Claude Edit must retain its post-read detail")
-        .to_owned();
+    assert!(
+        edited["result"]["source_ref"].is_null(),
+        "a Claude edit reply names no file-version reference: {edited}"
+    );
     assert_eq!(
         std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
         b"claude-edit\n"
     );
-    // The returned Edit source reference is the already-reserved prepare detail, even while
-    // ordinary detail capacity is saturated; a second Claude Edit can consume it directly.
+    // A second Claude edit needs no reference at all, even while ordinary detail capacity is
+    // saturated: the current bytes are its base.
     let chained = claude_operation(
         &mut first,
         &fixture,
@@ -19834,7 +19835,6 @@ async fn configured_product_claude_activates_a_reader_then_stops() {
         json!({
             "operation_id":"claude-edit-2",
             "path":"tracked.txt",
-            "source_ref":edited_source_ref,
             "content":"claude-chain\n"
         }),
     )

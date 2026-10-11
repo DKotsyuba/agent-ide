@@ -5,11 +5,10 @@
 
 use super::*;
 
-/// Reads the `source_ref` line of a batch read reply text and the files it names.
-fn source_ref_line(text: &str) -> &str {
-    text.lines()
-        .find(|line| line.starts_with("source_ref: "))
-        .unwrap_or_else(|| panic!("no source_ref line: {text}"))
+/// Asserts a read reply text names no file-version reference: the current text is the base of
+/// every edit (symbol-read-edit-v1), and the structured `detail_ref` stays beside the text.
+fn assert_no_source_ref(text: &str) {
+    assert!(!text.contains("source_ref"), "{text}");
 }
 
 /// `ide.read {items}` answers a symbol, a range and a whole file across three files in ONE
@@ -95,11 +94,7 @@ async fn read_items_answer_files_symbols_and_ranges_in_one_reply() {
         !text.contains("not included (over the reply budget)"),
         "{text}"
     );
-    let line = source_ref_line(&text);
-    assert!(
-        line.contains("src/lib.rs") && line.contains("src/util.rs") && line.contains("notes.md"),
-        "{line}"
-    );
+    assert_no_source_ref(&text);
     let source_ref = read["detail_ref"].as_str().unwrap().to_owned();
     let edit = actor
         .call(
@@ -139,7 +134,7 @@ async fn read_items_answer_files_symbols_and_ranges_in_one_reply() {
         json!({"items":[{"path":"big.md"},{"path":"notes.md"}]}),
         "{footer}"
     );
-    assert!(!source_ref_line(&text).contains("notes.md"), "{text}");
+    assert_no_source_ref(&text);
     let cut_ref = cut["detail_ref"].as_str().unwrap().to_owned();
     let refused = actor
         .call(
@@ -266,10 +261,7 @@ async fn read_items_answer_unchanged_for_identical_bytes_until_change_force_comp
         "{text}"
     );
     assert!(!text.contains("a.md line1"), "{text}");
-    assert!(
-        source_ref_line(&text).contains("valid for a.md, b.md"),
-        "{text}"
-    );
+    assert_no_source_ref(&text);
     let second_ref = second["detail_ref"].as_str().unwrap().to_owned();
     let edit = actor
         .call(
@@ -710,10 +702,7 @@ async fn read_edit_files(actor: &mut ProductActor, fixture: &ProductFixture) -> 
         json!({"items": EDIT_FILES.iter().map(|name| json!({"path": name})).collect::<Vec<_>>()}),
     )
     .await;
-    assert!(
-        source_ref_line(&text).contains("valid for a.md, b.md, c.md"),
-        "{text}"
-    );
+    assert_no_source_ref(&text);
     read["detail_ref"].as_str().unwrap().to_owned()
 }
 
@@ -822,7 +811,7 @@ async fn multi_file_edit_writes_nothing_when_any_file_is_stale_or_any_change_fai
     .await;
     assert_eq!(reply["state"], "edit_batch", "{reply} {text}");
     assert!(
-        text.starts_with("edit: applied 3 of 3 files; source_ref "),
+        text.starts_with("edit: applied 3 of 3 files; diagnostics: "),
         "{text}"
     );
     assert_files(&fixture, edited, "the unused id applies");
@@ -1199,9 +1188,10 @@ async fn slow_multi_file_edit_check_arrives_as_one_edit_checked_fact() {
         "the check never parks the reply: {edit} {text}"
     );
     assert!(
-        text.starts_with("edit: applied 2 of 2 files; source_ref "),
+        text.starts_with("edit: applied 2 of 2 files; diagnostics: pending"),
         "{text}"
     );
+    assert_no_source_ref(&text);
     assert!(
         text.contains(
             "diagnostics: pending; the project check arrives by itself as an edit-checked fact"

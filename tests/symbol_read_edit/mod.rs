@@ -142,7 +142,7 @@ async fn edits_by_address_need_no_source_ref_and_name_the_changed_lines() {
         &mut actor,
         &fixture,
         "ide.edit",
-        json!({"symbol":"src/batch.rs#second","old":"3","new":"4"}),
+        json!({"symbol":"src/batch.rs#second","old":"    3","new":"    4"}),
     )
     .await;
     assert!(text.contains("src/batch.rs#second:2 (L13)  replaced"), "{text}");
@@ -213,7 +213,7 @@ async fn edits_by_address_need_no_source_ref_and_name_the_changed_lines() {
         "ide.edit",
         json!({"path":FILE,"changes":[
             {"symbol":"src/batch.rs#utility:4-4","content":"    a * 5"},
-            {"symbol":"src/batch.rs#second","old":"3","new":"6"}]}),
+            {"symbol":"src/batch.rs#second","old":"    3","new":"    6"}]}),
     )
     .await;
     assert!(text.contains("src/batch.rs#utility:4 (L9)") && text.contains("src/batch.rs#second:2 (L13)"), "{text}");

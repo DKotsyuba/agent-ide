@@ -11015,7 +11015,14 @@ mod stop_retry_tests {
                 } if reference == "line-edit"
                     && note.ends_with("\nlines after 2 moved +1")
             ),
-            "{reply:?}"
+            "{}",
+            match &reply {
+                PeerReply::Edit { result, note, .. } => format!(
+                    "outcome {:?}, source_ref {:?}, note {note:?}",
+                    result.outcome, result.source_ref
+                ),
+                other => format!("{other:?}"),
+            }
         );
         assert_eq!(
             std::fs::read_to_string(fixture.root.join("a.gamma")).unwrap(),
@@ -14259,7 +14266,7 @@ mod stop_retry_tests {
         );
         assert_eq!(
             run(AssistanceTool::Read, serde_json::json!({"symbol":"##top"})).await,
-            Ok("b.alpha:1  (lines 1)\n1\t#top @btn\nsource_ref: serverless\n".into())
+            Ok("b.alpha:1  (lines 1)\n1\t#top @btn\n".into())
         );
         assert_eq!(
             run(

@@ -3259,9 +3259,11 @@ impl Worker<'_> {
                 )
         });
         let mut outline: Option<Outline> = None;
+        let mut outline_state: Option<Lexical> = None;
         let lexical = if needs_outline {
             let (resolved, _, from_text) = self.outline_of(job, observed, bytes).await?;
             outline = Some(resolved);
+            outline_state = from_text.clone();
             from_text
                 .as_ref()
                 .and_then(|why| self.lexical_note(job, observed.path(), why))
@@ -3362,7 +3364,22 @@ impl Worker<'_> {
         let changes =
             match resolve_changes_with(&source, outline.as_ref(), path, &requests, &site_of) {
                 Ok(changes) => changes,
-                Err(refusal) => return Ok(Err(refusal)),
+                Err(refusal) => {
+                    // An address the lexical outline lacks is not proven absent while the
+                    // language server loads: the edit parks or answers provider_unavailable,
+                    // never a refusal that would teach the address does not exist.
+                    if refusal
+                        .sentences
+                        .iter()
+                        .any(|sentence| sentence.contains(": no symbol "))
+                    {
+                        let code = missing_symbol(job, outline_state);
+                        if code != FailureCode::UnknownSymbol {
+                            return Err(code);
+                        }
+                    }
+                    return Ok(Err(refusal));
+                }
             };
         let (spliced, landings) = match apply_changes(&source, path, &changes) {
             Ok(applied) => applied,
