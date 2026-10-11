@@ -4591,7 +4591,7 @@ fn window_guard(
         // Only lines the read actually showed can be guarded: a window outside the remembered
         // span (the agent read `:1-3`, edits `:10-12`) is unguarded and echoes what it replaces.
         match remembered(&canonical).filter(|seen| seen.first <= first && last <= seen.last) {
-            Some(before) if rows_of(&before.text) == now => refusal.push(
+            Some(before) if rows_of(&before.text) != now => refusal.push(
                 index + 1,
                 format!(
                     "change {}: lines {first}-{last} of {canonical} changed since your read. \
