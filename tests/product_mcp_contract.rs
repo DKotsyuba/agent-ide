@@ -10371,10 +10371,7 @@ async fn configured_product_batch_read_then_edit_reports_landings_and_bytes() {
         note.contains("src/util.rs") && note.contains("(L1)  replaced (1 lines → 1)"),
         "{edit}"
     );
-    assert!(
-        note.contains("(L5-7)  replaced (3 lines → 3)"),
-        "{edit}"
-    );
+    assert!(note.contains("(L5-7)  replaced (3 lines → 3)"), "{edit}");
     assert_eq!(
         std::fs::read(fixture.root.join("src/util.rs")).unwrap(),
         b"// changed\npub fn utility() -> i32 {\n    2\n}\npub fn second() -> i32 {\n    42\n}\n"

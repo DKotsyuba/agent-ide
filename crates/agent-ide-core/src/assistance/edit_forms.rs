@@ -42,7 +42,9 @@ pub(super) fn normalize(parameters: &mut Value) {
         }
     }
     normalize_entries(object);
-    if object.contains_key("changes") || object.contains_key("files") || object.contains_key("patch")
+    if object.contains_key("changes")
+        || object.contains_key("files")
+        || object.contains_key("patch")
     {
         return;
     }
@@ -115,12 +117,12 @@ fn wrap_old_text(object: &mut Map<String, Value>) {
             entry.insert(field.to_owned(), value);
         }
     }
-    if let Some(Value::String(symbol)) = object.get("symbol").cloned() {
-        if let Some(file) = file_of(&symbol) {
-            object.remove("symbol");
-            entry.insert("within".to_owned(), Value::String(symbol));
-            object.entry("path").or_insert(Value::String(file));
-        }
+    if let Some(Value::String(symbol)) = object.get("symbol").cloned()
+        && let Some(file) = file_of(&symbol)
+    {
+        object.remove("symbol");
+        entry.insert("within".to_owned(), Value::String(symbol));
+        object.entry("path").or_insert(Value::String(file));
     }
     object.insert("changes".to_owned(), json!([Value::Object(entry)]));
 }
@@ -216,7 +218,9 @@ mod tests {
             json!({"path":"a.rs","changes":[{"symbol":"a.rs#F:2-3","content":"z"}]})
         );
         assert_eq!(
-            normalized(json!({"symbol":"a.rs#@imports","op":"insert","where":"after","content":"z"})),
+            normalized(
+                json!({"symbol":"a.rs#@imports","op":"insert","where":"after","content":"z"})
+            ),
             json!({"path":"a.rs","changes":[{"symbol":"a.rs#@imports","op":"insert","where":"after","content":"z"}]})
         );
         for untouched in [

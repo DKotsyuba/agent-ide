@@ -53,8 +53,9 @@ impl Worker<'_> {
                     files.push(json!({"path": path, "create": true, "content": content}));
                 }
                 PatchFile::Update { path, hunks } => {
-                    let (observed, bytes) =
-                        self.observe(&binding, std::path::PathBuf::from(&path)).await?;
+                    let (observed, bytes) = self
+                        .observe(&binding, std::path::PathBuf::from(&path))
+                        .await?;
                     if no_such_file(observed.state(), &path).is_some() {
                         return Err(refuse(job, format!("{path} does not exist")));
                     }

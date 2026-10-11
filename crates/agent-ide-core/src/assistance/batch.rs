@@ -692,9 +692,8 @@ pub(crate) fn validate_edit_files(object: &Map<String, Value>) -> Result<(), Par
                     .ok_or_else(|| invalid_field("content", FieldRule::String))?;
                 text_bytes += text.len();
                 single["content"] = content.clone();
-                match (create, reference) {
-                    (false, Some(reference)) => single["source_ref"] = json!(reference),
-                    _ => {}
+                if let (false, Some(reference)) = (create, reference) {
+                    single["source_ref"] = json!(reference);
                 }
             }
             _ => return Err(shape()),

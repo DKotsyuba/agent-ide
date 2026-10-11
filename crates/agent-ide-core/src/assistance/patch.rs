@@ -120,7 +120,10 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<PatchFile>, String> {
         return Err("patch: line 1: empty patch, expected `*** Begin Patch`".to_string());
     }
     if lines[index].trim_end() != "*** Begin Patch" {
-        return Err(format!("patch: line {}: expected `*** Begin Patch`", index + 1));
+        return Err(format!(
+            "patch: line {}: expected `*** Begin Patch`",
+            index + 1
+        ));
     }
     index += 1;
 
@@ -128,7 +131,10 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<PatchFile>, String> {
     let mut seen_paths = HashSet::new();
     loop {
         if index >= lines.len() {
-            return Err(format!("patch: line {}: missing `*** End Patch`", lines.len() + 1));
+            return Err(format!(
+                "patch: line {}: missing `*** End Patch`",
+                lines.len() + 1
+            ));
         }
         let number = index + 1;
         let line = lines[index].trim_end();
@@ -154,7 +160,7 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<PatchFile>, String> {
                         return Err(format!(
                             "patch: line {}: Add File lines must start with '+'",
                             index + 1
-                        ))
+                        ));
                     }
                 }
                 index += 1;
@@ -176,14 +182,20 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<PatchFile>, String> {
         }
     }
 
-    if let Some(offset) = lines[index..].iter().position(|line| !line.trim().is_empty()) {
+    if let Some(offset) = lines[index..]
+        .iter()
+        .position(|line| !line.trim().is_empty())
+    {
         return Err(format!(
             "patch: line {}: text after `*** End Patch`",
             index + offset + 1
         ));
     }
     if files.is_empty() {
-        return Err(format!("patch: line {}: patch has no file operations", index));
+        return Err(format!(
+            "patch: line {}: patch has no file operations",
+            index
+        ));
     }
     Ok(files)
 }
@@ -248,7 +260,9 @@ fn parse_update_body(
         }
         if raw.trim_end() == "*** End of File" {
             match open.take() {
-                Some((mut hunk, _)) if !(hunk.old_lines.is_empty() && hunk.new_lines.is_empty()) => {
+                Some((mut hunk, _))
+                    if !(hunk.old_lines.is_empty() && hunk.new_lines.is_empty()) =>
+                {
                     hunk.at_end_of_file = true;
                     hunks.push(hunk);
                 }
@@ -256,7 +270,7 @@ fn parse_update_body(
                     return Err(format!(
                         "patch: line {}: `*** End of File` must follow hunk lines",
                         number
-                    ))
+                    ));
                 }
             }
             may_open_bare = false;
@@ -284,7 +298,7 @@ fn parse_update_body(
                     return Err(format!(
                         "patch: line {}: hunk line must start with ' ', '-' or '+'",
                         number
-                    ))
+                    ));
                 }
             };
             if open.is_none() && !may_open_bare {
@@ -308,10 +322,7 @@ fn parse_update_body(
     }
     close_hunk(&mut open, &mut hunks)?;
     if hunks.is_empty() {
-        return Err(format!(
-            "patch: line {}: Update File has no hunks",
-            header
-        ));
+        return Err(format!("patch: line {}: Update File has no hunks", header));
     }
     Ok((hunks, index))
 }
@@ -433,10 +444,7 @@ fn locate(lines: &[&str], hunk: &Hunk, cursor: usize) -> Option<usize> {
         return Some(lines.len());
     }
     let from = search_start(lines, hunk, cursor);
-    let last = match lines.len().checked_sub(old.len()) {
-        Some(last) => last,
-        None => return None,
-    };
+    let last = lines.len().checked_sub(old.len())?;
     for level in 0..PASSES {
         if hunk.at_end_of_file {
             if last >= from && matches_at(lines, old, last, level) {
@@ -533,14 +541,14 @@ fn miss(lines: &[&str], hunk: &Hunk, number: usize) -> Miss {
             let count = (0..len)
                 .filter(|&offset| same_line(lines[start + offset], &old[offset], PASSES - 1))
                 .count();
-            if count > 0 && best.map_or(true, |(best_count, _)| count > best_count) {
+            if count > 0 && best.is_none_or(|(best_count, _)| count > best_count) {
                 best = Some((count, start));
             }
         }
     }
     let (start, end) = match best {
         Some((_, start)) => (start + 1, (start + len).min(lines.len())),
-        None => (1, lines.len().min(MISS_WINDOW).max(1)),
+        None => (1, lines.len().clamp(1, MISS_WINDOW)),
     };
     Miss {
         hunk: number,
@@ -569,7 +577,11 @@ struct Span {
 fn changed_span(hunk: &Hunk, at: usize) -> Option<Span> {
     let old = &hunk.old_lines;
     let new = &hunk.new_lines;
-    let prefix = old.iter().zip(new.iter()).take_while(|(a, b)| a == b).count();
+    let prefix = old
+        .iter()
+        .zip(new.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
     let room = old.len().min(new.len()) - prefix;
     let suffix = old
         .iter()
@@ -719,9 +731,11 @@ mod tests {
     /// Checks that a source line with different indentation still matches after trimming.
     #[test]
     fn applies_despite_indentation_difference() {
-        let applied =
-            apply_hunks("    fn f() {}\n", &[hunk(None, &["fn f() {}"], &["fn g() {}"], false)])
-                .unwrap();
+        let applied = apply_hunks(
+            "    fn f() {}\n",
+            &[hunk(None, &["fn f() {}"], &["fn g() {}"], false)],
+        )
+        .unwrap();
         assert_eq!(applied.text, "fn g() {}\n");
         assert_eq!(applied.changed, vec![(1, 1)]);
     }

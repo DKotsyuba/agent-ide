@@ -1273,7 +1273,10 @@ pub fn validate_call(
         AssistanceTool::Edit if object.contains_key("patch") => {
             // A Codex `apply_patch` body travels alone beside `operation_id`; its grammar is
             // checked by the worker, which owns the refusal text.
-            if object.keys().any(|key| !matches!(key.as_str(), "operation_id" | "patch")) {
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "operation_id" | "patch"))
+            {
                 return Err(invalid_field(
                     "patch",
                     FieldRule::OneOf("used only with \"operation_id\""),
@@ -6285,81 +6288,93 @@ mod managed_claude_front_tests {
         assert!(!reconnect.activated_before().await);
     }
 
-/// The lenient read range grammar: one line, a closed range and an open range parse; zero,
-/// reversed and malformed ranges do not. Edits keep the strict grammar.
-#[test]
-fn read_ranges_accept_one_line_closed_and_open_forms() {
-    let range = |text: &str| parse_read_range(text).map(|r| (r.start, r.end));
-    assert_eq!(range("7"), Some((7, 7)));
-    assert_eq!(range("7-9"), Some((7, 9)));
-    assert_eq!(range("7-"), Some((7, u32::MAX)));
-    for bad in ["", "0", "0-3", "9-7", "-3", "a-b", "1-2-3"] {
-        assert_eq!(range(bad), None, "{bad}");
+    /// The lenient read range grammar: one line, a closed range and an open range parse; zero,
+    /// reversed and malformed ranges do not. Edits keep the strict grammar.
+    #[test]
+    fn read_ranges_accept_one_line_closed_and_open_forms() {
+        let range = |text: &str| parse_read_range(text).map(|r| (r.start, r.end));
+        assert_eq!(range("7"), Some((7, 7)));
+        assert_eq!(range("7-9"), Some((7, 9)));
+        assert_eq!(range("7-"), Some((7, u32::MAX)));
+        for bad in ["", "0", "0-3", "9-7", "-3", "a-b", "1-2-3"] {
+            assert_eq!(range(bad), None, "{bad}");
+        }
+        assert!(parse_line_range("7").is_none() && parse_line_range("7-").is_none());
     }
-    assert!(parse_line_range("7").is_none() && parse_line_range("7-").is_none());
-}
 
-/// The address-shaped edit forms E1-E8 validate; their closed shape errors refuse.
-#[test]
-fn address_edit_forms_validate() {
-    for call in [
-        json!({"symbol":"a.rs#F:2-3","content":"x"}),
-        json!({"symbol":"a.rs#F:2","content":""}),
-        json!({"symbol":"a.rs#F","old":"x","new":"y"}),
-        json!({"symbol":"a.rs#F:2-3","old":"x","new":"y"}),
-        json!({"path":"a.rs","old":"x","new":"y"}),
-        json!({"file_path":"a.rs","old_string":"x","new_string":""}),
-        json!({"symbol":"a.rs#@imports","op":"insert","where":"after","content":"use x;"}),
-        json!({"symbol":"a.rs#@header","content":"// h"}),
-        json!({"symbol":"a.rs#F:2-3","op":"delete"}),
-        json!({"path":"a.rs","add_import":"use std::fmt;"}),
-        json!({"path":"a.rs","remove_import":"use std::fmt;"}),
-        json!({"path":"a.rs","changes":[{"symbol":"a.rs#F","old":"x","new":"y"},{"add_import":"use x;"}]}),
-    ] {
-        assert!(validate_call(AssistanceTool::Edit, call.clone()).is_ok(), "{call}");
+    /// The address-shaped edit forms E1-E8 validate; their closed shape errors refuse.
+    #[test]
+    fn address_edit_forms_validate() {
+        for call in [
+            json!({"symbol":"a.rs#F:2-3","content":"x"}),
+            json!({"symbol":"a.rs#F:2","content":""}),
+            json!({"symbol":"a.rs#F","old":"x","new":"y"}),
+            json!({"symbol":"a.rs#F:2-3","old":"x","new":"y"}),
+            json!({"path":"a.rs","old":"x","new":"y"}),
+            json!({"file_path":"a.rs","old_string":"x","new_string":""}),
+            json!({"symbol":"a.rs#@imports","op":"insert","where":"after","content":"use x;"}),
+            json!({"symbol":"a.rs#@header","content":"// h"}),
+            json!({"symbol":"a.rs#F:2-3","op":"delete"}),
+            json!({"path":"a.rs","add_import":"use std::fmt;"}),
+            json!({"path":"a.rs","remove_import":"use std::fmt;"}),
+            json!({"path":"a.rs","changes":[{"symbol":"a.rs#F","old":"x","new":"y"},{"add_import":"use x;"}]}),
+        ] {
+            assert!(
+                validate_call(AssistanceTool::Edit, call.clone()).is_ok(),
+                "{call}"
+            );
+        }
+        for call in [
+            json!({"path":"a.rs","add_import":"use a;\nuse b;"}),
+            json!({"path":"a.rs","old":"x"}),
+            json!({"path":"a.rs","old":"x","new":"y","content":"z"}),
+            json!({"symbol":"a.rs#F:2-3","old":"x","new":"y","content":"z"}),
+            json!({"path":"a.rs","add_import":"use a;","remove_import":"use b;"}),
+        ] {
+            assert!(
+                validate_call(AssistanceTool::Edit, call.clone()).is_err(),
+                "{call}"
+            );
+        }
     }
-    for call in [
-        json!({"path":"a.rs","add_import":"use a;\nuse b;"}),
-        json!({"path":"a.rs","old":"x"}),
-        json!({"path":"a.rs","old":"x","new":"y","content":"z"}),
-        json!({"symbol":"a.rs#F:2-3","old":"x","new":"y","content":"z"}),
-        json!({"path":"a.rs","add_import":"use a;","remove_import":"use b;"}),
-    ] {
-        assert!(validate_call(AssistanceTool::Edit, call.clone()).is_err(), "{call}");
-    }
-}
 
-/// The read forms accept windows, regions and `path:line` locations as symbol texts.
-#[test]
-fn read_accepts_windows_regions_and_locations() {
-    for call in [
-        json!({"symbol":"src/a.rs#Store/transcript:3-5"}),
-        json!({"symbol":"src/a.rs#@imports"}),
-        json!({"symbol":"/repo/src/a.rs:130"}),
-        json!({"symbols":["src/a.rs#@header","src/a.rs#Store/new:2","src/b.rs:88"]}),
-        json!({"items":[{"symbol":"src/a.rs#Store/transcript:10"},{"path":"docs/x.md","lines":"1-"}]}),
-    ] {
-        assert!(validate_call(AssistanceTool::Read, call.clone()).is_ok(), "{call}");
+    /// The read forms accept windows, regions and `path:line` locations as symbol texts.
+    #[test]
+    fn read_accepts_windows_regions_and_locations() {
+        for call in [
+            json!({"symbol":"src/a.rs#Store/transcript:3-5"}),
+            json!({"symbol":"src/a.rs#@imports"}),
+            json!({"symbol":"/repo/src/a.rs:130"}),
+            json!({"symbols":["src/a.rs#@header","src/a.rs#Store/new:2","src/b.rs:88"]}),
+            json!({"items":[{"symbol":"src/a.rs#Store/transcript:10"},{"path":"docs/x.md","lines":"1-"}]}),
+        ] {
+            assert!(
+                validate_call(AssistanceTool::Read, call.clone()).is_ok(),
+                "{call}"
+            );
+        }
     }
-}
 
-/// `ide.edit {patch}` validates alone beside an optional `operation_id`; any other field beside
-/// it, a non-string or an empty patch is refused, and the grammar is left to the worker.
-#[test]
-fn patch_edit_stands_alone() {
-    let ok = validate_call(
-        AssistanceTool::Edit,
-        json!({"patch":"*** Begin Patch\n*** End Patch"}),
-    )
-    .unwrap();
-    assert!(ok.parameters()["operation_id"].is_string());
-    for bad in [
-        json!({"patch":"x","path":"a.rs"}),
-        json!({"patch":"x","files":[]}),
-        json!({"patch":5}),
-        json!({"patch":""}),
-    ] {
-        assert!(validate_call(AssistanceTool::Edit, bad.clone()).is_err(), "{bad}");
+    /// `ide.edit {patch}` validates alone beside an optional `operation_id`; any other field beside
+    /// it, a non-string or an empty patch is refused, and the grammar is left to the worker.
+    #[test]
+    fn patch_edit_stands_alone() {
+        let ok = validate_call(
+            AssistanceTool::Edit,
+            json!({"patch":"*** Begin Patch\n*** End Patch"}),
+        )
+        .unwrap();
+        assert!(ok.parameters()["operation_id"].is_string());
+        for bad in [
+            json!({"patch":"x","path":"a.rs"}),
+            json!({"patch":"x","files":[]}),
+            json!({"patch":5}),
+            json!({"patch":""}),
+        ] {
+            assert!(
+                validate_call(AssistanceTool::Edit, bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
     }
-}
 }

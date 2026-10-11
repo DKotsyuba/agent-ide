@@ -138,7 +138,11 @@ pub(super) fn numbered_rows(text: &str, first: u32, last: u32, limit: usize) -> 
     let width = last.to_string().len();
     let mut out = String::new();
     for (index, row) in rows.iter().take(limit).enumerate() {
-        out.push_str(&format!("{:>width$}\t{}\n", first as usize + index, row.trim_end_matches('\n')));
+        out.push_str(&format!(
+            "{:>width$}\t{}\n",
+            first as usize + index,
+            row.trim_end_matches('\n')
+        ));
     }
     if rows.len() > limit {
         out.push_str(&format!("+{} more\n", rows.len() - limit));
@@ -192,10 +196,8 @@ impl Worker<'_> {
         job: &mut Job,
         binding: &BindingRef,
         text: &str,
-    ) -> Result<
-        Option<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>)>,
-        FailureCode,
-    > {
+    ) -> Result<Option<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>)>, FailureCode>
+    {
         let Some(request) = parse_request(text) else {
             return Ok(None);
         };
@@ -205,11 +207,15 @@ impl Worker<'_> {
             }
             Requested::Line { file, .. } => self.relative_file(binding, file.clone()).await?,
         };
-        let (observed, bytes) = self.observe(binding, file.clone()).await.inspect_err(|code| {
-            if matches!(code, FailureCode::SourceUnavailable) {
-                job.failure_detail = Some(format!("read:source_unavailable:{}", file.display()));
-            }
-        })?;
+        let (observed, bytes) = self
+            .observe(binding, file.clone())
+            .await
+            .inspect_err(|code| {
+                if matches!(code, FailureCode::SourceUnavailable) {
+                    job.failure_detail =
+                        Some(format!("read:source_unavailable:{}", file.display()));
+                }
+            })?;
         if let Some(code) = super::symbols::no_such_file(observed.state(), &file.to_string_lossy())
         {
             return Err(code);
@@ -222,7 +228,10 @@ impl Worker<'_> {
         {
             let authority = self.finish_symbol_job(job, binding, &observed).await?;
             let total = crate::lang::line_count(source);
-            let text = format!("{}: file has {total} lines; nothing at {line}\n", file.display());
+            let text = format!(
+                "{}: file has {total} lines; nothing at {line}\n",
+                file.display()
+            );
             return self.unit_reply(job, text, authority, observed).map(Some);
         }
         let Some((mut body, read)) = read_unit(&file, &map, source, &request) else {
@@ -287,7 +296,12 @@ mod tests {
     use crate::lang::{LineRange, Symbol, SymbolKind, SymbolPath};
 
     /// One symbol of `f.rs` spanning `lines`, named by the path `names`.
-    fn symbol(names: &[&str], kind: SymbolKind, lines: (u32, u32), children: Vec<Symbol>) -> Symbol {
+    fn symbol(
+        names: &[&str],
+        kind: SymbolKind,
+        lines: (u32, u32),
+        children: Vec<Symbol>,
+    ) -> Symbol {
         let range = LineRange::new(lines.0, lines.1);
         Symbol {
             path: SymbolPath::new(

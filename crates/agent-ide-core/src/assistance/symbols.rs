@@ -413,7 +413,9 @@ impl Worker<'_> {
                     // A bare path of a file no IDE language reads has no outline to resolve: it
                     // reads as text, like `ide.read {path}`.
                     let text_file = request.is_none()
-                        && legacy.as_ref().is_some_and(|symbol| symbol.segments().is_empty())
+                        && legacy
+                            .as_ref()
+                            .is_some_and(|symbol| symbol.segments().is_empty())
                         && Lang::for_path(&file).is_none();
                     let index = match self
                         .read_batch_file(job, &binding, &mut files, file.clone(), !text_file)
@@ -527,13 +529,7 @@ impl Worker<'_> {
                     };
                     let total = lang::line_count(source);
                     if range.start > total {
-                        items.push((
-                            format!(
-                                "{}", nothing_at(total, range)
-                            ),
-                            None,
-                            item,
-                        ));
+                        items.push((nothing_at(total, range), None, item));
                         continue;
                     }
                     let clamped = LineRange::new(range.start, range.end.min(total));
@@ -3258,12 +3254,12 @@ impl Worker<'_> {
                 request,
                 ChangeRequest::Symbol { .. } | ChangeRequest::Import { .. }
             ) || matches!(
-                    request,
-                    ChangeRequest::Old {
-                        within: Some(_),
-                        ..
-                    }
-                )
+                request,
+                ChangeRequest::Old {
+                    within: Some(_),
+                    ..
+                }
+            )
         });
         let mut outline: Option<Outline> = None;
         let mut outline_state: Option<Lexical> = None;
@@ -4334,8 +4330,7 @@ fn parse_change_requests(entries: &[Value]) -> Result<Vec<ChangeRequest>, Failur
                     .get(key)
                     .and_then(Value::as_str)
                     .map(|text| (add, text.to_owned()))
-            })
-        {
+            }) {
             ChangeRequest::Import { add, text }
         } else if let Some(lines) = entry.get("lines").and_then(Value::as_str) {
             ChangeRequest::Lines {
@@ -4865,7 +4860,9 @@ fn resolve_changes_with(
                             number,
                             base: range,
                             action: ChangeAction::Replace(
-                                lang::slice_lines(source, range).trim_end_matches('\n').to_owned(),
+                                lang::slice_lines(source, range)
+                                    .trim_end_matches('\n')
+                                    .to_owned(),
                             ),
                             address: ChangeAddress::Symbol(anchor),
                         });
@@ -4894,10 +4891,17 @@ fn resolve_changes_with(
                     },
                     (false, _, Some(span)) => match find_old(source, statement, Some(span)) {
                         OldMatch::One { start, end } => {
-                            let end = if source[end..].starts_with('\n') { end + 1 } else { end };
+                            let end = if source[end..].starts_with('\n') {
+                                end + 1
+                            } else {
+                                end
+                            };
                             resolved.push(ResolvedChange {
                                 number,
-                                base: LineRange::new(line_of(start), line_of(end.saturating_sub(1))),
+                                base: LineRange::new(
+                                    line_of(start),
+                                    line_of(end.saturating_sub(1)),
+                                ),
                                 action: ChangeAction::Splice {
                                     start,
                                     end,
@@ -5364,11 +5368,7 @@ fn changed_rows(
 /// `file#unit:N-M (L131-135)` for the final lines `range`: the window inside the unit that holds
 /// them (the unit's own address when they cover it, the first line's address when they cross
 /// units), followed by the absolute lines; `path:N-M` without a map.
-fn position_text(
-    path: &str,
-    map: Option<&lang::address::AddressMap>,
-    range: LineRange,
-) -> String {
+fn position_text(path: &str, map: Option<&lang::address::AddressMap>, range: LineRange) -> String {
     let absolute = if range.start == range.end {
         format!(" (L{})", range.start)
     } else {
@@ -5614,7 +5614,9 @@ mod batch_tests {
         )
         .unwrap_err();
         assert!(
-            refusal.detail().contains("a.gamma#card/btn:9 has 3 lines, not 9"),
+            refusal
+                .detail()
+                .contains("a.gamma#card/btn:9 has 3 lines, not 9"),
             "{}",
             refusal.detail()
         );
@@ -5637,9 +5639,15 @@ mod batch_tests {
         }];
         let read = |before: &'static str| move |_: &str| Some(before.to_owned());
         // E6a: the remembered line 2 differs from the current one.
-        let refusal = window_guard("a.gamma", &map, source, &request, &read("sym btn\nOLD\nend\n"))
-            .unwrap_err()
-            .detail();
+        let refusal = window_guard(
+            "a.gamma",
+            &map,
+            source,
+            &request,
+            &read("sym btn\nOLD\nend\n"),
+        )
+        .unwrap_err()
+        .detail();
         assert!(
             refusal.contains("lines 2-2 of a.gamma#card/btn changed since your read")
                 && refusal.contains("2\t2")
@@ -5648,9 +5656,15 @@ mod batch_tests {
         );
         // E6b: the same window lines pass although the unit differs elsewhere.
         assert!(
-            window_guard("a.gamma", &map, source, &request, &read("CHANGED\n2\nend\n"))
-                .unwrap()
-                .is_empty()
+            window_guard(
+                "a.gamma",
+                &map,
+                source,
+                &request,
+                &read("CHANGED\n2\nend\n")
+            )
+            .unwrap()
+            .is_empty()
         );
         // E6c: nothing remembered applies and echoes the replaced line.
         let echoes = window_guard("a.gamma", &map, source, &request, &|_| None).unwrap();
@@ -5669,8 +5683,13 @@ mod batch_tests {
                 within: Some(within.to_owned()),
             }]
         };
-        let changes = resolve_changes(source, Some(&outline), "a.gamma", &request("a.gamma#card/btn:2"))
-            .expect("one match inside the window");
+        let changes = resolve_changes(
+            source,
+            Some(&outline),
+            "a.gamma",
+            &request("a.gamma#card/btn:2"),
+        )
+        .expect("one match inside the window");
         let (candidate, _) = apply_changes(source, "a.gamma", &changes).unwrap();
         assert_eq!(candidate, "sym card\n1\nsym btn\n9\nend\nmark\nend\n");
     }
@@ -5966,7 +5985,10 @@ mod batch_tests {
         let rows = changed_rows("a.gamma", &many, &landings, None, None, &[]);
         assert_eq!(rows.lines().count(), 13, "{rows}");
         assert!(rows.ends_with("  +2 more"), "{rows}");
-        assert!(rows.starts_with("  a.gamma:2 (L2)  replaced (1 lines → 1)"), "{rows}");
+        assert!(
+            rows.starts_with("  a.gamma:2 (L2)  replaced (1 lines → 1)"),
+            "{rows}"
+        );
     }
 
     /// The single form's one change produces byte-identical candidates for every legacy action.
