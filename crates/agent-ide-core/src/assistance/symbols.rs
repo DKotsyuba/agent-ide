@@ -332,7 +332,6 @@ impl Worker<'_> {
         if Lang::for_path(&path).is_none() {
             text.push_str(NO_ANALYSIS_NOTE);
         }
-        text.push_str(&format!("source_ref: {}\n", job.reference));
         let (reply, page) =
             ContextPageState::new(text, 0, false, ResultKind::Read).next(&job.reference)?;
         self.shared.set_context_page(&job.reference, page);
@@ -598,15 +597,9 @@ impl Worker<'_> {
             } else {
                 ""
             };
-            if names.len() > 1 {
-                format!(
-                    "{note}source_ref: {} (valid for {})\n",
-                    job.reference,
-                    names.join(", ")
-                )
-            } else {
-                format!("{note}source_ref: {}\n", job.reference)
-            }
+            // No file-version reference is printed: the current text is the freshness check.
+            let _ = names;
+            note.to_owned()
         };
         let files_named = items
             .iter()
@@ -3416,31 +3409,32 @@ impl Worker<'_> {
         } else {
             None
         };
-        let mut note = landing_note(&changes, &landings, align.as_ref());
-        let anchor = changes
-            .iter()
-            .map(|change| change.base.end)
-            .max()
-            .unwrap_or(0);
-        if let Some(shift) = line_shift_note(
-            &source,
-            &candidate,
-            changes
-                .iter()
-                .map(|change| change.base.start)
-                .min()
-                .unwrap_or(anchor),
-        ) {
-            note.push('\n');
-            note.push_str(&shift);
-        }
+        // The changed lines after the edit, by address: the candidate's own address map names
+        // them (a language without an outline names `path:lines`).
+        let candidate_map = match Lang::for_path(&file) {
+            Some(language) => crate::modules::calls::outline_from_source(
+                language,
+                observed.worktree().worktree_path(),
+                observed.path(),
+                &candidate,
+            )
+            .await
+            .ok()
+            .flatten()
+            .map(|outline| lang::address::AddressMap::build(&outline, &candidate)),
+            None => None,
+        };
+        let mut note = changed_rows(
+            path,
+            &changes,
+            &landings,
+            align.as_ref(),
+            candidate_map.as_ref(),
+            &echoes,
+        );
         if let Some(note_line) = pre_existing {
             note.push('\n');
             note.push_str(&note_line);
-        }
-        for echo in echoes {
-            note.push('\n');
-            note.push_str(echo.trim_end());
         }
         if let Some(lexical) = lexical {
             note = format!("{lexical}\n{note}");
@@ -4168,8 +4162,11 @@ impl ChangeAction {
     }
 }
 
-/// How the reply names one change's address.
+/// How one change was addressed. The reply names changes by their final address
+/// ([`changed_rows`]); only the import kinds are read back, and the other payloads document
+/// the request for diagnostics.
 #[derive(Debug)]
+#[allow(dead_code)]
 enum ChangeAddress {
     /// `lines 12-20` (base-version numbers).
     Lines(LineRange),
@@ -4204,36 +4201,6 @@ impl ResolvedChange {
     /// Whether this change inserts (a zero-width span that no other span may strictly contain).
     fn inserts(&self) -> bool {
         matches!(self.action, ChangeAction::Insert(..))
-    }
-
-    /// One change's landing sentence: `change 2: src/x.rs#Foo/bar inserted after #Foo (now 26–33)`.
-    fn landing(&self, now: Option<LineRange>) -> String {
-        let now = now
-            .map(|range| format!(" (now {range})"))
-            .unwrap_or_default();
-        match &self.address {
-            ChangeAddress::Lines(range) => format!(
-                "change {}: lines {range} {}{now}",
-                self.number,
-                self.action.verb()
-            ),
-            ChangeAddress::Symbol(path) => {
-                format!("change {}: {path} {}{now}", self.number, self.action.verb())
-            }
-            ChangeAddress::Insert {
-                path,
-                anchor,
-                where_,
-            } => format!(
-                "change {}: {path} inserted {where_} #{anchor}{now}",
-                self.number
-            ),
-            ChangeAddress::OldText { line } => format!(
-                "change {}: old text at line {line} {}{now}",
-                self.number,
-                self.action.verb()
-            ),
-        }
     }
 }
 
@@ -4529,7 +4496,7 @@ fn window_guard(
     source: &str,
     requests: &[ChangeRequest],
     remembered: &dyn Fn(&str) -> Option<String>,
-) -> Result<Vec<String>, Refusal> {
+) -> Result<Vec<(usize, String)>, Refusal> {
     let mut refusal = Refusal {
         sentences: Vec::new(),
         refused: std::collections::BTreeSet::new(),
@@ -4580,9 +4547,9 @@ fn window_guard(
                 ),
             ),
             Some(_) => {}
-            None => echoes.push(format!(
-                "{canonical}:{first}-{last} was:\n{}",
-                super::target::numbered_rows(&current, first, last, 8)
+            None => echoes.push((
+                index,
+                super::target::numbered_rows(&current, first, last, 8),
             )),
         }
     }
@@ -5268,31 +5235,115 @@ fn apply_changes(
     Ok((buffer, landings))
 }
 
-/// The success reply's per-change landing summary, `+N more` past the first
-/// [`MAX_LANDING_SENTENCES`] entries, each range remapped through the formatter's line movement
-/// when the formatter moved lines.
-fn landing_note(
+/// Change lines a success reply lists before `+<k> more` (symbol-read-edit-v1 §3.3).
+const MAX_CHANGE_ROWS: usize = 12;
+
+/// The success reply's change lines, one per change, each naming the changed lines AFTER the
+/// edit as an address that `ide.read` accepts (symbol-read-edit-v1 §3.3):
+/// `  src/a.rs#Store/transcript:12-16 (L131-135)  replaced (3 lines → 5)`.
+///
+/// `map` is the address map of the edited text; without one (a language with no outline) the
+/// lines are named `path:12-16`. A deleted symbol keeps the address it had, other deletions name
+/// the address now holding the join point. `echoes` pairs a change index with the old lines a
+/// window edit replaced (no remembered read), printed under its line as `; was:`. Past
+/// [`MAX_CHANGE_ROWS`] lines the rest is counted as `+<k> more`. Landing ranges are mapped
+/// through `align` when the formatter moved lines.
+fn changed_rows(
+    path: &str,
     changes: &[ResolvedChange],
     landings: &[Option<LineRange>],
     align: Option<&lang::text::LineAlign>,
+    map: Option<&lang::address::AddressMap>,
+    echoes: &[(usize, String)],
 ) -> String {
-    let rendered = changes
-        .iter()
-        .zip(landings)
-        .map(|(change, now)| {
-            change.landing(now.map(|range| align.map_or(range, |align| align.map_range(range))))
-        })
-        .take(MAX_LANDING_SENTENCES)
-        .collect::<Vec<_>>()
-        .join("; ");
-    let count = changes.len();
-    let noun = if count == 1 { "change" } else { "changes" };
-    let mut note = format!("{count} {noun} applied: {rendered}");
-    let hidden = changes.len().saturating_sub(MAX_LANDING_SENTENCES);
-    if hidden > 0 {
-        note.push_str(&format!("; +{hidden} more"));
+    let mut rows = Vec::new();
+    for (index, (change, now)) in changes.iter().zip(landings).enumerate() {
+        let now = now.map(|range| align.map_or(range, |align| align.map_range(range)));
+        let old_lines = change.base.len();
+        let label = match &change.address {
+            ChangeAddress::Insert { anchor, .. } if anchor == "@imports" => "added",
+            ChangeAddress::Symbol(address) if address.ends_with("#@imports") => {
+                match change.action {
+                    ChangeAction::Replace(_) => "unchanged",
+                    _ => "removed",
+                }
+            }
+            _ => change.action.verb(),
+        };
+        let place = match now {
+            Some(range) => position_text(path, map, range),
+            None => match &change.address {
+                ChangeAddress::Symbol(address) => address.clone(),
+                _ => map
+                    .and_then(|map| map.address_at(Path::new(path), change.base.start))
+                    .unwrap_or_else(|| format!("{path}:{}", change.base.start)),
+            },
+        };
+        let counts = match (label, now) {
+            ("replaced", Some(range)) => format!(" ({old_lines} lines → {})", range.len()),
+            ("inserted", Some(range)) => format!(" ({} lines)", range.len()),
+            ("deleted", _) => format!(" ({old_lines} lines)"),
+            _ => String::new(),
+        };
+        let mut row = format!("  {place}  {label}{counts}");
+        if let Some((_, was)) = echoes.iter().find(|(at, _)| *at == index) {
+            row.push_str("; was:");
+            for line in was.lines() {
+                row.push_str("\n    ");
+                row.push_str(line);
+            }
+        }
+        rows.push(row);
     }
-    note
+    let hidden = rows.len().saturating_sub(MAX_CHANGE_ROWS);
+    rows.truncate(MAX_CHANGE_ROWS);
+    if hidden > 0 {
+        rows.push(format!("  +{hidden} more"));
+    }
+    rows.join("\n")
+}
+
+/// `file#unit:N-M (L131-135)` for the final lines `range`: the window inside the unit that holds
+/// them (the unit's own address when they cover it, the first line's address when they cross
+/// units), followed by the absolute lines; `path:N-M` without a map.
+fn position_text(
+    path: &str,
+    map: Option<&lang::address::AddressMap>,
+    range: LineRange,
+) -> String {
+    let absolute = if range.start == range.end {
+        format!(" (L{})", range.start)
+    } else {
+        format!(" (L{}-{})", range.start, range.end)
+    };
+    let named = map.and_then(|map| {
+        let first = map.at_line(range.start)?;
+        let last = map.at_line(range.end)?;
+        let unit = &map.units()[first.unit];
+        let address = if first.unit == last.unit {
+            let window = (range != unit.span).then(|| lang::address::Window {
+                first: range.start - unit.span.start + 1,
+                last: Some(range.end - unit.span.start + 1),
+            });
+            lang::address::Address::new(
+                Some(PathBuf::from(path)),
+                unit.address.segments().to_vec(),
+                window,
+            )
+        } else {
+            lang::address::Address::new(
+                Some(PathBuf::from(path)),
+                unit.address.segments().to_vec(),
+                first.address.window(),
+            )
+        };
+        Some(address.to_string())
+    });
+    match named {
+        Some(address) => format!("{address}{absolute}"),
+        None if range.start == range.end => format!("{path}:{}{absolute}", range.start),
+        None => format!("{path}:{}-{}{absolute}", range.start, range.end),
+    }
 }
 
 /// History entries kept on one symbol card.
@@ -5545,7 +5596,7 @@ mod batch_tests {
         );
         // E6c: nothing remembered applies and echoes the replaced line.
         let echoes = window_guard("a.gamma", &map, source, &request, &|_| None).unwrap();
-        assert_eq!(echoes, ["a.gamma#card/btn:2-2 was:\n2\t2\n"]);
+        assert_eq!(echoes, [(0, "2\t2\n".to_owned())]);
     }
 
     /// `{old, new, within: <window>}` matches only inside the window.
@@ -5820,29 +5871,44 @@ mod batch_tests {
         }
     }
 
-    /// The landing note lists the first eight changes and counts the rest.
+    /// The change lines name the final lines by address, count lines, show the echo of an
+    /// unread window and clip after twelve lines.
     #[test]
-    fn landing_note_clips_after_eight_changes() {
-        let changes: Vec<ResolvedChange> = (1..=10)
+    fn changed_rows_name_final_lines_and_clip() {
+        let source = "sym card\n1\nsym btn\n2\nend\nmark\nend\n";
+        let outline = gamma_outline(source);
+        let map = lang::address::AddressMap::build(&outline, source);
+        let one = vec![change(
+            1,
+            LineRange::new(4, 4),
+            ChangeAction::Replace("two\nthree".to_owned()),
+        )];
+        let rows = changed_rows(
+            "a.gamma",
+            &one,
+            &[Some(LineRange::new(4, 5))],
+            None,
+            Some(&map),
+            &[(0, "2\t2\n".to_owned())],
+        );
+        assert_eq!(
+            rows,
+            "  a.gamma#card/btn:2-3 (L4-5)  replaced (1 lines → 2); was:\n    2\t2"
+        );
+        let many: Vec<ResolvedChange> = (1..=14)
             .map(|number| {
                 change(
                     number,
-                    LineRange::new(number as u32, number as u32),
+                    LineRange::new(2, 2),
                     ChangeAction::Replace("x".to_owned()),
                 )
             })
             .collect();
-        let landings = changes
-            .iter()
-            .map(|change| Some(change.base))
-            .collect::<Vec<_>>();
-        let note = landing_note(&changes, &landings, None);
-        assert!(
-            note.starts_with("10 changes applied: change 1: lines 1 replaced (now 1)"),
-            "{note}"
-        );
-        assert!(note.ends_with("; +2 more"), "{note}");
-        assert!(!note.contains("change 9:"), "{note}");
+        let landings = vec![Some(LineRange::new(2, 2)); 14];
+        let rows = changed_rows("a.gamma", &many, &landings, None, None, &[]);
+        assert_eq!(rows.lines().count(), 13, "{rows}");
+        assert!(rows.ends_with("  +2 more"), "{rows}");
+        assert!(rows.starts_with("  a.gamma:2 (L2)  replaced (1 lines → 1)"), "{rows}");
     }
 
     /// The single form's one change produces byte-identical candidates for every legacy action.

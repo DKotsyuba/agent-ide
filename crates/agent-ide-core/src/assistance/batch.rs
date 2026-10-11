@@ -874,25 +874,21 @@ pub(crate) struct FileReport {
 /// Renders the whole reply text of one multi-file edit, summary line first.
 ///
 /// `files` holds every requested file in request order. When all are written the first line is
-/// `edit: applied <w> of <n> files; source_ref <ref> (valid for all <w>); diagnostics: <d>`;
+/// `edit: applied <w> of <n> files; diagnostics: <d>`;
 /// otherwise it is `edit: partial — written <w> of <n>; not written: <k> <path> (<reason>), …;
-/// the same operation_id resumes the rest`, followed by a `source_ref <ref> (valid for the
-/// written files)` line when any file is written. One line per file follows
+/// the same operation_id resumes the rest`, followed by a `diagnostics: <d>` line when any file
+/// is written. No line names a file-version reference. One line per file follows
 /// (`  <k> <path>: <state>[; <note>][; diagnostics <d>]`), then at most eight `new:` problem lines.
 /// Every line states a fact; none names a waiting or repeating instruction.
 pub(crate) fn render_edit_reply(
     files: &[FileReport],
-    source_ref: Option<&str>,
     diagnostics: &str,
     new_lines: &[String],
 ) -> String {
     let written = files.iter().filter(|file| file.state.written()).count();
     let total = files.len();
     let mut text = if written == total {
-        let reference = source_ref
-            .map(|reference| format!("; source_ref {reference} (valid for all {written})"))
-            .unwrap_or_default();
-        format!("edit: applied {written} of {total} files{reference}; diagnostics: {diagnostics}\n")
+        format!("edit: applied {written} of {total} files; diagnostics: {diagnostics}\n")
     } else {
         let missing = files
             .iter()
@@ -917,10 +913,8 @@ pub(crate) fn render_edit_reply(
                  operation_id resumes the rest\n"
             )
         };
-        if let Some(reference) = source_ref.filter(|_| written > 0) {
-            head.push_str(&format!(
-                "source_ref {reference} (valid for the written files); diagnostics: {diagnostics}\n"
-            ));
+        if written > 0 {
+            head.push_str(&format!("diagnostics: {diagnostics}\n"));
         }
         head
     };
@@ -934,13 +928,18 @@ pub(crate) fn render_edit_reply(
             FileState::Unknown => "unknown (the write may have happened)".to_owned(),
         };
         text.push_str(&format!("  {} {}: {state}", index + 1, file.path));
-        if let Some(note) = &file.note {
-            text.push_str(&format!("; {note}"));
-        }
         if let Some(diagnostics) = &file.diagnostics {
             text.push_str(&format!("; diagnostics {diagnostics}"));
         }
         text.push('\n');
+        // The file's changed lines (by address), one per line under the file's own line.
+        if let Some(note) = &file.note {
+            for line in note.lines() {
+                text.push_str("  ");
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
     }
     for line in new_lines.iter().take(8) {
         text.push_str(line);
@@ -1013,7 +1012,7 @@ pub(crate) fn edit_batch_reply(
         outcome: edit_outcome(files),
         source_ref: source_ref.map(str::to_owned),
         files: edit_batch_files(files),
-        text: render_edit_reply(files, source_ref, diagnostics, new_lines),
+        text: render_edit_reply(files, diagnostics, new_lines),
         truncated: false,
     }
 }
@@ -1752,21 +1751,20 @@ mod tests {
         let applied = render_edit_reply(
             &[
                 FileReport {
-                    note: Some("1 change applied: change 1: lines 2 replaced (now 2)".into()),
+                    note: Some("  a.rs:2 (L2)  replaced (1 lines → 1)".into()),
                     diagnostics: Some("clean".into()),
                     ..report("a.rs", FileState::Replaced)
                 },
                 report("b.rs", FileState::WrittenEarlier { created: false }),
                 report("c.rs", FileState::Created),
             ],
-            Some("ref-9"),
             "clean",
             &[],
         );
         assert_eq!(
             applied,
-            "edit: applied 3 of 3 files; source_ref ref-9 (valid for all 3); diagnostics: clean\n  \
-             1 a.rs: replaced; 1 change applied: change 1: lines 2 replaced (now 2); diagnostics clean\n  \
+            "edit: applied 3 of 3 files; diagnostics: clean\n  \
+             1 a.rs: replaced; diagnostics clean\n    a.rs:2 (L2)  replaced (1 lines → 1)\n  \
              2 b.rs: written earlier by this operation_id\n  3 c.rs: created\n"
         );
         let partial = render_edit_reply(
@@ -1778,15 +1776,13 @@ mod tests {
                 ),
                 report("c.rs", FileState::NotWritten(NotWritten::NotReached)),
             ],
-            Some("ref-9"),
             "unknown",
             &["new: a.rs:1:1 error x".into()],
         );
         assert!(
             partial.starts_with(
                 "edit: partial — written 1 of 3; not written: 2 b.rs (changed after validation), \
-             3 c.rs (not reached); the same operation_id resumes the rest\nsource_ref ref-9 \
-             (valid for the written files); diagnostics: unknown\n"
+             3 c.rs (not reached); the same operation_id resumes the rest\ndiagnostics: unknown\n"
             ),
             "{partial}"
         );

@@ -2366,7 +2366,14 @@ fn queue_capacity(ordinary: usize, tool: AssistanceTool) -> usize {
 /// names what happened. `None` (replace, the line-range form, every plain edit) keeps the
 /// outcome word; rename builds its own summary reply.
 fn edit_operation(parameters: &Value) -> Option<String> {
-    match parameters.get("op").and_then(Value::as_str) {
+    // A one-entry `changes` call (every single-symbol form is rewritten to one) names its entry's
+    // operation.
+    let op = match parameters.get("changes").and_then(Value::as_array) {
+        Some(entries) if entries.len() == 1 => entries[0].get("op"),
+        Some(_) => None,
+        None => parameters.get("op"),
+    };
+    match op.and_then(Value::as_str) {
         Some("insert") => Some("inserted".to_owned()),
         Some("delete") => Some("deleted".to_owned()),
         _ => None,

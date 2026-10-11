@@ -402,7 +402,7 @@ impl Worker<'_> {
                         path,
                         base,
                         candidate,
-                        note: note.lines().next().map(str::to_owned),
+                        note: (!note.is_empty()).then_some(note),
                     })),
                     Err(refusal) => Ok(Err(format!("{label}: {}", refusal.detail()))),
                 }

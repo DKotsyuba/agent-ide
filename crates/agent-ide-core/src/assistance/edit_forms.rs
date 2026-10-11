@@ -1,20 +1,21 @@
 //! The address-shaped `ide.edit` forms of `symbol-read-edit-v1` section 3.1, rewritten into the
 //! one-file `changes` form before validation so a single engine applies them.
 //!
-//! Rewritten here (nothing else is touched, so every pre-v1 request keeps its exact path):
+//! Rewritten here (whole-file `content`, `files`, `patch` and `rename` are not touched):
 //!
 //! | request | becomes |
 //! |---|---|
 //! | `{symbol, old, new}` (E3) | `{path: <symbol's file>, changes: [{old, new, within: symbol}]}` |
 //! | `{path, old, new}` and the `file_path`/`old_string`/`new_string` aliases (E4) | `{path, changes: [{old, new}]}` |
 //! | `{path, add_import}` / `{path, remove_import}` (E8) | `{path, changes: [{add_import}]}` / `{... remove_import}` |
-//! | `{symbol, content \| op}` whose address has a window or names a region (E1, E2, E5, E6) | `{path: <symbol's file>, changes: [{symbol, content \| op, where}]}` |
+//! | `{symbol, content \| op}` (E1, E2, E5, E6, windows and regions included) | `{path: <symbol's file>, changes: [{symbol, content \| op, where}]}` |
+//! | `{path, lines, content}` | `{path, changes: [{lines, content}]}` |
 //!
 //! A `changes` entry that carries both `symbol` and `old` is the E3 entry: its `symbol` becomes
 //! `within`. A request that mixes a rewritten form with a field of another form keeps that field,
-//! so the `changes` validation refuses the mix exactly as it refuses any other.
+//! so the `changes` validation refuses the mix exactly as it refuses any other. One engine
+//! therefore applies every form and every success reply lists the changed lines by address.
 
-use crate::lang::address::{Address, Parsed};
 use serde_json::{Map, Value, json};
 
 /// Top-level aliases of the Claude-native edit shape and the field each stands for.
@@ -49,13 +50,35 @@ pub(super) fn normalize(parameters: &mut Value) {
         wrap_old_text(object);
     } else if object.contains_key("add_import") || object.contains_key("remove_import") {
         wrap_import(object);
-    } else if let Some(symbol) = object.get("symbol").and_then(Value::as_str)
-        && is_unit_edit(symbol)
+    } else if object.contains_key("symbol")
         && !object.contains_key("lines")
-        && object.get("op").and_then(Value::as_str) != Some("rename")
+        && matches!(
+            object.get("op").and_then(Value::as_str),
+            None | Some("replace" | "insert" | "delete")
+        )
     {
         wrap_symbol(object);
+    } else if object.contains_key("lines")
+        && !object.contains_key("symbol")
+        && matches!(
+            object.get("op").and_then(Value::as_str),
+            None | Some("replace")
+        )
+    {
+        wrap_lines(object);
     }
+}
+
+/// `{path, lines, content}` becomes one `{lines, content}` entry.
+fn wrap_lines(object: &mut Map<String, Value>) {
+    let mut entry = Map::new();
+    for field in ["lines", "content"] {
+        if let Some(value) = object.remove(field) {
+            entry.insert(field.to_owned(), value);
+        }
+    }
+    object.remove("op");
+    object.insert("changes".to_owned(), json!([Value::Object(entry)]));
 }
 
 /// Turns each `{symbol, old, new}` entry of `changes` into `{old, new, within: symbol}`.
@@ -74,18 +97,6 @@ fn normalize_entries(object: &mut Map<String, Value>) {
             entry.insert("within".to_owned(), symbol);
         }
     }
-}
-
-/// Whether `symbol` is an address the single-symbol path cannot edit: it carries a window or
-/// names a region (`file#@imports`).
-fn is_unit_edit(symbol: &str) -> bool {
-    matches!(
-        Address::parse(symbol),
-        Ok(Parsed::Address(address))
-            if address.file().is_some()
-                && (address.window().is_some()
-                    || address.segments().iter().any(|s| s.name.starts_with('@')))
-    )
 }
 
 /// The file part of `symbol` (`src/a.rs` of `src/a.rs#Foo`), when it has one.
@@ -182,9 +193,17 @@ mod tests {
         );
     }
 
-    /// Windows and regions are rewritten; a plain symbol, a rename and the pre-v1 forms are not.
+    /// Symbol and line forms are rewritten; a rename and whole-file content are not.
     #[test]
-    fn only_window_and_region_symbols_are_rewritten() {
+    fn symbol_and_line_forms_are_rewritten() {
+        assert_eq!(
+            normalized(json!({"symbol":"a.rs#F","op":"delete"})),
+            json!({"path":"a.rs","changes":[{"symbol":"a.rs#F","op":"delete"}]})
+        );
+        assert_eq!(
+            normalized(json!({"path":"a.rs","lines":"1-2","source_ref":"s","content":"z"})),
+            json!({"path":"a.rs","source_ref":"s","changes":[{"lines":"1-2","content":"z"}]})
+        );
         assert_eq!(
             normalized(json!({"symbol":"a.rs#F:2-3","content":"z"})),
             json!({"path":"a.rs","changes":[{"symbol":"a.rs#F:2-3","content":"z"}]})
@@ -194,10 +213,9 @@ mod tests {
             json!({"path":"a.rs","changes":[{"symbol":"a.rs#@imports","op":"insert","where":"after","content":"z"}]})
         );
         for untouched in [
-            json!({"symbol":"a.rs#F","content":"z"}),
             json!({"symbol":"a.rs#F:2-3","op":"rename","new_name":"g"}),
-            json!({"path":"a.rs","lines":"1-2","content":"z"}),
             json!({"path":"a.rs","content":"z"}),
+            json!({"symbol":"a.rs#F","path":"b.rs","lines":"1-2","content":"z"}),
         ] {
             assert_eq!(normalized(untouched.clone()), untouched);
         }
