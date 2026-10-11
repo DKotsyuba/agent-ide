@@ -10992,7 +10992,7 @@ mod stop_retry_tests {
         let stale = blake3::hash(b"sym card\nsym other\nend\n")
             .to_hex()
             .to_string();
-        let invocation = production_call(&mut worker, "line-actor", "patch-stale");
+        let invocation = production_call(&worker, "line-actor", "patch-stale");
         let (mut job, _cancel) = tool_job(
             &fixture.root,
             invocation,
