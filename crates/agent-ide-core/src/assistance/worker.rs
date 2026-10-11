@@ -53,6 +53,8 @@ mod inspection;
 mod links;
 #[path = "navigation.rs"]
 mod navigation;
+#[path = "worker/patch_edit.rs"]
+mod patch_edit;
 #[path = "providers.rs"]
 mod providers;
 #[path = "snapshots.rs"]
@@ -5368,6 +5370,9 @@ impl<'a> Worker<'a> {
                 Some(authority),
                 source,
             ));
+        }
+        if job.parameters.get("patch").is_some() {
+            return self.edit_patch(job).await;
         }
         if job.parameters.get("files").is_some() {
             return self.edit_files(job).await;

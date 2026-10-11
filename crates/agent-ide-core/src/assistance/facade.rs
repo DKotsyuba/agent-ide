@@ -293,6 +293,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "The source_ref of the ide.read/ide.context this content is based on; required with `path`+`lines` and to replace an existing file with `path`+`content`, optional (but validated) with `symbol`. Omit it with `path`+`content` to create a new file."},
                     "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES, "description": "Replacement or inserted code, including the symbol's doc comment and attributes."},
                     "changes": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "additionalProperties": false, "properties": {"lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "op": {"type": "string", "enum": ["replace", "insert", "delete"]}, "where": {"type": "string", "enum": ["before", "after", "first", "last"]}, "content": {"type": "string"}, "old": {"type": "string", "minLength": 1}, "new": {"type": "string"}, "within": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}}, "description": "1–32 changes to ONE file (named by `path`), each addressed by exactly one of `lines`, `symbol` or `old`; every address resolves against the bytes `source_ref` names before anything is applied, and overlapping or unmatched addresses are refused together with nothing written. `lines` numbers are that version's, never shifted by other changes (empty `content` deletes the range); `old` must match exactly once (add `within` to scope it) and `new` replaces exactly the matched bytes, terminators included (`\"\"` deletes the match)."}},
+                    "patch": {"type": "string", "minLength": 1, "maxLength": super::batch::MAX_EDIT_TEXT_BYTES, "description": "A Codex apply_patch body (`*** Begin Patch` … `*** End Patch` with Add File and Update File sections), applied atomically across files. Use it alone; delete and move are not supported."},
                     "files": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_EDIT_FILES, "items": {"type": "object", "additionalProperties": false, "required": ["path"], "properties": {"path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}, "changes": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object"}}, "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES}, "create": {"type": "boolean"}}}, "description": "One logical change across up to 16 files in ONE call, with only `operation_id` and an optional default `source_ref` beside it: each entry is {\"path\",\"changes\":[…]} (exactly the one-file `changes` entries), {\"path\",\"create\":true,\"content\"} (a new file) or {\"path\",\"content\"} (whole new content), with its own optional `source_ref`; at most 128 changes and 128 KiB of text in all. Every file is validated before the first write and any refusal writes nothing; files are written in order, one project check runs on the result, a partial write is reported per file, and the same `operation_id` resumes the rest."}
                 }
             }),
@@ -717,6 +718,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "new_name",
             "lines",
             "files",
+            "patch",
         ],
         AssistanceTool::Outline => &["path", "kinds", "paths", "glob"],
         AssistanceTool::Read => &[
@@ -1258,6 +1260,24 @@ pub fn validate_call(
         }
         AssistanceTool::Stop => {
             optional_string(object, "activation_id", MAX_ACTIVATION_ID_BYTES)?;
+        }
+        AssistanceTool::Edit if object.contains_key("patch") => {
+            // A Codex `apply_patch` body travels alone beside `operation_id`; its grammar is
+            // checked by the worker, which owns the refusal text.
+            if object.keys().any(|key| !matches!(key.as_str(), "operation_id" | "patch")) {
+                return Err(invalid_field(
+                    "patch",
+                    FieldRule::OneOf("used only with \"operation_id\""),
+                ));
+            }
+            let patch = required_string(object, "patch", super::batch::MAX_EDIT_TEXT_BYTES)?;
+            if patch.len() > super::batch::MAX_EDIT_TEXT_BYTES {
+                return Err(invalid_field(
+                    "patch",
+                    FieldRule::TooLong(super::batch::MAX_EDIT_TEXT_BYTES),
+                ));
+            }
+            required_string(object, "operation_id", 128)?;
         }
         AssistanceTool::Edit if object.contains_key("files") => {
             super::batch::validate_edit_files(object)?;
@@ -6239,5 +6259,25 @@ fn read_ranges_accept_one_line_closed_and_open_forms() {
         assert_eq!(range(bad), None, "{bad}");
     }
     assert!(parse_line_range("7").is_none() && parse_line_range("7-").is_none());
+}
+
+/// `ide.edit {patch}` validates alone beside an optional `operation_id`; any other field beside
+/// it, a non-string or an empty patch is refused, and the grammar is left to the worker.
+#[test]
+fn patch_edit_stands_alone() {
+    let ok = validate_call(
+        AssistanceTool::Edit,
+        json!({"patch":"*** Begin Patch\n*** End Patch"}),
+    )
+    .unwrap();
+    assert!(ok.parameters()["operation_id"].is_string());
+    for bad in [
+        json!({"patch":"x","path":"a.rs"}),
+        json!({"patch":"x","files":[]}),
+        json!({"patch":5}),
+        json!({"patch":""}),
+    ] {
+        assert!(validate_call(AssistanceTool::Edit, bad.clone()).is_err(), "{bad}");
+    }
 }
 }
