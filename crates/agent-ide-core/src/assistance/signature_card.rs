@@ -1,16 +1,16 @@
 //! The call-signature block that ends every `ide.start` reply.
 //!
 //! Agents that cannot see the tool schemas cheaply (the Codex code mode prints the whole tool
-//! catalog, about 18 KiB, once or more per agent) get the exact batch call shapes here instead,
-//! in at most 2048 bytes. The block follows the project card and the servers
+//! catalog, at most 13 KiB, once or more per agent) get the exact batch call shapes here instead,
+//! in at most 1536 bytes. The block follows the project card and the servers
 //! line of the start reply (`docs/contracts/start-index-state-v1.md` §1) and shows one example per
 //! batch form of `docs/contracts/batch-api-v1.md`, the pushed-results rule and the required
 //! `ide.stop`. It is reply text read after a call, so it falls under the strict tier of
 //! `docs/contracts/reply-hygiene-v1.md` §2.
 
-/// Largest size of the signature block in bytes, a tenth of the catalog dump it replaces.
+/// Signature-block ceiling of harness-reply-v1 r5, independent of catalog size.
 #[cfg(test)]
-const MAX_SIGNATURE_BYTES: usize = 2048;
+const MAX_SIGNATURE_BYTES: usize = 1536;
 
 /// The signature block text, without a leading or trailing newline.
 const SIGNATURE_BLOCK: &str = r#"call forms (JSON arguments): find an address, read the symbol, edit it
@@ -25,7 +25,7 @@ Addresses: src/a.rs#Type/method:7 (L123) is printed by every result; path:line f
 
 /// Returns the call-signature block that follows the project card in an `ide.start` reply.
 ///
-/// The text is constant, language-neutral and at most 2048 bytes; every example is a JSON object
+/// The text is constant, language-neutral and at most 1536 bytes; every example is a JSON object
 /// in the argument shape of the named tool's batch form.
 pub(crate) fn signature_block() -> &'static str {
     SIGNATURE_BLOCK

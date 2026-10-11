@@ -149,6 +149,15 @@ fn stale_forms(name: &str, text: &str) -> Vec<&'static str> {
 fn symbol_first_sources() -> Vec<(String, String)> {
     let mut sources = vec![
         (
+            "active tools-v0.4 model workflow".to_owned(),
+            file_surface("docs/contracts/tools-v0.4.md", Tier::Teaching)
+                .text
+                .split("## Operator compatibility reference")
+                .next()
+                .expect("guide preamble")
+                .to_owned(),
+        ),
+        (
             "SERVER_INSTRUCTIONS".to_owned(),
             SERVER_INSTRUCTIONS.to_owned(),
         ),
@@ -189,6 +198,22 @@ fn symbol_first_sources() -> Vec<(String, String)> {
             .map(|surface| (surface.name, surface.text)),
     );
     sources
+}
+
+/// The complete active guide contains no positive idle/queue wait advice, including its
+/// separately labeled compatibility record. Parameter names alone remain valid operator data.
+#[test]
+fn active_tool_guide_never_teaches_idle_waiting() {
+    let guide = normalised(&file_surface("docs/contracts/tools-v0.4.md", Tier::Teaching).text);
+    for advice in [
+        "nothing else to do",
+        "wait once",
+        "once when idle",
+        "wait for pending work",
+        "queue saturation says to wait",
+    ] {
+        assert!(!guide.contains(advice), "active guide teaches {advice}");
+    }
 }
 
 /// Returns the repository root, two levels above this crate.
@@ -625,15 +650,26 @@ fn examples_in(text: &str) -> Vec<(AssistanceTool, String)> {
 
 /// Reports why an example does not hold, or `None` when it does.
 ///
-/// A complete example must pass the facade's own argument validation. An abbreviated one (it
-/// holds `…` in place of an array or an object) must still be an object whose every top-level
-/// key is a property of the tool's schema.
-fn example_problem(tool: AssistanceTool, example: &str) -> Option<String> {
-    let schema = tool_schemas()
+/// Complete examples pass public validation and the actual host catalog's top-level closed
+/// properties. Abbreviated examples still name only advertised keys; compatibility-only keys
+/// and tools absent from that host are refused rather than mistaken for teaching support.
+fn example_problem(host: CatalogHost, tool: AssistanceTool, example: &str) -> Option<String> {
+    let schema = host
+        .catalog(StdioFacade::described_tool_router().list_all())
         .into_iter()
-        .find(|schema| schema.tool == tool)
-        .expect("every tool has a schema");
+        .find(|schema| &*schema.name == tool.mcp_name());
+    let Some(schema) = schema else {
+        return Some("tool not advertised to this host".into());
+    };
     if let Ok(value) = serde_json::from_str::<Value>(&example.replace('…', "x")) {
+        if let Some(fields) = value.as_object() {
+            let properties = schema.input_schema["properties"]
+                .as_object()
+                .expect("schema properties");
+            if let Some(key) = fields.keys().find(|key| !properties.contains_key(*key)) {
+                return Some(format!("`{key}` is not advertised to {host:?}"));
+            }
+        }
         return validate_call(tool, value)
             .err()
             .map(|error| format!("refused: {error:?}"));
@@ -657,34 +693,38 @@ fn example_problem(tool: AssistanceTool, example: &str) -> Option<String> {
 /// Every `ide.<tool> {…}` example the teaching text shows — the server instructions, the tool
 /// descriptions, the skill and the `ide.start` signature block — is an argument object of that
 /// tool: complete examples pass the facade's validation, abbreviated ones use only schema
-/// properties. The schemas validated against are the ones `schemas/tools.json` snapshots.
+/// properties. Each host is checked against its actual served catalog and native validation.
 #[test]
 fn teaching_examples_validate_against_the_tool_schemas() {
-    let mut teaching = vec![(
-        "SERVER_INSTRUCTIONS".to_owned(),
-        SERVER_INSTRUCTIONS.to_owned(),
-    )];
-    for tool in StdioFacade::described_tool_router().list_all() {
-        teaching.push((
-            format!("{} description", tool.name),
-            tool.description.as_deref().unwrap_or_default().to_owned(),
-        ));
-    }
-    teaching.push((
-        "ide.start signature block".to_owned(),
-        signature_block().to_owned(),
-    ));
-    teaching.push((
-        "SKILL.md".to_owned(),
-        file_surface("skills/agent-ide/SKILL.md", Tier::Teaching).text,
-    ));
     let mut checked = 0;
     let mut problems = Vec::new();
-    for (name, text) in teaching {
-        for (tool, example) in examples_in(&text) {
-            checked += 1;
-            if let Some(problem) = example_problem(tool, &example) {
-                problems.push(format!("{name}: {} {example}: {problem}", tool.mcp_name()));
+    for (host, skill) in [
+        (CatalogHost::Claude, "skills/agent-ide/SKILL.md"),
+        (CatalogHost::Codex, "skills/codex/agent-ide/SKILL.md"),
+    ] {
+        let mut teaching = vec![
+            (
+                "server instructions".to_owned(),
+                host.instructions().to_owned(),
+            ),
+            ("signature block".to_owned(), signature_block().to_owned()),
+            (skill.to_owned(), file_surface(skill, Tier::Teaching).text),
+        ];
+        for tool in host.catalog(StdioFacade::described_tool_router().list_all()) {
+            teaching.push((
+                tool.name.to_string(),
+                tool.description.unwrap_or_default().to_string(),
+            ));
+        }
+        for (name, text) in teaching {
+            for (tool, example) in examples_in(&text) {
+                checked += 1;
+                if let Some(problem) = example_problem(host, tool, &example) {
+                    problems.push(format!(
+                        "{host:?} {name}: {} {example}: {problem}",
+                        tool.mcp_name()
+                    ));
+                }
             }
         }
     }
@@ -705,15 +745,52 @@ fn the_example_checker_refuses_what_a_live_call_refuses() {
     )));
     assert!(found.contains(&(AssistanceTool::Inspect, r#"{"wait_ms": 5}"#.to_owned())));
     assert_eq!(
-        example_problem(AssistanceTool::Inspect, r#"{"wait_ms": 5}"#),
+        example_problem(
+            CatalogHost::Claude,
+            AssistanceTool::Inspect,
+            r#"{"kind":"problems"}"#
+        ),
         None
     );
-    assert!(example_problem(AssistanceTool::Inspect, r#"{"wait": 5}"#).is_some());
-    assert!(example_problem(AssistanceTool::Inspect, r#"{"wait_ms": "soon"}"#).is_some());
-    assert!(example_problem(AssistanceTool::Edit, r#"{"files":[…],"unknown":1}"#).is_some());
+    assert!(
+        example_problem(
+            CatalogHost::Claude,
+            AssistanceTool::Inspect,
+            r#"{"wait_ms": 5}"#
+        )
+        .is_some()
+    );
+    assert!(
+        example_problem(
+            CatalogHost::Codex,
+            AssistanceTool::Inspect,
+            r#"{"wait": 5}"#
+        )
+        .is_some()
+    );
+    assert!(
+        example_problem(
+            CatalogHost::Codex,
+            AssistanceTool::Inspect,
+            r#"{"wait_ms": "soon"}"#
+        )
+        .is_some()
+    );
+    assert!(
+        example_problem(
+            CatalogHost::Claude,
+            AssistanceTool::Edit,
+            r#"{"files":[…],"unknown":1}"#
+        )
+        .is_some()
+    );
     assert_eq!(
-        example_problem(AssistanceTool::Edit, r#"{"files":[…]}"#),
+        example_problem(
+            CatalogHost::Claude,
+            AssistanceTool::Edit,
+            r#"{"files":[…]}"#
+        ),
         None
     );
-    assert!(example_problem(AssistanceTool::Inspect, "{wait_ms: 5}").is_some());
+    assert!(example_problem(CatalogHost::Codex, AssistanceTool::Inspect, "{wait_ms: 5}").is_some());
 }

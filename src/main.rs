@@ -437,13 +437,14 @@ async fn telemetry_owner(database: &Path) -> Result<Telemetry, AppError> {
 enum Command {
     /// Serves health and finite Assistance dispatch until interrupted or killed.
     Daemon { runtime_dir: PathBuf },
-    /// Serves the static six-tool MCP surface on stdio without creating local runtime state.
+    /// Serves the host catalog over stdio: eleven tools for Claude, nine for Codex.
     Mcp {
+        /// Existing daemon endpoint directory; this unmanaged front never creates it.
         runtime_dir: PathBuf,
         /// Catalog advertised to the host; `claude` unless `--host` selects another (export).
         host: CatalogHost,
     },
-    /// Owns one private daemon and serves the same static six-tool surface until stdio ends.
+    /// Owns one private daemon and serves its selected host catalog until stdio ends.
     ManagedMcp {
         /// Absolute one-target launcher template rebound to this process and captured candidate.
         launcher_template: PathBuf,

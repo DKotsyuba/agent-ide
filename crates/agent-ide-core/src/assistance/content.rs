@@ -105,7 +105,7 @@ pub(crate) fn fits_with_status(reply: &PeerReply, status: &str, envelope: Envelo
 /// Serialization or template failure returns `None` regardless of `envelope`, so a value this
 /// renderer cannot faithfully represent never silently drops its structured copy. A tagged
 /// execution-profile refusal keeps the public structured `code` string stable; the closed cause
-/// tag is passed to the template only, so it appears solely in compact text; likewise an error's
+/// tag selects natural compact wording without being printed; likewise an error's
 /// `detail` reaches the template as `resolution_detail` and is removed from the structured copy.
 /// Projection performs no I/O, host inspection, diagnostics inference, or model call.
 fn project(
@@ -133,6 +133,7 @@ fn project(
     context["environment_key"] = serde_json::Value::String(String::new());
     context["environment_selector"] = serde_json::Value::String(String::new());
     context["environment_example"] = serde_json::Value::String(String::new());
+    context["refusal_excerpt"] = serde_json::Value::String(String::new());
     context["tool_name"] = serde_json::Value::String(tool_name.unwrap_or_default().to_owned());
     context["test_status_id"] =
         test_status_id.map_or(serde_json::Value::Null, serde_json::Value::from);
@@ -141,6 +142,18 @@ fn project(
         context["resolution_detail"] = serde_json::Value::String(detail.to_owned());
         context["resolution_message"] =
             serde_json::Value::String(resolution_message(detail).to_owned());
+        if matches!(
+            reply,
+            PeerReply::Error {
+                code: FailureCode::EditRefused,
+                ..
+            }
+        ) {
+            // Authorized producer text stays exact inside the separately quoted current-text
+            // excerpt; labels outside that excerpt still pass display_safe below.
+            context["refusal_excerpt"] =
+                serde_json::Value::String(resolution_message(detail).to_owned());
+        }
         if let Some((key, selector)) = environment_refusal(detail) {
             context["environment_key"] = serde_json::Value::String(key.clone());
             context["environment_selector"] = serde_json::Value::String(selector.to_owned());
@@ -148,6 +161,14 @@ fn project(
                 "{{{}: \".venv\"}}",
                 serde_json::Value::String(key.clone())
             ));
+        }
+        if let Some(selection) = detail.strip_prefix("environment:") {
+            context["refusal_excerpt"] = serde_json::Value::String(display_safe(selection.trim()));
+        }
+        if let Some(ancestor) = detail
+            .strip_prefix("start:root_absent; nearest existing ancestor below an allowed root: ")
+        {
+            context["refusal_excerpt"] = serde_json::Value::String(ancestor.to_owned());
         }
         if let Some(fields) = structured.as_object_mut() {
             fields.remove("detail");
@@ -160,6 +181,19 @@ fn project(
     {
         // The takeover's fixed reason phrase completes the `taken_over` sentence.
         context["resolution_message"] = serde_json::Value::String(reason.clone());
+    }
+    if let PeerReply::Unavailable {
+        cause:
+            Some(
+                super::reply::HostBindingCause::ProjectMoved { bound, asked }
+                | super::reply::HostBindingCause::OtherRepository { bound, asked },
+            ),
+        ..
+    } = reply
+    {
+        context["resolution_message"] = serde_json::Value::String(format!(
+            "Bound repository: {bound}; requested root: {asked}"
+        ));
     }
     if let PeerReply::Unavailable { .. } = reply {
         // The public structured shape keeps its historical fields; the closed cause reaches the
@@ -276,7 +310,7 @@ fn escape_untrusted_labels(context: &mut serde_json::Value) {
 /// Renders one untrusted label as visible single-line text: newline, carriage return, tab and
 /// the remaining control characters become their escapes, and bidirectional format marks become
 /// explicit `\u` escapes instead of silently reordering the line.
-fn display_safe(label: &str) -> String {
+pub(crate) fn display_safe(label: &str) -> String {
     let mut escaped = String::with_capacity(label.len());
     for character in label.chars() {
         match character {
@@ -346,6 +380,26 @@ fn environment() -> &'static Environment<'static> {
     ENVIRONMENT.get_or_init(|| reply_environment(Some(RENDER_FUEL)))
 }
 
+/// Formats the typed template mapper's refusal as one <=160-byte head, exactly one
+/// <=120-byte Repair line and an optional <=60-line/4096-byte producer excerpt. Head and
+/// repair are escaped single-line labels; excerpt rows are quoted as data without parsing
+/// away current source, effect or stale-safety information. Performs no I/O or inference.
+fn refusal_text(head: String, repair: String, excerpt: Option<String>) -> String {
+    let head = super::reply::bounded_utf8_prefix(&display_safe(&head), 160);
+    let repair = super::reply::bounded_utf8_prefix(&display_safe(&repair), 112);
+    let mut text = format!("{head}\nRepair: {repair}");
+    if let Some(excerpt) = excerpt.filter(|text| !text.is_empty()) {
+        let quoted = excerpt
+            .lines()
+            .take(60)
+            .map(|line| format!("  {line}\n"))
+            .collect::<String>();
+        text.push('\n');
+        text.push_str(&super::reply::bounded_utf8_prefix(&quoted, 4096));
+    }
+    text
+}
+
 /// VM-instruction budget for one reply render; a render that exceeds it fails into the
 /// presentation-degraded fallback instead of looping. Keeps tenfold headroom over the costliest
 /// real render (the final error fallbacks walk every `elif` of `reply.jinja`, so each added error
@@ -358,12 +412,14 @@ const RENDER_RECURSION_LIMIT: usize = 16;
 /// the helpers `reply.jinja` actually uses are registered, so an added template construct fails
 /// loudly here instead of silently widening the engine (JINJA-02).
 ///
-/// Registered set: filter `join`; tests `defined`, `mapping`, `startingwith`, `endingwith`.
+/// Registered set: filter `join`; bounded refusal formatter; tests `defined`, `mapping`,
+/// `startingwith`, `endingwith`. The formatter receives data, never template source.
 fn reply_environment(fuel: Option<u64>) -> Environment<'static> {
     let mut environment = Environment::empty();
     environment.set_undefined_behavior(UndefinedBehavior::Strict);
     environment.set_auto_escape_callback(|_| AutoEscape::None);
     environment.add_filter("join", minijinja::filters::join);
+    environment.add_function("refusal", refusal_text);
     environment.add_test("defined", minijinja::tests::is_defined);
     environment.add_test("mapping", minijinja::tests::is_mapping);
     environment.add_test("startingwith", minijinja::tests::is_startingwith);
@@ -572,6 +628,7 @@ mod tests {
             serde_json::json!({
                 "state": "unavailable", "reason": "host_binding",
                 "cause_tag": "project_moved: bound to /a, asked /b",
+                "resolution_message": "Bound repository: /a; requested root: /b",
                 "tool_name": "ide.test", "test_status_id": 7
             }),
         ];
@@ -664,7 +721,84 @@ mod tests {
         assert_eq!(rendered.structured_content, Some(expected));
     }
 
-    /// An `edit_refused` refusal renders its stage, the per-change sentences and the retry step.
+    /// Generic refusals obey r5 budgets through the production renderer, preserve isError and
+    /// typed outcomes, and expose no internal inspect/start/diff reason labels in model text.
+    #[test]
+    fn generic_refusals_have_one_bounded_repair_and_preserve_outcomes() {
+        for (code, detail) in [
+            (FailureCode::InvalidDetail, "inspect:detail_expired"),
+            (
+                FailureCode::WorkspaceActivation,
+                "start:worktree_unresolved:identity_read",
+            ),
+            (FailureCode::Capacity, "diff:too_large"),
+            (FailureCode::Internal, "daemon:internal"),
+            (
+                FailureCode::SourceTooLarge {
+                    size: u64::MAX,
+                    ceiling: 4096,
+                },
+                "read:source_too_large",
+            ),
+        ] {
+            let reply = PeerReply::Error {
+                code,
+                detail: Some(detail.to_owned()),
+            };
+            let mut expected = serde_json::to_value(&reply).unwrap();
+            expected.as_object_mut().unwrap().remove("detail");
+            let result = render(reply, Envelope::WithStructured).unwrap();
+            let text = text_of(&result);
+            let lines = text.lines().collect::<Vec<_>>();
+            assert!(lines[0].len() <= 160, "{text}");
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.starts_with("Repair:"))
+                    .count(),
+                1,
+                "{text}"
+            );
+            assert!(
+                lines[1].starts_with("Repair:") && lines[1].len() <= 120,
+                "{text}"
+            );
+            assert!(
+                !text.contains(detail)
+                    && !lines[1].contains(" or ")
+                    && !lines[1].contains("once")
+                    && !lines[0].starts_with("error:")
+                    && !lines[0].starts_with("unavailable:"),
+                "{text}"
+            );
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(result.structured_content, Some(expected));
+        }
+        let rendered = render(
+            PeerReply::Error {
+                code: FailureCode::EditRefused,
+                detail: Some(format!(
+                    "edit:refused: Current unit:\n{}",
+                    "1\tλ\n".repeat(100)
+                )),
+            },
+            Envelope::TextOnly,
+        )
+        .unwrap();
+        let text = text_of(&rendered);
+        let excerpt = text.splitn(3, '\n').nth(2).unwrap();
+        assert!(
+            excerpt.len() <= 4096 && excerpt.lines().count() <= 60,
+            "{text}"
+        );
+        assert!(excerpt.contains("1\tλ"), "current unit was lost: {text}");
+        let bounded = refusal_text("λ".repeat(300), "λ".repeat(300), None);
+        let lines = bounded.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0].len(), 160);
+        assert_eq!(lines[1].len(), 120);
+    }
+
+    /// An edit refusal retains its per-change/current-text data under one repair line.
     #[test]
     fn edit_refused_names_its_changes_and_the_same_operation_id() {
         let reply = PeerReply::Error {
@@ -681,11 +815,10 @@ mod tests {
         let text = text_of(&rendered);
         assert_eq!(
             text,
-            "error: edit_refused (edit:refused); 2 of 3 changes refused, nothing written — \
+            "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  2 of 3 changes refused, nothing written — \
              change 2: old text not found; closest line 214: \"        let total = \
              lang::line_count(&source);\"; change 3: old text matches 2 places (lines 40, 88); \
-             add \"within\":\"src/x.rs#Owner/name\" or more surrounding lines. Fix the named \
-             changes and retry with the same operation_id"
+             add \"within\":\"src/x.rs#Owner/name\" or more surrounding lines\n"
         );
         // The structured copy keeps the closed code and drops the detail payload.
         let structured = rendered.structured_content.unwrap();
@@ -844,7 +977,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&rendered),
-            "unavailable: host_binding (inactive_binding); this session's IDE activation has stopped; read run 7 with ide.inspect {\"detail_ref\":\"tests #7\"}, or call ide.start to run tests again"
+            "This IDE activation has stopped.\nRepair: Read the retained run with ide.inspect {\"detail_ref\":\"tests #7\"}."
         );
         let other = render_with_call(
             PeerReply::Unavailable {
@@ -859,7 +992,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&other),
-            "unavailable: host_binding (inactive_binding); this session's IDE activation has stopped. Call ide.start, then repeat this call, or continue with native tools"
+            "This IDE session is not active.\nRepair: Call ide.start in this project."
         );
     }
 
@@ -892,7 +1025,7 @@ mod tests {
             assert_eq!(
                 text_of(&rendered),
                 format!(
-                    "unavailable: host_binding (taken_over); another agent took over this worktree's IDE activation {why}. Call ide.start ({{\"read_only\": true}} while the other agent writes), or continue with native tools"
+                    "Another session took over this activation.\nRepair: Call ide.start with {{\"read_only\":true}} while that session writes.\n  {why}\n"
                 )
             );
         }
@@ -933,58 +1066,56 @@ mod tests {
             let tag = cause.cause_tag();
             let expected = match tag.as_str() {
                 "outside_allowed_roots" => {
-                    "the session project is outside the directories the IDE may open. Call ide.start with an allowed root, or continue with native tools"
+                    "This project is outside the directories the IDE may open.\nRepair: Call ide.start with an allowed root."
                 }
                 "hooks_not_delivered" => {
-                    "the daemon has received no host event for this session. Call ide.start with the same root, or continue with native tools"
+                    "The IDE received no host event for this session.\nRepair: Call ide.start in this project."
                 }
                 "invalid_metadata" => {
-                    "the host sent malformed call metadata. Send a new tool call, or continue with native tools"
+                    "The host sent malformed call metadata.\nRepair: Send a new tool call."
                 }
                 "missing_field" => {
-                    "required host call metadata is missing. Send a new tool call, or continue with native tools"
+                    "Required host call metadata is missing.\nRepair: Send a new tool call."
                 }
                 "invalid_field" => {
-                    "host call metadata contains an invalid field. Send a new tool call, or continue with native tools"
+                    "Host call metadata contains an invalid field.\nRepair: Send a new tool call."
                 }
                 "invalid_attachment" => {
-                    "the host attachment does not identify this call. Repeat the call, or continue with native tools"
+                    "The host attachment does not identify this call.\nRepair: Repeat the call as a new tool invocation."
                 }
                 "unsupported_hook_phase" => {
-                    "the host reported an unsupported tool-call phase. Repeat the call, or continue with native tools"
+                    "The host reported an unsupported tool-call phase.\nRepair: Repeat the call as a new tool invocation."
                 }
                 "missing_pre" => {
-                    "the host's before-tool event for this call did not reach the daemon. Repeat the call once, or continue with native tools"
+                    "The host's before-tool event did not reach the IDE.\nRepair: Repeat the call."
                 }
-                "replay" => {
-                    "this exact call was already processed. Send it as a new tool call, or continue with native tools"
-                }
+                "replay" => "This exact call was already processed.\nRepair: Send a new tool call.",
                 "mismatch" => {
-                    "the host event did not match this call. Repeat the call, or continue with native tools"
+                    "The host event did not match this call.\nRepair: Repeat the call as a new tool invocation."
                 }
                 "missing_invocation" => {
-                    "the host's completion event arrived before its tool call was validated. Send a new tool call, or continue with native tools"
+                    "The host's completion event arrived before call validation.\nRepair: Send a new tool call."
                 }
                 "inactive_binding" => {
-                    "this session's IDE activation has stopped. Call ide.start, then repeat this call, or continue with native tools"
+                    "This IDE session is not active.\nRepair: Call ide.start in this project."
                 }
                 "never_activated" => {
-                    "no IDE activation in this session yet. Call ide.start, then repeat this call, or continue with native tools"
+                    "This session has no IDE activation yet.\nRepair: Call ide.start in this project."
                 }
                 "recovery_needed" => {
-                    "the IDE restarted and this session's activation is not restored yet. Call ide.start, then repeat this call, or continue with native tools"
+                    "The IDE restarted; this activation has not been restored.\nRepair: Call ide.start in this project."
                 }
                 "capacity_exceeded" => {
-                    "the daemon's session table is full. Call ide.stop, then ide.start, or continue with native tools"
+                    "The IDE's bounded session table is full.\nRepair: Continue this work with native tools."
                 }
                 "host_unrecognized" => {
-                    "this host did not identify the call in a supported format. Continue with native tools"
+                    "This host did not identify the call in a supported format.\nRepair: Continue this work with native tools."
                 }
                 other if other.starts_with("other_repository:") => {
-                    "other agents of this session may still work in the bound repository, so this start was refused and nothing moved. Start under the bound repository, work in the other repository from a session started there, or continue with native tools"
+                    "Other agents still use the bound repository; nothing moved.\nRepair: Call ide.start under the bound repository.\n  Bound repository: /private/tmp/ai-r-move; requested root: /Users/pluto/projects/other-repository\n"
                 }
                 moved if moved.starts_with("project_moved:") => {
-                    "the IDE could not move to the requested root. Call ide.start under the session's current root, or continue with native tools"
+                    "The IDE could not move to the requested root.\nRepair: Call ide.start under this session's current root.\n  Bound repository: /private/tmp/ai-r-move; requested root: /Users/pluto/projects/agent-worktree\n"
                 }
                 _ => panic!("unrecognized host-binding cause: {tag}"),
             };
@@ -996,10 +1127,7 @@ mod tests {
                 Envelope::WithStructured,
             )
             .unwrap();
-            assert_eq!(
-                text_of(&rendered),
-                format!("unavailable: host_binding ({tag}); {expected}")
-            );
+            assert_eq!(text_of(&rendered), expected);
             assert_eq!(
                 rendered.structured_content,
                 Some(serde_json::json!({"state":"unavailable","reason":"host_binding"}))
@@ -1016,7 +1144,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&bare),
-            "unavailable: host_binding; continue with native tools"
+            "The host could not bind this IDE call.\nRepair: Repeat the call as a new tool invocation."
         );
     }
 
@@ -1026,47 +1154,47 @@ mod tests {
         for (detail, expected) in [
             (
                 "diff:unsupported_entry",
-                "error: source_unavailable (diff:unsupported_entry); Git evidence for this comparison became unusable. Call ide.diff again",
+                "Git evidence for this comparison became unusable.\nRepair: Call ide.diff again.",
             ),
             (
                 "inspect:source_changed",
-                "error: source_unavailable (inspect:source_changed); the source changed since this result was captured. Read it again with ide.read",
+                "The source changed since this result was captured.\nRepair: Read the requested unit again with ide.read.",
             ),
             (
                 "inspect:source_changed:\"src/main.rs\"",
-                "error: source_unavailable (inspect:source_changed); \"src/main.rs\" changed since this result was captured. Read it again with ide.read",
+                "The source changed since this result was captured.\nRepair: Read the requested unit again with ide.read.\n  \"src/main.rs\"\n",
             ),
             (
                 "inspect:source_changed:\"src/main.rs\"",
-                "error: source_unavailable (inspect:source_changed); \"src/main.rs\" changed since this result was captured. Read it again with ide.read",
+                "The source changed since this result was captured.\nRepair: Read the requested unit again with ide.read.\n  \"src/main.rs\"\n",
             ),
             (
                 "context:source_changed",
-                "error: source_unavailable (context:source_changed); the source changed since it was read. Re-read it with ide.read, then retry",
+                "The source changed since this result was captured.\nRepair: Read the requested unit again with ide.read.",
             ),
             (
                 "context:source_changed:\"src/main.rs\"",
-                "error: source_unavailable (context:source_changed); \"src/main.rs\" changed since it was read. Re-read it with ide.read, then retry",
+                "The source changed since this result was captured.\nRepair: Read the requested unit again with ide.read.\n  \"src/main.rs\"\n",
             ),
             (
                 "context:observation_failed:\"src/main.rs\"",
-                "error: source_unavailable (context:observation_failed); \"src/main.rs\" could not be read through the confined reader. Retry the call, or continue with native tools",
+                "The requested source could not be read safely.\nRepair: Read it with a native tool.\n  \"src/main.rs\"\n",
             ),
             (
                 "read:line_range:file has 249 lines; requested 286-334",
-                "error: source_unavailable (read:line_range); file has 249 lines; requested 286-334",
+                "The requested range is unavailable.\nRepair: Read a valid range with ide.read.\n  file has 249 lines; requested 286-334\n",
             ),
             (
                 "read:not_text:assets/logo.png",
-                "error: source_unavailable (read:not_text); assets/logo.png is not a readable text file (binary, not UTF-8 or unreadable), so ide.read cannot show it. Inspect it with a native tool such as `file` or `xxd`",
+                "This file is not readable text.\nRepair: Inspect it with a native file tool.\n  assets/logo.png\n",
             ),
             (
                 "read:source_unavailable:src/main.rs",
-                "error: source_unavailable (read:source_unavailable); src/main.rs could not be read at that path. Retry ide.read, or continue with native tools",
+                "The requested source could not be read safely.\nRepair: Read it with a native tool.\n  src/main.rs\n",
             ),
             (
                 "diff:activation_commit_unknown; use mode: head",
-                "error: source_unavailable (diff:activation_commit_unknown); the start commit of this activation is unknown, so the task view is unavailable; use ide.diff {\"mode\": \"head\"}",
+                "The activation's start commit is unknown; the task diff is unavailable.\nRepair: Call ide.diff with {\"mode\":\"head\"}.",
             ),
         ] {
             let rendered = render(
@@ -1089,7 +1217,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&bare),
-            "error: source_unavailable (context:source_unavailable); the requested source could not be read. Retry the call, or continue with native tools"
+            "The requested source could not be read safely.\nRepair: Read it with a native tool."
         );
     }
 
@@ -1107,7 +1235,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&rendered),
-            "error: no_such_file: src/assistance/host_bindng.rs (outline:no_such_file); this path does not exist in the worktree. Fix the path, or use ide.symbol with a bare name to find it"
+            "This path does not exist in the worktree.\nRepair: Correct the path and repeat this call.\n  src/assistance/host_bindng.rs\n"
         );
         let for_read = render(
             PeerReply::Error {
@@ -1119,7 +1247,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&for_read),
-            "error: no_such_file: src/missing.rs (read:no_such_file); this path does not exist in the worktree. Fix the path, or use ide.symbol with a bare name to find it"
+            "This path does not exist in the worktree.\nRepair: Correct the path and repeat this call.\n  src/missing.rs\n"
         );
     }
 
@@ -1136,7 +1264,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&rendered),
-            "error: unsupported_file: Cargo.toml (outline:unsupported_file); no IDE language reads this file type, so it has no outline or symbols. Read its text with ide.read `path` and `lines` or `ranges`, or with native tools"
+            "No registered language outlines this file type.\nRepair: Read the file with a native tool.\n  Cargo.toml\n"
         );
         assert_eq!(
             rendered.structured_content.unwrap()["code"]["unsupported_file"],
@@ -1157,10 +1285,10 @@ mod tests {
         .unwrap();
         let text = text_of(&expired);
         assert!(
-            text.starts_with("error: invalid_detail (inspect:detail_unknown);"),
+            text.starts_with("This result reference was never issued.\nRepair: Repeat the original IDE call to get a fresh result."),
             "{text}"
         );
-        assert!(text.contains("repeat the original ide.* call"), "{text}");
+        assert!(text.contains("Repeat the original IDE call"), "{text}");
         assert_eq!(expired.is_error, Some(true));
     }
 
@@ -1170,15 +1298,15 @@ mod tests {
         for (detail, expected) in [
             (
                 "inspect:detail_unknown",
-                "error: invalid_detail (inspect:detail_unknown); this detail_ref was never issued; repeat the original ide.* call to get a fresh one, or continue with native tools",
+                "This result reference was never issued.\nRepair: Repeat the original IDE call to get a fresh result.",
             ),
             (
                 "inspect:detail_expired",
-                "error: invalid_detail (inspect:detail_expired); this detail_ref has expired; repeat the original ide.* call to get a fresh one, or continue with native tools",
+                "This result reference has expired.\nRepair: Repeat the original IDE call to get a fresh result.",
             ),
             (
                 "inspect:detail_mismatch",
-                "error: invalid_detail (inspect:detail_mismatch); this detail_ref was issued for different arguments. Repeat the original call with its exact arguments, or make a fresh ide.* call",
+                "This result reference belongs to different arguments.\nRepair: Repeat the original call with its exact arguments.",
             ),
         ] {
             let rendered = render(
@@ -1206,8 +1334,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&conflict),
-            "error: invalid_detail (start:activation_conflict); this activation_id was used \
-             with another root; use a new activation_id"
+            "This activation_id was already used with another root.\nRepair: Call ide.start with a new activation_id."
         );
     }
 
@@ -1231,7 +1358,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("not handed over automatically"), "{text}");
-        assert!(text.contains("call ide.stop there"), "{text}");
+        assert!(text.contains("Call ide.stop there"), "{text}");
     }
 
     /// Start stages keep distinct causes and recovery instructions in the compact reply.
@@ -1240,19 +1367,19 @@ mod tests {
         for (detail, expected) in [
             (
                 "start:worktree_held_by_another_actor",
-                "another agent session owns this worktree's IDE activation",
+                "Another agent session owns this worktree's IDE activation",
             ),
             (
                 "start:worktree_held_by_this_actor",
-                "another session for this actor owns this worktree",
+                "Another session for this actor owns this worktree",
             ),
             (
                 "start:actor_owns_another_worktree",
-                "this actor's IDE activation is attached to another worktree",
+                "This actor's IDE activation is attached to another worktree",
             ),
             (
                 "start:provider_cache_namespace_conflict",
-                "another active session owns the language-server cache",
+                "Another active session owns the language-server cache",
             ),
             (
                 "start:git_discovery_failed: not a Git worktree",
@@ -1260,11 +1387,11 @@ mod tests {
             ),
             (
                 "start:worktree_unresolved: could not be resolved",
-                "the worktree could not be resolved",
+                "The worktree could not be resolved",
             ),
             (
                 "start:durable_state: activation state failed",
-                "saved workspace state could not be read",
+                "Saved workspace state could not be read",
             ),
         ] {
             let rendered = render(
@@ -1315,8 +1442,8 @@ mod tests {
             "task-7",
             "since 2026-10-04T10:00:00Z",
             "last activity 2026-10-04T10:01:00Z",
-            "Start with {\"read_only\": true} to read alongside",
-            "the slot frees when that session ends or after 30 min without activity",
+            "Call ide.start with {\"read_only\":true} to read alongside",
+            "The slot frees when that session ends or after 30 min without activity",
         ] {
             assert!(held.contains(fact), "missing {fact:?}: {held}");
         }
@@ -1360,11 +1487,11 @@ mod tests {
                 serde_json::Value::String(key.to_owned())
             );
             for fact in [
-                &format!("environment selector {selector} for {key} is outside"),
+                &format!("Selector: {selector}; project key: {key}"),
                 "inside the worktree",
                 "not a base interpreter",
-                &format!("ide.start with environment {example}"),
-                "allowed_roots",
+                &format!("environment {example}"),
+                "allowed roots",
             ] {
                 assert!(line.contains(fact), "missing {fact:?}: {line}");
             }
@@ -1379,7 +1506,7 @@ mod tests {
             Envelope::TextOnly,
         )
         .unwrap();
-        assert!(text_of(&ordinary).contains("the requested project root is outside"));
+        assert!(text_of(&ordinary).contains("The requested root is outside"));
     }
 
     /// Edit and test refusals share the exact read-only response shape and current-writer field.
@@ -1398,14 +1525,14 @@ mod tests {
             .unwrap();
             let line = text_of(&rendered);
             assert!(
-                line.starts_with(&format!("refused: read_only ({tool});")),
+                line.starts_with("This activation started with read_only: true;"),
                 "{line}"
             );
             assert!(line.contains("started with read_only: true"), "{line}");
-            assert!(line.contains("call ide.start without read_only"), "{line}");
+            assert!(line.contains("Call ide.start without read_only"), "{line}");
             assert!(line.contains("one writer per worktree"), "{line}");
             assert!(
-                line.contains("current writer: activation task-7, since"),
+                line.contains("Current writer: activation task-7, since"),
                 "{line}"
             );
         }
@@ -1417,7 +1544,7 @@ mod tests {
             Envelope::TextOnly,
         )
         .unwrap();
-        assert!(text_of(&none).ends_with("current writer: none"));
+        assert!(text_of(&none).ends_with("Current writer: none\n"));
     }
 
     /// Capacity failures identify the capture, queue, result-store or protected actor resource
@@ -1434,7 +1561,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&large_diff),
-            "error: capacity (diff:too_large); the source, patch or path capture budget is full; narrow ide.diff with paths or review it with native git"
+            "This diff exceeds a bounded capture or reply envelope limit.\nRepair: Call ide.diff with narrower paths."
         );
         let staged = render(
             PeerReply::Error {
@@ -1446,7 +1573,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&staged),
-            "error: capacity (inspect:detail_unknown); the IDE's bounded queue or result store is full. Wait for pending work, or call ide.stop and ide.start"
+            "The IDE's bounded queue or result store is full.\nRepair: Repeat this call."
         );
         for (stage, recovery) in [
             ("worker:queue_full", "request queue"),
@@ -1478,7 +1605,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text_of(&bare),
-            "error: capacity (worker:capacity); the IDE's bounded queue or result store is full. Wait for pending work, or call ide.stop and ide.start"
+            "The IDE's bounded queue or result store is full.\nRepair: Repeat this call."
         );
     }
 
@@ -1489,112 +1616,112 @@ mod tests {
             (
                 FailureCode::UnknownSymbol,
                 "edit:range_past_end: line 17 is past the end of src/a.rs (3 lines)",
-                "error: unknown_symbol (edit:range_past_end); line 17 is past the end of src/a.rs (3 lines). Re-read the symbol with ide.read, then retry",
+                "No symbol matches the requested address.\nRepair: List the file's addresses with ide.outline.\n  line 17 is past the end of src/a.rs (3 lines)\n",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "outline:provider_unavailable ext=md",
-                "error: provider_unavailable (outline:no_server); no language server is configured for .md files in this project. Continue with native tools",
+                "No language server is configured for .md files in this project.\nRepair: Continue this operation with native tools.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "symbol:provider_unavailable ext=md (provider: no server for this file type)",
-                "error: provider_unavailable (symbol:no_server); no language server is configured for .md files in this project. Continue with native tools",
+                "No language server is configured for .md files in this project.\nRepair: Continue this operation with native tools.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "edit:rename_no_edits:foo",
-                "error: provider_unavailable (edit:rename_no_edits); the language server returned no edits for symbol foo. Check it with ide.symbol, then retry",
+                "The language server returned no edits for this rename.\nRepair: Check the requested symbol with ide.symbol.\n  foo\n",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "edit:rename_request_failed:foo",
-                "error: provider_unavailable (edit:rename_request_failed); the language server failed to rename symbol foo. Check it with ide.symbol, then retry",
+                "The language server failed to process this rename.\nRepair: Check the requested symbol with ide.symbol.\n  foo\n",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "edit:rename_unsupported_edits:foo",
-                "error: provider_unavailable (edit:rename_unsupported_edits); the language server returned edits the IDE cannot safely apply for symbol foo. Continue with native tools",
+                "The language server returned rename edits the IDE cannot safely apply.\nRepair: Use native tools for this rename.\n  foo\n",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "test:selection_unavailable",
-                "error: provider_unavailable (test:selection_unavailable); tests could not be selected from these arguments. Use ide.test with a pattern or path",
+                "Tests could not be selected from these arguments.\nRepair: Call ide.test with a pattern.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "read:provider_unavailable ext=gamma",
-                "error: provider_unavailable (read:no_server); no language server is configured for .gamma files in this project. Continue with native tools",
+                "No language server is configured for .gamma files in this project.\nRepair: Continue this operation with native tools.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "symbol:provider_unavailable ext=delta",
-                "error: provider_unavailable (symbol:no_server); no language server is configured for .delta files in this project. Continue with native tools",
+                "No language server is configured for .delta files in this project.\nRepair: Continue this operation with native tools.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "context:provider_unavailable ext=epsilon",
-                "error: provider_unavailable (context:no_server); no language server is configured for .epsilon files in this project. Continue with native tools",
+                "No language server is configured for .epsilon files in this project.\nRepair: Continue this operation with native tools.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "symbol:provider_unavailable (fixtureserver: workspace load failed; outline and read answer from source)",
-                "error: provider_unavailable (symbol:provider_unavailable (fixtureserver: workspace load failed; outline and read answer from source)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.inspect {\"kind\":\"problems\"} shows the project check)",
+                "The server cannot answer semantic requests; source outline and read remain available.\nRepair: Read the definition with ide.read.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "read:provider_unavailable (fixtureserver: transport gone; outline and read answer from source)",
-                "error: provider_unavailable (read:provider_unavailable (fixtureserver: transport gone; outline and read answer from source)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.inspect {\"kind\":\"problems\"} shows the project check)",
+                "The server cannot answer semantic requests; source outline and read remain available.\nRepair: Read the definition with ide.read.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "symbol:provider_unavailable (fixtureserver: references request failed; outline and read answer from source)",
-                "error: provider_unavailable (symbol:provider_unavailable (fixtureserver: references request failed; outline and read answer from source)); the language server cannot answer semantic requests. ide.outline and ide.read still answer from source; usages and callers do not. Retry later; if it keeps failing, fix what stops the project from loading (ide.inspect {\"kind\":\"problems\"} shows the project check)",
+                "The server cannot answer semantic requests; source outline and read remain available.\nRepair: Read the definition with ide.read.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "outline:provider_unavailable (fixtureserver: documentSymbols request failed; use native reads)",
-                "error: provider_unavailable (outline:provider_unavailable (fixtureserver: documentSymbols request failed; use native reads)); the language server cannot answer semantic requests. No source outline answers either; use native reads. Retry later; if it keeps failing, fix what stops the project from loading (ide.inspect {\"kind\":\"problems\"} shows the project check)",
+                "The server cannot answer this request and no source outline is available.\nRepair: Read the source with native tools.",
             ),
             (
                 FailureCode::ProviderUnavailable,
                 "symbol:provider_unavailable (fixtureserver-plain: workspace load failed; use native reads)",
-                "error: provider_unavailable (symbol:provider_unavailable (fixtureserver-plain: workspace load failed; use native reads)); the language server cannot answer semantic requests. No source outline answers either; use native reads. Retry later; if it keeps failing, fix what stops the project from loading (ide.inspect {\"kind\":\"problems\"} shows the project check)",
+                "The server cannot answer this request and no source outline is available.\nRepair: Read the source with native tools.",
             ),
             (
                 FailureCode::InvalidDetail,
                 "test:unknown_run:42",
-                "error: invalid_detail (test:unknown_run); run #42 is unknown or expired. Start a new run with ide.test",
+                "This test run is unknown or expired.\nRepair: Start a new run with ide.test.",
             ),
             (
                 FailureCode::Capacity,
                 "stop:busy",
-                "error: capacity (stop:busy); the IDE's state store stayed busy, so this stop is not recorded yet and its grant is still held. The IDE keeps retrying it itself; nothing more is needed",
+                "This stop is not recorded; its grant remains held while the IDE retries.\nRepair: Continue this work with native tools.",
             ),
             (
                 FailureCode::Capacity,
                 "stop:store_full",
-                "error: capacity (stop:store_full); the IDE's state store for this repository is full, so this stop cannot be recorded and its grant stays held. The IDE keeps retrying, but a full store only clears when every IDE session of this repository ends and it restarts; continue with native tools",
+                "This stop is not recorded; its grant remains held while the IDE retries.\nRepair: Continue this work with native tools.\n  The full state store clears only when every IDE session of this repository ends and the IDE restarts.\n",
             ),
             (
                 FailureCode::Deadline,
                 "stop:store_deadline",
-                "error: deadline (stop:store_deadline); recording this stop took too long and may still complete. The IDE keeps retrying it with the same operation id, so nothing more is needed",
+                "Recording this stop took too long and may still complete; the IDE retries with the same operation id.\nRepair: Continue this work with native tools.",
             ),
             (
                 FailureCode::WorkspaceAuthority,
                 "stop:store_unavailable",
-                "error: workspace_authority (stop:store_unavailable); the IDE's state store could not record this stop, so its grant is still held. The IDE keeps retrying it itself; continue with native tools",
+                "This stop is not recorded; its grant remains held while the IDE retries.\nRepair: Continue this work with native tools.",
             ),
             (
                 FailureCode::WorkspaceAuthority,
                 "stop:authority",
-                "error: workspace_authority (stop:authority); this stop conflicts with the recorded activation. Call ide.start to see the current binding, then repeat ide.stop",
+                "This stop conflicts with the recorded activation.\nRepair: Call ide.start to see the current binding.",
             ),
             (
                 FailureCode::Deadline,
                 "stop:deadline",
-                "error: deadline (stop:deadline); stopping exceeded 800 ms and cleanup may still be running. Call ide.start to check the session before editing, or continue with native tools",
+                "Stopping exceeded its time limit; cleanup may still be running.\nRepair: Call ide.start to check the session before editing.",
             ),
         ] {
             let rendered = render(
@@ -1649,7 +1776,10 @@ mod tests {
             .unwrap();
             assert_eq!(
                 text_of(&rendered),
-                format!("error: execution_profile ({tag}); {message}. Continue with native tools")
+                format!(
+                    "{}.\nRepair: Continue with native tools.",
+                    message[..1].to_uppercase() + &message[1..]
+                )
             );
             assert_eq!(
                 rendered.structured_content.unwrap()["code"],
@@ -1673,7 +1803,10 @@ mod tests {
         let rendered = render(reply, Envelope::WithStructured).unwrap();
         let text = text_of(&rendered);
         assert!(call_tool_result_fits(&rendered), "{text}");
-        assert!(text.contains("resolution_unverified") && text.contains("retry the call"));
+        assert!(
+            text.contains("could not verify project membership")
+                && text.contains("Repair: Read the project problems")
+        );
         assert!(text.contains("tsconfig.json") && text.contains("src/outside.ts"));
         assert!(!text.contains("native"));
         assert_eq!(rendered.structured_content, Some(expected));
@@ -2304,7 +2437,11 @@ mod tests {
         .unwrap();
         let text = text_of(&result);
         assert!(
-            text.contains("choose one of the listed candidates or \"auto\""),
+            text.contains("Repair: Select one listed project environment with ide.start."),
+            "{text}"
+        );
+        assert!(
+            text.contains("alpha: candidate absent; candidates one, two"),
             "{text}"
         );
         assert!(!text.contains("detail_ref"), "{text}");

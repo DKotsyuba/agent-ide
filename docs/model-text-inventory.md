@@ -15,6 +15,10 @@ to the M-028 address or M-029 read/edit modules and follows their contracts).
 
 ## Teaching text
 
+The active model workflow in `docs/contracts/tools-v0.4.md` is guarded too: r5 refusal
+and deferred-result rules supersede the separately labeled operator compatibility record.
+That record keeps unadvertised protocol compatibility without model idle-wait advice.
+
 | Source | Where | Before | After | Status |
 |---|---|---|---|---|
 | Server paragraph, Claude (G) | `facade.rs:4936` `SERVER_INSTRUCTIONS` | 735 | 508 | rewritten |
@@ -27,11 +31,11 @@ to the M-028 address or M-029 read/edit modules and follows their contracts).
 | `ide.symbol` description (G) | `facade.rs:4849` | 641 | 324 | rewritten |
 | `ide.graph` description (G) | `facade.rs:4863` | 469 | 174 | trimmed (Claude only) |
 | `ide.test` description (G) | `facade.rs:4875` | 997 | 337 | rewritten |
-| `ide.inspect` description (G) | `facade.rs:4889` | 462 | 274 | rewritten (no `wait_ms`; Codex adds problems) |
+| `ide.inspect` description (G) | `facade.rs` `CatalogHost::catalog` | 462 | 330 | rewritten (no `wait_ms`; both hosts serve problems) |
 | `ide.stop` description (G) | `facade.rs:4904` | 292 | 204 | trimmed |
 | `ide.edit` description (G) | `facade.rs:4917` | 873 | 451 | rewritten (no `source_ref`) |
 | Property texts, all tools (G) | `facade.rs:216` `tool_schemas()` | up to 609 each | at most 160 each | rewritten |
-| Advertised schemas as served (G) | `facade.rs:4994` `CatalogHost::catalog`, `slim_schema` | 22,309 total | Claude 14,650; Codex 12,874 | trimmed (bounds dropped, aliases and `source_ref` unadvertised) |
+| Advertised schemas as served (G) | `facade.rs` `CatalogHost::catalog`, `slim_schema` | 22,309 total | Claude 15,099; Codex 12,874 | trimmed (bounds dropped, aliases and `source_ref` unadvertised); both hosts advertise inspect problems; real binary export, compact JSON array sizes |
 | `ide.start` signature block (G) | `signature_card.rs:16` | 1,145 | 1,012 | rewritten (edit by symbol, regions) |
 | Claude skill (G) | `skills/agent-ide/SKILL.md` | 33,349 | 3,243 | rewritten |
 | Codex skill (G) | `skills/codex/agent-ide/SKILL.md` | (none) | 2,764 | rewritten (new) |
@@ -43,14 +47,14 @@ to the M-028 address or M-029 read/edit modules and follows their contracts).
 
 | Source | Where | Before | After | Status |
 |---|---|---|---|---|
-| Reply template (G) | `assets/mcp/reply.jinja` | 37,119 | 35,497 | trimmed: no `complete <kind>:` labels, no `Next:` lines, one `Cut; …` trailer; stale writes repeat the call, while an explicitly supplied stale legacy reference keeps its own repair note |
+| Reply template (G) | `assets/mcp/reply.jinja` | 37,119 | 23,046 | rewritten: bounded natural refusals; no `complete <kind>:` labels, no `Next:` lines, one `Cut; …` trailer; stale writes repeat the call, while an explicitly supplied stale legacy reference keeps its own repair note |
 | Read, outline, symbol headers and per-item lines | `batch.rs`, `symbols.rs` (M-029/M-028) | n/a | n/a | owned |
 | Edit reply lines and refusals with `Repair:` | `batch.rs`, `batch_edit.rs`, `edit_forms.rs` (M-029) | n/a | n/a | owned |
-| Host-binding and capacity refusals | `reply.jinja` `unavailable:` and `error:` branches | single sentence, one action | unchanged shape | kept: each already names one repair step; `wait` advice removed from the two capacity lines |
+| Generic refusals | `reply.jinja` typed branches, `content.rs` `refusal_text`, `facade.rs` transport fallbacks | reason-code labels and alternative actions | head ≤160 UTF-8 bytes, one Repair ≤120 bytes, optional quoted excerpt ≤60 lines/4 KiB | rewritten: current units, held-writer facts and uncertain stop outcomes remain data; reconnect hints replace the repair |
 | Presentation-degraded fallbacks | `content.rs:490` | 2 lines | 2 lines | trimmed (no label) |
 | Batch refusal shapes | `batch.rs:35` `ITEM_SHAPE`, `batch.rs:584` `FILE_SHAPE` | quoted `source_ref` | no `source_ref` | trimmed |
-| Context target refusals | `facade.rs:678`, `facade.rs:681` | 2 lines | 2 lines | kept (name the one missing field) |
-| Diff trailer and no-change line | `snapshots.rs` `render_diff_compact`, `incremental_diff_reply` | n/a | new | rewritten: `unchanged since your last diff: K hunks`, `no changes since your last diff`; exact and degraded captures share the filter, returning hunks are new again, and continuation delivery counts as seen |
+| Argument refusals | `facade.rs` `ParameterError::message`, `content.rs` | internal reason prefix | natural head, one Repair and quoted field/rule | rewritten (names the missing field without exposing caller values) |
+| Diff trailer and no-change line | `snapshots.rs` `render_diff_compact`, `incremental_diff_reply`; `worker.rs` delivery accounting | n/a | new | rewritten: `unchanged since your last diff: K hunks`, `no changes since your last diff`; exact and degraded captures share the filter, returning hunks are new again, and only successful complete-body delivery counts as seen; pending, lost, capped or shrunken carriers preserve unseen hunks |
 | Diff provenance `current_tree` lines | `snapshots.rs:27` | 2 long lines | unchanged | kept: only printed with `provenance: true` |
 
 ## Hook plates and outbox facts

@@ -448,10 +448,25 @@ fn assert_compact_envelope(reply: &Value) {
         None => body,
     };
     match (state, kind) {
-        ("error", _) if structured["code"] == "conflict" => assert!(
-            text.starts_with("error: conflict") || text.starts_with("refused: read_only ("),
-            "{reply}"
-        ),
+        ("error", _) | ("invalid_parameters", _) => {
+            let lines = text.lines().collect::<Vec<_>>();
+            assert!(
+                lines[0].len() <= 160 && lines[1].starts_with("Repair: ") && lines[1].len() <= 120,
+                "{reply}"
+            );
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.starts_with("Repair: "))
+                    .count(),
+                1,
+                "{reply}"
+            );
+            assert!(
+                !lines[0].starts_with("error:") && !lines[1].contains(" or "),
+                "{reply}"
+            );
+        }
         ("complete", Some("test")) => assert!(
             text.starts_with("tests #")
                 || text.starts_with("tests: could not start ")
@@ -516,13 +531,11 @@ fn assert_compact_envelope(reply: &Value) {
         ("complete", Some("activation" | "context" | "diff" | "stop")) => {
             assert!(!body.is_empty(), "{reply}")
         }
-        ("invalid_parameters", _) => {
-            // The `apply_patch` body refusals keep their own wording (symbol-read-edit-v1 §5).
-            assert!(
-                text.starts_with("invalid bounded parameters:") || text.starts_with("patch: "),
-                "{reply}"
-            )
-        }
+        ("unavailable", _) => assert!(text.contains("\nRepair: "), "{reply}"),
+        ("pending", _) => assert!(
+            text.contains("arrives by itself") && text.contains("Result reference:"),
+            "{reply}"
+        ),
         _ => assert!(text.starts_with(state), "{reply}"),
     }
     if kind == Some("edit") {
@@ -557,7 +570,10 @@ fn assert_claude_envelope(reply: &Value) -> &str {
     );
     assert_eq!(
         result.get("isError") == Some(&json!(true)),
-        text.starts_with("error") || text.starts_with("refused: read_only ("),
+        matches!(
+            claude_fields("", text)["state"].as_str(),
+            Some("error" | "invalid_parameters")
+        ),
         "{reply}"
     );
     text
@@ -591,14 +607,130 @@ fn claude_fields(tool: &str, text: &str) -> Value {
         .strip_prefix("<agent-ide>\n")
         .and_then(|rest| rest.split_once("</agent-ide>\n"))
         .map_or(text, |(_, reply)| reply);
-    if let Some(rest) = text.strip_prefix("unavailable: ") {
-        return json!({"state":"unavailable","reason":token(rest)});
+    // Refusal types are reconstructed from their decision-facing meaning, never an internal
+    // label. The independent envelope oracle still compares this meaning with actual isError.
+    if text
+        .lines()
+        .nth(1)
+        .is_some_and(|line| line.starts_with("Repair: "))
+        && !text.starts_with("edit: ")
+    {
+        let head = text.lines().next().unwrap();
+        let code = if head.starts_with("This activation started with read_only:")
+            || head.starts_with("Another agent session owns")
+            || head.starts_with("Another session for this actor")
+            || head.starts_with("This actor's IDE activation")
+            || head.starts_with("Another active session owns")
+            || head.starts_with("A live IDE session owns")
+            || head.starts_with("This activation_id was committed")
+        {
+            Some("conflict")
+        } else if head.starts_with("This result reference")
+            || head.starts_with("This activation_id was already used")
+            || head.starts_with("This test run is unknown")
+        {
+            Some("invalid_detail")
+        } else if head.starts_with("The source changed")
+            || head.starts_with("The requested source")
+            || head.starts_with("The requested range")
+            || head.starts_with("This file is not readable")
+            || head.starts_with("This directory is not a Git")
+            || head.starts_with("Git evidence for this")
+            || head.starts_with("The activation's start commit")
+        {
+            Some("source_unavailable")
+        } else if head.starts_with("The requested root")
+            || head.starts_with("This environment selector")
+        {
+            Some("outside_allowed_roots")
+        } else if head.starts_with("Edit refused;") {
+            Some("edit_refused")
+        } else if head.starts_with("No symbol matches") {
+            Some("unknown_symbol")
+        } else if head.starts_with("The IDE could not complete this request") {
+            Some("internal")
+        } else if head.starts_with("The IDE's bounded queue")
+            || head.starts_with("The IDE's bounded request queue")
+            || head.starts_with("The IDE's bounded result store")
+            || head.starts_with("This diff exceeds")
+            || head.starts_with("This call would consume capacity")
+        {
+            Some("capacity")
+        } else if head.starts_with("The language server has not finished") {
+            Some("provider_loading")
+        } else if head.starts_with("The language server returned")
+            || head.starts_with("The language server failed")
+            || head.starts_with("No language server")
+            || head.starts_with("The server cannot answer")
+            || head.starts_with("No language-server result")
+            || head.starts_with("Tests could not be selected")
+        {
+            Some("provider_unavailable")
+        } else if head.starts_with("The project could not be activated")
+            || head.starts_with("Git worktree discovery")
+            || head.starts_with("Saved workspace state")
+            || head.starts_with("The worktree could not be resolved")
+        {
+            Some("workspace_activation")
+        } else if head.contains("its outcome is unknown")
+            || head.starts_with("This call may have run")
+        {
+            Some("outcome_unknown")
+        } else if head.starts_with("The IDE could not identify this stop's session") {
+            Some("stop_unidentified")
+        } else if head.starts_with("The IDE is serving too many calls") {
+            Some("busy")
+        } else if head.starts_with("The IDE restarted after an internal fault") {
+            Some("restarting")
+        } else if head.starts_with("The language server could not verify") {
+            Some("resolution_unverified")
+        } else if head.starts_with("The IDE could not safely run")
+            || head.starts_with("The IDE could not start the required process")
+            || head.starts_with("The IDE could not establish the allowed Git")
+            || head.starts_with("The Git query was refused")
+            || head.starts_with("The configured Git does not support")
+            || head.starts_with("The process request was invalid")
+            || head.starts_with("The process tried to write data reserved")
+            || head.starts_with("The failed process did not stop")
+            || head.starts_with("This cached result crosses a symlink")
+        {
+            Some("execution_profile")
+        } else if head.starts_with("This operation exceeded")
+            || head.starts_with("Stopping exceeded")
+            || head.starts_with("Recording this stop took too long")
+        {
+            Some("deadline")
+        } else if head.starts_with("This call was cancelled") {
+            Some("cancelled")
+        } else if head.starts_with("This result belongs to an older IDE activation")
+            || head.starts_with("This stop conflicts")
+            || head.starts_with("This stop is not recorded")
+        {
+            Some("workspace_authority")
+        } else if head.starts_with("The IDE could not match this session") {
+            Some("launcher_configuration")
+        } else if head.starts_with("The configured Git lacks a required capture") {
+            Some("unsupported_git")
+        } else if head.starts_with("The IDE host attachment is unavailable")
+            || head.starts_with("The IDE connection")
+            || head.starts_with("The IDE exited and could not reconnect")
+            || head.starts_with("The IDE's result is unavailable")
+            || head.starts_with("The IDE result exceeds the reply limit")
+        {
+            Some("transport")
+        } else {
+            None
+        };
+        if head == "These arguments do not match the tool schema." {
+            return json!({"state":"invalid_parameters"});
+        }
+        return code.map_or_else(
+            || json!({"state":"unavailable","reason":"host_binding"}),
+            |code| json!({"state":"error","code":code}),
+        );
     }
-    if let Some(rest) = text.strip_prefix("error: ") {
-        return json!({"state":"error","code":token(rest)});
-    }
-    if let Some(rest) = text.strip_prefix("pending: ") {
-        return json!({"state":"pending","detail_ref":after(rest, "detail_ref ")});
+    if text.starts_with("The result arrives by itself") {
+        return json!({"state":"pending","detail_ref":after(text, "Result reference: ")});
     }
     if let Some(rest) = text.strip_prefix("edit: ") {
         let outcome = token(rest);
@@ -826,7 +958,7 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
         unavailable["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("continue with native tools")
+            .contains("Continue with native tools")
     );
     let invalid = mcp
         .exchange(
@@ -840,7 +972,7 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
         invalid["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("invalid bounded parameters")
+            .contains("These arguments do not match the tool schema.")
     );
     // The plain `ide.context` schema cannot express "path or problems", so the handler explains it.
     let no_target = mcp
@@ -853,7 +985,7 @@ async fn binary_discovery_is_static_and_inactive_calls_are_fail_open() {
     assert_eq!(no_target["result"]["isError"], true);
     assert_eq!(
         no_target["result"]["content"][0]["text"],
-        "invalid bounded parameters: ide.context needs either \"path\" or \"kind\":\"problems\""
+        "These arguments do not match the tool schema.\nRepair: Correct the named arguments and repeat this call.\n  ide.context needs either \"path\" or \"kind\":\"problems\".\n"
     );
     mcp.close().await;
     assert!(!runtime.exists());
@@ -972,17 +1104,17 @@ async fn modern_tools_call_is_fail_open_and_selects_host_from_request_meta() {
         (
             2,
             json!({"claudecode/toolUseId":"modern-claude-call"}),
-            "Assistance host metadata or attachment is unavailable; continue with native tools",
+            "The IDE host attachment is unavailable.\nRepair: Continue with native tools.",
         ),
         (
             3,
             json!({"threadId":"actor","callId":"call-3","x-codex-turn-metadata":{"turn":"test"}}),
-            "Assistance host metadata or attachment is unavailable; continue with native tools",
+            "The IDE host attachment is unavailable.\nRepair: Continue with native tools.",
         ),
         (
             4,
             json!({}),
-            "unavailable: host_binding (host_unrecognized); this host did not identify the call in a supported format. Continue with native tools",
+            "This host did not identify the call in a supported format.\nRepair: Continue this work with native tools.",
         ),
     ] {
         let reply = mcp
@@ -1044,7 +1176,7 @@ async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
         unavailable["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("continue with native tools")
+            .contains("Continue with native tools")
     );
     mcp.close().await;
 }
@@ -1090,7 +1222,7 @@ async fn binary_routes_methods_to_typed_missing_peer_and_survives_daemon_loss() 
     // No supported host metadata can never correlate: the closed cause names it (T15B follow-up).
     assert_eq!(
         no_metadata["result"]["content"][0]["text"],
-        "unavailable: host_binding (host_unrecognized); this host did not identify the call in a supported format. Continue with native tools"
+        "This host did not identify the call in a supported format.\nRepair: Continue this work with native tools."
     );
     for (index, (name, arguments)) in [
         ("ide.start", json!({"activation_id":"activate"})),
@@ -1117,7 +1249,7 @@ async fn binary_routes_methods_to_typed_missing_peer_and_survives_daemon_loss() 
         assert_eq!(response["result"]["content"].as_array().unwrap().len(), 1);
         assert_eq!(
             response["result"]["content"][0]["text"],
-            "unavailable: host_binding (hooks_not_delivered); the daemon has received no host event for this session. Call ide.start with the same root, or continue with native tools"
+            "The IDE received no host event for this session.\nRepair: Call ide.start in this project."
         );
         assert_eq!(
             response["result"]["structuredContent"],
@@ -1197,7 +1329,7 @@ async fn modern_codex_call_is_text_only_without_initialize() {
     assert!(
         response["result"]["content"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.starts_with("unavailable: host_binding")),
+            .is_some_and(|text| claude_fields("", text)["state"] == "unavailable"),
         "{response}"
     );
     daemon.kill().await.unwrap();
@@ -2378,7 +2510,7 @@ async fn binary_renders_typed_lifecycle_replies_without_transport_errors() {
         (
             host_call("actor", "unavailable", "ide.start"),
             json!({"state":"unavailable","reason":"host_binding"}),
-            "unavailable: host_binding; continue with native tools",
+            "The host could not bind this IDE call.\nRepair: Repeat the call as a new tool invocation.",
         ),
         (
             host_call("actor", "stopped", "ide.stop"),
@@ -4959,7 +5091,7 @@ async fn managed_claude_startup_requires_template() {
         response["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("continue with native tools")
+            .contains("Continue with native tools")
     );
     mcp.close().await;
     // The shared rendezvous directory this MCP created is never removed on exit, even when no
@@ -5307,7 +5439,7 @@ async fn managed_claude_moved_session_reroots_into_an_allowed_root() {
         .await;
     assert_eq!(
         assert_claude_envelope(&refused),
-        "unavailable: host_binding (outside_allowed_roots); the session project is outside the directories the IDE may open. Call ide.start with an allowed root, or continue with native tools",
+        "This project is outside the directories the IDE may open.\nRepair: Call ide.start with an allowed root.",
         "{refused}"
     );
 
@@ -5338,7 +5470,7 @@ async fn managed_claude_moved_session_reroots_into_an_allowed_root() {
     let rerooted_text = assert_claude_envelope(&rerooted);
     assert!(
         rerooted_text.starts_with(
-            "unavailable: host_binding (hooks_not_delivered); the daemon has received no host event for this session. Call ide.start with the same root, or continue with native tools"
+            "The IDE received no host event for this session.\nRepair: Call ide.start in this project."
         ),
         "{rerooted_text}"
     );
@@ -5528,15 +5660,16 @@ async fn managed_claude_cross_repository_start_is_refused_without_moving_the_ses
         .await;
     let refused_text = assert_claude_envelope(&refused);
     assert!(
-        refused_text.starts_with("unavailable: host_binding (other_repository: bound to "),
+        refused_text.starts_with("Other agents still use the bound repository; nothing moved."),
         "{refused_text}"
     );
     assert!(
-        refused_text.contains(&format!(", asked {}", other.display())),
+        refused_text.contains(&format!("requested root: {}", other.display())),
         "{refused_text}"
     );
     assert!(
-        refused_text.contains("this start was refused and nothing moved"),
+        refused_text.contains("nothing moved")
+            && refused_text.contains("Repair: Call ide.start under the bound repository."),
         "{refused_text}"
     );
     assert!(
@@ -5805,8 +5938,8 @@ async fn claude_session_survives_a_daemon_restart_between_calls() {
         .await;
     let stale_text = assert_claude_envelope(&stale);
     assert!(
-        stale_text.starts_with("error: invalid_detail")
-            && stale_text.contains("issued before the IDE restarted; re-read"),
+        stale_text.starts_with("This result reference was issued before the IDE restarted.")
+            && stale_text.contains("Repair: Repeat the original IDE call"),
         "{stale_text}"
     );
 
@@ -6052,10 +6185,9 @@ async fn claude_context_pages_survive_native_posts_but_not_real_edits() {
     let refused_text = assert_claude_envelope(&refused);
     let _ = total;
     assert!(
-        refused_text.contains("error: source_unavailable")
-            && refused_text.contains("inspect:source_changed")
-            && refused_text.contains("\"claude-pages.py\" changed since this result was captured")
-            && refused_text.contains("Read it again with ide.read"),
+        refused_text.starts_with("The source changed since this result was captured.")
+            && refused_text.contains("  \"claude-pages.py\"")
+            && refused_text.contains("Repair: Read the requested unit again with ide.read."),
         "{refused_text}"
     );
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
@@ -7436,7 +7568,7 @@ async fn managed_auto_zcode_host_reroots_like_claude() {
         .await;
     assert_eq!(
         unrecognized["result"]["content"][0]["text"],
-        "unavailable: host_binding (host_unrecognized); this host did not identify the call in a supported format. Continue with native tools",
+        "This host did not identify the call in a supported format.\nRepair: Continue this work with native tools.",
         "{unrecognized}"
     );
     assert!(
@@ -7467,7 +7599,7 @@ async fn managed_auto_zcode_host_reroots_like_claude() {
     let rerooted_text = assert_claude_envelope(&rerooted);
     assert!(
         rerooted_text.starts_with(
-            "unavailable: host_binding (hooks_not_delivered); the daemon has received no host event for this session. Call ide.start with the same root, or continue with native tools; retry: session re-rooted"
+            "The IDE received no host event for this session.\nRepair: session re-rooted"
         ),
         "{rerooted_text}"
     );
@@ -7762,7 +7894,7 @@ async fn managed_claude_hook_pairs_through_project_dir_when_the_shell_cwd_left_t
     assert!(
         refused["result"]["content"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.starts_with("unavailable: host_binding")),
+            .is_some_and(|text| claude_fields("", text)["state"] == "unavailable"),
         "a pre routed nowhere cannot pair: {refused}"
     );
     mcp.close().await;
@@ -7833,7 +7965,7 @@ async fn managed_claude_hook_never_routes_a_wandering_cwd_to_another_registered_
     assert!(
         refused["result"]["content"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.starts_with("unavailable: host_binding")),
+            .is_some_and(|text| claude_fields("", text)["state"] == "unavailable"),
         "the stray pre never reached the other repository: {refused}"
     );
     mcp.close().await;
@@ -7902,7 +8034,7 @@ async fn managed_claude_hook_with_a_vanished_project_dir_never_routes_to_another
         assert!(
             refused["result"]["content"][0]["text"]
                 .as_str()
-                .is_some_and(|text| text.starts_with("unavailable: host_binding")),
+                .is_some_and(|text| claude_fields("", text)["state"] == "unavailable"),
             "a pre of unusable project {project:?} never reaches the repository the shell stands in: {refused}"
         );
         next += 1;
@@ -8726,7 +8858,7 @@ async fn configured_product_task_diff_refuses_unknown_activation_commit() {
     let text = task["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(
         text,
-        "error: source_unavailable (diff:activation_commit_unknown); the start commit of this activation is unknown, so the task view is unavailable; use ide.diff {\"mode\": \"head\"}"
+        "The activation's start commit is unknown; the task diff is unavailable.\nRepair: Call ide.diff with {\"mode\":\"head\"}."
     );
 
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
@@ -10940,9 +11072,9 @@ async fn configured_product_batch_old_not_found_refuses_and_retries_the_same_ope
     assert_eq!(refused["code"], "edit_refused", "{refused}");
     assert_eq!(
         batch_without_status_plate(&refused_text),
-        "error: edit_refused (edit:refused); 1 of 2 changes refused, nothing written — \
+        "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 2 changes refused, nothing written — \
          change 2: old text not found; closest lines 1-3; first difference at line 1: \
-         \"pub fn first() -> i32 {\". Fix the named changes and retry with the same operation_id",
+         \"pub fn first() -> i32 {\"\n",
         "{refused_text}"
     );
     assert_eq!(
@@ -11023,9 +11155,9 @@ async fn configured_product_batch_old_ambiguous_lists_both_lines_and_within_retr
     assert_eq!(refused["code"], "edit_refused", "{refused}");
     assert_eq!(
         batch_without_status_plate(&refused_text),
-        "error: edit_refused (edit:refused); 1 of 1 changes refused, nothing written — \
+        "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 1 changes refused, nothing written — \
          change 1: old text matches 2 places (lines 6, 10); add \"within\":\"<symbol>\" or \
-         more surrounding lines. Fix the named changes and retry with the same operation_id",
+         more surrounding lines\n",
         "{refused_text}"
     );
     assert_eq!(
@@ -11099,7 +11231,7 @@ async fn configured_product_batch_overlapping_changes_refuse_naming_both_ranges(
     assert_eq!(refused["code"], "edit_refused", "{refused}");
     assert_eq!(
         batch_without_status_plate(&refused_text),
-        "error: edit_refused (edit:refused); 2 of 2 changes refused, nothing written — \
+        "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  2 of 2 changes refused, nothing written — \
          changes 1 and 2 overlap (base lines 1–2 and 2–3); merge them or narrow the ranges. \
          Fix the named changes and retry with the same operation_id",
         "{refused_text}"
@@ -11265,7 +11397,7 @@ async fn configured_product_batch_cannot_address_a_symbol_an_earlier_change_woul
     assert_eq!(refused["code"], "edit_refused", "{refused}");
     assert_eq!(
         batch_without_status_plate(&refused_text),
-        "error: edit_refused (edit:refused); 1 of 2 changes refused, nothing written — \
+        "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 2 changes refused, nothing written — \
          change 2: no symbol src/batch.rs#gamma; check ide.outline {\"path\":\"src/batch.rs\"}. \
          Fix the named changes and retry with the same operation_id",
         "{refused_text}"
@@ -11314,7 +11446,7 @@ async fn configured_product_batch_lines_past_end_refuses_naming_the_file_length(
     assert_eq!(refused["code"], "edit_refused", "{refused}");
     assert_eq!(
         batch_without_status_plate(&refused_text),
-        "error: edit_refused (edit:refused); 1 of 1 changes refused, nothing written — \
+        "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 1 changes refused, nothing written — \
          change 1: lines 9 is past the end of src/batch.rs (7 lines); re-read the file. \
          Fix the named changes and retry with the same operation_id",
         "{refused_text}"
@@ -11371,11 +11503,11 @@ async fn configured_product_batch_rust_syntax_gate_refuses_and_notes_pre_existin
     assert_eq!(refused["code"], "edit_refused", "{refused}");
     assert_eq!(
         batch_without_status_plate(&refused_text),
-        "error: edit_refused (edit:refused); 1 of 1 changes refused, nothing written — \
+        "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 1 changes refused, nothing written — \
          change 1 produced a syntax error at line 5: \"unbalanced delimiters: '(' opened at \
          line 5 is never closed\" \
          (candidate lines 3-7: \"}\\n\\npub fn target( -> i32 {\\n    helper()\\n}\"); candidate \
-         not written. Fix the named changes and retry with the same operation_id",
+         not written\n",
         "{refused_text}"
     );
     assert_eq!(
@@ -11475,10 +11607,10 @@ async fn configured_product_batch_several_refusals_in_one_bounded_reply() {
     assert_eq!(
         batch_without_status_plate(&refused_text),
         format!(
-            "error: edit_refused (edit:refused); 2 of 3 changes refused, nothing written — \
+            "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  2 of 3 changes refused, nothing written — \
              change 2: old text not found; closest lines 1-1; first difference at line 1: \
              \"// {clipped_comment}\"; change 3: no symbol src/batch.rs#nope; check ide.outline \
-             {{\"path\":\"src/batch.rs\"}}. Fix the named changes and retry with the same operation_id"
+             {{\"path\":\"src/batch.rs\"}}\n"
         ),
         "{refused_text}"
     );
@@ -11488,7 +11620,7 @@ async fn configured_product_batch_several_refusals_in_one_bounded_reply() {
     );
 
     // Five refusals with full-length excerpts overflow the bound: the reply is clipped at the
-    // bound (never past it) and stays a single actionable line.
+    // bound (never past it), below one bounded Repair line.
     let changes: Vec<Value> = (0..5)
         .map(|number| json!({"old":format!("// {} absent {number}", "x".repeat(40)),"new":"x"}))
         .collect();
@@ -11506,11 +11638,11 @@ async fn configured_product_batch_several_refusals_in_one_bounded_reply() {
     .await;
     let (clipped, clipped_text) = batch_settle_with_text(&mut actor, &fixture, clipped).await;
     assert_eq!(clipped["code"], "edit_refused", "{clipped}");
-    let prefix = "error: edit_refused (edit:refused); ";
-    let suffix = ". Fix the named changes and retry with the same operation_id";
+    let prefix = "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  ";
+    let suffix = "\n";
     assert!(
         clipped_text.starts_with(
-            "error: edit_refused (edit:refused); 5 of 5 changes refused, nothing written — \
+            "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  5 of 5 changes refused, nothing written — \
              change 1: old text not found; closest lines 1-1; first difference at line 1: \""
         ),
         "{clipped_text}"
@@ -11621,7 +11753,7 @@ async fn configured_product_batch_python_syntax_gate_refuses_writes_and_proceeds
     assert_eq!(refused["code"], "edit_refused", "{refused}");
     assert_eq!(
         batch_without_status_plate(&refused_text),
-        "error: edit_refused (edit:refused); 1 of 1 changes refused, nothing written — \
+        "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 1 changes refused, nothing written — \
          change 1 produced a syntax error at line 5: \"invalid syntax\" (candidate lines 3-6: \
          \"\\n\\ndef broken(:\\n    return 2\"); candidate not written. Fix the named changes \
          and retry with the same operation_id",
@@ -11790,10 +11922,10 @@ async fn configured_product_batch_typescript_syntax_gate_refuses_and_writes() {
     assert_eq!(refused["code"], "edit_refused", "{refused}");
     assert_eq!(
         batch_without_status_plate(&refused_text),
-        "error: edit_refused (edit:refused); 1 of 1 changes refused, nothing written — \
+        "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 1 changes refused, nothing written — \
          change 1 produced a syntax error at line 5: \"Parameter declaration expected.\" \
          (candidate lines 3-7: \"}\\n\\nfunction broken( : number {\\n    return 2;\\n}\"); \
-         candidate not written. Fix the named changes and retry with the same operation_id",
+         candidate not written\n",
         "{refused_text}"
     );
     assert_eq!(
@@ -11901,10 +12033,10 @@ async fn configured_product_batch_typescript_gate_uses_the_configured_package() 
     assert_eq!(refused["code"], "edit_refused", "{refused}");
     assert_eq!(
         batch_without_status_plate(&refused_text),
-        "error: edit_refused (edit:refused); 1 of 1 changes refused, nothing written — \
+        "Edit refused; nothing was written.\nRepair: Correct the named changes and repeat with the same operation_id.\n  1 of 1 changes refused, nothing written — \
          change 1 produced a syntax error at line 5: \"Parameter declaration expected.\" \
          (candidate lines 3-7: \"}\\n\\nfunction broken( : number {\\n    return 2;\\n}\"); \
-         candidate not written. Fix the named changes and retry with the same operation_id",
+         candidate not written\n",
         "{refused_text}"
     );
     assert_eq!(
@@ -12551,7 +12683,7 @@ async fn product_outline_and_read_report_no_such_file() {
     actor.lifecycle(&fixture, "PostToolUse", &call).await;
     assert_eq!(
         missing_outline_path["result"]["content"][0]["text"],
-        "invalid bounded parameters: ide.outline needs \"path\" (a file or directory relative to the worktree root)",
+        "These arguments do not match the tool schema.\nRepair: Correct the named arguments and repeat this call.\n  ide.outline needs \"path\" (a file or directory relative to the worktree root).\n",
         "{missing_outline_path}"
     );
     actor.next += 1;
@@ -22007,7 +22139,7 @@ async fn eyes_codex_managed_hook_lifecycles_stay_silent_without_delivery() {
         invalid["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("invalid bounded parameters"),
+            .contains("These arguments do not match the tool schema."),
         "{invalid}"
     );
     let rejected_post = managed_native_phase(
@@ -23751,7 +23883,7 @@ async fn managed_claude_lost_reply_on_a_live_daemon_keeps_every_actor() {
         json!({"path":"src/lib.rs","lines":"1-2"}),
     )
     .await;
-    assert_eq!(lost["code"], "outcome_unknown:", "{lost}");
+    assert_eq!(lost["code"], "outcome_unknown", "{lost}");
     assert_eq!(
         managed_claude_candidate_attachment(&fixture.root),
         attachment
@@ -23799,7 +23931,7 @@ async fn managed_claude_lost_edit_reply_is_reported_and_never_resent() {
     let reply = mcp.exchange(request.clone()).await;
     let text = assert_claude_envelope(&reply);
     assert!(
-        text.starts_with("error: outcome_unknown: ide.edit may have reached the IDE and applied")
+        text.starts_with("This edit may have applied; its outcome is unknown.")
             && text.contains("ide.diff"),
         "{text}"
     );
@@ -23920,7 +24052,7 @@ async fn managed_claude_stopped_actor_is_never_recovered() {
     let request = json!({"jsonrpc":"2.0","id":next,"method":"tools/call","params":{"name":"ide.stop","arguments":{},"_meta":{"claudecode/toolUseId":call}}});
     let lost_stop = assert_claude_envelope(&mcp.exchange(request.clone()).await).to_owned();
     assert!(
-        lost_stop.starts_with("error: outcome_unknown:"),
+        lost_stop.starts_with("This activation change may have applied; its outcome is unknown."),
         "{lost_stop}"
     );
     next += 1;
@@ -24050,9 +24182,9 @@ async fn managed_claude_writer_of_an_ended_session_is_taken_over() {
     )
     .await;
     assert!(
-        refused.starts_with(
-            "error: conflict (start:worktree_held_by_another_actor: actor gone-session"
-        ) && refused.contains("another agent's live session holds the only writer slot"),
+        refused.starts_with("Another agent session owns this worktree's IDE activation.")
+            && refused.contains("actor gone-session")
+            && refused.contains("Repair: Call ide.start with {\"read_only\":true}"),
         "{refused}"
     );
 
@@ -24069,7 +24201,9 @@ async fn managed_claude_writer_of_an_ended_session_is_taken_over() {
             json!({}),
         )
         .await;
-        if !text.starts_with("error: conflict") || tokio::time::Instant::now() >= deadline {
+        if !text.starts_with("Another agent session owns this worktree")
+            || tokio::time::Instant::now() >= deadline
+        {
             break text;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

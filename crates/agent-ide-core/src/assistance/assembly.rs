@@ -344,7 +344,8 @@ async fn with_git_notice(
 ///
 /// The plate is marked delivered only once it was actually attached: the whole reply is fitted
 /// into the exact final MCP carrier the host reads (`content::reply_envelope()`), shrinking only
-/// owner text, and a plate that cannot fit beside any (possibly shrunk) body stays due for the
+/// ordinary owner text. A fitted Diff page stays whole because delivery has accounted for its
+/// complete hunks; a plate that cannot fit beside that page stays due. Other plates stay due for the
 /// next terminal reply. The fitting decision and the delivery record are one atomic feed step.
 fn attach_reply_plate(
     feed: Option<&Arc<ProjectProblemFeed>>,
@@ -357,6 +358,15 @@ fn attach_reply_plate(
         loop {
             if super::content::fits_with_status(&fitting, plate, super::content::reply_envelope()) {
                 return true;
+            }
+            if matches!(
+                fitting,
+                PeerReply::Complete {
+                    kind: super::reply::ResultKind::Diff,
+                    ..
+                }
+            ) {
+                return false;
             }
             if !fitting.shrink_text() {
                 return false;
@@ -917,7 +927,7 @@ impl ProductDispatcher {
                     AssistanceMethod::Test => super::facade::AssistanceTool::Test,
                     AssistanceMethod::HookSubmit => return Err(HostBindingCause::InvalidMetadata),
                 };
-                let call = super::facade::validate_call(
+                let call = super::facade::validate_normalized_call(
                     tool,
                     object
                         .get("parameters")

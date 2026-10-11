@@ -1,11 +1,525 @@
 [
-{"annotations":{"openWorldHint":false,"readOnlyHint":true},"description":"What changed since your last diff (the first call: everything uncommitted), paged. A `mode`\n(`head`, `staged`, `unstaged`, `task`) asks for the whole diff of that kind. Review it\nbefore finishing instead of running `git diff`.","inputSchema":{"additionalProperties":false,"properties":{"detail_ref":{"description":"Reference from an earlier reply: continue that result.","type":"string"},"mode":{"description":"The whole diff: `head` (uncommitted), `staged`, `unstaged` or `task` (since activation). Omit for only what changed since your last diff.","enum":["head","staged","unstaged","task"],"type":"string"},"paths":{"description":"Worktree-relative files or directories to limit the diff to; literal paths only.","items":{"type":"string"},"type":"array"},"provenance":{"default":false,"description":"Return the exact worktree and comparison identity header instead of the compact default.","type":"boolean"}},"type":"object"},"name":"ide.diff"},
-{"annotations":{"destructiveHint":true,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":false},"description":"Edit by address. Replace a symbol with its new doc and body:\n`{\"symbol\":\"src/a.rs#Type/method\",\"content\":\"…\"}`. Change inside it with `old`/`new`\nscoped to the symbol, or `content` for a window `…/method:3-5`. Also `op`\ninsert/delete/rename, `add_import`/`remove_import`, `files` for several files and `patch`\nfor apply_patch. All changes apply or none; the reply is immediate and the project check\n(cargo check, pyright or tsc) arrives by itself.","inputSchema":{"additionalProperties":false,"properties":{"add_import":{"description":"With `path`: an import statement as written in the file; added after the other imports.","type":"string"},"changes":{"items":{"additionalProperties":false,"description":"Up to 32 changes to the file `path`: each is `symbol` with `content` or `old`/`new`, `lines`, `add_import` or `remove_import`. All apply or none.","properties":{"add_import":{"type":"string"},"content":{"type":"string"},"lines":{"type":"string"},"new":{"type":"string"},"old":{"type":"string"},"op":{"enum":["replace","insert","delete"],"type":"string"},"remove_import":{"type":"string"},"symbol":{"type":"string"},"where":{"enum":["before","after","first","last"],"type":"string"},"within":{"type":"string"}},"type":"object"},"type":"array"},"content":{"description":"Replacement or inserted code, including the symbol's doc comment and attributes.","type":"string"},"files":{"description":"Up to 16 files in one call: {path, changes}, {path, create:true, content} or {path, content}. All apply or none; one project check runs.","items":{"additionalProperties":false,"properties":{"changes":{"items":{"type":"object"},"type":"array"},"content":{"type":"string"},"create":{"type":"boolean"},"path":{"type":"string"}},"required":["path"],"type":"object"},"type":"array"},"lines":{"description":"With `path`: file lines `a-b` to replace; for code prefer a `symbol` or a window.","type":"string"},"new":{"description":"The replacement for `old`; empty deletes the match.","type":"string"},"new_name":{"description":"For rename: the new identifier, applied project-wide.","type":"string"},"old":{"description":"Exact text to replace with `new`; it must occur once in the scope (the `symbol`, else the whole `path`).","type":"string"},"op":{"default":"replace","description":"replace (default), insert (placed by `where`), delete or rename (to `new_name`, project-wide) the `symbol`.","enum":["replace","insert","delete","rename"],"type":"string"},"operation_id":{"description":"Optional name that makes a retry safe: repeating it never applies the edit twice.","type":"string"},"patch":{"description":"A Codex apply_patch body (Add File, Update File), applied atomically. Use it alone.","type":"string"},"path":{"type":"string"},"remove_import":{"description":"With `path`: the import statement to remove, as written in the file.","type":"string"},"symbol":{"description":"Address `src/a.rs#Type/method`, a window `…/method:3-5` (lines of the symbol) or a region `src/a.rs#@imports`.","type":"string"},"where":{"description":"For insert: before/after the anchor symbol, or first/last member of a container anchor.","enum":["before","after","first","last"],"type":"string"}},"type":"object"},"name":"ide.edit"},
-{"annotations":{"openWorldHint":false,"readOnlyHint":true},"description":"Read what Agent IDE holds for you. Results of long work (test runs, project checks,\npending answers) arrive by themselves in an `<agent-ide>` block, so never poll for them.\n`{}` hands over everything ready now; `detail_ref` or `detail_refs` read results or their\nnext pages. `{\"kind\":\"problems\"}` lists the project check problems.","inputSchema":{"additionalProperties":false,"properties":{"detail_ref":{"description":"Reference from an earlier reply: continue that result.","type":"string"},"detail_refs":{"description":"Several references answered in order in one reply; not with `detail_ref`.","items":{"type":"string"},"type":"array"},"kind":{"description":"`problems`: the project check results instead of a file.","enum":["problems"],"type":"string"},"language":{"description":"With `problems`: limit to one language.","enum":["rust","python","typescript"],"type":"string"},"offset":{"description":"With `problems`: continue from this problem index (see `next_offset`).","maximum":4294967295,"minimum":0,"type":"integer"}},"type":"object"},"name":"ide.inspect"},
-{"annotations":{"openWorldHint":false,"readOnlyHint":true},"description":"Skeleton of files: every symbol and region (`@header`, `@imports`) with its address,\nsignature, doc line and line numbers. Far cheaper than reading a file. Give `paths` (up to\n24) or a `glob`; `path` takes one file or a directory. Addresses look like\n`src/a.rs#Type/method` and feed ide.read and ide.edit.","inputSchema":{"additionalProperties":false,"properties":{"glob":{"description":"Worktree-relative pattern (`*`, `?`, `**`), e.g. `crates/x/src/**/*.rs`; at most 24 files.","type":"string"},"kinds":{"description":"Comma list of symbol kinds to keep (a container of a match still shows); `region` also lists @header, @imports.","type":"string"},"path":{"description":"File relative to the project root.","type":"string"},"paths":{"description":"Up to 24 worktree-relative files, outlined in request order.","items":{"type":"string"},"type":"array"}},"type":"object"},"name":"ide.outline"},
-{"annotations":{"openWorldHint":false,"readOnlyHint":true},"description":"Read code by address: `src/a.rs#Type/method` returns doc and body numbered from 1,\n`…/method:3-5` a window, `src/a.rs#@imports` or `#@header` a region, `path:line` (from\ngrep) the enclosing symbol. Read many at once with `items`. Use `path` and `lines` only\nfor non-code files.","inputSchema":{"additionalProperties":false,"properties":{"force":{"default":false,"description":"With `items`: return an item's text even when unchanged since your last read of it.","type":"boolean"},"items":{"description":"Up to 32 reads in one call: {symbol} (address, window or `path:line`), or {path} / {path, lines} for non-code files.","items":{"additionalProperties":false,"properties":{"lines":{"type":"string"},"path":{"type":"string"},"symbol":{"type":"string"}},"type":"object"},"type":"array"},"lines":{"description":"With `path`: `120-180`, `120-` (to the end) or `120`; an end past the file is clamped.","type":"string"},"path":{"description":"Non-code file relative to the project root; alone the whole file, with `lines` or `ranges` those lines.","type":"string"},"ranges":{"description":"Several line ranges of the non-code file `path` in one reply.","items":{"type":"string"},"type":"array"},"symbol":{"description":"Address `src/a.rs#Type/method`, a window `…:3-5`, a region `src/a.rs#@imports` or `path:line`; returns doc and body.","type":"string"},"symbols":{"description":"Several addresses in one reply, request order; a failed one fails only itself.","items":{"type":"string"},"type":"array"}},"type":"object"},"name":"ide.read"},
-{"annotations":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":false},"description":"Activate Agent IDE once per task, before any other ide.* call. Returns the project card:\nlanguages, build and test commands, layout, entry points, docs and the call forms. Use it\ninstead of reading README, Cargo.toml or package.json. End the task with ide.stop.","inputSchema":{"additionalProperties":false,"properties":{"activation_id":{"description":"Stable id for this activation; repeating it returns the same activation. Optional.","type":"string"},"environment":{"additionalProperties":{"type":"string"},"description":"Environment per language, optionally per root (`python:packages/alpha`): a candidate the start card lists, a path to one, or `auto`.","type":"object"},"read_only":{"default":false,"description":"Start as a reader; the default is the one writer allowed per worktree.","type":"boolean"},"root":{"description":"Absolute directory to activate, below an allowed root; defaults to the host's project directory.","type":"string"}},"type":"object"},"name":"ide.start"},
-{"annotations":{"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"readOnlyHint":false},"description":"End this task's IDE session; edited files stay on disk. Required when the task ends or\nbefore handing off: frees the writer slot, lists uncollected test runs and flushes\nundelivered results. Call it once.","inputSchema":{"additionalProperties":false,"properties":{"activation_id":{"description":"Optional, accepted for symmetry with ide.start; stop always ends this session's activation.","type":"string"}},"type":"object"},"name":"ide.stop"},
-{"annotations":{"openWorldHint":false,"readOnlyHint":true},"description":"Cards for symbols: signature, doc, address, usages (src and tests, with source lines),\ncallers and callees as addresses, and with `history` the last commits. Takes addresses or\nbare names (several matches list their addresses). Replaces grep for usages and callers;\nlist the construction sites before changing a constructor.","inputSchema":{"additionalProperties":false,"properties":{"callees":{"default":0,"description":"Callees to list, 0–3 (0 = none).","maximum":3,"minimum":0,"type":"integer"},"callers":{"default":1,"description":"Caller levels to list, 0–3 (0 = none).","maximum":3,"minimum":0,"type":"integer"},"history":{"default":false,"description":"Include the last commits touching the definition (opt-in).","type":"boolean"},"symbol":{"description":"Address `src/a.rs#Type/method`, or a bare name to search the project.","type":"string"},"symbols":{"description":"Up to 8 addresses or bare names in one call, request order; a failed one fails only itself.","items":{"type":"string"},"type":"array"},"usages":{"default":true,"description":"Include usages (src/tests split, with source lines).","type":"boolean"}},"type":"object"},"name":"ide.symbol"},
-{"annotations":{"readOnlyHint":false},"description":"Run tests as one run: `targets` of `{symbol}`, `{path}` or `{pattern}` (up to 8), or one\n`symbol` (the tests that reference it), `path`, `pattern` or explicit `command`. Returns\nthe pass/fail line with a rerun command; a longer run answers `started` and its outcome\narrives by itself in an `<agent-ide>` block. Use it instead of a shell.","inputSchema":{"additionalProperties":false,"properties":{"budget_s":{"default":120,"description":"Seconds before the run is stopped and reported as timed out.","maximum":600,"minimum":1,"type":"integer"},"command":{"description":"Explicit argv to run instead of the detected runner; all argument bytes together are limited to 16 KiB.","items":{"type":"string"},"type":"array"},"cwd":{"description":"Working directory relative to the worktree root; must resolve inside the worktree. Only with `command`.","type":"string"},"env":{"additionalProperties":{"type":"string"},"description":"Variables added to the inherited environment; only with `command`.","type":"object"},"path":{"description":"Run the tests in this file or directory.","type":"string"},"pattern":{"description":"Run tests whose name matches this substring (runner filter).","type":"string"},"status":{"description":"Re-read run number N (from `tests #N`) instead of starting one.","minimum":1,"type":"integer"},"symbol":{"description":"Run the tests that reference this address (`src/a.rs#Type/method`).","type":"string"},"targets":{"description":"Up to 8 targets in one run, each {symbol}, {path} or {pattern}; one result line per target and one rerun line.","items":{"additionalProperties":false,"minProperties":1,"properties":{"path":{"type":"string"},"pattern":{"type":"string"},"symbol":{"type":"string"}},"type":"object"},"type":"array"}},"type":"object"},"name":"ide.test"}
+  {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "What changed since your last diff (the first call: everything uncommitted), paged. A `mode`\n(`head`, `staged`, `unstaged`, `task`) asks for the whole diff of that kind. Review it\nbefore finishing instead of running `git diff`.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "detail_ref": {
+          "description": "Reference from an earlier reply: continue that result.",
+          "type": "string"
+        },
+        "mode": {
+          "description": "The whole diff: `head` (uncommitted), `staged`, `unstaged` or `task` (since activation). Omit for only what changed since your last diff.",
+          "enum": [
+            "head",
+            "staged",
+            "unstaged",
+            "task"
+          ],
+          "type": "string"
+        },
+        "paths": {
+          "description": "Worktree-relative files or directories to limit the diff to; literal paths only.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "provenance": {
+          "default": false,
+          "description": "Return the exact worktree and comparison identity header instead of the compact default.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.diff"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Edit by address. Replace a symbol with its new doc and body:\n`{\"symbol\":\"src/a.rs#Type/method\",\"content\":\"…\"}`. Change inside it with `old`/`new`\nscoped to the symbol, or `content` for a window `…/method:3-5`. Also `op`\ninsert/delete/rename, `add_import`/`remove_import`, `files` for several files and `patch`\nfor apply_patch. All changes apply or none; the reply is immediate and the project check\n(cargo check, pyright or tsc) arrives by itself.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "add_import": {
+          "description": "With `path`: an import statement as written in the file; added after the other imports.",
+          "type": "string"
+        },
+        "changes": {
+          "items": {
+            "additionalProperties": false,
+            "description": "Up to 32 changes to the file `path`: each is `symbol` with `content` or `old`/`new`, `lines`, `add_import` or `remove_import`. All apply or none.",
+            "properties": {
+              "add_import": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string"
+              },
+              "lines": {
+                "type": "string"
+              },
+              "new": {
+                "type": "string"
+              },
+              "old": {
+                "type": "string"
+              },
+              "op": {
+                "enum": [
+                  "replace",
+                  "insert",
+                  "delete"
+                ],
+                "type": "string"
+              },
+              "remove_import": {
+                "type": "string"
+              },
+              "symbol": {
+                "type": "string"
+              },
+              "where": {
+                "enum": [
+                  "before",
+                  "after",
+                  "first",
+                  "last"
+                ],
+                "type": "string"
+              },
+              "within": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "content": {
+          "description": "Replacement or inserted code, including the symbol's doc comment and attributes.",
+          "type": "string"
+        },
+        "files": {
+          "description": "Up to 16 files in one call: {path, changes}, {path, create:true, content} or {path, content}. All apply or none; one project check runs.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "changes": {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "content": {
+                "type": "string"
+              },
+              "create": {
+                "type": "boolean"
+              },
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "lines": {
+          "description": "With `path`: file lines `a-b` to replace; for code prefer a `symbol` or a window.",
+          "type": "string"
+        },
+        "new": {
+          "description": "The replacement for `old`; empty deletes the match.",
+          "type": "string"
+        },
+        "new_name": {
+          "description": "For rename: the new identifier, applied project-wide.",
+          "type": "string"
+        },
+        "old": {
+          "description": "Exact text to replace with `new`; it must occur once in the scope (the `symbol`, else the whole `path`).",
+          "type": "string"
+        },
+        "op": {
+          "default": "replace",
+          "description": "replace (default), insert (placed by `where`), delete or rename (to `new_name`, project-wide) the `symbol`.",
+          "enum": [
+            "replace",
+            "insert",
+            "delete",
+            "rename"
+          ],
+          "type": "string"
+        },
+        "operation_id": {
+          "description": "Optional name that makes a retry safe: repeating it never applies the edit twice.",
+          "type": "string"
+        },
+        "patch": {
+          "description": "A Codex apply_patch body (Add File, Update File), applied atomically. Use it alone.",
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "remove_import": {
+          "description": "With `path`: the import statement to remove, as written in the file.",
+          "type": "string"
+        },
+        "symbol": {
+          "description": "Address `src/a.rs#Type/method`, a window `…/method:3-5` (lines of the symbol) or a region `src/a.rs#@imports`.",
+          "type": "string"
+        },
+        "where": {
+          "description": "For insert: before/after the anchor symbol, or first/last member of a container anchor.",
+          "enum": [
+            "before",
+            "after",
+            "first",
+            "last"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.edit"
+  },
+  {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read what Agent IDE holds for you. Results of long work (test runs, project checks,\npending answers) arrive by themselves in an `<agent-ide>` block, so never poll for them.\n`{}` hands over everything ready now; `detail_ref` or `detail_refs` read results or their\nnext pages. `{\"kind\":\"problems\"}` lists the project check problems.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "detail_ref": {
+          "description": "Reference from an earlier reply: continue that result.",
+          "type": "string"
+        },
+        "detail_refs": {
+          "description": "Several references answered in order in one reply; not with `detail_ref`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "description": "`problems`: the project check results instead of a file.",
+          "enum": [
+            "problems"
+          ],
+          "type": "string"
+        },
+        "language": {
+          "description": "With `problems`: limit to one language.",
+          "enum": [
+            "rust",
+            "python",
+            "typescript"
+          ],
+          "type": "string"
+        },
+        "offset": {
+          "description": "With `problems`: continue from this problem index (see `next_offset`).",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.inspect"
+  },
+  {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Skeleton of files: every symbol and region (`@header`, `@imports`) with its address,\nsignature, doc line and line numbers. Far cheaper than reading a file. Give `paths` (up to\n24) or a `glob`; `path` takes one file or a directory. Addresses look like\n`src/a.rs#Type/method` and feed ide.read and ide.edit.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "glob": {
+          "description": "Worktree-relative pattern (`*`, `?`, `**`), e.g. `crates/x/src/**/*.rs`; at most 24 files.",
+          "type": "string"
+        },
+        "kinds": {
+          "description": "Comma list of symbol kinds to keep (a container of a match still shows); `region` also lists @header, @imports.",
+          "type": "string"
+        },
+        "path": {
+          "description": "File relative to the project root.",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Up to 24 worktree-relative files, outlined in request order.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.outline"
+  },
+  {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read code by address: `src/a.rs#Type/method` returns doc and body numbered from 1,\n`…/method:3-5` a window, `src/a.rs#@imports` or `#@header` a region, `path:line` (from\ngrep) the enclosing symbol. Read many at once with `items`. Use `path` and `lines` only\nfor non-code files.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "force": {
+          "default": false,
+          "description": "With `items`: return an item's text even when unchanged since your last read of it.",
+          "type": "boolean"
+        },
+        "items": {
+          "description": "Up to 32 reads in one call: {symbol} (address, window or `path:line`), or {path} / {path, lines} for non-code files.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "lines": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "symbol": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "lines": {
+          "description": "With `path`: `120-180`, `120-` (to the end) or `120`; an end past the file is clamped.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Non-code file relative to the project root; alone the whole file, with `lines` or `ranges` those lines.",
+          "type": "string"
+        },
+        "ranges": {
+          "description": "Several line ranges of the non-code file `path` in one reply.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "symbol": {
+          "description": "Address `src/a.rs#Type/method`, a window `…:3-5`, a region `src/a.rs#@imports` or `path:line`; returns doc and body.",
+          "type": "string"
+        },
+        "symbols": {
+          "description": "Several addresses in one reply, request order; a failed one fails only itself.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.read"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Activate Agent IDE once per task, before any other ide.* call. Returns the project card:\nlanguages, build and test commands, layout, entry points, docs and the call forms. Use it\ninstead of reading README, Cargo.toml or package.json. End the task with ide.stop.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "activation_id": {
+          "description": "Stable id for this activation; repeating it returns the same activation. Optional.",
+          "type": "string"
+        },
+        "environment": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Environment per language, optionally per root (`python:packages/alpha`): a candidate the start card lists, a path to one, or `auto`.",
+          "type": "object"
+        },
+        "read_only": {
+          "default": false,
+          "description": "Start as a reader; the default is the one writer allowed per worktree.",
+          "type": "boolean"
+        },
+        "root": {
+          "description": "Absolute directory to activate, below an allowed root; defaults to the host's project directory.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.start"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "End this task's IDE session; edited files stay on disk. Required when the task ends or\nbefore handing off: frees the writer slot, lists uncollected test runs and flushes\nundelivered results. Call it once.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "activation_id": {
+          "description": "Optional, accepted for symmetry with ide.start; stop always ends this session's activation.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.stop"
+  },
+  {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Cards for symbols: signature, doc, address, usages (src and tests, with source lines),\ncallers and callees as addresses, and with `history` the last commits. Takes addresses or\nbare names (several matches list their addresses). Replaces grep for usages and callers;\nlist the construction sites before changing a constructor.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "callees": {
+          "default": 0,
+          "description": "Callees to list, 0–3 (0 = none).",
+          "maximum": 3,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "callers": {
+          "default": 1,
+          "description": "Caller levels to list, 0–3 (0 = none).",
+          "maximum": 3,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "history": {
+          "default": false,
+          "description": "Include the last commits touching the definition (opt-in).",
+          "type": "boolean"
+        },
+        "symbol": {
+          "description": "Address `src/a.rs#Type/method`, or a bare name to search the project.",
+          "type": "string"
+        },
+        "symbols": {
+          "description": "Up to 8 addresses or bare names in one call, request order; a failed one fails only itself.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "usages": {
+          "default": true,
+          "description": "Include usages (src/tests split, with source lines).",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.symbol"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": false
+    },
+    "description": "Run tests as one run: `targets` of `{symbol}`, `{path}` or `{pattern}` (up to 8), or one\n`symbol` (the tests that reference it), `path`, `pattern` or explicit `command`. Returns\nthe pass/fail line with a rerun command; a longer run answers `started` and its outcome\narrives by itself in an `<agent-ide>` block. Use it instead of a shell.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "budget_s": {
+          "default": 120,
+          "description": "Seconds before the run is stopped and reported as timed out.",
+          "maximum": 600,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "command": {
+          "description": "Explicit argv to run instead of the detected runner; all argument bytes together are limited to 16 KiB.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cwd": {
+          "description": "Working directory relative to the worktree root; must resolve inside the worktree. Only with `command`.",
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Variables added to the inherited environment; only with `command`.",
+          "type": "object"
+        },
+        "path": {
+          "description": "Run the tests in this file or directory.",
+          "type": "string"
+        },
+        "pattern": {
+          "description": "Run tests whose name matches this substring (runner filter).",
+          "type": "string"
+        },
+        "status": {
+          "description": "Re-read run number N (from `tests #N`) instead of starting one.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "symbol": {
+          "description": "Run the tests that reference this address (`src/a.rs#Type/method`).",
+          "type": "string"
+        },
+        "targets": {
+          "description": "Up to 8 targets in one run, each {symbol}, {path} or {pattern}; one result line per target and one rerun line.",
+          "items": {
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "pattern": {
+                "type": "string"
+              },
+              "symbol": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.test"
+  }
 ]

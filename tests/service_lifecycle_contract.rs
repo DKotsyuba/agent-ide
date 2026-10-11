@@ -706,7 +706,9 @@ fn assert_reached_live_daemon(response: &Value) {
     assert!(
         response["result"]["content"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.starts_with("unavailable: host_binding")),
+            .is_some_and(|text| text
+                .starts_with("The IDE received no host event for this session.")
+                && text.contains("\nRepair: ")),
         "{response}"
     );
 }
@@ -725,8 +727,9 @@ fn assert_reached_live_daemon_after_reconnect(response: &Value) {
     assert!(
         response["result"]["content"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.starts_with("unavailable: host_binding")
-                && text.contains("retry: daemon restarted; repeat this call once")),
+            .is_some_and(|text| text
+                .starts_with("The IDE received no host event for this session.")
+                && text.contains("Repair: daemon restarted; repeat this call")),
         "{response}"
     );
 }

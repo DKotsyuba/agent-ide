@@ -445,6 +445,11 @@ impl DiffPageState {
     pub(super) const fn provenance(&self) -> bool {
         self.provenance
     }
+    /// Returns the bounded pre-capture suppression set for preparation of the next actual
+    /// body delivery; preparing an inspected page does not itself consume its hunks.
+    pub(super) fn seen_hunks(&self) -> &BTreeSet<u64> {
+        &self.seen_hunks
+    }
     /// Builds the next retained page state with the same pre-capture suppression set,
     /// or `None` once selection no longer overflows; advancing never suppresses unseen hunks.
     pub(super) fn advance(&self, result: &crate::changes::DiffResult) -> Option<Self> {
@@ -1322,7 +1327,7 @@ impl Worker<'_> {
         let previous = self.shared.previous_diff_hunks(&binding, &composed);
         let incremental = job.parameters["since_last"].as_bool().unwrap_or(false);
         let seen_before = if incremental {
-            previous
+            previous.clone()
         } else {
             BTreeSet::new()
         };
@@ -1383,9 +1388,10 @@ impl Worker<'_> {
             }
             code
         })?;
-        self.shared.remember_diff_hunks(&binding, &result);
         let reply =
             incremental_diff_reply(incremental, &seen_before, mode, &reference, &result, reply);
+        self.shared
+            .prepare_diff_delivery(&reference, &previous, &result, &reply);
         self.shared
             .set_diff_provenance(&reference, tracked_paths.into_iter().collect());
         let diff_page = result
@@ -1639,7 +1645,7 @@ impl Worker<'_> {
         );
         let previous = self.shared.previous_diff_hunks(&binding, &probe);
         let seen_before = if incremental {
-            previous
+            previous.clone()
         } else {
             BTreeSet::new()
         };
@@ -1681,9 +1687,10 @@ impl Worker<'_> {
             }
             code
         })?;
-        self.shared.remember_diff_hunks(&binding, &result);
         let reply =
             incremental_diff_reply(incremental, &seen_before, mode, &reference, &result, reply);
+        self.shared
+            .prepare_diff_delivery(&reference, &previous, &result, &reply);
         // T36B: retain the bounded provenance of every path this diff represents — each
         // delivered path plus its rename source — independently of the disposable pagination
         // state, so cached delivery must prove each under the live profile before it hands

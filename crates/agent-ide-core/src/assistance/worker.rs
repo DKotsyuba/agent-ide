@@ -578,7 +578,11 @@ struct Ledger {
     read_memory: BTreeMap<BindingRef, super::batch::ReadMemory>,
     /// Per binding, delivered diff hunks still present in the latest capture. Shared with
     /// continuation delivery, bounded by snapshots, and cleared when the binding ends.
-    diff_seen: BTreeMap<BindingRef, BTreeSet<u64>>,
+    diff_seen: BTreeMap<BindingRef, (String, BTreeSet<u64>)>,
+    /// Per retained diff reference: exact fitted body digest, prior delivered hunks still in
+    /// this capture, and complete hunks on its current page. Capture prepares these candidates;
+    /// only a successful matching body send consumes them into diff_seen.
+    diff_delivery: BTreeMap<String, ([u8; 32], BTreeSet<u64>, BTreeSet<u64>)>,
     /// Pending `job-ready` registrations (OUTBOX §3.2) by result reference, with the epoch the
     /// fact is fenced at; taken by the job's settlement or by a read through its own reference.
     deferred: BTreeMap<String, (super::outbox::DeferSpec, super::outbox::JobEpoch)>,
@@ -603,6 +607,7 @@ impl Default for Ledger {
             handing_over: BTreeSet::new(),
             read_memory: BTreeMap::new(),
             diff_seen: BTreeMap::new(),
+            diff_delivery: BTreeMap::new(),
             deferred: BTreeMap::new(),
             started: BTreeMap::new(),
         }
@@ -754,47 +759,117 @@ impl RequestIds {
     }
 }
 impl Shared {
-    /// Forgets delivered hunks absent from `capture` and returns the remaining bounded
-    /// process-local identities for this binding. A poisoned ledger fails open with no
+    /// Returns this binding's delivered hunk identities present in `capture` without changing
+    /// process-local delivery history. A poisoned ledger fails open with no
     /// suppression; no lock survives I/O and a later return to an old hunk is delivered again.
     pub(super) fn previous_diff_hunks(
         &self,
         binding: &BindingRef,
         capture: &crate::changes::DiffResult,
     ) -> BTreeSet<u64> {
-        let Ok(mut ledger) = self.ledger.lock() else {
+        let Ok(ledger) = self.ledger.lock() else {
             return BTreeSet::new();
         };
-        let seen = ledger.diff_seen.entry(binding.clone()).or_default();
+        let mut seen = ledger
+            .diff_seen
+            .get(binding)
+            .map(|(_, seen)| seen.clone())
+            .unwrap_or_default();
         seen.retain(|fingerprint| capture.captured_fingerprints().contains(fingerprint));
-        seen.clone()
+        seen
     }
 
-    /// Records this binding's complete delivered page hunks for the next incremental capture,
-    /// including pages collected through inspect. Split parts are not mistaken for a complete
-    /// hunk and binary summaries never prove unchanged content; a poisoned ledger leaves
-    /// later calls unsuppressed.
-    /// The finite memory resets at its ceiling instead of hiding unseen work.
-    pub(super) fn remember_diff_hunks(
+    /// Prepares bounded delivery candidates without changing what the agent has seen. The
+    /// exact fitted body is hashed; split parts and binary summaries cannot prove a complete
+    /// hunk. Evicted references release their candidates on the next preparation.
+    pub(super) fn prepare_diff_delivery(
         &self,
-        binding: &BindingRef,
+        reference: &str,
+        prior: &BTreeSet<u64>,
         result: &crate::changes::DiffResult,
+        reply: &PeerReply,
     ) {
+        let PeerReply::Complete {
+            kind: ResultKind::Diff,
+            text,
+            ..
+        } = reply
+        else {
+            return;
+        };
         if let Ok(mut ledger) = self.ledger.lock() {
-            let seen = ledger.diff_seen.entry(binding.clone()).or_default();
-            // ponytail: 4096 retained hunks per binding; increase the bounded ceiling if real
-            // captures regularly exceed it. Resetting repeats work instead of hiding new hunks.
-            if seen.len() + result.selected_hunks().len() > snapshots::MAX_SEEN_DIFF_HUNKS {
+            let live = ledger.details.keys().cloned().collect::<BTreeSet<_>>();
+            ledger
+                .diff_delivery
+                .retain(|reference, _| live.contains(reference));
+            if !live.contains(reference) {
+                return;
+            }
+            let delivered = result
+                .selected_hunks()
+                .iter()
+                .filter(|hunk| !hunk.is_binary())
+                .map(crate::changes::DiffHunk::fingerprint)
+                .filter(|fingerprint| result.captured_fingerprints().contains(fingerprint))
+                .collect();
+            ledger.diff_delivery.insert(
+                reference.to_owned(),
+                (
+                    *blake3::hash(text.as_bytes()).as_bytes(),
+                    prior.clone(),
+                    delivered,
+                ),
+            );
+        }
+    }
+
+    /// Records complete hunks only after a successful actual body send. The delivered body
+    /// must match the prepared fitted digest and survive the final carrier's fitting; pending
+    /// replies, ready-reference facts, lost receivers and shrunken bodies never stamp hunks.
+    /// Pages of the same capture extend its delivered set; a newly delivered capture expires
+    /// absent old hunks. A poisoned ledger fails open, repeating rather than hiding work.
+    fn mark_diff_body_delivered(&self, binding: &BindingRef, reference: &str, reply: &PeerReply) {
+        let PeerReply::Complete {
+            kind: ResultKind::Diff,
+            text,
+            ..
+        } = reply
+        else {
+            return;
+        };
+        if !super::content::fits(reply, super::content::reply_envelope()) {
+            return;
+        }
+        if let Ok(mut ledger) = self.ledger.lock() {
+            if !ledger
+                .details
+                .get(reference)
+                .is_some_and(|detail| detail.binding == *binding)
+            {
+                return;
+            }
+            let Some((digest, prior, delivered)) = ledger.diff_delivery.get(reference) else {
+                return;
+            };
+            if blake3::hash(text.as_bytes()).as_bytes() != digest {
+                return;
+            }
+            let prior = prior.clone();
+            let delivered = delivered.clone();
+            ledger.diff_delivery.remove(reference);
+            let (capture, seen) = ledger.diff_seen.entry(binding.clone()).or_default();
+            if capture != reference {
+                *capture = reference.to_owned();
+                *seen = prior;
+            }
+            // ponytail: reset beyond 4096 hunks; raise the bounded ceiling if real captures need it.
+            if seen.len() + delivered.len() > snapshots::MAX_SEEN_DIFF_HUNKS {
                 seen.clear();
             }
-            seen.extend(
-                result
-                    .selected_hunks()
-                    .iter()
-                    .filter(|hunk| !hunk.is_binary())
-                    .map(crate::changes::DiffHunk::fingerprint)
-                    .filter(|fingerprint| result.captured_fingerprints().contains(fingerprint)),
-            );
+            seen.extend(delivered);
+            if let Some(detail) = ledger.details.get_mut(reference) {
+                detail.diff_page_fresh = false;
+            }
         }
     }
 
@@ -1794,6 +1869,8 @@ impl WorkerHandle {
             }
             ledger.queue.clear();
             ledger.details.clear();
+            ledger.diff_delivery.clear();
+            ledger.diff_seen.clear();
             ledger.starts.clear();
             ledger.feedback.clear();
             ledger.delivered.clear();
@@ -1941,6 +2018,9 @@ impl WorkerHandle {
             ledger.read_memory.remove(&binding);
             ledger.diff_seen.remove(&binding);
             let live = ledger.details.keys().cloned().collect::<BTreeSet<_>>();
+            ledger
+                .diff_delivery
+                .retain(|reference, _| live.contains(reference));
             ledger
                 .deferred
                 .retain(|reference, _| live.contains(reference));
@@ -2830,14 +2910,14 @@ impl<'a> Worker<'a> {
                     let requested = root.join(cwd).canonicalize();
                     let Ok(requested) = requested else {
                         return Ok((
-                            PeerReply::InvalidParameters { message: "invalid bounded parameters: \"cwd\" must resolve to a directory inside the worktree".to_owned() },
+                            PeerReply::InvalidParameters { message: "Argument \"cwd\" must resolve to a directory inside the worktree.".to_owned() },
                             Some(authority),
                             None,
                         ));
                     };
                     if !requested.starts_with(&root_path) || !requested.is_dir() {
                         return Ok((
-                            PeerReply::InvalidParameters { message: "invalid bounded parameters: \"cwd\" must resolve to a directory inside the worktree".to_owned() },
+                            PeerReply::InvalidParameters { message: "Argument \"cwd\" must resolve to a directory inside the worktree.".to_owned() },
                             Some(authority),
                             None,
                         ));
@@ -3758,6 +3838,14 @@ impl<'a> Worker<'a> {
                 }
             );
             let mark_reply = is_context.then(|| reply.clone());
+            let is_diff = matches!(
+                reply,
+                PeerReply::Complete {
+                    kind: ResultKind::Diff,
+                    ..
+                }
+            );
+            let diff_reply = is_diff.then(|| reply.clone());
             let paged = matches!(
                 reply,
                 PeerReply::Complete {
@@ -3767,6 +3855,10 @@ impl<'a> Worker<'a> {
             );
             match sender.send(reply) {
                 Ok(()) => {
+                    if let Some(diff_reply) = diff_reply {
+                        self.shared
+                            .mark_diff_body_delivered(&binding, &job.reference, &diff_reply);
+                    }
                     // The waiting caller got the answer itself: nothing is pushed for it.
                     self.shared.reference_read(&binding, &job.reference);
                     if let Some(mark_reply) = mark_reply {
@@ -3776,7 +3868,7 @@ impl<'a> Worker<'a> {
                             &mark_reply,
                         );
                     }
-                    if paged {
+                    if paged && !is_diff {
                         // Page one just reached the caller through this settlement, so the first
                         // `ide.inspect` of its `detail_ref` must serve page two, not repeat page
                         // one (T16B) — for every paged kind, symbol cards and outlines included.
@@ -6513,11 +6605,6 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 // `reply` already holds this exact page's composed text, produced by the job
                 // (page 1) or a prior expansion, and no caller has retrieved it yet. Hand it over
                 // unchanged; only a later inspection may advance past it.
-                if let Ok(mut ledger) = shared.ledger.lock()
-                    && let Some(detail) = ledger.details.get_mut(&request.reference)
-                {
-                    detail.diff_page_fresh = false;
-                }
                 return Ok::<_, InspectFailure>(reply);
             }
             let Some(authority) = &authority else {
@@ -6581,6 +6668,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 },
                 code => InspectFailure::new(code),
             })?;
+            shared.prepare_diff_delivery(&request.reference, page.seen_hunks(), &advanced, &next);
             let encoded = next
                 .clone()
                 .encode()
@@ -6589,13 +6677,12 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 shared.set_diff_page(&request.reference, None);
                 return Err(InspectFailure::new(FailureCode::Internal));
             };
-            shared.remember_diff_hunks(&request.binding, &advanced);
             if let Ok(mut ledger) = shared.ledger.lock()
                 && let Some(detail) = ledger.details.get_mut(&request.reference)
             {
                 detail.reply = next.clone();
                 detail.diff_page = page.advance(&advanced);
-                detail.diff_page_fresh = false;
+                detail.diff_page_fresh = true;
             }
             return Ok::<_, InspectFailure>(next);
         }
@@ -6660,6 +6747,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
     );
     let terminal = retrieved && !matches!(reply, PeerReply::Pending { .. });
     if request.reply.send(reply.clone()).is_ok() {
+        shared.mark_diff_body_delivered(&request.binding, &request.reference, &reply);
         if terminal {
             // Read through its own reference: the job's pushed fact is delivered (OUTBOX §6).
             shared.reference_read(&request.binding, &request.reference);
@@ -14248,6 +14336,176 @@ mod stop_retry_tests {
             cancel_sender,
         )
     }
+    /// A real diff capture and pending settlement do not consume hunks. Dropping the original
+    /// waiter keeps the body available; actual later inspection delivery alone records it.
+    #[tokio::test]
+    async fn pending_diff_and_lost_waiter_do_not_hide_undelivered_hunks() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        std::fs::write(fixture.root.join("delivery.txt"), "before\n").unwrap();
+        git_commit(&fixture.root, "diff delivery baseline");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        let (binding, authority) =
+            activate_worktree(&mut worker, "diff-reader", "delivery-start").await;
+        std::fs::write(fixture.root.join("delivery.txt"), "after\n").unwrap();
+        for n in 0..40 {
+            std::fs::write(fixture.root.join(format!("later-{n:02}.txt")), "new hunk\n").unwrap();
+        }
+        let invocation = production_call(&worker, "diff-reader", "delivery-first");
+        let (mut job, _cancel) = diff_job(&fixture.root, invocation, "delivery-first");
+        job.parameters = serde_json::json!({"mode":"head","since_last":true});
+        retain_detail(
+            &worker,
+            &binding,
+            &job.reference,
+            AssistanceTool::Diff,
+            &authority,
+        );
+        let (reply, actual_authority, source) = worker.diff(&mut job).await.unwrap();
+        assert!(
+            matches!(&reply, PeerReply::Complete { text, .. } if text.contains("+after")),
+            "{reply:?}"
+        );
+        assert!(
+            !worker
+                .shared
+                .ledger
+                .lock()
+                .unwrap()
+                .diff_seen
+                .contains_key(&binding),
+            "capture is not delivery"
+        );
+        let mut shrunken = reply.clone();
+        assert!(shrunken.shrink_text());
+        worker
+            .shared
+            .mark_diff_body_delivered(&binding, &job.reference, &shrunken);
+        let mut capped = reply.clone();
+        if let PeerReply::Complete { text, .. } = &mut capped {
+            *text = "x".repeat(crate::assistance::reply::MAX_REPLY_BYTES);
+        }
+        worker
+            .shared
+            .mark_diff_body_delivered(&binding, &job.reference, &capped);
+        assert!(
+            !worker
+                .shared
+                .ledger
+                .lock()
+                .unwrap()
+                .diff_seen
+                .contains_key(&binding),
+            "shrunken/capped carriers do not deliver complete hunks"
+        );
+        worker
+            .shared
+            .complete(&job.reference, reply.clone(), actual_authority, source, 0);
+        journal_pending(&worker, &mut job);
+        worker.deliver_job_reply(&mut job, reply.clone());
+        assert!(
+            !worker
+                .shared
+                .ledger
+                .lock()
+                .unwrap()
+                .diff_seen
+                .contains_key(&binding),
+            "lost waiter is not delivery"
+        );
+        let second_invocation = production_call(&worker, "diff-reader", "delivery-second");
+        let (mut second, _cancel) = diff_job(&fixture.root, second_invocation, "delivery-second");
+        second.parameters = serde_json::json!({"mode":"head","since_last":true});
+        retain_detail(
+            &worker,
+            &binding,
+            &second.reference,
+            AssistanceTool::Diff,
+            &authority,
+        );
+        let (again, _, _) = worker.diff(&mut second).await.unwrap();
+        assert!(
+            matches!(&again, PeerReply::Complete { text, .. } if text.contains("+after")),
+            "unseen hunk was hidden: {again:?}"
+        );
+        let (send, receive) = oneshot::channel();
+        serve_inspection(
+            &worker.workspace,
+            &worker.shared,
+            Inspection {
+                binding: binding.clone(),
+                reference: job.reference.clone(),
+                expected: None,
+                reply: send,
+                delivery: None,
+            },
+        )
+        .await;
+        let delivered = receive.await.unwrap();
+        assert!(
+            matches!(&delivered, PeerReply::Complete { text, .. } if text.contains("+after")),
+            "{delivered:?}"
+        );
+        assert!(
+            !worker.shared.ledger.lock().unwrap().diff_seen[&binding]
+                .1
+                .is_empty()
+        );
+        let before = worker.shared.ledger.lock().unwrap().diff_seen[&binding]
+            .1
+            .clone();
+        let (send, receive) = oneshot::channel();
+        drop(receive);
+        serve_inspection(
+            &worker.workspace,
+            &worker.shared,
+            Inspection {
+                binding: binding.clone(),
+                reference: job.reference.clone(),
+                expected: None,
+                reply: send,
+                delivery: None,
+            },
+        )
+        .await;
+        let advanced = {
+            let ledger = worker.shared.ledger.lock().unwrap();
+            assert_eq!(
+                ledger.diff_seen[&binding].1, before,
+                "lost continuation is not delivery"
+            );
+            assert!(ledger.details[&job.reference].diff_page_fresh);
+            ledger.details[&job.reference].reply.clone()
+        };
+        let (send, receive) = oneshot::channel();
+        serve_inspection(
+            &worker.workspace,
+            &worker.shared,
+            Inspection {
+                binding: binding.clone(),
+                reference: job.reference.clone(),
+                expected: None,
+                reply: send,
+                delivery: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            receive.await.unwrap(),
+            advanced,
+            "lost page must be delivered before advancing"
+        );
+        assert!(
+            worker.shared.ledger.lock().unwrap().diff_seen[&binding]
+                .1
+                .len()
+                > before.len()
+        );
+    }
+
     #[tokio::test]
     async fn diff_streams_drain_at_the_workspace_boundary_not_the_launcher_budget() {
         // The launcher's 1 KiB child-capture budget no longer truncates fixed Git metadata:

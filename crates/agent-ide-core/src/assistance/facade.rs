@@ -628,12 +628,12 @@ impl FieldRule {
 impl ParameterError {
     /// Renders the single-line model-facing refusal naming exactly what to fix (T21B).
     ///
-    /// Only caller field names that passed `echoable_field` are echoed back, and no field value
-    /// is ever included, so the text stays safe and bounded under 256 bytes on one line.
+    /// Only caller field names that passed `echoable_field` are echoed back; field values never
+    /// enter this message. The shared renderer bounds its head and adds exactly one repair.
     pub fn message(&self, tool: AssistanceTool) -> String {
         match self {
             Self::InvalidObject => format!(
-                "invalid bounded parameters: arguments must be a JSON object under {} bytes",
+                "Arguments must be a JSON object under {} bytes.",
                 parameter_limit(tool)
             ),
             Self::UnknownField(name) => {
@@ -641,49 +641,30 @@ impl ParameterError {
                     .as_ref()
                     .map(|name| format!(" \"{name}\""))
                     .unwrap_or_default();
-                let allowed = allowed_fields(tool)
-                    .iter()
-                    .filter(|field| **field != "since_last")
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                if allowed.is_empty() {
-                    format!("invalid bounded parameters: unknown field{named}")
-                } else {
-                    format!("invalid bounded parameters: unknown field{named}; allowed: {allowed}")
-                }
+                format!("Unknown argument{named}.")
             }
             Self::InvalidField { field, rule } => {
-                format!("invalid bounded parameters: \"{field}\" {}", rule.text())
+                format!("Argument \"{field}\" {}.", rule.text())
             }
             Self::ContextTarget => CONTEXT_TARGET_MESSAGE.to_string(),
             Self::OutlineTarget => OUTLINE_TARGET_MESSAGE.to_string(),
-            Self::ReadTarget => {
-                "ide.read needs one form: `items`, or `symbol`, or `path` alone (the whole \
-                 file), or `path` with `lines`, or `path` with `ranges`, or `symbols` — exactly one"
-                    .to_string()
-            }
-            Self::EditTarget => {
-                "ide.edit takes one form: `symbol` with `op`, or `path` with `lines` — not both"
-                    .to_string()
-            }
+            Self::ReadTarget => "ide.read needs exactly one supported read target.".to_string(),
+            Self::EditTarget => "ide.edit needs exactly one supported edit target.".to_string(),
             Self::ChangesTarget => {
-                "ide.edit takes one form: \"changes\" with \"path\", or one single-change form \
-                 — not both"
-                    .to_string()
+                "ide.edit cannot combine a changes list with a single-change form.".to_string()
             }
-            Self::TestTargetUnsupported(message) => format!(
-                "invalid bounded parameters: {message}; use ide.test with `pattern` or `command`"
-            ),
+            Self::TestTargetUnsupported(message) => {
+                format!("This test target is unsupported: {message}.")
+            }
         }
     }
 }
 
 /// Model-facing text for a context request that names neither a path nor the problems kind.
-const CONTEXT_TARGET_MESSAGE: &str =
-    "invalid bounded parameters: ide.context needs either \"path\" or \"kind\":\"problems\"";
+const CONTEXT_TARGET_MESSAGE: &str = "ide.context needs either \"path\" or \"kind\":\"problems\".";
 /// Model-facing text for an outline request without its required path.
-const OUTLINE_TARGET_MESSAGE: &str = "invalid bounded parameters: ide.outline needs \"path\" (a file or directory relative to the worktree root)";
+const OUTLINE_TARGET_MESSAGE: &str =
+    "ide.outline needs \"path\" (a file or directory relative to the worktree root).";
 
 /// The closed request form of one call for the journal (QW-4): the names of the parameters the
 /// tool defines that the call carries, in the tool's own order, joined by `+` (for example
@@ -806,12 +787,26 @@ impl ValidatedCall {
     }
 }
 
-/// Validates one closed logical tool payload and rejects identity or authority-shaped extra fields.
+/// Validates public model arguments, rejecting internal normalized fields before shared
+/// shape validation. Default diffs derive their incremental flag; explicit modes stay full.
 pub fn validate_call(
+    tool: AssistanceTool,
+    parameters: Value,
+) -> Result<ValidatedCall, ParameterError> {
+    if tool == AssistanceTool::Diff && parameters.get("since_last").is_some() {
+        return Err(ParameterError::UnknownField(Some("since_last".to_owned())));
+    }
+    validate_normalized_call(tool, parameters)
+}
+
+/// Validates the trusted front's normalized daemon payload with the same bounded shapes.
+/// Preserves the front-derived diff flag across daemon revalidation; this entry is not used
+/// for public model arguments. Raw internal callers without a mode receive the usual default.
+pub(crate) fn validate_normalized_call(
     tool: AssistanceTool,
     mut parameters: Value,
 ) -> Result<ValidatedCall, ParameterError> {
-    // `ide.inspect {"kind":"problems"}` is the Codex spelling of the `ide.context` problems call.
+    // Both catalogs advertise the problems spelling; the legacy context route stays accepted.
     let tool = fold_inspect_problems(tool, &parameters);
     let batch_key = super::batch::batch_key(tool, &parameters);
     let size = serde_json::to_vec(&parameters)
@@ -1955,7 +1950,7 @@ fn journal_transport_timeout(tool: AssistanceTool, phase: &str) {
 }
 
 /// The answer to an `ide.stop` that was not sent because its actor could not be identified.
-const STOP_UNIDENTIFIED: &str = "error: stop_unidentified: the IDE could not identify this ide.stop's session, so nothing was stopped; repeat ide.stop, or continue with native tools";
+const STOP_UNIDENTIFIED: &str = "The IDE could not identify this stop's session; nothing was stopped.\nRepair: Repeat ide.stop.";
 
 /// What one stop's identity query established (see `StdioFacade::identify_actor`).
 enum StopIdentity {
@@ -3714,7 +3709,12 @@ impl StdioFacade {
                 call_started.elapsed(),
                 &front_context,
             );
-            return CallToolResult::error(vec![ContentBlock::text(error.message(tool))]);
+            return render_reply(
+                PeerReply::InvalidParameters {
+                    message: error.message(tool),
+                },
+                content::Envelope::TextOnly,
+            );
         }
         // harness-reply-v1 R1: every host, recognized or not, receives the compact text block
         // alone; a host shows `structuredContent` in place of it when present, so none is sent.
@@ -3958,7 +3958,7 @@ impl StdioFacade {
                 );
             }
             FacadeOutcome::InvalidParameters => {
-                "invalid bounded parameters; inspect the tool schema"
+                "These arguments do not match the tool schema.\nRepair: Correct the arguments and repeat this call."
             }
             FacadeOutcome::MissingHostMetadata => {
                 // A caller whose `_meta` names no supported host contract can never correlate an
@@ -3971,44 +3971,42 @@ impl StdioFacade {
                     };
                     return render_reply_with_status(reply, None, envelope);
                 }
-                "Assistance host metadata or attachment is unavailable; continue with native tools"
+                "The IDE host attachment is unavailable.\nRepair: Continue with native tools."
             }
             FacadeOutcome::Unavailable => {
-                "Assistance daemon transport is unavailable; continue with native tools"
+                "The IDE connection is unavailable.\nRepair: Continue with native tools."
             }
             FacadeOutcome::TimedOut => {
-                "Assistance daemon transport timed out; continue with native tools"
+                "The IDE connection timed out.\nRepair: Continue with native tools."
             }
             // The daemon refused the call before running it, so even a mutation applied nothing.
             FacadeOutcome::Busy => {
-                "error: busy: the IDE is serving too many calls at once and did not run this one, so nothing was applied; repeat this call in a moment"
+                "The IDE is serving too many calls; this call did not run and nothing was applied.\nRepair: Repeat this call."
             }
             // The daemon refused the call before running it (and a managed client already tried
             // the replacement once), so even a mutation applied nothing.
             FacadeOutcome::Restarting => {
-                "error: restarting: the IDE restarted after an internal fault and did not run this call, so nothing was applied; repeat this call"
+                "The IDE restarted after an internal fault; this call did not run and nothing was applied.\nRepair: Repeat this call."
             }
             // Never resent: the daemon may have executed the call, and a resend could only repeat
             // a change or be refused for its already consumed pre-hook.
             FacadeOutcome::OutcomeUnknown => match tool {
                 AssistanceTool::Edit => {
-                    "error: outcome_unknown: ide.edit may have reached the IDE and applied; verify with ide.diff before another edit"
+                    "This edit may have applied; its outcome is unknown.\nRepair: Verify with ide.diff before another edit."
                 }
                 AssistanceTool::Test => {
-                    "error: outcome_unknown: ide.test may have reached the IDE and started; check ide.inspect or ide.test status before another run"
+                    "This test may have started; its outcome is unknown.\nRepair: Read ide.inspect before starting another run."
                 }
                 AssistanceTool::Start | AssistanceTool::Stop => {
-                    "error: outcome_unknown: this call may have reached the IDE and applied; call ide.start to see the current binding before continuing"
+                    "This activation change may have applied; its outcome is unknown.\nRepair: Call ide.start to see the current binding."
                 }
-                _ => {
-                    "error: outcome_unknown: this call may have reached the IDE but its reply was lost; repeat this call"
-                }
+                _ => "This call may have run, but its reply was lost.\nRepair: Repeat this call.",
             },
             FacadeOutcome::ReestablishFailed => {
-                "Assistance daemon exited; re-establish failed; continue with native tools"
+                "The IDE exited and could not reconnect.\nRepair: Continue with native tools."
             }
             FacadeOutcome::Incomplete => {
-                "typed Assistance peer result is unavailable; continue with native tools"
+                "The IDE's result is unavailable.\nRepair: Continue with native tools."
             }
         };
         CallToolResult::error(vec![ContentBlock::text(message)])
@@ -4058,7 +4056,7 @@ pub(super) fn render_reply_with_status(
         receipt.map_or_else(
             || {
                 CallToolResult::error(vec![ContentBlock::text(
-                    "Assistance result exceeds the bounded envelope; continue with native tools",
+                    "The IDE result exceeds the reply limit.\nRepair: Continue with native tools.",
                 )])
             },
             content::PresentationReceipt::degraded,
@@ -4067,17 +4065,17 @@ pub(super) fn render_reply_with_status(
 }
 
 /// Stable text for [`render_reply_after_reconnect`]'s added `retry` field (T08B).
-const RECONNECT_RETRY_HINT: &str = "daemon restarted; repeat this call once";
+const RECONNECT_RETRY_HINT: &str = "daemon restarted; repeat this call";
 /// Recovery when a non-Start call reaches a replacement with no actor binding.
-const RECONNECT_START_HINT: &str =
-    "daemon restarted; call ide.start first, then repeat this call with fresh references";
+const RECONNECT_START_HINT: &str = "daemon restarted; call ide.start in this project";
 /// Recovery after this session re-rooted to the requested root (T15B): the re-rooted call's own
 /// pre-hook ran before the new rendezvous existed, so the next call pairs normally.
-const REROOT_RETRY_HINT: &str = "session re-rooted to the requested root; repeat this call once";
+const REROOT_RETRY_HINT: &str = "session re-rooted to the requested root; repeat this call";
 /// Recovery after this session re-rooted on a missing pre-hook alone (T15B): a repeat pairs when
 /// the session truly moved, and a root-less start returns it to the host's project directory when
 /// the one lost pre-hook left it there.
-const REROOT_LATE_PRE_HINT: &str = "session re-rooted to the requested root; repeat this call once, or call ide.start without root";
+const REROOT_LATE_PRE_HINT: &str =
+    "session re-rooted to the requested root; call ide.start without root";
 
 /// A provider refusal's derived stage names the requested file's extension only, never its path,
 /// and every other failure keeps the plain `<tool>:<reason>` default.
@@ -4165,14 +4163,33 @@ fn render_reply_after_reconnect(
     with_retry_hint(rendered, hint)
 }
 
-/// Appends one stable recovery hint to a rendered result: a `retry` field beside the structured
-/// copy and the same sentence at the end of the compact text.
+/// Carries one stable recovery hint in the structured retry field and compact text. A typed
+/// refusal's existing Repair line is replaced within its 120-byte ceiling; quoted source data
+/// stays unchanged, so reconnect recovery never adds a second alternative repair.
 fn with_retry_hint(mut rendered: CallToolResult, hint: &str) -> CallToolResult {
     if let Some(Value::Object(fields)) = rendered.structured_content.as_mut() {
         fields.insert("retry".to_owned(), Value::String(hint.to_owned()));
     }
     if let Some(ContentBlock::Text(text)) = rendered.content.first_mut() {
-        text.text = format!("{}; retry: {hint}", text.text);
+        if text.text.lines().any(|line| line.starts_with("Repair: ")) {
+            let repair = format!(
+                "Repair: {}",
+                super::reply::bounded_utf8_prefix(&content::display_safe(hint), 112)
+            );
+            text.text = text
+                .text
+                .split_inclusive('\n')
+                .map(|line| {
+                    if line.starts_with("Repair: ") {
+                        format!("{repair}{}", if line.ends_with('\n') { "\n" } else { "" })
+                    } else {
+                        line.to_owned()
+                    }
+                })
+                .collect();
+        } else {
+            text.text = format!("{}; retry: {hint}", text.text);
+        }
     }
     rendered
 }
@@ -4240,11 +4257,22 @@ pub(crate) fn staged_detail(
     stage
 }
 
-/// Appends the explicit replaced-reference note to one rendered result, when due.
+/// Gives an InvalidDetail refusal its explicit restart reason without adding another recovery
+/// action or extending its Repair line. Only the known refusal head changes; carried status
+/// and the existing bounded repair remain intact.
 fn note_replaced_references(mut rendered: CallToolResult, note: bool) -> CallToolResult {
     if note && let Some(ContentBlock::Text(text)) = rendered.content.first_mut() {
-        text.text
-            .push_str(" (issued before the IDE restarted; re-read)");
+        if let Some((head, tail)) = text.text.split_once("\nRepair: ") {
+            let status = head.rsplit_once('\n').map_or("", |(status, _)| status);
+            text.text = format!(
+                "{}This result reference was issued before the IDE restarted.\nRepair: {tail}",
+                if status.is_empty() {
+                    String::new()
+                } else {
+                    format!("{status}\n")
+                }
+            );
+        }
     }
     rendered
 }
@@ -4652,7 +4680,7 @@ fn oversized_edit_replies_keep_outcome_operation_id_and_no_replay() {
     };
     assert_eq!(
         text.text,
-        "Assistance result exceeds the bounded envelope; continue with native tools"
+        "The IDE result exceeds the reply limit.\nRepair: Continue with native tools."
     );
     assert_eq!(read.is_error, Some(true));
 }
@@ -5001,8 +5029,8 @@ impl CatalogHost {
     ///
     /// Every advertised schema is slimmed ([`slim_schema`]) and omits the legacy aliases and the
     /// deprecated `source_ref` (the validator still accepts them), so the model reads only the
-    /// symbol-first forms. Claude keeps every tool. Codex drops `ide.context` and `ide.graph` and
-    /// lets `ide.inspect` also serve the project problems (`kind`, `language`, `offset`, exactly
+    /// symbol-first forms. Claude keeps every tool; Codex drops `ide.context` and `ide.graph`.
+    /// Both hosts let `ide.inspect` serve project problems (`kind`, `language`, `offset`, exactly
     /// the `ide.context` problems parameters, which `ide.inspect` folds into that tool on arrival).
     pub fn catalog(self, tools: Vec<rmcp::model::Tool>) -> Vec<rmcp::model::Tool> {
         let problems = tool_schemas()[1].input_schema["properties"].clone();
@@ -5012,7 +5040,7 @@ impl CatalogHost {
                 self == Self::Claude || !matches!(&*tool.name, "ide.context" | "ide.graph")
             })
             .map(|mut tool| {
-                if self == Self::Codex && &*tool.name == "ide.inspect" {
+                if &*tool.name == "ide.inspect" {
                     let mut schema = (*tool.input_schema).clone();
                     if let Some(Value::Object(properties)) = schema.get_mut("properties") {
                         for name in ["kind", "language", "offset"] {
@@ -5275,20 +5303,20 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Start,
-            "invalid bounded parameters: unknown field \"actor_id\"; allowed: activation_id, root, read_only, environment"
+            "Unknown argument \"actor_id\"."
                 .to_string(),
         ),
         (
             validate_call(AssistanceTool::Stop, json!({"authority":1}))
                 .unwrap_err(),
             AssistanceTool::Stop,
-            "invalid bounded parameters: unknown field \"authority\"; allowed: activation_id"
+            "Unknown argument \"authority\"."
                 .to_string(),
         ),
         (
             validate_call(AssistanceTool::Context, json!({"../escape":1})).unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: unknown field; allowed: path, byte_offset, detail_ref, kind, language, offset"
+            "Unknown argument."
                 .to_string(),
         ),
         (
@@ -5298,7 +5326,7 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Inspect,
-            "invalid bounded parameters: \"detail_refs\" must be not together with detail_ref"
+            "Argument \"detail_refs\" must be not together with detail_ref."
                 .to_string(),
         ),
         (
@@ -5308,40 +5336,40 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: \"path\" must be a path relative to the worktree root, not absolute"
+            "Argument \"path\" must be a path relative to the worktree root, not absolute."
                 .to_string(),
         ),
         (
             validate_call(AssistanceTool::Context, json!({"path": "../secrets"})).unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: \"path\" must not contain \"..\"".to_string(),
+            "Argument \"path\" must not contain \"..\".".to_string(),
         ),
         (
             validate_call(AssistanceTool::Context, oversized).unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: arguments must be a JSON object under 4096 bytes"
+            "Arguments must be a JSON object under 4096 bytes."
                 .to_string(),
         ),
         (
             validate_call(AssistanceTool::Context, json!({"path": "a".repeat(1025)})).unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: \"path\" is longer than 1024 bytes".to_string(),
+            "Argument \"path\" is longer than 1024 bytes.".to_string(),
         ),
         (
             validate_call(AssistanceTool::Start, json!({"activation_id": ""})).unwrap_err(),
             AssistanceTool::Start,
-            "invalid bounded parameters: \"activation_id\" must be a non-empty string".to_string(),
+            "Argument \"activation_id\" must be a non-empty string.".to_string(),
         ),
         (
             validate_call(AssistanceTool::Start, json!({"activation_id": 7})).unwrap_err(),
             AssistanceTool::Start,
-            "invalid bounded parameters: \"activation_id\" must be a non-empty string".to_string(),
+            "Argument \"activation_id\" must be a non-empty string.".to_string(),
         ),
         (
             validate_call(AssistanceTool::Context, json!({"kind":"problems","offset":-1}))
                 .unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: \"offset\" must be a non-negative integer up to 4294967295"
+            "Argument \"offset\" must be a non-negative integer up to 4294967295."
                 .to_string(),
         ),
         (
@@ -5351,7 +5379,7 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: \"byte_offset\" must be a non-negative integer up to 1048576"
+            "Argument \"byte_offset\" must be a non-negative integer up to 1048576."
                 .to_string(),
         ),
         (
@@ -5362,19 +5390,19 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             .unwrap_err(),
             AssistanceTool::Context,
             format!(
-                "invalid bounded parameters: \"language\" must be {}",
+                "Argument \"language\" must be {}.",
                 checked_language_alternatives()
             ),
         ),
         (
             validate_call(AssistanceTool::Context, json!({"path":"a.rs","offset":5})).unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: \"offset\" requires \"kind\":\"problems\"".to_string(),
+            "Argument \"offset\" requires \"kind\":\"problems\".".to_string(),
         ),
         (
             validate_call(AssistanceTool::Diff, json!({"mode":"all"})).unwrap_err(),
             AssistanceTool::Diff,
-            "invalid bounded parameters: \"mode\" must be \"head\", \"staged\", \"unstaged\", or \"task\""
+            "Argument \"mode\" must be \"head\", \"staged\", \"unstaged\", or \"task\"."
                 .to_string(),
         ),
         (
@@ -5384,7 +5412,7 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Edit,
-            "invalid bounded parameters: \"content\" must be a string".to_string(),
+            "Argument \"content\" must be a string.".to_string(),
         ),
         (
             validate_call(
@@ -5394,7 +5422,7 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             .unwrap_err(),
             AssistanceTool::Edit,
             format!(
-                "invalid bounded parameters: \"content\" is longer than {MAX_EDIT_ARGUMENT_CONTENT_BYTES} bytes"
+                "Argument \"content\" is longer than {MAX_EDIT_ARGUMENT_CONTENT_BYTES} bytes."
             ),
         ),
         (
@@ -5404,19 +5432,19 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Edit,
-            "invalid bounded parameters: \"path\" must be a path relative to the worktree root, not absolute"
+            "Argument \"path\" must be a path relative to the worktree root, not absolute."
                 .to_string(),
         ),
         (
             validate_call(AssistanceTool::Context, json!({})).unwrap_err(),
             AssistanceTool::Context,
-            "invalid bounded parameters: ide.context needs either \"path\" or \"kind\":\"problems\""
+            "ide.context needs either \"path\" or \"kind\":\"problems\"."
                 .to_string(),
         ),
         (
             validate_call(AssistanceTool::Outline, json!({})).unwrap_err(),
             AssistanceTool::Outline,
-            "invalid bounded parameters: ide.outline needs \"path\" (a file or directory relative to the worktree root)".to_string(),
+            "ide.outline needs \"path\" (a file or directory relative to the worktree root).".to_string(),
         ),
         (
             validate_call(
@@ -5425,8 +5453,7 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Read,
-            "ide.read needs one form: `items`, or `symbol`, or `path` alone (the whole file), \
-             or `path` with `lines`, or `path` with `ranges`, or `symbols` — exactly one"
+            "ide.read needs exactly one supported read target."
                 .to_string(),
         ),
         (
@@ -5436,8 +5463,7 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Edit,
-            "ide.edit takes one form: \"changes\" with \"path\", or one single-change form \
-             — not both"
+            "ide.edit cannot combine a changes list with a single-change form."
                 .to_string(),
         ),
         (
@@ -5447,19 +5473,19 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Edit,
-            "ide.edit takes one form: `symbol` with `op`, or `path` with `lines` — not both"
+            "ide.edit needs exactly one supported edit target."
                 .to_string(),
         ),
         (
             validate_call(AssistanceTool::Graph, json!({"symbol":"f","depth":0})).unwrap_err(),
             AssistanceTool::Graph,
-            "invalid bounded parameters: \"depth\" must be an integer from 1 to 3".to_owned(),
+            "Argument \"depth\" must be an integer from 1 to 3.".to_owned(),
         ),
         (
             validate_call(AssistanceTool::Test, json!({"symbol":"a.rs#f","budget_s":0}))
                 .unwrap_err(),
             AssistanceTool::Test,
-            "invalid bounded parameters: \"budget_s\" must be an integer from 1 to 600"
+            "Argument \"budget_s\" must be an integer from 1 to 600."
                 .to_owned(),
         ),
     ]
@@ -5706,6 +5732,27 @@ fn full_file_edit_without_source_ref_is_a_creation_request() {
     );
 }
 
+/// Public callers cannot inject the normalized diff flag, and daemon revalidation keeps the
+/// front's default/full decision without letting explicit modes become incremental.
+#[test]
+fn diff_mode_is_derived_at_public_ingress_and_preserved_for_the_daemon() {
+    for mode in ["head", "unstaged", "staged", "task"] {
+        assert!(
+            validate_call(AssistanceTool::Diff, json!({"mode":mode,"since_last":true})).is_err()
+        );
+        let full = validate_call(AssistanceTool::Diff, json!({"mode":mode})).unwrap();
+        assert_ne!(full.parameters()["since_last"], true);
+        let daemon =
+            validate_normalized_call(AssistanceTool::Diff, full.parameters().clone()).unwrap();
+        assert_ne!(daemon.parameters()["since_last"], true);
+    }
+    let incremental = validate_call(AssistanceTool::Diff, json!({})).unwrap();
+    assert_eq!(incremental.parameters()["since_last"], true);
+    let daemon =
+        validate_normalized_call(AssistanceTool::Diff, incremental.parameters().clone()).unwrap();
+    assert_eq!(daemon.parameters()["since_last"], true);
+}
+
 /// Start accepts only absolute, normalized optional working-directory roots.
 #[test]
 fn start_root_must_be_absolute_and_normalized() {
@@ -5794,7 +5841,7 @@ fn absolute_context_path_refusal_names_the_relative_path_rule() {
     .message(AssistanceTool::Context);
     assert_eq!(
         message,
-        "invalid bounded parameters: \"path\" must be a path relative to the worktree root, not absolute"
+        "Argument \"path\" must be a path relative to the worktree root, not absolute."
     );
 }
 
@@ -6074,7 +6121,7 @@ mod managed_claude_front_tests {
                 // An older daemon and several actors: nothing is guessed or sent.
                 (_, true) => {
                     assert!(
-                        !sent && text.starts_with("error: stop_unidentified"),
+                        !sent && text.starts_with("The IDE could not identify this stop's session"),
                         "{text}"
                     );
                     assert_eq!(reconnect.remembered_tags(None).len(), 2);
@@ -6113,7 +6160,7 @@ mod managed_claude_front_tests {
         };
         let (text, sent) = tokio::join!(claude_call(front, "ide.stop", json!({})), peer);
         assert!(
-            !sent && text.starts_with("error: stop_unidentified"),
+            !sent && text.starts_with("The IDE could not identify this stop's session"),
             "{text}"
         );
         assert_eq!(reconnect.remembered_tags(None), vec![tag]);
@@ -6531,7 +6578,10 @@ mod managed_claude_front_tests {
             claude_call(front, "ide.start", json!({"activation_id":"x"})),
             peer
         );
-        assert!(text.starts_with("error: outcome_unknown"), "{text}");
+        assert!(
+            text.starts_with("This activation change may have applied; its outcome is unknown."),
+            "{text}"
+        );
         assert!(!reconnect.activated_before().await);
     }
 
