@@ -641,7 +641,12 @@ impl ParameterError {
                     .as_ref()
                     .map(|name| format!(" \"{name}\""))
                     .unwrap_or_default();
-                let allowed = allowed_fields(tool).join(", ");
+                let allowed = allowed_fields(tool)
+                    .iter()
+                    .filter(|field| **field != "since_last")
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 if allowed.is_empty() {
                     format!("invalid bounded parameters: unknown field{named}")
                 } else {
@@ -708,7 +713,9 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "language",
             "offset",
         ],
-        AssistanceTool::Diff => &["mode", "detail_ref", "provenance", "paths"],
+        // `since_last` is set by the normalization below (a call without `mode`) and read back by
+        // the daemon's own validation; it is never advertised.
+        AssistanceTool::Diff => &["mode", "detail_ref", "provenance", "paths", "since_last"],
         AssistanceTool::Inspect => &["detail_ref", "detail_refs", "wait_ms"],
         AssistanceTool::Stop => &["activation_id"],
         AssistanceTool::Edit => &[
@@ -1231,6 +1238,12 @@ pub fn validate_call(
                 .is_some_and(|value| !value.is_boolean())
             {
                 return Err(invalid_field("provenance", FieldRule::Boolean));
+            }
+            if object
+                .get("since_last")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                return Err(invalid_field("since_last", FieldRule::Boolean));
             }
         }
 

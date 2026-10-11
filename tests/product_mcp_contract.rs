@@ -5732,6 +5732,13 @@ async fn claude_session_survives_a_daemon_restart_between_calls() {
     assert_eq!(started["kind"], "activation", "{started}");
 
     // One call before the restart, keeping its reference for the stale-reference check.
+    // A source too large for one reply is cut, and the cut names the `detail_ref` that continues
+    // it; a complete reply names no reference.
+    std::fs::write(
+        fixture.root.join("restart-pages.txt"),
+        "padding padding padding\n".repeat(20_000),
+    )
+    .unwrap();
     next += 1;
     let before = managed_claude_call(
         &mut mcp,
@@ -5740,14 +5747,13 @@ async fn claude_session_survives_a_daemon_restart_between_calls() {
         "restart-session",
         None,
         "ide.context",
-        json!({"path":"src/lib.rs"}),
+        json!({"path":"restart-pages.txt"}),
     )
     .await;
-    // Reads print no reference any more; a context reply still names its `detail_ref`.
     let stale_ref = before["detail_ref"]
         .as_str()
         .map(str::to_owned)
-        .expect("a context reply names its detail_ref");
+        .expect("a cut context reply names its detail_ref");
 
     // The shared daemon generation ends; the watcher must heal it before the next pre-hook.
     let stale_attachment = managed_claude_candidate_attachment(&fixture.root);
@@ -7965,6 +7971,12 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
     // A lexical context answer is a degraded success that retains a result; inspecting that
     // result after the call's own degraded mark was consumed reports it degraded again, names
     // the call that queued it as `origin`, and is typed as delivered.
+    // The source is too large for one reply, so the cut names the `detail_ref` that continues it.
+    std::fs::write(
+        fixture.root.join("context-pages.txt"),
+        "padding padding padding\n".repeat(20_000),
+    )
+    .unwrap();
     next += 1;
     let context_call = next;
     let lexical = managed_claude_call(
@@ -7974,7 +7986,7 @@ async fn managed_claude_dispatch_lines_carry_closed_context() {
         "context-session",
         None,
         "ide.context",
-        json!({"path":"src/lib.rs"}),
+        json!({"path":"context-pages.txt"}),
     )
     .await;
     let detail_ref = lexical["detail_ref"]
@@ -17480,7 +17492,6 @@ async fn configured_product_claude_typescript_unverified_membership_falls_back_t
         context["text"].as_str().unwrap().contains(source),
         "{context}"
     );
-    assert!(context["detail_ref"].as_str().is_some(), "{context}");
 
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
@@ -19677,7 +19688,7 @@ async fn claude_context_problems_then_edit_keeps_unchanged_source() {
             &fixture,
             "ide.edit",
             json!({"operation_id":"first-edit","path":"fastapi/utils.py",
-                "source_ref":context["detail_ref"],"content":"edited\n"}),
+                "content":"edited\n"}),
         )
         .await;
     let (edit, _) = actor.settle_claude(&fixture, edit).await;
@@ -19692,52 +19703,20 @@ async fn claude_context_problems_then_edit_keeps_unchanged_source() {
         )
         .await;
     let (older, _) = actor.settle_claude(&fixture, older).await;
-    let newer = actor
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"fastapi/utils.py","byte_offset":0}),
-        )
-        .await;
-    let (newer, _) = actor.settle_claude(&fixture, newer).await;
-    assert_ne!(older["detail_ref"], newer["detail_ref"]);
+    assert_eq!(older["kind"], "context", "{older}");
     let edit = actor
         .call_claude(
             &fixture,
             "ide.edit",
             json!({
                 "operation_id":"after-reobserve", "path":"fastapi/utils.py",
-                "source_ref":older["detail_ref"], "content":"edited again\n"
+                "content":"edited again\n"
             }),
         )
         .await;
     let (edit, _) = actor.settle_claude(&fixture, edit).await;
     assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
     assert_eq!(std::fs::read(&path).unwrap(), b"edited again\n");
-
-    let context = actor
-        .call_claude(
-            &fixture,
-            "ide.context",
-            json!({"path":"fastapi/utils.py","byte_offset":0}),
-        )
-        .await;
-    let (context, _) = actor.settle_claude(&fixture, context).await;
-    std::fs::write(&path, "external\n").unwrap();
-    let stale = actor
-        .call_claude(
-            &fixture,
-            "ide.edit",
-            json!({
-                "operation_id":"after-change", "path":"fastapi/utils.py",
-                "source_ref":context["detail_ref"], "content":"must not write\n"
-            }),
-        )
-        .await;
-    let (stale, _) = actor.settle_claude(&fixture, stale).await;
-    assert_eq!(stale["result"]["outcome"], "stale_source", "{stale}");
-    assert_eq!(stale["result"]["source_ref"], Value::Null, "{stale}");
-    assert_eq!(std::fs::read(&path).unwrap(), b"external\n");
 
     let stopped = actor.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
@@ -20073,7 +20052,7 @@ async fn configured_product_claude_activates_a_reader_then_stops() {
         json!({"path":"tracked.txt","byte_offset":0}),
     )
     .await;
-    let stop_source_ref = stop_context["detail_ref"].as_str().unwrap().to_owned();
+    assert_eq!(stop_context["kind"], "context", "{stop_context}");
     let ready = first
         .call_claude(
             &fixture,
@@ -20081,7 +20060,6 @@ async fn configured_product_claude_activates_a_reader_then_stops() {
             json!({
                 "operation_id":"claude-stop-ready",
                 "path":"tracked.txt",
-                "source_ref":stop_source_ref,
                 "content":"claude-stop-ready\n"
             }),
         )
@@ -20270,7 +20248,6 @@ async fn claude_diff_and_failed_reinspection_do_not_exhaust_detail_capacity() {
         .await;
     let (context, _) = first.settle_claude(&fixture, context).await;
     assert_eq!(context["kind"], "context", "{context}");
-    assert!(context["detail_ref"].is_string(), "{context}");
     let stopped = first.call_claude(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
     first.mcp.close().await;
@@ -20313,7 +20290,6 @@ async fn claude_later_binding_diffs_path_edited_under_earlier_grant() {
             json!({
                 "operation_id":"claude-epoch-first-edit",
                 "path":"tracked.txt",
-                "source_ref":context["detail_ref"],
                 "content":"edited-under-first-grant\n"
             }),
         )

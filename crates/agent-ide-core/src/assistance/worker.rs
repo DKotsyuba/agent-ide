@@ -13073,9 +13073,9 @@ mod stop_retry_tests {
     #[tokio::test]
     async fn context_continuation_serves_the_complete_text_through_repeated_inspect() {
         let fixture = Fixture::new();
-        // 60800 bytes, well above any plausible single reply envelope, so at least two
-        // continuation pages are required regardless of exact overhead.
-        let content = "let value = 1;\n".repeat(3800);
+        // 152,000 bytes, well above the 64 KiB reply envelope (replies carry no structured copy
+        // any more), so at least two continuation pages are required regardless of overhead.
+        let content = "let value = 1;\n".repeat(10_000);
         std::fs::write(fixture.root.join("main.rs"), &content).unwrap();
         let store = fixture.store();
         let workspace = DurableWorkspace::open(&store).await.unwrap();
