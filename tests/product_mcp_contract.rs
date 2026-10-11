@@ -12472,7 +12472,7 @@ async fn configured_product_links_css_html_and_python_names() {
          \x20 src/Menu.tsx#Menu:2 (L3)      [typescript ~clsx call] return <nav className={clsx(\"btn\", { \"btn-lg\": props.big })}>Menu</nav>;\n\
          \x20 (~ = heuristic match, not proven)\n\
          links: 1 style variable used here\n\
-         \x20 --brand  → theme.scss:1 :root\n\
+         \x20 --brand  → theme.scss#:root (L1)\n\
          unavailable for: python\n\
          callers: unavailable (css has no call hierarchy)\n"
     );
@@ -12509,7 +12509,7 @@ async fn configured_product_links_css_html_and_python_names() {
     );
     let button = symbol(&mut actor, "src/Button.tsx#Button").await;
     assert!(
-        button.contains("links: 1 class name used here\n  .btn  → styles.css:2 .btn, styles.css:6 .layout .btn (+1 more)\n"),
+        button.contains("links: 1 class name used here\n  .btn  → styles.css#.btn (L2), styles.css#.layout .btn (L6) (+1 more)\n"),
         "{button}"
     );
     let graph = async |actor: &mut ProductActor, requested: &str, direction: &str| {
