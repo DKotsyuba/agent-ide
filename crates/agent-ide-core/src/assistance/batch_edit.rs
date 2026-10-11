@@ -846,8 +846,8 @@ impl Worker<'_> {
     }
 
     /// Answers a multi-file edit whose project check is still running with `diagnostics:
-    /// pending` shortly before its caller's inline window ends (session-outbox-v1 §8.6), as the
-    /// one-file edit does.
+    /// pending` at once, right after the writes (symbol-read-edit-v1 §3.3), as the one-file edit
+    /// does.
     ///
     /// Only a caller still waiting is answered, only once, and only when the session's outbox
     /// can hold the check as in-flight work under the job's reference: the job stays parked on
@@ -857,19 +857,12 @@ impl Worker<'_> {
         if check.answered_early {
             return;
         }
-        let started = job.deadline.checked_sub(Duration::from_millis(
-            self.shared.launcher.limits.operation_ms,
-        ));
-        let due = started.is_none_or(|started| {
-            tokio::time::Instant::now() + super::delivery::EARLY_EDIT_REPLY_MARGIN
-                >= started + INLINE_REPLY_WAIT
-        });
         let waiting = job
             .stop_reply
             .as_ref()
             .is_some_and(|sender| !sender.is_closed());
         let binding = job.invocation.binding_ref().clone();
-        if !due || !waiting || !self.shared.outbox.is_open(&binding) {
+        if !waiting || !self.shared.outbox.is_open(&binding) {
             return;
         }
         let subject = format!("edit {}", check.operation_id);
