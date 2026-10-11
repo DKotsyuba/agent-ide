@@ -111,11 +111,22 @@
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "add_import": {
+          "description": "With `path`: one import statement, written as in the file, added after the other imports (nothing happens if it is already there).",
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        },
         "changes": {
           "items": {
             "additionalProperties": false,
-            "description": "1–32 changes to ONE file (named by `path`), each addressed by exactly one of `lines`, `symbol` or `old`; every address resolves against the bytes `source_ref` names before anything is applied, and overlapping or unmatched addresses are refused together with nothing written. `lines` numbers are that version's, never shifted by other changes (empty `content` deletes the range); `old` must match exactly once (add `within` to scope it) and `new` replaces exactly the matched bytes, terminators included (`\"\"` deletes the match).",
+            "description": "1–32 changes to ONE file (named by `path`), each addressed by exactly one of `lines`, `symbol` (an address, a `:N-M` window or an `@` region), `old` (with `symbol` or `within` to scope it), `add_import` or `remove_import`; every address resolves against the file's current text before anything is applied, and overlapping or unmatched addresses are refused together with nothing written. `lines` numbers are the current file's, never shifted by other changes (empty `content` deletes the range); `old` must match exactly once and `new` replaces exactly the matched bytes, terminators included (`\"\"` deletes the match).",
             "properties": {
+              "add_import": {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
               "content": {
                 "type": "string"
               },
@@ -136,6 +147,11 @@
                   "insert",
                   "delete"
                 ],
+                "type": "string"
+              },
+              "remove_import": {
+                "maxLength": 1024,
+                "minLength": 1,
                 "type": "string"
               },
               "symbol": {
@@ -167,6 +183,12 @@
         "content": {
           "description": "Replacement or inserted code, including the symbol's doc comment and attributes.",
           "maxLength": 131072,
+          "type": "string"
+        },
+        "file_path": {
+          "description": "Alias of `path`.",
+          "maxLength": 1024,
+          "minLength": 1,
           "type": "string"
         },
         "files": {
@@ -214,9 +236,27 @@
           "pattern": "^[0-9]+-[0-9]+$",
           "type": "string"
         },
+        "new": {
+          "description": "The replacement for `old`; empty deletes the match. Aliases: `new_string`.",
+          "type": "string"
+        },
         "new_name": {
           "description": "For rename: the new identifier, applied project-wide.",
           "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "new_string": {
+          "description": "Alias of `new`.",
+          "type": "string"
+        },
+        "old": {
+          "description": "Exact text to replace with `new`; it must occur exactly once in the scope (`symbol`'s unit or window, else the whole `path`). Aliases: `old_string`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "old_string": {
+          "description": "Alias of `old`.",
           "minLength": 1,
           "type": "string"
         },
@@ -232,8 +272,14 @@
           "type": "string"
         },
         "operation_id": {
-          "description": "Any unique id for this edit; repeating it never applies the edit twice.",
+          "description": "Optional. Name an edit to make a retry safe: repeating the id never applies the edit twice. Omitted, a fresh id is used.",
           "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "patch": {
+          "description": "A Codex apply_patch body (`*** Begin Patch` … `*** End Patch` with Add File and Update File sections), applied atomically across files. Use it alone; delete and move are not supported.",
+          "maxLength": 131072,
           "minLength": 1,
           "type": "string"
         },
@@ -242,14 +288,20 @@
           "minLength": 1,
           "type": "string"
         },
+        "remove_import": {
+          "description": "With `path`: the import statement to remove, as written in the file.",
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        },
         "source_ref": {
-          "description": "The source_ref of the ide.read/ide.context this content is based on; required with `path`+`lines` and to replace an existing file with `path`+`content`, optional (but validated) with `symbol`. Omit it with `path`+`content` to create a new file.",
+          "description": "Deprecated and never needed: the current text is the base of every edit. A supplied value is still checked against the file.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "symbol": {
-          "description": "Symbol path `file#Owner/name`.",
+          "description": "Address `file#Owner/name`, a window `file#Owner/name:3-5` (lines counted from the symbol's first line) or a region `file#@imports`.",
           "maxLength": 1024,
           "minLength": 1,
           "type": "string"
@@ -265,9 +317,6 @@
           "type": "string"
         }
       },
-      "required": [
-        "operation_id"
-      ],
       "type": "object"
     },
     "name": "ide.edit"
@@ -378,10 +427,10 @@
           "type": "string"
         },
         "kinds": {
-          "description": "Comma list over the closed symbol-kind vocabulary; keeps a symbol whose kind is selected or a descendant's is, so a container of a selected member still shows.",
+          "description": "Comma list over the closed symbol-kind vocabulary; keeps a symbol whose kind is selected or a descendant's is, so a container of a selected member still shows. `region` also lists file-level regions (@header, @imports, ...).",
           "maxLength": 256,
           "minLength": 1,
-          "pattern": "^(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol)(,(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol))*$",
+          "pattern": "^(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol|region)(,(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol|region))*$",
           "type": "string"
         },
         "path": {
@@ -426,7 +475,7 @@
             "additionalProperties": false,
             "properties": {
               "lines": {
-                "pattern": "^[0-9]+-[0-9]+$",
+                "pattern": "^[0-9]+(-[0-9]*)?$",
                 "type": "string"
               },
               "path": {
@@ -447,8 +496,8 @@
           "type": "array"
         },
         "lines": {
-          "description": "Inclusive 1-based line range such as `120-180`.",
-          "pattern": "^[0-9]+-[0-9]+$",
+          "description": "Inclusive 1-based line range: `120-180`, `120-` (to the end) or `120`. An end past the file is clamped.",
+          "pattern": "^[0-9]+(-[0-9]*)?$",
           "type": "string"
         },
         "path": {
@@ -460,7 +509,7 @@
         "ranges": {
           "description": "Several line ranges of `path` in one reply, request order, with the same numbered gutter and one `source_ref`.",
           "items": {
-            "pattern": "^[0-9]+-[0-9]+$",
+            "pattern": "^[0-9]+(-[0-9]*)?$",
             "type": "string"
           },
           "maxItems": 16,
