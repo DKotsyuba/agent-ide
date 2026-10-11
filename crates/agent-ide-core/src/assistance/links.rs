@@ -503,6 +503,29 @@ impl Worker<'_> {
                 && shown.site.fact.line <= range.end
         };
         let mixed = gathered.defined.len() > 1;
+        // The other definitions of a name print their symbol address with the absolute line.
+        let wanted: Vec<(PathBuf, u32)> = gathered
+            .defined
+            .iter()
+            .flat_map(|(_, defines, _)| {
+                defines
+                    .sites
+                    .iter()
+                    .filter(|shown| !own(shown))
+                    .take(MAX_ALSO)
+                    .map(|shown| (shown.site.file.clone(), shown.site.fact.line))
+            })
+            .collect();
+        let located = Box::pin(self.position_addresses(job, &wanted)).await;
+        let mut also_places = render::LocationAddresses::new();
+        for (index, (file, line)) in wanted.iter().enumerate() {
+            if let Some(Some(address)) = located.rows.get(index) {
+                also_places.insert(
+                    (file.display().to_string(), *line),
+                    super::addressing::tagged(super::addressing::symbol_part(address), *line),
+                );
+            }
+        }
         let mut rows: Vec<(&ShownSite, Usage)> = Vec::new();
         let mut not_listed = 0;
         for (key, defines, uses) in &gathered.defined {
@@ -516,7 +539,14 @@ impl Worker<'_> {
                 let also: Vec<String> = others
                     .iter()
                     .take(MAX_ALSO)
-                    .map(|shown| format!("{} {}", location(shown), selector(&shown.text)))
+                    .map(|shown| {
+                        let site = (shown.site.file.display().to_string(), shown.site.fact.line);
+                        // An address names the definition; only a bare location needs its text.
+                        match also_places.get(&site) {
+                            Some(place) => place.clone(),
+                            None => format!("{} {}", location(shown), selector(&shown.text)),
+                        }
+                    })
                     .collect();
                 line.push_str(&format!(" — also {}", also.join(", ")));
                 if others.len() > MAX_ALSO {

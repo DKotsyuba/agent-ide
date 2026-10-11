@@ -14245,8 +14245,9 @@ mod stop_retry_tests {
             Ok(
                 "symbol: ##top — element id, 1 element, 1 usage in 1 files (alpha, gamma)\n\
                 definitions:\n  b.alpha:1  [alpha] #top @btn\n\
-                usages: 1 indexed in 1 files (src 1, tests 0)\n  a.gamma:3  [gamma] #top\n\
-                unavailable for: delta\n"
+                usages: 1 indexed in 1 files (src 1, tests 0)\n  a.gamma#card/btn:2 (L3)  [gamma] #top\n\
+                unavailable for: delta\n\
+                addresses: omitted for 1 locations (no outline for the file)\n"
                     .into()
             )
         );
