@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use serde_json::{Map, Value, json};
 
 use super::facade::{
-    AssistanceTool, FieldRule, ParameterError, invalid_field, parse_line_range, path_shape_rule,
+    AssistanceTool, FieldRule, ParameterError, invalid_field, parse_read_range, path_shape_rule,
 };
 use super::reply::{
     EditBatchFile, EditBatchFileState, EditBatchOutcome, EditBatchReason, PeerReply,
@@ -251,7 +251,7 @@ pub(crate) fn validate_read_items(object: &Map<String, Value>) -> Result<(), Par
                 if let Some(rule) = path_shape_rule(path) {
                     return Err(invalid_field("items", rule));
                 }
-                if lines.is_some_and(|lines| parse_line_range(lines).is_none()) {
+                if lines.is_some_and(|lines| parse_read_range(lines).is_none()) {
                     return Err(invalid_field("items", FieldRule::LineRange));
                 }
                 path.to_owned()

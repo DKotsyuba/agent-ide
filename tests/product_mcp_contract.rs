@@ -477,6 +477,7 @@ fn assert_compact_envelope(reply: &Value) {
             // A batch read opens with its summary line (batch-api-v1 §2).
             if !(header.starts_with("read: ")
                 || header.starts_with("no such ")
+                || header.starts_with("file has ")
                 || header.starts_with("not a readable text file")
                 || header.contains(" has no code symbols; ")
                 || header.ends_with("  (empty file)"))
@@ -11828,9 +11829,9 @@ async fn product_outline_and_read_report_no_such_file() {
         json!({"path":"real.rs","lines":"286-334"}),
     )
     .await;
-    assert_eq!(
-        text, "error: source_unavailable (read:line_range); file has 1 lines; requested 286-334",
-        "{past_end}"
+    assert!(
+        text.contains("file has 1 lines; nothing at 286-334") && past_end["code"].is_null(),
+        "a read starting past the end is a success: {past_end} {text}"
     );
     let (unreadable, text) = batch_call_with_text(
         &mut actor,

@@ -203,8 +203,9 @@ impl Worker<'_> {
     /// like any read. Any readable text file answers the `path` forms, whatever its type; a file
     /// no IDE language analyzes ends with [`NO_ANALYSIS_NOTE`]. A binary or unreadable file
     /// is refused as `source_unavailable` with a `read:not_text:` or `read:source_unavailable:`
-    /// detail (a soft refusal naming native tools, never `internal`); a `lines` range past the
-    /// end is refused `read:line_range`. The `symbol` form still needs an outline, so a file no
+    /// detail (a soft refusal naming native tools, never `internal`); a `lines` range (`N`, `N-M`,
+    /// `N-`) is clamped at the end of the file, and one starting past it succeeds with
+    /// `file has <n> lines; nothing at <range>`. The `symbol` form still needs an outline, so a file no
     /// IDE language reads answers `unsupported_file`.
     pub(super) async fn read(
         &mut self,
@@ -265,7 +266,7 @@ impl Worker<'_> {
                     Some(lines) => Some(
                         lines
                             .as_str()
-                            .and_then(crate::assistance::facade::parse_line_range)
+                            .and_then(crate::assistance::facade::parse_read_range)
                             .ok_or(FailureCode::SourceUnavailable)?,
                     ),
                     None => None,
@@ -287,14 +288,16 @@ impl Worker<'_> {
         }
         let source = readable_text(job, &observed, &bytes, &path)?;
         let total = lang::line_count(source);
+        // A start past the end is a success that says so; an end past it is clamped.
         if let Some(range) = range
-            && (range.start > total || range.end > total)
+            && range.start > total
         {
-            job.failure_detail = Some(format!(
-                "read:line_range:file has {total} lines; requested {}-{}",
-                range.start, range.end
-            ));
-            return Err(FailureCode::SourceUnavailable);
+            let authority = self.finish_symbol_job(job, &binding, &observed).await?;
+            let text = nothing_at(total, range);
+            let (reply, page) =
+                ContextPageState::new(text, 0, false, ResultKind::Read).next(&job.reference)?;
+            self.shared.set_context_page(&job.reference, page);
+            return Ok((reply, Some(authority), Some(observed)));
         }
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
         let mut text = match range {
@@ -445,7 +448,7 @@ impl Worker<'_> {
                 ReadItem::Path(path) | ReadItem::Lines(path, _) => {
                     let range = match &item {
                         ReadItem::Lines(_, lines) => Some(
-                            crate::assistance::facade::parse_line_range(lines)
+                            crate::assistance::facade::parse_read_range(lines)
                                 .ok_or(FailureCode::Internal)?,
                         ),
                         _ => None,
@@ -487,8 +490,7 @@ impl Worker<'_> {
                     if range.start > total {
                         items.push((
                             format!(
-                                "no such range: lines {range} is past the end of {path} \
-                                 ({total} lines)\n"
+                                "{}", nothing_at(total, range)
                             ),
                             None,
                             item,
@@ -5747,4 +5749,17 @@ short 2026-09-25 nope
         );
         assert_eq!(long.len(), MAX_HISTORY);
     }
+}
+
+/// The success text of a read whose range starts past the end of the file:
+/// `file has <total> lines; nothing at <a>-<b>` (`<a>-` for an open range, `<a>` for one line).
+fn nothing_at(total: u32, range: LineRange) -> String {
+    let at = if range.end == u32::MAX {
+        format!("{}-", range.start)
+    } else if range.start == range.end {
+        range.start.to_string()
+    } else {
+        format!("{}-{}", range.start, range.end)
+    };
+    format!("file has {total} lines; nothing at {at}\n")
 }

@@ -317,10 +317,10 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "properties": {
                     "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`; returns its body with the doc header."},
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root; alone it reads the whole file, with `lines` or `ranges` those lines."},
-                    "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "Inclusive 1-based line range such as `120-180`."},
+                    "lines": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$", "description": "Inclusive 1-based line range: `120-180`, `120-` (to the end) or `120`. An end past the file is clamped."},
                     "symbols": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "description": "Several bodies in one reply, request order, one `source_ref` valid for every file included: `[\"src/a.rs#Foo/bar\",\"src/b.rs#qux\"]`. Unknown symbols are reported per item without failing the rest; a bare file path reads the text of a file no IDE language reads."},
-                    "ranges": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "description": "Several line ranges of `path` in one reply, request order, with the same numbered gutter and one `source_ref`."},
-                    "items": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_READ_ITEMS, "items": {"type": "object", "additionalProperties": false, "properties": {"symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}}}, "description": "Everything to read in ONE call, up to 32 items over at most 16 files, instead of `symbol`, `path`, `lines`, `symbols` or `ranges`: each item is exactly one of {\"symbol\":\"src/a.rs#Foo/bar\"}, {\"path\":\"docs/x.md\"} (the whole file) or {\"path\":\"src/b.rs\",\"lines\":\"10-40\"}. The reply opens with a summary line, then one block per item in request order; a failed item fails only itself, and one `source_ref` is valid for every file whose items were all delivered."},
+                    "ranges": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$"}, "description": "Several line ranges of `path` in one reply, request order, with the same numbered gutter and one `source_ref`."},
+                    "items": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_READ_ITEMS, "items": {"type": "object", "additionalProperties": false, "properties": {"symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "lines": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$"}}}, "description": "Everything to read in ONE call, up to 32 items over at most 16 files, instead of `symbol`, `path`, `lines`, `symbols` or `ranges`: each item is exactly one of {\"symbol\":\"src/a.rs#Foo/bar\"}, {\"path\":\"docs/x.md\"} (the whole file) or {\"path\":\"src/b.rs\",\"lines\":\"10-40\"}. The reply opens with a summary line, then one block per item in request order; a failed item fails only itself, and one `source_ref` is valid for every file whose items were all delivered."},
                     "force": {"type": "boolean", "default": false, "description": "With `items`: return the text of an item even when its bytes are unchanged since your earlier read."}
                 }
             }),
@@ -446,11 +446,27 @@ fn range_list(
 ) -> Result<Option<Vec<String>>, ParameterError> {
     let list = string_list(object, field, max)?;
     if let Some(list) = &list
-        && list.iter().any(|range| parse_line_range(range).is_none())
+        && list.iter().any(|range| parse_read_range(range).is_none())
     {
         return Err(invalid_field(field, FieldRule::LineRange));
     }
     Ok(list)
+}
+
+/// Parses a lenient read range: `N` (one line), `N-M` or `N-` (to the end of the file).
+///
+/// The end of an open range is `u32::MAX`; readers clamp every end to the file's last line, so a
+/// range past the end of a file is never a parse failure. `None` for any other shape, a zero
+/// start or an end before the start.
+pub(crate) fn parse_read_range(text: &str) -> Option<crate::lang::LineRange> {
+    let (start, end) = match text.split_once('-') {
+        None => (text, text),
+        Some((start, "")) => (start, "4294967295"),
+        Some(pair) => pair,
+    };
+    let start: u32 = start.parse().ok()?;
+    let end: u32 = end.parse().ok()?;
+    (start >= 1 && end >= start).then(|| crate::lang::LineRange::new(start, end))
 }
 
 /// Parses an inclusive 1-based `start-end` line range; `None` for any other shape.
@@ -591,7 +607,7 @@ impl FieldRule {
             ),
             Self::RequiresProblemsKind => "requires \"kind\":\"problems\"".to_string(),
             Self::Boolean => "must be true or false".to_string(),
-            Self::LineRange => "must be an inclusive 1-based range like 120-180".to_string(),
+            Self::LineRange => "must be a 1-based line range like 120-180, 120- or 120".to_string(),
             Self::RangeEditSourceRef => {
                 "is required for a line-range edit; re-read the lines (ide.read) and retry with \
                  the new source_ref"
@@ -871,7 +887,7 @@ pub fn validate_call(
                     if let Some(rule) = path_shape_rule(path) {
                         return Err(invalid_field("path", rule));
                     }
-                    if parse_line_range(object["lines"].as_str().unwrap_or_default()).is_none() {
+                    if parse_read_range(object["lines"].as_str().unwrap_or_default()).is_none() {
                         return Err(invalid_field("lines", FieldRule::LineRange));
                     }
                 }
@@ -6257,4 +6273,18 @@ mod managed_claude_front_tests {
         assert!(text.starts_with("error: outcome_unknown"), "{text}");
         assert!(!reconnect.activated_before().await);
     }
+
+/// The lenient read range grammar: one line, a closed range and an open range parse; zero,
+/// reversed and malformed ranges do not. Edits keep the strict grammar.
+#[test]
+fn read_ranges_accept_one_line_closed_and_open_forms() {
+    let range = |text: &str| parse_read_range(text).map(|r| (r.start, r.end));
+    assert_eq!(range("7"), Some((7, 7)));
+    assert_eq!(range("7-9"), Some((7, 9)));
+    assert_eq!(range("7-"), Some((7, u32::MAX)));
+    for bad in ["", "0", "0-3", "9-7", "-3", "a-b", "1-2-3"] {
+        assert_eq!(range(bad), None, "{bad}");
+    }
+    assert!(parse_line_range("7").is_none() && parse_line_range("7-").is_none());
+}
 }
