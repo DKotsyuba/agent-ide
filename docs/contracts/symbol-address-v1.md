@@ -1,6 +1,6 @@
 # Symbol address v1 contract
 
-Revision: symbol-address r1; tracked boundary id `symbol-address-v1`, revision 1. Status: draft for
+Revision: symbol-address r2; tracked boundary id `symbol-address-v1`, revision 2 (r2 only unifies the tracked description; the text is that of r1). Status: draft for
 agreement. Provider: M-028 (`crates/agent-ide-core/src/lang/address.rs` and
 `crates/agent-ide-core/src/assistance/addressing.rs`, both created by this module). Consumers: M-029
 (`ide.read`, `ide.edit`: resolution of an address to a span) and M-030 (instructions, skill text and
