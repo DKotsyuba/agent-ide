@@ -70,7 +70,9 @@ impl Worker<'_> {
         observed: &SourceObservation,
         bytes: &[u8],
     ) -> Result<(Arc<AddressMap>, Option<Lexical>), FailureCode> {
-        let (outline, _, lexical) = self.outline_of(job, observed, bytes).await?;
+        // Boxed: the outline futures are large and these helpers sit under the deepest call
+        // chains (batch symbol -> card -> addresses), where debug-build stack frames add up.
+        let (outline, _, lexical) = Box::pin(self.outline_of(job, observed, bytes)).await?;
         let map = AddressMap::build(&outline, observed_text(observed, bytes)?);
         Ok((Arc::new(map), lexical))
     }
@@ -85,7 +87,7 @@ impl Worker<'_> {
     ) -> Option<Arc<AddressMap>> {
         let parked = job.park_until.take();
         let detail = job.failure_detail.take();
-        let map = self.address_map(job, observed, bytes).await.ok();
+        let map = Box::pin(self.address_map(job, observed, bytes)).await.ok();
         job.park_until = parked;
         job.failure_detail = detail;
         map.map(|(map, _)| map)
@@ -155,7 +157,7 @@ impl Worker<'_> {
             return;
         }
         let all: Vec<(PathBuf, u32)> = usages.iter().chain(&calls).cloned().collect();
-        let addresses = self.position_addresses(job, &all).await;
+        let addresses = Box::pin(self.position_addresses(job, &all)).await;
         for (index, (file, line)) in all.iter().enumerate() {
             let key = (file.to_string_lossy().into_owned(), *line);
             if index < usages.len() {
@@ -185,7 +187,7 @@ impl Worker<'_> {
             .filter(|node| !node.file.is_empty())
             .map(|node| (PathBuf::from(&node.file), node.line))
             .collect();
-        let addresses = self.position_addresses(job, &all).await;
+        let addresses = Box::pin(self.position_addresses(job, &all)).await;
         for (index, (file, line)) in all.iter().enumerate() {
             if let Some(Some(address)) = addresses.rows.get(index) {
                 graph.addresses.insert(
@@ -224,7 +226,7 @@ impl Worker<'_> {
         {
             return Err(code);
         }
-        let (map, _) = self.address_map(job, &observed, &bytes).await?;
+        let (map, _) = Box::pin(self.address_map(job, &observed, &bytes)).await?;
         let Some(located) = map.at_line(line) else {
             job.failure_detail = Some(format!(
                 "symbol:line_past_end: {}:{line} is past the end of the file",
@@ -277,7 +279,7 @@ impl Worker<'_> {
                     out.reason.get_or_insert("time limit");
                     None
                 } else {
-                    let found = self.scanned_map(job, &authority, file).await;
+                    let found = Box::pin(self.scanned_map(job, &authority, file)).await;
                     if found.is_none() {
                         out.reason.get_or_insert("no outline for the file");
                     }
@@ -307,7 +309,7 @@ impl Worker<'_> {
         let text = String::from_utf8(read.contents().to_vec()).ok()?;
         let parked = job.park_until.take();
         let detail = job.failure_detail.take();
-        let outline = self.scanned_outline(job, authority, file).await;
+        let outline = Box::pin(self.scanned_outline(job, authority, file)).await;
         job.park_until = parked;
         job.failure_detail = detail;
         Some(Arc::new(AddressMap::build(&outline?.0, &text)))

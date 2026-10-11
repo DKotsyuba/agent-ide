@@ -764,7 +764,7 @@ impl Worker<'_> {
             .as_str()
             .ok_or(FailureCode::UnknownSymbol)?
             .to_owned();
-        let requested = self.locate_line(job, &binding, &requested).await?;
+        let requested = Box::pin(self.locate_line(job, &binding, &requested)).await?;
         let symbol = SymbolPath::parse(&requested).map_err(|_| FailureCode::UnknownSymbol)?;
         let want_usages = job
             .parameters
@@ -813,7 +813,7 @@ impl Worker<'_> {
                         let mut candidates = match located {
                             Located::One(file) => {
                                 let authority = self.authority(&binding).await?;
-                                match self.scanned_map(job, &authority, &file).await {
+                                match Box::pin(self.scanned_map(job, &authority, &file)).await {
                                     Some(map) => map
                                         .named(&name)
                                         .into_iter()
@@ -1144,7 +1144,7 @@ impl Worker<'_> {
                 card.history = history_lines(&worktree_root, &file, found.range).await;
             }
         }
-        self.address_card_rows(job, &mut card).await;
+        Box::pin(self.address_card_rows(job, &mut card)).await;
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
         if card.usages.len() > render::MAX_USAGE_LINES {
             card.more_detail = Some(job.reference.clone());
@@ -1179,7 +1179,7 @@ impl Worker<'_> {
             .as_str()
             .ok_or(FailureCode::UnknownSymbol)?
             .to_owned();
-        let requested = self.locate_line(job, &binding, &requested).await?;
+        let requested = Box::pin(self.locate_line(job, &binding, &requested)).await?;
         let symbol = SymbolPath::parse(&requested).map_err(|_| FailureCode::UnknownSymbol)?;
         let file = match symbol.file() {
             Some(file) => file.to_path_buf(),
@@ -1497,7 +1497,7 @@ impl Worker<'_> {
                 break;
             }
         }
-        self.address_graph_nodes(job, &mut graph).await;
+        Box::pin(self.address_graph_nodes(job, &mut graph)).await;
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
         let text = render::call_graph_text(&graph, &direction, depth);
         let (reply, page) =
@@ -1969,7 +1969,7 @@ impl Worker<'_> {
                 let mut rows: Vec<(std::path::PathBuf, String)> = Vec::new();
                 let mut complete = true;
                 for file in files {
-                    match self.scanned_map(job, &authority, &file).await {
+                    match Box::pin(self.scanned_map(job, &authority, &file)).await {
                         Some(map) => rows.extend(
                             map.named(name)
                                 .into_iter()
