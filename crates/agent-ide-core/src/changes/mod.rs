@@ -140,11 +140,7 @@ impl DiffHunk {
     /// Returns a process-local identity of this hunk's path and exact bytes, so a later diff can
     /// tell which hunks the caller already holds. Not stable across processes or releases.
     pub fn fingerprint(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.path.hash(&mut hasher);
-        self.patch.hash(&mut hasher);
-        hasher.finish()
+        hunk_fingerprint(&self.path, &self.patch)
     }
 
     /// Returns the 0-based position of this hunk in the unbounded raw hunk stream.
@@ -468,9 +464,18 @@ pub struct DiffResult {
     /// Selected hunks dropped by [`Self::without_seen_hunks`] because the caller already holds
     /// them from its previous diff; zero for a full diff.
     unchanged_hunks: usize,
+    /// Fingerprints of every complete hunk in this capture, including later pages, so a
+    /// session forgets previously delivered hunks that disappeared or changed.
+    captured_fingerprints: std::collections::BTreeSet<u64>,
 }
 
 impl DiffResult {
+    /// Returns the process-local fingerprints of all complete captured hunks, independent
+    /// of selection, pagination and incremental filtering; an unavailable capture has none.
+    pub(crate) fn captured_fingerprints(&self) -> &std::collections::BTreeSet<u64> {
+        &self.captured_fingerprints
+    }
+
     /// Drops every selected hunk whose [`DiffHunk::fingerprint`] `seen` accepts, remembering how
     /// many were dropped (see [`Self::unchanged_hunks`]).
     ///
@@ -726,6 +731,7 @@ impl DiffResult {
             untracked_text_files: 0,
             hunk_addresses: Default::default(),
             unchanged_hunks: 0,
+            captured_fingerprints: Default::default(),
             truncated_output: false,
             overflow_hunks: 0,
             overflow_bytes: 0,
@@ -900,6 +906,8 @@ pub fn plain_diff_paths(stdout: &[u8]) -> Option<Vec<PathBuf>> {
 /// `None` selects page one. `confine` checks every named path before selection. `None` means the
 /// patch is malformed, a path is refused, or the supplied cursor is stale. A successful result
 /// carries the next cursor only while complete hunks remain under the original byte ceiling.
+/// Full-capture hunk fingerprints stay available independently of the selected page, so
+/// incremental consumers can expire history without discarding undelivered hunks.
 /// `operation` and `generation` are required for resumable task pages; empty/zero values are used
 /// only by `compose_plain_diff`, which deliberately does not mint a continuation.
 pub fn compose_plain_diff_page(
@@ -923,6 +931,11 @@ pub fn compose_plain_diff_page(
     {
         return None;
     }
+    let captured_fingerprints = parsed
+        .hunks
+        .iter()
+        .map(|hunk| hunk_fingerprint(&hunk.path, &hunk.patch))
+        .collect();
     let total_hunks = parsed.hunks.len();
     let start = cursor.map_or(0, DiffDetailCursor::next_hunk);
     let (selected_hunks, overflow_hunks, overflow_bytes, next_hunk) = select_hunks(
@@ -972,6 +985,7 @@ pub fn compose_plain_diff_page(
         untracked_text_files: 0,
         hunk_addresses: Default::default(),
         unchanged_hunks: 0,
+        captured_fingerprints,
         detail_cursor: next_hunk
             .filter(|_| !operation.is_empty() && generation > 0)
             .map(|next| DiffDetailCursor::new_plain(expected_scope, operation, generation, next)),
@@ -991,6 +1005,8 @@ pub fn compose_plain_diff_page(
 }
 
 /// Applies common scope/cursor validation before parsing or selecting any hunk payload.
+/// Valid captures retain every complete hunk fingerprint independently of the bounded page;
+/// invalid scope/cursor results expose no capture fingerprints or source payload.
 fn compose_diff_at(
     expected_scope: &GitScope,
     comparison: &GitComparison,
@@ -1046,6 +1062,7 @@ fn compose_diff_at(
             untracked_text_files: 0,
             hunk_addresses: Default::default(),
             unchanged_hunks: 0,
+            captured_fingerprints: Default::default(),
             truncated_output: false,
             overflow_hunks: 0,
             overflow_bytes: 0,
@@ -1072,6 +1089,11 @@ fn compose_diff_at(
             .untracked_paths()
             .iter()
             .any(|path| path.name_only().is_some());
+    let captured_fingerprints = parsed
+        .hunks
+        .iter()
+        .map(|hunk| hunk_fingerprint(&hunk.path, &hunk.patch))
+        .collect();
     let total_hunks = parsed.hunks.len();
     let raw_hunks = parsed
         .hunks
@@ -1162,6 +1184,7 @@ fn compose_diff_at(
             .count(),
         hunk_addresses: Default::default(),
         unchanged_hunks: 0,
+        captured_fingerprints,
         name_only: evidence
             .untracked_paths()
             .iter()
@@ -1261,6 +1284,17 @@ fn select_hunks(
         break;
     }
     (selected, omitted, omitted_bytes, cursor)
+}
+
+/// Hashes a captured workspace path and exact complete patch bytes for process-local
+/// incremental comparison. The identity is shared by raw captures and selected hunks;
+/// it is neither persisted nor stable across releases.
+fn hunk_fingerprint(path: &std::path::Path, patch: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    patch.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Parsed, owner-scoped raw diff hunk before budget selection.

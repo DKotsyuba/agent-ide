@@ -379,6 +379,8 @@ impl Worker<'_> {
         // is what the continuation footer must name.
         let mut items: Vec<(String, Option<usize>, ReadItem)> = Vec::new();
         let mut duplicates: Vec<String> = Vec::new();
+        // The unit reads of delivered-or-cut blocks, by item index, for the window-edit guard.
+        let mut unit_reads: Vec<(usize, target::UnitRead)> = Vec::new();
         let mut seen: Vec<ReadItem> = Vec::new();
         for item in requested {
             if seen.contains(&item) {
@@ -468,7 +470,8 @@ impl Worker<'_> {
                     let found = legacy.as_ref().and_then(|symbol| outline.find(symbol));
                     let block = match (unit, found) {
                         (Some((text, read)), _) => {
-                            self.remember_unit_read(&binding, read);
+                            // Remembered below, only if this block is delivered in the reply.
+                            unit_reads.push((items.len(), read));
                             (text, Some(index))
                         }
                         (None, Some(found)) => {
@@ -664,6 +667,14 @@ impl Worker<'_> {
             return Ok((reply, authority, Some(files[file].1.clone())));
         }
         let (text, delivered) = compose(&prefix(included));
+        // The window-edit guard knows only the units whose blocks this reply carries in full;
+        // a cut block's lines were never delivered.
+        for (index, read) in unit_reads {
+            if index < included {
+                let last = read.last;
+                self.remember_unit_read(&binding, read, last);
+            }
+        }
         // Remember the blocks this reply carries in full, so their repeat can answer unchanged.
         if epoch.is_some()
             && let Ok(mut ledger) = self.shared.ledger.lock()
@@ -2965,7 +2976,7 @@ impl Worker<'_> {
                                     source_ref: None,
                                 },
                                 diagnostics: EditDiagnostics::Unknown {},
-                                note: None,
+                                note: Some(STALE_SOURCE_REF_NOTE.to_owned()),
                                 operation: None,
                             },
                             authority,
@@ -3149,7 +3160,7 @@ impl Worker<'_> {
                                     source_ref: None,
                                 },
                                 diagnostics: EditDiagnostics::Unknown {},
-                                note: None,
+                                note: Some(STALE_SOURCE_REF_NOTE.to_owned()),
                                 operation: None,
                             },
                             authority,
@@ -3370,7 +3381,7 @@ impl Worker<'_> {
         // The light window guard: a window edit whose lines changed since this session's last
         // read of the unit is refused with the unit's current text; with no remembered read the
         // edit applies and the reply echoes the replaced lines.
-        let echoes = match outline.as_ref() {
+        let mut echoes = match outline.as_ref() {
             Some(outline) => {
                 let map = lang::address::AddressMap::build(outline, &source);
                 let binding = job.invocation.binding_ref().clone();
@@ -3383,6 +3394,24 @@ impl Worker<'_> {
             }
             None => Vec::new(),
         };
+        // A file-numbered `lines` entry has no unit to guard against: it echoes the old lines it
+        // replaces, so numbers copied from stale grep output are visible at once.
+        let total_lines = lang::line_count(&source);
+        for (index, request) in requests.iter().enumerate() {
+            if let ChangeRequest::Lines { range, .. } = request
+                && range.start <= total_lines
+            {
+                echoes.push((
+                    index,
+                    super::target::numbered_rows(
+                        &source,
+                        range.start,
+                        range.end.min(total_lines),
+                        8,
+                    ),
+                ));
+            }
+        }
         let changes =
             match resolve_changes_with(&source, outline.as_ref(), path, &requests, &site_of) {
                 Ok(changes) => changes,
@@ -3463,6 +3492,12 @@ impl Worker<'_> {
             .map(|outline| lang::address::AddressMap::build(&outline, &candidate)),
             None => None,
         };
+        // This session's own write is part of what it knows: units it had read whole now read
+        // as the edited text, so a window copied from this reply is not "changed since your
+        // read" (symbol-read-edit-v1 §3.2 rule 3).
+        if let Some(map) = candidate_map.as_ref() {
+            self.refresh_unit_memory(job.invocation.binding_ref(), path, map, &candidate);
+        }
         let mut note = changed_rows(
             path,
             &changes,
@@ -4542,7 +4577,7 @@ fn window_guard(
     map: &lang::address::AddressMap,
     source: &str,
     requests: &[ChangeRequest],
-    remembered: &dyn Fn(&str) -> Option<String>,
+    remembered: &dyn Fn(&str) -> Option<batch::RememberedUnit>,
 ) -> Result<Vec<(usize, String)>, Refusal> {
     let mut refusal = Refusal {
         sentences: Vec::new(),
@@ -4582,8 +4617,10 @@ fn window_guard(
                 .collect()
         };
         let now = rows_of(&current);
-        match remembered(&canonical) {
-            Some(before) if rows_of(&before) != now => refusal.push(
+        // Only lines the read actually showed can be guarded: a window outside the remembered
+        // span (the agent read `:1-3`, edits `:10-12`) is unguarded and echoes what it replaces.
+        match remembered(&canonical).filter(|seen| seen.first <= first && last <= seen.last) {
+            Some(before) if rows_of(&before.text) != now => refusal.push(
                 index + 1,
                 format!(
                     "change {}: lines {first}-{last} of {canonical} changed since your read. \
@@ -4626,6 +4663,16 @@ fn unit_range_of(
     outline: Option<&Outline>,
     map: Option<&lang::address::AddressMap>,
 ) -> Result<LineRange, UnitMiss> {
+    // A `path:line` location names the unit or region that holds the line, whole
+    // (symbol-read-edit-v1 §1).
+    if let Ok(lang::address::Parsed::Location { file, line, .. }) =
+        lang::address::Address::parse(requested)
+    {
+        return match map.and_then(|map| map.at_line(line).map(|located| (map, located))) {
+            Some((map, located)) if file == Path::new(path) => Ok(map.units()[located.unit].span),
+            _ => Err(UnitMiss::Unknown),
+        };
+    }
     let parsed = match lang::address::Address::parse(requested) {
         Ok(lang::address::Parsed::Address(address)) => Some(address),
         _ => None,
@@ -5036,6 +5083,10 @@ const MAX_LANDING_SENTENCES: usize = 8;
 const MAX_REFUSAL_DETAIL_BYTES: usize = 512;
 /// Bytes of a refusal detail that quotes the unit's current text (symbol-read-edit-v1 §3.5).
 const MAX_CURRENT_TEXT_REFUSAL_BYTES: usize = 4096;
+/// The stale-source reply's reason when a caller's own (deprecated) `source_ref` no longer names
+/// the file's current text; without a `source_ref` a stale write reads "changed while the edit
+/// was applied" instead.
+pub(super) const STALE_SOURCE_REF_NOTE: &str = "the supplied source_ref does not match this file's current text. Repair: send the edit without source_ref";
 
 /// How a syntax error relates to the change it is attributed to.
 enum Attribution {
@@ -5303,7 +5354,8 @@ const MAX_CHANGE_ROWS: usize = 12;
 /// `map` is the address map of the edited text; without one (a language with no outline) the
 /// lines are named `path:12-16`. A deleted symbol keeps the address it had, other deletions name
 /// the address now holding the join point. `echoes` pairs a change index with the old lines a
-/// window edit replaced (no remembered read), printed under its line as `; was:`. Past
+/// change replaced when the agent has no read of them to rely on (a window edit with no remembered
+/// read of those lines, or any file-numbered `lines` edit), printed under its line as `; was:`. Past
 /// [`MAX_CHANGE_ROWS`] lines the rest is counted as `+<k> more`. Landing ranges are mapped
 /// through `align` when the formatter moved lines.
 fn changed_rows(
@@ -5637,7 +5689,16 @@ mod batch_tests {
             where_: None,
             content: Some("x".to_owned()),
         }];
-        let read = |before: &'static str| move |_: &str| Some(before.to_owned());
+        // A read that showed the whole three-line unit.
+        let read = |before: &'static str| {
+            move |_: &str| {
+                Some(batch::RememberedUnit {
+                    text: before.to_owned(),
+                    first: 1,
+                    last: 3,
+                })
+            }
+        };
         // E6a: the remembered line 2 differs from the current one.
         let refusal = window_guard(
             "a.gamma",
@@ -5666,6 +5727,17 @@ mod batch_tests {
             .unwrap()
             .is_empty()
         );
+        // A read that showed only unit line 1 leaves line 2 unguarded: the edit applies and
+        // echoes what it replaces, although line 2 differs from the remembered text.
+        let partial = |_: &str| {
+            Some(batch::RememberedUnit {
+                text: "sym btn\nOLD\nend\n".to_owned(),
+                first: 1,
+                last: 1,
+            })
+        };
+        let echoes = window_guard("a.gamma", &map, source, &request, &partial).unwrap();
+        assert_eq!(echoes, [(0, "2\t2\n".to_owned())]);
         // E6c: nothing remembered applies and echoes the replaced line.
         let echoes = window_guard("a.gamma", &map, source, &request, &|_| None).unwrap();
         assert_eq!(echoes, [(0, "2\t2\n".to_owned())]);

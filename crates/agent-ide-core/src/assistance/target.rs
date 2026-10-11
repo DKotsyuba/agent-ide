@@ -65,6 +65,8 @@ pub(super) fn read_unit(
                     UnitRead {
                         address: canonical,
                         text: String::new(),
+                        first: 0,
+                        last: 0,
                     },
                 ));
             }
@@ -123,6 +125,8 @@ pub(super) fn read_unit(
         UnitRead {
             address: canonical,
             text: whole,
+            first,
+            last,
         },
     ))
 }
@@ -150,13 +154,43 @@ pub(super) fn numbered_rows(text: &str, first: u32, last: u32, limit: usize) -> 
     out
 }
 
-/// What a unit read delivered: the unit's canonical address and its whole current text, the
-/// session's memory of the read for the window-edit guard.
+/// The last unit line a paged reply to a unit read actually delivered: `read.last` when the
+/// reply is complete, else the number of the last numbered row in its text (`0` when the first
+/// page held no row).
+pub(super) fn delivered_last(reply: &PeerReply, read: &UnitRead) -> u32 {
+    match reply {
+        PeerReply::Complete {
+            text,
+            truncated: true,
+            ..
+        } => {
+            let last_row = text
+                .lines()
+                .rev()
+                .find_map(|line| line.split_once('\t')?.0.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            // A page cut inside a row did not deliver that row.
+            if text.ends_with('\n') {
+                last_row
+            } else {
+                last_row.saturating_sub(1)
+            }
+        }
+        _ => read.last,
+    }
+}
+
+/// What a unit read delivered: the unit's canonical address, its whole current text and the
+/// unit lines the reply showed, the session's memory of the read for the window-edit guard.
 pub(super) struct UnitRead {
     /// `file#unit`, never with a window.
     pub(super) address: String,
     /// The unit's whole text at read time; empty when the read delivered no lines.
     pub(super) text: String,
+    /// First unit line (1-based) the reply showed; `0` when it showed none.
+    pub(super) first: u32,
+    /// Last unit line the reply showed.
+    pub(super) last: u32,
 }
 
 /// `file#unit` of unit `unit` of `map`, windowless.
@@ -190,7 +224,9 @@ impl Worker<'_> {
     /// reports its own refusal); otherwise the numbered unit reply (see [`read_unit`]).
     ///
     /// A file no IDE language reads has no map, so its locations and addresses answer the
-    /// outline's own refusal. The read is remembered for the window-edit guard.
+    /// outline's own refusal. The unit lines the reply's first page delivered (all of them when
+    /// the reply is complete, see [`delivered_last`]) are remembered for the window-edit guard;
+    /// lines on later pages count as read only once they are delivered and read again.
     pub(super) async fn read_by_address(
         &mut self,
         job: &mut Job,
@@ -245,34 +281,77 @@ impl Worker<'_> {
             body.push('\n');
         }
         let authority = self.finish_symbol_job(job, binding, &observed).await?;
-        self.remember_unit_read(binding, read);
-        self.unit_reply(job, body, authority, observed).map(Some)
+        let reply = self.unit_reply(job, body, authority, observed)?;
+        // Only the lines the reply's first page actually delivered are remembered as read.
+        let delivered = delivered_last(&reply.0, &read);
+        self.remember_unit_read(binding, read, delivered);
+        Ok(Some(reply))
     }
 
-    /// Remembers `read` as this session's last read of its unit, for the window-edit guard;
-    /// nothing is kept while the context epoch is unknown.
-    pub(super) fn remember_unit_read(&self, binding: &BindingRef, read: UnitRead) {
+    /// Remembers `read` as this session's last read of its unit, for the window-edit guard,
+    /// with the unit lines `read.first..=delivered_last` (the last line the reply actually
+    /// delivered); nothing is kept when none was delivered or while the context epoch is
+    /// unknown.
+    pub(super) fn remember_unit_read(
+        &self,
+        binding: &BindingRef,
+        read: UnitRead,
+        delivered_last: u32,
+    ) {
+        let last = read.last.min(delivered_last);
+        if read.first == 0 || last < read.first {
+            return;
+        }
         let epoch = self.context_epoch(binding);
         if let Ok(mut ledger) = self.shared.ledger.lock() {
             ledger
                 .read_memory
                 .entry(binding.clone())
                 .or_default()
-                .remember_unit(epoch, &read.address, read.text);
+                .remember_unit(epoch, &read.address, read.text, read.first, last);
         }
     }
 
-    /// The text of unit `address` (`file#unit`) as this session last read it in the current
-    /// context epoch, or `None` when nothing is remembered (never read, `ide.stop`, a context
-    /// compaction, or an unknown epoch).
-    pub(super) fn remembered_unit(&self, binding: &BindingRef, address: &str) -> Option<String> {
+    /// Refreshes the units this session remembers of `path` after its own write: `map` is the
+    /// address map of the written text and `text` that text. Units read whole take the new text;
+    /// units read in part are forgotten (see `ReadMemory::refresh_file_units`).
+    pub(super) fn refresh_unit_memory(
+        &self,
+        binding: &BindingRef,
+        path: &str,
+        map: &AddressMap,
+        text: &str,
+    ) {
+        let epoch = self.context_epoch(binding);
+        let current = |address: &str| -> Option<(String, u32)> {
+            let index = (0..map.units().len())
+                .find(|&index| canonical(Path::new(path), map, index) == address)?;
+            let span = map.units()[index].span;
+            Some((crate::lang::slice_lines(text, span), span.len()))
+        };
+        if let Ok(mut ledger) = self.shared.ledger.lock()
+            && let Some(memory) = ledger.read_memory.get_mut(binding)
+        {
+            memory.refresh_file_units(epoch, path, &current);
+        }
+    }
+
+    /// What this session last read of unit `address` (`file#unit`) in the current context epoch:
+    /// the unit's text then and the unit lines the read showed. `None` when nothing is
+    /// remembered (never read, `ide.stop`, a context compaction, or an unknown epoch).
+    pub(super) fn remembered_unit(
+        &self,
+        binding: &BindingRef,
+        address: &str,
+    ) -> Option<crate::assistance::batch::RememberedUnit> {
         let epoch = self.context_epoch(binding);
         let ledger = self.shared.ledger.lock().ok()?;
-        ledger
-            .read_memory
-            .get(binding)?
-            .unit_text(epoch, address)
-            .map(str::to_owned)
+        let found = ledger.read_memory.get(binding)?.unit_text(epoch, address)?;
+        Some(crate::assistance::batch::RememberedUnit {
+            text: found.text.clone(),
+            first: found.first,
+            last: found.last,
+        })
     }
 
     /// Wraps a rendered unit read as the paged `read` reply of the job.
@@ -342,6 +421,29 @@ mod tests {
         read_unit(Path::new("f.rs"), &map, &src, &request)
             .unwrap_or_else(|| panic!("no unit: {text}"))
             .0
+    }
+
+    /// A paged reply counts as read only up to the last row it delivered whole; a complete one
+    /// counts as read to the unit's last line.
+    #[test]
+    fn a_paged_reply_remembers_only_the_delivered_rows() {
+        let read = UnitRead {
+            address: "f.rs#Foo".into(),
+            text: String::new(),
+            first: 1,
+            last: 10,
+        };
+        let page = |text: &str, truncated: bool| PeerReply::Complete {
+            kind: ResultKind::Read,
+            text: text.to_owned(),
+            detail_ref: None,
+            truncated,
+            continuation: truncated,
+        };
+        assert_eq!(delivered_last(&page("h\n1\ta\n2\tb\n", false), &read), 10);
+        assert_eq!(delivered_last(&page("h\n1\ta\n2\tb\n", true), &read), 2);
+        assert_eq!(delivered_last(&page("h\n1\ta\n2\tb", true), &read), 1);
+        assert_eq!(delivered_last(&page("h\n", true), &read), 0);
     }
 
     /// A unit reads whole with its extent, numbered from 1 inside the unit.

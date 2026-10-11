@@ -8437,7 +8437,8 @@ async fn configured_product_task_diff_includes_committed_and_uncommitted_changes
 
 /// A diff that names no mode answers only what changed since the activation's previous diff: the
 /// first call is whole, a repeat on an unchanged tree is one short line, a later change shows only
-/// its own hunk, and naming a mode always answers the whole diff.
+/// its own hunk, returning to earlier bytes is reported again, and naming a mode answers the
+/// whole diff. Continuation pages count as delivered and never suppress a newly changed late hunk.
 #[tokio::test]
 async fn configured_product_default_diff_answers_only_what_changed_since_the_last_diff() {
     let fixture = ProductFixture::new(json!([]));
@@ -8496,6 +8497,99 @@ async fn configured_product_default_diff_answers_only_what_changed_since_the_las
             && whole_text.contains("+changed after the diff"),
         "{whole_text}"
     );
+
+    // History is not the previous capture: A -> B -> A must deliver the returning A.
+    std::fs::write(fixture.root.join("tracked.txt"), "intermediate diff\n").unwrap();
+    let intermediate = actor.call(&fixture, "ide.diff", json!({})).await;
+    let intermediate = actor.settle(&fixture, intermediate).await;
+    assert!(
+        intermediate["text"]
+            .as_str()
+            .unwrap()
+            .contains("+intermediate diff"),
+        "{intermediate}"
+    );
+    std::fs::write(fixture.root.join("tracked.txt"), "changed after the diff\n").unwrap();
+    let returned = actor.call(&fixture, "ide.diff", json!({})).await;
+    let returned = actor.settle(&fixture, returned).await;
+    assert!(
+        returned["text"]
+            .as_str()
+            .unwrap()
+            .contains("+changed after the diff"),
+        "{returned}"
+    );
+
+    // More than one page must stay new until delivered, then repeat as one short line.
+    for index in 0..40 {
+        std::fs::write(
+            fixture.root.join(format!("incremental-{index:02}.txt")),
+            format!("incremental-marker-{index:02}\n"),
+        )
+        .unwrap();
+    }
+    let first = actor.call(&fixture, "ide.diff", json!({})).await;
+    let mut page = actor.settle(&fixture, first).await;
+    let reference = page["detail_ref"].as_str().unwrap().to_owned();
+    let mut delivered = String::new();
+    let mut page_count = 0;
+    loop {
+        assert_eq!(page["kind"], "diff", "{page}");
+        delivered.push_str(page["text"].as_str().unwrap());
+        page_count += 1;
+        assert!(page_count < 16, "incremental pages did not terminate");
+        if page["continuation"] == false {
+            break;
+        }
+        page = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+            .await;
+    }
+    assert!(page_count > 1);
+    for index in 0..40 {
+        assert_eq!(
+            delivered
+                .matches(&format!("+incremental-marker-{index:02}"))
+                .count(),
+            1,
+            "{delivered}"
+        );
+    }
+    let repeated = actor.call(&fixture, "ide.diff", json!({})).await;
+    let repeated = actor.settle(&fixture, repeated).await;
+    assert!(
+        repeated["text"]
+            .as_str()
+            .unwrap()
+            .contains("no changes since your last diff"),
+        "{repeated}"
+    );
+    assert_eq!(repeated["continuation"], false, "{repeated}");
+
+    std::fs::write(
+        fixture.root.join("incremental-39.txt"),
+        "changed-late-hunk\n",
+    )
+    .unwrap();
+    let first = actor.call(&fixture, "ide.diff", json!({})).await;
+    let mut page = actor.settle(&fixture, first).await;
+    let reference = page["detail_ref"].as_str().unwrap().to_owned();
+    let mut changed = String::new();
+    let mut page_count = 0;
+    loop {
+        assert_eq!(page["kind"], "diff", "{page}");
+        changed.push_str(page["text"].as_str().unwrap());
+        page_count += 1;
+        assert!(page_count < 16, "late incremental hunk was lost");
+        if page["continuation"] == false {
+            break;
+        }
+        page = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+            .await;
+    }
+    assert!(changed.contains("+changed-late-hunk"), "{changed}");
+    assert!(!changed.contains("+incremental-marker-"), "{changed}");
 
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
     assert_eq!(stopped["kind"], "stop", "{stopped}");
@@ -8954,7 +9048,8 @@ async fn diff_with_an_untracked_symlink_lists_it_and_completes() {
 
 /// The degraded plain `git diff` fallback never answers for a path the exact capture refuses: a
 /// tracked directory replaced by a symlink to a directory outside the worktree refuses the whole
-/// diff instead of delivering hunks for the paths behind it.
+/// diff instead of delivering hunks for the paths behind it. Before refusal, default fallback
+/// calls suppress repeats, report returning hunks again and keep explicit full diffs available.
 #[tokio::test]
 async fn diff_plain_fallback_refuses_a_path_the_exact_capture_refuses() {
     let fixture = ProductFixture::new(json!([]));
@@ -8996,6 +9091,52 @@ async fn diff_plain_fallback_refuses_a_path_the_exact_capture_refuses() {
             .unwrap()
             .contains("exact capture unavailable"),
         "{degraded}"
+    );
+
+    let repeated = actor.call(&fixture, "ide.diff", json!({})).await;
+    let repeated = actor.settle(&fixture, repeated).await;
+    assert!(
+        repeated["text"]
+            .as_str()
+            .unwrap()
+            .contains("no changes since your last diff"),
+        "{repeated}"
+    );
+    assert!(
+        repeated["text"]
+            .as_str()
+            .unwrap()
+            .contains("exact capture unavailable"),
+        "{repeated}"
+    );
+    std::fs::write(
+        fixture.root.join("a-observed.txt"),
+        "intermediate fallback\n",
+    )
+    .unwrap();
+    let changed = actor.call(&fixture, "ide.diff", json!({})).await;
+    let changed = actor.settle(&fixture, changed).await;
+    assert!(
+        changed["text"]
+            .as_str()
+            .unwrap()
+            .contains("+intermediate fallback"),
+        "{changed}"
+    );
+    std::fs::write(fixture.root.join("a-observed.txt"), "unreconciled\n").unwrap();
+    let returned = actor.call(&fixture, "ide.diff", json!({})).await;
+    let returned = actor.settle(&fixture, returned).await;
+    assert!(
+        returned["text"].as_str().unwrap().contains("+unreconciled"),
+        "{returned}"
+    );
+    let full = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let full = actor.settle(&fixture, full).await;
+    assert!(
+        full["text"].as_str().unwrap().contains("+unreconciled"),
+        "{full}"
     );
 
     let outside = fixture.base.join("outside-linked");
@@ -10829,7 +10970,8 @@ async fn configured_product_batch_old_not_found_refuses_and_retries_the_same_ope
         batch_without_status_plate(&retried_text),
         format!(
             "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#@header:1 (L1)  replaced \
-             (3 lines → 1)\n  src/batch.rs#second (L3-5)  replaced (3 lines → 3)\n\
+             (3 lines → 1); was:\n    1\tpub fn first() -> i32 {{\n    2\t    1\n    3\t}}\n\
+             \x20 src/batch.rs#second (L3-5)  replaced (3 lines → 3)\n\
              lines after 1 moved -2",
             batch_diagnostics_segment(&retried)
         ),
@@ -11014,7 +11156,7 @@ async fn configured_product_batch_terminator_old_empty_lines_and_same_line_inser
         batch_without_status_plate(&edit_text),
         format!(
             "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#alpha:2 (L2)  replaced \
-             (1 lines → 1)\n  src/batch.rs#beta:1  deleted (1 lines)\nlines after 2 moved -1",
+             (1 lines → 1)\n  src/batch.rs#beta:1  deleted (1 lines); was:\n    4\t\nlines after 2 moved -1",
             batch_diagnostics_segment(&edit)
         ),
         "{edit_text}"
@@ -11075,7 +11217,8 @@ async fn configured_product_batch_terminator_old_empty_lines_and_same_line_inser
         batch_without_status_plate(&insert_text),
         format!(
             "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#helper (L5-7)  inserted \
-             (3 lines)\n  src/batch.rs#beta (L9-11)  replaced (3 lines → 3)\n\
+             (3 lines)\n  src/batch.rs#beta (L9-11)  replaced (3 lines → 3); was:\n    \
+             4\tpub fn beta() -> i32 {{\n    5\t    2\n    6\t}}\n\
              lines after 4 moved +5",
             batch_diagnostics_segment(&insert)
         ),
@@ -11849,7 +11992,8 @@ async fn configured_product_batch_ranges_read_then_edit_by_those_lines_without_r
         batch_without_status_plate(&edit_text),
         format!(
             "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#alpha:2 (L6)  replaced \
-             (1 lines → 1)\n  src/batch.rs#beta:2 (L10)  replaced (1 lines → 1)",
+             (1 lines → 1); was:\n    6\t    helper(1)\n  src/batch.rs#beta:2 (L10)  \
+             replaced (1 lines → 1); was:\n    10\t    helper(2)",
             batch_diagnostics_segment(&edit)
         ),
         "{edit_text}"
@@ -12045,7 +12189,7 @@ async fn configured_product_batch_legacy_single_change_replies_stay_byte_identic
         batch_without_status_plate(&lines_text),
         format!(
             "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#alpha:2 (L2)  replaced \
-             (1 lines → 1)",
+             (1 lines → 1); was:\n    2\t    1",
             batch_diagnostics_segment(&lines)
         ),
         "{lines_text}"

@@ -1807,7 +1807,8 @@ mod tests {
         assert!(text.ends_with("diagnostics: current_clean"), "{text}");
     }
 
-    /// Names the changed file or incomplete read and directs the caller to the newest usable reference.
+    /// A stale write names the file changed during application, confirms no write occurred,
+    /// and directs the caller to repeat the call without teaching file-version references.
     #[test]
     fn stale_edit_text_explains_why_no_write_occurred() {
         let reply = PeerReply::Edit {
@@ -1818,11 +1819,31 @@ mod tests {
         };
         let rendered = render(reply, Envelope::TextOnly).unwrap();
         let text = text_of(&rendered);
+        // symbol-read-edit-v1 §3.2 rule 6: a write that found the file changed answers with the
+        // contract sentence and a repeat-the-call repair, and mentions no file-version reference.
         assert!(text.contains("No write occurred"));
-        assert!(text.contains("the file changed"));
         assert!(
-            text.contains("Re-read the symbol with ide.read, then retry")
-                && !text.contains("source_ref"),
+            text.contains(
+                "edit refused: src/lib.rs changed while the edit was applied. Repair: repeat the call"
+            ) && !text.contains("source_ref"),
+            "{text}"
+        );
+    }
+
+    /// A stale deprecated `source_ref` names itself and says to send the edit without it.
+    #[test]
+    fn stale_source_ref_note_replaces_the_changed_while_applied_sentence() {
+        let reply = PeerReply::Edit {
+            result: edit_result(EditOutcome::StaleSource).unwrap(),
+            diagnostics: EditDiagnostics::Unknown {},
+            note: Some("the supplied source_ref does not match this file's current text. Repair: send the edit without source_ref".into()),
+            operation: None,
+        };
+        let rendered = render(reply, Envelope::TextOnly).unwrap();
+        let text = text_of(&rendered);
+        assert!(
+            text.contains("the supplied source_ref does not match")
+                && !text.contains("changed while the edit was applied"),
             "{text}"
         );
     }

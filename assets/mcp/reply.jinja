@@ -321,7 +321,7 @@ edit: {{ outcome }}; path {{ result.path }}; diagnostics: pending; the project c
 {%- endif -%}
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "stale_source" -%}
-edit: stale_source; path {{ result.path }}. No write occurred; the file changed. Re-read the symbol with ide.read, then retry{% if note %}{{ "\n" }}{{ note }}{% endif %}
+edit: stale_source; path {{ result.path }}. No write occurred — {% if note %}{{ note }}{% else %}edit refused: {{ result.path }} changed while the edit was applied. Repair: repeat the call{% endif %}
 {%- endif -%}
 {%- if state == "edit" and result.outcome == "conflicting_duplicate" -%}
 edit: conflicting_duplicate; path {{ result.path }}. No write occurred; read the target with ide.read before using a new operation_id

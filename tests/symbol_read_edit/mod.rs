@@ -503,3 +503,247 @@ async fn window_edits_are_guarded_by_the_last_read() {
     assert!(text.contains("; was:\n    3\t    let a = x * 9;"), "{text}");
     finished(actor, daemon, &fixture).await;
 }
+
+/// The guard covers only the lines the session read, and follows the session's own edits: a
+/// window outside a partial read is unguarded and echoes what it replaces (so lines the agent
+/// never saw are not overwritten silently), and a window copied from the session's own previous
+/// edit reply is not "changed since your read".
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn the_guard_covers_the_lines_read_and_follows_own_edits() {
+    let fixture = batch_edit_fixture(ORIGINAL);
+    let epoch = fixture.base.join("context-epoch");
+    std::fs::write(&epoch, "1").unwrap();
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let env = [("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE", epoch.to_str().unwrap())];
+    let daemon = fixture
+        .spawn_configured_daemon_with_env(Some(&home), false, Duration::from_secs(30), None, &env)
+        .await;
+    let mut actor = batch_started_actor(&fixture, "sre-guard-span", FILE).await;
+    // F4: only unit lines 1-3 were read; line 4 changes on disk; an edit of line 4 is unguarded
+    // and shows the old line it replaces.
+    call(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"symbol":"src/batch.rs#utility:1-3"}),
+    )
+    .await;
+    std::fs::write(fixture.root.join(FILE), ORIGINAL.replace("a * 2", "a * 9")).unwrap();
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":"src/batch.rs#utility:4-4","content":"    a * 5"}),
+    )
+    .await;
+    assert!(
+        text.contains(
+            "src/batch.rs#utility:4 (L9)  replaced (1 lines → 1); was:\n    4\t    a * 9"
+        ),
+        "{text}"
+    );
+    assert!(on_disk(&fixture).contains("    a * 5"));
+    // F3: read the whole unit, edit a window, then edit again from the edit's own address: the
+    // remembered unit follows the session's write, so nothing is "changed since your read".
+    reset(&fixture);
+    call(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"symbol":"src/batch.rs#utility"}),
+    )
+    .await;
+    let (_, first) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":"src/batch.rs#utility:3-3","content":"    let a = x + 1;"}),
+    )
+    .await;
+    assert!(
+        first.contains("src/batch.rs#utility:3 (L8)  replaced"),
+        "{first}"
+    );
+    let (_, second) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":"src/batch.rs#utility:3-3","content":"    let a = x + 2;"}),
+    )
+    .await;
+    assert!(
+        second.contains("src/batch.rs#utility:3 (L8)  replaced")
+            && !second.contains("changed since your read"),
+        "{second}"
+    );
+    assert!(on_disk(&fixture).contains("let a = x + 2;"));
+    finished(actor, daemon, &fixture).await;
+}
+
+/// E15 and the open-ended window: a stale deprecated `source_ref` is still refused, with its own
+/// wording and no write; `:N-` replaces from line N to the unit's last line.
+#[tokio::test]
+async fn a_stale_source_ref_is_refused_and_an_open_window_reaches_the_unit_end() {
+    let (fixture, daemon, mut actor) = started("sre-stale").await;
+    let (reply, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"path":FILE,"old":"a * 2","new":"a * 3","source_ref":"no-such-ref-1"}),
+    )
+    .await;
+    assert_eq!(reply["result"]["outcome"], "stale_source", "{reply}");
+    assert!(
+        text.contains("the supplied source_ref does not match")
+            && !text.contains("changed while the edit was applied"),
+        "{text}"
+    );
+    assert_eq!(on_disk(&fixture), ORIGINAL);
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":"src/batch.rs#utility:4-","content":"    a * 7\n}"}),
+    )
+    .await;
+    assert!(
+        text.contains("src/batch.rs#utility:4-5 (L9-10)  replaced (2 lines → 2)"),
+        "{text}"
+    );
+    assert_eq!(on_disk(&fixture), ORIGINAL.replace("a * 2", "a * 7"));
+    finished(actor, daemon, &fixture).await;
+}
+
+/// A file-numbered `lines` edit echoes the old lines it replaces, and an edit by a relative
+/// `path:line` replaces the whole unit or region that holds the line (symbol-read-edit-v1 §1).
+#[tokio::test]
+async fn lines_edits_echo_and_locations_address_units_and_regions() {
+    let (fixture, daemon, mut actor) = started("sre-lines").await;
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"path":FILE,"lines":"9-9","content":"    a * 4"}),
+    )
+    .await;
+    assert!(
+        text.contains("(L9)  replaced (1 lines → 1); was:\n    9\t    a * 2"),
+        "{text}"
+    );
+    assert_eq!(on_disk(&fixture), ORIGINAL.replace("a * 2", "a * 4"));
+    // A location inside a function replaces that whole function.
+    reset(&fixture);
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":"src/batch.rs:9","content":"pub fn utility(x: u32) -> u32 {\n    x\n}"}),
+    )
+    .await;
+    assert!(
+        text.contains("src/batch.rs#utility (L6-8)  replaced (5 lines → 3)"),
+        "{text}"
+    );
+    assert!(!on_disk(&fixture).contains("Doubles"));
+    // A location inside a region replaces the region.
+    reset(&fixture);
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":"src/batch.rs:2","content":"use std::io;"}),
+    )
+    .await;
+    assert!(text.contains("#@imports"), "{text}");
+    let after = on_disk(&fixture);
+    assert!(
+        after.contains("use std::io;") && !after.contains("use std::fmt;"),
+        "{after}"
+    );
+    finished(actor, daemon, &fixture).await;
+}
+
+/// A file with a small function and a `big` one whose numbered text is larger than one reply
+/// page. Unit lines of `big`: 1 is its header, 2-6001 the repeated `let`, 6002-6003 its tail.
+fn paged_source() -> String {
+    format!(
+        "pub fn small() -> u32 {{\n    1\n}}\n\npub fn big() -> u32 {{\n{}    7\n}}\n",
+        "    let a = 1;\n".repeat(6000)
+    )
+}
+
+/// Starts a daemon with a known context epoch (the window guard remembers nothing without one)
+/// and an actor warmed on [`paged_source`].
+#[cfg(feature = "test-seams")]
+async fn paged_started(name: &'static str) -> (ProductFixture, OwnedDaemon, ProductActor) {
+    let fixture = batch_edit_fixture(&paged_source());
+    let epoch = fixture.base.join("context-epoch");
+    std::fs::write(&epoch, "1").unwrap();
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let env = [("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE", epoch.to_str().unwrap())];
+    let daemon = fixture
+        .spawn_configured_daemon_with_env(Some(&home), false, Duration::from_secs(30), None, &env)
+        .await;
+    let actor = batch_started_actor(&fixture, name, FILE).await;
+    (fixture, daemon, actor)
+}
+
+/// A unit read that is cut into pages counts as read only up to the last row its first page
+/// delivered: a window edit of a row on a later page is unguarded and echoes what it replaces,
+/// although the unit is unchanged since the read (symbol-read-edit-v1 §3.2 rule 3).
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn a_paged_read_guards_only_the_rows_it_delivered() {
+    let (fixture, daemon, mut actor) = paged_started("sre-paged").await;
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"symbol":"src/batch.rs#big"}),
+    )
+    .await;
+    assert!(
+        text.contains("page 1;") && !text.contains("\n5990\t"),
+        "the read must be cut before row 5990: {}",
+        &text[..text.len().min(300)]
+    );
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":"src/batch.rs#big:5990-5990","content":"    let a = 2;"}),
+    )
+    .await;
+    assert!(text.contains("; was:\n    5990\t    let a = 1;"), "{text}");
+    finished(actor, daemon, &fixture).await;
+}
+
+/// A batch read remembers a unit only when its block is delivered in the reply: a block cut from
+/// the reply leaves its unit unguarded, so a window edit there echoes what it replaces.
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn a_batch_read_guards_only_the_blocks_it_delivered() {
+    let (fixture, daemon, mut actor) = paged_started("sre-batch-cut").await;
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"symbols":["src/batch.rs#small","src/batch.rs#big"]}),
+    )
+    .await;
+    assert!(
+        text.contains("1\tpub fn small() -> u32 {") && !text.contains("src/batch.rs#big  ("),
+        "the big block must be cut: {}",
+        &text[..text.len().min(400)]
+    );
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":"src/batch.rs#big:100-100","content":"    let a = 2;"}),
+    )
+    .await;
+    assert!(text.contains("; was:\n    100\t    let a = 1;"), "{text}");
+    finished(actor, daemon, &fixture).await;
+}

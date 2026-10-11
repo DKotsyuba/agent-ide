@@ -576,6 +576,9 @@ struct Ledger {
     /// Per active binding, the blocks `ide.read {items}` delivered, for the unchanged answer.
     /// Cleared at the same points `feedback` is cleared.
     read_memory: BTreeMap<BindingRef, super::batch::ReadMemory>,
+    /// Per binding, delivered diff hunks still present in the latest capture. Shared with
+    /// continuation delivery, bounded by snapshots, and cleared when the binding ends.
+    diff_seen: BTreeMap<BindingRef, BTreeSet<u64>>,
     /// Pending `job-ready` registrations (OUTBOX §3.2) by result reference, with the epoch the
     /// fact is fenced at; taken by the job's settlement or by a read through its own reference.
     deferred: BTreeMap<String, (super::outbox::DeferSpec, super::outbox::JobEpoch)>,
@@ -599,6 +602,7 @@ impl Default for Ledger {
             delivered: BTreeMap::new(),
             handing_over: BTreeSet::new(),
             read_memory: BTreeMap::new(),
+            diff_seen: BTreeMap::new(),
             deferred: BTreeMap::new(),
             started: BTreeMap::new(),
         }
@@ -750,6 +754,50 @@ impl RequestIds {
     }
 }
 impl Shared {
+    /// Forgets delivered hunks absent from `capture` and returns the remaining bounded
+    /// process-local identities for this binding. A poisoned ledger fails open with no
+    /// suppression; no lock survives I/O and a later return to an old hunk is delivered again.
+    pub(super) fn previous_diff_hunks(
+        &self,
+        binding: &BindingRef,
+        capture: &crate::changes::DiffResult,
+    ) -> BTreeSet<u64> {
+        let Ok(mut ledger) = self.ledger.lock() else {
+            return BTreeSet::new();
+        };
+        let seen = ledger.diff_seen.entry(binding.clone()).or_default();
+        seen.retain(|fingerprint| capture.captured_fingerprints().contains(fingerprint));
+        seen.clone()
+    }
+
+    /// Records this binding's complete delivered page hunks for the next incremental capture,
+    /// including pages collected through inspect. Split parts are not mistaken for a complete
+    /// hunk and binary summaries never prove unchanged content; a poisoned ledger leaves
+    /// later calls unsuppressed.
+    /// The finite memory resets at its ceiling instead of hiding unseen work.
+    pub(super) fn remember_diff_hunks(
+        &self,
+        binding: &BindingRef,
+        result: &crate::changes::DiffResult,
+    ) {
+        if let Ok(mut ledger) = self.ledger.lock() {
+            let seen = ledger.diff_seen.entry(binding.clone()).or_default();
+            // ponytail: 4096 retained hunks per binding; increase the bounded ceiling if real
+            // captures regularly exceed it. Resetting repeats work instead of hiding new hunks.
+            if seen.len() + result.selected_hunks().len() > snapshots::MAX_SEEN_DIFF_HUNKS {
+                seen.clear();
+            }
+            seen.extend(
+                result
+                    .selected_hunks()
+                    .iter()
+                    .filter(|hunk| !hunk.is_binary())
+                    .map(crate::changes::DiffHunk::fingerprint)
+                    .filter(|fingerprint| result.captured_fingerprints().contains(fingerprint)),
+            );
+        }
+    }
+
     /// The call id of the call that queued the job behind `reference`, while it is remembered.
     fn request_of(&self, reference: &str) -> Option<String> {
         self.requests
@@ -1702,7 +1750,6 @@ impl WorkerHandle {
                     next_revoke_retry: None,
                     registered: BTreeMap::new(),
                     baselines: BTreeMap::new(),
-                    diff_seen: BTreeMap::new(),
                     heads: BTreeMap::new(),
                     source_sequence: 0,
                     uncertain: std::collections::BTreeSet::new(),
@@ -1892,6 +1939,7 @@ impl WorkerHandle {
             ledger.feedback.remove(&binding);
             ledger.delivered.remove(&binding);
             ledger.read_memory.remove(&binding);
+            ledger.diff_seen.remove(&binding);
             let live = ledger.details.keys().cloned().collect::<BTreeSet<_>>();
             ledger
                 .deferred
@@ -2589,10 +2637,6 @@ struct Worker<'a> {
     registered: BTreeMap<BindingRef, RegisteredPaths>,
     /// Durable partial activation baselines retained for same-binding diff provenance.
     baselines: BTreeMap<BindingRef, crate::workspace::git::BaselineContext>,
-    /// Per binding: fingerprints of the diff hunks already delivered to the caller, so the next
-    /// default `ide.diff` answers only what changed since. Bounded (see `snapshots`); dropped with
-    /// the binding.
-    diff_seen: BTreeMap<BindingRef, BTreeSet<u64>>,
     /// Per binding: when `HEAD` was last probed, successfully or not, and the checked-out branch or
     /// detached commit last read (first by its start); a failed read keeps the earlier reading.
     heads: BTreeMap<
@@ -5478,7 +5522,7 @@ impl<'a> Worker<'a> {
             })
         });
         let Some(source) = source else {
-            return self
+            let mut stale = self
                 .settle_edit(
                     prepared,
                     &request,
@@ -5486,7 +5530,11 @@ impl<'a> Worker<'a> {
                     None,
                     None,
                 )
-                .await;
+                .await?;
+            if let PeerReply::Edit { note, .. } = &mut stale.0 {
+                *note = Some(symbols::STALE_SOURCE_REF_NOTE.to_owned());
+            }
+            return Ok(stale);
         };
         self.edit_with_source(job, request, prepared, source, true)
             .await
@@ -6092,7 +6140,6 @@ impl<'a> Worker<'a> {
         self.leases.remove(binding);
         self.registered.remove(binding);
         self.baselines.remove(binding);
-        self.diff_seen.remove(binding);
         self.heads.remove(binding);
         if let Ok(mut activated) = self.shared.activated.lock() {
             activated.remove(&binding.fingerprint());
@@ -6107,6 +6154,7 @@ impl<'a> Worker<'a> {
             ledger.feedback.remove(binding);
             ledger.delivered.remove(binding);
             ledger.read_memory.remove(binding);
+            ledger.diff_seen.remove(binding);
         }
     }
 
@@ -6303,6 +6351,8 @@ impl InspectFailure {
 /// source paths or bytes and needs no read-path proof; other path-less details retain the
 /// whole-tree proof requirement. A semantic Context also proves each retained definition and
 /// reference path, so a newly denied secondary file invalidates its cached page.
+/// Complete diff hunks on a delivered continuation join the binding's incremental memory;
+/// an authorization, freshness or encoding refusal never records that page as delivered.
 async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, request: Inspection) {
     if fault_seam("inspection") {
         panic!("agent-ide test seam: deliberate inspection panic");
@@ -6539,6 +6589,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 shared.set_diff_page(&request.reference, None);
                 return Err(InspectFailure::new(FailureCode::Internal));
             };
+            shared.remember_diff_hunks(&request.binding, &advanced);
             if let Ok(mut ledger) = shared.ledger.lock()
                 && let Some(detail) = ledger.details.get_mut(&request.reference)
             {
@@ -10359,7 +10410,6 @@ mod stop_retry_tests {
             next_revoke_retry: None,
             registered: BTreeMap::new(),
             baselines: BTreeMap::new(),
-            diff_seen: BTreeMap::new(),
             heads: BTreeMap::new(),
             source_sequence: 0,
             admission: Arc::new(Mutex::new(admission_controller())),
@@ -10975,6 +11025,130 @@ mod stop_retry_tests {
         }
     }
 
+    /// A whole-content replacement built by `apply_patch` carries the digest of the bytes its
+    /// hunks were applied to: a file that changed since is refused as changed while the edit was
+    /// applied and stays untouched, while a matching digest writes (symbol-read-edit-v1 §3.2
+    /// rule 6).
+    #[tokio::test]
+    async fn a_patch_replacement_is_refused_when_the_file_changed_meanwhile() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        let source = "sym card\nsym btn\nmark\nend\nend\n";
+        std::fs::write(fixture.root.join("a.gamma"), source).unwrap();
+        git_commit(&fixture.root, "patch fixture");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        worker.edits.install_schema().await.unwrap();
+        let (_binding, _authority) =
+            activate_worktree(&mut worker, "line-actor", "patch-start").await;
+        let stale = blake3::hash(b"sym card\nsym other\nend\n")
+            .to_hex()
+            .to_string();
+        let invocation = production_call(&worker, "line-actor", "patch-stale");
+        let (mut job, _cancel) = tool_job(
+            &fixture.root,
+            invocation,
+            "patch-stale",
+            AssistanceTool::Edit,
+            serde_json::json!({"operation_id":"patch-stale-op","files":[
+                {"path":"a.gamma","content":"patched\n","expect":stale}]}),
+        );
+        let refused = worker.edit(&mut job).await;
+        assert!(
+            matches!(refused, Err(FailureCode::EditRefused)),
+            "a changed file is refused"
+        );
+        assert!(
+            job.failure_detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("changed while the edit was applied"),
+            "{:?}",
+            job.failure_detail
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("a.gamma")).unwrap(),
+            source
+        );
+        let fresh = blake3::hash(source.as_bytes()).to_hex().to_string();
+        let reply = run_edit(
+            &mut worker,
+            &fixture.root,
+            "patch-fresh",
+            serde_json::json!({"operation_id":"patch-fresh-op","files":[
+                {"path":"a.gamma","content":"patched\n","expect":fresh}]}),
+        )
+        .await;
+        assert!(
+            matches!(reply, PeerReply::EditBatch { .. }),
+            "an unchanged file is written"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("a.gamma")).unwrap(),
+            "patched\n"
+        );
+    }
+
+    /// The `files` entries an `apply_patch` body is turned into pin the bytes the hunks were
+    /// applied to: when the file changes after the patch was planned (the window between the
+    /// patch's read and the multi-file write), writing those entries is refused as changed
+    /// while the edit was applied and the other writer's bytes stay (symbol-read-edit-v1 section
+    /// 3.2 rule 6). This is the production wiring of `expect`, not just the write-time check.
+    #[tokio::test]
+    async fn a_planned_patch_is_refused_when_the_file_changes_before_the_write() {
+        crate::lang::testing::install();
+        let fixture = Fixture::new();
+        let source = "sym card\nsym btn\nmark\nend\nend\n";
+        std::fs::write(fixture.root.join("a.gamma"), source).unwrap();
+        git_commit(&fixture.root, "planned patch fixture");
+        let store = fixture.store();
+        let workspace = DurableWorkspace::open(&store).await.unwrap();
+        let mut worker = worker(&store, workspace, fixture.root.clone());
+        worker.observations.install_schema().await.unwrap();
+        worker.edits.install_schema().await.unwrap();
+        let (binding, _authority) =
+            activate_worktree(&mut worker, "line-actor", "plan-start").await;
+        let invocation = production_call(&worker, "line-actor", "plan-patch");
+        let (mut job, _cancel) = tool_job(
+            &fixture.root,
+            invocation,
+            "plan-patch",
+            AssistanceTool::Edit,
+            serde_json::json!({}),
+        );
+        let parsed = crate::assistance::patch::parse_patch(
+            "*** Begin Patch\n*** Update File: a.gamma\n@@\n-mark\n+MARK\n*** End Patch\n",
+        )
+        .unwrap();
+        let files = worker
+            .patch_files(&mut job, &binding, parsed)
+            .await
+            .unwrap();
+        // Another writer changes the file after the plan and before the write.
+        let theirs = "sym card\nsym btn\nmark\nend\nend\n// theirs\n";
+        std::fs::write(fixture.root.join("a.gamma"), theirs).unwrap();
+        job.parameters = serde_json::json!({"operation_id":"plan-patch-op","files":files});
+        let refused = worker.edit(&mut job).await;
+        assert!(
+            matches!(refused, Err(FailureCode::EditRefused)),
+            "a changed file is refused"
+        );
+        assert!(
+            job.failure_detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("changed while the edit was applied"),
+            "{:?}",
+            job.failure_detail
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("a.gamma")).unwrap(),
+            theirs
+        );
+    }
+
     /// A line-range edit applies only on a retained same-path observation whose bytes are still
     /// current, reports its net line movement, and never writes on a refused base; the
     /// symbol form validates an explicit `source_ref` the same way and stays optional.
@@ -11175,9 +11349,10 @@ mod stop_retry_tests {
                         source_ref: None,
                         ..
                     },
-                    note: None,
+                    // A stale supplied source_ref names itself in the note.
+                    note: Some(note),
                     ..
-                }
+                } if note == symbols::STALE_SOURCE_REF_NOTE
             ),
             "{reply:?}"
         );
