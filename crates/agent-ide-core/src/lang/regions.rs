@@ -88,7 +88,9 @@ pub fn scan_gap(
     rules: &RegionRules,
 ) -> Vec<RawRegion> {
     let mut out = Vec::new();
-    if first > last {
+    // A caller may pass a gap that runs past the text (a stale outline); only real lines count.
+    let last = last.min(lines.len() as u32);
+    if first == 0 || first > last {
         return out;
     }
     let (f, l) = (first as usize - 1, last as usize - 1);

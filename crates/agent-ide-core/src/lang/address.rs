@@ -544,21 +544,34 @@ impl AddressMap {
             symbol: &'a Symbol,
             names: Vec<String>,
             depth: u8,
+            /// The symbol's range clamped into the file: a server may report lines past its end.
+            span: LineRange,
         }
-        fn flatten<'a>(level: &'a [Symbol], names: &[String], depth: u8, out: &mut Vec<Flat<'a>>) {
+        fn flatten<'a>(
+            level: &'a [Symbol],
+            names: &[String],
+            depth: u8,
+            total: u32,
+            out: &mut Vec<Flat<'a>>,
+        ) {
             for symbol in level {
                 let mut own = names.to_vec();
                 own.push(symbol.name.clone());
+                let last = total.max(1);
+                let start = symbol.range.start.clamp(1, last);
+                let end = symbol.range.end.clamp(start, last);
                 out.push(Flat {
                     symbol,
                     names: own.clone(),
                     depth,
+                    span: LineRange::new(start, end),
                 });
-                flatten(&symbol.children, &own, depth.saturating_add(1), out);
+                flatten(&symbol.children, &own, depth.saturating_add(1), total, out);
             }
         }
+        let line_total = super::line_count(source);
         let mut flat = Vec::new();
-        flatten(symbols, &[], 0, &mut flat);
+        flatten(symbols, &[], 0, line_total, &mut flat);
         // Ordinals: position inside the group of equal raw paths by (rank, file order).
         let mut ordinals = vec![1u32; flat.len()];
         let mut groups: std::collections::HashMap<&[String], Vec<usize>> = Default::default();
@@ -589,10 +602,9 @@ impl AddressMap {
             segments
         };
         // Top-level items in file order: symbol subtrees and regions.
-        let line_total = super::line_count(source);
         let lines: Vec<&str> = source.lines().collect();
         let mut tops: Vec<usize> = (0..flat.len()).filter(|&i| flat[i].depth == 0).collect();
-        tops.sort_by_key(|&i| (flat[i].symbol.range.start, i));
+        tops.sort_by_key(|&i| (flat[i].span.start, i));
         enum Item {
             Symbol(usize),
             Region(RawRegion),
@@ -600,8 +612,7 @@ impl AddressMap {
         let mut items: Vec<(u32, Item)> = Vec::new();
         let mut cursor = 1u32;
         for &i in &tops {
-            let range = flat[i].symbol.range;
-            let (start, end) = (range.start.max(1), range.end.min(line_total.max(1)));
+            let (start, end) = (flat[i].span.start, flat[i].span.end);
             if start > cursor {
                 for r in scan_gap(&lines, cursor, start - 1, cursor == 1, rules) {
                     items.push((r.span.start, Item::Region(r)));
@@ -680,7 +691,7 @@ impl AddressMap {
                         units.push(Unit {
                             address: Address::new(Some(file.clone()), segments, None),
                             kind: UnitKind::Symbol(f.symbol.kind),
-                            span: f.symbol.range,
+                            span: f.span,
                             depth: f.depth,
                             symbol: Some(i),
                             signature: f.symbol.signature.clone(),
@@ -842,8 +853,9 @@ impl AddressMap {
             None => (None, false),
         };
         let lines = window.unwrap_or(span);
-        let from = self.line_starts[lines.start as usize - 1];
-        let to = self.line_starts[(lines.end as usize).min(self.line_starts.len() - 1)];
+        let last_start = self.line_starts.len() - 1;
+        let from = self.line_starts[(lines.start as usize - 1).min(last_start)];
+        let to = self.line_starts[(lines.end as usize).min(last_start)];
         Ok(Resolved {
             unit,
             span,

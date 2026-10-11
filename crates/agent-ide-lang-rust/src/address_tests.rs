@@ -52,3 +52,28 @@ fn address_regions_rust() {
         ]
     );
 }
+
+/// Every map operation the worker uses answers on a tiny two-function file without panicking.
+#[test]
+fn address_operations_on_a_tiny_file() {
+    let source =
+        "/// Answers cold.\npub fn value() -> i32 { 7 }\n\npub fn caller() -> i32 { value() }\n";
+    let outline = LANGUAGE
+        .support()
+        .outline_from_source(Path::new("src/lib.rs"), source)
+        .unwrap();
+    let map = AddressMap::build(&outline, source);
+    for symbol in &outline.symbols {
+        assert!(map.address_of(symbol).is_some(), "{symbol:?}");
+        assert!(map.symbol_of(map.named(&symbol.name)[0]).is_some());
+    }
+    for line in 1..=4 {
+        assert!(map.address_at(Path::new("src/lib.rs"), line).is_some());
+    }
+    let missing = match agent_ide_core::lang::address::Address::parse("src/lib.rs#missing") {
+        Ok(agent_ide_core::lang::address::Parsed::Address(address)) => address,
+        other => panic!("{other:?}"),
+    };
+    assert!(map.resolve(&missing).is_err());
+    assert!(map.near(&missing).is_empty());
+}

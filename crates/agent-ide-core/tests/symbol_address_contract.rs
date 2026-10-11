@@ -117,6 +117,22 @@ fn symbol_address_contract_every_line_has_one_address() {
     assert!(map.at_line(0).is_none());
 }
 
+/// A server may report symbol lines past the end of the file (or an empty file with symbols):
+/// the map still covers every real line and never panics.
+#[test]
+fn symbol_address_contract_ranges_past_the_file_are_clamped() {
+    let source = "/// Answers.\npub fn value() {}\n\npub fn caller() {}\n";
+    let symbols = vec![
+        symbol(&["value"], SymbolKind::Function, 1, 4, Vec::new()),
+        symbol(&["caller"], SymbolKind::Function, 6, 9, Vec::new()),
+    ];
+    let map = AddressMap::build_parts(Path::new("f.rs"), &symbols, source, &GENERIC_RULES);
+    assert_eq!(map.violations(source), Vec::<String>::new());
+    let empty = AddressMap::build_parts(Path::new("f.rs"), &symbols, "", &GENERIC_RULES);
+    assert!(empty.at_line(1).is_none());
+    assert!(empty.resolve(&address("f.rs#caller")).is_ok());
+}
+
 /// `N` counts from the unit's first line, so it moves only when its own unit changes: padding
 /// above a symbol leaves its address and `:N` alone, padding inside shifts only what is below.
 #[test]

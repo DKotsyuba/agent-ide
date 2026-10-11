@@ -11697,8 +11697,9 @@ async fn configured_product_symbol_pages_long_usage_and_candidate_lists() {
         .flat_map(|page| page.lines())
         .filter(|line| line.ends_with("target();"))
         .map(|line| {
-            let location = line.split_whitespace().next().unwrap();
-            location.rsplit(':').next().unwrap().parse().unwrap()
+            // `<address> (L<line>)  target();`: the absolute line is the (L..) tag.
+            let tag = line.split_once("(L").unwrap().1;
+            tag.split(')').next().unwrap().parse().unwrap()
         })
         .collect();
     lines.sort_unstable();
@@ -11714,7 +11715,7 @@ async fn configured_product_symbol_pages_long_usage_and_candidate_lists() {
     let ambiguous = actor.settle(&fixture, ambiguous).await;
     let reference = ambiguous["detail_ref"].as_str().unwrap().to_owned();
     let text = ambiguous["text"].as_str().unwrap();
-    assert!(text.contains("dup matches 22 symbols"), "{text}");
+    assert!(text.starts_with("22 candidates for dup:\n"), "{text}");
     assert!(
         text.contains(&format!("  … 2 more (ide.inspect {reference})\n")),
         "{text}"
@@ -11727,7 +11728,12 @@ async fn configured_product_symbol_pages_long_usage_and_candidate_lists() {
         rest_text.contains("; complete\ncandidates 21–22 of 22:\n"),
         "{rest_text}"
     );
-    assert_eq!(rest_text.matches("dup\n").count(), 2, "{rest_text}");
+    // Each remaining candidate row is `<address>  fn  <signature>  (lines a–b)`.
+    assert_eq!(
+        rest_text.matches("/dup  fn  pub fn dup()").count(),
+        2,
+        "{rest_text}"
+    );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
@@ -12298,8 +12304,8 @@ async fn product_graph_names_use_sites_the_server_cannot_outline() {
     let graph = actor.settle(&fixture, graph).await;
     assert_eq!(
         graph["text"].as_str().unwrap_or_default(),
-        "graph: callers of frontend/src/Layout.css#.header (depth 2, 2 nodes, 1 edges)\n\
-         \x20 ⇢ frontend/src/Layout.tsx#Layout  frontend/src/Layout.tsx:3 [typescript]\n",
+        "graph: callers of frontend/src/Layout.css#.header (L1) (depth 2, 2 nodes, 1 edges)\n\
+         \x20 ⇢ frontend/src/Layout.tsx#Layout (L3) [typescript]\n",
         "{graph}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
@@ -12988,7 +12994,11 @@ async fn configured_product_rust_lexical_outline_matches_the_server() {
         };
         assert_eq!(
             server_text,
-            render::outline_text(&lexical),
+            render::address_outline_text(
+                &lexical,
+                &agent_ide::lang::address::AddressMap::build(&lexical, &source),
+                None
+            ),
             "{file}: the lexical outline must equal the server's"
         );
         assert!(!server_text.contains("outline: from source"), "{file}");
@@ -15269,7 +15279,7 @@ async fn configured_product_pyright_symbol_tools_and_edit() {
     assert!(!text.contains("return \"hello\""), "{symbol}");
     assert!(text.contains("usages: 1 in 1 files"), "{symbol}");
     assert!(
-        text.contains("main.py:9  return Greeter(\"world\").method()"),
+        text.contains("main.py#caller:2 (L9)  return Greeter(\"world\").method()"),
         "{symbol}"
     );
     // pyright has no call hierarchy: the card says so instead of printing nothing, and a
@@ -15685,7 +15695,8 @@ async fn configured_product_edit_in_a_package_without_environment_reports_server
     assert!(
         messages.iter().any(|message| {
             let message = message.as_str().unwrap();
-            message.starts_with("libs/contracts/mod.py:2:12 error ")
+            message
+                .starts_with("libs/contracts/mod.py:2:12 libs/contracts/mod.py#value:2 (L2) error ")
                 && message.contains("not assignable")
         }),
         "the type error carries path:line:col severity: {edit}"
@@ -16430,7 +16441,7 @@ async fn configured_product_typescript_symbol_tools_and_edit() {
     );
     assert!(!text.contains("return \"hello\""), "{symbol}");
     assert!(
-        text.contains("fixture.ts#caller  fixture.ts:4") && text.contains("new Greeter().method()"),
+        text.contains("fixture.ts#caller (L4)") && text.contains("new Greeter().method()"),
         "{symbol}"
     );
     let read = actor
