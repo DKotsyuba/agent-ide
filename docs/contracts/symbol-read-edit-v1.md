@@ -17,7 +17,7 @@ Purpose: an agent works the way it naturally does. It finds an address (`file#Ty
 ```text
 ADDRESS  := FILE '#' UNIT [':' WINDOW]        src/a.rs#Store/transcript:3-5
 UNIT     := a symbol path  (Type/method, nested as printed by ide.outline)
-          | a region name   (header, imports, and the others symbol-address-v1 defines)
+          | a region name   (@header, @imports, and the others symbol-address-v1 defines; regions carry an @ prefix)
 WINDOW   := N | N '-' M | N '-'               lines counted inside the unit; 1 is the unit's first line
 LOCATION := PATH ':' LINE [':' COL]           /abs/repo/src/a.rs:130   src/a.rs:130   (no '#')
 ```
@@ -36,8 +36,8 @@ Forms (unchanged keys; the address language of `symbol`/`symbols`/`items[].symbo
 {"symbol":"src/a.rs#Store/transcript"}
 {"symbol":"src/a.rs#Store/transcript:3-5"}
 {"symbol":"/repo/src/a.rs:130"}
-{"symbol":"src/a.rs#imports"}
-{"symbols":["src/a.rs#header","src/a.rs#Store/new","/repo/src/b.rs:88"]}
+{"symbol":"src/a.rs#@imports"}
+{"symbols":["src/a.rs#@header","src/a.rs#Store/new","/repo/src/b.rs:88"]}
 {"items":[{"symbol":"src/a.rs#Store/transcript:10"},{"path":"docs/x.md","lines":"1-40"}]}
 {"path":"src/a.rs","lines":"281-315"}
 ```
@@ -54,8 +54,8 @@ src/a.rs#Store/transcript  (34 lines; file lines 120-153)
 
 - The header is the unit's canonical address (symbol-address-v1 printing) and its extent. Lines are numbered inside the unit from 1; the number column is padded to the widest shown number. Numbers never continue the file's numbering.
 - Window: `src/a.rs#Store/transcript:3-5  (lines 3-5 of 34; file lines 122-124)` and only those lines, numbered 3 to 5.
-- `LOCATION`: the whole unit, header `src/a.rs#Store/transcript  (34 lines; file lines 120-153; your line 130 is line 11)`.
-- Region: same shape, e.g. `src/a.rs#imports  (6 lines; file lines 3-8)`.
+- `LOCATION`: the whole unit, header `src/a.rs#Store/transcript  (34 lines; file lines 120-153; your line 130 is line 11)`; locations render as `src/a.rs#Store/transcript:11 (L130)` (symbol-address-v1).
+- Region: same shape, e.g. `src/a.rs#@imports  (6 lines; file lines 3-8)`.
 - No `source_ref:` line. A reply too large for one page keeps today's byte paging (`detail_ref`, `ide.inspect`).
 - Batch forms keep today's summary line and block-per-item structure; each block is the reply above, minus the repeated trailer. Item failures stay per item (`no such symbol: <address> — check ide.outline {"path":"<file>"}`).
 
@@ -103,7 +103,7 @@ Notes:
 
 - E2 numbers belong to the unit's CURRENT text; two entries of one `changes` array address the same pre-edit numbering (as `lines` entries do today) and must not overlap.
 - E1 with `ADDRESS` = a region replaces that region (the file header comment, the import block).
-- E8 places a new import with the other imports (end of the `imports` region), or after the `header` region when the file has none. It never reorders existing imports.
+- E8 places a new import with the other imports (end of the `@imports` region), or after the `@header` region when the file has none. It never reorders existing imports.
 - The pre-v1 forms keep working: `{"path":P,"lines":"a-b","content":T}` (file line numbers), `within` on an `old` entry (scope = that symbol), the `symbol`+`op` forms, `source_ref` everywhere. None of them requires `source_ref` any more.
 - Caps unchanged: `symbol` 1024 bytes, `content` 128 KiB, 32 changes per file, 128 per call, 16 files.
 - Closed errors for shape: two forms in one call (`ide.edit: use one of …` naming the offending keys), `old` without `new`, a window on E4, `add_import` with a newline.
@@ -123,8 +123,8 @@ Success, one canonical text for a single-file and a multi-file call (the first l
 
 ```text
 edit: applied 3 changes in 2 files; diagnostics: pending (the project check arrives by itself as an edit-checked fact)
-  src/a.rs#Store/transcript:12-16  replaced (3 lines → 5)
-  src/a.rs#imports:7  added
+  src/a.rs#Store/transcript:12-16 (L131-135)  replaced (3 lines → 5)
+  src/a.rs#@imports:7 (L9)  added
   src/new.rs  created (12 lines)
 ```
 
@@ -212,7 +212,7 @@ Repair: resend with a window inside 1-34, or without a window to replace the who
 2. `Outline::unit(&SymbolPath) -> Option<Unit>` for symbols AND regions, `Unit { path, kind, range (header-inclusive), body }`.
 3. `Outline::unit_at(line) -> Option<Unit>` total over `1..=line_count`, and `Address::at(&Outline, line)` giving the canonical string for a file line (`unit` plus `:N`).
 4. `outline_from_source` (the in-process / module source outline, no language server) returns the same regions, so the addresses of an edited candidate can be printed at once.
-5. `insert_site` accepts a region as anchor: after `imports` appends an import, after `header` for a file without imports.
+5. `insert_site` accepts a region as anchor: after `@imports` appends an import, after `@header` for a file without imports.
 6. Duplicate names (impl blocks, overloads, same-named test fns) have an address form that parses back to exactly that unit.
 
 ## 7. Boundary cases (the contract test, `tests/symbol_read_edit_contract.rs`)
@@ -224,7 +224,7 @@ Inputs are a fixed fixture project (Rust, plus one Python file); every row is an
 | R1 | read `f.rs#Foo/bar` | header with extent, lines numbered 1..n, doc comment is line 1, no `source_ref` |
 | R2 | read `f.rs#Foo/bar:3-5` | lines numbered 3..5 only |
 | R3 | read `<abs>/f.rs:130` (inside `bar`) | the whole unit of `bar`, header names `your line 130 is line K` |
-| R4 | read `f.rs#header`, `f.rs#imports`, a constant | each reads as a unit |
+| R4 | read `f.rs#@header`, `f.rs#@imports`, a constant | each reads as a unit |
 | R5 | read path lines `281-315` of a 314-line file | lines 281-314, success |
 | R6 | read path lines `400-420` of a 314-line file | `file has 314 lines; nothing at 400-420`, success |
 | R7 | batch `symbols` mixing R1–R4 forms and one unknown symbol | blocks in order; only the unknown item fails |
