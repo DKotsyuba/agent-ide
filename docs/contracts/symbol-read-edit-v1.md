@@ -119,14 +119,16 @@ Notes:
 
 ### 3.3 Replies
 
-Success, one canonical text for a single-file and a multi-file call (the first line states the outcome and the check, one line per change follows; the lines name the CHANGED LINES AFTER the edit as addresses):
+Success (the first line states the outcome and the check, one line per change follows; the lines name the CHANGED LINES AFTER the edit as addresses). A single-file call:
 
 ```text
-edit: applied 3 changes in 2 files; diagnostics: pending (the project check arrives by itself as an edit-checked fact)
+edit: replaced; path src/a.rs; diagnostics: pending; the project check arrives by itself as an edit-checked fact
   src/a.rs#Store/transcript:12-16 (L131-135)  replaced (3 lines → 5)
   src/a.rs#@imports:7 (L9)  added
-  src/new.rs  created (12 lines)
+lines after 12 moved +2
 ```
+
+A multi-file call opens `edit: applied <n> of <n> files; diagnostics: …`, then one line per file (`  1 src/a.rs: replaced; diagnostics pending`) with that file's change lines indented under it. The trailing `lines after <N> moved <±k>` is a fact line, present only when the edit moved lines. Diagnostics words are `pending`, `unknown`, `not_analysed (<reason>)`, `current_clean` and `current_reported (…)` when the answer is already known.
 
 - Verbs: `replaced`, `inserted`, `deleted`, `added`, `removed`, `created`, `unchanged`. A deletion names the address that now holds the join point (`src/a.rs#Store:40`) or, for a deleted symbol, the address it had (`src/a.rs#Store/old_fn  deleted (22 lines)`).
 - At most 12 change lines, then `+<k> more`.
@@ -215,9 +217,9 @@ Repair: resend with a window inside 1-34, or without a window to replace the who
 5. `insert_site` accepts a region as anchor: after `@imports` appends an import, after `@header` for a file without imports.
 6. Duplicate names (impl blocks, overloads, same-named test fns) have an address form that parses back to exactly that unit.
 
-## 7. Boundary cases (the contract test, `tests/symbol_read_edit_contract.rs`)
+## 7. Boundary cases (the contract test, `tests/symbol_read_edit/mod.rs`, included from `tests/product_mcp_contract.rs`)
 
-Inputs are a fixed fixture project (Rust, plus one Python file); every row is an exact request → exact reply assertion.
+Inputs are a fixed fixture file (Rust); every row is an exact request → exact reply assertion, with the file on disk asserted after each edit.
 
 | # | Request | Reply |
 |---|---|---|

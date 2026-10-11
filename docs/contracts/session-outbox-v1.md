@@ -371,12 +371,14 @@ settled run marks its fact delivered (§6). Neither is taught as a way to wait.
 
 ### 8.6 `ide.edit` and its project check
 
-`ide.edit` answers once its write settles. If the project check finishes inside the 8 s inline
-window (`INLINE_REPLY_WAIT`, `worker.rs:68`), the diagnostics are in the reply as today; otherwise
-the reply carries `diagnostics: pending` (the reserved `EditDiagnostics::Pending`, `reply.rs:355`)
-and the check continues up to `EDIT_CHECK_WAIT` (90 s, `worker.rs:61`). Its outcome, or
-`unknown` at that deadline, becomes one `edit-checked` holding fact (§3.3). An edit reply is never
-a whole-reply `pending` because of its check.
+`ide.edit` answers right after its write settles (symbol-read-edit-v1 §3.4, E-003): when the
+session's outbox can hold the check, the reply carries `diagnostics: pending` at once (the
+reserved `EditDiagnostics::Pending`, `reply.rs:355`), without waiting for the project check or the
+language-server refresh, and the check continues up to `EDIT_CHECK_WAIT` (90 s, `worker.rs:61`).
+Its outcome, or `unknown` at that deadline, becomes one `edit-checked` holding fact (§3.3). A
+check that cannot be held (no open outbox) is waited for as before. An edit reply is never a
+whole-reply `pending` because of its check. (Until E-003 the early answer was sent only when the
+8 s inline window was nearly spent.)
 
 ### 8.7 Reply wording and teaching sentences
 
