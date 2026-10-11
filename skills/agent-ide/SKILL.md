@@ -13,7 +13,7 @@ description: Use Agent IDE `ide.*` tools for understanding and changing source c
 4. Find what must change, one call each: `ide.graph {"symbols":["src/a.rs#f"],"direction":"callers"}` for call sites, `ide.symbol {"symbols":["Kind"]}` for construction sites.
 5. Apply the whole change with ONE `ide.edit {"operation_id":"add-field-1","source_ref":"…","files":[{"path":"src/a.rs","changes":[{"old":"x: 0,","new":"x: 0,\ny: 0,"}]}]}`: everything is validated before the first write, and one project check runs.
 6. Run what matters with ONE `ide.test {"targets":[{"symbol":"src/a.rs#parse"},{"pattern":"roles_"}]}`.
-7. Results of long work are pushed to you in `<agent-ide>` blocks after your next tool call or when you end your turn; with nothing else to do, make one `ide.inspect {"wait_ms":120000}` call.
+7. Results of long work are pushed to you in `<agent-ide>` blocks after your next tool call or when you end your turn; never wait for them.
 8. Review with `ide.diff`, then `ide.stop`.
 
 What it saves: 26 single-hunk `ide.edit` calls cost 26 turns of about 260 k tokens of context each, and one `files` edit costs one. 36 turns spent only waiting for a test result were about a fifth of one run's input; a pushed result costs none.
@@ -364,15 +364,11 @@ for them. What to rely on, by host:
 
 - Claude: "Results of long work (test runs, project checks after edits, answers that were
   pending) are pushed to you in an <agent-ide> block after your next tool call or when you end
-  your turn, so never poll for them; if you have nothing else to do, call ide.inspect
-  {"wait_ms": 120000} once."
+  your turn, so never poll for them or wait."
 - Codex: "Results of long work (test runs, project checks after edits, answers that were
   pending) are pushed to you in an <agent-ide> block at the top of your next ide.* reply, after
-  your next tool call, or when you end your turn, so never poll for them; if you have nothing
-  else to do, call ide.inspect {"wait_ms": 120000} once."
+  your next tool call, or when you end your turn, so never poll for them or wait."
 
-`ide.inspect {"wait_ms": 120000}` returns as soon as a result is ready (at most 240000 ms); a
-wait that ends first answers `nothing ready yet` with what is in flight and cancels nothing.
 `ide.inspect {}` hands over what is ready now. `{"detail_refs": [...]}` answers up to eight
 references in one call.
 

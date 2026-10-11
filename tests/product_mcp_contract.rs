@@ -14654,10 +14654,11 @@ async fn configured_product_activation_reply_includes_the_project_card() {
         "ide.graph {\"symbols\"",
         "ide.test {\"targets\"",
         "ide.edit {\"operation_id\"",
-        "ide.inspect {\"wait_ms\"",
+        "ide.inspect {\"detail_refs\"",
     ] {
         assert!(signature.contains(form), "{form}: {signature}");
     }
+    assert!(!signature.contains("wait_ms"), "{signature}");
     assert!(signature.contains("\"files\":["), "{signature}");
     assert!(text.ends_with("End the task with ide.stop."), "{text}");
     assert!(!signature.contains("poll"), "{signature}");

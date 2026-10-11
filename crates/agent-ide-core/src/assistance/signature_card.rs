@@ -20,8 +20,8 @@ ide.symbol {"symbols":["src/a.rs#Store/get","src/b.rs#Kind"],"usages":true,"call
 ide.graph {"symbols":["src/a.rs#f","src/b.rs#g"],"direction":"callers","depth":1}
 ide.test {"targets":[{"symbol":"src/a.rs#parse"},{"path":"tests/cli.rs"},{"pattern":"roles_"}]}
 ide.edit {"operation_id":"add-field-1","source_ref":"<from ide.read>","files":[{"path":"src/a.rs","changes":[{"old":"x: 0,","new":"x: 0,\ny: 0,"}]},{"path":"src/new.rs","create":true,"content":"fn new() {}\n"}]}
-ide.inspect {"wait_ms":120000} or {"detail_refs":["<ref>","<ref>"]} or {}
-Read everything you need in one ide.read, change several files in one ide.edit (one project check). Results of long work arrive by themselves in an <agent-ide> block after your next tool call or when you end your turn; with nothing else to do, make one ide.inspect wait_ms call. End the task with ide.stop."#;
+ide.inspect {"detail_refs":["<ref>","<ref>"]} or {}
+Read everything you need in one ide.read, change several files in one ide.edit (one project check). Results of long work arrive by themselves in an <agent-ide> block after your next tool call or when you end your turn; never wait for them. End the task with ide.stop."#;
 
 /// Returns the call-signature block that follows the project card in an `ide.start` reply.
 ///
@@ -50,11 +50,11 @@ mod tests {
             "ide.test {\"targets\"",
             "ide.edit {\"operation_id\"",
             "\"files\"",
-            "ide.inspect {\"wait_ms\"",
-            "{\"detail_refs\"",
+            "ide.inspect {\"detail_refs\"",
         ] {
             assert!(block.contains(form), "{form}");
         }
+        assert!(!block.contains("wait_ms"), "nothing teaches waiting");
         assert!(block.contains("arrive by themselves in an <agent-ide> block"));
         assert!(block.contains("End the task with ide.stop."));
         assert!(!block.starts_with('\n') && !block.ends_with('\n'));
@@ -87,6 +87,6 @@ mod tests {
                 examples += 1;
             }
         }
-        assert_eq!(examples, 10);
+        assert_eq!(examples, 9);
     }
 }

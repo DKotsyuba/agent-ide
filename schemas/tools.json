@@ -330,7 +330,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Read what Agent IDE holds for you. Results of long work (test runs, project checks after\nedits, answers that were pending) are pushed to you in an `<agent-ide>` block, so never poll\nfor them. `{}` hands over everything ready now; `{\"wait_ms\": 120000}` waits once for the\nnext result when you have nothing else to do; `detail_refs` answers several references in\none call; `detail_ref` reads one result or its next page (outline, symbol, graph, diff,\ntest output).",
+    "description": "Read what Agent IDE holds for you. Results of long work (test runs, project checks after\nedits, answers that were pending) are pushed to you in an `<agent-ide>` block, so never poll\nfor them. `{}` hands over everything ready now; `detail_refs` answers several references\nin one call; `detail_ref` reads one result or its next page (outline, symbol, graph, diff,\ntest output).",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -350,12 +350,6 @@
           "maxItems": 8,
           "minItems": 1,
           "type": "array"
-        },
-        "wait_ms": {
-          "description": "Wait up to this long: with no reference, for the first result of this session; with references, for one of them to settle.",
-          "maximum": 240000,
-          "minimum": 0,
-          "type": "integer"
         }
       },
       "type": "object"

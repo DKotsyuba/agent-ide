@@ -264,8 +264,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "type": "object", "additionalProperties": false,
                 "properties": {
                     "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."},
-                    "detail_refs": {"type": "array", "minItems": 1, "maxItems": super::outbox::MAX_DETAIL_REFS, "items": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}, "description": "Several references answered in order in one reply; not with `detail_ref`."},
-                    "wait_ms": {"type": "integer", "minimum": 0, "maximum": super::outbox::MAX_WAIT_MS, "description": "Wait up to this long: with no reference, for the first result of this session; with references, for one of them to settle."}
+                    "detail_refs": {"type": "array", "minItems": 1, "maxItems": super::outbox::MAX_DETAIL_REFS, "items": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}, "description": "Several references answered in order in one reply; not with `detail_ref`."}
                 }
             }),
         ),
@@ -4832,9 +4831,8 @@ impl StdioFacade {
 
     /// Read what Agent IDE holds for you. Results of long work (test runs, project checks after
     /// edits, answers that were pending) are pushed to you in an `<agent-ide>` block, so never poll
-    /// for them. `{}` hands over everything ready now; `{"wait_ms": 120000}` waits once for the
-    /// next result when you have nothing else to do; `detail_refs` answers several references in
-    /// one call; `detail_ref` reads one result or its next page (outline, symbol, graph, diff,
+    /// for them. `{}` hands over everything ready now; `detail_refs` answers several references
+    /// in one call; `detail_ref` reads one result or its next page (outline, symbol, graph, diff,
     /// test output).
     #[tool(name = "ide.inspect", input_schema = tool_schemas()[3].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
@@ -4890,8 +4888,7 @@ ide.symbol / ide.graph instead of reading files and grep; ONE ide.edit {\"files\
 logical change, with one project check; ide.test for the tests that matter. Symbols are \
 `file#Owner/name`. Results of long work (test runs, project checks, pending answers) are pushed \
 to you in an <agent-ide> block after your next tool call or when you end your turn, so never \
-poll for them; with nothing else to do, call ide.inspect {\"wait_ms\": 120000} once. Native \
-tools remain for non-source files and as a fallback.";
+poll for them or wait. Native tools remain for non-source files and as a fallback.";
 
 /// Ensures diagnostics hide both launch attachments and populated host metadata in either format.
 #[test]
@@ -4905,6 +4902,22 @@ fn debug_redacts_trusted_transport_and_host_metadata() {
             "private host Debug leaked"
         );
     }
+}
+
+/// Nothing the host shows the model teaches waiting: the server paragraph and every advertised
+/// tool schema (descriptions included) omit `wait_ms` and any "wait once when idle" advice, while
+/// the call validator still accepts `wait_ms` (harness-reply-v1 R6).
+#[test]
+fn advertised_text_never_teaches_waiting() {
+    let mut advertised = SERVER_INSTRUCTIONS.to_owned();
+    let facade = StdioFacade::new(std::path::PathBuf::from("/nonexistent-runtime"));
+    for tool in facade.router.list_all() {
+        advertised.push_str(&serde_json::to_string(&tool).unwrap());
+    }
+    for banned in ["wait_ms", "nothing else to do", "wait once"] {
+        assert!(!advertised.contains(banned), "advertised text names {banned}");
+    }
+    assert!(validate_call(AssistanceTool::Inspect, json!({"wait_ms": 5})).is_ok());
 }
 
 /// Private catalog cache lifetime in milliseconds for modern MCP requests (SEP-2549).
