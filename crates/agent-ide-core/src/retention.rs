@@ -1922,6 +1922,8 @@ impl Drop for SweepLock {
 /// Applies the policy in a long-lived daemon: first after `FIRST_SWEEP_DELAY`, then every
 /// `SWEEP_INTERVAL`, each on a blocking thread and only when no daemon swept within
 /// `SWEEP_SPACING`. Removals are recorded in this process's error log. Runs until dropped.
+/// Hint collection uses the same configured Claude parent as writers; an invalid parent skips
+/// that collection and records a path-free failure without falling back to the legacy parent.
 pub async fn run_periodically() {
     let mut delay = FIRST_SWEEP_DELAY;
     loop {
@@ -1936,10 +1938,13 @@ pub async fn run_periodically() {
                 // The Claude hook key hints below the temporary root go with the same round, but
                 // only while no process that may publish one without the lock is alive.
                 use crate::errorlog::{Fields, Method, Outcome, record};
-                let (outcome, detail) = match hint_publishers_unsafe(&process_snapshot) {
-                    Some(unsafe_publishers) if unsafe_publishers.is_empty() => {
+                let (outcome, detail) = match (
+                    crate::hook_hints::effective_root(),
+                    hint_publishers_unsafe(&process_snapshot),
+                ) {
+                    (Ok(tmp), Some(unsafe_publishers)) if unsafe_publishers.is_empty() => {
                         let hints = crate::hook_hints::collect(
-                            Path::new(crate::hook_hints::TMP_ROOT),
+                            &tmp,
                             true,
                             SystemTime::now(),
                             &hint_publishers_safe(),
@@ -1949,11 +1954,15 @@ pub async fn run_periodically() {
                             format!("hook_key_hints removed={}", hints.stale),
                         )
                     }
-                    Some(unsafe_publishers) => (
+                    (Ok(_), Some(unsafe_publishers)) => (
                         Outcome::Skipped,
                         format!("hook_key_hints paused={}", unsafe_publishers.len()),
                     ),
-                    None => (Outcome::Skipped, "hook_key_hints paused=unknown".to_owned()),
+                    (Ok(_), None) => (Outcome::Skipped, "hook_key_hints paused=unknown".to_owned()),
+                    (Err(_), _) => (
+                        Outcome::Skipped,
+                        "hook_key_hints paused=invalid_root".to_owned(),
+                    ),
                 };
                 if outcome == Outcome::Skipped || detail != "hook_key_hints removed=0" {
                     record(

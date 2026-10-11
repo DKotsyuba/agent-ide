@@ -224,3 +224,22 @@ fn an_unsafe_publisher_appearing_mid_pass_keeps_the_remaining_hints() {
         .count();
     assert_eq!(left, 2);
 }
+
+/// An explicit parent confines stale collection to that root; malformed overrides never select
+/// the legacy parent. Both the selected and untouched sentinel roots are private test scratch.
+#[test]
+fn redirected_parent_confines_collection_and_rejects_malformed_overrides() {
+    let selected = scratch("redirected-root");
+    let untouched = scratch("unselected-root");
+    let selected_hint = hint(&selected, "0000000000000001", None, OLD);
+    let untouched_hint = hint(&untouched, "0000000000000002", None, OLD);
+    let root = resolve_root(Some(selected.as_os_str().to_owned())).unwrap();
+    assert_eq!(root, fs::canonicalize(&*selected).unwrap());
+    let report = collect(&root, true, SystemTime::now(), &|| true);
+    assert_eq!(report.stale, 1);
+    assert!(!selected_hint.exists());
+    assert!(untouched_hint.exists());
+    assert!(resolve_root(Some("relative".into())).is_err());
+    assert!(resolve_root(Some(selected.join("../escape").into_os_string())).is_err());
+    assert!(resolve_root(Some(selected.join("missing").into_os_string())).is_err());
+}
