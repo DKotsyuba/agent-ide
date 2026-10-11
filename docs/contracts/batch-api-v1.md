@@ -113,6 +113,8 @@ unchanged since your read <ref>: <item> (<n> lines); "force":true returns the te
 
 ## 7. `ide.edit {files}`
 
+> E-003 (symbol-read-edit-v1): `operation_id` and every `source_ref` are optional (the files' current bytes are the base, still stale-safe at the write); a `{path, content}` entry replaces an existing file; `changes` entries also take `symbol` windows (`file#Type/m:3-5`), `@` regions, `{symbol, old, new}`, `add_import` and `remove_import`; the reply carries no `source_ref` text and lists each file's changed lines by address under its file line; the check is never waited for. The `source_ref`-based rules below remain valid for a caller that still sends one.
+
 ```json
 {"operation_id":"add-roles-1","source_ref":"…-58",
  "files":[

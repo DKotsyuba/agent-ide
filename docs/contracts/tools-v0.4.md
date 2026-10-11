@@ -306,6 +306,8 @@ graph: callees of src/Button.tsx#Button (depth 2, 2 nodes, 1 edges)
 
 ### 2.4 `ide.read` — symbol body or line range (implemented)
 
+> E-003 (symbol-read-edit-v1 §2): `symbol`, `symbols` and `items[].symbol` also take `file#Type/m:N-M` windows, `@` regions and `path:line`; the reply is headed `<address>  (<n> lines; file lines a-b)` and numbers lines from 1 inside the unit; `lines` accepts `N`, `N-M` and `N-`, an end past the file is clamped and a start past it answers `file has <n> lines; nothing at a-b`; no reply prints a `source_ref` line. Where the text below says otherwise, this note wins.
+
 Input: `{symbol}`, `{path, lines: "120-180"}` or `{path}` (the whole file).
 
 Output is code with line numbers and the header included:
@@ -338,6 +340,8 @@ A file no IDE language analyzes (a log, `README.md`, YAML, a script, `Cargo.toml
 Errors: `no_such_file` (the requested path does not exist in the worktree; fix the path or use `ide.symbol` with a bare name), `unknown_symbol`, `unsupported_file` (symbol address into a file no IDE language reads), `source_unavailable` (binary or unreadable file, or a line range past the end).
 
 ### 2.5 `ide.edit` — edit a symbol or range (implemented)
+
+> E-003 (symbol-read-edit-v1 §3-§5): no form needs `source_ref` or `operation_id` (a missing id is generated); the current text is the base. New forms: a unit window (`file#Type/m:3-5` with `content`, guarded by the session's last read of the unit), `old`/`new` scoped to a unit, a window or the file (aliases `file_path`, `old_string`, `new_string`), `@` regions, `add_import`/`remove_import`, a whole-file `content` replacement, and Codex `patch` (Add File and Update File). Every success reply lists the changed lines by address (`  file#unit:N-M (L<a>-<b>)  <verb> (<k> lines → <m>)`), prints no `source_ref`, and arrives without waiting for the project check. Where the text below says otherwise, this note wins.
 
 Input operations:
 

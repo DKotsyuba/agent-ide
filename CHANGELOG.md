@@ -4,6 +4,14 @@
 
 ### Added
 
+- `ide.read` and `ide.edit` work on symbol addresses. A read takes `file#Type/method`, a `:N`, `:N-M` or `:N-` window counted from the symbol's first line, an `@header`/`@imports` region or the `path:line` that grep prints, and answers `<address>  (<n> lines; file lines a-b)` with lines numbered from 1 inside the unit. An edit replaces a whole symbol or region, lines inside a symbol (refused with the symbol's current text when those lines changed since the session's last read of it, otherwise applied with the replaced lines echoed), exact old text with new text scoped to a symbol or the file, inserts next to a symbol or region, adds or removes one import, replaces a whole file, and accepts a Codex `apply_patch` body (`patch`, Add File and Update File). No form needs a file-version reference or an `operation_id`.
+- Every edit reply lists the changed lines by address valid for `ide.read`, with absolute lines and counts (`src/a.rs#Store/transcript:12-16 (L131-135)  replaced (3 lines → 5)`), and leaves right after the write: the project check arrives as an `edit-checked` fact instead of being waited for.
+
+### Changed
+
+- A plain line range past the end of a file is clamped (`N`, `N-M` and `N-` are accepted) and a start past the end answers `file has <n> lines; nothing at a-b` as a success instead of a refusal.
+- Read and edit replies no longer print a `source_ref`; the current text is the freshness check. A supplied `source_ref` is still validated and deprecated.
+
 - `ide.symbol` and `ide.graph` never leave the agent waiting on a loading server. For a language whose source outline is exact (Rust) they answer at once with an answer labelled `approximate:` (definition from the source outline, usages and depth-1 callers as name matches marked `~`); for other languages, or a bare name the scan cannot resolve to one definition, they answer `pending` at once. The same job keeps running for up to 10 minutes (at most 4 per session) and its precise answer is registered with the session outbox, to arrive as a fact. A cold Rust worktree's first `ide.symbol` now answers in about 0.5 s instead of `pending` after 8 s. A bare name whose servers are all loading answers `provider_loading` instead of `provider_unavailable`, and the remaining `provider_loading` replies no longer ask to repeat the call.
 - The `ide.start` card's servers line reports each server language's session for the worktree as it is: `ready`, `warming; …`, `not started; …` or `unavailable (<cause>)`. Servers still start lazily, on the first `ide.symbol` or `ide.graph` call of the language; the start launches nothing.
 - `ide.symbol` usages of a struct, enum or class tag the rows that build a value of it (`Name {`, `Name(`, `Name::new(`, `new Name(`, an enum variant) as `construction ~`, list them first and count them on the usages line (`…; 9 constructions`). The rule is lexical and marked as a heuristic.

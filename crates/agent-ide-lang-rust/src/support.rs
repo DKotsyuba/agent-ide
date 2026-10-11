@@ -214,6 +214,19 @@ impl LanguageSupport for RustSupport {
         })
     }
 
+    /// Rust regions: `//!` and `#![..]` header, `use`/`pub use`/`extern crate` imports,
+    /// `#[..]` attributes belong to the statement below, items end at `;` or `}`.
+    fn region_rules(&self) -> &'static agent_ide_core::lang::regions::RegionRules {
+        &agent_ide_core::lang::regions::RegionRules {
+            header_prefixes: &["#![", "#!"],
+            import_prefixes: &["use ", "extern crate "],
+            attribute_prefixes: &["#["],
+            visibility_prefix: true,
+            semicolon_imports: true,
+            ..agent_ide_core::lang::regions::GENERIC_RULES
+        }
+    }
+
     /// `.rs` files under a `tests` directory or named `*_test.rs`; nothing under `benches`.
     /// Expects a project-relative path: every component is examined.
     fn is_test_file(&self, file: &Path) -> bool {

@@ -248,9 +248,9 @@ async fn python_module_matches_in_process_answers() {
     );
     assert!(moduled.iter().any(|reply| reply.contains("mode: semantic")));
     assert!(
-        moduled
-            .iter()
-            .any(|reply| reply.contains("main.py:10  return double(2)"))
+        moduled.iter().any(
+            |reply| reply.contains("main.py#run:2 (L10)") && reply.contains("return double(2)")
+        )
     );
     parity::assert_parity(&in_process, &moduled);
     let owned: Vec<ProcessIdentity> = owned.into_iter().chain(daemon.tree().all()).collect();

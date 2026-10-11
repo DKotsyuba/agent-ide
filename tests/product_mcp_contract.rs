@@ -463,7 +463,9 @@ fn assert_compact_envelope(reply: &Value) {
         ("complete", Some("symbol")) => assert!(
             body.starts_with("symbol: ")
                 || body.starts_with("symbols: ")
-                || body.starts_with("ambiguous_symbol: ")
+                || body
+                    .split_once(" candidates for ")
+                    .is_some_and(|(count, _)| count.parse::<u32>().is_ok())
                 || (text.starts_with("page ") && !text.starts_with("page 1;")),
             "{reply}"
         ),
@@ -499,16 +501,23 @@ fn assert_compact_envelope(reply: &Value) {
             // A batch read opens with its summary line (batch-api-v1 §2).
             if !(header.starts_with("read: ")
                 || header.starts_with("no such ")
+                || header.starts_with("file has ")
                 || header.starts_with("not a readable text file")
                 || header.contains(" has no code symbols; ")
                 || header.ends_with("  (empty file)"))
             {
-                let (title, details) = header.split_once("  (lines ").expect("read symbol header");
+                // `<title>  (lines A–B)` for a range, `<address>  (<n> lines; file lines A-B)` for
+                // a unit and `<address>:A-B  (lines A-B of <n>; file lines C-D)` for a window.
+                let (title, details) = header.split_once("  (").expect("read symbol header");
                 assert!(!title.is_empty() && details.ends_with(')'), "{reply}");
             }
         }
         ("invalid_parameters", _) => {
-            assert!(text.starts_with("invalid bounded parameters:"), "{reply}")
+            // The `apply_patch` body refusals keep their own wording (symbol-read-edit-v1 §5).
+            assert!(
+                text.starts_with("invalid bounded parameters:") || text.starts_with("patch: "),
+                "{reply}"
+            )
         }
         _ => assert!(text.starts_with(state), "{reply}"),
     }
@@ -571,6 +580,13 @@ fn claude_fields(text: &str) -> Value {
             .map(|index| token(&text[index + marker.len()..]))
     }
 
+    // A delivered fact (an `edit-checked` status plate) may precede the reply proper; the reply's
+    // own facts follow it. The unparsed fallback below keeps the whole text.
+    let original = text;
+    let text = text
+        .strip_prefix("<agent-ide>\n")
+        .and_then(|rest| rest.split_once("</agent-ide>\n"))
+        .map_or(text, |(_, reply)| reply);
     if let Some(rest) = text.strip_prefix("unavailable: ") {
         return json!({"state":"unavailable","reason":token(rest)});
     }
@@ -618,7 +634,7 @@ fn claude_fields(text: &str) -> Value {
             "truncated":truncated,"continuation":continuation,"detail_ref":detail_ref,
         });
     }
-    json!({"text":text})
+    json!({"text":original})
 }
 
 /// Calls one managed Codex tool using only trusted request metadata for actor and sandbox identity.
@@ -5658,7 +5674,7 @@ async fn claude_call_with_a_late_pre_hook_is_served_not_refused() {
     let fields = claude_fields(assert_claude_envelope(&reply));
     let text = fields["text"].as_str().unwrap_or_default();
     assert!(
-        text.contains("pub fn value() -> i32") && text.contains("source_ref: "),
+        text.contains("pub fn value() -> i32") && !text.contains("source_ref"),
         "the late-pre read must be served, not refused: {reply}"
     );
     mcp.close().await;
@@ -5719,15 +5735,15 @@ async fn claude_session_survives_a_daemon_restart_between_calls() {
         next,
         "restart-session",
         None,
-        "ide.read",
-        json!({"path":"src/lib.rs","lines":"1-2"}),
+        "ide.context",
+        json!({"path":"src/lib.rs"}),
     )
     .await;
-    let stale_ref = claude_text(&before)
-        .split("source_ref: ")
-        .nth(1)
-        .map(|tail| tail.trim().to_owned())
-        .expect("read reply carries a source_ref");
+    // Reads print no reference any more; a context reply still names its `detail_ref`.
+    let stale_ref = before["detail_ref"]
+        .as_str()
+        .map(str::to_owned)
+        .expect("a context reply names its detail_ref");
 
     // The shared daemon generation ends; the watcher must heal it before the next pre-hook.
     let stale_attachment = managed_claude_candidate_attachment(&fixture.root);
@@ -6315,7 +6331,8 @@ async fn an_edit_to_an_undeclared_rust_module_is_not_analysed() {
                        "source_ref":context["detail_ref"],"content":content}),
             )
             .await;
-        actor.settle(&fixture, edit).await
+        let edit = actor.settle(&fixture, edit).await;
+        settle_edit_check(&mut actor, &fixture, edit).await
     };
     let orphan = edit("src/orphan.rs", "orphan-create", "pub fn orphan() {}\n").await;
     assert_eq!(orphan["result"]["outcome"], "created", "{orphan}");
@@ -6430,6 +6447,7 @@ printf '{"reason":"build-finished","success":true}\n'
         )
         .await;
     let edited = actor.settle(&fixture, edited).await;
+    let edited = settle_edit_check(&mut actor, &fixture, edited).await;
     assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
     assert_eq!(
         edited["diagnostics"]["state"], "current_reported",
@@ -6497,26 +6515,22 @@ async fn a_full_file_edit_without_source_ref_creates_only_a_missing_file() {
         content
     );
 
-    let before = std::fs::read(fixture.root.join("src/lib.rs")).unwrap();
-    let refused = actor
+    // symbol-read-edit-v1 E10: a whole-file `content` edit of an existing file needs no
+    // `source_ref`; it replaces the current bytes.
+    let replaced = actor
         .call(
             &fixture,
             "ide.edit",
             json!({"operation_id":"create-existing","path":"src/lib.rs",
-                   "content":"pub fn clobbered() {}\n"}),
+                   "content":"pub fn replaced() {}\n"}),
         )
         .await;
-    let refused = actor.settle(&fixture, refused).await;
-    assert_eq!(refused["state"], "invalid_parameters", "{refused}");
+    let replaced = actor.settle(&fixture, replaced).await;
+    assert_eq!(replaced["state"], "edit", "{replaced}");
+    assert_eq!(replaced["result"]["outcome"], "replaced", "{replaced}");
     assert_eq!(
-        refused["text"],
-        "invalid bounded parameters: \"source_ref\" is required to replace an existing file: \
-         read it first (ide.read)",
-        "{refused}"
-    );
-    assert_eq!(
-        std::fs::read(fixture.root.join("src/lib.rs")).unwrap(),
-        before
+        std::fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap(),
+        "pub fn replaced() {}\n"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
@@ -9773,7 +9787,7 @@ async fn configured_product_symbol_card_answers_requested_callees() {
     let work = card(&mut actor, "src/lib.rs#Service/work").await;
     let work_text = work["text"].as_str().unwrap_or_default();
     assert!(
-        work_text.contains("callees: 1\n  src/lib.rs#Service/helper  src/lib.rs:4\n"),
+        work_text.contains("callees: 1\n  src/lib.rs#Service/helper (L4)\n"),
         "the method's callee must be listed: {work_text}"
     );
     let idle = card(&mut actor, "src/lib.rs#idle").await;
@@ -9876,7 +9890,7 @@ async fn configured_product_symbol_card_answers_callees_alongside_default_caller
     let reply = actor.settle(&fixture, reply).await;
     let text = reply["text"].as_str().unwrap_or_default();
     assert!(
-        text.contains("callees: 1\n  src/lib.rs#Service/helper  src/lib.rs:4\n"),
+        text.contains("callees: 1\n  src/lib.rs#Service/helper (L4)\n"),
         "the callee must still be listed with default callers requested too: {text}"
     );
     assert!(
@@ -9935,6 +9949,374 @@ async fn configured_product_outline_kinds_filter_keeps_containers_and_states_the
     assert!(
         text.contains("showing") && text.contains("by kinds fn,method"),
         "the footer must state the cut: {text}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A source whose every line has an address: header (1-2), imports (3), `value` (5-7), `caller`
+/// (8-10), `Service` (12) and its impl with `work` (14) and `idle` (15). The address tests below
+/// share it (symbol-address-v1).
+const ADDRESS_SOURCE: &str = "//! Crate docs.\n\nuse std::fmt;\n\npub fn value() -> i32 {\n    7\n}\npub fn caller() -> i32 {\n    value()\n}\n\npub struct Service;\nimpl Service {\n    pub fn work(&self) -> bool { true }\n    pub fn idle(&self) {}\n}\n";
+
+/// The outline lists regions with their addresses, `kinds: region` lists only them, `path:line`
+/// (relative and absolute) resolves to the enclosing symbol, a line in a region names the region,
+/// and an unknown member answers `unknown_symbol` with `near:` addresses (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_address_outline_path_line_and_near() {
+    let fixture = symbol_test_fixture();
+    std::fs::write(fixture.root.join("src/lib.rs"), ADDRESS_SOURCE).unwrap();
+    std::fs::write(fixture.root.join("tests/path_tests.rs"), "").unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "tests/path_tests.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "address fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "address-outline").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"address-outline-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    let reply = actor
+        .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+        .await;
+    let reply = actor.settle(&fixture, reply).await;
+    let text = reply["text"].as_str().unwrap_or_default();
+    assert!(text.contains("\n1–2  src/lib.rs#@header\n"), "{text}");
+    assert!(text.contains("\n3  src/lib.rs#@imports\n"), "{text}");
+    assert!(
+        text.contains("  src/lib.rs#value  pub fn value() -> i32"),
+        "{text}"
+    );
+    assert!(text.contains("  src/lib.rs#Service/work  "), "{text}");
+
+    let reply = actor
+        .call(
+            &fixture,
+            "ide.outline",
+            json!({"path":"src/lib.rs","kinds":"region"}),
+        )
+        .await;
+    let reply = actor.settle(&fixture, reply).await;
+    let text = reply["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("src/lib.rs#@header") && text.contains("src/lib.rs#@imports"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("pub fn value") && text.contains("by kinds region"),
+        "kinds: region lists only regions and states the cut: {text}"
+    );
+
+    let absolute = format!("{}:6", fixture.root.join("src/lib.rs").display());
+    for location in ["src/lib.rs:9", absolute.as_str()] {
+        let reply = actor
+            .call(
+                &fixture,
+                "ide.symbol",
+                json!({"symbol":location,"usages":false,"callers":0}),
+            )
+            .await;
+        let reply = actor.settle(&fixture, reply).await;
+        let text = reply["text"].as_str().unwrap_or_default();
+        let expected = if location == "src/lib.rs:9" {
+            "symbol: caller — fn, src/lib.rs#caller"
+        } else {
+            "symbol: value — fn, src/lib.rs#value"
+        };
+        assert!(text.contains(expected), "{location}: {reply}");
+    }
+    // The refusal text (not the settled structured value, which carries only the code) names the
+    // region and the near addresses.
+    let region = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.symbol",
+        json!({"symbol":"src/lib.rs:3","usages":false,"callers":0}),
+    )
+    .await;
+    let (region, region_text) = batch_settle_with_text(&mut actor, &fixture, region).await;
+    assert_eq!(region["code"], "unknown_symbol", "{region}");
+    assert!(
+        region_text.contains("src/lib.rs#@imports"),
+        "a line in a region names the region address: {region_text}"
+    );
+
+    let near = batch_call_with_text(
+        &mut actor,
+        &fixture,
+        "ide.symbol",
+        json!({"symbol":"src/lib.rs#Service/wrok"}),
+    )
+    .await;
+    let (near, near_text) = batch_settle_with_text(&mut actor, &fixture, near).await;
+    assert_eq!(near["code"], "unknown_symbol", "{near}");
+    assert!(
+        near_text.contains("near: ") && near_text.contains("src/lib.rs#Service/work"),
+        "an unknown member lists the addresses near it: {near_text}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A changed hunk is preceded by `@ <address> (L<line>)` of its first changed line, and a deleted
+/// file by `@ <path> (deleted)` (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_diff_hunks_carry_addresses() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(fixture.root.join("src/lib.rs"), ADDRESS_SOURCE).unwrap();
+    std::fs::write(fixture.root.join("src/gone.rs"), "pub fn gone() {}\n").unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "src/gone.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "diff address fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "diff-address").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"diff-address-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        ADDRESS_SOURCE.replace("    7\n", "    8\n"),
+    )
+    .unwrap();
+    std::fs::remove_file(fixture.root.join("src/gone.rs")).unwrap();
+    let diff = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let diff = actor.settle(&fixture, diff).await;
+    assert_eq!(diff["kind"], "diff", "{diff}");
+    let text = diff["text"].as_str().unwrap();
+    assert!(text.contains("\n@ src/lib.rs#value:2 (L6)\n"), "{text}");
+    assert!(text.contains("\n@ src/gone.rs (deleted)\n"), "{text}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Pages of a long diff reached through `ide.inspect` carry the same `@ address (L..)` lines as
+/// page 1 (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_later_diff_pages_carry_addresses() {
+    let fixture = ProductFixture::new(json!([]));
+    let functions = |value: i32| -> String {
+        (0..40)
+            .map(|n| {
+                format!(
+                    "pub fn f{n}() -> i32 {{\n    {value}\n}}\n{}",
+                    "\n".repeat(8)
+                )
+            })
+            .collect()
+    };
+    std::fs::write(fixture.root.join("src/lib.rs"), functions(1)).unwrap();
+    fixture.git(&["add", "--", "src/lib.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "many functions"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "diff-pages-address").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"diff-pages-address-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    std::fs::write(fixture.root.join("src/lib.rs"), functions(2)).unwrap();
+    let first = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let first = actor.settle(&fixture, first).await;
+    assert_eq!(first["continuation"], true, "{first}");
+    assert!(
+        first["text"]
+            .as_str()
+            .unwrap()
+            .contains("\n@ src/lib.rs#f0:2 (L2)\n"),
+        "{first}"
+    );
+    let reference = first["detail_ref"].as_str().unwrap().to_owned();
+    let mut later = String::new();
+    for _ in 0..6 {
+        let page = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+            .await;
+        let page = actor.settle(&fixture, page).await;
+        later.push_str(page["text"].as_str().unwrap_or_default());
+        if page["continuation"] != true {
+            break;
+        }
+    }
+    assert!(later.contains("\n@ src/lib.rs#f39:2 (L"), "{later}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Name-index usage rows, name-card definitions and ambiguity candidates of a style name carry
+/// the addresses of their lines (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_name_cards_and_index_usages_carry_addresses() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(
+        fixture.root.join("styles.css"),
+        ".btn {\n  color: red;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("index.html"),
+        "<main id=\"app\">\n<button class=\"btn\">Save</button>\n</main>\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("app.py"), "def btn():\n    return 1\n").unwrap();
+    fixture.git(&["add", "--", "styles.css", "index.html", "app.py"]);
+    fixture.git(&["commit", "--quiet", "-m", "name card fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "name-card-address").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"name-card-address-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let card = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":".btn"}))
+        .await;
+    let card = actor.settle(&fixture, card).await;
+    let text = card["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("styles.css#.btn (L1)  [css] .btn"),
+        "the definition row carries its address: {text}"
+    );
+    assert!(
+        text.contains("index.html#")
+            && text
+                .lines()
+                .any(|line| line.contains("(L2)") && line.contains("<button class=\"btn\">")),
+        "the index usage row carries its address: {text}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Project problems rows carry the position address of their line (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_problems_rows_carry_addresses() {
+    let fixture = ProductFixture::new(json!([]));
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let cargo = home.join(".rustup/toolchains/fake/bin/cargo");
+    let script = r#"#!/bin/sh
+for entry in "1:5" "2:9" "3:14"; do
+  n=${entry%%:*}
+  line=${entry##*:}
+  printf '{"reason":"compiler-message","package_id":"fixture","message":{"level":"error","message":"fake %s","code":null,"spans":[{"file_name":"src/lib.rs","is_primary":true,"line_start":%s,"column_start":1}]}}\n' "$n" "$line"
+done
+printf '{"reason":"compiler-artifact","package_id":"fixture"}\n'
+printf '{"reason":"build-finished","success":true}\n'
+"#;
+    std::fs::write(&cargo, script).unwrap();
+    std::fs::write(fixture.root.join("src/lib.rs"), ADDRESS_SOURCE).unwrap();
+    fixture.git(&["add", "--", "src/lib.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "problem address fixture"]);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "problem-address").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"problem-address-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let text = loop {
+        let problems = actor
+            .call(&fixture, "ide.context", json!({"kind":"problems"}))
+            .await;
+        let problems = actor.settle(&fixture, problems).await;
+        let text = problems["text"].as_str().unwrap_or_default().to_owned();
+        if text.contains("rust: ready; errors: 3") {
+            break text;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "initial check did not settle: {problems}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    for row in [
+        "src/lib.rs:5:1 src/lib.rs#value:1 (L5) error fake 1",
+        "src/lib.rs:9:1 src/lib.rs#caller:2 (L9) error fake 2",
+        "src/lib.rs:14:1 src/lib.rs#Service/work:1 (L14) error fake 3",
+    ] {
+        assert!(text.contains(row), "{row}\n{text}");
+    }
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A failing test's assertion site prints as the test's position address with the absolute line
+/// (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_test_failures_carry_addresses() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn fails() { assert_eq!(2 + 2, 5); }\n}\n",
+    )
+    .unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "test-address").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"test-address-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    actor
+        .call(&fixture, "ide.test", json!({"path":"src/lib.rs"}))
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let completed = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fixture tests did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let status = actor.call(&fixture, "ide.test", json!({"status":1})).await;
+        if status["text"]
+            .as_str()
+            .unwrap()
+            .contains("0 passed, 1 failed")
+        {
+            break status;
+        }
+    };
+    let text = completed["text"].as_str().unwrap();
+    assert!(text.contains("FAIL tests::fails"), "{text}");
+    assert!(
+        text.contains("src/lib.rs#tests/fails:2 (L4)"),
+        "the assertion site is the test's position address with its absolute line: {text}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
@@ -10013,14 +10395,13 @@ async fn configured_product_batch_read_then_edit_reports_landings_and_bytes() {
     let edit = actor.settle(&fixture, edit).await;
     assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
     let note = edit["note"].as_str().unwrap_or_default();
+    // The changed lines are named by address (`src/util.rs#second (L5-7)` when the file's map
+    // is available, `src/util.rs:5-7 (L5-7)` otherwise) with their absolute lines.
     assert!(
-        note.contains("change 1: lines 1 replaced (now 1)"),
+        note.contains("src/util.rs") && note.contains("(L1)  replaced (1 lines → 1)"),
         "{edit}"
     );
-    assert!(
-        note.contains("change 2: old text at line 5 replaced (now 5–7)"),
-        "{edit}"
-    );
+    assert!(note.contains("(L5-7)  replaced (3 lines → 3)"), "{edit}");
     assert_eq!(
         std::fs::read(fixture.root.join("src/util.rs")).unwrap(),
         b"// changed\npub fn utility() -> i32 {\n    2\n}\npub fn second() -> i32 {\n    42\n}\n"
@@ -10160,7 +10541,62 @@ async fn batch_settle_with_text(
         .await;
         delay = delay.saturating_mul(2).min(PRODUCT_SETTLE_MAX_DELAY);
     }
+    // An edit answers at once with `diagnostics: pending` (symbol-read-edit-v1 §3.3); its own
+    // reference returns the settled reply once the project check has finished.
+    let mut polls = 0;
+    while reply.0["state"] == "edit" && reply.0["diagnostics"]["state"] == "pending" {
+        assert!(
+            tokio::time::Instant::now() < deadline && polls < PRODUCT_SETTLE_MAX_POLLS,
+            "edit check did not settle: {}",
+            reply.0
+        );
+        let reference = reply.0["diagnostics"]["detail_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        tokio::time::sleep(PRODUCT_SETTLE_INITIAL_DELAY).await;
+        polls += 1;
+        let next = batch_call_with_text(
+            actor,
+            fixture,
+            "ide.inspect",
+            json!({"detail_ref":reference}),
+        )
+        .await;
+        if next.0["state"] == "edit" || next.0["state"] == "pending" {
+            reply = next;
+        }
+    }
     reply
+}
+
+/// An edit reply whose diagnostics are still `pending` settled through its own reference
+/// (symbol-read-edit-v1 §3.3); any other reply is returned unchanged.
+async fn settle_edit_check(
+    actor: &mut ProductActor,
+    fixture: &ProductFixture,
+    mut edit: Value,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+    while edit["state"] == "edit" && edit["diagnostics"]["state"] == "pending" {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "edit check did not settle: {edit}"
+        );
+        let reference = edit["diagnostics"]["detail_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        tokio::time::sleep(PRODUCT_SETTLE_INITIAL_DELAY).await;
+        let next = actor
+            .call(fixture, "ide.inspect", json!({"detail_ref":reference}))
+            .await;
+        let next = actor.settle(fixture, next).await;
+        if next["state"] == "edit" {
+            edit = next;
+        }
+    }
+    edit
 }
 
 /// Starts one actor over `fixture` and warms the analyzer until `path`'s outline answers from
@@ -10297,12 +10733,11 @@ async fn configured_product_batch_old_not_found_refuses_and_retries_the_same_ope
     )
     .await;
     let (retried, retried_text) = batch_settle_with_text(&mut actor, &fixture, retried).await;
-    let edit_ref = retried["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&retried_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {edit_ref}; {}\n2 changes applied: \
-             change 1: lines 1–3 replaced (now 1); change 2: old text at line 5 replaced (now 3–5)\n\
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#@header:1 (L1)  replaced \
+             (3 lines → 1)\n  src/batch.rs#second (L3-5)  replaced (3 lines → 3)\n\
              lines after 1 moved -2",
             batch_diagnostics_segment(&retried)
         ),
@@ -10377,12 +10812,11 @@ async fn configured_product_batch_old_ambiguous_lists_both_lines_and_within_retr
     )
     .await;
     let (scoped, scoped_text) = batch_settle_with_text(&mut actor, &fixture, scoped).await;
-    let edit_ref = scoped["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&scoped_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {edit_ref}; {}\n1 change applied: \
-             change 1: old text at line 10 replaced (now 10)",
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#beta:2 (L10)  replaced \
+             (1 lines → 1)",
             batch_diagnostics_segment(&scoped)
         ),
         "{scoped_text}"
@@ -10487,9 +10921,8 @@ async fn configured_product_batch_terminator_old_empty_lines_and_same_line_inser
     assert_eq!(
         batch_without_status_plate(&edit_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {edit_ref}; {}\n2 changes applied: \
-             change 1: old text at line 2 replaced (now 2); change 2: lines 4 deleted\n\
-             lines after 2 moved -1",
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#alpha:2 (L2)  replaced \
+             (1 lines → 1)\n  src/batch.rs#beta:1  deleted (1 lines)\nlines after 2 moved -1",
             batch_diagnostics_segment(&edit)
         ),
         "{edit_text}"
@@ -10545,14 +10978,13 @@ async fn configured_product_batch_terminator_old_empty_lines_and_same_line_inser
     )
     .await;
     let (insert, insert_text) = batch_settle_with_text(&mut actor, &fixture, insert).await;
-    let insert_ref = insert["result"]["source_ref"].as_str().unwrap();
     assert_eq!(insert["result"]["outcome"], "replaced", "{insert}");
     assert_eq!(
         batch_without_status_plate(&insert_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {insert_ref}; {}\n2 changes applied: \
-             change 1: src/batch.rs#beta inserted before #beta (now 5–7); change 2: lines 4–6 \
-             replaced (now 9–11)\nlines after 4 moved +5",
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#helper (L5-7)  inserted \
+             (3 lines)\n  src/batch.rs#beta (L9-11)  replaced (3 lines → 3)\n\
+             lines after 4 moved +5",
             batch_diagnostics_segment(&insert)
         ),
         "{insert_text}"
@@ -10738,13 +11170,12 @@ async fn configured_product_batch_rust_syntax_gate_refuses_and_notes_pre_existin
     )
     .await;
     let (applied, applied_text) = batch_settle_with_text(&mut actor, &fixture, applied).await;
-    let broken_edit_ref = applied["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&applied_text),
         format!(
-            "edit: replaced; path src/broken.rs; source_ref {broken_edit_ref}; {}\n1 change \
-             applied: change 1: old text at line 2 replaced (now 2)\nnote: src/broken.rs already \
-             had a syntax error (line 5) before this edit; edit applied",
+            "edit: replaced; path src/broken.rs; {}\n  src/broken.rs:2 (L2)  replaced \
+             (1 lines → 1)\nnote: src/broken.rs already had a syntax error (line 5) before this \
+             edit; edit applied",
             batch_diagnostics_segment(&applied)
         ),
         "{applied_text}"
@@ -10980,12 +11411,10 @@ async fn configured_product_batch_python_syntax_gate_refuses_writes_and_proceeds
     .await;
     let (written, written_text) = batch_settle_with_text(&mut actor, &fixture, written).await;
     assert_eq!(written["result"]["outcome"], "replaced", "{written}");
-    let python_ref = written["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&written_text),
         format!(
-            "edit: replaced; path svc/app.py; source_ref {python_ref}; {}\n1 change applied: \
-             change 1: old text at line 5 replaced (now 5)",
+            "edit: replaced; path svc/app.py; {}\n  svc/app.py:5 (L5)  replaced (1 lines → 1)",
             batch_diagnostics_segment(&written)
         ),
         "{written_text}"
@@ -11037,7 +11466,7 @@ async fn configured_product_batch_python_syntax_gate_refuses_writes_and_proceeds
     assert_eq!(unchecked["result"]["outcome"], "replaced", "{unchecked}");
     assert_eq!(
         unchecked["note"].as_str().unwrap_or_default(),
-        "1 change applied: change 1: old text at line 5 replaced (now 5)",
+        "  svc/app.py:5 (L5)  replaced (1 lines → 1)",
         "{unchecked}"
     );
     assert!(
@@ -11151,12 +11580,10 @@ async fn configured_product_batch_typescript_syntax_gate_refuses_and_writes() {
     .await;
     let (written, written_text) = batch_settle_with_text(&mut actor, &fixture, written).await;
     assert_eq!(written["result"]["outcome"], "replaced", "{written}");
-    let written_ref = written["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&written_text),
         format!(
-            "edit: replaced; path app.ts; source_ref {written_ref}; {}\n1 change applied: \
-             change 1: old text at line 5 replaced (now 5)",
+            "edit: replaced; path app.ts; {}\n  app.ts#renamed:1 (L5)  replaced (1 lines → 1)",
             batch_diagnostics_segment(&written)
         ),
         "{written_text}"
@@ -11264,12 +11691,10 @@ async fn configured_product_batch_typescript_gate_uses_the_configured_package() 
     .await;
     let (written, written_text) = batch_settle_with_text(&mut actor, &fixture, written).await;
     assert_eq!(written["result"]["outcome"], "replaced", "{written}");
-    let written_ref = written["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&written_text),
         format!(
-            "edit: replaced; path app.ts; source_ref {written_ref}; {}\n1 change applied: \
-             change 1: old text at line 5 replaced (now 5)",
+            "edit: replaced; path app.ts; {}\n  app.ts#renamed:1 (L5)  replaced (1 lines → 1)",
             batch_diagnostics_segment(&written)
         ),
         "{written_text}"
@@ -11309,8 +11734,7 @@ async fn configured_product_batch_ranges_read_then_edit_by_those_lines_without_r
         format!(
             "read: 2 items in 1 files — 2 delivered, 0 unchanged, 0 not included, 0 failed\n\
              src/batch.rs  (lines 5–7)\n5\tpub fn alpha() -> i32 {{\n6\t    helper(1)\n7\t}}\n\
-             src/batch.rs  (lines 9–11)\n 9\tpub fn beta() -> i32 {{\n10\t    helper(2)\n11\t}}\n\
-             source_ref: {source_ref}\n"
+             src/batch.rs  (lines 9–11)\n 9\tpub fn beta() -> i32 {{\n10\t    helper(2)\n11\t}}\n"
         ),
         "{read_text}"
     );
@@ -11331,12 +11755,11 @@ async fn configured_product_batch_ranges_read_then_edit_by_those_lines_without_r
     )
     .await;
     let (edit, edit_text) = batch_settle_with_text(&mut actor, &fixture, edit).await;
-    let edit_ref = edit["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&edit_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {edit_ref}; {}\n2 changes applied: \
-             change 1: lines 6 replaced (now 6); change 2: lines 10 replaced (now 10)",
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#alpha:2 (L6)  replaced \
+             (1 lines → 1)\n  src/batch.rs#beta:2 (L10)  replaced (1 lines → 1)",
             batch_diagnostics_segment(&edit)
         ),
         "{edit_text}"
@@ -11397,20 +11820,18 @@ async fn configured_product_batch_read_budget_footer_duplicate_and_unknown_symbo
     let (read, read_text) = batch_settle_with_text(&mut actor, &fixture, read).await;
     assert_eq!(read["kind"], "read", "{read}");
     assert_eq!(read["truncated"], true, "{read}");
-    let source_ref = read["detail_ref"].as_str().unwrap();
-    // The delivered block renders with the same numbered gutter as every read.
+    // The delivered block renders the unit with the same numbered gutter as every read.
     let huge_a_end = 383usize;
     let width = huge_a_end.to_string().len();
     let mut expected = format!(
         "read: 3 items in 1 files — 1 delivered, 0 unchanged, 1 not included, 1 failed\n\
-         src/big.rs#huge_a  (lines 1–{huge_a_end})\n"
+         src/big.rs#huge_a  ({huge_a_end} lines; file lines 1-{huge_a_end})\n"
     );
     for number in 1..=huge_a_end {
         expected.push_str(&format!("{number:>width$}\t{}\n", lines[number - 1]));
     }
     expected.push_str(&format!(
         "no such symbol: src/big.rs#missing — check ide.outline {{\"path\":\"src/big.rs\"}}\n\
-         source_ref: {source_ref}\n\
          duplicates shown once: src/big.rs#huge_a\n\
          not included (over the reply budget): src/big.rs#huge_b — call ide.read \
          {{\"symbols\":[\"src/big.rs#huge_b\"]}}\n\n\
@@ -11461,12 +11882,12 @@ async fn configured_product_batch_legacy_single_change_replies_stay_byte_identic
     )
     .await;
     let (insert, insert_text) = batch_settle_with_text(&mut actor, &fixture, insert).await;
-    let insert_ref = insert["result"]["source_ref"].as_str().unwrap();
     assert_eq!(insert["operation"], "inserted", "{insert}");
     assert_eq!(
         batch_without_status_plate(&insert_text),
         format!(
-            "edit: inserted; path src/batch.rs; source_ref {insert_ref}; {}\nlines after 4 moved +4",
+            "edit: inserted; path src/batch.rs; {}\n  src/batch.rs#added:1 (L5)  inserted \
+             (1 lines)\nlines after 4 moved +4",
             batch_diagnostics_segment(&insert)
         ),
         "{insert_text}"
@@ -11493,11 +11914,11 @@ async fn configured_product_batch_legacy_single_change_replies_stay_byte_identic
     )
     .await;
     let (replace, replace_text) = batch_settle_with_text(&mut actor, &fixture, replace).await;
-    let replace_ref = replace["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&replace_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {replace_ref}; {}",
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#beta (L9-11)  replaced \
+             (3 lines → 3)",
             batch_diagnostics_segment(&replace)
         ),
         "{replace_text}"
@@ -11530,11 +11951,11 @@ async fn configured_product_batch_legacy_single_change_replies_stay_byte_identic
     )
     .await;
     let (lines, lines_text) = batch_settle_with_text(&mut actor, &fixture, lines).await;
-    let lines_ref = lines["result"]["source_ref"].as_str().unwrap();
     assert_eq!(
         batch_without_status_plate(&lines_text),
         format!(
-            "edit: replaced; path src/batch.rs; source_ref {lines_ref}; {}",
+            "edit: replaced; path src/batch.rs; {}\n  src/batch.rs#alpha:2 (L2)  replaced \
+             (1 lines → 1)",
             batch_diagnostics_segment(&lines)
         ),
         "{lines_text}"
@@ -11725,8 +12146,9 @@ async fn configured_product_symbol_pages_long_usage_and_candidate_lists() {
         .flat_map(|page| page.lines())
         .filter(|line| line.ends_with("target();"))
         .map(|line| {
-            let location = line.split_whitespace().next().unwrap();
-            location.rsplit(':').next().unwrap().parse().unwrap()
+            // `<address> (L<line>)  target();`: the absolute line is the (L..) tag.
+            let tag = line.split_once("(L").unwrap().1;
+            tag.split(')').next().unwrap().parse().unwrap()
         })
         .collect();
     lines.sort_unstable();
@@ -11742,7 +12164,7 @@ async fn configured_product_symbol_pages_long_usage_and_candidate_lists() {
     let ambiguous = actor.settle(&fixture, ambiguous).await;
     let reference = ambiguous["detail_ref"].as_str().unwrap().to_owned();
     let text = ambiguous["text"].as_str().unwrap();
-    assert!(text.contains("dup matches 22 symbols"), "{text}");
+    assert!(text.contains("\n22 candidates for dup:\n"), "{text}");
     assert!(
         text.contains(&format!("  … 2 more (ide.inspect {reference})\n")),
         "{text}"
@@ -11755,7 +12177,12 @@ async fn configured_product_symbol_pages_long_usage_and_candidate_lists() {
         rest_text.contains("; complete\ncandidates 21–22 of 22:\n"),
         "{rest_text}"
     );
-    assert_eq!(rest_text.matches("dup\n").count(), 2, "{rest_text}");
+    // Each remaining candidate row is `<address>  fn  <signature>  (lines a–b)`.
+    assert_eq!(
+        rest_text.matches("/dup  fn  pub fn dup()").count(),
+        2,
+        "{rest_text}"
+    );
     actor.call(&fixture, "ide.stop", json!({})).await;
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
@@ -11858,9 +12285,9 @@ async fn product_outline_and_read_report_no_such_file() {
         json!({"path":"real.rs","lines":"286-334"}),
     )
     .await;
-    assert_eq!(
-        text, "error: source_unavailable (read:line_range); file has 1 lines; requested 286-334",
-        "{past_end}"
+    assert!(
+        text.contains("file has 1 lines; nothing at 286-334") && past_end["code"].is_null(),
+        "a read starting past the end is a success: {past_end} {text}"
     );
     let (unreadable, text) = batch_call_with_text(
         &mut actor,
@@ -11906,9 +12333,11 @@ async fn product_outline_and_read_report_no_such_file() {
         )
         .await;
     actor.lifecycle(&fixture, "PostToolUse", &call).await;
-    assert_eq!(
-        old_text_edit["result"]["content"][0]["text"],
-        "invalid bounded parameters: \"source_ref\" is required for an old-text change; re-read this file with ide.read and retry with the new source_ref",
+    // symbol-read-edit-v1: an old-text change needs no `source_ref`; the current bytes are the base.
+    assert!(
+        old_text_edit["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("edit: replaced; path real.rs")),
         "{old_text_edit}"
     );
     daemon.kill().await.unwrap();
@@ -11993,7 +12422,12 @@ async fn product_style_sheets_answer_symbol_tools_without_a_server() {
     let outline = actor.settle(&fixture, outline).await;
     assert_eq!(
         outline["text"],
-        "styles.css  (8 lines, css)\n    2  .btn\n    6  @media (min-width: 40em)\n    7    .card .btn\n  (3 symbols)\n",
+        "styles.css  (8 lines, css)\n\
+         1  styles.css#@header\n\
+         2–4  styles.css#.btn  .btn\n\
+         6–8  styles.css#@media (min-width: 40em)  @media (min-width: 40em)\n\
+         7  styles.css#@media (min-width: 40em)/.card .btn  .card .btn\n\
+         \x20 (3 symbols, 1 regions)\n",
         "{outline}"
     );
 
@@ -12007,7 +12441,7 @@ async fn product_style_sheets_answer_symbol_tools_without_a_server() {
         symbol["text"],
         "symbol: .btn — symbol, styles.css#.btn (lines 2–4)\nsignature: .btn\n\
          definition styles.css#.btn  (lines 2–4)\n\
-         defines: class name btn — also styles.css:7 .card .btn, theme.scss:1 .btn\n\
+         defines: class name btn — also styles.css#@media (min-width: 40em)/.card .btn (L7), theme.scss#.btn (L1)\n\
          usages: 0 indexed in 0 files (src 0, tests 0)\n\
          links: 1 style variable used here\n\
          \x20 --brand  → no indexed declaration\n\
@@ -12027,7 +12461,7 @@ async fn product_style_sheets_answer_symbol_tools_without_a_server() {
     let text = read["text"].as_str().unwrap();
     assert!(
         text.starts_with(
-            "styles.css#@media (min-width: 40em)/.card .btn  (lines 7)\n7\t  .card .btn { padding: 0; }\n"
+            "styles.css#@media (min-width: 40em)/.card .btn  (1 lines; file lines 7-7)\n1\t  .card .btn { padding: 0; }\n"
         ),
         "{read}"
     );
@@ -12113,52 +12547,54 @@ async fn configured_product_links_css_html_and_python_names() {
         symbol(&mut actor, "styles.css#.btn").await,
         "symbol: .btn — symbol, styles.css#.btn (lines 2–4)\nsignature: .btn\n\
          definition styles.css#.btn  (lines 2–4)\n\
-         defines: class name btn — also styles.css:6 .layout .btn, theme.scss:2 .btn\n\
+         defines: class name btn — also styles.css#.layout .btn (L6), theme.scss#.btn (L2)\n\
          usages: 4 indexed in 3 files (src 4, tests 0)\n\
-         \x20 index.html:5      [html] <button class=\"btn btn-primary\">Save</button>\n\
-         \x20 index.html:6      [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
-         \x20 src/Button.tsx:2  [typescript] return <button className=\"btn\">Save</button>;\n\
-         \x20 src/Menu.tsx:3    [typescript ~clsx call] return <nav className={clsx(\"btn\", { \"btn-lg\": props.big })}>Menu</nav>;\n\
+         \x20 index.html#main#main:2 (L5)   [html] <button class=\"btn btn-primary\">Save</button>\n\
+         \x20 index.html#main#main:3 (L6)   [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
+         \x20 src/Button.tsx#Button:2 (L2)  [typescript] return <button className=\"btn\">Save</button>;\n\
+         \x20 src/Menu.tsx#Menu:2 (L3)      [typescript ~clsx call] return <nav className={clsx(\"btn\", { \"btn-lg\": props.big })}>Menu</nav>;\n\
          \x20 (~ = heuristic match, not proven)\n\
          links: 1 style variable used here\n\
-         \x20 --brand  → theme.scss:1 :root\n\
+         \x20 --brand  → theme.scss#:root (L1)\n\
          unavailable for: python\n\
          callers: unavailable (css has no call hierarchy)\n"
     );
-    assert_eq!(
-        symbol(&mut actor, "##main").await,
-        "symbol: ##main — element id, 1 element, 2 usages in 2 files (css, html)\n\
-         definitions:\n\
-         \x20 index.html:4  [html] <main id=\"main\" class=\"layout\">  (index.html#main#main, lines 4–8)\n\
-         usages: 2 indexed in 2 files (src 2, tests 0)\n\
-         \x20 index.html:6  [html] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
-         \x20 styles.css:7  [css] #main { display: block; }\n\
-         unavailable for: python\n"
+    let main_card = symbol(&mut actor, "##main").await;
+    assert!(
+        main_card.starts_with(
+            "symbol: ##main — element id, 1 element, 2 usages in 2 files (css, html)\ndefinitions:\n"
+        ) && main_card.contains(
+            "  index.html#main#main (L4)  [html] <main id=\"main\" class=\"layout\">  (lines 4–8)\n"
+        ) && main_card.contains(
+            "  index.html#main#main:3 (L6)  [html] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n"
+        ) && main_card
+            .contains("  styles.css##main:1 (L7)      [css] #main { display: block; }\n"),
+        "{main_card}"
     );
     assert_eq!(
         symbol(&mut actor, ".btn").await,
         "symbol: .btn — class name, 3 rules, 4 usages in 3 files (typescript, css, html)\n\
          definitions:\n\
-         \x20 styles.css:2  [css] .btn  (styles.css#.btn, lines 2–4)\n\
-         \x20 styles.css:6  [css] .layout .btn  (styles.css#.layout .btn, lines 6)\n\
-         \x20 theme.scss:2  [css] .btn  (theme.scss#.btn, lines 2–4)\n\
+         \x20 styles.css#.btn (L2)          [css] .btn  (lines 2–4)\n\
+         \x20 styles.css#.layout .btn (L6)  [css] .layout .btn  (lines 6)\n\
+         \x20 theme.scss#.btn (L2)          [css] .btn  (lines 2–4)\n\
          usages: 4 indexed in 3 files (src 4, tests 0)\n\
-         \x20 index.html:5      [html] <button class=\"btn btn-primary\">Save</button>\n\
-         \x20 index.html:6      [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
-         \x20 src/Button.tsx:2  [typescript] return <button className=\"btn\">Save</button>;\n\
-         \x20 src/Menu.tsx:3    [typescript ~clsx call] return <nav className={clsx(\"btn\", { \"btn-lg\": props.big })}>Menu</nav>;\n\
+         \x20 index.html#main#main:2 (L5)   [html] <button class=\"btn btn-primary\">Save</button>\n\
+         \x20 index.html#main#main:3 (L6)   [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
+         \x20 src/Button.tsx#Button:2 (L2)  [typescript] return <button className=\"btn\">Save</button>;\n\
+         \x20 src/Menu.tsx#Menu:2 (L3)      [typescript ~clsx call] return <nav className={clsx(\"btn\", { \"btn-lg\": props.big })}>Menu</nav>;\n\
          \x20 (~ = heuristic match, not proven)\n\
          unavailable for: python\n"
     );
     assert_eq!(
         symbol(&mut actor, "btn").await,
-        "ambiguous_symbol: btn matches 2 symbols; repeat ide.symbol with one exact path:\n\
-         \x20 app.py#btn\n\
-         \x20 .btn  (class name: 3 rules, 4 usages)\n"
+        "2 candidates for btn:\n\
+         \x20 app.py#btn  fn  def btn()  (lines 1–2)\n\
+         \x20 .btn  (class name: 3 rules, 4 usages)  styles.css#.btn (L2), styles.css#.layout .btn (L6)\n"
     );
     let button = symbol(&mut actor, "src/Button.tsx#Button").await;
     assert!(
-        button.contains("links: 1 class name used here\n  .btn  → styles.css:2 .btn, styles.css:6 .layout .btn (+1 more)\n"),
+        button.contains("links: 1 class name used here\n  .btn  → styles.css#.btn (L2), styles.css#.layout .btn (L6) (+1 more)\n"),
         "{button}"
     );
     let graph = async |actor: &mut ProductActor, requested: &str, direction: &str| {
@@ -12176,16 +12612,16 @@ async fn configured_product_links_css_html_and_python_names() {
     };
     assert_eq!(
         graph(&mut actor, "styles.css#.btn", "callers").await,
-        "graph: callers of styles.css#.btn (depth 2, 5 nodes, 4 edges)\n\
-         \x20 ⇢ index.html#main#main  index.html:4 [html]\n\
-         \x20 ⇢ src/Button.tsx#Button  src/Button.tsx:1 [typescript]\n\
-         \x20   ← src/App.tsx#App  src/App.tsx:2\n\
-         \x20 ⇢ src/Menu.tsx#Menu  src/Menu.tsx:2 [typescript]\n"
+        "graph: callers of styles.css#.btn (L2) (depth 2, 5 nodes, 4 edges)\n\
+         \x20 ⇢ index.html#main#main (L4) [html]\n\
+         \x20 ⇢ src/Button.tsx#Button (L1) [typescript]\n\
+         \x20   ← src/App.tsx#App (L2)\n\
+         \x20 ⇢ src/Menu.tsx#Menu (L2) [typescript]\n"
     );
     assert_eq!(
         graph(&mut actor, "src/Button.tsx#Button", "callees").await,
-        "graph: callees of src/Button.tsx#Button (depth 2, 2 nodes, 1 edges)\n\
-         \x20 ⇢ .btn  styles.css:2 [class name]\n"
+        "graph: callees of src/Button.tsx#Button (L1) (depth 2, 2 nodes, 1 edges)\n\
+         \x20 ⇢ styles.css#.btn (L2) [class name]\n"
     );
     let read = actor
         .call(&fixture, "ide.read", json!({"symbol":".btn"}))
@@ -12207,7 +12643,7 @@ async fn configured_product_links_css_html_and_python_names() {
     assert!(
         after.contains(
             "usages: 3 indexed in 3 files (src 3, tests 0)\n\
-             \x20 index.html:5      [html ~template] <a href=\"#main\""
+             \x20 index.html#main#main:2 (L5)   [html ~template] <a href=\"#main\""
         ) && !after.contains("<button class="),
         "{after}"
     );
@@ -12320,8 +12756,8 @@ async fn product_graph_names_use_sites_the_server_cannot_outline() {
     let graph = actor.settle(&fixture, graph).await;
     assert_eq!(
         graph["text"].as_str().unwrap_or_default(),
-        "graph: callers of frontend/src/Layout.css#.header (depth 2, 2 nodes, 1 edges)\n\
-         \x20 ⇢ frontend/src/Layout.tsx#Layout  frontend/src/Layout.tsx:3 [typescript]\n",
+        "graph: callers of frontend/src/Layout.css#.header (L1) (depth 2, 2 nodes, 1 edges)\n\
+         \x20 ⇢ frontend/src/Layout.tsx#Layout (L3) [typescript]\n",
         "{graph}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
@@ -12457,7 +12893,7 @@ async fn product_index_reads_stay_outside_the_binding_budget() {
             "links: 1 class name used here",
         ),
         ("ide.read", json!({"symbol":".btn"}), ".btn {"),
-        ("ide.outline", json!({"path":"page01.html"}), "(1 symbols)"),
+        ("ide.outline", json!({"path":"page01.html"}), "(1 symbols"),
         ("ide.outline", json!({"path":"styles.css"}), ".btn"),
         (
             "ide.symbol",
@@ -13010,7 +13446,11 @@ async fn configured_product_rust_lexical_outline_matches_the_server() {
         };
         assert_eq!(
             server_text,
-            render::outline_text(&lexical),
+            render::address_outline_text(
+                &lexical,
+                &agent_ide::lang::address::AddressMap::build(&lexical, &source),
+                None
+            ),
             "{file}: the lexical outline must equal the server's"
         );
         assert!(!server_text.contains("outline: from source"), "{file}");
@@ -13034,7 +13474,12 @@ async fn configured_product_rust_lexical_outline_matches_the_server() {
                 .await;
             let read = actor.settle(&fixture, read).await;
             let text = read["text"].as_str().unwrap_or_default();
-            let header = format!("{address}  (lines {})\n", symbol.range);
+            let header = format!(
+                "{address}  ({} lines; file lines {}-{})\n",
+                symbol.range.len(),
+                symbol.range.start,
+                symbol.range.end
+            );
             assert!(
                 text.starts_with(&header),
                 "{file}: {symbol:?} expected {header:?}, got {text}"
@@ -13597,7 +14042,7 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
     let server_only = actor.settle(&fixture, server_only).await;
     let read_text = server_only["text"].as_str().unwrap_or_default();
     assert!(
-        read_text.starts_with("src/lib.rs#server_only  (lines "),
+        read_text.starts_with("src/lib.rs#server_only  ("),
         "{server_only}"
     );
     let refused = actor.settle(&fixture, refused).await;
@@ -13617,7 +14062,7 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
         let text = settled["text"].as_str().unwrap_or_default();
         // Three symbols for a file with two functions is the server's answer; the lexical
         // outline of the same file reports two and marks itself lexical.
-        if settled["kind"] == "outline" && text.contains("(3 symbols)") {
+        if settled["kind"] == "outline" && text.contains("(3 symbols") {
             break settled;
         }
         assert!(
@@ -13907,7 +14352,7 @@ async fn configured_product_unavailable_rust_symbol_tools_answer_from_the_lexica
         let text = settled["text"].as_str().unwrap_or_default();
         // Three symbols for a file with two functions is the server's answer; the lexical
         // outline of the same file reports two and marks itself lexical.
-        if settled["kind"] == "outline" && text.contains("(3 symbols)") {
+        if settled["kind"] == "outline" && text.contains("(3 symbols") {
             break settled;
         }
         assert!(
@@ -15292,7 +15737,7 @@ async fn configured_product_pyright_symbol_tools_and_edit() {
     assert!(!text.contains("return \"hello\""), "{symbol}");
     assert!(text.contains("usages: 1 in 1 files"), "{symbol}");
     assert!(
-        text.contains("main.py:9  return Greeter(\"world\").method()"),
+        text.contains("main.py#caller:2 (L9)  return Greeter(\"world\").method()"),
         "{symbol}"
     );
     // pyright has no call hierarchy: the card says so instead of printing nothing, and a
@@ -15625,6 +16070,7 @@ async fn configured_product_nested_python_packages_are_listed_checked_and_edited
         )
         .await;
     let edit = actor.settle(&fixture, edit).await;
+    let edit = settle_edit_check(&mut actor, &fixture, edit).await;
     assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
     assert_eq!(
         edit["diagnostics"]["state"], "current_clean",
@@ -15699,6 +16145,7 @@ async fn configured_product_edit_in_a_package_without_environment_reports_server
         )
         .await;
     let edit = actor.settle(&fixture, edit).await;
+    let edit = settle_edit_check(&mut actor, &fixture, edit).await;
     assert_eq!(edit["result"]["outcome"], "replaced", "{edit}");
     assert_eq!(
         edit["diagnostics"]["state"], "current_reported",
@@ -15708,7 +16155,8 @@ async fn configured_product_edit_in_a_package_without_environment_reports_server
     assert!(
         messages.iter().any(|message| {
             let message = message.as_str().unwrap();
-            message.starts_with("libs/contracts/mod.py:2:12 error ")
+            message
+                .starts_with("libs/contracts/mod.py:2:12 libs/contracts/mod.py#value:2 (L2) error ")
                 && message.contains("not assignable")
         }),
         "the type error carries path:line:col severity: {edit}"
@@ -15730,7 +16178,7 @@ async fn configured_product_edit_in_a_package_without_environment_reports_server
         context["text"]
             .as_str()
             .unwrap()
-            .contains("libs/contracts/mod.py:2:12 error "),
+            .contains("libs/contracts/mod.py:2:12 libs/contracts/mod.py#value:2 (L2) error "),
         "context diagnostics carry their location: {context}"
     );
     let stopped = actor.call(&fixture, "ide.stop", json!({})).await;
@@ -16453,7 +16901,7 @@ async fn configured_product_typescript_symbol_tools_and_edit() {
     );
     assert!(!text.contains("return \"hello\""), "{symbol}");
     assert!(
-        text.contains("fixture.ts#caller  fixture.ts:4") && text.contains("new Greeter().method()"),
+        text.contains("fixture.ts#caller (L4)") && text.contains("new Greeter().method()"),
         "{symbol}"
     );
     let read = actor
@@ -17273,7 +17721,8 @@ async fn configured_product_rust_delete_does_not_report_cached_flycheck_diagnost
     assert_eq!(deleted["state"], "edit", "{deleted}");
     assert_eq!(deleted["operation"], "deleted", "{deleted}");
     assert!(
-        !deleted.to_string().contains("cold_probe"),
+        // The change line names the address the deleted symbol had; the diagnostics must not.
+        !deleted["diagnostics"].to_string().contains("cold_probe"),
         "a deleted function's cached flycheck warning must not be current: {deleted}"
     );
     actor.call(&fixture, "ide.stop", json!({})).await;
@@ -19508,16 +19957,16 @@ async fn configured_product_claude_activates_a_reader_then_stops() {
     .await;
     assert_eq!(edited["state"], "edit", "{edited}");
     assert_eq!(edited["result"]["outcome"], "replaced", "{edited}");
-    let edited_source_ref = edited["result"]["source_ref"]
-        .as_str()
-        .expect("a successful Claude Edit must retain its post-read detail")
-        .to_owned();
+    assert!(
+        edited["result"]["source_ref"].is_null(),
+        "a Claude edit reply names no file-version reference: {edited}"
+    );
     assert_eq!(
         std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
         b"claude-edit\n"
     );
-    // The returned Edit source reference is the already-reserved prepare detail, even while
-    // ordinary detail capacity is saturated; a second Claude Edit can consume it directly.
+    // A second Claude edit needs no reference at all, even while ordinary detail capacity is
+    // saturated: the current bytes are its base.
     let chained = claude_operation(
         &mut first,
         &fixture,
@@ -19525,7 +19974,6 @@ async fn configured_product_claude_activates_a_reader_then_stops() {
         json!({
             "operation_id":"claude-edit-2",
             "path":"tracked.txt",
-            "source_ref":edited_source_ref,
             "content":"claude-chain\n"
         }),
     )
@@ -23834,3 +24282,6 @@ async fn failed_stop_is_retried_by_the_daemon_without_another_call() {
 
 /// Batch forms (batch-api-v1) against the real daemon, sharing this file's fixtures.
 mod batch_api;
+
+/// Boundary tests of `symbol-read-edit-v1` against the real daemon, sharing this file's fixtures.
+mod symbol_read_edit;

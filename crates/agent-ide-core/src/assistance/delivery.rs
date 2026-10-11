@@ -28,16 +28,12 @@ use super::super::{
     tests::{RunResult, TestRuns, summary_absent},
     wake::{MAX_WAKE_BYTES, SessionWaker, WakeOutcome, WakeTarget},
 };
-use super::{INLINE_REPLY_WAIT, Job, JobStage, Shared, Worker, edit_operation};
+use super::{Job, JobStage, Shared, Worker, edit_operation};
 use crate::changes::edit::EditResult;
 
 /// Slack added to a run's budget before its holding registration expires: settlement, output
 /// draining and the settle hook itself.
 const RUN_SETTLE_SLACK: Duration = Duration::from_secs(5);
-/// How long before the caller's inline window ends an edit still awaiting its project check is
-/// answered with `diagnostics: pending` (OUTBOX §8.6), leaving room for the reply to travel. The
-/// multi-file edit (`batch_edit`) answers early by the same margin.
-pub(super) const EARLY_EDIT_REPLY_MARGIN: Duration = Duration::from_millis(1500);
 /// Most diagnostic `new:` lines one `edit-checked` fact carries (OUTBOX §3.3).
 const MAX_NEW_LINES: usize = 8;
 /// How long a holding fact waits before an idle session is woken, so an imminent hook takes it
@@ -371,8 +367,8 @@ fn edit_checked_fact(
 }
 
 impl Worker<'_> {
-    /// Answers an edit whose project check is still running with `diagnostics: pending` shortly
-    /// before its caller's inline window ends (OUTBOX §8.6).
+    /// Answers an edit whose project check is still running with `diagnostics: pending` at once,
+    /// right after the write is observed, without waiting for the check (symbol-read-edit-v1 §3.3).
     ///
     /// Only a caller still waiting is answered, and only when the session's outbox can hold the
     /// check as in-flight work under the job's reference: the job stays parked on its check and
@@ -386,18 +382,12 @@ impl Worker<'_> {
         else {
             return;
         };
-        let started = job.deadline.checked_sub(Duration::from_millis(
-            self.shared.launcher.limits.operation_ms,
-        ));
-        let due = started.is_none_or(|started| {
-            tokio::time::Instant::now() + EARLY_EDIT_REPLY_MARGIN >= started + INLINE_REPLY_WAIT
-        });
         let waiting = job
             .stop_reply
             .as_ref()
             .is_some_and(|sender| !sender.is_closed());
         let binding = job.invocation.binding_ref().clone();
-        if !due || !waiting || !self.shared.outbox.is_open(&binding) {
+        if !waiting || !self.shared.outbox.is_open(&binding) {
             return;
         }
         if result.outcome.has_post_source() {

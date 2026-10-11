@@ -281,18 +281,25 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Edit,
             json!({
                 "type": "object", "additionalProperties": false,
-                "required": ["operation_id"],
                 "properties": {
-                    "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Any unique id for this edit; repeating it never applies the edit twice."},
+                    "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Optional. Name an edit to make a retry safe: repeating the id never applies the edit twice. Omitted, a fresh id is used."},
                     "op": {"type": "string", "enum": ["replace", "insert", "delete", "rename"], "default": "replace", "description": "Symbol operation. replace: new body for `symbol` (or for `path`+`lines`); insert: new symbol placed `where` relative to `symbol`; delete: remove `symbol` with its header; rename: rename `symbol` project-wide to `new_name`."},
-                    "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`."},
+                    "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Address `file#Owner/name`, a window `file#Owner/name:3-5` (lines counted from the symbol's first line) or a region `file#@imports`."},
+                    "old": {"type": "string", "minLength": 1, "description": "Exact text to replace with `new`; it must occur exactly once in the scope (`symbol`'s unit or window, else the whole `path`). Aliases: `old_string`."},
+                    "new": {"type": "string", "description": "The replacement for `old`; empty deletes the match. Aliases: `new_string`."},
+                    "old_string": {"type": "string", "minLength": 1, "description": "Alias of `old`."},
+                    "new_string": {"type": "string", "description": "Alias of `new`."},
+                    "file_path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Alias of `path`."},
+                    "add_import": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "With `path`: one import statement, written as in the file, added after the other imports (nothing happens if it is already there)."},
+                    "remove_import": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "With `path`: the import statement to remove, as written in the file."},
                     "where": {"type": "string", "enum": ["before", "after", "first", "last"], "description": "For insert: before/after the anchor symbol, or first/last member of a container anchor."},
                     "new_name": {"type": "string", "minLength": 1, "maxLength": 128, "description": "For rename: the new identifier, applied project-wide."},
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES},
                     "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "With `path`: inclusive 1-based line range to replace."},
-                    "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "The source_ref of the ide.read/ide.context this content is based on; required with `path`+`lines` and to replace an existing file with `path`+`content`, optional (but validated) with `symbol`. Omit it with `path`+`content` to create a new file."},
+                    "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Deprecated and never needed: the current text is the base of every edit. A supplied value is still checked against the file."},
                     "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES, "description": "Replacement or inserted code, including the symbol's doc comment and attributes."},
-                    "changes": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "additionalProperties": false, "properties": {"lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "op": {"type": "string", "enum": ["replace", "insert", "delete"]}, "where": {"type": "string", "enum": ["before", "after", "first", "last"]}, "content": {"type": "string"}, "old": {"type": "string", "minLength": 1}, "new": {"type": "string"}, "within": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}}, "description": "1–32 changes to ONE file (named by `path`), each addressed by exactly one of `lines`, `symbol` or `old`; every address resolves against the bytes `source_ref` names before anything is applied, and overlapping or unmatched addresses are refused together with nothing written. `lines` numbers are that version's, never shifted by other changes (empty `content` deletes the range); `old` must match exactly once (add `within` to scope it) and `new` replaces exactly the matched bytes, terminators included (`\"\"` deletes the match)."}},
+                    "changes": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object", "additionalProperties": false, "properties": {"lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "op": {"type": "string", "enum": ["replace", "insert", "delete"]}, "where": {"type": "string", "enum": ["before", "after", "first", "last"]}, "content": {"type": "string"}, "old": {"type": "string", "minLength": 1}, "new": {"type": "string"}, "within": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "add_import": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "remove_import": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}}, "description": "1–32 changes to ONE file (named by `path`), each addressed by exactly one of `lines`, `symbol` (an address, a `:N-M` window or an `@` region), `old` (with `symbol` or `within` to scope it), `add_import` or `remove_import`; every address resolves against the file's current text before anything is applied, and overlapping or unmatched addresses are refused together with nothing written. `lines` numbers are the current file's, never shifted by other changes (empty `content` deletes the range); `old` must match exactly once and `new` replaces exactly the matched bytes, terminators included (`\"\"` deletes the match)."}},
+                    "patch": {"type": "string", "minLength": 1, "maxLength": super::batch::MAX_EDIT_TEXT_BYTES, "description": "A Codex apply_patch body (`*** Begin Patch` … `*** End Patch` with Add File and Update File sections), applied atomically across files. Use it alone; delete and move are not supported."},
                     "files": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_EDIT_FILES, "items": {"type": "object", "additionalProperties": false, "required": ["path"], "properties": {"path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "source_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}, "changes": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"type": "object"}}, "content": {"type": "string", "maxLength": MAX_EDIT_ARGUMENT_CONTENT_BYTES}, "create": {"type": "boolean"}}}, "description": "One logical change across up to 16 files in ONE call, with only `operation_id` and an optional default `source_ref` beside it: each entry is {\"path\",\"changes\":[…]} (exactly the one-file `changes` entries), {\"path\",\"create\":true,\"content\"} (a new file) or {\"path\",\"content\"} (whole new content), with its own optional `source_ref`; at most 128 changes and 128 KiB of text in all. Every file is validated before the first write and any refusal writes nothing; files are written in order, one project check runs on the result, a partial write is reported per file, and the same `operation_id` resumes the rest."}
                 }
             }),
@@ -305,7 +312,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root."},
                     "paths": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_OUTLINE_FILES, "items": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "description": "Several files in ONE call instead of `path`: up to 24 worktree-relative paths, outlined in request order behind one summary line; a file past the reply budget is listed in one line with its exact call."},
                     "glob": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "Every file matching this worktree-relative pattern in ONE call instead of `path`: `*` within a segment, `?` one character, `**` any directories (e.g. `crates/x/src/**/*.rs`); at most 24 files in path order, never outside the worktree, skipping hidden and build directories."},
-                    "kinds": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol)(,(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol))*$", "description": "Comma list over the closed symbol-kind vocabulary; keeps a symbol whose kind is selected or a descendant's is, so a container of a selected member still shows."}
+                    "kinds": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol|region)(,(module|namespace|struct|enum|class|interface|trait|impl|type|fn|method|constructor|field|variant|const|var|test|symbol|region))*$", "description": "Comma list over the closed symbol-kind vocabulary; keeps a symbol whose kind is selected or a descendant's is, so a container of a selected member still shows. `region` also lists file-level regions (@header, @imports, ...)."}
                 }
             }),
         ),
@@ -316,10 +323,10 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "properties": {
                     "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`; returns its body with the doc header."},
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root; alone it reads the whole file, with `lines` or `ranges` those lines."},
-                    "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$", "description": "Inclusive 1-based line range such as `120-180`."},
+                    "lines": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$", "description": "Inclusive 1-based line range: `120-180`, `120-` (to the end) or `120`. An end past the file is clamped."},
                     "symbols": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "description": "Several bodies in one reply, request order, one `source_ref` valid for every file included: `[\"src/a.rs#Foo/bar\",\"src/b.rs#qux\"]`. Unknown symbols are reported per item without failing the rest; a bare file path reads the text of a file no IDE language reads."},
-                    "ranges": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}, "description": "Several line ranges of `path` in one reply, request order, with the same numbered gutter and one `source_ref`."},
-                    "items": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_READ_ITEMS, "items": {"type": "object", "additionalProperties": false, "properties": {"symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "lines": {"type": "string", "pattern": "^[0-9]+-[0-9]+$"}}}, "description": "Everything to read in ONE call, up to 32 items over at most 16 files, instead of `symbol`, `path`, `lines`, `symbols` or `ranges`: each item is exactly one of {\"symbol\":\"src/a.rs#Foo/bar\"}, {\"path\":\"docs/x.md\"} (the whole file) or {\"path\":\"src/b.rs\",\"lines\":\"10-40\"}. The reply opens with a summary line, then one block per item in request order; a failed item fails only itself, and one `source_ref` is valid for every file whose items were all delivered."},
+                    "ranges": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$"}, "description": "Several line ranges of `path` in one reply, request order, with the same numbered gutter and one `source_ref`."},
+                    "items": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_READ_ITEMS, "items": {"type": "object", "additionalProperties": false, "properties": {"symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES}, "lines": {"type": "string", "pattern": "^[0-9]+(-[0-9]*)?$"}}}, "description": "Everything to read in ONE call, up to 32 items over at most 16 files, instead of `symbol`, `path`, `lines`, `symbols` or `ranges`: each item is exactly one of {\"symbol\":\"src/a.rs#Foo/bar\"}, {\"path\":\"docs/x.md\"} (the whole file) or {\"path\":\"src/b.rs\",\"lines\":\"10-40\"}. The reply opens with a summary line, then one block per item in request order; a failed item fails only itself, and one `source_ref` is valid for every file whose items were all delivered."},
                     "force": {"type": "boolean", "default": false, "description": "With `items`: return the text of an item even when its bytes are unchanged since your earlier read."}
                 }
             }),
@@ -445,11 +452,42 @@ fn range_list(
 ) -> Result<Option<Vec<String>>, ParameterError> {
     let list = string_list(object, field, max)?;
     if let Some(list) = &list
-        && list.iter().any(|range| parse_line_range(range).is_none())
+        && list.iter().any(|range| parse_read_range(range).is_none())
     {
         return Err(invalid_field(field, FieldRule::LineRange));
     }
     Ok(list)
+}
+
+/// A fresh `operation_id` for an edit call that named none: process id, wall-clock nanoseconds
+/// and a process-wide counter, so ids never repeat across calls or daemon restarts.
+fn generated_operation_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    format!(
+        "auto-{}-{nanos:x}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Parses a lenient read range: `N` (one line), `N-M` or `N-` (to the end of the file).
+///
+/// The end of an open range is `u32::MAX`; readers clamp every end to the file's last line, so a
+/// range past the end of a file is never a parse failure. `None` for any other shape, a zero
+/// start or an end before the start.
+pub(crate) fn parse_read_range(text: &str) -> Option<crate::lang::LineRange> {
+    let (start, end) = match text.split_once('-') {
+        None => (text, text),
+        Some((start, "")) => (start, "4294967295"),
+        Some(pair) => pair,
+    };
+    let start: u32 = start.parse().ok()?;
+    let end: u32 = end.parse().ok()?;
+    (start >= 1 && end >= start).then(|| crate::lang::LineRange::new(start, end))
 }
 
 /// Parses an inclusive 1-based `start-end` line range; `None` for any other shape.
@@ -545,14 +583,6 @@ pub enum FieldRule {
     Boolean,
     /// The value must be an inclusive 1-based range `start-end` with `start <= end`.
     LineRange,
-    /// The closed method cannot proceed without the `source_ref` of the read its lines came from.
-    RangeEditSourceRef,
-    /// Exact-text changes require a source observation from the file that contains the text.
-    OldTextSourceRef,
-    /// A full-file edit without `source_ref` named a file that already exists: it may only create
-    /// a missing one, so replacing needs the `source_ref` of a read of that file. The worker, not
-    /// the facade, applies this rule, since only it observes whether the path exists.
-    ReplaceSourceRef,
 }
 
 impl FieldRule {
@@ -590,18 +620,7 @@ impl FieldRule {
             ),
             Self::RequiresProblemsKind => "requires \"kind\":\"problems\"".to_string(),
             Self::Boolean => "must be true or false".to_string(),
-            Self::LineRange => "must be an inclusive 1-based range like 120-180".to_string(),
-            Self::RangeEditSourceRef => {
-                "is required for a line-range edit; re-read the lines (ide.read) and retry with \
-                 the new source_ref"
-                    .to_string()
-            }
-            Self::OldTextSourceRef => {
-                "is required for an old-text change; re-read this file with ide.read and retry with the new source_ref".to_string()
-            }
-            Self::ReplaceSourceRef => {
-                "is required to replace an existing file: read it first (ide.read)".to_string()
-            }
+            Self::LineRange => "must be a 1-based line range like 120-180".to_string(),
         }
     }
 }
@@ -640,8 +659,7 @@ impl ParameterError {
                     .to_string()
             }
             Self::EditTarget => {
-                "ide.edit takes one form: `symbol` with `op`, or `path` with `lines` and \
-                 `source_ref` — not both"
+                "ide.edit takes one form: `symbol` with `op`, or `path` with `lines` — not both"
                     .to_string()
             }
             Self::ChangesTarget => {
@@ -705,6 +723,7 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "new_name",
             "lines",
             "files",
+            "patch",
         ],
         AssistanceTool::Outline => &["path", "kinds", "paths", "glob"],
         AssistanceTool::Read => &[
@@ -802,6 +821,17 @@ pub fn validate_call(
         }
         _ => {}
     }
+    // `operation_id` is optional on every edit form: a call without one gets a fresh id, so it
+    // is never mistaken for a replay of another call.
+    if tool == AssistanceTool::Edit
+        && let Some(map) = parameters.as_object_mut()
+        && !map.contains_key("operation_id")
+    {
+        map.insert("operation_id".to_owned(), json!(generated_operation_id()));
+    }
+    if tool == AssistanceTool::Edit {
+        super::edit_forms::normalize(&mut parameters);
+    }
     let object = parameters
         .as_object()
         .ok_or(ParameterError::InvalidObject)?;
@@ -829,9 +859,9 @@ pub fn validate_call(
                 .get("kinds")
                 .and_then(Value::as_str)
                 .is_some_and(|kinds| {
-                    kinds
-                        .split(',')
-                        .any(|kind| crate::lang::SymbolKind::from_name(kind).is_none())
+                    kinds.split(',').any(|kind| {
+                        kind != "region" && crate::lang::SymbolKind::from_name(kind).is_none()
+                    })
                 })
             {
                 return Err(invalid_field(
@@ -870,7 +900,7 @@ pub fn validate_call(
                     if let Some(rule) = path_shape_rule(path) {
                         return Err(invalid_field("path", rule));
                     }
-                    if parse_line_range(object["lines"].as_str().unwrap_or_default()).is_none() {
+                    if parse_read_range(object["lines"].as_str().unwrap_or_default()).is_none() {
                         return Err(invalid_field("lines", FieldRule::LineRange));
                     }
                 }
@@ -1239,6 +1269,27 @@ pub fn validate_call(
         AssistanceTool::Stop => {
             optional_string(object, "activation_id", MAX_ACTIVATION_ID_BYTES)?;
         }
+        AssistanceTool::Edit if object.contains_key("patch") => {
+            // A Codex `apply_patch` body travels alone beside `operation_id`; its grammar is
+            // checked by the worker, which owns the refusal text.
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "operation_id" | "patch"))
+            {
+                return Err(invalid_field(
+                    "patch",
+                    FieldRule::OneOf("used only with \"operation_id\""),
+                ));
+            }
+            let patch = required_string(object, "patch", super::batch::MAX_EDIT_TEXT_BYTES)?;
+            if patch.len() > super::batch::MAX_EDIT_TEXT_BYTES {
+                return Err(invalid_field(
+                    "patch",
+                    FieldRule::TooLong(super::batch::MAX_EDIT_TEXT_BYTES),
+                ));
+            }
+            required_string(object, "operation_id", 128)?;
+        }
         AssistanceTool::Edit if object.contains_key("files") => {
             super::batch::validate_edit_files(object)?;
         }
@@ -1262,15 +1313,21 @@ pub fn validate_call(
                         FieldRule::OneOf("an array of 1 to 32 change objects"),
                     )
                 })?;
-            // Line numbers and exact text are only meaningful for the bytes the caller read, so
-            // any `lines` or `old` entry makes the call name the observation it came from.
-            let mut needs_source = false;
             for entry in changes {
                 let entry = entry.as_object().ok_or_else(|| {
                     invalid_field("changes", FieldRule::OneOf("an array of change objects"))
                 })?;
                 let allowed = [
-                    "lines", "symbol", "op", "where", "content", "old", "new", "within",
+                    "lines",
+                    "symbol",
+                    "op",
+                    "where",
+                    "content",
+                    "old",
+                    "new",
+                    "within",
+                    "add_import",
+                    "remove_import",
                 ];
                 if let Some(field) = entry
                     .keys()
@@ -1278,7 +1335,7 @@ pub fn validate_call(
                 {
                     return Err(ParameterError::UnknownField(echoable_field(field)));
                 }
-                let addresses = ["lines", "symbol", "old"]
+                let addresses = ["lines", "symbol", "old", "add_import", "remove_import"]
                     .into_iter()
                     .filter(|field| entry.contains_key(*field))
                     .count();
@@ -1286,19 +1343,36 @@ pub fn validate_call(
                     return Err(invalid_field(
                         "changes",
                         FieldRule::OneOf(
-                            "each entry addressed by exactly one of \"lines\", \"symbol\" or \
-                             \"old\"",
+                            "each entry addressed by exactly one of \"lines\", \"symbol\", \
+                             \"old\", \"add_import\" or \"remove_import\"",
                         ),
                     ));
                 }
-                if entry.contains_key("lines") {
+                if let Some(field) = ["add_import", "remove_import"]
+                    .into_iter()
+                    .find(|field| entry.contains_key(*field))
+                {
+                    // One import statement as written; a second form key beside it is a mix.
+                    let statement = entry_string(entry, field)?;
+                    if statement.contains('\n') || statement.len() > MAX_SYMBOL_PATH_BYTES {
+                        return Err(invalid_field(
+                            "changes",
+                            FieldRule::OneOf("an import statement on one line"),
+                        ));
+                    }
+                    if entry.len() != 1 {
+                        return Err(invalid_field(
+                            "changes",
+                            FieldRule::OneOf("an import entry with no other key"),
+                        ));
+                    }
+                } else if entry.contains_key("lines") {
                     if parse_line_range(entry_string(entry, "lines")?).is_none() {
                         return Err(invalid_field(
                             "changes",
                             FieldRule::OneOf("entry \"lines\" like 12-20"),
                         ));
                     }
-                    needs_source = true;
                     // The content may be empty: empty replaces the range with nothing, which
                     // deletes those lines.
                     if !entry.get("content").is_some_and(Value::is_string) {
@@ -1334,7 +1408,10 @@ pub fn validate_call(
                     }
                     match op {
                         "replace" => {
-                            entry_string(entry, "content")?;
+                            // Empty content deletes the unit or the window (E2).
+                            if !entry.get("content").is_some_and(Value::is_string) {
+                                return Err(invalid_field("content", FieldRule::String));
+                            }
                         }
                         "insert" => {
                             entry_string(entry, "content")?;
@@ -1358,7 +1435,6 @@ pub fn validate_call(
                     }
                 } else {
                     entry_string(entry, "old")?;
-                    needs_source = true;
                     if !entry
                         .get("new")
                         .is_some_and(|value| value.as_str().is_some())
@@ -1384,21 +1460,9 @@ pub fn validate_call(
                     }
                 }
             }
-            if needs_source {
-                // Line numbers and exact text name the read they came from; the refusal teaches
-                // the re-read the way the single line-range form's does.
-                if !object.contains_key("source_ref") {
-                    let rule = if changes.iter().any(|entry| entry.get("old").is_some()) {
-                        FieldRule::OldTextSourceRef
-                    } else {
-                        FieldRule::RangeEditSourceRef
-                    };
-                    return Err(invalid_field("source_ref", rule));
-                }
-                required_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?;
-            } else {
-                optional_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?;
-            }
+            // Without `source_ref` every address resolves against the bytes current at
+            // processing time.
+            optional_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?;
         }
         AssistanceTool::Edit if object.contains_key("symbol") || object.contains_key("lines") => {
             required_string(object, "operation_id", 128)?;
@@ -1440,12 +1504,6 @@ pub fn validate_call(
                 if parse_line_range(required_string(object, "lines", 32)?).is_none() {
                     return Err(invalid_field("lines", FieldRule::LineRange));
                 }
-                // Line numbers are only meaningful for the exact content the caller read, so the
-                // range form always names the observation it came from.
-                if !object.contains_key("source_ref") {
-                    return Err(invalid_field("source_ref", FieldRule::RangeEditSourceRef));
-                }
-                required_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?;
             }
             match op {
                 "replace" | "insert" => {
@@ -5312,26 +5370,6 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
         ),
         (
             validate_call(
-                AssistanceTool::Edit,
-                json!({"operation_id":"o","path":"a.rs","lines":"1-2","content":"x"}),
-            )
-            .unwrap_err(),
-            AssistanceTool::Edit,
-            "invalid bounded parameters: \"source_ref\" is required for a line-range edit; \
-             re-read the lines (ide.read) and retry with the new source_ref"
-                .to_string(),
-        ),
-        (
-            validate_call(
-                AssistanceTool::Edit,
-                json!({"operation_id":"o","path":"a.rs","changes":[{"old":"x","new":"y"}]}),
-            )
-            .unwrap_err(),
-            AssistanceTool::Edit,
-            "invalid bounded parameters: \"source_ref\" is required for an old-text change; re-read this file with ide.read and retry with the new source_ref".to_string(),
-        ),
-        (
-            validate_call(
                 AssistanceTool::Read,
                 json!({"symbol":"a.rs#run","path":"a.rs","lines":"1-2"}),
             )
@@ -5359,8 +5397,7 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
             )
             .unwrap_err(),
             AssistanceTool::Edit,
-            "ide.edit takes one form: `symbol` with `op`, or `path` with `lines` and \
-             `source_ref` — not both"
+            "ide.edit takes one form: `symbol` with `op`, or `path` with `lines` — not both"
                 .to_string(),
         ),
         (
@@ -5482,15 +5519,9 @@ fn edit_changes_shape_matrix() {
         )
         .is_ok()
     );
-    // A lines entry without source_ref is refused on the source_ref rule.
-    assert_eq!(
-        batch(false, json!([{"lines":"3-4","content":"x"}])).unwrap_err(),
-        invalid_field("source_ref", FieldRule::RangeEditSourceRef)
-    );
-    assert_eq!(
-        batch(false, json!([{"old":"a","new":"b"}])).unwrap_err(),
-        invalid_field("source_ref", FieldRule::OldTextSourceRef)
-    );
+    // Lines and old entries need no source_ref: the current bytes are the base.
+    assert!(batch(false, json!([{"lines":"3-4","content":"x"}])).is_ok());
+    assert!(batch(false, json!([{"old":"a","new":"b"}])).is_ok());
     // No address, two addresses, a bad op, a bad where, a missing payload.
     assert!(batch(true, json!([{"content":"x"}])).is_err());
     assert!(batch(true, json!([{"lines":"1-2","old":"a","new":"b"}])).is_err());
@@ -5615,14 +5646,13 @@ fn full_file_edit_without_source_ref_is_a_creation_request() {
         )
         .is_err()
     );
-    assert_eq!(
-        ParameterError::InvalidField {
-            field: "source_ref",
-            rule: FieldRule::ReplaceSourceRef,
-        }
-        .message(AssistanceTool::Edit),
-        "invalid bounded parameters: \"source_ref\" is required to replace an existing file: \
-         read it first (ide.read)"
+    // A whole-file replacement needs no source_ref either, and an edit without operation_id
+    // gets a distinct generated one.
+    let first = validate_call(AssistanceTool::Edit, json!({"path":"a.rs","content":"x"})).unwrap();
+    let second = validate_call(AssistanceTool::Edit, json!({"path":"a.rs","content":"x"})).unwrap();
+    assert_ne!(
+        first.parameters()["operation_id"],
+        second.parameters()["operation_id"]
     );
 }
 
@@ -6453,5 +6483,95 @@ mod managed_claude_front_tests {
         );
         assert!(text.starts_with("error: outcome_unknown"), "{text}");
         assert!(!reconnect.activated_before().await);
+    }
+
+    /// The lenient read range grammar: one line, a closed range and an open range parse; zero,
+    /// reversed and malformed ranges do not. Edits keep the strict grammar.
+    #[test]
+    fn read_ranges_accept_one_line_closed_and_open_forms() {
+        let range = |text: &str| parse_read_range(text).map(|r| (r.start, r.end));
+        assert_eq!(range("7"), Some((7, 7)));
+        assert_eq!(range("7-9"), Some((7, 9)));
+        assert_eq!(range("7-"), Some((7, u32::MAX)));
+        for bad in ["", "0", "0-3", "9-7", "-3", "a-b", "1-2-3"] {
+            assert_eq!(range(bad), None, "{bad}");
+        }
+        assert!(parse_line_range("7").is_none() && parse_line_range("7-").is_none());
+    }
+
+    /// The address-shaped edit forms E1-E8 validate; their closed shape errors refuse.
+    #[test]
+    fn address_edit_forms_validate() {
+        for call in [
+            json!({"symbol":"a.rs#F:2-3","content":"x"}),
+            json!({"symbol":"a.rs#F:2","content":""}),
+            json!({"symbol":"a.rs#F","old":"x","new":"y"}),
+            json!({"symbol":"a.rs#F:2-3","old":"x","new":"y"}),
+            json!({"path":"a.rs","old":"x","new":"y"}),
+            json!({"file_path":"a.rs","old_string":"x","new_string":""}),
+            json!({"symbol":"a.rs#@imports","op":"insert","where":"after","content":"use x;"}),
+            json!({"symbol":"a.rs#@header","content":"// h"}),
+            json!({"symbol":"a.rs#F:2-3","op":"delete"}),
+            json!({"path":"a.rs","add_import":"use std::fmt;"}),
+            json!({"path":"a.rs","remove_import":"use std::fmt;"}),
+            json!({"path":"a.rs","changes":[{"symbol":"a.rs#F","old":"x","new":"y"},{"add_import":"use x;"}]}),
+        ] {
+            assert!(
+                validate_call(AssistanceTool::Edit, call.clone()).is_ok(),
+                "{call}"
+            );
+        }
+        for call in [
+            json!({"path":"a.rs","add_import":"use a;\nuse b;"}),
+            json!({"path":"a.rs","old":"x"}),
+            json!({"path":"a.rs","old":"x","new":"y","content":"z"}),
+            json!({"symbol":"a.rs#F:2-3","old":"x","new":"y","content":"z"}),
+            json!({"path":"a.rs","add_import":"use a;","remove_import":"use b;"}),
+        ] {
+            assert!(
+                validate_call(AssistanceTool::Edit, call.clone()).is_err(),
+                "{call}"
+            );
+        }
+    }
+
+    /// The read forms accept windows, regions and `path:line` locations as symbol texts.
+    #[test]
+    fn read_accepts_windows_regions_and_locations() {
+        for call in [
+            json!({"symbol":"src/a.rs#Store/transcript:3-5"}),
+            json!({"symbol":"src/a.rs#@imports"}),
+            json!({"symbol":"/repo/src/a.rs:130"}),
+            json!({"symbols":["src/a.rs#@header","src/a.rs#Store/new:2","src/b.rs:88"]}),
+            json!({"items":[{"symbol":"src/a.rs#Store/transcript:10"},{"path":"docs/x.md","lines":"1-"}]}),
+        ] {
+            assert!(
+                validate_call(AssistanceTool::Read, call.clone()).is_ok(),
+                "{call}"
+            );
+        }
+    }
+
+    /// `ide.edit {patch}` validates alone beside an optional `operation_id`; any other field beside
+    /// it, a non-string or an empty patch is refused, and the grammar is left to the worker.
+    #[test]
+    fn patch_edit_stands_alone() {
+        let ok = validate_call(
+            AssistanceTool::Edit,
+            json!({"patch":"*** Begin Patch\n*** End Patch"}),
+        )
+        .unwrap();
+        assert!(ok.parameters()["operation_id"].is_string());
+        for bad in [
+            json!({"patch":"x","path":"a.rs"}),
+            json!({"patch":"x","files":[]}),
+            json!({"patch":5}),
+            json!({"patch":""}),
+        ] {
+            assert!(
+                validate_call(AssistanceTool::Edit, bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
     }
 }

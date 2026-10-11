@@ -174,15 +174,22 @@ impl Worker<'_> {
         }
         let (outline, _, lexical) = self.outline_of(job, &observed, &bytes).await?;
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
+        let map = lang::address::AddressMap::build(&outline, observed_text(&observed, &bytes)?);
         let mut text = match job.parameters.get("kinds").and_then(Value::as_str) {
             Some(requested) => {
-                let kinds: Vec<lang::SymbolKind> = requested
-                    .split(',')
-                    .filter_map(lang::SymbolKind::from_name)
+                let names: Vec<&str> = requested.split(',').map(str::trim).collect();
+                let kinds: Vec<lang::SymbolKind> = names
+                    .iter()
+                    .filter_map(|name| lang::SymbolKind::from_name(name))
                     .collect();
-                render::filtered_outline_text(&outline, &kinds, requested)
+                let filter = render::OutlineFilter {
+                    kinds: &kinds,
+                    regions: names.contains(&"region"),
+                    requested,
+                };
+                render::address_outline_text(&outline, &map, Some(&filter))
             }
-            None => render::outline_text(&outline),
+            None => render::address_outline_text(&outline, &map, None),
         };
         if let Some(why) = lexical.as_ref()
             && let Some(note) = self.lexical_note(job, observed.path(), why)
@@ -203,8 +210,9 @@ impl Worker<'_> {
     /// like any read. Any readable text file answers the `path` forms, whatever its type; a file
     /// no IDE language analyzes ends with [`NO_ANALYSIS_NOTE`]. A binary or unreadable file
     /// is refused as `source_unavailable` with a `read:not_text:` or `read:source_unavailable:`
-    /// detail (a soft refusal naming native tools, never `internal`); a `lines` range past the
-    /// end is refused `read:line_range`. The `symbol` form still needs an outline, so a file no
+    /// detail (a soft refusal naming native tools, never `internal`); a `lines` range (`N`, `N-M`,
+    /// `N-`) is clamped at the end of the file, and one starting past it succeeds with
+    /// `file has <n> lines; nothing at <range>`. The `symbol` form still needs an outline, so a file no
     /// IDE language reads answers `unsupported_file`.
     pub(super) async fn read(
         &mut self,
@@ -222,6 +230,15 @@ impl Worker<'_> {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let sigil = requested.as_deref().and_then(links::sigil_address);
+        // An address, window, region or `path:line` reads as a numbered unit
+        // (symbol-read-edit-v1 §2.1); anything else, or a unit the file does not have, reads
+        // the pre-v1 way below, which also owns the refusal texts.
+        if sigil.is_none()
+            && let Some(text) = requested.as_deref()
+            && let Some(reply) = Box::pin(self.read_by_address(job, &binding, text)).await?
+        {
+            return Ok(reply);
+        }
         let mut lexical = None;
         let (path, range, title) = match (requested.as_deref(), sigil) {
             // A sigil address reads the name's first indexed definition.
@@ -265,7 +282,7 @@ impl Worker<'_> {
                     Some(lines) => Some(
                         lines
                             .as_str()
-                            .and_then(crate::assistance::facade::parse_line_range)
+                            .and_then(crate::assistance::facade::parse_read_range)
                             .ok_or(FailureCode::SourceUnavailable)?,
                     ),
                     None => None,
@@ -287,14 +304,16 @@ impl Worker<'_> {
         }
         let source = readable_text(job, &observed, &bytes, &path)?;
         let total = lang::line_count(source);
+        // A start past the end is a success that says so; an end past it is clamped.
         if let Some(range) = range
-            && (range.start > total || range.end > total)
+            && range.start > total
         {
-            job.failure_detail = Some(format!(
-                "read:line_range:file has {total} lines; requested {}-{}",
-                range.start, range.end
-            ));
-            return Err(FailureCode::SourceUnavailable);
+            let authority = self.finish_symbol_job(job, &binding, &observed).await?;
+            let text = nothing_at(total, range);
+            let (reply, page) =
+                ContextPageState::new(text, 0, false, ResultKind::Read).next(&job.reference)?;
+            self.shared.set_context_page(&job.reference, page);
+            return Ok((reply, Some(authority), Some(observed)));
         }
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
         let mut text = match range {
@@ -313,7 +332,6 @@ impl Worker<'_> {
         if Lang::for_path(&path).is_none() {
             text.push_str(NO_ANALYSIS_NOTE);
         }
-        text.push_str(&format!("source_ref: {}\n", job.reference));
         let (reply, page) =
             ContextPageState::new(text, 0, false, ResultKind::Read).next(&job.reference)?;
         self.shared.set_context_page(&job.reference, page);
@@ -373,15 +391,32 @@ impl Worker<'_> {
             seen.push(item.clone());
             match &item {
                 ReadItem::Symbol(address) => {
-                    let Ok(symbol) = SymbolPath::parse_item(address) else {
-                        return Err(FailureCode::UnknownSymbol);
-                    };
-                    let Some(file) = symbol.file().map(Path::to_path_buf) else {
-                        return Err(FailureCode::UnknownSymbol);
+                    // An address with a window or region, or a `path:line` location, reads as a
+                    // numbered unit (symbol-read-edit-v1 §2.1); other text, or a unit the file
+                    // lacks, takes the pre-v1 symbol path below.
+                    let request = target::parse_request(address);
+                    let legacy = SymbolPath::parse_item(address).ok();
+                    let file = match (&request, &legacy) {
+                        (Some(target::Requested::Line { file, .. }), _) => {
+                            self.relative_file(&binding, file.clone()).await?
+                        }
+                        (_, Some(symbol)) => symbol
+                            .file()
+                            .map(Path::to_path_buf)
+                            .ok_or(FailureCode::UnknownSymbol)?,
+                        (Some(target::Requested::Address(found)), None) => found
+                            .file()
+                            .map(Path::to_path_buf)
+                            .ok_or(FailureCode::UnknownSymbol)?,
+                        (None, None) => return Err(FailureCode::UnknownSymbol),
                     };
                     // A bare path of a file no IDE language reads has no outline to resolve: it
                     // reads as text, like `ide.read {path}`.
-                    let text_file = symbol.segments().is_empty() && Lang::for_path(&file).is_none();
+                    let text_file = request.is_none()
+                        && legacy
+                            .as_ref()
+                            .is_some_and(|symbol| symbol.segments().is_empty())
+                        && Lang::for_path(&file).is_none();
                     let index = match self
                         .read_batch_file(job, &binding, &mut files, file.clone(), !text_file)
                         .await
@@ -426,12 +461,21 @@ impl Worker<'_> {
                         ));
                         continue;
                     };
-                    let block = match outline.find(&symbol) {
-                        Some(found) => {
+                    let unit = request.as_ref().and_then(|request| {
+                        let map = lang::address::AddressMap::build(outline, source);
+                        target::read_unit(&file, &map, source, request)
+                    });
+                    let found = legacy.as_ref().and_then(|symbol| outline.find(symbol));
+                    let block = match (unit, found) {
+                        (Some((text, read)), _) => {
+                            self.remember_unit_read(&binding, read);
+                            (text, Some(index))
+                        }
+                        (None, Some(found)) => {
                             let text = render::read_text(&file, Some(address), found.range, source);
                             (text, Some(index))
                         }
-                        None => (
+                        (None, None) => (
                             format!(
                                 "no such symbol: {address} — check ide.outline \
                                  {{\"path\":\"{}\"}}\n",
@@ -445,7 +489,7 @@ impl Worker<'_> {
                 ReadItem::Path(path) | ReadItem::Lines(path, _) => {
                     let range = match &item {
                         ReadItem::Lines(_, lines) => Some(
-                            crate::assistance::facade::parse_line_range(lines)
+                            crate::assistance::facade::parse_read_range(lines)
                                 .ok_or(FailureCode::Internal)?,
                         ),
                         _ => None,
@@ -485,14 +529,7 @@ impl Worker<'_> {
                     };
                     let total = lang::line_count(source);
                     if range.start > total {
-                        items.push((
-                            format!(
-                                "no such range: lines {range} is past the end of {path} \
-                                 ({total} lines)\n"
-                            ),
-                            None,
-                            item,
-                        ));
+                        items.push((nothing_at(total, range), None, item));
                         continue;
                     }
                     let clamped = LineRange::new(range.start, range.end.min(total));
@@ -556,15 +593,9 @@ impl Worker<'_> {
             } else {
                 ""
             };
-            if names.len() > 1 {
-                format!(
-                    "{note}source_ref: {} (valid for {})\n",
-                    job.reference,
-                    names.join(", ")
-                )
-            } else {
-                format!("{note}source_ref: {}\n", job.reference)
-            }
+            // No file-version reference is printed: the current text is the freshness check.
+            let _ = names;
+            note.to_owned()
         };
         let files_named = items
             .iter()
@@ -736,7 +767,7 @@ impl Worker<'_> {
     /// file whose trimmed content is the epoch and replaces the outbox's answer, so product tests
     /// can simulate a compaction by rewriting it; content that is not a number stands for an
     /// unknown epoch (`None`).
-    fn context_epoch(&self, binding: &BindingRef) -> Option<u64> {
+    pub(super) fn context_epoch(&self, binding: &BindingRef) -> Option<u64> {
         match crate::test_seams::var("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE") {
             Some(seam) => std::fs::read_to_string(seam).ok()?.trim().parse().ok(),
             None => crate::assistance::outbox::SessionOutbox::context_epoch(&*self.shared, binding),
@@ -757,6 +788,7 @@ impl Worker<'_> {
             .as_str()
             .ok_or(FailureCode::UnknownSymbol)?
             .to_owned();
+        let requested = Box::pin(self.locate_line(job, &binding, &requested)).await?;
         let symbol = SymbolPath::parse(&requested).map_err(|_| FailureCode::UnknownSymbol)?;
         let want_usages = job
             .parameters
@@ -803,10 +835,20 @@ impl Worker<'_> {
                     }
                     Ok(located) => {
                         let mut candidates = match located {
-                            Located::One(file) => vec![format!("{}#{name}", file.display())],
+                            Located::One(file) => {
+                                let authority = self.authority(&binding).await?;
+                                match Box::pin(self.scanned_map(job, &authority, &file)).await {
+                                    Some(map) => map
+                                        .named(&name)
+                                        .into_iter()
+                                        .map(|u| render::candidate_row(&map.units()[u]))
+                                        .collect(),
+                                    None => vec![format!("{}#{name}", file.display())],
+                                }
+                            }
                             Located::Many(candidates) => candidates,
                         };
-                        candidates.extend(indexed.iter().map(links::candidate));
+                        candidates.extend(self.candidate_rows(job, &binding, &indexed).await);
                         return self.ambiguous(job, &binding, &requested, candidates).await;
                     }
                     Err(FailureCode::UnknownSymbol | FailureCode::ProviderUnavailable)
@@ -823,7 +865,7 @@ impl Worker<'_> {
         let (observed, bytes) = self.observe(&binding, file.clone()).await?;
         let (outline, worktree_root, lexical) = self.outline_of(job, &observed, &bytes).await?;
         let found = match symbol.file() {
-            Some(_) => outline.find(&symbol).cloned(),
+            Some(_) => find_symbol(&outline, observed_text(&observed, &bytes)?, &symbol),
             None => {
                 let name = symbol.name().unwrap_or_default();
                 // A declaration and its impl blocks share one address: one definition, which
@@ -833,29 +875,35 @@ impl Worker<'_> {
                     1 => Some(candidates[0].clone()),
                     0 => None,
                     _ => {
-                        let mut candidates = candidates
-                            .iter()
-                            .map(|candidate| candidate.path.to_string())
-                            .collect::<Vec<_>>();
-                        candidates.sort();
+                        let candidates = in_file_candidates(
+                            &outline,
+                            observed_text(&observed, &bytes)?,
+                            symbol.name().unwrap_or_default(),
+                        );
                         return self.ambiguous(job, &binding, &requested, candidates).await;
                     }
                 }
             }
         }
-        .ok_or_else(|| missing_symbol(job, lexical.clone()))?;
+        .ok_or_else(|| {
+            missing_symbol_near(job, lexical.clone(), &outline, &observed, &bytes, &symbol)
+        })?;
         let source = observed_text(&observed, &bytes)?;
+        // The card echoes the canonical address (`~k` form for a duplicate), not the raw path.
+        let address = lang::address::AddressMap::build(&outline, source)
+            .address_of(&found)
+            .unwrap_or_else(|| found.path.to_string());
         let mut card = SymbolCard {
             heading: format!(
                 "{} — {}, {} (lines {})",
                 found.name,
                 found.kind.name(),
-                found.path,
+                address,
                 found.range
             ),
             signature: Some(found.signature.clone()),
             doc: found.doc.clone(),
-            definition: Some(format!("{}  (lines {})", found.path, found.range)),
+            definition: Some(format!("{}  (lines {})", address, found.range)),
             ..Default::default()
         };
         if self.session_server(observed.path()).is_none() {
@@ -1120,6 +1168,7 @@ impl Worker<'_> {
                 card.history = history_lines(&worktree_root, &file, found.range).await;
             }
         }
+        Box::pin(self.address_card_rows(job, &mut card)).await;
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
         if card.usages.len() > render::MAX_USAGE_LINES {
             card.more_detail = Some(job.reference.clone());
@@ -1154,6 +1203,7 @@ impl Worker<'_> {
             .as_str()
             .ok_or(FailureCode::UnknownSymbol)?
             .to_owned();
+        let requested = Box::pin(self.locate_line(job, &binding, &requested)).await?;
         let symbol = SymbolPath::parse(&requested).map_err(|_| FailureCode::UnknownSymbol)?;
         let file = match symbol.file() {
             Some(file) => file.to_path_buf(),
@@ -1174,29 +1224,24 @@ impl Worker<'_> {
         let (observed, bytes) = self.observe(&binding, file.clone()).await?;
         let (outline, worktree_root, lexical) = self.outline_of(job, &observed, &bytes).await?;
         let found = match symbol.file() {
-            Some(_) => outline.find(&symbol).cloned(),
+            Some(_) => find_symbol(&outline, observed_text(&observed, &bytes)?, &symbol),
             None => {
                 let candidates = collapse_named(outline.named(symbol.name().unwrap_or_default()));
                 match candidates.len() {
                     1 => Some(candidates[0].clone()),
                     0 => None,
                     _ => {
-                        return self
-                            .ambiguous(
-                                job,
-                                &binding,
-                                &requested,
-                                candidates
-                                    .iter()
-                                    .map(|candidate| candidate.path.to_string())
-                                    .collect(),
-                            )
-                            .await;
+                        let rows = in_file_candidates(
+                            &outline,
+                            observed_text(&observed, &bytes)?,
+                            symbol.name().unwrap_or_default(),
+                        );
+                        return self.ambiguous(job, &binding, &requested, rows).await;
                     }
                 }
             }
         }
-        .ok_or_else(|| missing_symbol(job, lexical))?;
+        .ok_or_else(|| missing_symbol_near(job, lexical, &outline, &observed, &bytes, &symbol))?;
         // A server whose call hierarchy answers nothing for constructors and partial answers for
         // everything else would make the walk below render a misleading graph; answer the fact.
         let depth = job
@@ -1476,8 +1521,16 @@ impl Worker<'_> {
                 break;
             }
         }
+        let omitted = Box::pin(self.address_graph_nodes(job, &mut graph)).await;
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
-        let text = render::call_graph_text(&graph, &direction, depth);
+        let mut text = render::call_graph_text(&graph, &direction, depth);
+        if let Some(note) = omitted {
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&note);
+            text.push('\n');
+        }
         let (reply, page) =
             ContextPageState::new(text, 0, false, ResultKind::Graph).next(&job.reference)?;
         self.shared.set_context_page(&job.reference, page);
@@ -1555,7 +1608,7 @@ impl Worker<'_> {
     /// the outline came from the text alone (replies then say so in one compact line; an
     /// address it does not contain waits for the server while it loads — see
     /// [`missing_symbol`]).
-    async fn outline_of(
+    pub(super) async fn outline_of(
         &mut self,
         job: &mut Job,
         observed: &SourceObservation,
@@ -1757,7 +1810,7 @@ impl Worker<'_> {
     /// is exact, so the call needs no repeat, but semantic facts (usages, callers) are not
     /// included. `None` when no server owns the file (nothing is loading, failed or refused).
     /// A note makes the call a degraded success in the journal (QW-4): `job`'s call is marked.
-    fn lexical_note(&self, job: &Job, path: &Path, why: &Lexical) -> Option<String> {
+    pub(super) fn lexical_note(&self, job: &Job, path: &Path, why: &Lexical) -> Option<String> {
         let server = self.session_server(path)?;
         let state = match why {
             Lexical::Loading => "still indexing".to_owned(),
@@ -1939,12 +1992,36 @@ impl Worker<'_> {
                 Err(FailureCode::UnknownSymbol)
             }
             1 => Ok(Located::One(matches.remove(0).0)),
-            _ => Ok(Located::Many(
-                matches
-                    .into_iter()
-                    .map(|(_, candidate, _)| candidate)
-                    .collect(),
-            )),
+            _ => {
+                // Candidate rows carry the canonical address; a declaration and its impl blocks
+                // collapse to one, so a name that is one definition still answers its card.
+                let files: std::collections::BTreeSet<std::path::PathBuf> =
+                    matches.iter().map(|found| found.0.clone()).collect();
+                let mut rows: Vec<(std::path::PathBuf, String)> = Vec::new();
+                let mut complete = true;
+                for file in files {
+                    match Box::pin(self.scanned_map(job, &authority, &file)).await {
+                        Some(map) => rows.extend(
+                            map.named(name)
+                                .into_iter()
+                                .map(|u| (file.clone(), render::candidate_row(&map.units()[u]))),
+                        ),
+                        None => complete = false,
+                    }
+                }
+                if complete && rows.len() == 1 {
+                    Ok(Located::One(rows.remove(0).0))
+                } else if complete && !rows.is_empty() {
+                    Ok(Located::Many(rows.into_iter().map(|row| row.1).collect()))
+                } else {
+                    Ok(Located::Many(
+                        matches
+                            .into_iter()
+                            .map(|(_, candidate, _)| candidate)
+                            .collect(),
+                    ))
+                }
+            }
         }
     }
 
@@ -1953,7 +2030,7 @@ impl Worker<'_> {
     /// lexical one answered while the server loads, so no call-hierarchy walk starts from it),
     /// falling back to the language's text outline when the server cannot answer, or `None`
     /// when it cannot be read or outlined.
-    async fn scanned_outline(
+    pub(super) async fn scanned_outline(
         &mut self,
         job: &mut Job,
         authority: &AuthorityStamp,
@@ -1997,10 +2074,7 @@ impl Worker<'_> {
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
         let authority = self.authority(binding).await?;
         self.shared.active(binding)?;
-        let mut text = format!(
-            "ambiguous_symbol: {requested} matches {} symbols; repeat ide.symbol with one exact path:\n",
-            candidates.len()
-        );
+        let mut text = format!("{} candidates for {requested}:\n", candidates.len());
         for candidate in candidates.iter().take(MAX_CANDIDATE_LINES) {
             text.push_str(&format!("  {candidate}\n"));
         }
@@ -2148,7 +2222,7 @@ impl Worker<'_> {
     /// language server, and a Codex host posts a native hint for every shell command the agent
     /// runs meanwhile (its own `sleep` between polls), which would discard a correct result.
     /// What the result depends on is the observed file, and `source_matches` re-reads it.
-    async fn finish_symbol_job(
+    pub(super) async fn finish_symbol_job(
         &mut self,
         job: &Job,
         binding: &BindingRef,
@@ -2284,6 +2358,32 @@ pub(super) fn inside_test(outline: &Outline, line: u32) -> bool {
 
 /// Candidates an ambiguity reply prints before the rest moves behind its `detail_ref`.
 const MAX_CANDIDATE_LINES: usize = 20;
+
+/// The symbol `path` names in `outline`: the legacy name match first, then the canonical address
+/// forms (`~k` duplicates, `%` escapes, a trailing `:N` window) through the address map.
+fn find_symbol(outline: &Outline, source: &str, path: &SymbolPath) -> Option<lang::Symbol> {
+    if let Some(found) = outline.find(path) {
+        return Some(found.clone());
+    }
+    let lang::address::Parsed::Address(address) =
+        lang::address::Address::parse(&path.to_string()).ok()?
+    else {
+        return None;
+    };
+    let map = lang::address::AddressMap::build(outline, source);
+    let unit = map.resolve(&address).ok()?.unit;
+    map.symbol_of(unit).cloned()
+}
+
+/// Candidate rows of a bare name inside one outlined file: every definition named `name`, one
+/// row each with its canonical address (declaration and impl blocks collapsed), in file order.
+fn in_file_candidates(outline: &Outline, source: &str, name: &str) -> Vec<String> {
+    let map = lang::address::AddressMap::build(outline, source);
+    map.named(name)
+        .into_iter()
+        .map(|u| render::candidate_row(&map.units()[u]))
+        .collect()
+}
 
 /// Where a bare name resolved to.
 pub(super) enum Located {
@@ -2533,6 +2633,37 @@ pub(super) fn missing_symbol(job: &mut Job, lexical: Option<Lexical>) -> Failure
             FailureCode::ProviderLoading
         }
     }
+}
+
+/// [`missing_symbol`] for an address the outline of `observed` does not contain: when the answer
+/// is `unknown_symbol`, the failure detail `symbol:near:<a>, <b>` lists up to five units near the
+/// requested address (same last name elsewhere, or siblings under its owner) so the next call
+/// can name one exactly.
+pub(super) fn missing_symbol_near(
+    job: &mut Job,
+    lexical: Option<Lexical>,
+    outline: &Outline,
+    observed: &SourceObservation,
+    bytes: &[u8],
+    symbol: &SymbolPath,
+) -> FailureCode {
+    let code = missing_symbol(job, lexical);
+    if code == FailureCode::UnknownSymbol
+        && let Ok(source) = observed_text(observed, bytes)
+        && let Ok(lang::address::Parsed::Address(address)) =
+            lang::address::Address::parse(&symbol.to_string())
+    {
+        let map = lang::address::AddressMap::build(outline, source);
+        let near: Vec<String> = map
+            .near(&address)
+            .into_iter()
+            .map(|u| map.units()[u].address.to_string())
+            .collect();
+        if !near.is_empty() {
+            job.failure_detail = Some(format!("symbol:near:{}", near.join(", ")));
+        }
+    }
+    code
 }
 
 /// Byte offset of the symbol's name on its declaration line, for position-based requests.
@@ -3042,12 +3173,17 @@ impl Worker<'_> {
                 candidate
             }
             Err(refusal) => {
+                let detail = refusal.detail();
+                // A refusal that quotes the unit's current text (the window guard) keeps room
+                // for it; every other refusal stays inside the one-line bound.
+                let limit = if detail.contains("Current text:") {
+                    MAX_CURRENT_TEXT_REFUSAL_BYTES
+                } else {
+                    MAX_REFUSAL_DETAIL_BYTES
+                };
                 job.failure_detail = Some(format!(
                     "edit:refused: {}",
-                    crate::assistance::reply::bounded_utf8_prefix(
-                        &refusal.detail(),
-                        MAX_REFUSAL_DETAIL_BYTES
-                    )
+                    crate::assistance::reply::bounded_utf8_prefix(&detail, limit)
                 ));
                 return Err(FailureCode::EditRefused);
             }
@@ -3114,19 +3250,23 @@ impl Worker<'_> {
         // language without its server) exactly like the single line-range form does, instead of
         // refusing provider_unavailable for addresses it never uses.
         let needs_outline = requests.iter().any(|request| {
-            matches!(request, ChangeRequest::Symbol { .. })
-                || matches!(
-                    request,
-                    ChangeRequest::Old {
-                        within: Some(_),
-                        ..
-                    }
-                )
+            matches!(
+                request,
+                ChangeRequest::Symbol { .. } | ChangeRequest::Import { .. }
+            ) || matches!(
+                request,
+                ChangeRequest::Old {
+                    within: Some(_),
+                    ..
+                }
+            )
         });
         let mut outline: Option<Outline> = None;
+        let mut outline_state: Option<Lexical> = None;
         let lexical = if needs_outline {
             let (resolved, _, from_text) = self.outline_of(job, observed, bytes).await?;
             outline = Some(resolved);
+            outline_state = from_text.clone();
             from_text
                 .as_ref()
                 .and_then(|why| self.lexical_note(job, observed.path(), why))
@@ -3137,13 +3277,73 @@ impl Worker<'_> {
         // from its module), then resolve every change synchronously against the answers.
         let mut sites = std::collections::HashMap::new();
         if let Some(outline) = outline.as_ref() {
+            // Region anchors and new imports place by the file's address map, in process.
+            let map = lang::address::AddressMap::build(outline, &source);
+            for request in &requests {
+                match request {
+                    ChangeRequest::Import { add: true, .. } => {
+                        // After the last import line of the file's `@imports` region; a file
+                        // with no imports gets the map's own placement (after its header).
+                        let imports_end = map
+                            .units()
+                            .iter()
+                            .filter(|unit| {
+                                unit.kind
+                                    == lang::address::UnitKind::Region(
+                                        lang::address::RegionKind::Imports,
+                                    )
+                            })
+                            .map(|unit| unit.span.end)
+                            .max();
+                        let site = match imports_end {
+                            Some(end) => Ok(lang::InsertSite {
+                                line: end + 1,
+                                indent: String::new(),
+                                blank_before: 0,
+                                blank_after: 0,
+                            }),
+                            None => map.insert_site(
+                                &source,
+                                outline.language.support(),
+                                &region_address("@imports"),
+                                lang::InsertWhere::After,
+                            ),
+                        };
+                        sites.insert((imports_path(), lang::InsertWhere::After), site);
+                    }
+                    ChangeRequest::Symbol {
+                        requested,
+                        path: symbol,
+                        op: "insert",
+                        where_,
+                        ..
+                    } if region_anchor(requested).is_some() => {
+                        if let (Some(anchor), Some(placement)) =
+                            (region_anchor(requested), insert_where(where_.as_deref()))
+                        {
+                            sites.insert(
+                                (symbol.clone(), placement),
+                                map.insert_site(
+                                    &source,
+                                    outline.language.support(),
+                                    &anchor,
+                                    placement,
+                                ),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
             for request in &requests {
                 if let ChangeRequest::Symbol {
+                    requested,
                     path: symbol,
                     op: "insert",
                     where_,
                     ..
                 } = request
+                    && region_anchor(requested).is_none()
                     && let Some(placement) = insert_where(where_.as_deref())
                 {
                     let site = crate::modules::calls::insert_site(
@@ -3167,10 +3367,41 @@ impl Worker<'_> {
                 .cloned()
                 .unwrap_or_else(|| Err(lang::LangError::UnknownSymbol(symbol.clone())))
         };
+        // The light window guard: a window edit whose lines changed since this session's last
+        // read of the unit is refused with the unit's current text; with no remembered read the
+        // edit applies and the reply echoes the replaced lines.
+        let echoes = match outline.as_ref() {
+            Some(outline) => {
+                let map = lang::address::AddressMap::build(outline, &source);
+                let binding = job.invocation.binding_ref().clone();
+                match window_guard(path, &map, &source, &requests, &|address| {
+                    self.remembered_unit(&binding, address)
+                }) {
+                    Ok(echoes) => echoes,
+                    Err(refusal) => return Ok(Err(refusal)),
+                }
+            }
+            None => Vec::new(),
+        };
         let changes =
             match resolve_changes_with(&source, outline.as_ref(), path, &requests, &site_of) {
                 Ok(changes) => changes,
-                Err(refusal) => return Ok(Err(refusal)),
+                Err(refusal) => {
+                    // An address the lexical outline lacks is not proven absent while the
+                    // language server loads: the edit parks or answers provider_unavailable,
+                    // never a refusal that would teach the address does not exist.
+                    if refusal
+                        .sentences
+                        .iter()
+                        .any(|sentence| sentence.contains(": no symbol "))
+                    {
+                        let code = missing_symbol(job, outline_state);
+                        if code != FailureCode::UnknownSymbol {
+                            return Err(code);
+                        }
+                    }
+                    return Ok(Err(refusal));
+                }
             };
         let (spliced, landings) = match apply_changes(&source, path, &changes) {
             Ok(applied) => applied,
@@ -3217,21 +3448,35 @@ impl Worker<'_> {
         } else {
             None
         };
-        let mut note = landing_note(&changes, &landings, align.as_ref());
-        let anchor = changes
-            .iter()
-            .map(|change| change.base.end)
-            .max()
-            .unwrap_or(0);
-        if let Some(shift) = line_shift_note(
-            &source,
-            &candidate,
-            changes
-                .iter()
-                .map(|change| change.base.start)
-                .min()
-                .unwrap_or(anchor),
-        ) {
+        // The changed lines after the edit, by address: the candidate's own address map names
+        // them (a language without an outline names `path:lines`).
+        let candidate_map = match Lang::for_path(&file) {
+            Some(language) => crate::modules::calls::outline_from_source(
+                language,
+                observed.worktree().worktree_path(),
+                observed.path(),
+                &candidate,
+            )
+            .await
+            .ok()
+            .flatten()
+            .map(|outline| lang::address::AddressMap::build(&outline, &candidate)),
+            None => None,
+        };
+        let mut note = changed_rows(
+            path,
+            &changes,
+            &landings,
+            align.as_ref(),
+            candidate_map.as_ref(),
+            &echoes,
+        );
+        // The net line movement stays a fact line: the reply's retained detail uses it to refuse
+        // a later `lines` edit that names a file-version reference older than this edit.
+        let first_changed = changes.iter().map(|change| change.base.start).min();
+        if let Some(shift) =
+            first_changed.and_then(|line| line_shift_note(&source, &candidate, line))
+        {
             note.push('\n');
             note.push_str(&shift);
         }
@@ -3270,26 +3515,19 @@ impl Worker<'_> {
         let (operation_id, path, content) =
             (text("operation_id")?, text("path")?, text("content")?);
         let file = std::path::PathBuf::from(&path);
-        let (observed, _) = self.observe(&binding, file.clone()).await?;
-        if observed.bytes().is_some() {
-            let authority = self.authority(&binding).await.ok();
-            return Ok((
-                PeerReply::InvalidParameters {
-                    message: crate::assistance::facade::ParameterError::InvalidField {
-                        field: "source_ref",
-                        rule: crate::assistance::facade::FieldRule::ReplaceSourceRef,
-                    }
-                    .message(AssistanceTool::Edit),
-                },
-                authority,
-                None,
-            ));
-        }
+        let (observed, file_bytes) = self.observe(&binding, file.clone()).await?;
+        // An existing file is replaced against its current bytes (no file-version reference is
+        // needed); the pre-write gate then compares against that text, not an empty base.
+        let current = if observed.bytes().is_some() {
+            observed_text(&observed, &file_bytes)?.to_owned()
+        } else {
+            String::new()
+        };
         let candidate = self.format_candidate(&observed, &file, content).await;
         // The same pre-write structural gate as every edit: new content that does not parse is
         // not written (an empty base can never have carried a pre-existing error).
         let gated = self
-            .gate_candidate(job, &observed, &file, "", &candidate)
+            .gate_candidate(job, &observed, &file, &current, &candidate)
             .await;
         if let Err((line, message)) = gated {
             job.failure_detail = Some(format!(
@@ -3972,8 +4210,11 @@ impl ChangeAction {
     }
 }
 
-/// How the reply names one change's address.
+/// How one change was addressed. The reply names changes by their final address
+/// ([`changed_rows`]); only the import kinds are read back, and the other payloads document
+/// the request for diagnostics.
 #[derive(Debug)]
+#[allow(dead_code)]
 enum ChangeAddress {
     /// `lines 12-20` (base-version numbers).
     Lines(LineRange),
@@ -4008,36 +4249,6 @@ impl ResolvedChange {
     /// Whether this change inserts (a zero-width span that no other span may strictly contain).
     fn inserts(&self) -> bool {
         matches!(self.action, ChangeAction::Insert(..))
-    }
-
-    /// One change's landing sentence: `change 2: src/x.rs#Foo/bar inserted after #Foo (now 26–33)`.
-    fn landing(&self, now: Option<LineRange>) -> String {
-        let now = now
-            .map(|range| format!(" (now {range})"))
-            .unwrap_or_default();
-        match &self.address {
-            ChangeAddress::Lines(range) => format!(
-                "change {}: lines {range} {}{now}",
-                self.number,
-                self.action.verb()
-            ),
-            ChangeAddress::Symbol(path) => {
-                format!("change {}: {path} {}{now}", self.number, self.action.verb())
-            }
-            ChangeAddress::Insert {
-                path,
-                anchor,
-                where_,
-            } => format!(
-                "change {}: {path} inserted {where_} #{anchor}{now}",
-                self.number
-            ),
-            ChangeAddress::OldText { line } => format!(
-                "change {}: old text at line {line} {}{now}",
-                self.number,
-                self.action.verb()
-            ),
-        }
     }
 }
 
@@ -4092,6 +4303,9 @@ enum ChangeRequest {
         new: String,
         within: Option<String>,
     },
+    /// Add the import statement `text` after the file's other imports (idempotent), or remove
+    /// the one that equals it.
+    Import { add: bool, text: String },
 }
 
 /// Parses the facade-validated `changes` entries; anything malformed here is an internal error,
@@ -4109,13 +4323,26 @@ fn parse_change_requests(entries: &[Value]) -> Result<Vec<ChangeRequest>, Failur
                 .map(str::to_owned)
                 .ok_or(FailureCode::Internal)
         };
-        let request = if let Some(lines) = entry.get("lines").and_then(Value::as_str) {
+        let request = if let Some((add, text)) = [("add_import", true), ("remove_import", false)]
+            .into_iter()
+            .find_map(|(key, add)| {
+                entry
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(|text| (add, text.to_owned()))
+            }) {
+            ChangeRequest::Import { add, text }
+        } else if let Some(lines) = entry.get("lines").and_then(Value::as_str) {
             ChangeRequest::Lines {
                 range: crate::assistance::facade::parse_line_range(lines)
                     .ok_or(FailureCode::Internal)?,
                 content: text("content")?,
             }
-        } else if let Some(symbol) = entry.get("symbol").and_then(Value::as_str) {
+        } else if let Some(symbol) = entry
+            .get("symbol")
+            .and_then(Value::as_str)
+            .filter(|_| !entry.contains_key("old"))
+        {
             ChangeRequest::Symbol {
                 requested: symbol.to_owned(),
                 path: SymbolPath::parse(symbol).map_err(|_| FailureCode::Internal)?,
@@ -4141,8 +4368,10 @@ fn parse_change_requests(entries: &[Value]) -> Result<Vec<ChangeRequest>, Failur
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned(),
+                // `{symbol, old, new}` is the E3 entry: its symbol scopes the match.
                 within: entry
                     .get("within")
+                    .or_else(|| entry.get("symbol"))
                     .and_then(Value::as_str)
                     .map(str::to_owned),
             }
@@ -4300,6 +4529,177 @@ fn resolve_changes(
     )
 }
 
+/// The light guard of a window edit (symbol-read-edit-v1 §3.2): for every windowed `symbol`
+/// replace or delete, compares lines `N..M` of the unit's current text with the same lines of
+/// the text the session last read (`remembered`, by `file#unit` address).
+///
+/// A difference refuses that change with the unit's current numbered text and the repair step,
+/// nothing written. A window with no remembered read is applied, and its replaced old lines are
+/// returned (one block per window, at most 8 numbered lines) so the reply can echo them.
+/// Windows the map cannot resolve are left to the resolver's own refusal.
+fn window_guard(
+    path: &str,
+    map: &lang::address::AddressMap,
+    source: &str,
+    requests: &[ChangeRequest],
+    remembered: &dyn Fn(&str) -> Option<String>,
+) -> Result<Vec<(usize, String)>, Refusal> {
+    let mut refusal = Refusal {
+        sentences: Vec::new(),
+        refused: std::collections::BTreeSet::new(),
+        total: requests.len(),
+    };
+    let mut echoes = Vec::new();
+    for (index, request) in requests.iter().enumerate() {
+        let ChangeRequest::Symbol { requested, op, .. } = request else {
+            continue;
+        };
+        if *op == "insert" {
+            continue;
+        }
+        let Ok(lang::address::Parsed::Address(address)) = lang::address::Address::parse(requested)
+        else {
+            continue;
+        };
+        let (Some(window), Ok(resolved)) = (address.window(), map.resolve(&address)) else {
+            continue;
+        };
+        let unit = &map.units()[resolved.unit];
+        let canonical = lang::address::Address::new(
+            Some(PathBuf::from(path)),
+            unit.address.segments().to_vec(),
+            None,
+        )
+        .to_string();
+        let length = unit.span.len();
+        let (first, last) = (window.first, window.last.unwrap_or(length).min(length));
+        let current = lang::slice_lines(source, unit.span);
+        let rows_of = |text: &str| -> Vec<String> {
+            text.split_inclusive('\n')
+                .skip(first as usize - 1)
+                .take((last - first + 1) as usize)
+                .map(str::to_owned)
+                .collect()
+        };
+        let now = rows_of(&current);
+        match remembered(&canonical) {
+            Some(before) if rows_of(&before) != now => refusal.push(
+                index + 1,
+                format!(
+                    "change {}: lines {first}-{last} of {canonical} changed since your read. \
+                     Current text:\n{}Repair: resend with the window that holds your lines, \
+                     or read {canonical} again",
+                    index + 1,
+                    super::target::numbered_rows(&current, 1, length, 20),
+                ),
+            ),
+            Some(_) => {}
+            None => echoes.push((
+                index,
+                super::target::numbered_rows(&current, first, last, 8),
+            )),
+        }
+    }
+    if refusal.refused.is_empty() {
+        Ok(echoes)
+    } else {
+        Err(refusal)
+    }
+}
+
+/// Why an address could not be turned into lines.
+enum UnitMiss {
+    /// No such unit (or a file other than the edit's).
+    Unknown,
+    /// The window starts at `first`, beyond the unit's `length` lines.
+    Length { length: u32, first: u32 },
+}
+
+/// The lines an address names in the edit's file: the unit, or the window inside it.
+///
+/// Plain symbol paths keep resolving through the outline as before; an address with a window or
+/// a region name resolves through the file's address map, which also catches what the outline
+/// does not know (`~k` duplicates).
+fn unit_range_of(
+    requested: &str,
+    path: &str,
+    outline: Option<&Outline>,
+    map: Option<&lang::address::AddressMap>,
+) -> Result<LineRange, UnitMiss> {
+    let parsed = match lang::address::Address::parse(requested) {
+        Ok(lang::address::Parsed::Address(address)) => Some(address),
+        _ => None,
+    };
+    let special = parsed.as_ref().is_some_and(|address| {
+        address.window().is_some()
+            || address
+                .segments()
+                .iter()
+                .any(|segment| segment.name.starts_with('@'))
+    });
+    if !special
+        && let Ok(symbol) = SymbolPath::parse(requested)
+        && symbol.file().is_none_or(|file| file == Path::new(path))
+        && let Some(found) = outline.and_then(|outline| outline.find(&symbol))
+    {
+        return Ok(found.range);
+    }
+    let (Some(map), Some(address)) = (map, parsed) else {
+        return Err(UnitMiss::Unknown);
+    };
+    if address.file().is_some_and(|file| file != Path::new(path)) {
+        return Err(UnitMiss::Unknown);
+    }
+    match map.resolve(&address) {
+        Ok(resolved) => Ok(resolved.window.unwrap_or(resolved.span)),
+        Err(lang::address::ResolveError::LineOutOfRange { length }) => Err(UnitMiss::Length {
+            length,
+            first: address.window().map_or(1, |window| window.first),
+        }),
+        Err(_) => Err(UnitMiss::Unknown),
+    }
+}
+
+/// The refusal sentence for a window that starts past its unit.
+fn window_sentence(number: usize, requested: &str, length: u32, first: u32) -> String {
+    format!(
+        "change {number}: {requested} has {length} lines, not {first}; use a window inside \
+         1-{length}, or no window to replace the whole unit"
+    )
+}
+
+/// The anchor path under which the new-import site is filed in the site table.
+fn imports_path() -> SymbolPath {
+    SymbolPath::new(None, vec!["@imports".to_owned()])
+}
+
+/// The address of a file-level region by name (`@imports`), without a file.
+fn region_address(name: &str) -> lang::address::Address {
+    lang::address::Address::new(
+        None,
+        vec![lang::address::Segment {
+            name: name.to_owned(),
+            ordinal: 1,
+        }],
+        None,
+    )
+}
+
+/// The address of `requested` when it names a file-level region (`file#@imports`).
+fn region_anchor(requested: &str) -> Option<lang::address::Address> {
+    match lang::address::Address::parse(requested) {
+        Ok(lang::address::Parsed::Address(address))
+            if address
+                .segments()
+                .first()
+                .is_some_and(|segment| segment.name.starts_with('@')) =>
+        {
+            Some(address)
+        }
+        _ => None,
+    }
+}
+
 /// An insertion site lookup: the anchor's outline, the anchor and the placement.
 type SiteOf<'a> = dyn Fn(&Outline, &SymbolPath, lang::InsertWhere) -> Result<lang::InsertSite, lang::LangError>
     + 'a;
@@ -4326,6 +4726,8 @@ fn resolve_changes_with(
 ) -> Result<Vec<ResolvedChange>, Refusal> {
     let spans = line_byte_spans(source);
     let line_of = |byte: usize| line_of_byte(&spans, byte);
+    let map = outline.map(|outline| lang::address::AddressMap::build(outline, source));
+    let unit_range = |requested: &str| unit_range_of(requested, path, outline, map.as_ref());
     let mut refusal = Refusal {
         sentences: Vec::new(),
         refused: std::collections::BTreeSet::new(),
@@ -4408,16 +4810,20 @@ fn resolve_changes_with(
                         ),
                     }
                 } else {
-                    let Some(found) = outline
-                        .expect("a symbol entry resolves against the outline")
-                        .find(symbol)
-                    else {
-                        no_symbol(requested, &mut refusal);
-                        continue;
+                    let range = match unit_range(requested) {
+                        Ok(range) => range,
+                        Err(UnitMiss::Unknown) => {
+                            no_symbol(requested, &mut refusal);
+                            continue;
+                        }
+                        Err(UnitMiss::Length { length, first }) => {
+                            refusal.push(number, window_sentence(number, requested, length, first));
+                            continue;
+                        }
                     };
                     resolved.push(ResolvedChange {
                         number,
-                        base: found.range,
+                        base: range,
                         action: if *op == "delete" {
                             ChangeAction::Delete
                         } else {
@@ -4427,18 +4833,103 @@ fn resolve_changes_with(
                     });
                 }
             }
+            ChangeRequest::Import { add, text } => {
+                let statement = text.trim();
+                let region = map.as_ref().and_then(|map| {
+                    map.units()
+                        .iter()
+                        .find(|unit| {
+                            unit.kind
+                                == lang::address::UnitKind::Region(
+                                    lang::address::RegionKind::Imports,
+                                )
+                        })
+                        .map(|unit| unit.span)
+                });
+                let present = region.and_then(|span| {
+                    (span.start..=span.end).find(|line| {
+                        lang::slice_lines(source, LineRange::new(*line, *line)).trim() == statement
+                    })
+                });
+                let anchor = format!("{path}#@imports");
+                match (*add, present, region) {
+                    // Already imported: the line is rewritten as it is, an unchanged edit.
+                    (true, Some(line), _) => {
+                        let range = LineRange::new(line, line);
+                        resolved.push(ResolvedChange {
+                            number,
+                            base: range,
+                            action: ChangeAction::Replace(
+                                lang::slice_lines(source, range)
+                                    .trim_end_matches('\n')
+                                    .to_owned(),
+                            ),
+                            address: ChangeAddress::Symbol(anchor),
+                        });
+                    }
+                    (true, None, _) => match site_of(
+                        outline.expect("an import entry resolves against the outline"),
+                        &imports_path(),
+                        lang::InsertWhere::After,
+                    ) {
+                        Ok(site) => resolved.push(ResolvedChange {
+                            number,
+                            base: LineRange::new(site.line, site.line),
+                            action: ChangeAction::Insert(site, text.clone()),
+                            address: ChangeAddress::Insert {
+                                path: anchor,
+                                anchor: "@imports".to_owned(),
+                                // Marks the import form: a plain insert next to the region
+                                // keeps the verb `inserted`.
+                                where_: "import".to_owned(),
+                            },
+                        }),
+                        Err(_) => refusal.push(
+                            number,
+                            format!("change {number}: cannot place an import in {path}"),
+                        ),
+                    },
+                    (false, _, Some(span)) => match find_old(source, statement, Some(span)) {
+                        OldMatch::One { start, end } => {
+                            let end = if source[end..].starts_with('\n') {
+                                end + 1
+                            } else {
+                                end
+                            };
+                            resolved.push(ResolvedChange {
+                                number,
+                                base: LineRange::new(
+                                    line_of(start),
+                                    line_of(end.saturating_sub(1)),
+                                ),
+                                action: ChangeAction::Splice {
+                                    start,
+                                    end,
+                                    new: String::new(),
+                                },
+                                address: ChangeAddress::Symbol(anchor),
+                            });
+                        }
+                        _ => refusal.push(
+                            number,
+                            format!("change {number}: import not found in {anchor}: {statement}"),
+                        ),
+                    },
+                    (false, _, None) => refusal.push(
+                        number,
+                        format!("change {number}: {path} has no imports to remove from"),
+                    ),
+                }
+            }
             ChangeRequest::Old { old, new, within } => {
                 let scope = match within {
-                    Some(within) => match SymbolPath::parse(within)
-                        .ok()
-                        .filter(|symbol| symbol.file().is_none_or(|file| file == Path::new(path)))
-                        .and_then(|symbol| {
-                            outline
-                                .expect("a `within` address resolves against the outline")
-                                .find(&symbol)
-                        }) {
-                        Some(found) => Some(found.range),
-                        None => {
+                    Some(within) => match unit_range(within) {
+                        Ok(range) => Some(range),
+                        Err(UnitMiss::Length { length, first }) => {
+                            refusal.push(number, window_sentence(number, within, length, first));
+                            continue;
+                        }
+                        Err(UnitMiss::Unknown) => {
                             refusal.push(
                                 number,
                                 format!(
@@ -4543,6 +5034,8 @@ const MAX_REFUSAL_EXCERPT_BYTES: usize = 80;
 const MAX_LANDING_SENTENCES: usize = 8;
 /// Bytes the whole refusal detail is clipped to, one line.
 const MAX_REFUSAL_DETAIL_BYTES: usize = 512;
+/// Bytes of a refusal detail that quotes the unit's current text (symbol-read-edit-v1 §3.5).
+const MAX_CURRENT_TEXT_REFUSAL_BYTES: usize = 4096;
 
 /// How a syntax error relates to the change it is attributed to.
 enum Attribution {
@@ -4800,31 +5293,115 @@ fn apply_changes(
     Ok((buffer, landings))
 }
 
-/// The success reply's per-change landing summary, `+N more` past the first
-/// [`MAX_LANDING_SENTENCES`] entries, each range remapped through the formatter's line movement
-/// when the formatter moved lines.
-fn landing_note(
+/// Change lines a success reply lists before `+<k> more` (symbol-read-edit-v1 §3.3).
+const MAX_CHANGE_ROWS: usize = 12;
+
+/// The success reply's change lines, one per change, each naming the changed lines AFTER the
+/// edit as an address that `ide.read` accepts (symbol-read-edit-v1 §3.3):
+/// `  src/a.rs#Store/transcript:12-16 (L131-135)  replaced (3 lines → 5)`.
+///
+/// `map` is the address map of the edited text; without one (a language with no outline) the
+/// lines are named `path:12-16`. A deleted symbol keeps the address it had, other deletions name
+/// the address now holding the join point. `echoes` pairs a change index with the old lines a
+/// window edit replaced (no remembered read), printed under its line as `; was:`. Past
+/// [`MAX_CHANGE_ROWS`] lines the rest is counted as `+<k> more`. Landing ranges are mapped
+/// through `align` when the formatter moved lines.
+fn changed_rows(
+    path: &str,
     changes: &[ResolvedChange],
     landings: &[Option<LineRange>],
     align: Option<&lang::text::LineAlign>,
+    map: Option<&lang::address::AddressMap>,
+    echoes: &[(usize, String)],
 ) -> String {
-    let rendered = changes
-        .iter()
-        .zip(landings)
-        .map(|(change, now)| {
-            change.landing(now.map(|range| align.map_or(range, |align| align.map_range(range))))
-        })
-        .take(MAX_LANDING_SENTENCES)
-        .collect::<Vec<_>>()
-        .join("; ");
-    let count = changes.len();
-    let noun = if count == 1 { "change" } else { "changes" };
-    let mut note = format!("{count} {noun} applied: {rendered}");
-    let hidden = changes.len().saturating_sub(MAX_LANDING_SENTENCES);
-    if hidden > 0 {
-        note.push_str(&format!("; +{hidden} more"));
+    let mut rows = Vec::new();
+    for (index, (change, now)) in changes.iter().zip(landings).enumerate() {
+        let now = now.map(|range| align.map_or(range, |align| align.map_range(range)));
+        let old_lines = change.base.len();
+        let label = match &change.address {
+            ChangeAddress::Insert { anchor, where_, .. }
+                if anchor == "@imports" && where_ == "import" =>
+            {
+                "added"
+            }
+            ChangeAddress::Symbol(address) if address.ends_with("#@imports") => {
+                match change.action {
+                    ChangeAction::Replace(_) => "unchanged",
+                    _ => "removed",
+                }
+            }
+            _ => change.action.verb(),
+        };
+        let place = match now {
+            Some(range) => position_text(path, map, range),
+            None => match &change.address {
+                ChangeAddress::Symbol(address) => address.clone(),
+                _ => map
+                    .and_then(|map| map.address_at(Path::new(path), change.base.start))
+                    .unwrap_or_else(|| format!("{path}:{}", change.base.start)),
+            },
+        };
+        let counts = match (label, now) {
+            ("replaced", Some(range)) => format!(" ({old_lines} lines → {})", range.len()),
+            ("inserted", Some(range)) => format!(" ({} lines)", range.len()),
+            ("deleted", _) => format!(" ({old_lines} lines)"),
+            _ => String::new(),
+        };
+        let mut row = format!("  {place}  {label}{counts}");
+        if let Some((_, was)) = echoes.iter().find(|(at, _)| *at == index) {
+            row.push_str("; was:");
+            for line in was.lines() {
+                row.push_str("\n    ");
+                row.push_str(line);
+            }
+        }
+        rows.push(row);
     }
-    note
+    let hidden = rows.len().saturating_sub(MAX_CHANGE_ROWS);
+    rows.truncate(MAX_CHANGE_ROWS);
+    if hidden > 0 {
+        rows.push(format!("  +{hidden} more"));
+    }
+    rows.join("\n")
+}
+
+/// `file#unit:N-M (L131-135)` for the final lines `range`: the window inside the unit that holds
+/// them (the unit's own address when they cover it, the first line's address when they cross
+/// units), followed by the absolute lines; `path:N-M` without a map.
+fn position_text(path: &str, map: Option<&lang::address::AddressMap>, range: LineRange) -> String {
+    let absolute = if range.start == range.end {
+        format!(" (L{})", range.start)
+    } else {
+        format!(" (L{}-{})", range.start, range.end)
+    };
+    let named = map.and_then(|map| {
+        let first = map.at_line(range.start)?;
+        let last = map.at_line(range.end)?;
+        let unit = &map.units()[first.unit];
+        let address = if first.unit == last.unit {
+            let window = (range != unit.span).then(|| lang::address::Window {
+                first: range.start - unit.span.start + 1,
+                last: Some(range.end - unit.span.start + 1),
+            });
+            lang::address::Address::new(
+                Some(PathBuf::from(path)),
+                unit.address.segments().to_vec(),
+                window,
+            )
+        } else {
+            lang::address::Address::new(
+                Some(PathBuf::from(path)),
+                unit.address.segments().to_vec(),
+                first.address.window(),
+            )
+        };
+        Some(address.to_string())
+    });
+    match named {
+        Some(address) => format!("{address}{absolute}"),
+        None if range.start == range.end => format!("{path}:{}{absolute}", range.start),
+        None => format!("{path}:{}-{}{absolute}", range.start, range.end),
+    }
 }
 
 /// History entries kept on one symbol card.
@@ -5005,6 +5582,116 @@ mod batch_tests {
             Some(LineRange::new(7, 7)),
             "mark,two stays one line, shifted down one"
         );
+    }
+
+    /// A `:N-M` window replaces lines counted from the unit's first line; a window that starts
+    /// past the unit is refused naming the unit's length (symbol-read-edit-v1 E2).
+    #[test]
+    fn a_window_replaces_unit_relative_lines_and_refuses_past_the_unit() {
+        let source = "sym card\n1\nsym btn\n2\nend\nmark\nend\n";
+        let outline = gamma_outline(source);
+        let entry = |requested: &str| ChangeRequest::Symbol {
+            requested: requested.to_owned(),
+            path: SymbolPath::parse(requested).unwrap(),
+            op: "replace",
+            where_: None,
+            content: Some("two".to_owned()),
+        };
+        let changes = resolve_changes(
+            source,
+            Some(&outline),
+            "a.gamma",
+            &[entry("a.gamma#card/btn:2")],
+        )
+        .expect("the window resolves");
+        let (candidate, _) = apply_changes(source, "a.gamma", &changes).expect("no overlaps");
+        assert_eq!(candidate, "sym card\n1\nsym btn\ntwo\nend\nmark\nend\n");
+        let refusal = resolve_changes(
+            source,
+            Some(&outline),
+            "a.gamma",
+            &[entry("a.gamma#card/btn:9")],
+        )
+        .unwrap_err();
+        assert!(
+            refusal
+                .detail()
+                .contains("a.gamma#card/btn:9 has 3 lines, not 9"),
+            "{}",
+            refusal.detail()
+        );
+    }
+
+    /// The window guard (symbol-read-edit-v1 E6a-E6c): a remembered read whose window lines
+    /// differ refuses with the unit's current text; equal window lines pass even if the unit
+    /// changed elsewhere; no remembered read applies and echoes the replaced old lines.
+    #[test]
+    fn the_window_guard_refuses_changed_lines_and_echoes_unread_ones() {
+        let source = "sym card\n1\nsym btn\n2\nend\nmark\nend\n";
+        let outline = gamma_outline(source);
+        let map = lang::address::AddressMap::build(&outline, source);
+        let request = [ChangeRequest::Symbol {
+            requested: "a.gamma#card/btn:2".to_owned(),
+            path: SymbolPath::parse("a.gamma#card/btn:2").unwrap(),
+            op: "replace",
+            where_: None,
+            content: Some("x".to_owned()),
+        }];
+        let read = |before: &'static str| move |_: &str| Some(before.to_owned());
+        // E6a: the remembered line 2 differs from the current one.
+        let refusal = window_guard(
+            "a.gamma",
+            &map,
+            source,
+            &request,
+            &read("sym btn\nOLD\nend\n"),
+        )
+        .unwrap_err()
+        .detail();
+        assert!(
+            refusal.contains("lines 2-2 of a.gamma#card/btn changed since your read")
+                && refusal.contains("2\t2")
+                && refusal.contains("Repair:"),
+            "{refusal}"
+        );
+        // E6b: the same window lines pass although the unit differs elsewhere.
+        assert!(
+            window_guard(
+                "a.gamma",
+                &map,
+                source,
+                &request,
+                &read("CHANGED\n2\nend\n")
+            )
+            .unwrap()
+            .is_empty()
+        );
+        // E6c: nothing remembered applies and echoes the replaced line.
+        let echoes = window_guard("a.gamma", &map, source, &request, &|_| None).unwrap();
+        assert_eq!(echoes, [(0, "2\t2\n".to_owned())]);
+    }
+
+    /// `{old, new, within: <window>}` matches only inside the window.
+    #[test]
+    fn old_text_scopes_to_a_window() {
+        let source = "sym card\n1\nsym btn\n1\nend\nmark\nend\n";
+        let outline = gamma_outline(source);
+        let request = |within: &str| {
+            [ChangeRequest::Old {
+                old: "1".to_owned(),
+                new: "9".to_owned(),
+                within: Some(within.to_owned()),
+            }]
+        };
+        let changes = resolve_changes(
+            source,
+            Some(&outline),
+            "a.gamma",
+            &request("a.gamma#card/btn:2"),
+        )
+        .expect("one match inside the window");
+        let (candidate, _) = apply_changes(source, "a.gamma", &changes).unwrap();
+        assert_eq!(candidate, "sym card\n1\nsym btn\n9\nend\nmark\nend\n");
     }
 
     /// Two inserts at one anchor apply in array order; an insert at a span's boundary is fine,
@@ -5261,29 +5948,47 @@ mod batch_tests {
         }
     }
 
-    /// The landing note lists the first eight changes and counts the rest.
+    /// The change lines name the final lines by address, count lines, show the echo of an
+    /// unread window and clip after twelve lines.
     #[test]
-    fn landing_note_clips_after_eight_changes() {
-        let changes: Vec<ResolvedChange> = (1..=10)
+    fn changed_rows_name_final_lines_and_clip() {
+        let source = "sym card\n1\nsym btn\n2\nend\nmark\nend\n";
+        let outline = gamma_outline(source);
+        let map = lang::address::AddressMap::build(&outline, source);
+        let one = vec![change(
+            1,
+            LineRange::new(4, 4),
+            ChangeAction::Replace("two\nthree".to_owned()),
+        )];
+        let rows = changed_rows(
+            "a.gamma",
+            &one,
+            &[Some(LineRange::new(4, 5))],
+            None,
+            Some(&map),
+            &[(0, "2\t2\n".to_owned())],
+        );
+        assert_eq!(
+            rows,
+            "  a.gamma#card/btn:2-3 (L4-5)  replaced (1 lines → 2); was:\n    2\t2"
+        );
+        let many: Vec<ResolvedChange> = (1..=14)
             .map(|number| {
                 change(
                     number,
-                    LineRange::new(number as u32, number as u32),
+                    LineRange::new(2, 2),
                     ChangeAction::Replace("x".to_owned()),
                 )
             })
             .collect();
-        let landings = changes
-            .iter()
-            .map(|change| Some(change.base))
-            .collect::<Vec<_>>();
-        let note = landing_note(&changes, &landings, None);
+        let landings = vec![Some(LineRange::new(2, 2)); 14];
+        let rows = changed_rows("a.gamma", &many, &landings, None, None, &[]);
+        assert_eq!(rows.lines().count(), 13, "{rows}");
+        assert!(rows.ends_with("  +2 more"), "{rows}");
         assert!(
-            note.starts_with("10 changes applied: change 1: lines 1 replaced (now 1)"),
-            "{note}"
+            rows.starts_with("  a.gamma:2 (L2)  replaced (1 lines → 1)"),
+            "{rows}"
         );
-        assert!(note.ends_with("; +2 more"), "{note}");
-        assert!(!note.contains("change 9:"), "{note}");
     }
 
     /// The single form's one change produces byte-identical candidates for every legacy action.
@@ -5747,4 +6452,17 @@ short 2026-09-25 nope
         );
         assert_eq!(long.len(), MAX_HISTORY);
     }
+}
+
+/// The success text of a read whose range starts past the end of the file:
+/// `file has <total> lines; nothing at <a>-<b>` (`<a>-` for an open range, `<a>` for one line).
+fn nothing_at(total: u32, range: LineRange) -> String {
+    let at = if range.end == u32::MAX {
+        format!("{}-", range.start)
+    } else if range.start == range.end {
+        range.start.to_string()
+    } else {
+        format!("{}-{}", range.start, range.end)
+    };
+    format!("file has {total} lines; nothing at {at}\n")
 }

@@ -17,6 +17,8 @@ use std::{
 
 use async_lsp::lsp_types as lsp;
 
+/// Symbol addresses (`file#Type/method:N`), regions and the line partition.
+pub mod address;
 /// Line and brace helpers shared by the support modules of brace-delimited languages.
 pub mod brace;
 pub mod edits;
@@ -24,6 +26,8 @@ pub mod environment;
 /// Cross-language name facts: namespaces, facts, the fact sink and the `NameFacts` seam.
 pub mod names;
 pub mod path;
+/// File-level region scanner and its per-language rules.
+pub mod regions;
 pub mod render;
 /// Line, indentation and project-fact helpers shared by language support modules.
 pub mod text;
@@ -681,6 +685,13 @@ pub trait LanguageSupport: Send + Sync {
         anchor: &SymbolPath,
         where_: InsertWhere,
     ) -> Result<InsertSite, LangError>;
+
+    /// Static facts the region scanner needs (comment markers, import and header statements,
+    /// block shape); see `symbol-address-v1` section 5. The default is the generic `//`, `/* */`
+    /// rule set with no imports.
+    fn region_rules(&self) -> &'static regions::RegionRules {
+        &regions::GENERIC_RULES
+    }
 
     /// Whether `file` is a test file by the language's conventions (`tests/`, `test_*.py`, `*.test.ts`).
     fn is_test_file(&self, file: &Path) -> bool;

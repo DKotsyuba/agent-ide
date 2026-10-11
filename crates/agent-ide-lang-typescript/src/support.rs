@@ -295,13 +295,16 @@ impl LanguageSupport for TypeScript {
             }
             let text = lines[index..=last].join("\n");
             let (end, stop) = scan_signature(&text);
-            let range = LineRange::new(index as u32 + 1, last as u32 + 1);
+            let body = LineRange::new(index as u32 + 1, last as u32 + 1);
+            // A server outline starts a symbol at its JSDoc block; so does this one, which keeps
+            // a symbol's `:N` the same before and after the server loads (symbol-address-v1 §9).
+            let range = LineRange::new(jsdoc_start(&lines, index) as u32 + 1, last as u32 + 1);
             symbols.push(Symbol {
                 path: SymbolPath::new(Some(file.to_path_buf()), vec![name.clone()]),
                 kind,
                 name,
                 range,
-                body: range,
+                body,
                 signature: render_signature(&text[..end], stop, kind),
                 doc: None,
                 children: Vec::new(),
@@ -409,6 +412,22 @@ impl LanguageSupport for TypeScript {
         } else {
             site(close as u32 + 1, member_indent, u8::from(has_members), 0)
         })
+    }
+
+    /// TypeScript/JavaScript regions: shebang and directive-prologue header, `import ..` and
+    /// `export * from` imports.
+    fn region_rules(&self) -> &'static agent_ide_core::lang::regions::RegionRules {
+        &agent_ide_core::lang::regions::RegionRules {
+            header_prefixes: &["#!", "\"use strict\"", "'use strict'"],
+            import_prefixes: &[
+                "import ",
+                "import\"",
+                "import'",
+                "export * from",
+                "export * as",
+            ],
+            ..agent_ide_core::lang::regions::GENERIC_RULES
+        }
     }
 
     /// `*.test.*`, `*.spec.*` and anything under `__tests__/`, for every script extension.
@@ -848,6 +867,22 @@ fn strip_modifiers(mut text: &str) -> &str {
         };
         text = rest;
     }
+}
+
+/// Index of the first line of the `/** … */` block that directly precedes the declaration on
+/// line `index` (no blank line between), or `index` itself when there is none.
+fn jsdoc_start(lines: &[&str], index: usize) -> usize {
+    let Some(previous) = index.checked_sub(1) else {
+        return index;
+    };
+    if !lines[previous].trim_end().ends_with("*/") {
+        return index;
+    }
+    (0..=previous)
+        .rev()
+        .find(|&at| lines[at].trim_start().starts_with("/**"))
+        .filter(|&at| (at..previous).all(|k| !lines[k].contains("*/")))
+        .unwrap_or(index)
 }
 
 /// The kind and name of a column-0 declaration line; `export default function` without a name

@@ -5,7 +5,7 @@ use super::{
     facade::{AssistanceTool, FeedbackDelta, render_reply},
     host_binding::{ActiveBindingUse, BindingRef, HostBindingGuard, ValidatedInvocation},
     launcher::{LaunchTarget, LauncherConfig},
-    problems::{ProblemSource, ProjectProblemFeed, parse_language, problems_text_with_rechecks},
+    problems::{self, ProblemSource, ProjectProblemFeed, parse_language, problems_text_addressed},
     reply::{
         EditDiagnostics, ExecutionProfileCause, FailureCode, MAX_NO_SUCH_FILE_PATH_BYTES,
         PeerReply, ResultKind, bounded_utf8_prefix,
@@ -34,6 +34,8 @@ use crate::{
         store::WorkspaceStore,
     },
 };
+#[path = "addressing.rs"]
+mod addressing;
 #[path = "approximate.rs"]
 mod approximate;
 #[path = "batch_edit.rs"]
@@ -53,6 +55,8 @@ mod inspection;
 mod links;
 #[path = "navigation.rs"]
 mod navigation;
+#[path = "worker/patch_edit.rs"]
+mod patch_edit;
 #[path = "providers.rs"]
 mod providers;
 #[path = "snapshots.rs"]
@@ -61,6 +65,8 @@ pub(super) mod snapshots;
 mod symbols;
 #[path = "takeover.rs"]
 mod takeover;
+#[path = "target.rs"]
+mod target;
 #[path = "turn.rs"]
 mod turn;
 
@@ -2358,7 +2364,14 @@ fn queue_capacity(ordinary: usize, tool: AssistanceTool) -> usize {
 /// names what happened. `None` (replace, the line-range form, every plain edit) keeps the
 /// outcome word; rename builds its own summary reply.
 fn edit_operation(parameters: &Value) -> Option<String> {
-    match parameters.get("op").and_then(Value::as_str) {
+    // A one-entry `changes` call (every single-symbol form is rewritten to one) names its entry's
+    // operation.
+    let op = match parameters.get("changes").and_then(Value::as_array) {
+        Some(entries) if entries.len() == 1 => entries[0].get("op"),
+        Some(_) => None,
+        None => parameters.get("op"),
+    };
+    match op.and_then(Value::as_str) {
         Some("insert") => Some("inserted".to_owned()),
         Some("delete") => Some("deleted".to_owned()),
         _ => None,
@@ -5092,6 +5105,14 @@ impl<'a> Worker<'a> {
                 )
                 .expect("fixed feedback envelope is bounded")
             });
+        let diagnostic_map = if diagnostics
+            .as_ref()
+            .is_some_and(|found| !found.diagnostics.is_empty())
+        {
+            self.optional_address_map(job, &observed, &bytes).await
+        } else {
+            None
+        };
         let diagnostic_text = diagnostics.as_ref().map_or_else(
             || "diagnostics_freshness: unknown\ndiagnostic_count: unknown\nfeedback_delta: none".to_owned(),
             |diagnostics| {
@@ -5100,9 +5121,10 @@ impl<'a> Worker<'a> {
                     .iter()
                     .take(8)
                     .map(|diagnostic| {
-                        super::reply::diagnostic_line(
+                        super::reply::diagnostic_line_at(
                             &observed.path().to_string_lossy(),
                             diagnostic,
+                            diagnostic_map.as_deref(),
                         )
                     })
                     .collect::<Vec<_>>();
@@ -5278,7 +5300,29 @@ impl<'a> Worker<'a> {
                 } else {
                     source.rechecks(authority.worktree().worktree_path())
                 };
-                problems_text_with_rechecks(&snapshots, &rechecks, language, offset)
+                let locations = problems::page_locations(&snapshots, language, offset);
+                let located = self
+                    .position_addresses(
+                        job,
+                        &locations
+                            .iter()
+                            .map(|(file, line)| (PathBuf::from(file), *line))
+                            .collect::<Vec<_>>(),
+                    )
+                    .await;
+                let mut addresses = crate::lang::render::LocationAddresses::new();
+                for (index, (file, line)) in locations.iter().enumerate() {
+                    if let Some(tag) = located.tag(index, *line) {
+                        addresses.insert((file.clone(), *line), tag);
+                    }
+                }
+                let mut text =
+                    problems_text_addressed(&snapshots, &rechecks, language, offset, &addresses);
+                if let Some(note) = located.note() {
+                    text.push('\n');
+                    text.push_str(&note);
+                }
+                text
             }
             None => "checks disabled".to_owned(),
         };
@@ -5366,6 +5410,9 @@ impl<'a> Worker<'a> {
                 Some(authority),
                 source,
             ));
+        }
+        if job.parameters.get("patch").is_some() {
+            return self.edit_patch(job).await;
         }
         if job.parameters.get("files").is_some() {
             return self.edit_files(job).await;
@@ -5575,11 +5622,19 @@ impl<'a> Worker<'a> {
                             .await;
                         job.deadline = original;
                         let diagnostics = match result {
-                            Ok(Some(provider)) => EditDiagnostics::from_snapshot(
-                                request.path.trim_start_matches("./"),
-                                &provider.context,
-                                &provider.diagnostics,
-                            ),
+                            Ok(Some(provider)) => {
+                                let map = if provider.diagnostics.diagnostics.is_empty() {
+                                    None
+                                } else {
+                                    self.optional_address_map(job, &observed, &bytes).await
+                                };
+                                EditDiagnostics::from_snapshot(
+                                    request.path.trim_start_matches("./"),
+                                    &provider.context,
+                                    &provider.diagnostics,
+                                    map.as_deref(),
+                                )
+                            }
                             Ok(None) | Err(_) => EditDiagnostics::Unknown {},
                         };
                         (Some(observed), diagnostics)
@@ -6433,6 +6488,12 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             // `PeerReply::encode` needing to shrink it: a shrink cuts at a UTF-8 boundary, not a
             // hunk boundary, which would silently deliver a partial hunk while the cursor advanced
             // past it as if it were whole.
+            // Later pages carry the same `@ address (L..)` lines as page 1; the lookup runs once
+            // over the largest page and every smaller retry reuses it.
+            let probe = page.expand_with_max_hunks(&expected_scope, page.budget().max_hunks);
+            let hunk_lines =
+                addressing::lexical_hunk_addresses(authority.worktree().worktree_path(), &probe)
+                    .await;
             let (advanced, next) = snapshots::fit_diff_page(
                 page.mode(),
                 authority.epoch(),
@@ -6440,7 +6501,10 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 page.budget().max_hunks,
                 page.provenance(),
                 true,
-                |max_hunks| page.expand_with_max_hunks(&expected_scope, max_hunks),
+                |max_hunks| {
+                    page.expand_with_max_hunks(&expected_scope, max_hunks)
+                        .with_hunk_addresses(&hunk_lines)
+                },
             )
             .map_err(|code| match code {
                 // A structurally unavailable or failed selection can never be repaired by a later
@@ -10955,8 +11019,9 @@ mod stop_retry_tests {
                     },
                     note: Some(note),
                     ..
-                } if reference == "line-edit"
-                    && note == "lines after 2 moved +1"
+                // This drives the worker directly with the single `lines` form (the facade
+                // rewrites it to `changes` in production), so only the movement fact is the note.
+                } if reference == "line-edit" && note == "lines after 2 moved +1"
             ),
             "{reply:?}"
         );
@@ -14155,7 +14220,7 @@ mod stop_retry_tests {
             )
             .await,
             Ok(
-                "a.gamma  (5 lines, gamma)\n    1  sym card\n    2    sym btn\n  (2 symbols)\n"
+                "a.gamma  (5 lines, gamma)\n1–5  a.gamma#card  sym card\n2–4  a.gamma#card/btn  sym btn\n  (2 symbols)\n"
                     .into()
             )
         );
@@ -14166,7 +14231,9 @@ mod stop_retry_tests {
         .await
         .unwrap();
         assert!(
-            read.starts_with("a.gamma#card/btn  (lines 2–4)\n2\t  sym btn\n3\t  #top\n4\t  end\n"),
+            read.starts_with(
+                "a.gamma#card/btn  (3 lines; file lines 2-4)\n1\t  sym btn\n2\t  #top\n3\t  end\n"
+            ),
             "{read}"
         );
         assert_eq!(
@@ -14193,14 +14260,15 @@ mod stop_retry_tests {
             Ok(
                 "symbol: ##top — element id, 1 element, 1 usage in 1 files (alpha, gamma)\n\
                 definitions:\n  b.alpha:1  [alpha] #top @btn\n\
-                usages: 1 indexed in 1 files (src 1, tests 0)\n  a.gamma:3  [gamma] #top\n\
-                unavailable for: delta\n"
+                usages: 1 indexed in 1 files (src 1, tests 0)\n  a.gamma#card/btn:2 (L3)  [gamma] #top\n\
+                unavailable for: delta\n\
+                addresses: omitted for 1 locations (no outline for the file)\n"
                     .into()
             )
         );
         assert_eq!(
             run(AssistanceTool::Read, serde_json::json!({"symbol":"##top"})).await,
-            Ok("b.alpha:1  (lines 1)\n1\t#top @btn\nsource_ref: serverless\n".into())
+            Ok("b.alpha:1  (lines 1)\n1\t#top @btn\n".into())
         );
         assert_eq!(
             run(
@@ -14493,7 +14561,7 @@ mod stop_retry_tests {
                     text.starts_with("job-ready ide.read a.gamma#card/btn: ready\n"),
                     "{text}"
                 );
-                assert!(text.contains("2\t  sym btn"), "{text}");
+                assert!(text.contains("1\t  sym btn"), "{text}");
             }
         }
         std::fs::write(
