@@ -6476,6 +6476,12 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             // `PeerReply::encode` needing to shrink it: a shrink cuts at a UTF-8 boundary, not a
             // hunk boundary, which would silently deliver a partial hunk while the cursor advanced
             // past it as if it were whole.
+            // Later pages carry the same `@ address (L..)` lines as page 1; the lookup runs once
+            // over the largest page and every smaller retry reuses it.
+            let probe = page.expand_with_max_hunks(&expected_scope, page.budget().max_hunks);
+            let hunk_lines =
+                addressing::lexical_hunk_addresses(authority.worktree().worktree_path(), &probe)
+                    .await;
             let (advanced, next) = snapshots::fit_diff_page(
                 page.mode(),
                 authority.epoch(),
@@ -6483,7 +6489,10 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
                 page.budget().max_hunks,
                 page.provenance(),
                 true,
-                |max_hunks| page.expand_with_max_hunks(&expected_scope, max_hunks),
+                |max_hunks| {
+                    page.expand_with_max_hunks(&expected_scope, max_hunks)
+                        .with_hunk_addresses(&hunk_lines)
+                },
             )
             .map_err(|code| match code {
                 // A structurally unavailable or failed selection can never be repaired by a later

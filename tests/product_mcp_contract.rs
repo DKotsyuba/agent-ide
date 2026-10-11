@@ -10063,6 +10063,128 @@ async fn configured_product_diff_hunks_carry_addresses() {
     daemon.wait().await.unwrap();
 }
 
+/// Pages of a long diff reached through `ide.inspect` carry the same `@ address (L..)` lines as
+/// page 1 (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_later_diff_pages_carry_addresses() {
+    let fixture = ProductFixture::new(json!([]));
+    let functions = |value: i32| -> String {
+        (0..40)
+            .map(|n| {
+                format!(
+                    "pub fn f{n}() -> i32 {{\n    {value}\n}}\n{}",
+                    "\n".repeat(8)
+                )
+            })
+            .collect()
+    };
+    std::fs::write(fixture.root.join("src/lib.rs"), functions(1)).unwrap();
+    fixture.git(&["add", "--", "src/lib.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "many functions"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "diff-pages-address").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"diff-pages-address-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    std::fs::write(fixture.root.join("src/lib.rs"), functions(2)).unwrap();
+    let first = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let first = actor.settle(&fixture, first).await;
+    assert_eq!(first["continuation"], true, "{first}");
+    assert!(
+        first["text"]
+            .as_str()
+            .unwrap()
+            .contains("\n@ src/lib.rs#f0:2 (L2)\n"),
+        "{first}"
+    );
+    let reference = first["detail_ref"].as_str().unwrap().to_owned();
+    let mut later = String::new();
+    for _ in 0..6 {
+        let page = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+            .await;
+        let page = actor.settle(&fixture, page).await;
+        later.push_str(page["text"].as_str().unwrap_or_default());
+        if page["continuation"] != true {
+            break;
+        }
+    }
+    assert!(later.contains("\n@ src/lib.rs#f39:2 (L"), "{later}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Name-index usage rows, name-card definitions and ambiguity candidates of a style name carry
+/// the addresses of their lines (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_name_cards_and_index_usages_carry_addresses() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(
+        fixture.root.join("styles.css"),
+        ".btn {\n  color: red;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("index.html"),
+        "<main id=\"app\">\n<button class=\"btn\">Save</button>\n</main>\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("app.py"), "def btn():\n    return 1\n").unwrap();
+    fixture.git(&["add", "--", "styles.css", "index.html", "app.py"]);
+    fixture.git(&["commit", "--quiet", "-m", "name card fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "name-card-address").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"name-card-address-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let card = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":".btn"}))
+        .await;
+    let card = actor.settle(&fixture, card).await;
+    let text = card["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("styles.css#.btn (L1)  [css] .btn"),
+        "the definition row carries its address: {text}"
+    );
+    assert!(
+        text.contains("index.html#")
+            && text
+                .lines()
+                .any(|line| line.contains("(L2)") && line.contains("<button class=\"btn\">")),
+        "the index usage row carries its address: {text}"
+    );
+    let candidates = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":"btn"}))
+        .await;
+    let candidates = actor.settle(&fixture, candidates).await;
+    let text = candidates["text"].as_str().unwrap_or_default();
+    assert!(text.contains("candidates for btn:"), "{text}");
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("  .btn  (class name: ")
+                && line.contains("styles.css#.btn (L1)")),
+        "the style candidate row names its definition address: {text}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Project problems rows carry the position address of their line (symbol-address-v1 §8).
 #[tokio::test]
 async fn configured_product_problems_rows_carry_addresses() {

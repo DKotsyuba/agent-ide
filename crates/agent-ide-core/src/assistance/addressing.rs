@@ -60,6 +60,56 @@ pub(super) fn tagged(address: &str, line: u32) -> String {
     format!("{address} (L{line})")
 }
 
+/// The `@ <address>` lines for the hunks `result` selected (see
+/// [`Worker::diff_hunk_addresses`]) for callers that have no worker: each file is read from
+/// `root` and outlined by its language's source outline, never a server, within
+/// [`ADDRESS_BUDGET`]. A hunk whose file has no source outline gets no line.
+pub(super) async fn lexical_hunk_addresses(
+    root: &Path,
+    result: &crate::changes::DiffResult,
+) -> BTreeMap<usize, String> {
+    let lookup = async {
+        let mut lines = BTreeMap::new();
+        let mut maps: BTreeMap<PathBuf, Option<AddressMap>> = BTreeMap::new();
+        for hunk in result.selected_hunks() {
+            if !hunk.starts_hunk() {
+                continue;
+            }
+            if hunk.deletes_file() {
+                lines.insert(hunk.index(), format!("{} (deleted)", hunk.path().display()));
+                continue;
+            }
+            let Some(line) = hunk.first_changed_line() else {
+                continue;
+            };
+            let path = hunk.path().clone();
+            if !maps.contains_key(&path) {
+                let map = lexical_map(root, &path).await;
+                maps.insert(path.clone(), map);
+            }
+            if let Some(Some(map)) = maps.get(&path)
+                && let Some(address) = map.address_at(&path, line)
+            {
+                lines.insert(hunk.index(), tagged(&address, line));
+            }
+        }
+        lines
+    };
+    tokio::time::timeout(ADDRESS_BUDGET, lookup)
+        .await
+        .unwrap_or_default()
+}
+
+/// The address map of `relative` under `root` from its language's source outline.
+pub(super) async fn lexical_map(root: &Path, relative: &Path) -> Option<AddressMap> {
+    let language = crate::lang::Language::for_path(relative)?;
+    let source = std::fs::read_to_string(root.join(relative)).ok()?;
+    let outline = crate::modules::calls::outline_from_source(language, root, relative, &source)
+        .await
+        .ok()??;
+    Some(AddressMap::build(&outline, &source))
+}
+
 impl Worker<'_> {
     /// The [`AddressMap`] of one observed file, built from the same outline the call renders
     /// (server, module or lexical) and the exact source `bytes`; the second value says why the
@@ -137,16 +187,11 @@ impl Worker<'_> {
         card: &mut crate::lang::render::SymbolCard,
     ) {
         let locate = |file: &str, line: u32| (PathBuf::from(file), line);
-        // Rows from the name index (cross-language usages) keep `file:line`: they list other
-        // languages' files and are a different, heuristic source.
-        let usages: Vec<(PathBuf, u32)> = if card.usages_indexed {
-            Vec::new()
-        } else {
-            card.usages
-                .iter()
-                .map(|usage| locate(&usage.file, usage.line))
-                .collect()
-        };
+        let usages: Vec<(PathBuf, u32)> = card
+            .usages
+            .iter()
+            .map(|usage| locate(&usage.file, usage.line))
+            .collect();
         let calls: Vec<(PathBuf, u32)> = card
             .callers
             .iter()
@@ -175,12 +220,13 @@ impl Worker<'_> {
     }
 
     /// Fills the graph's nodes with the addresses of the symbols they name, each with its
-    /// absolute line; a node that did not resolve keeps its raw path and `file:line`.
+    /// absolute line; a node that did not resolve keeps its raw path and `file:line`. Returns the
+    /// `addresses: omitted for N locations (<reason>)` line when some node did not resolve.
     pub(super) async fn address_graph_nodes(
         &mut self,
         job: &mut Job,
         graph: &mut crate::lang::render::CallGraph,
-    ) {
+    ) -> Option<String> {
         let all: Vec<(PathBuf, u32)> = graph
             .nodes
             .iter()
@@ -196,6 +242,7 @@ impl Worker<'_> {
                 );
             }
         }
+        addresses.note()
     }
 
     /// Turns a `path:line[:col]` location (what grep and compilers print) into the canonical

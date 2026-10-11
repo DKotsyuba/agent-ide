@@ -846,6 +846,35 @@ impl Worker<'_> {
         .await
         .map_err(|failure| super::symbols::module_failure(job, &failure))?;
         self.shared.active(binding)?;
+        // Every definition and usage row prints the address of its line with the absolute line
+        // when the file resolves (symbol-address-v1); the rest keep `file:line`.
+        let locations: Vec<(PathBuf, u32)> = gathered
+            .iter()
+            .flat_map(|links| {
+                links
+                    .defines
+                    .iter()
+                    .map(|(shown, _)| shown)
+                    .chain(links.uses.sites.iter())
+                    .map(|shown| (shown.site.file.clone(), shown.site.fact.line))
+            })
+            .collect();
+        let located = Box::pin(self.position_addresses(job, &locations)).await;
+        let mut positions = render::LocationAddresses::new();
+        let mut symbols = render::LocationAddresses::new();
+        for (index, (file, line)) in locations.iter().enumerate() {
+            let key = (file.display().to_string(), *line);
+            if let Some(Some(address)) = located.rows.get(index) {
+                symbols.insert(
+                    key.clone(),
+                    super::addressing::tagged(super::addressing::symbol_part(address), *line),
+                );
+            }
+            if let Some(tag) = located.tag(index, *line) {
+                positions.insert(key, tag);
+            }
+        }
+        let omitted = located.note();
         let mut head = String::new();
         let mut tail = String::new();
         for links in gathered {
@@ -877,21 +906,33 @@ impl Worker<'_> {
             let width = links
                 .defines
                 .iter()
-                .map(|(shown, _)| location(shown).len())
+                .map(|(shown, _)| {
+                    let site = (shown.site.file.display().to_string(), shown.site.fact.line);
+                    symbols
+                        .get(&site)
+                        .map_or_else(|| location(shown).len(), String::len)
+                })
                 .max()
                 .unwrap_or(0);
             let definitions = links
                 .defines
                 .iter()
                 .map(|(shown, address)| {
+                    let site = (shown.site.file.display().to_string(), shown.site.fact.line);
+                    let resolved = symbols.get(&site);
+                    let place = resolved.cloned().unwrap_or_else(|| location(shown));
                     let mut row = format!(
-                        "{:<width$}  [{}] {}",
-                        location(shown),
+                        "{place:<width$}  [{}] {}",
                         shown.site.language,
                         selector(&shown.text)
                     );
-                    if let Some((path, range)) = address {
-                        row.push_str(&format!("  ({path}, lines {range})"));
+                    match (resolved, address) {
+                        // The address already names the symbol; only its lines are added.
+                        (Some(_), Some((_, range))) => row.push_str(&format!("  (lines {range})")),
+                        (None, Some((path, range))) => {
+                            row.push_str(&format!("  ({path}, lines {range})"))
+                        }
+                        _ => {}
                     }
                     row
                 })
@@ -909,8 +950,12 @@ impl Worker<'_> {
                 usages_dropped: links.uses.dropped + links.defines_dropped,
                 report_empty_usages: true,
                 links: notes(&links.uncovered, state, links.capped),
+                usage_addresses: positions.clone(),
                 ..Default::default()
             };
+            if let Some(note) = &omitted {
+                card.links.push(note.clone());
+            }
             if links.uses.more > 0 {
                 card.links.insert(
                     0,
@@ -988,6 +1033,72 @@ impl Worker<'_> {
                 ),
             },
         )
+    }
+}
+
+impl Worker<'_> {
+    /// The bridge candidate lines of an ambiguity list, each followed by the addresses (with
+    /// absolute lines) of up to two of its definitions when their files resolve:
+    /// `.btn  (class name: 3 rules, 4 usages)  styles.css#.btn (L2), theme.scss#.btn (L1)`.
+    /// Lines whose definitions do not resolve keep the plain [`candidate`] form.
+    pub(super) async fn candidate_rows(
+        &mut self,
+        job: &mut Job,
+        binding: &BindingRef,
+        summaries: &[KeySummary],
+    ) -> Vec<String> {
+        let plain = || summaries.iter().map(candidate).collect::<Vec<_>>();
+        let Ok(authority) = self.authority(binding).await else {
+            return plain();
+        };
+        let Ok((index, _)) = self.name_index(job, authority.worktree()).await else {
+            return plain();
+        };
+        let keys: Vec<NameKey> = summaries
+            .iter()
+            .map(|summary| summary.key.clone())
+            .collect();
+        let Ok(sites) = with_names(index, move |index| {
+            keys.iter()
+                .map(|key| {
+                    index
+                        .proven_sites(key, Some(Role::Define), 2)
+                        .sites
+                        .into_iter()
+                        .map(|shown| (shown.site.file.clone(), shown.site.fact.line))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        else {
+            return plain();
+        };
+        let locations: Vec<(PathBuf, u32)> = sites.iter().flatten().cloned().collect();
+        let located = Box::pin(self.position_addresses(job, &locations)).await;
+        let mut next = 0;
+        summaries
+            .iter()
+            .zip(&sites)
+            .map(|(summary, own)| {
+                let tags: Vec<String> = own
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(offset, (_, line))| {
+                        let address = located.rows.get(next + offset)?.as_ref()?;
+                        Some(super::addressing::tagged(
+                            super::addressing::symbol_part(address),
+                            *line,
+                        ))
+                    })
+                    .collect();
+                next += own.len();
+                match tags.is_empty() {
+                    true => candidate(summary),
+                    false => format!("{}  {}", candidate(summary), tags.join(", ")),
+                }
+            })
+            .collect()
     }
 }
 
