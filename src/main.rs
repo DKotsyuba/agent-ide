@@ -1193,7 +1193,7 @@ impl ManagedRuntime {
 
     /// Exclusively creates the one deterministic shared Claude runtime directory with mode `0700`.
     ///
-    /// `path` must be the rendezvous-key-derived child of [`claude_rendezvous_parent`]. An
+    /// `path` must be the rendezvous-key-derived child of [`agent_ide::hook_hints::effective_root`]. An
     /// existing path is never opened, repaired, or removed here, so a fresh generation can never
     /// silently reuse or overwrite a live daemon's directory identity; [`Self::ensure_deterministic`]
     /// is the idempotent entry point a second worktree's MCP uses to join an existing rendezvous. The
@@ -1470,26 +1470,6 @@ const CLAUDE_KEY_CACHE_PREFIX: &str = agent_ide::hook_hints::KEY_CACHE_PREFIX;
 /// Fixed owner-only file name holding one candidate's cached rendezvous key bytes.
 const CLAUDE_KEY_CACHE_FILE: &str = agent_ide::hook_hints::KEY_FILE;
 
-/// Resolves the shared parent for Claude runtime and candidate-cache paths without creating it.
-///
-/// A nonempty `AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT` opts into an existing absolute, normalized
-/// operator-selected parent; otherwise `/private/tmp` remains the production default. Every
-/// MCP, hook and daemon process must inherit the same value. Canonicalization errors and relative
-/// or traversal-containing overrides are rejected. Child ownership, mode and no-follow checks
-/// remain unchanged; choose a short parent so Unix socket paths fit the platform limit.
-fn claude_rendezvous_parent() -> std::io::Result<PathBuf> {
-    let parent = std::env::var_os("AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT")
-        .filter(|value| !value.is_empty())
-        .map_or_else(|| PathBuf::from("/private/tmp"), PathBuf::from);
-    if !absolute_local_path(&parent) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Claude rendezvous parent must be absolute and normalized",
-        ));
-    }
-    fs::canonicalize(parent)
-}
-
 /// Derives the deterministic per-candidate path of [`claude_rendezvous_key`]'s hot-path cache.
 ///
 /// Keyed by the raw candidate path itself (never the resolved key), so it never requires `git` to
@@ -1498,7 +1478,8 @@ fn claude_key_cache_path(candidate: &Path) -> std::io::Result<PathBuf> {
     let identity = blake3::hash(candidate.as_os_str().as_bytes())
         .to_hex()
         .to_string();
-    Ok(claude_rendezvous_parent()?.join(format!("{CLAUDE_KEY_CACHE_PREFIX}{}", &identity[..16])))
+    Ok(agent_ide::hook_hints::effective_root()?
+        .join(format!("{CLAUDE_KEY_CACHE_PREFIX}{}", &identity[..16])))
 }
 
 /// Best-effort caches `key` for `candidate`'s hot path; per EYES-r2, only the MCP server calls this.
@@ -1664,18 +1645,25 @@ fn prepare_private_persistent_directory(path: &Path) -> std::io::Result<()> {
 /// `status` only reports; `prune` sweeps now under the machine-wide sweep lock (exit 2 when
 /// another sweep holds it), ignoring the hourly spacing but every lease and rule, and records its
 /// removals in the error log of the current directory's repository (the one `errors` reads).
+/// Hint status/prune uses the shared operator-selected Claude parent. An invalid parent exits 2
+/// with a repair message before any sweep; it never falls back to the legacy parent.
 async fn run_cache(prune: bool) -> ExitCode {
     let Some(root) = agent_ide::retention::state_root() else {
         eprintln!("agent-ide: cannot resolve the user home");
         return ExitCode::from(2);
     };
-    let tmp = Path::new(agent_ide::hook_hints::TMP_ROOT);
+    let Ok(tmp) = agent_ide::hook_hints::effective_root() else {
+        eprintln!(
+            "agent-ide: cannot resolve Claude rendezvous parent; set AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT to an existing absolute normalized directory"
+        );
+        return ExitCode::from(2);
+    };
     if !prune {
         print!(
             "{}",
             agent_ide::retention::sweep(&root, false).render(false)
         );
-        let hints = agent_ide::hook_hints::collect(tmp, false, SystemTime::now(), &|| true);
+        let hints = agent_ide::hook_hints::collect(&tmp, false, SystemTime::now(), &|| true);
         println!(
             "hook key hints: {} in {}, {} stale and removable",
             hints.hints,
@@ -1702,7 +1690,7 @@ async fn run_cache(prune: bool) -> ExitCode {
     let pause = hint_pause_note();
     if pause.is_empty() {
         let hints = agent_ide::hook_hints::collect(
-            tmp,
+            &tmp,
             true,
             SystemTime::now(),
             &agent_ide::retention::hint_publishers_safe(),
@@ -1842,11 +1830,12 @@ fn managed_telemetry_database(candidate: &Path) -> Result<PathBuf, TelemetryStat
 /// `key` is the rendezvous key resolved by [`claude_rendezvous_key`] (a repository's canonical git
 /// common directory, or the canonical candidate itself outside a git repository). The full digest
 /// remains in the attachment record to reject a theoretical collision in the sixteen-hex-character
-/// pathname prefix. The parent is selected by [`claude_rendezvous_parent`]; model arguments cannot
+/// pathname prefix. The parent is selected by [`agent_ide::hook_hints::effective_root`]; model arguments cannot
 /// redirect it.
 fn claude_runtime_path(key: &Path) -> std::io::Result<PathBuf> {
     let identity = claude_rendezvous_identity(key);
-    Ok(claude_rendezvous_parent()?.join(format!("{CLAUDE_RUNTIME_PREFIX}{}", &identity[..16])))
+    Ok(agent_ide::hook_hints::effective_root()?
+        .join(format!("{CLAUDE_RUNTIME_PREFIX}{}", &identity[..16])))
 }
 
 /// Resolves the two operator-reported Claude rendezvous paths for one existing project directory.
@@ -3955,13 +3944,20 @@ mod tests {
         assert_ne!(first_path, claude_runtime_path(second).unwrap());
         assert_eq!(
             first_path.parent(),
-            Some(claude_rendezvous_parent().unwrap().as_path())
+            Some(agent_ide::hook_hints::effective_root().unwrap().as_path())
         );
         assert_eq!(
             claude_key_cache_path(first).unwrap().parent(),
             first_path.parent()
         );
-        assert!(first_path.join("daemon.sock").as_os_str().as_bytes().len() < 104);
+        assert!(
+            first_path
+                .join("agent-ide.sock")
+                .as_os_str()
+                .as_bytes()
+                .len()
+                < 104
+        );
         assert!(canonical_claude_project(Some(OsString::from("relative"))).is_err());
         assert!(canonical_claude_project(Some(OsString::from("/private/tmp/../tmp"))).is_err());
     }
@@ -4207,10 +4203,12 @@ mod tests {
         // The shortened suffix is the shared key digest's sixteen-hex-character prefix, not any
         // candidate-specific path digest.
         let key = claude_rendezvous_key(&fs::canonicalize(&repo).unwrap()).await;
-        let expected = claude_rendezvous_parent().unwrap().join(format!(
-            "{CLAUDE_RUNTIME_PREFIX}{}",
-            &claude_rendezvous_identity(&key)[..16]
-        ));
+        let expected = agent_ide::hook_hints::effective_root()
+            .unwrap()
+            .join(format!(
+                "{CLAUDE_RUNTIME_PREFIX}{}",
+                &claude_rendezvous_identity(&key)[..16]
+            ));
         assert_eq!(repo_runtime, expected);
         assert!(
             claude_rendezvous_paths(&parent.join("absent"))

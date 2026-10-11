@@ -1,4 +1,4 @@
-//! Safe collection of the Claude hook key hints `/private/tmp/ai-k-<16 hex>`.
+//! Safe collection of Claude hook key hints `ai-k-<16 hex>` below the configured temporary parent.
 //!
 //! A managed Claude MCP leaves one hint directory per candidate worktree (`key`, the rendezvous
 //! key the hook must not run `git` to find, and `candidate-attachment`). Nothing ever removed
@@ -26,7 +26,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-/// The temporary root the hint and runtime directories live in (its canonical path).
+/// Legacy temporary parent used only when no nonempty operator override is supplied.
 pub const TMP_ROOT: &str = "/private/tmp";
 /// Name prefix of a key hint directory.
 pub const KEY_CACHE_PREFIX: &str = "ai-k-";
@@ -40,6 +40,37 @@ pub const RUNTIME_PREFIX: &str = "ai-r-";
 pub const STALE_AFTER: Duration = Duration::from_secs(86_400);
 /// Longest `key` file read, as written by the publisher.
 const KEY_BYTES: u64 = 4096;
+
+/// Resolves the existing canonical parent shared by Claude runtimes, hint writers and collectors.
+///
+/// Nonempty `AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT` selects an absolute normalized operator path;
+/// unset or empty values preserve [`TMP_ROOT`]. Every MCP, hook and daemon must inherit the same
+/// value. Invalid or unresolved overrides fail closed without falling back to the legacy parent.
+/// This creates nothing; private child ownership, no-follow and locking checks remain unchanged.
+/// Choose a short parent to fit Unix socket path limits.
+pub fn effective_root() -> std::io::Result<PathBuf> {
+    resolve_root(std::env::var_os("AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT"))
+}
+
+/// Resolves one injected operator value with the same validation used by [`effective_root`].
+/// Empty or absent values select the legacy parent; relative/traversing paths and filesystem
+/// canonicalization errors return an error without creating anything or selecting another root.
+fn resolve_root(value: Option<std::ffi::OsString>) -> std::io::Result<PathBuf> {
+    let parent = value
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| PathBuf::from(TMP_ROOT), PathBuf::from);
+    if !parent.is_absolute()
+        || !parent
+            .components()
+            .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Claude rendezvous parent must be absolute and normalized",
+        ));
+    }
+    fs::canonicalize(parent)
+}
 
 /// Returns the full BLAKE3 digest, as hex, of one canonical rendezvous key's raw path bytes.
 pub fn rendezvous_identity(key: &Path) -> String {
