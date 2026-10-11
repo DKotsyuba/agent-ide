@@ -4920,6 +4920,20 @@ fn advertised_text_never_teaches_waiting() {
     assert!(validate_call(AssistanceTool::Inspect, json!({"wait_ms": 5})).is_ok());
 }
 
+/// The advertised catalog stays inside the harness-reply-v1 byte budgets: every tool description
+/// under the 2048-byte Claude clipping limit and the server paragraph under 700 bytes. The
+/// 600/160-byte description limits and the catalog totals arrive with the rewritten descriptions
+/// (M-030 T-003), which tighten this test.
+#[test]
+fn catalog_stays_within_the_budgets() {
+    assert!(SERVER_INSTRUCTIONS.len() <= 700, "{}", SERVER_INSTRUCTIONS.len());
+    let facade = StdioFacade::new(std::path::PathBuf::from("/nonexistent-runtime"));
+    for tool in facade.router.list_all() {
+        let description = tool.description.as_deref().unwrap_or_default().len();
+        assert!(description <= 2048, "{} description {description} B", tool.name);
+    }
+}
+
 /// Private catalog cache lifetime in milliseconds for modern MCP requests (SEP-2549).
 const TOOLS_LIST_TTL_MS: u64 = 60_000;
 
