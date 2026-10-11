@@ -503,3 +503,114 @@ async fn window_edits_are_guarded_by_the_last_read() {
     assert!(text.contains("; was:\n    3\t    let a = x * 9;"), "{text}");
     finished(actor, daemon, &fixture).await;
 }
+
+/// The guard covers only the lines the session read, and follows the session's own edits: a
+/// window outside a partial read is unguarded and echoes what it replaces (so lines the agent
+/// never saw are not overwritten silently), and a window copied from the session's own previous
+/// edit reply is not "changed since your read".
+#[cfg(feature = "test-seams")]
+#[tokio::test]
+async fn the_guard_covers_the_lines_read_and_follows_own_edits() {
+    let fixture = batch_edit_fixture(ORIGINAL);
+    let epoch = fixture.base.join("context-epoch");
+    std::fs::write(&epoch, "1").unwrap();
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let env = [("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE", epoch.to_str().unwrap())];
+    let daemon = fixture
+        .spawn_configured_daemon_with_env(Some(&home), false, Duration::from_secs(30), None, &env)
+        .await;
+    let mut actor = batch_started_actor(&fixture, "sre-guard-span", FILE).await;
+    // F4: only unit lines 1-3 were read; line 4 changes on disk; an edit of line 4 is unguarded
+    // and shows the old line it replaces.
+    call(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"symbol":"src/batch.rs#utility:1-3"}),
+    )
+    .await;
+    std::fs::write(fixture.root.join(FILE), ORIGINAL.replace("a * 2", "a * 9")).unwrap();
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":"src/batch.rs#utility:4-4","content":"    a * 5"}),
+    )
+    .await;
+    assert!(
+        text.contains(
+            "src/batch.rs#utility:4 (L9)  replaced (1 lines → 1); was:\n    4\t    a * 9"
+        ),
+        "{text}"
+    );
+    assert!(on_disk(&fixture).contains("    a * 5"));
+    // F3: read the whole unit, edit a window, then edit again from the edit's own address: the
+    // remembered unit follows the session's write, so nothing is "changed since your read".
+    reset(&fixture);
+    call(
+        &mut actor,
+        &fixture,
+        "ide.read",
+        json!({"symbol":"src/batch.rs#utility"}),
+    )
+    .await;
+    let (_, first) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":"src/batch.rs#utility:3-3","content":"    let a = x + 1;"}),
+    )
+    .await;
+    assert!(
+        first.contains("src/batch.rs#utility:3 (L8)  replaced"),
+        "{first}"
+    );
+    let (_, second) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":"src/batch.rs#utility:3-3","content":"    let a = x + 2;"}),
+    )
+    .await;
+    assert!(
+        second.contains("src/batch.rs#utility:3 (L8)  replaced")
+            && !second.contains("changed since your read"),
+        "{second}"
+    );
+    assert!(on_disk(&fixture).contains("let a = x + 2;"));
+    finished(actor, daemon, &fixture).await;
+}
+
+/// E15 and the open-ended window: a stale deprecated `source_ref` is still refused, with its own
+/// wording and no write; `:N-` replaces from line N to the unit's last line.
+#[tokio::test]
+async fn a_stale_source_ref_is_refused_and_an_open_window_reaches_the_unit_end() {
+    let (fixture, daemon, mut actor) = started("sre-stale").await;
+    let (reply, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"path":FILE,"old":"a * 2","new":"a * 3","source_ref":"no-such-ref-1"}),
+    )
+    .await;
+    assert_eq!(reply["result"]["outcome"], "stale_source", "{reply}");
+    assert!(
+        text.contains("the supplied source_ref does not match")
+            && !text.contains("changed while the edit was applied"),
+        "{text}"
+    );
+    assert_eq!(on_disk(&fixture), ORIGINAL);
+    let (_, text) = call(
+        &mut actor,
+        &fixture,
+        "ide.edit",
+        json!({"symbol":"src/batch.rs#utility:4-","content":"    a * 7\n}"}),
+    )
+    .await;
+    assert!(
+        text.contains("src/batch.rs#utility:4-5 (L9-10)  replaced (2 lines → 2)"),
+        "{text}"
+    );
+    assert_eq!(on_disk(&fixture), ORIGINAL.replace("a * 2", "a * 7"));
+    finished(actor, daemon, &fixture).await;
+}

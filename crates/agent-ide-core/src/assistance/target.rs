@@ -65,6 +65,8 @@ pub(super) fn read_unit(
                     UnitRead {
                         address: canonical,
                         text: String::new(),
+                        first: 0,
+                        last: 0,
                     },
                 ));
             }
@@ -123,6 +125,8 @@ pub(super) fn read_unit(
         UnitRead {
             address: canonical,
             text: whole,
+            first,
+            last,
         },
     ))
 }
@@ -150,13 +154,17 @@ pub(super) fn numbered_rows(text: &str, first: u32, last: u32, limit: usize) -> 
     out
 }
 
-/// What a unit read delivered: the unit's canonical address and its whole current text, the
-/// session's memory of the read for the window-edit guard.
+/// What a unit read delivered: the unit's canonical address, its whole current text and the
+/// unit lines the reply showed, the session's memory of the read for the window-edit guard.
 pub(super) struct UnitRead {
     /// `file#unit`, never with a window.
     pub(super) address: String,
     /// The unit's whole text at read time; empty when the read delivered no lines.
     pub(super) text: String,
+    /// First unit line (1-based) the reply showed; `0` when it showed none.
+    pub(super) first: u32,
+    /// Last unit line the reply showed.
+    pub(super) last: u32,
 }
 
 /// `file#unit` of unit `unit` of `map`, windowless.
@@ -252,27 +260,59 @@ impl Worker<'_> {
     /// Remembers `read` as this session's last read of its unit, for the window-edit guard;
     /// nothing is kept while the context epoch is unknown.
     pub(super) fn remember_unit_read(&self, binding: &BindingRef, read: UnitRead) {
+        if read.first == 0 {
+            return;
+        }
         let epoch = self.context_epoch(binding);
         if let Ok(mut ledger) = self.shared.ledger.lock() {
             ledger
                 .read_memory
                 .entry(binding.clone())
                 .or_default()
-                .remember_unit(epoch, &read.address, read.text);
+                .remember_unit(epoch, &read.address, read.text, read.first, read.last);
         }
     }
 
-    /// The text of unit `address` (`file#unit`) as this session last read it in the current
-    /// context epoch, or `None` when nothing is remembered (never read, `ide.stop`, a context
-    /// compaction, or an unknown epoch).
-    pub(super) fn remembered_unit(&self, binding: &BindingRef, address: &str) -> Option<String> {
+    /// Refreshes the units this session remembers of `path` after its own write: `map` is the
+    /// address map of the written text and `text` that text. Units read whole take the new text;
+    /// units read in part are forgotten (see `ReadMemory::refresh_file_units`).
+    pub(super) fn refresh_unit_memory(
+        &self,
+        binding: &BindingRef,
+        path: &str,
+        map: &AddressMap,
+        text: &str,
+    ) {
+        let epoch = self.context_epoch(binding);
+        let current = |address: &str| -> Option<(String, u32)> {
+            let index = (0..map.units().len())
+                .find(|&index| canonical(Path::new(path), map, index) == address)?;
+            let span = map.units()[index].span;
+            Some((crate::lang::slice_lines(text, span), span.len()))
+        };
+        if let Ok(mut ledger) = self.shared.ledger.lock()
+            && let Some(memory) = ledger.read_memory.get_mut(binding)
+        {
+            memory.refresh_file_units(epoch, path, &current);
+        }
+    }
+
+    /// What this session last read of unit `address` (`file#unit`) in the current context epoch:
+    /// the unit's text then and the unit lines the read showed. `None` when nothing is
+    /// remembered (never read, `ide.stop`, a context compaction, or an unknown epoch).
+    pub(super) fn remembered_unit(
+        &self,
+        binding: &BindingRef,
+        address: &str,
+    ) -> Option<crate::assistance::batch::RememberedUnit> {
         let epoch = self.context_epoch(binding);
         let ledger = self.shared.ledger.lock().ok()?;
-        ledger
-            .read_memory
-            .get(binding)?
-            .unit_text(epoch, address)
-            .map(str::to_owned)
+        let found = ledger.read_memory.get(binding)?.unit_text(epoch, address)?;
+        Some(crate::assistance::batch::RememberedUnit {
+            text: found.text.clone(),
+            first: found.first,
+            last: found.last,
+        })
     }
 
     /// Wraps a rendered unit read as the paged `read` reply of the job.

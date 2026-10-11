@@ -364,7 +364,8 @@ fn close_hunk(open: &mut Option<(Hunk, usize)>, hunks: &mut Vec<Hunk>) -> Result
 /// after trimming and mapping curly single and double quotes (including the low and reversed
 /// forms) to `'` and `"`, en, em and minus signs to `-`, and a non-breaking space to a space.
 /// A hunk with `at_end_of_file` matches only at the end of the source. An empty `old_lines`
-/// inserts at the end of the source.
+/// inserts after the hunk's `@@` anchor line when it has one and finds it, else at the end of the
+/// source. A source containing `\r\n` keeps that ending on every line a hunk writes.
 ///
 /// The output keeps the source's final-newline state, except that a hunk that is end-anchored or
 /// inserts at the end and adds lines makes the result end with `\n`.
@@ -389,6 +390,9 @@ pub(crate) fn apply_hunks(source: &str, hunks: &[Hunk]) -> Result<Applied, Miss>
         }
     }
 
+    // A CRLF file keeps its line ending: the replacement lines carry the same `\r` the source
+    // lines (split on `\n`) already end with.
+    let crlf = source.contains("\r\n");
     let mut out: Vec<String> = Vec::new();
     let mut spans: Vec<Span> = Vec::new();
     let mut ends_with_newline = trailing_newline;
@@ -396,12 +400,19 @@ pub(crate) fn apply_hunks(source: &str, hunks: &[Hunk]) -> Result<Applied, Miss>
     for (hunk, &(start, old_len)) in hunks.iter().zip(&placed) {
         out.extend(lines[next..start].iter().map(|line| line.to_string()));
         let at = out.len();
-        out.extend(hunk.new_lines.iter().cloned());
+        out.extend(hunk.new_lines.iter().map(|line| {
+            if crlf {
+                format!("{line}\r")
+            } else {
+                line.clone()
+            }
+        }));
         if let Some(span) = changed_span(hunk, at) {
             spans.push(span);
         }
         next = start + old_len;
-        if (hunk.at_end_of_file || hunk.old_lines.is_empty()) && !hunk.new_lines.is_empty() {
+        let appends = hunk.at_end_of_file || (hunk.old_lines.is_empty() && start == lines.len());
+        if appends && !hunk.new_lines.is_empty() {
             ends_with_newline = true;
         }
     }
@@ -441,7 +452,14 @@ fn split_source(source: &str) -> (Vec<&str>, bool) {
 fn locate(lines: &[&str], hunk: &Hunk, cursor: usize) -> Option<usize> {
     let old = &hunk.old_lines;
     if old.is_empty() {
-        return Some(lines.len());
+        // An add-only hunk goes after its `@@` anchor line when it has one and it is found,
+        // else at the end of the source.
+        return Some(
+            hunk.anchor
+                .as_deref()
+                .and_then(|anchor| find_anchor(lines, anchor, cursor))
+                .unwrap_or(lines.len()),
+        );
     }
     let from = search_start(lines, hunk, cursor);
     let last = lines.len().checked_sub(old.len())?;
@@ -466,18 +484,22 @@ fn locate(lines: &[&str], hunk: &Hunk, cursor: usize) -> Option<usize> {
 /// Without an anchor this is `cursor`. With an anchor it is one past the first line at or after
 /// `cursor` whose trimmed text equals the trimmed anchor, or `cursor` when no such line exists.
 fn search_start(lines: &[&str], hunk: &Hunk, cursor: usize) -> usize {
-    match hunk.anchor.as_deref() {
-        None => cursor,
-        Some(anchor) => {
-            let wanted = anchor.trim();
-            lines
-                .iter()
-                .enumerate()
-                .skip(cursor)
-                .find(|(_, line)| line.trim() == wanted)
-                .map_or(cursor, |(index, _)| index + 1)
-        }
-    }
+    hunk.anchor
+        .as_deref()
+        .and_then(|anchor| find_anchor(lines, anchor, cursor))
+        .unwrap_or(cursor)
+}
+
+/// The index one past the first line at or after `cursor` whose trimmed text equals the trimmed
+/// `anchor`, or `None` when no such line exists.
+fn find_anchor(lines: &[&str], anchor: &str, cursor: usize) -> Option<usize> {
+    let wanted = anchor.trim();
+    lines
+        .iter()
+        .enumerate()
+        .skip(cursor)
+        .find(|(_, line)| line.trim() == wanted)
+        .map(|(index, _)| index + 1)
 }
 
 /// Reports whether `old` matches the source lines starting at `start` under one pass.
@@ -717,6 +739,31 @@ mod tests {
         let applied = apply_hunks("a\nb\nc\n", &[hunk(None, &["b"], &["B"], false)]).unwrap();
         assert_eq!(applied.text, "a\nB\nc\n");
         assert_eq!(applied.changed, vec![(2, 2)]);
+    }
+
+    /// Checks that a CRLF file keeps its line ending on the replaced lines.
+    #[test]
+    fn crlf_files_keep_their_line_endings() {
+        let applied = apply_hunks(
+            "a\r\nb\r\nc\r\n",
+            &[hunk(None, &["b"], &["B", "B2"], false)],
+        )
+        .unwrap();
+        assert_eq!(applied.text, "a\r\nB\r\nB2\r\nc\r\n");
+    }
+
+    /// Checks that an add-only hunk with an `@@` anchor goes after the anchor line, not at the
+    /// end of the file, and that without a found anchor it still appends.
+    #[test]
+    fn an_anchored_add_only_hunk_lands_after_its_anchor() {
+        let applied = apply_hunks(
+            "fn a() {\n}\nfn b() {\n}\n",
+            &[hunk(Some("fn a() {"), &[], &["    x();"], false)],
+        )
+        .unwrap();
+        assert_eq!(applied.text, "fn a() {\n    x();\n}\nfn b() {\n}\n");
+        let appended = apply_hunks("a\nb\n", &[hunk(Some("missing"), &[], &["z"], false)]).unwrap();
+        assert_eq!(appended.text, "a\nb\nz\n");
     }
 
     /// Checks that a source line with trailing spaces still matches the hunk line without them.

@@ -2965,7 +2965,7 @@ impl Worker<'_> {
                                     source_ref: None,
                                 },
                                 diagnostics: EditDiagnostics::Unknown {},
-                                note: None,
+                                note: Some(STALE_SOURCE_REF_NOTE.to_owned()),
                                 operation: None,
                             },
                             authority,
@@ -3149,7 +3149,7 @@ impl Worker<'_> {
                                     source_ref: None,
                                 },
                                 diagnostics: EditDiagnostics::Unknown {},
-                                note: None,
+                                note: Some(STALE_SOURCE_REF_NOTE.to_owned()),
                                 operation: None,
                             },
                             authority,
@@ -3463,6 +3463,12 @@ impl Worker<'_> {
             .map(|outline| lang::address::AddressMap::build(&outline, &candidate)),
             None => None,
         };
+        // This session's own write is part of what it knows: units it had read whole now read
+        // as the edited text, so a window copied from this reply is not "changed since your
+        // read" (symbol-read-edit-v1 §3.2 rule 3).
+        if let Some(map) = candidate_map.as_ref() {
+            self.refresh_unit_memory(job.invocation.binding_ref(), path, map, &candidate);
+        }
         let mut note = changed_rows(
             path,
             &changes,
@@ -4542,7 +4548,7 @@ fn window_guard(
     map: &lang::address::AddressMap,
     source: &str,
     requests: &[ChangeRequest],
-    remembered: &dyn Fn(&str) -> Option<String>,
+    remembered: &dyn Fn(&str) -> Option<batch::RememberedUnit>,
 ) -> Result<Vec<(usize, String)>, Refusal> {
     let mut refusal = Refusal {
         sentences: Vec::new(),
@@ -4582,8 +4588,10 @@ fn window_guard(
                 .collect()
         };
         let now = rows_of(&current);
-        match remembered(&canonical) {
-            Some(before) if rows_of(&before) != now => refusal.push(
+        // Only lines the read actually showed can be guarded: a window outside the remembered
+        // span (the agent read `:1-3`, edits `:10-12`) is unguarded and echoes what it replaces.
+        match remembered(&canonical).filter(|seen| seen.first <= first && last <= seen.last) {
+            Some(before) if rows_of(&before.text) != now => refusal.push(
                 index + 1,
                 format!(
                     "change {}: lines {first}-{last} of {canonical} changed since your read. \
@@ -5036,6 +5044,10 @@ const MAX_LANDING_SENTENCES: usize = 8;
 const MAX_REFUSAL_DETAIL_BYTES: usize = 512;
 /// Bytes of a refusal detail that quotes the unit's current text (symbol-read-edit-v1 §3.5).
 const MAX_CURRENT_TEXT_REFUSAL_BYTES: usize = 4096;
+/// The stale-source reply's reason when a caller's own (deprecated) `source_ref` no longer names
+/// the file's current text; without a `source_ref` a stale write reads "changed while the edit
+/// was applied" instead.
+pub(super) const STALE_SOURCE_REF_NOTE: &str = "the supplied source_ref does not match this file's current text. Repair: send the edit without source_ref";
 
 /// How a syntax error relates to the change it is attributed to.
 enum Attribution {
@@ -5637,7 +5649,16 @@ mod batch_tests {
             where_: None,
             content: Some("x".to_owned()),
         }];
-        let read = |before: &'static str| move |_: &str| Some(before.to_owned());
+        // A read that showed the whole three-line unit.
+        let read = |before: &'static str| {
+            move |_: &str| {
+                Some(batch::RememberedUnit {
+                    text: before.to_owned(),
+                    first: 1,
+                    last: 3,
+                })
+            }
+        };
         // E6a: the remembered line 2 differs from the current one.
         let refusal = window_guard(
             "a.gamma",
@@ -5666,6 +5687,17 @@ mod batch_tests {
             .unwrap()
             .is_empty()
         );
+        // A read that showed only unit line 1 leaves line 2 unguarded: the edit applies and
+        // echoes what it replaces, although line 2 differs from the remembered text.
+        let partial = |_: &str| {
+            Some(batch::RememberedUnit {
+                text: "sym btn\nOLD\nend\n".to_owned(),
+                first: 1,
+                last: 1,
+            })
+        };
+        let echoes = window_guard("a.gamma", &map, source, &request, &partial).unwrap();
+        assert_eq!(echoes, [(0, "2\t2\n".to_owned())]);
         // E6c: nothing remembered applies and echoes the replaced line.
         let echoes = window_guard("a.gamma", &map, source, &request, &|_| None).unwrap();
         assert_eq!(echoes, [(0, "2\t2\n".to_owned())]);

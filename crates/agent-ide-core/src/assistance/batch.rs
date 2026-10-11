@@ -478,7 +478,7 @@ pub(crate) struct ReadMemory {
     blocks: std::collections::BTreeMap<String, ([u8; 32], String)>,
     /// Per `file#unit` address: the unit's whole text as the session last read it, the base of
     /// the window-edit guard (symbol-read-edit-v1 §3.2). Dropped with the epoch like `blocks`.
-    units: std::collections::BTreeMap<String, String>,
+    units: std::collections::BTreeMap<String, RememberedUnit>,
 }
 
 /// Most unit texts the memory keeps; a full memory starts over rather than growing.
@@ -534,9 +534,17 @@ impl ReadMemory {
         );
     }
 
-    /// Records the whole `text` of unit `address` (`file#unit`) as read in `epoch`; nothing is
-    /// recorded for an unknown epoch. A new epoch or a full memory starts over.
-    pub(crate) fn remember_unit(&mut self, epoch: Option<u64>, address: &str, text: String) {
+    /// Records the text of unit `address` (`file#unit`) as read in `epoch`, with the 1-based unit
+    /// lines `first..=last` the read delivered; nothing is recorded for an unknown epoch. A new
+    /// epoch or a full memory starts over.
+    pub(crate) fn remember_unit(
+        &mut self,
+        epoch: Option<u64>,
+        address: &str,
+        text: String,
+        first: u32,
+        last: u32,
+    ) {
         let Some(epoch) = epoch else {
             return;
         };
@@ -548,17 +556,73 @@ impl ReadMemory {
         if self.units.len() >= MAX_REMEMBERED_UNITS && !self.units.contains_key(address) {
             self.units.clear();
         }
-        self.units.insert(address.to_owned(), text);
+        self.units
+            .insert(address.to_owned(), RememberedUnit { text, first, last });
     }
 
-    /// The text of unit `address` this session last read in the same `epoch`, or `None` (unknown
+    /// What this session last read of unit `address` in the same `epoch`, or `None` (unknown
     /// epoch, a different epoch, never read).
-    pub(crate) fn unit_text(&self, epoch: Option<u64>, address: &str) -> Option<&str> {
+    pub(crate) fn unit_text(&self, epoch: Option<u64>, address: &str) -> Option<&RememberedUnit> {
         if epoch.is_none() || self.epoch != epoch {
             return None;
         }
-        self.units.get(address).map(String::as_str)
+        self.units.get(address)
     }
+
+    /// Refreshes the remembered units of file `file` after this session's own write: a unit
+    /// whose whole text was remembered takes the text `current` gives for its address (or is
+    /// forgotten when `current` knows no such unit); a unit read only in part is forgotten, since
+    /// the lines the agent never saw are no longer known to it.
+    pub(crate) fn refresh_file_units(
+        &mut self,
+        epoch: Option<u64>,
+        file: &str,
+        current: &dyn Fn(&str) -> Option<(String, u32)>,
+    ) {
+        if epoch.is_none() || self.epoch != epoch {
+            return;
+        }
+        let prefix = format!("{file}#");
+        let keys: Vec<String> = self
+            .units
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for key in keys {
+            let Some(old) = self.units.get(&key) else {
+                continue;
+            };
+            let whole = old.first == 1 && old.last >= old.text.lines().count() as u32;
+            match (whole, current(&key)) {
+                (true, Some((text, length))) => {
+                    self.units.insert(
+                        key,
+                        RememberedUnit {
+                            text,
+                            first: 1,
+                            last: length,
+                        },
+                    );
+                }
+                _ => {
+                    self.units.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+/// One unit as a session last read it: its whole text at that time and the 1-based unit lines
+/// the read delivered (`first..=last`). Only those lines were seen by the agent.
+#[derive(Debug)]
+pub(crate) struct RememberedUnit {
+    /// The unit's whole text when read.
+    pub(crate) text: String,
+    /// First unit line the read delivered.
+    pub(crate) first: u32,
+    /// Last unit line the read delivered.
+    pub(crate) last: u32,
 }
 
 /// The one line that replaces an unchanged block:
@@ -1567,6 +1631,30 @@ mod tests {
             footer.contains("f7.md") && !footer.contains("f8.md"),
             "{footer}"
         );
+    }
+
+    /// After the session's own write, a unit it had read whole takes the new text, a unit it had
+    /// read in part is forgotten, and another epoch's memory is never touched.
+    #[test]
+    fn own_writes_refresh_whole_units_and_forget_partial_ones() {
+        let mut memory = ReadMemory::default();
+        memory.remember_unit(Some(1), "a.rs#whole", "x\ny\n".into(), 1, 2);
+        memory.remember_unit(Some(1), "a.rs#part", "p\nq\nr\n".into(), 1, 2);
+        memory.remember_unit(Some(1), "b.rs#other", "o\n".into(), 1, 1);
+        let current = |address: &str| match address {
+            "a.rs#whole" => Some(("x\nY\nz\n".to_owned(), 3)),
+            _ => None,
+        };
+        memory.refresh_file_units(Some(2), "a.rs", &current);
+        assert!(memory.unit_text(Some(1), "a.rs#whole").unwrap().text == "x\ny\n");
+        memory.refresh_file_units(Some(1), "a.rs", &current);
+        let whole = memory.unit_text(Some(1), "a.rs#whole").unwrap();
+        assert_eq!(
+            (whole.text.as_str(), whole.first, whole.last),
+            ("x\nY\nz\n", 1, 3)
+        );
+        assert!(memory.unit_text(Some(1), "a.rs#part").is_none());
+        assert!(memory.unit_text(Some(1), "b.rs#other").is_some());
     }
 
     #[test]

@@ -5475,7 +5475,7 @@ impl<'a> Worker<'a> {
             })
         });
         let Some(source) = source else {
-            return self
+            let mut stale = self
                 .settle_edit(
                     prepared,
                     &request,
@@ -5483,7 +5483,11 @@ impl<'a> Worker<'a> {
                     None,
                     None,
                 )
-                .await;
+                .await?;
+            if let PeerReply::Edit { note, .. } = &mut stale.0 {
+                *note = Some(symbols::STALE_SOURCE_REF_NOTE.to_owned());
+            }
+            return Ok(stale);
         };
         self.edit_with_source(job, request, prepared, source, true)
             .await
