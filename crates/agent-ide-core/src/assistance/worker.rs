@@ -11171,9 +11171,10 @@ mod stop_retry_tests {
                         source_ref: None,
                         ..
                     },
-                    note: None,
+                    // A stale supplied source_ref names itself in the note.
+                    note: Some(note),
                     ..
-                }
+                } if note == symbols::STALE_SOURCE_REF_NOTE
             ),
             "{reply:?}"
         );
