@@ -282,9 +282,8 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             AssistanceTool::Edit,
             json!({
                 "type": "object", "additionalProperties": false,
-                "required": ["operation_id"],
                 "properties": {
-                    "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Any unique id for this edit; repeating it never applies the edit twice."},
+                    "operation_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Optional. Name an edit to make a retry safe: repeating the id never applies the edit twice. Omitted, a fresh id is used."},
                     "op": {"type": "string", "enum": ["replace", "insert", "delete", "rename"], "default": "replace", "description": "Symbol operation. replace: new body for `symbol` (or for `path`+`lines`); insert: new symbol placed `where` relative to `symbol`; delete: remove `symbol` with its header; rename: rename `symbol` project-wide to `new_name`."},
                     "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Symbol path `file#Owner/name`."},
                     "where": {"type": "string", "enum": ["before", "after", "first", "last"], "description": "For insert: before/after the anchor symbol, or first/last member of a container anchor."},
@@ -453,6 +452,21 @@ fn range_list(
     Ok(list)
 }
 
+/// A fresh `operation_id` for an edit call that named none: process id, wall-clock nanoseconds
+/// and a process-wide counter, so ids never repeat across calls or daemon restarts.
+fn generated_operation_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    format!(
+        "auto-{}-{nanos:x}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// Parses a lenient read range: `N` (one line), `N-M` or `N-` (to the end of the file).
 ///
 /// The end of an open range is `u32::MAX`; readers clamp every end to the file's last line, so a
@@ -562,14 +576,6 @@ pub enum FieldRule {
     Boolean,
     /// The value must be an inclusive 1-based range `start-end` with `start <= end`.
     LineRange,
-    /// The closed method cannot proceed without the `source_ref` of the read its lines came from.
-    RangeEditSourceRef,
-    /// Exact-text changes require a source observation from the file that contains the text.
-    OldTextSourceRef,
-    /// A full-file edit without `source_ref` named a file that already exists: it may only create
-    /// a missing one, so replacing needs the `source_ref` of a read of that file. The worker, not
-    /// the facade, applies this rule, since only it observes whether the path exists.
-    ReplaceSourceRef,
 }
 
 impl FieldRule {
@@ -607,18 +613,7 @@ impl FieldRule {
             ),
             Self::RequiresProblemsKind => "requires \"kind\":\"problems\"".to_string(),
             Self::Boolean => "must be true or false".to_string(),
-            Self::LineRange => "must be a 1-based line range like 120-180, 120- or 120".to_string(),
-            Self::RangeEditSourceRef => {
-                "is required for a line-range edit; re-read the lines (ide.read) and retry with \
-                 the new source_ref"
-                    .to_string()
-            }
-            Self::OldTextSourceRef => {
-                "is required for an old-text change; re-read this file with ide.read and retry with the new source_ref".to_string()
-            }
-            Self::ReplaceSourceRef => {
-                "is required to replace an existing file: read it first (ide.read)".to_string()
-            }
+            Self::LineRange => "must be a 1-based line range like 120-180".to_string(),
         }
     }
 }
@@ -818,6 +813,14 @@ pub fn validate_call(
             return Err(ParameterError::InvalidObject);
         }
         _ => {}
+    }
+    // `operation_id` is optional on every edit form: a call without one gets a fresh id, so it
+    // is never mistaken for a replay of another call.
+    if tool == AssistanceTool::Edit
+        && let Some(map) = parameters.as_object_mut()
+        && !map.contains_key("operation_id")
+    {
+        map.insert("operation_id".to_owned(), json!(generated_operation_id()));
     }
     let object = parameters
         .as_object()
@@ -1279,9 +1282,6 @@ pub fn validate_call(
                         FieldRule::OneOf("an array of 1 to 32 change objects"),
                     )
                 })?;
-            // Line numbers and exact text are only meaningful for the bytes the caller read, so
-            // any `lines` or `old` entry makes the call name the observation it came from.
-            let mut needs_source = false;
             for entry in changes {
                 let entry = entry.as_object().ok_or_else(|| {
                     invalid_field("changes", FieldRule::OneOf("an array of change objects"))
@@ -1315,7 +1315,6 @@ pub fn validate_call(
                             FieldRule::OneOf("entry \"lines\" like 12-20"),
                         ));
                     }
-                    needs_source = true;
                     // The content may be empty: empty replaces the range with nothing, which
                     // deletes those lines.
                     if !entry.get("content").is_some_and(Value::is_string) {
@@ -1375,7 +1374,6 @@ pub fn validate_call(
                     }
                 } else {
                     entry_string(entry, "old")?;
-                    needs_source = true;
                     if !entry
                         .get("new")
                         .is_some_and(|value| value.as_str().is_some())
@@ -1401,21 +1399,9 @@ pub fn validate_call(
                     }
                 }
             }
-            if needs_source {
-                // Line numbers and exact text name the read they came from; the refusal teaches
-                // the re-read the way the single line-range form's does.
-                if !object.contains_key("source_ref") {
-                    let rule = if changes.iter().any(|entry| entry.get("old").is_some()) {
-                        FieldRule::OldTextSourceRef
-                    } else {
-                        FieldRule::RangeEditSourceRef
-                    };
-                    return Err(invalid_field("source_ref", rule));
-                }
-                required_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?;
-            } else {
-                optional_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?;
-            }
+            // Without `source_ref` every address resolves against the bytes current at
+            // processing time.
+            optional_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?;
         }
         AssistanceTool::Edit if object.contains_key("symbol") || object.contains_key("lines") => {
             required_string(object, "operation_id", 128)?;
@@ -1457,12 +1443,6 @@ pub fn validate_call(
                 if parse_line_range(required_string(object, "lines", 32)?).is_none() {
                     return Err(invalid_field("lines", FieldRule::LineRange));
                 }
-                // Line numbers are only meaningful for the exact content the caller read, so the
-                // range form always names the observation it came from.
-                if !object.contains_key("source_ref") {
-                    return Err(invalid_field("source_ref", FieldRule::RangeEditSourceRef));
-                }
-                required_string(object, "source_ref", MAX_DETAIL_REF_BYTES)?;
             }
             match op {
                 "replace" | "insert" => {
@@ -5131,26 +5111,6 @@ fn t21b_refusals() -> Vec<(ParameterError, AssistanceTool, String)> {
         ),
         (
             validate_call(
-                AssistanceTool::Edit,
-                json!({"operation_id":"o","path":"a.rs","lines":"1-2","content":"x"}),
-            )
-            .unwrap_err(),
-            AssistanceTool::Edit,
-            "invalid bounded parameters: \"source_ref\" is required for a line-range edit; \
-             re-read the lines (ide.read) and retry with the new source_ref"
-                .to_string(),
-        ),
-        (
-            validate_call(
-                AssistanceTool::Edit,
-                json!({"operation_id":"o","path":"a.rs","changes":[{"old":"x","new":"y"}]}),
-            )
-            .unwrap_err(),
-            AssistanceTool::Edit,
-            "invalid bounded parameters: \"source_ref\" is required for an old-text change; re-read this file with ide.read and retry with the new source_ref".to_string(),
-        ),
-        (
-            validate_call(
                 AssistanceTool::Read,
                 json!({"symbol":"a.rs#run","path":"a.rs","lines":"1-2"}),
             )
@@ -5301,15 +5261,9 @@ fn edit_changes_shape_matrix() {
         )
         .is_ok()
     );
-    // A lines entry without source_ref is refused on the source_ref rule.
-    assert_eq!(
-        batch(false, json!([{"lines":"3-4","content":"x"}])).unwrap_err(),
-        invalid_field("source_ref", FieldRule::RangeEditSourceRef)
-    );
-    assert_eq!(
-        batch(false, json!([{"old":"a","new":"b"}])).unwrap_err(),
-        invalid_field("source_ref", FieldRule::OldTextSourceRef)
-    );
+    // Lines and old entries need no source_ref: the current bytes are the base.
+    assert!(batch(false, json!([{"lines":"3-4","content":"x"}])).is_ok());
+    assert!(batch(false, json!([{"old":"a","new":"b"}])).is_ok());
     // No address, two addresses, a bad op, a bad where, a missing payload.
     assert!(batch(true, json!([{"content":"x"}])).is_err());
     assert!(batch(true, json!([{"lines":"1-2","old":"a","new":"b"}])).is_err());
@@ -5434,14 +5388,13 @@ fn full_file_edit_without_source_ref_is_a_creation_request() {
         )
         .is_err()
     );
-    assert_eq!(
-        ParameterError::InvalidField {
-            field: "source_ref",
-            rule: FieldRule::ReplaceSourceRef,
-        }
-        .message(AssistanceTool::Edit),
-        "invalid bounded parameters: \"source_ref\" is required to replace an existing file: \
-         read it first (ide.read)"
+    // A whole-file replacement needs no source_ref either, and an edit without operation_id
+    // gets a distinct generated one.
+    let first = validate_call(AssistanceTool::Edit, json!({"path":"a.rs","content":"x"})).unwrap();
+    let second = validate_call(AssistanceTool::Edit, json!({"path":"a.rs","content":"x"})).unwrap();
+    assert_ne!(
+        first.parameters()["operation_id"],
+        second.parameters()["operation_id"]
     );
 }
 

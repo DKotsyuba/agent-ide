@@ -3272,26 +3272,19 @@ impl Worker<'_> {
         let (operation_id, path, content) =
             (text("operation_id")?, text("path")?, text("content")?);
         let file = std::path::PathBuf::from(&path);
-        let (observed, _) = self.observe(&binding, file.clone()).await?;
-        if observed.bytes().is_some() {
-            let authority = self.authority(&binding).await.ok();
-            return Ok((
-                PeerReply::InvalidParameters {
-                    message: crate::assistance::facade::ParameterError::InvalidField {
-                        field: "source_ref",
-                        rule: crate::assistance::facade::FieldRule::ReplaceSourceRef,
-                    }
-                    .message(AssistanceTool::Edit),
-                },
-                authority,
-                None,
-            ));
-        }
+        let (observed, file_bytes) = self.observe(&binding, file.clone()).await?;
+        // An existing file is replaced against its current bytes (no file-version reference is
+        // needed); the pre-write gate then compares against that text, not an empty base.
+        let current = if observed.bytes().is_some() {
+            observed_text(&observed, &file_bytes)?.to_owned()
+        } else {
+            String::new()
+        };
         let candidate = self.format_candidate(&observed, &file, content).await;
         // The same pre-write structural gate as every edit: new content that does not parse is
         // not written (an empty base can never have carried a pre-existing error).
         let gated = self
-            .gate_candidate(job, &observed, &file, "", &candidate)
+            .gate_candidate(job, &observed, &file, &current, &candidate)
             .await;
         if let Err((line, message)) = gated {
             job.failure_detail = Some(format!(

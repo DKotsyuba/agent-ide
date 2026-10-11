@@ -552,11 +552,11 @@ const FILE_SHAPE: &str = "an array of 1 to 16 entries, each with \"path\" and ex
 
 /// Validates one `ide.edit {operation_id, source_ref?, files}` request object.
 ///
-/// Only `operation_id` (required), a batch default `source_ref` and `files` may appear. `files`
+/// Only `operation_id` (the facade fills a missing one in), a batch default `source_ref` and `files` may appear. `files`
 /// holds 1 to [`MAX_EDIT_FILES`] objects with unique paths, each exactly one of `changes`
 /// (validated exactly as the one-file `changes` form with the entry's or the batch's
 /// `source_ref`), `content` with `create: true` (validated as the creation form) or `content`
-/// alone (a whole-content replacement, which needs a `source_ref`). Across all files at most
+/// alone (a whole-content replacement of the file's current bytes; `source_ref` is optional). Across all files at most
 /// [`MAX_EDIT_CHANGES_TOTAL`] changes and [`MAX_EDIT_TEXT_BYTES`] of `content` and `new` text are
 /// accepted. The one-file rules run through the facade's own validation of the equivalent
 /// one-file request, so both forms refuse the same entries the same way; nothing is observed.
@@ -659,11 +659,8 @@ pub(crate) fn validate_edit_files(object: &Map<String, Value>) -> Result<(), Par
                 text_bytes += text.len();
                 single["content"] = content.clone();
                 match (create, reference) {
-                    (true, _) => {}
                     (false, Some(reference)) => single["source_ref"] = json!(reference),
-                    (false, None) => {
-                        return Err(invalid_field("source_ref", FieldRule::ReplaceSourceRef));
-                    }
+                    _ => {}
                 }
             }
             _ => return Err(shape()),
@@ -1601,14 +1598,11 @@ mod tests {
     #[test]
     fn edit_files_refuse_bad_shapes_and_mixes() {
         for bad in [
-            json!({"files":[{"path":"a.md","content":"x","create":true}]}),
             json!({"operation_id":"op","files":[]}),
             json!({"operation_id":"op","path":"a.md","files":[{"path":"a.md","create":true,"content":"x"}]}),
             json!({"operation_id":"op","files":[{"path":"a.md"}]}),
             json!({"operation_id":"op","files":[{"path":"a.md","content":"x","changes":[{"lines":"1-1","content":""}]}]}),
             json!({"operation_id":"op","files":[{"path":"a.md","create":true,"changes":[{"symbol":"a.md#x","op":"delete"}]}]}),
-            json!({"operation_id":"op","files":[{"path":"a.md","content":"replace without a base"}]}),
-            json!({"operation_id":"op","files":[{"path":"a.md","changes":[{"lines":"1-1","content":""}]}]}),
             json!({"operation_id":"op","files":[{"path":"../a.md","create":true,"content":"x"}]}),
             json!({"operation_id":"op","files":[{"path":"a.md","create":true,"content":"x"},{"path":"a.md","create":true,"content":"y"}]}),
             json!({"operation_id":"op","files":[{"path":"a.md","create":"yes","content":"x"}]}),
