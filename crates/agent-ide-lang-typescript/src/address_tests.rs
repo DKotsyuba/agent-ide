@@ -36,8 +36,7 @@ fn address_totality_typescript_repository() {
 #[test]
 fn address_regions_typescript() {
     let source = "\"use strict\";\n// c\nimport { a } from \"a\";\nimport \"side\";\n\nexport const LIMIT = 4;\n\nmodule.exports = {\n  x: 1,\n};\n\n/** Run. */\nexport function run() {\n  return 1;\n}\n";
-    // The source outline starts `run` at its declaration, so the JSDoc line is trivia here; a
-    // server outline covers it (addresses are equal, only that symbol's `:N` base differs).
+    // The JSDoc block belongs to `run`, as it does in a server outline.
     assert_eq!(
         rows(source),
         [
@@ -47,8 +46,8 @@ fn address_regions_typescript() {
             "6-6 f.ts#LIMIT",
             "7-7 f.ts#@after/LIMIT",
             "8-10 f.ts#@code/module.exports",
-            "11-12 f.ts#@after/@code%2Fmodule.exports",
-            "13-15 f.ts#run",
+            "11-11 f.ts#@after/@code%2Fmodule.exports",
+            "12-15 f.ts#run",
         ]
     );
 }

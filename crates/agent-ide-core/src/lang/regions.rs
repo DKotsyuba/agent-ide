@@ -285,6 +285,36 @@ fn depth_delta(line: &str, rules: &RegionRules) -> i32 {
     depth
 }
 
+/// The line without a trailing comment (`use a; // note`, `@import "x"; /* c */`), so a statement
+/// that ends in `;` is recognised whatever follows it. Quotes are skipped like in
+/// [`depth_delta`].
+fn code_part<'a>(line: &'a str, rules: &RegionRules) -> &'a str {
+    let mut quote: Option<char> = None;
+    let mut chars = line.char_indices();
+    while let Some((at, c)) = chars.next() {
+        if let Some(q) = quote {
+            if c == '\\' {
+                chars.next();
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        let rest = &line[at..];
+        if rules.line_comments.iter().any(|p| rest.starts_with(p))
+            || rules
+                .block_comment
+                .is_some_and(|(open, _)| rest.starts_with(open))
+        {
+            return &line[..at];
+        }
+        if matches!(c, '"' | '`') || (c == '\'' && rest[1..].contains('\'')) {
+            quote = Some(c);
+        }
+    }
+    line
+}
+
 /// Leading whitespace width of a line.
 fn indent(line: &str) -> usize {
     line.len() - line.trim_start().len()
@@ -321,7 +351,7 @@ fn statement_end(
         if j >= l {
             return l;
         }
-        let t = lines[j].trim_end();
+        let t = code_part(lines[j], rules).trim_end();
         if depth <= 0 {
             if import {
                 let open_semicolon = rules.semicolon_imports && !t.ends_with(';');
@@ -424,6 +454,20 @@ mod tests {
                 (Imports, 4, 8, String::new()),
                 (After, 9, 9, String::new()),
                 (Code, 10, 12, "thread_local!".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_import_ends_at_a_semicolon_before_a_trailing_comment() {
+        let src = "use a; // note\nuse b; /* c */\n\nfn_call();\n";
+        use RawKind::*;
+        assert_eq!(
+            kinds(src, &RUST),
+            vec![
+                (Imports, 1, 2, String::new()),
+                (After, 3, 3, String::new()),
+                (Code, 4, 4, "fn_call".to_owned()),
             ]
         );
     }

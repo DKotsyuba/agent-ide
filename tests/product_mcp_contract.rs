@@ -9914,6 +9914,263 @@ async fn configured_product_outline_kinds_filter_keeps_containers_and_states_the
     daemon.wait().await.unwrap();
 }
 
+/// A source whose every line has an address: header (1-2), imports (3), `value` (5-7), `caller`
+/// (8-10), `Service` (12) and its impl with `work` (14) and `idle` (15). The address tests below
+/// share it (symbol-address-v1).
+const ADDRESS_SOURCE: &str = "//! Crate docs.\n\nuse std::fmt;\n\npub fn value() -> i32 {\n    7\n}\npub fn caller() -> i32 {\n    value()\n}\n\npub struct Service;\nimpl Service {\n    pub fn work(&self) -> bool { true }\n    pub fn idle(&self) {}\n}\n";
+
+/// The outline lists regions with their addresses, `kinds: region` lists only them, `path:line`
+/// (relative and absolute) resolves to the enclosing symbol, a line in a region names the region,
+/// and an unknown member answers `unknown_symbol` with `near:` addresses (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_address_outline_path_line_and_near() {
+    let fixture = symbol_test_fixture();
+    std::fs::write(fixture.root.join("src/lib.rs"), ADDRESS_SOURCE).unwrap();
+    std::fs::write(fixture.root.join("tests/path_tests.rs"), "").unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "tests/path_tests.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "address fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "address-outline").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"address-outline-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+
+    let reply = actor
+        .call(&fixture, "ide.outline", json!({"path":"src/lib.rs"}))
+        .await;
+    let reply = actor.settle(&fixture, reply).await;
+    let text = reply["text"].as_str().unwrap_or_default();
+    assert!(text.contains("\n1–2  src/lib.rs#@header\n"), "{text}");
+    assert!(text.contains("\n3  src/lib.rs#@imports\n"), "{text}");
+    assert!(
+        text.contains("  src/lib.rs#value  pub fn value() -> i32"),
+        "{text}"
+    );
+    assert!(text.contains("  src/lib.rs#Service/work  "), "{text}");
+
+    let reply = actor
+        .call(
+            &fixture,
+            "ide.outline",
+            json!({"path":"src/lib.rs","kinds":"region"}),
+        )
+        .await;
+    let reply = actor.settle(&fixture, reply).await;
+    let text = reply["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("src/lib.rs#@header") && text.contains("src/lib.rs#@imports"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("pub fn value") && text.contains("by kinds region"),
+        "kinds: region lists only regions and states the cut: {text}"
+    );
+
+    let absolute = format!("{}:6", fixture.root.join("src/lib.rs").display());
+    for location in ["src/lib.rs:9", absolute.as_str()] {
+        let reply = actor
+            .call(
+                &fixture,
+                "ide.symbol",
+                json!({"symbol":location,"usages":false,"callers":0}),
+            )
+            .await;
+        let reply = actor.settle(&fixture, reply).await;
+        let text = reply["text"].as_str().unwrap_or_default();
+        let expected = if location == "src/lib.rs:9" {
+            "symbol: caller — fn, src/lib.rs#caller"
+        } else {
+            "symbol: value — fn, src/lib.rs#value"
+        };
+        assert!(text.contains(expected), "{location}: {reply}");
+    }
+    let region = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"src/lib.rs:3","usages":false,"callers":0}),
+        )
+        .await;
+    let region = actor.settle(&fixture, region).await;
+    assert_eq!(region["code"], "unknown_symbol", "{region}");
+    assert!(
+        region.to_string().contains("src/lib.rs#@imports"),
+        "{region}"
+    );
+
+    let near = actor
+        .call(
+            &fixture,
+            "ide.symbol",
+            json!({"symbol":"src/lib.rs#Service/wrok"}),
+        )
+        .await;
+    let near = actor.settle(&fixture, near).await;
+    assert_eq!(near["code"], "unknown_symbol", "{near}");
+    let near_text = near.to_string();
+    assert!(
+        near_text.contains("near: ") && near_text.contains("src/lib.rs#Service/work"),
+        "an unknown member lists the addresses near it: {near}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A changed hunk is preceded by `@ <address> (L<line>)` of its first changed line, and a deleted
+/// file by `@ <path> (deleted)` (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_diff_hunks_carry_addresses() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(fixture.root.join("src/lib.rs"), ADDRESS_SOURCE).unwrap();
+    std::fs::write(fixture.root.join("src/gone.rs"), "pub fn gone() {}\n").unwrap();
+    fixture.git(&["add", "--", "src/lib.rs", "src/gone.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "diff address fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "diff-address").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"diff-address-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        ADDRESS_SOURCE.replace("    7\n", "    8\n"),
+    )
+    .unwrap();
+    std::fs::remove_file(fixture.root.join("src/gone.rs")).unwrap();
+    let diff = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let diff = actor.settle(&fixture, diff).await;
+    assert_eq!(diff["kind"], "diff", "{diff}");
+    let text = diff["text"].as_str().unwrap();
+    assert!(text.contains("\n@ src/lib.rs#value:2 (L6)\n"), "{text}");
+    assert!(text.contains("\n@ src/gone.rs (deleted)\n"), "{text}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Project problems rows carry the position address of their line (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_problems_rows_carry_addresses() {
+    let fixture = ProductFixture::new(json!([]));
+    let home = enable_fake_rust_checks(&fixture, &fixture.base);
+    let cargo = home.join(".rustup/toolchains/fake/bin/cargo");
+    let script = r#"#!/bin/sh
+for entry in "1:5" "2:9" "3:14"; do
+  n=${entry%%:*}
+  line=${entry##*:}
+  printf '{"reason":"compiler-message","package_id":"fixture","message":{"level":"error","message":"fake %s","code":null,"spans":[{"file_name":"src/lib.rs","is_primary":true,"line_start":%s,"column_start":1}]}}\n' "$n" "$line"
+done
+printf '{"reason":"compiler-artifact","package_id":"fixture"}\n'
+printf '{"reason":"build-finished","success":true}\n'
+"#;
+    std::fs::write(&cargo, script).unwrap();
+    std::fs::write(fixture.root.join("src/lib.rs"), ADDRESS_SOURCE).unwrap();
+    fixture.git(&["add", "--", "src/lib.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "problem address fixture"]);
+    let mut daemon = fixture.daemon_with_home(Some(&home)).await;
+    let mut actor = ProductActor::new(&fixture, "problem-address").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"problem-address-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let text = loop {
+        let problems = actor
+            .call(&fixture, "ide.context", json!({"kind":"problems"}))
+            .await;
+        let problems = actor.settle(&fixture, problems).await;
+        let text = problems["text"].as_str().unwrap_or_default().to_owned();
+        if text.contains("rust: ready; errors: 3") {
+            break text;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "initial check did not settle: {problems}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    for row in [
+        "src/lib.rs:5:1 src/lib.rs#value:1 (L5) error fake 1",
+        "src/lib.rs:9:1 src/lib.rs#caller:2 (L9) error fake 2",
+        "src/lib.rs:14:1 src/lib.rs#Service/work:1 (L14) error fake 3",
+    ] {
+        assert!(text.contains(row), "{row}\n{text}");
+    }
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// A failing test's assertion site prints as the test's position address with the absolute line
+/// (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_test_failures_carry_addresses() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(
+        fixture.root.join("src/lib.rs"),
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn fails() { assert_eq!(2 + 2, 5); }\n}\n",
+    )
+    .unwrap();
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "test-address").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"test-address-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    actor
+        .call(&fixture, "ide.test", json!({"path":"src/lib.rs"}))
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let completed = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fixture tests did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let status = actor.call(&fixture, "ide.test", json!({"status":1})).await;
+        if status["text"]
+            .as_str()
+            .unwrap()
+            .contains("0 passed, 1 failed")
+        {
+            break status;
+        }
+    };
+    let text = completed["text"].as_str().unwrap();
+    assert!(text.contains("FAIL tests::fails"), "{text}");
+    assert!(
+        text.contains("src/lib.rs#tests/fails:2 (L4)"),
+        "the assertion site is the test's position address with its absolute line: {text}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Exercises the owner's outline → cross-file batch read → single-file batch edit flow without an intervening re-read.
 #[tokio::test]
 async fn configured_product_batch_read_then_edit_reports_landings_and_bytes() {
@@ -11969,15 +12226,14 @@ async fn product_style_sheets_answer_symbol_tools_without_a_server() {
         .call(&fixture, "ide.outline", json!({"path":"styles.css"}))
         .await;
     let outline = actor.settle(&fixture, outline).await;
-    let outline_text = outline["text"].as_str().unwrap();
-    assert!(
-        outline_text.starts_with("styles.css  (8 lines, css)\n")
-            && outline_text.contains("  styles.css#.btn  .btn\n")
-            && outline_text
-                .contains("  styles.css#@media (min-width: 40em)  @media (min-width: 40em)\n")
-            && outline_text
-                .contains("  styles.css#@media (min-width: 40em)/.card .btn  .card .btn\n")
-            && outline_text.contains("(3 symbols"),
+    assert_eq!(
+        outline["text"],
+        "styles.css  (8 lines, css)\n\
+         1  styles.css#@header\n\
+         2–4  styles.css#.btn  .btn\n\
+         6–8  styles.css#@media (min-width: 40em)  @media (min-width: 40em)\n\
+         7  styles.css#@media (min-width: 40em)/.card .btn  .card .btn\n\
+         \x20 (3 symbols, 1 regions)\n",
         "{outline}"
     );
 
@@ -12134,11 +12390,11 @@ async fn configured_product_links_css_html_and_python_names() {
          \x20 (~ = heuristic match, not proven)\n\
          unavailable for: python\n"
     );
-    let candidates = symbol(&mut actor, "btn").await;
-    assert!(
-        candidates.starts_with("2 candidates for btn:\n  app.py#btn  ")
-            && candidates.ends_with("\n  .btn  (class name: 3 rules, 4 usages)\n"),
-        "a bare name lists every candidate with its address, never an ambiguity error: {candidates}"
+    assert_eq!(
+        symbol(&mut actor, "btn").await,
+        "2 candidates for btn:\n\
+         \x20 app.py#btn  fn  def btn()  (lines 1–2)\n\
+         \x20 .btn  (class name: 3 rules, 4 usages)\n"
     );
     let button = symbol(&mut actor, "src/Button.tsx#Button").await;
     assert!(
