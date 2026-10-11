@@ -604,6 +604,23 @@ impl Worker<'_> {
                 .map(|(key, _)| display(key).chars().count())
                 .max()
                 .unwrap_or(0);
+            // Each target prints its symbol address with the absolute line when its file resolves.
+            let wanted: Vec<(PathBuf, u32)> = gathered
+                .linked
+                .iter()
+                .flat_map(|(_, defines)| defines.sites.iter())
+                .map(|shown| (shown.site.file.clone(), shown.site.fact.line))
+                .collect();
+            let located = Box::pin(self.position_addresses(job, &wanted)).await;
+            let mut target_places = render::LocationAddresses::new();
+            for (index, (file, line)) in wanted.iter().enumerate() {
+                if let Some(Some(address)) = located.rows.get(index) {
+                    target_places.insert(
+                        (file.display().to_string(), *line),
+                        super::addressing::tagged(super::addressing::symbol_part(address), *line),
+                    );
+                }
+            }
             for (key, defines) in &gathered.linked {
                 let target = if defines.sites.is_empty() {
                     format!("no indexed {}", key.namespace.define_word())
@@ -612,7 +629,14 @@ impl Worker<'_> {
                         .sites
                         .iter()
                         .map(|shown| {
-                            let mut row = format!("{} {}", location(shown), selector(&shown.text));
+                            let site =
+                                (shown.site.file.display().to_string(), shown.site.fact.line);
+                            let mut row = match target_places.get(&site) {
+                                Some(place) => place.clone(),
+                                None => {
+                                    format!("{} {}", location(shown), selector(&shown.text))
+                                }
+                            };
                             if let Some(reason) = inferred(key, shown) {
                                 row.push_str(&format!(" (~{reason})"));
                             }
