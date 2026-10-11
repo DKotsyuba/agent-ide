@@ -852,7 +852,7 @@ impl Worker<'_> {
                             }
                             Located::Many(candidates) => candidates,
                         };
-                        candidates.extend(indexed.iter().map(links::candidate));
+                        candidates.extend(self.candidate_rows(job, &binding, &indexed).await);
                         return self.ambiguous(job, &binding, &requested, candidates).await;
                     }
                     Err(FailureCode::UnknownSymbol | FailureCode::ProviderUnavailable)
@@ -1525,9 +1525,16 @@ impl Worker<'_> {
                 break;
             }
         }
-        Box::pin(self.address_graph_nodes(job, &mut graph)).await;
+        let omitted = Box::pin(self.address_graph_nodes(job, &mut graph)).await;
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
-        let text = render::call_graph_text(&graph, &direction, depth);
+        let mut text = render::call_graph_text(&graph, &direction, depth);
+        if let Some(note) = omitted {
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&note);
+            text.push('\n');
+        }
         let (reply, page) =
             ContextPageState::new(text, 0, false, ResultKind::Graph).next(&job.reference)?;
         self.shared.set_context_page(&job.reference, page);

@@ -411,7 +411,7 @@ pub enum RegionKind {
     Header,
     /// `@imports`: a run of import statements.
     Imports,
-    /// `@main`: Python `if __name__ == "__main__":` block.
+    /// `@main`: the entry-point guard block of a language that has one.
     Main,
     /// `@code/<leader>`: a top-level statement block that is neither symbol nor import.
     Code,

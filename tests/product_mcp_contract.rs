@@ -10075,6 +10075,116 @@ async fn configured_product_diff_hunks_carry_addresses() {
     daemon.wait().await.unwrap();
 }
 
+/// Pages of a long diff reached through `ide.inspect` carry the same `@ address (L..)` lines as
+/// page 1 (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_later_diff_pages_carry_addresses() {
+    let fixture = ProductFixture::new(json!([]));
+    let functions = |value: i32| -> String {
+        (0..40)
+            .map(|n| {
+                format!(
+                    "pub fn f{n}() -> i32 {{\n    {value}\n}}\n{}",
+                    "\n".repeat(8)
+                )
+            })
+            .collect()
+    };
+    std::fs::write(fixture.root.join("src/lib.rs"), functions(1)).unwrap();
+    fixture.git(&["add", "--", "src/lib.rs"]);
+    fixture.git(&["commit", "--quiet", "-m", "many functions"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "diff-pages-address").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"diff-pages-address-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    std::fs::write(fixture.root.join("src/lib.rs"), functions(2)).unwrap();
+    let first = actor
+        .call(&fixture, "ide.diff", json!({"mode":"head"}))
+        .await;
+    let first = actor.settle(&fixture, first).await;
+    assert_eq!(first["continuation"], true, "{first}");
+    assert!(
+        first["text"]
+            .as_str()
+            .unwrap()
+            .contains("\n@ src/lib.rs#f0:2 (L2)\n"),
+        "{first}"
+    );
+    let reference = first["detail_ref"].as_str().unwrap().to_owned();
+    let mut later = String::new();
+    for _ in 0..6 {
+        let page = actor
+            .call(&fixture, "ide.inspect", json!({"detail_ref":&reference}))
+            .await;
+        let page = actor.settle(&fixture, page).await;
+        later.push_str(page["text"].as_str().unwrap_or_default());
+        if page["continuation"] != true {
+            break;
+        }
+    }
+    assert!(later.contains("\n@ src/lib.rs#f39:2 (L"), "{later}");
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
+/// Name-index usage rows, name-card definitions and ambiguity candidates of a style name carry
+/// the addresses of their lines (symbol-address-v1 §8).
+#[tokio::test]
+async fn configured_product_name_cards_and_index_usages_carry_addresses() {
+    let fixture = ProductFixture::new(json!([]));
+    std::fs::write(
+        fixture.root.join("styles.css"),
+        ".btn {\n  color: red;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("index.html"),
+        "<main id=\"app\">\n<button class=\"btn\">Save</button>\n</main>\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.root.join("app.py"), "def btn():\n    return 1\n").unwrap();
+    fixture.git(&["add", "--", "styles.css", "index.html", "app.py"]);
+    fixture.git(&["commit", "--quiet", "-m", "name card fixture"]);
+    let mut daemon = fixture.daemon().await;
+    let mut actor = ProductActor::new(&fixture, "name-card-address").await;
+    let started = actor
+        .call(
+            &fixture,
+            "ide.start",
+            json!({"activation_id":"name-card-address-start"}),
+        )
+        .await;
+    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
+    let card = actor
+        .call(&fixture, "ide.symbol", json!({"symbol":".btn"}))
+        .await;
+    let card = actor.settle(&fixture, card).await;
+    let text = card["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("styles.css#.btn (L1)  [css] .btn"),
+        "the definition row carries its address: {text}"
+    );
+    assert!(
+        text.contains("index.html#")
+            && text
+                .lines()
+                .any(|line| line.contains("(L2)") && line.contains("<button class=\"btn\">")),
+        "the index usage row carries its address: {text}"
+    );
+    actor.call(&fixture, "ide.stop", json!({})).await;
+    actor.mcp.close().await;
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+}
+
 /// Project problems rows carry the position address of their line (symbol-address-v1 §8).
 #[tokio::test]
 async fn configured_product_problems_rows_carry_addresses() {
@@ -12410,40 +12520,40 @@ async fn configured_product_links_css_html_and_python_names() {
         symbol(&mut actor, "styles.css#.btn").await,
         "symbol: .btn — symbol, styles.css#.btn (lines 2–4)\nsignature: .btn\n\
          definition styles.css#.btn  (lines 2–4)\n\
-         defines: class name btn — also styles.css:6 .layout .btn, theme.scss:2 .btn\n\
+         defines: class name btn — also styles.css#.layout .btn (L6), theme.scss#.btn (L2)\n\
          usages: 4 indexed in 3 files (src 4, tests 0)\n\
-         \x20 index.html:5      [html] <button class=\"btn btn-primary\">Save</button>\n\
-         \x20 index.html:6      [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
-         \x20 src/Button.tsx:2  [typescript] return <button className=\"btn\">Save</button>;\n\
-         \x20 src/Menu.tsx:3    [typescript ~clsx call] return <nav className={clsx(\"btn\", { \"btn-lg\": props.big })}>Menu</nav>;\n\
+         \x20 index.html#main#main:2 (L5)   [html] <button class=\"btn btn-primary\">Save</button>\n\
+         \x20 index.html#main#main:3 (L6)   [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
+         \x20 src/Button.tsx#Button:2 (L2)  [typescript] return <button className=\"btn\">Save</button>;\n\
+         \x20 src/Menu.tsx#Menu:2 (L3)      [typescript ~clsx call] return <nav className={clsx(\"btn\", { \"btn-lg\": props.big })}>Menu</nav>;\n\
          \x20 (~ = heuristic match, not proven)\n\
          links: 1 style variable used here\n\
-         \x20 --brand  → theme.scss:1 :root\n\
+         \x20 --brand  → theme.scss#:root (L1)\n\
          unavailable for: python\n\
          callers: unavailable (css has no call hierarchy)\n"
     );
-    assert_eq!(
-        symbol(&mut actor, "##main").await,
-        "symbol: ##main — element id, 1 element, 2 usages in 2 files (css, html)\n\
-         definitions:\n\
-         \x20 index.html:4  [html] <main id=\"main\" class=\"layout\">  (index.html#main#main, lines 4–8)\n\
-         usages: 2 indexed in 2 files (src 2, tests 0)\n\
-         \x20 index.html:6  [html] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
-         \x20 styles.css:7  [css] #main { display: block; }\n\
-         unavailable for: python\n"
+    let main_card = symbol(&mut actor, "##main").await;
+    assert!(
+        main_card.starts_with(
+            "symbol: ##main — element id, 1 element, 2 usages in 2 files (css, html)\ndefinitions:\n"
+        ) && main_card.contains(
+            "  index.html#main#main (L4)  [html] <main id=\"main\" class=\"layout\">  (lines 4–8)\n"
+        ) && main_card.contains("index.html#main#main:3 (L6)")
+            && main_card.contains("(L7)  [css] #main { display: block; }\n"),
+        "{main_card}"
     );
     assert_eq!(
         symbol(&mut actor, ".btn").await,
         "symbol: .btn — class name, 3 rules, 4 usages in 3 files (typescript, css, html)\n\
          definitions:\n\
-         \x20 styles.css:2  [css] .btn  (styles.css#.btn, lines 2–4)\n\
-         \x20 styles.css:6  [css] .layout .btn  (styles.css#.layout .btn, lines 6)\n\
-         \x20 theme.scss:2  [css] .btn  (theme.scss#.btn, lines 2–4)\n\
+         \x20 styles.css#.btn (L2)         [css] .btn  (lines 2–4)\n\
+         \x20 styles.css#.layout .btn (L6)  [css] .layout .btn  (lines 6)\n\
+         \x20 theme.scss#.btn (L2)         [css] .btn  (lines 2–4)\n\
          usages: 4 indexed in 3 files (src 4, tests 0)\n\
-         \x20 index.html:5      [html] <button class=\"btn btn-primary\">Save</button>\n\
-         \x20 index.html:6      [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
-         \x20 src/Button.tsx:2  [typescript] return <button className=\"btn\">Save</button>;\n\
-         \x20 src/Menu.tsx:3    [typescript ~clsx call] return <nav className={clsx(\"btn\", { \"btn-lg\": props.big })}>Menu</nav>;\n\
+         \x20 index.html#main#main:2 (L5)   [html] <button class=\"btn btn-primary\">Save</button>\n\
+         \x20 index.html#main#main:3 (L6)   [html ~template] <a href=\"#main\" class=\"btn {{ extra }}\">Top</a>\n\
+         \x20 src/Button.tsx#Button:2 (L2)  [typescript] return <button className=\"btn\">Save</button>;\n\
+         \x20 src/Menu.tsx#Menu:2 (L3)      [typescript ~clsx call] return <nav className={clsx(\"btn\", { \"btn-lg\": props.big })}>Menu</nav>;\n\
          \x20 (~ = heuristic match, not proven)\n\
          unavailable for: python\n"
     );
@@ -12451,11 +12561,11 @@ async fn configured_product_links_css_html_and_python_names() {
         symbol(&mut actor, "btn").await,
         "2 candidates for btn:\n\
          \x20 app.py#btn  fn  def btn()  (lines 1–2)\n\
-         \x20 .btn  (class name: 3 rules, 4 usages)\n"
+         \x20 .btn  (class name: 3 rules, 4 usages)  styles.css#.btn (L2), styles.css#.layout .btn (L6)\n"
     );
     let button = symbol(&mut actor, "src/Button.tsx#Button").await;
     assert!(
-        button.contains("links: 1 class name used here\n  .btn  → styles.css:2 .btn, styles.css:6 .layout .btn (+1 more)\n"),
+        button.contains("links: 1 class name used here\n  .btn  → styles.css#.btn (L2), styles.css#.layout .btn (L6) (+1 more)\n"),
         "{button}"
     );
     let graph = async |actor: &mut ProductActor, requested: &str, direction: &str| {
@@ -12504,7 +12614,7 @@ async fn configured_product_links_css_html_and_python_names() {
     assert!(
         after.contains(
             "usages: 3 indexed in 3 files (src 3, tests 0)\n\
-             \x20 index.html:5      [html ~template] <a href=\"#main\""
+             \x20 index.html#main#main:2 (L5)   [html ~template] <a href=\"#main\""
         ) && !after.contains("<button class="),
         "{after}"
     );
