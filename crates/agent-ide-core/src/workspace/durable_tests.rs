@@ -206,10 +206,12 @@ struct Fixture(PathBuf);
 impl Fixture {
     /// Creates isolated native directories and one registered source file.
     fn new() -> Self {
-        let path = PathBuf::from("/private/tmp").join(format!(
-            "durable-native-{}",
-            blake3::Hash::from(random_nonce().unwrap()).to_hex()
-        ));
+        let path = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "durable-native-{}",
+                blake3::Hash::from(random_nonce().unwrap()).to_hex()
+            ));
         fs::create_dir_all(path.join("tree/.git")).unwrap();
         fs::write(path.join("tree/source"), b"authorized bytes").unwrap();
         Self(path)

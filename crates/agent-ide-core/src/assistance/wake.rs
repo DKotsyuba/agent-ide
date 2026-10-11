@@ -398,10 +398,9 @@ mod tests {
         /// Builds the registry for session `session` with `kind`, `entrypoint` and `state`, and
         /// returns the inbox with the socket path [`Self::serve`] listens on.
         fn new(tag: &str, kind: &str, entrypoint: &str, state: &str) -> (Self, PathBuf) {
-            let directory = PathBuf::from(format!(
-                "/private/tmp/m026-wake-{}-{tag}",
-                std::process::id()
-            ));
+            let directory = std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!("m026-wake-{}-{tag}", std::process::id()));
             let _ = std::fs::remove_dir_all(&directory);
             std::fs::create_dir_all(&directory).unwrap();
             let socket = directory.join("inbox.sock");
@@ -496,7 +495,9 @@ mod tests {
     /// an interactive session.
     #[test]
     fn registry_proves_interactive_sessions_only() {
-        let registry = PathBuf::from(format!("/private/tmp/m026-registry-{}", std::process::id()));
+        let registry = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("m026-registry-{}", std::process::id()));
         std::fs::create_dir_all(&registry).unwrap();
         std::fs::write(
             registry.join("100.json"),

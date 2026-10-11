@@ -1453,16 +1453,16 @@ async fn named_hook(
     assert!(output.stdout.is_empty() && output.stderr.is_empty());
 }
 
-/// Creates one fresh owner-only rendezvous test area directly below `/private/tmp`.
-///
-/// Kept short and outside `std::env::temp_dir()`: fixture Unix-socket paths must stay under
-/// `SUN_LEN`, and the area must never be a real production rendezvous root.
+/// Creates one fresh owner-only rendezvous test area below the canonical temporary parent.
+/// Set `TMPDIR` to a short directory so fixture Unix sockets stay below `SUN_LEN`.
 fn rendezvous_area(tag: &str) -> PathBuf {
-    let base = PathBuf::from(format!(
-        "/private/tmp/.airvb-{tag}-{}-{}",
-        std::process::id(),
-        NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed)
-    ));
+    let base = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            ".airvb-{tag}-{}-{}",
+            std::process::id(),
+            NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed)
+        ));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir(&base).unwrap();
     std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -2960,6 +2960,9 @@ impl ProductFixture {
     fn git(&self, args: &[&str]) {
         let output = std::process::Command::new("/usr/bin/git")
             .env_clear()
+            .env("TMPDIR", std::env::temp_dir())
+            .env("TMP", std::env::temp_dir())
+            .env("TEMP", std::env::temp_dir())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(["-C"])
@@ -2979,6 +2982,9 @@ impl ProductFixture {
         let git = |args: &[&str]| {
             let output = std::process::Command::new("/usr/bin/git")
                 .env_clear()
+                .env("TMPDIR", std::env::temp_dir())
+                .env("TMP", std::env::temp_dir())
+                .env("TEMP", std::env::temp_dir())
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .args(["-C"])
@@ -3538,6 +3544,15 @@ impl ProductActor {
     }
 }
 
+/// Independently reproduces the operator-selected Claude parent, preserving its legacy default.
+/// The parent must already exist; fixture code never creates or changes the operator's root.
+fn managed_claude_parent() -> PathBuf {
+    let parent = std::env::var_os("AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT")
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| PathBuf::from("/private/tmp"), PathBuf::from);
+    std::fs::canonicalize(parent).unwrap()
+}
+
 /// Reproduces the public deterministic Claude candidate-cache slot for product-edge assertions.
 ///
 /// The candidate cache is keyed by the canonical candidate path itself (never the rendezvous key),
@@ -3551,8 +3566,7 @@ fn managed_claude_candidate_attachment(project: &Path) -> String {
             .as_os_str()
             .as_bytes(),
     );
-    let path = std::fs::canonicalize("/private/tmp")
-        .unwrap()
+    let path = managed_claude_parent()
         .join(format!("ai-k-{}", &identity.to_hex().as_str()[..16]))
         .join("candidate-attachment");
     std::fs::read_to_string(path).unwrap_or_default()
@@ -3578,9 +3592,7 @@ fn managed_claude_runtime_path(project: &Path) -> PathBuf {
         project
     };
     let hash = blake3::hash(key.as_os_str().as_bytes());
-    std::fs::canonicalize("/private/tmp")
-        .unwrap()
-        .join(format!("ai-r-{}", &hash.to_hex().as_str()[..16]))
+    managed_claude_parent().join(format!("ai-r-{}", &hash.to_hex().as_str()[..16]))
 }
 
 /// Returns the private journal directory a project's hooks and daemon write under the redirected
@@ -5374,7 +5386,7 @@ async fn managed_claude_first_worktree_start_pairs_before_mcp_call() {
     let runtime = managed_claude_runtime_path(&left);
     let _guard = SharedClaudeDaemonGuard(runtime.clone());
     assert!(!runtime.exists());
-    let cache = std::fs::canonicalize("/private/tmp").unwrap().join(format!(
+    let cache = managed_claude_parent().join(format!(
         "ai-k-{}",
         &blake3::hash(left.as_os_str().as_bytes()).to_hex().as_str()[..16]
     ));
@@ -6079,8 +6091,7 @@ async fn a_pre_hook_on_a_dead_generations_attachment_fails_open_until_the_cache_
 
     let live = managed_claude_candidate_attachment(&fixture.root);
     assert_eq!(live.len(), 64, "a published attachment is 64 hex digits");
-    let cache = std::fs::canonicalize("/private/tmp")
-        .unwrap()
+    let cache = managed_claude_parent()
         .join(format!(
             "ai-k-{}",
             &blake3::hash(
@@ -8988,6 +8999,9 @@ async fn configured_product_clean_tree_diff_completes_over_large_metadata_and_ig
     assert_eq!(
         std::process::Command::new("/usr/bin/git")
             .env_clear()
+            .env("TMPDIR", std::env::temp_dir())
+            .env("TMP", std::env::temp_dir())
+            .env("TEMP", std::env::temp_dir())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(["-C"])
@@ -15214,6 +15228,9 @@ async fn configured_product_resolves_a_new_linked_worktree_after_daemon_start() 
     std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
     let output = std::process::Command::new("/usr/bin/git")
         .env_clear()
+        .env("TMPDIR", std::env::temp_dir())
+        .env("TMP", std::env::temp_dir())
+        .env("TEMP", std::env::temp_dir())
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .args(["-C"])
@@ -15266,6 +15283,9 @@ async fn configured_product_same_actor_start_on_another_root_hands_the_activatio
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let output = std::process::Command::new("/usr/bin/git")
             .env_clear()
+            .env("TMPDIR", std::env::temp_dir())
+            .env("TMP", std::env::temp_dir())
+            .env("TEMP", std::env::temp_dir())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(["-C"])
@@ -17315,6 +17335,9 @@ async fn configured_product_isolates_typescript_across_two_divergent_worktree_ac
     let child_git = |args: &[&str]| {
         let output = std::process::Command::new("/usr/bin/git")
             .env_clear()
+            .env("TMPDIR", std::env::temp_dir())
+            .env("TMP", std::env::temp_dir())
+            .env("TEMP", std::env::temp_dir())
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .arg("-C")

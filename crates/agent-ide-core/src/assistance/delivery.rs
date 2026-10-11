@@ -1157,10 +1157,9 @@ mod worker_tests {
     async fn a_started_run_reaches_owner_and_subscriber_once() {
         crate::lang::testing::install();
         let gamma = crate::lang::Language::by_id("gamma").expect("test language");
-        let root = std::path::PathBuf::from(format!(
-            "/private/tmp/m026-outbox-run-{}",
-            std::process::id()
-        ));
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("m026-outbox-run-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let bindings = Arc::new(Mutex::new(HostBindingGuard::default()));
         let owner = bind(&bindings, "owner");
