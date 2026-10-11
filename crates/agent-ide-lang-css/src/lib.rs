@@ -9,6 +9,8 @@
 
 use agent_ide_core::lang::{Language, LanguageDescriptor};
 
+#[cfg(test)]
+mod address_tests;
 pub mod names;
 mod scan;
 pub mod support;

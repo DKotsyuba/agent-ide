@@ -9,7 +9,9 @@
 use std::{fmt, ops::Range, path::PathBuf};
 
 use super::{
-    InsertSite, InsertWhere, LangError, LanguageSupport, LineRange, Outline, SymbolKind, SymbolPath,
+    InsertSite, InsertWhere, LangError, LanguageSupport, LineRange, Outline, Symbol, SymbolKind,
+    SymbolPath,
+    regions::{RawKind, RawRegion, RegionRules, scan_gap},
 };
 
 /// Why address text was rejected by [`Address::parse`].
@@ -295,15 +297,16 @@ fn parse_segment(raw: &str) -> Result<Segment, AddressError> {
     if raw.is_empty() {
         return Err(AddressError::EmptySegment);
     }
-    if let Some((name, k)) = raw.rsplit_once('~') {
-        if let Ok(ordinal) = k.parse::<u32>() {
-            if ordinal >= 2 && !name.is_empty() && k.bytes().all(|b| b.is_ascii_digit()) {
-                return Ok(Segment {
-                    name: decode_name(name),
-                    ordinal,
-                });
-            }
-        }
+    if let Some((name, k)) = raw.rsplit_once('~')
+        && let Ok(ordinal) = k.parse::<u32>()
+        && ordinal >= 2
+        && !name.is_empty()
+        && k.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Ok(Segment {
+            name: decode_name(name),
+            ordinal,
+        });
     }
     Ok(Segment {
         name: decode_name(raw),
@@ -366,9 +369,8 @@ impl fmt::Display for Window {
 impl fmt::Display for Address {
     /// Canonical text `file#a/b~2:3-5` (file-less: `a/b`). Parsing it back yields `self`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.file {
-            Some(file) => write!(f, "{}#", file.display())?,
-            None => {}
+        if let Some(file) = &self.file {
+            write!(f, "{}#", file.display())?;
         }
         for (i, s) in self.segments.iter().enumerate() {
             if i > 0 {
@@ -493,16 +495,263 @@ pub enum ResolveError {
 pub struct AddressMap {
     file: PathBuf,
     units: Vec<Unit>,
-    #[allow(dead_code)] // read by the T-002 builder and `at_line`
     line_count: u32,
+    /// The outline the map was built from, kept for symbol anchors of `insert_site`.
+    outline: Option<Outline>,
+    /// Symbol paths by pre-order outline index.
+    symbol_paths: Vec<SymbolPath>,
+    /// Innermost unit index of each line (`owner[line - 1]`).
+    owner: Vec<usize>,
+    /// Byte offset of the start of each line, plus the source length as the last entry.
+    line_starts: Vec<usize>,
+    /// Canonical segments to unit index.
+    index: std::collections::HashMap<Vec<Segment>, usize>,
+}
+
+/// Disambiguation class of a symbol inside a group of equal raw paths: declarations, impl blocks,
+/// then fields (contract section 4).
+fn rank(kind: SymbolKind) -> u8 {
+    match kind {
+        SymbolKind::Impl => 1,
+        SymbolKind::Field => 2,
+        _ => 0,
+    }
 }
 
 impl AddressMap {
     /// Builds the map: outline symbols plus regions so every line `1..=line_count` has exactly one
     /// innermost unit. Reads the language's region rules from `outline.language`. Never fails.
     pub fn build(outline: &Outline, source: &str) -> AddressMap {
-        let _ = (outline, source);
-        todo!("T-002")
+        let rules = outline.language.support().region_rules();
+        let mut map = Self::build_parts(&outline.file, &outline.symbols, source, rules);
+        map.outline = Some(outline.clone());
+        map
+    }
+
+    /// [`Self::build`] on loose parts: the file, its top-level symbols and explicit region rules.
+    /// `insert_site` on a symbol anchor needs the outline and answers `UnknownSymbol` for a map
+    /// built this way.
+    pub fn build_parts(
+        file: &std::path::Path,
+        symbols: &[Symbol],
+        source: &str,
+        rules: &RegionRules,
+    ) -> AddressMap {
+        // Pre-order flattening with ancestry names and depth.
+        struct Flat<'a> {
+            symbol: &'a Symbol,
+            names: Vec<String>,
+            depth: u8,
+        }
+        fn flatten<'a>(level: &'a [Symbol], names: &[String], depth: u8, out: &mut Vec<Flat<'a>>) {
+            for symbol in level {
+                let mut own = names.to_vec();
+                own.push(symbol.name.clone());
+                out.push(Flat {
+                    symbol,
+                    names: own.clone(),
+                    depth,
+                });
+                flatten(&symbol.children, &own, depth.saturating_add(1), out);
+            }
+        }
+        let mut flat = Vec::new();
+        flatten(symbols, &[], 0, &mut flat);
+        // Ordinals: position inside the group of equal raw paths by (rank, file order).
+        let mut ordinals = vec![1u32; flat.len()];
+        let mut groups: std::collections::HashMap<&[String], Vec<usize>> = Default::default();
+        for (i, f) in flat.iter().enumerate() {
+            groups.entry(f.names.as_slice()).or_default().push(i);
+        }
+        for members in groups.values() {
+            let mut sorted = members.clone();
+            sorted.sort_by_key(|&i| (rank(flat[i].symbol.kind), i));
+            for (k, &i) in sorted.iter().enumerate() {
+                ordinals[i] = k as u32 + 1;
+            }
+        }
+        let file = file.to_path_buf();
+        let seg_of = |i: usize| {
+            let f = &flat[i];
+            let mut segments: Vec<Segment> = f.names[..f.names.len() - 1]
+                .iter()
+                .map(|name| Segment {
+                    name: name.clone(),
+                    ordinal: 1,
+                })
+                .collect();
+            segments.push(Segment {
+                name: f.names[f.names.len() - 1].clone(),
+                ordinal: ordinals[i],
+            });
+            segments
+        };
+        // Top-level items in file order: symbol subtrees and regions.
+        let line_total = super::line_count(source);
+        let lines: Vec<&str> = source.lines().collect();
+        let mut tops: Vec<usize> = (0..flat.len()).filter(|&i| flat[i].depth == 0).collect();
+        tops.sort_by_key(|&i| (flat[i].symbol.range.start, i));
+        enum Item {
+            Symbol(usize),
+            Region(RawRegion),
+        }
+        let mut items: Vec<(u32, Item)> = Vec::new();
+        let mut cursor = 1u32;
+        for &i in &tops {
+            let range = flat[i].symbol.range;
+            let (start, end) = (range.start.max(1), range.end.min(line_total.max(1)));
+            if start > cursor {
+                for r in scan_gap(&lines, cursor, start - 1, cursor == 1, rules) {
+                    items.push((r.span.start, Item::Region(r)));
+                }
+            }
+            items.push((start, Item::Symbol(i)));
+            cursor = cursor.max(end + 1);
+        }
+        if cursor <= line_total {
+            for r in scan_gap(&lines, cursor, line_total, cursor == 1, rules) {
+                items.push((r.span.start, Item::Region(r)));
+            }
+        }
+        // Units in pre-order, naming regions as they appear.
+        let mut units: Vec<Unit> = Vec::new();
+        let mut counters: std::collections::HashMap<Vec<String>, u32> = Default::default();
+        let mut prev_text: Option<String> = None;
+        let mut paths: Vec<SymbolPath> = Vec::with_capacity(flat.len());
+        for (_, item) in items {
+            match item {
+                Item::Region(r) => {
+                    let (names, kind): (Vec<String>, RegionKind) = match r.kind {
+                        RawKind::Header => (vec!["@header".into()], RegionKind::Header),
+                        RawKind::Imports => (vec!["@imports".into()], RegionKind::Imports),
+                        RawKind::Main => (vec!["@main".into()], RegionKind::Main),
+                        RawKind::Code => (vec!["@code".into(), r.leader.clone()], RegionKind::Code),
+                        RawKind::After => (
+                            vec!["@after".into(), prev_text.clone().unwrap_or_default()],
+                            RegionKind::After,
+                        ),
+                    };
+                    let count = counters.entry(names.clone()).or_insert(0);
+                    *count += 1;
+                    let ordinal = *count;
+                    let mut segments: Vec<Segment> = names[..names.len() - 1]
+                        .iter()
+                        .map(|name| Segment {
+                            name: name.clone(),
+                            ordinal: 1,
+                        })
+                        .collect();
+                    segments.push(Segment {
+                        name: names[names.len() - 1].clone(),
+                        ordinal,
+                    });
+                    let address = Address::new(Some(file.clone()), segments, None);
+                    if r.kind != RawKind::After {
+                        let parts: Vec<String> =
+                            address.segments().iter().map(Segment::to_string).collect();
+                        prev_text = Some(parts.join("/"));
+                    }
+                    units.push(Unit {
+                        address,
+                        kind: UnitKind::Region(kind),
+                        span: r.span,
+                        depth: 0,
+                        symbol: None,
+                        signature: String::new(),
+                        doc: None,
+                    });
+                }
+                Item::Symbol(top) => {
+                    // The subtree of `top` is the following flat entries with greater depth.
+                    let mut i = top;
+                    loop {
+                        let f = &flat[i];
+                        let segments = seg_of(i);
+                        paths.push(SymbolPath::new(Some(file.clone()), f.names.clone()));
+                        units.push(Unit {
+                            address: Address::new(Some(file.clone()), segments, None),
+                            kind: UnitKind::Symbol(f.symbol.kind),
+                            span: f.symbol.range,
+                            depth: f.depth,
+                            symbol: Some(i),
+                            signature: f.symbol.signature.clone(),
+                            doc: f.symbol.doc.clone(),
+                        });
+                        i += 1;
+                        if i >= flat.len() || flat[i].depth == 0 {
+                            break;
+                        }
+                    }
+                    let last = Segment::to_string(&seg_of(top).pop().unwrap());
+                    prev_text = Some(last);
+                }
+            }
+        }
+        // Paint lines: deeper wins, then later start, then shorter span.
+        let mut order: Vec<usize> = (0..units.len()).collect();
+        order.sort_by_key(|&u| {
+            let s = units[u].span;
+            (units[u].depth, s.start, std::cmp::Reverse(s.len()))
+        });
+        let mut owner = vec![usize::MAX; line_total as usize];
+        for u in order {
+            let s = units[u].span;
+            for line in s.start..=s.end.min(line_total) {
+                owner[line as usize - 1] = u;
+            }
+        }
+        let mut line_starts = vec![0usize];
+        for (at, b) in source.bytes().enumerate() {
+            if b == b'\n' {
+                line_starts.push(at + 1);
+            }
+        }
+        if *line_starts.last().unwrap() != source.len() || line_starts.len() <= line_total as usize
+        {
+            line_starts.push(source.len());
+        }
+        let mut index = std::collections::HashMap::new();
+        for (u, unit) in units.iter().enumerate() {
+            index.entry(unit.address.segments().to_vec()).or_insert(u);
+        }
+        AddressMap {
+            file,
+            units,
+            line_count: line_total,
+            outline: None,
+            symbol_paths: paths,
+            owner,
+            line_starts,
+            index,
+        }
+    }
+
+    /// Checks the contract invariants of section 3 and 4 against `source`: every line has an
+    /// address whose resolution contains it, all canonical addresses differ, and each unit
+    /// resolves to itself. Returns one message per violation (empty when sound). Meant for the
+    /// per-language conformance tests.
+    pub fn violations(&self, source: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (i, unit) in self.units.iter().enumerate() {
+            if !seen.insert(unit.address.to_string()) {
+                out.push(format!("duplicate address {}", unit.address));
+            }
+            match self.resolve(&unit.address) {
+                Ok(r) if r.unit == i => {}
+                other => out.push(format!("{} resolves to {other:?}", unit.address)),
+            }
+        }
+        for line in 1..=super::line_count(source) {
+            match self.at_line(line) {
+                None => out.push(format!("line {line} has no address")),
+                Some(located) => match self.resolve(&located.address) {
+                    Ok(r) if r.window.is_some_and(|w| w.start == line) => {}
+                    other => out.push(format!("line {line} -> {} -> {other:?}", located.address)),
+                },
+            }
+        }
+        out
     }
 
     /// Units in file order, pre-order.
@@ -517,48 +766,161 @@ impl AddressMap {
 
     /// The unit named by `path` (symbols and regions; a region is the one-segment `@imports`).
     pub fn unit(&self, path: &SymbolPath) -> Option<&Unit> {
-        let _ = path;
-        todo!("T-003")
+        let segments: Vec<Segment> = path
+            .segments()
+            .iter()
+            .map(|s| parse_segment(s))
+            .collect::<Result<_, _>>()
+            .ok()?;
+        self.index.get(&segments).map(|&u| &self.units[u])
     }
 
-    /// Address (with window) to absolute lines and byte range.
+    /// Address (with window) to absolute lines and byte range. A file part, when present, must be
+    /// this map's file; an address without segments names no unit.
     pub fn resolve(&self, address: &Address) -> Result<Resolved, ResolveError> {
-        let _ = address;
-        todo!("T-003")
+        if address.file().is_some_and(|f| f != self.file) {
+            return Err(ResolveError::UnknownUnit { near: Vec::new() });
+        }
+        let Some(&unit) = self.index.get(address.segments()) else {
+            return Err(ResolveError::UnknownUnit {
+                near: self.near(address),
+            });
+        };
+        let span = self.units[unit].span;
+        let (window, clamped) = match address.window() {
+            Some(w) => {
+                let (lines, clamped) = w.to_lines(span)?;
+                (Some(lines), clamped)
+            }
+            None => (None, false),
+        };
+        let lines = window.unwrap_or(span);
+        let from = self.line_starts[lines.start as usize - 1];
+        let to = self.line_starts[(lines.end as usize).min(self.line_starts.len() - 1)];
+        Ok(Resolved {
+            unit,
+            span,
+            window,
+            bytes: from..to,
+            clamped,
+        })
     }
 
     /// The position address of `line`; `None` only beyond the last line.
     pub fn at_line(&self, line: u32) -> Option<Located> {
-        let _ = line;
-        todo!("T-003")
+        if line == 0 || line > self.line_count {
+            return None;
+        }
+        let unit = *self.owner.get(line as usize - 1)?;
+        let n = line - self.units[unit].span.start + 1;
+        Some(Located {
+            unit,
+            address: self.units[unit].address.with_window(Window {
+                first: n,
+                last: Some(n),
+            }),
+        })
     }
 
     /// `file#unit:N` for `line`, without the absolute line.
     pub fn address_at(&self, file: &std::path::Path, line: u32) -> Option<String> {
-        let _ = (file, line);
-        todo!("T-003")
+        let located = self.at_line(line)?;
+        Some(
+            Address::new(
+                Some(file.to_path_buf()),
+                located.address.segments().to_vec(),
+                located.address.window(),
+            )
+            .to_string(),
+        )
     }
 
     /// Units whose last segment equals `name`, file order, with the declaration-and-impl collapse.
     pub fn named(&self, name: &str) -> Vec<usize> {
-        let _ = name;
-        todo!("T-003")
+        let matches: Vec<usize> = (0..self.units.len())
+            .filter(|&u| {
+                matches!(self.units[u].kind, UnitKind::Symbol(_))
+                    && self.units[u]
+                        .address
+                        .segments()
+                        .last()
+                        .is_some_and(|s| s.name == name)
+            })
+            .collect();
+        let raw = |u: usize| -> Vec<&str> {
+            self.units[u]
+                .address
+                .segments()
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect()
+        };
+        let is_impl = |u: usize| self.units[u].kind == UnitKind::Symbol(SymbolKind::Impl);
+        matches
+            .iter()
+            .copied()
+            .filter(|&u| !is_impl(u) || !matches.iter().any(|&v| !is_impl(v) && raw(v) == raw(u)))
+            .collect()
     }
 
-    /// At most five units near an unresolvable `address`.
+    /// At most five units near an unresolvable `address`: same last name elsewhere first, then
+    /// siblings under the same owner.
     pub fn near(&self, address: &Address) -> Vec<usize> {
-        let _ = address;
-        todo!("T-003")
+        let Some(last) = address.segments().last() else {
+            return Vec::new();
+        };
+        let owner: Vec<&str> = address.segments()[..address.segments().len() - 1]
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        let symbols =
+            (0..self.units.len()).filter(|&u| matches!(self.units[u].kind, UnitKind::Symbol(_)));
+        let mut out: Vec<usize> = symbols
+            .clone()
+            .filter(|&u| {
+                self.units[u]
+                    .address
+                    .segments()
+                    .last()
+                    .is_some_and(|s| s.name == last.name)
+            })
+            .collect();
+        if !owner.is_empty() {
+            for u in symbols {
+                let segs = self.units[u].address.segments();
+                let same_owner = segs.len() == owner.len() + 1
+                    && segs[..owner.len()]
+                        .iter()
+                        .map(|s| s.name.as_str())
+                        .eq(owner.iter().copied());
+                if same_owner && !out.contains(&u) {
+                    out.push(u);
+                }
+            }
+        }
+        out.truncate(5);
+        out
     }
 
     /// Line where a new import belongs: after the last import, else after `@header`, else 1.
     pub fn imports_insertion_line(&self) -> u32 {
-        todo!("T-003")
+        let end_of = |kind: RegionKind| {
+            self.units
+                .iter()
+                .filter(|u| u.kind == UnitKind::Region(kind))
+                .map(|u| u.span.end)
+                .max()
+        };
+        end_of(RegionKind::Imports)
+            .or_else(|| end_of(RegionKind::Header))
+            .map_or(1, |end| end + 1)
     }
 
     /// Insertion point relative to `anchor`. A region anchor is placed here (`After` at its last
     /// line + 1, `Before` at its first line); a symbol anchor delegates to
-    /// [`LanguageSupport::insert_site`].
+    /// [`LanguageSupport::insert_site`]. A missing `@imports` anchor falls back to
+    /// [`Self::imports_insertion_line`]. Errors: `UnknownSymbol` for an unresolvable anchor,
+    /// `NotAContainer` for `First`/`Last` on a region.
     pub fn insert_site(
         &self,
         source: &str,
@@ -566,9 +928,94 @@ impl AddressMap {
         anchor: &Address,
         where_: InsertWhere,
     ) -> Result<InsertSite, LangError> {
-        let _ = (source, lang, anchor, where_);
-        todo!("T-003")
+        let site = |line, blank_before, blank_after| InsertSite {
+            line,
+            indent: String::new(),
+            blank_before,
+            blank_after,
+        };
+        let unit = self.index.get(anchor.segments()).copied();
+        let Some(unit) = unit else {
+            let is_imports =
+                anchor.segments().len() == 1 && anchor.segments()[0].name == "@imports";
+            return if is_imports && matches!(where_, InsertWhere::After | InsertWhere::Last) {
+                let line = self.imports_insertion_line();
+                Ok(site(line, u8::from(line > 1), 1))
+            } else {
+                Err(LangError::UnknownSymbol(anchor.symbol_path()))
+            };
+        };
+        let u = &self.units[unit];
+        match (u.kind, where_) {
+            (UnitKind::Region(_), InsertWhere::First | InsertWhere::Last) => {
+                Err(LangError::NotAContainer(anchor.symbol_path()))
+            }
+            (UnitKind::Region(kind), InsertWhere::After) => {
+                let adjacent = kind == RegionKind::Imports;
+                Ok(site(u.span.end + 1, u8::from(!adjacent), 0))
+            }
+            (UnitKind::Region(_), InsertWhere::Before) => Ok(site(u.span.start, 0, 1)),
+            (UnitKind::Symbol(_), _) => {
+                let (Some(outline), Some(i)) = (&self.outline, u.symbol) else {
+                    return Err(LangError::UnknownSymbol(anchor.symbol_path()));
+                };
+                lang.insert_site(source, outline, &self.symbol_paths[i], where_)
+            }
+        }
     }
+}
+
+/// Conformance sweep for a language's tests: builds the [`AddressMap`] of every file under `root`
+/// whose extension the language owns (skipping `target`, `node_modules`, `.git` and virtual
+/// environments), using the language's source outline, and returns the number of files checked
+/// plus every [`AddressMap::violations`] message prefixed with the file.
+pub fn conformance_sweep(
+    root: &std::path::Path,
+    language: super::Language,
+) -> (usize, Vec<String>) {
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if !matches!(
+                    &*name,
+                    "target" | "node_modules" | ".git" | ".venv" | "venv"
+                ) {
+                    walk(&path, out);
+                }
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(root, &mut files);
+    files.sort();
+    let (mut checked, mut failures) = (0, Vec::new());
+    for path in files {
+        let owned = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| language.descriptor().extensions.contains(&e));
+        let Some(source) = owned.then(|| std::fs::read_to_string(&path).ok()).flatten() else {
+            continue;
+        };
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        let Some(outline) = language.support().outline_from_source(rel, &source) else {
+            continue;
+        };
+        checked += 1;
+        let map = AddressMap::build(&outline, &source);
+        for message in map.violations(&source) {
+            failures.push(format!("{}: {message}", rel.display()));
+        }
+    }
+    (checked, failures)
 }
 
 #[cfg(test)]
@@ -676,9 +1123,107 @@ mod tests {
         );
     }
 
+    fn symbol(
+        names: &[&str],
+        kind: SymbolKind,
+        lines: (u32, u32),
+        children: Vec<Symbol>,
+    ) -> Symbol {
+        let range = LineRange::new(lines.0, lines.1);
+        Symbol {
+            path: SymbolPath::new(
+                Some("f.rs".into()),
+                names.iter().map(|n| n.to_string()).collect(),
+            ),
+            kind,
+            name: names.last().unwrap().to_string(),
+            range,
+            body: range,
+            signature: format!("sig {}", names.last().unwrap()),
+            doc: None,
+            children,
+        }
+    }
+
+    /// A file with a header, a type, an impl with two same-named methods and a tail comment.
+    fn sample() -> (String, AddressMap) {
+        let src = "// header\n\nstruct Foo;\n\nimpl Foo {\n    fn new() {}\n    // note\n    fn new() {}\n}\n\n// tail\n";
+        let new = |n| symbol(&["Foo", "new"], SymbolKind::Method, (n, n), Vec::new());
+        let symbols = vec![
+            symbol(&["Foo"], SymbolKind::Struct, (3, 3), Vec::new()),
+            symbol(&["Foo"], SymbolKind::Impl, (5, 9), vec![new(6), new(8)]),
+        ];
+        let map = AddressMap::build_parts(
+            std::path::Path::new("f.rs"),
+            &symbols,
+            src,
+            &crate::lang::regions::GENERIC_RULES,
+        );
+        (src.to_owned(), map)
+    }
+
     #[test]
-    #[ignore = "T-002/T-003: AddressMap bodies land after the foundation"]
-    fn address_map_stub_is_pending() {
-        todo!()
+    fn address_totality_and_uniqueness() {
+        let (src, map) = sample();
+        let names: Vec<String> = map.units().iter().map(|u| u.address.to_string()).collect();
+        assert_eq!(
+            names,
+            [
+                "f.rs#@header",
+                "f.rs#Foo",
+                "f.rs#@after/Foo",
+                "f.rs#Foo~2",
+                "f.rs#Foo/new",
+                "f.rs#Foo/new~2",
+                "f.rs#@after/Foo%7E2",
+            ]
+        );
+        for line in 1..=crate::lang::line_count(&src) {
+            let located = map.at_line(line).expect("every line has an address");
+            let resolved = map.resolve(&located.address).unwrap();
+            assert!(resolved.window.unwrap().start == line, "line {line}");
+        }
+        assert!(map.at_line(12).is_none());
+        for (i, unit) in map.units().iter().enumerate() {
+            assert_eq!(map.resolve(&unit.address).unwrap().unit, i);
+        }
+    }
+
+    #[test]
+    fn address_positions_windows_and_bytes() {
+        let (src, map) = sample();
+        let at = |n| map.address_at(std::path::Path::new("f.rs"), n).unwrap();
+        assert_eq!(at(1), "f.rs#@header:1");
+        assert_eq!(at(5), "f.rs#Foo~2:1");
+        assert_eq!(at(7), "f.rs#Foo~2:3");
+        assert_eq!(at(8), "f.rs#Foo/new~2:1");
+        assert_eq!(at(9), "f.rs#Foo~2:5");
+        let r = map.resolve(&addr("f.rs#Foo~2:2-3")).unwrap();
+        assert_eq!(&src[r.bytes], "    fn new() {}\n    // note\n");
+        let r = map.resolve(&addr("f.rs#Foo~2:4-99")).unwrap();
+        assert!(r.clamped);
+        assert_eq!(
+            map.resolve(&addr("f.rs#Foo:2")).unwrap_err(),
+            ResolveError::LineOutOfRange { length: 1 }
+        );
+        assert!(matches!(
+            map.resolve(&addr("f.rs#Missing/new")),
+            Err(ResolveError::UnknownUnit { .. })
+        ));
+        assert_eq!(map.imports_insertion_line(), 3);
+    }
+
+    #[test]
+    fn address_names_collapse_impl_into_declaration() {
+        let (_, map) = sample();
+        let foo: Vec<String> = map
+            .named("Foo")
+            .into_iter()
+            .map(|u| map.units()[u].address.to_string())
+            .collect();
+        assert_eq!(foo, ["f.rs#Foo"]);
+        assert_eq!(map.named("new").len(), 2);
+        let near = map.near(&addr("f.rs#Foo/nwe"));
+        assert_eq!(near.len(), 2);
     }
 }

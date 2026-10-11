@@ -411,6 +411,22 @@ impl LanguageSupport for TypeScript {
         })
     }
 
+    /// TypeScript/JavaScript regions: shebang and directive-prologue header, `import ..` and
+    /// `export * from` imports.
+    fn region_rules(&self) -> &'static agent_ide_core::lang::regions::RegionRules {
+        &agent_ide_core::lang::regions::RegionRules {
+            header_prefixes: &["#!", "\"use strict\"", "'use strict'"],
+            import_prefixes: &[
+                "import ",
+                "import\"",
+                "import'",
+                "export * from",
+                "export * as",
+            ],
+            ..agent_ide_core::lang::regions::GENERIC_RULES
+        }
+    }
+
     /// `*.test.*`, `*.spec.*` and anything under `__tests__/`, for every script extension.
     fn is_test_file(&self, file: &Path) -> bool {
         let script = file

@@ -533,6 +533,21 @@ impl LanguageSupport for Python {
             }
         }
     }
+    /// Python regions: `#` comments, module docstring header, `import`/`from` imports, decorators
+    /// bind to the statement below, indented lines continue a block, `if __name__` is `@main`.
+    fn region_rules(&self) -> &'static agent_ide_core::lang::regions::RegionRules {
+        &agent_ide_core::lang::regions::RegionRules {
+            line_comments: &["#"],
+            block_comment: None,
+            import_prefixes: &["import ", "from "],
+            attribute_prefixes: &["@"],
+            indentation_blocks: true,
+            main_marker: Some("if __name__"),
+            docstring_header: true,
+            ..agent_ide_core::lang::regions::GENERIC_RULES
+        }
+    }
+
     /// `test_*.py`, `*_test.py`, `conftest.py` and any `.py` file under a `tests` or `test` directory.
     fn is_test_file(&self, file: &Path) -> bool {
         let Some(name) = file.file_name().and_then(|name| name.to_str()) else {
