@@ -824,6 +824,9 @@ pub fn validate_call(
     {
         map.insert("operation_id".to_owned(), json!(generated_operation_id()));
     }
+    if tool == AssistanceTool::Edit {
+        super::edit_forms::normalize(&mut parameters);
+    }
     let object = parameters
         .as_object()
         .ok_or(ParameterError::InvalidObject)?;
@@ -1307,7 +1310,16 @@ pub fn validate_call(
                     invalid_field("changes", FieldRule::OneOf("an array of change objects"))
                 })?;
                 let allowed = [
-                    "lines", "symbol", "op", "where", "content", "old", "new", "within",
+                    "lines",
+                    "symbol",
+                    "op",
+                    "where",
+                    "content",
+                    "old",
+                    "new",
+                    "within",
+                    "add_import",
+                    "remove_import",
                 ];
                 if let Some(field) = entry
                     .keys()
@@ -1315,7 +1327,7 @@ pub fn validate_call(
                 {
                     return Err(ParameterError::UnknownField(echoable_field(field)));
                 }
-                let addresses = ["lines", "symbol", "old"]
+                let addresses = ["lines", "symbol", "old", "add_import", "remove_import"]
                     .into_iter()
                     .filter(|field| entry.contains_key(*field))
                     .count();
@@ -1323,12 +1335,30 @@ pub fn validate_call(
                     return Err(invalid_field(
                         "changes",
                         FieldRule::OneOf(
-                            "each entry addressed by exactly one of \"lines\", \"symbol\" or \
-                             \"old\"",
+                            "each entry addressed by exactly one of \"lines\", \"symbol\", \
+                             \"old\", \"add_import\" or \"remove_import\"",
                         ),
                     ));
                 }
-                if entry.contains_key("lines") {
+                if let Some(field) = ["add_import", "remove_import"]
+                    .into_iter()
+                    .find(|field| entry.contains_key(*field))
+                {
+                    // One import statement as written; a second form key beside it is a mix.
+                    let statement = entry_string(entry, field)?;
+                    if statement.contains('\n') || statement.len() > MAX_SYMBOL_PATH_BYTES {
+                        return Err(invalid_field(
+                            "changes",
+                            FieldRule::OneOf("an import statement on one line"),
+                        ));
+                    }
+                    if entry.len() != 1 {
+                        return Err(invalid_field(
+                            "changes",
+                            FieldRule::OneOf("an import entry with no other key"),
+                        ));
+                    }
+                } else if entry.contains_key("lines") {
                     if parse_line_range(entry_string(entry, "lines")?).is_none() {
                         return Err(invalid_field(
                             "changes",
@@ -1370,7 +1400,10 @@ pub fn validate_call(
                     }
                     match op {
                         "replace" => {
-                            entry_string(entry, "content")?;
+                            // Empty content deletes the unit or the window (E2).
+                            if !entry.get("content").is_some_and(Value::is_string) {
+                                return Err(invalid_field("content", FieldRule::String));
+                            }
                         }
                         "insert" => {
                             entry_string(entry, "content")?;
@@ -6259,6 +6292,36 @@ fn read_ranges_accept_one_line_closed_and_open_forms() {
         assert_eq!(range(bad), None, "{bad}");
     }
     assert!(parse_line_range("7").is_none() && parse_line_range("7-").is_none());
+}
+
+/// The address-shaped edit forms E1-E8 validate; their closed shape errors refuse.
+#[test]
+fn address_edit_forms_validate() {
+    for call in [
+        json!({"symbol":"a.rs#F:2-3","content":"x"}),
+        json!({"symbol":"a.rs#F:2","content":""}),
+        json!({"symbol":"a.rs#F","old":"x","new":"y"}),
+        json!({"symbol":"a.rs#F:2-3","old":"x","new":"y"}),
+        json!({"path":"a.rs","old":"x","new":"y"}),
+        json!({"file_path":"a.rs","old_string":"x","new_string":""}),
+        json!({"symbol":"a.rs#@imports","op":"insert","where":"after","content":"use x;"}),
+        json!({"symbol":"a.rs#@header","content":"// h"}),
+        json!({"symbol":"a.rs#F:2-3","op":"delete"}),
+        json!({"path":"a.rs","add_import":"use std::fmt;"}),
+        json!({"path":"a.rs","remove_import":"use std::fmt;"}),
+        json!({"path":"a.rs","changes":[{"symbol":"a.rs#F","old":"x","new":"y"},{"add_import":"use x;"}]}),
+    ] {
+        assert!(validate_call(AssistanceTool::Edit, call.clone()).is_ok(), "{call}");
+    }
+    for call in [
+        json!({"path":"a.rs","add_import":"use a;\nuse b;"}),
+        json!({"path":"a.rs","old":"x"}),
+        json!({"path":"a.rs","old":"x","new":"y","content":"z"}),
+        json!({"symbol":"a.rs#F:2-3","old":"x","new":"y","content":"z"}),
+        json!({"path":"a.rs","add_import":"use a;","remove_import":"use b;"}),
+    ] {
+        assert!(validate_call(AssistanceTool::Edit, call.clone()).is_err(), "{call}");
+    }
 }
 
 /// The read forms accept windows, regions and `path:line` locations as symbol texts.

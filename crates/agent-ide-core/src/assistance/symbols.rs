@@ -3249,8 +3249,10 @@ impl Worker<'_> {
         // language without its server) exactly like the single line-range form does, instead of
         // refusing provider_unavailable for addresses it never uses.
         let needs_outline = requests.iter().any(|request| {
-            matches!(request, ChangeRequest::Symbol { .. })
-                || matches!(
+            matches!(
+                request,
+                ChangeRequest::Symbol { .. } | ChangeRequest::Import { .. }
+            ) || matches!(
                     request,
                     ChangeRequest::Old {
                         within: Some(_),
@@ -3272,13 +3274,54 @@ impl Worker<'_> {
         // from its module), then resolve every change synchronously against the answers.
         let mut sites = std::collections::HashMap::new();
         if let Some(outline) = outline.as_ref() {
+            // Region anchors and new imports place by the file's address map, in process.
+            let map = lang::address::AddressMap::build(outline, &source);
+            for request in &requests {
+                match request {
+                    ChangeRequest::Import { add: true, .. } => {
+                        sites.insert(
+                            (imports_path(), lang::InsertWhere::After),
+                            map.insert_site(
+                                &source,
+                                outline.language.support(),
+                                &region_address("@imports"),
+                                lang::InsertWhere::After,
+                            ),
+                        );
+                    }
+                    ChangeRequest::Symbol {
+                        requested,
+                        path: symbol,
+                        op: "insert",
+                        where_,
+                        ..
+                    } if region_anchor(requested).is_some() => {
+                        if let (Some(anchor), Some(placement)) =
+                            (region_anchor(requested), insert_where(where_.as_deref()))
+                        {
+                            sites.insert(
+                                (symbol.clone(), placement),
+                                map.insert_site(
+                                    &source,
+                                    outline.language.support(),
+                                    &anchor,
+                                    placement,
+                                ),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
             for request in &requests {
                 if let ChangeRequest::Symbol {
+                    requested,
                     path: symbol,
                     op: "insert",
                     where_,
                     ..
                 } = request
+                    && region_anchor(requested).is_none()
                     && let Some(placement) = insert_where(where_.as_deref())
                 {
                     let site = crate::modules::calls::insert_site(
@@ -4220,6 +4263,9 @@ enum ChangeRequest {
         new: String,
         within: Option<String>,
     },
+    /// Add the import statement `text` after the file's other imports (idempotent), or remove
+    /// the one that equals it.
+    Import { add: bool, text: String },
 }
 
 /// Parses the facade-validated `changes` entries; anything malformed here is an internal error,
@@ -4237,13 +4283,27 @@ fn parse_change_requests(entries: &[Value]) -> Result<Vec<ChangeRequest>, Failur
                 .map(str::to_owned)
                 .ok_or(FailureCode::Internal)
         };
-        let request = if let Some(lines) = entry.get("lines").and_then(Value::as_str) {
+        let request = if let Some((add, text)) = [("add_import", true), ("remove_import", false)]
+            .into_iter()
+            .find_map(|(key, add)| {
+                entry
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(|text| (add, text.to_owned()))
+            })
+        {
+            ChangeRequest::Import { add, text }
+        } else if let Some(lines) = entry.get("lines").and_then(Value::as_str) {
             ChangeRequest::Lines {
                 range: crate::assistance::facade::parse_line_range(lines)
                     .ok_or(FailureCode::Internal)?,
                 content: text("content")?,
             }
-        } else if let Some(symbol) = entry.get("symbol").and_then(Value::as_str) {
+        } else if let Some(symbol) = entry
+            .get("symbol")
+            .and_then(Value::as_str)
+            .filter(|_| !entry.contains_key("old"))
+        {
             ChangeRequest::Symbol {
                 requested: symbol.to_owned(),
                 path: SymbolPath::parse(symbol).map_err(|_| FailureCode::Internal)?,
@@ -4269,8 +4329,10 @@ fn parse_change_requests(entries: &[Value]) -> Result<Vec<ChangeRequest>, Failur
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned(),
+                // `{symbol, old, new}` is the E3 entry: its symbol scopes the match.
                 within: entry
                     .get("within")
+                    .or_else(|| entry.get("symbol"))
                     .and_then(Value::as_str)
                     .map(str::to_owned),
             }
@@ -4428,6 +4490,99 @@ fn resolve_changes(
     )
 }
 
+/// Why an address could not be turned into lines.
+enum UnitMiss {
+    /// No such unit (or a file other than the edit's).
+    Unknown,
+    /// The window starts at `first`, beyond the unit's `length` lines.
+    Length { length: u32, first: u32 },
+}
+
+/// The lines an address names in the edit's file: the unit, or the window inside it.
+///
+/// Plain symbol paths keep resolving through the outline as before; an address with a window or
+/// a region name resolves through the file's address map, which also catches what the outline
+/// does not know (`~k` duplicates).
+fn unit_range_of(
+    requested: &str,
+    path: &str,
+    outline: Option<&Outline>,
+    map: Option<&lang::address::AddressMap>,
+) -> Result<LineRange, UnitMiss> {
+    let parsed = match lang::address::Address::parse(requested) {
+        Ok(lang::address::Parsed::Address(address)) => Some(address),
+        _ => None,
+    };
+    let special = parsed.as_ref().is_some_and(|address| {
+        address.window().is_some()
+            || address
+                .segments()
+                .iter()
+                .any(|segment| segment.name.starts_with('@'))
+    });
+    if !special
+        && let Ok(symbol) = SymbolPath::parse(requested)
+        && symbol.file().is_none_or(|file| file == Path::new(path))
+        && let Some(found) = outline.and_then(|outline| outline.find(&symbol))
+    {
+        return Ok(found.range);
+    }
+    let (Some(map), Some(address)) = (map, parsed) else {
+        return Err(UnitMiss::Unknown);
+    };
+    if address.file().is_some_and(|file| file != Path::new(path)) {
+        return Err(UnitMiss::Unknown);
+    }
+    match map.resolve(&address) {
+        Ok(resolved) => Ok(resolved.window.unwrap_or(resolved.span)),
+        Err(lang::address::ResolveError::LineOutOfRange { length }) => Err(UnitMiss::Length {
+            length,
+            first: address.window().map_or(1, |window| window.first),
+        }),
+        Err(_) => Err(UnitMiss::Unknown),
+    }
+}
+
+/// The refusal sentence for a window that starts past its unit.
+fn window_sentence(number: usize, requested: &str, length: u32, first: u32) -> String {
+    format!(
+        "change {number}: {requested} has {length} lines, not {first}; use a window inside \
+         1-{length}, or no window to replace the whole unit"
+    )
+}
+
+/// The anchor path under which the new-import site is filed in the site table.
+fn imports_path() -> SymbolPath {
+    SymbolPath::new(None, vec!["@imports".to_owned()])
+}
+
+/// The address of a file-level region by name (`@imports`), without a file.
+fn region_address(name: &str) -> lang::address::Address {
+    lang::address::Address::new(
+        None,
+        vec![lang::address::Segment {
+            name: name.to_owned(),
+            ordinal: 1,
+        }],
+        None,
+    )
+}
+
+/// The address of `requested` when it names a file-level region (`file#@imports`).
+fn region_anchor(requested: &str) -> Option<lang::address::Address> {
+    match lang::address::Address::parse(requested) {
+        Ok(lang::address::Parsed::Address(address))
+            if address
+                .segments()
+                .first()
+                .is_some_and(|segment| segment.name.starts_with('@')) =>
+        {
+            Some(address)
+        }
+        _ => None,
+    }
+}
+
 /// An insertion site lookup: the anchor's outline, the anchor and the placement.
 type SiteOf<'a> = dyn Fn(&Outline, &SymbolPath, lang::InsertWhere) -> Result<lang::InsertSite, lang::LangError>
     + 'a;
@@ -4454,6 +4609,8 @@ fn resolve_changes_with(
 ) -> Result<Vec<ResolvedChange>, Refusal> {
     let spans = line_byte_spans(source);
     let line_of = |byte: usize| line_of_byte(&spans, byte);
+    let map = outline.map(|outline| lang::address::AddressMap::build(outline, source));
+    let unit_range = |requested: &str| unit_range_of(requested, path, outline, map.as_ref());
     let mut refusal = Refusal {
         sentences: Vec::new(),
         refused: std::collections::BTreeSet::new(),
@@ -4536,16 +4693,20 @@ fn resolve_changes_with(
                         ),
                     }
                 } else {
-                    let Some(found) = outline
-                        .expect("a symbol entry resolves against the outline")
-                        .find(symbol)
-                    else {
-                        no_symbol(requested, &mut refusal);
-                        continue;
+                    let range = match unit_range(requested) {
+                        Ok(range) => range,
+                        Err(UnitMiss::Unknown) => {
+                            no_symbol(requested, &mut refusal);
+                            continue;
+                        }
+                        Err(UnitMiss::Length { length, first }) => {
+                            refusal.push(number, window_sentence(number, requested, length, first));
+                            continue;
+                        }
                     };
                     resolved.push(ResolvedChange {
                         number,
-                        base: found.range,
+                        base: range,
                         action: if *op == "delete" {
                             ChangeAction::Delete
                         } else {
@@ -4555,18 +4716,92 @@ fn resolve_changes_with(
                     });
                 }
             }
+            ChangeRequest::Import { add, text } => {
+                let statement = text.trim();
+                let region = map.as_ref().and_then(|map| {
+                    map.units()
+                        .iter()
+                        .find(|unit| {
+                            unit.kind
+                                == lang::address::UnitKind::Region(
+                                    lang::address::RegionKind::Imports,
+                                )
+                        })
+                        .map(|unit| unit.span)
+                });
+                let present = region.and_then(|span| {
+                    (span.start..=span.end).find(|line| {
+                        lang::slice_lines(source, LineRange::new(*line, *line)).trim() == statement
+                    })
+                });
+                let anchor = format!("{path}#@imports");
+                match (*add, present, region) {
+                    // Already imported: the line is rewritten as it is, an unchanged edit.
+                    (true, Some(line), _) => {
+                        let range = LineRange::new(line, line);
+                        resolved.push(ResolvedChange {
+                            number,
+                            base: range,
+                            action: ChangeAction::Replace(
+                                lang::slice_lines(source, range).trim_end_matches('\n').to_owned(),
+                            ),
+                            address: ChangeAddress::Symbol(anchor),
+                        });
+                    }
+                    (true, None, _) => match site_of(
+                        outline.expect("an import entry resolves against the outline"),
+                        &imports_path(),
+                        lang::InsertWhere::After,
+                    ) {
+                        Ok(site) => resolved.push(ResolvedChange {
+                            number,
+                            base: LineRange::new(site.line, site.line),
+                            action: ChangeAction::Insert(site, text.clone()),
+                            address: ChangeAddress::Insert {
+                                path: anchor,
+                                anchor: "@imports".to_owned(),
+                                where_: "after".to_owned(),
+                            },
+                        }),
+                        Err(_) => refusal.push(
+                            number,
+                            format!("change {number}: cannot place an import in {path}"),
+                        ),
+                    },
+                    (false, _, Some(span)) => match find_old(source, statement, Some(span)) {
+                        OldMatch::One { start, end } => {
+                            let end = if source[end..].starts_with('\n') { end + 1 } else { end };
+                            resolved.push(ResolvedChange {
+                                number,
+                                base: LineRange::new(line_of(start), line_of(end.saturating_sub(1))),
+                                action: ChangeAction::Splice {
+                                    start,
+                                    end,
+                                    new: String::new(),
+                                },
+                                address: ChangeAddress::Symbol(anchor),
+                            });
+                        }
+                        _ => refusal.push(
+                            number,
+                            format!("change {number}: import not found in {anchor}: {statement}"),
+                        ),
+                    },
+                    (false, _, None) => refusal.push(
+                        number,
+                        format!("change {number}: {path} has no imports to remove from"),
+                    ),
+                }
+            }
             ChangeRequest::Old { old, new, within } => {
                 let scope = match within {
-                    Some(within) => match SymbolPath::parse(within)
-                        .ok()
-                        .filter(|symbol| symbol.file().is_none_or(|file| file == Path::new(path)))
-                        .and_then(|symbol| {
-                            outline
-                                .expect("a `within` address resolves against the outline")
-                                .find(&symbol)
-                        }) {
-                        Some(found) => Some(found.range),
-                        None => {
+                    Some(within) => match unit_range(within) {
+                        Ok(range) => Some(range),
+                        Err(UnitMiss::Length { length, first }) => {
+                            refusal.push(number, window_sentence(number, within, length, first));
+                            continue;
+                        }
+                        Err(UnitMiss::Unknown) => {
                             refusal.push(
                                 number,
                                 format!(
@@ -5133,6 +5368,60 @@ mod batch_tests {
             Some(LineRange::new(7, 7)),
             "mark,two stays one line, shifted down one"
         );
+    }
+
+    /// A `:N-M` window replaces lines counted from the unit's first line; a window that starts
+    /// past the unit is refused naming the unit's length (symbol-read-edit-v1 E2).
+    #[test]
+    fn a_window_replaces_unit_relative_lines_and_refuses_past_the_unit() {
+        let source = "sym card\n1\nsym btn\n2\nend\nmark\nend\n";
+        let outline = gamma_outline(source);
+        let entry = |requested: &str| ChangeRequest::Symbol {
+            requested: requested.to_owned(),
+            path: SymbolPath::parse(requested).unwrap(),
+            op: "replace",
+            where_: None,
+            content: Some("two".to_owned()),
+        };
+        let changes = resolve_changes(
+            source,
+            Some(&outline),
+            "a.gamma",
+            &[entry("a.gamma#card/btn:2")],
+        )
+        .expect("the window resolves");
+        let (candidate, _) = apply_changes(source, "a.gamma", &changes).expect("no overlaps");
+        assert_eq!(candidate, "sym card\n1\nsym btn\ntwo\nend\nmark\nend\n");
+        let refusal = resolve_changes(
+            source,
+            Some(&outline),
+            "a.gamma",
+            &[entry("a.gamma#card/btn:9")],
+        )
+        .unwrap_err();
+        assert!(
+            refusal.detail().contains("a.gamma#card/btn:9 has 3 lines, not 9"),
+            "{}",
+            refusal.detail()
+        );
+    }
+
+    /// `{old, new, within: <window>}` matches only inside the window.
+    #[test]
+    fn old_text_scopes_to_a_window() {
+        let source = "sym card\n1\nsym btn\n1\nend\nmark\nend\n";
+        let outline = gamma_outline(source);
+        let request = |within: &str| {
+            [ChangeRequest::Old {
+                old: "1".to_owned(),
+                new: "9".to_owned(),
+                within: Some(within.to_owned()),
+            }]
+        };
+        let changes = resolve_changes(source, Some(&outline), "a.gamma", &request("a.gamma#card/btn:2"))
+            .expect("one match inside the window");
+        let (candidate, _) = apply_changes(source, "a.gamma", &changes).unwrap();
+        assert_eq!(candidate, "sym card\n1\nsym btn\n9\nend\nmark\nend\n");
     }
 
     /// Two inserts at one anchor apply in array order; an insert at a span's boundary is fine,

@@ -67,6 +67,9 @@ pub(crate) mod test_fact;
 /// Parses Codex `apply_patch` envelopes and applies their hunks to source text, purely.
 pub(crate) mod patch;
 
+/// Rewrites the address-shaped single `ide.edit` forms into the one-file `changes` form.
+mod edit_forms;
+
 /// Holds the call-signature block that ends every `ide.start` reply.
 pub(crate) mod signature_card;
 
