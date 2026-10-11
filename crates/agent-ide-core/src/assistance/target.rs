@@ -127,6 +127,25 @@ pub(super) fn read_unit(
     ))
 }
 
+/// Lines `first..=last` (1-based, inside `text`) of a unit's `text`, as `number<TAB>line` rows
+/// numbered from `first` and at most `limit` of them, then `+<k> more` when cut.
+pub(super) fn numbered_rows(text: &str, first: u32, last: u32, limit: usize) -> String {
+    let rows: Vec<&str> = text
+        .split_inclusive('\n')
+        .skip(first as usize - 1)
+        .take((last - first + 1) as usize)
+        .collect();
+    let width = last.to_string().len();
+    let mut out = String::new();
+    for (index, row) in rows.iter().take(limit).enumerate() {
+        out.push_str(&format!("{:>width$}\t{}\n", first as usize + index, row.trim_end_matches('\n')));
+    }
+    if rows.len() > limit {
+        out.push_str(&format!("+{} more\n", rows.len() - limit));
+    }
+    out
+}
+
 /// What a unit read delivered: the unit's canonical address and its whole current text, the
 /// session's memory of the read for the window-edit guard.
 pub(super) struct UnitRead {
@@ -232,6 +251,19 @@ impl Worker<'_> {
                 .or_default()
                 .remember_unit(epoch, &read.address, read.text);
         }
+    }
+
+    /// The text of unit `address` (`file#unit`) as this session last read it in the current
+    /// context epoch, or `None` when nothing is remembered (never read, `ide.stop`, a context
+    /// compaction, or an unknown epoch).
+    pub(super) fn remembered_unit(&self, binding: &BindingRef, address: &str) -> Option<String> {
+        let epoch = self.context_epoch(binding);
+        let ledger = self.shared.ledger.lock().ok()?;
+        ledger
+            .read_memory
+            .get(binding)?
+            .unit_text(epoch, address)
+            .map(str::to_owned)
     }
 
     /// Wraps a rendered unit read as the paged `read` reply of the job.

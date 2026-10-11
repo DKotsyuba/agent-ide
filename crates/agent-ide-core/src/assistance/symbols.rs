@@ -3177,12 +3177,17 @@ impl Worker<'_> {
                 candidate
             }
             Err(refusal) => {
+                let detail = refusal.detail();
+                // A refusal that quotes the unit's current text (the window guard) keeps room
+                // for it; every other refusal stays inside the one-line bound.
+                let limit = if detail.contains("Current text:") {
+                    MAX_CURRENT_TEXT_REFUSAL_BYTES
+                } else {
+                    MAX_REFUSAL_DETAIL_BYTES
+                };
                 job.failure_detail = Some(format!(
                     "edit:refused: {}",
-                    crate::assistance::reply::bounded_utf8_prefix(
-                        &refusal.detail(),
-                        MAX_REFUSAL_DETAIL_BYTES
-                    )
+                    crate::assistance::reply::bounded_utf8_prefix(&detail, limit)
                 ));
                 return Err(FailureCode::EditRefused);
             }
@@ -3345,6 +3350,22 @@ impl Worker<'_> {
                 .cloned()
                 .unwrap_or_else(|| Err(lang::LangError::UnknownSymbol(symbol.clone())))
         };
+        // The light window guard: a window edit whose lines changed since this session's last
+        // read of the unit is refused with the unit's current text; with no remembered read the
+        // edit applies and the reply echoes the replaced lines.
+        let echoes = match outline.as_ref() {
+            Some(outline) => {
+                let map = lang::address::AddressMap::build(outline, &source);
+                let binding = job.invocation.binding_ref().clone();
+                match window_guard(path, &map, &source, &requests, &|address| {
+                    self.remembered_unit(&binding, address)
+                }) {
+                    Ok(echoes) => echoes,
+                    Err(refusal) => return Ok(Err(refusal)),
+                }
+            }
+            None => Vec::new(),
+        };
         let changes =
             match resolve_changes_with(&source, outline.as_ref(), path, &requests, &site_of) {
                 Ok(changes) => changes,
@@ -3416,6 +3437,10 @@ impl Worker<'_> {
         if let Some(note_line) = pre_existing {
             note.push('\n');
             note.push_str(&note_line);
+        }
+        for echo in echoes {
+            note.push('\n');
+            note.push_str(echo.trim_end());
         }
         if let Some(lexical) = lexical {
             note = format!("{lexical}\n{note}");
@@ -4490,6 +4515,84 @@ fn resolve_changes(
     )
 }
 
+/// The light guard of a window edit (symbol-read-edit-v1 §3.2): for every windowed `symbol`
+/// replace or delete, compares lines `N..M` of the unit's current text with the same lines of
+/// the text the session last read (`remembered`, by `file#unit` address).
+///
+/// A difference refuses that change with the unit's current numbered text and the repair step,
+/// nothing written. A window with no remembered read is applied, and its replaced old lines are
+/// returned (one block per window, at most 8 numbered lines) so the reply can echo them.
+/// Windows the map cannot resolve are left to the resolver's own refusal.
+fn window_guard(
+    path: &str,
+    map: &lang::address::AddressMap,
+    source: &str,
+    requests: &[ChangeRequest],
+    remembered: &dyn Fn(&str) -> Option<String>,
+) -> Result<Vec<String>, Refusal> {
+    let mut refusal = Refusal {
+        sentences: Vec::new(),
+        refused: std::collections::BTreeSet::new(),
+        total: requests.len(),
+    };
+    let mut echoes = Vec::new();
+    for (index, request) in requests.iter().enumerate() {
+        let ChangeRequest::Symbol { requested, op, .. } = request else {
+            continue;
+        };
+        if *op == "insert" {
+            continue;
+        }
+        let Ok(lang::address::Parsed::Address(address)) = lang::address::Address::parse(requested)
+        else {
+            continue;
+        };
+        let (Some(window), Ok(resolved)) = (address.window(), map.resolve(&address)) else {
+            continue;
+        };
+        let unit = &map.units()[resolved.unit];
+        let canonical = lang::address::Address::new(
+            Some(PathBuf::from(path)),
+            unit.address.segments().to_vec(),
+            None,
+        )
+        .to_string();
+        let length = unit.span.len();
+        let (first, last) = (window.first, window.last.unwrap_or(length).min(length));
+        let current = lang::slice_lines(source, unit.span);
+        let rows_of = |text: &str| -> Vec<String> {
+            text.split_inclusive('\n')
+                .skip(first as usize - 1)
+                .take((last - first + 1) as usize)
+                .map(str::to_owned)
+                .collect()
+        };
+        let now = rows_of(&current);
+        match remembered(&canonical) {
+            Some(before) if rows_of(&before) != now => refusal.push(
+                index + 1,
+                format!(
+                    "change {}: lines {first}-{last} of {canonical} changed since your read. \
+                     Current text:\n{}Repair: resend with the window that holds your lines, \
+                     or read {canonical} again",
+                    index + 1,
+                    super::target::numbered_rows(&current, 1, length, 20),
+                ),
+            ),
+            Some(_) => {}
+            None => echoes.push(format!(
+                "{canonical}:{first}-{last} was:\n{}",
+                super::target::numbered_rows(&current, first, last, 8)
+            )),
+        }
+    }
+    if refusal.refused.is_empty() {
+        Ok(echoes)
+    } else {
+        Err(refusal)
+    }
+}
+
 /// Why an address could not be turned into lines.
 enum UnitMiss {
     /// No such unit (or a file other than the edit's).
@@ -4906,6 +5009,8 @@ const MAX_REFUSAL_EXCERPT_BYTES: usize = 80;
 const MAX_LANDING_SENTENCES: usize = 8;
 /// Bytes the whole refusal detail is clipped to, one line.
 const MAX_REFUSAL_DETAIL_BYTES: usize = 512;
+/// Bytes of a refusal detail that quotes the unit's current text (symbol-read-edit-v1 §3.5).
+const MAX_CURRENT_TEXT_REFUSAL_BYTES: usize = 4096;
 
 /// How a syntax error relates to the change it is attributed to.
 enum Attribution {
@@ -5404,6 +5509,43 @@ mod batch_tests {
             "{}",
             refusal.detail()
         );
+    }
+
+    /// The window guard (symbol-read-edit-v1 E6a-E6c): a remembered read whose window lines
+    /// differ refuses with the unit's current text; equal window lines pass even if the unit
+    /// changed elsewhere; no remembered read applies and echoes the replaced old lines.
+    #[test]
+    fn the_window_guard_refuses_changed_lines_and_echoes_unread_ones() {
+        let source = "sym card\n1\nsym btn\n2\nend\nmark\nend\n";
+        let outline = gamma_outline(source);
+        let map = lang::address::AddressMap::build(&outline, source);
+        let request = [ChangeRequest::Symbol {
+            requested: "a.gamma#card/btn:2".to_owned(),
+            path: SymbolPath::parse("a.gamma#card/btn:2").unwrap(),
+            op: "replace",
+            where_: None,
+            content: Some("x".to_owned()),
+        }];
+        let read = |before: &'static str| move |_: &str| Some(before.to_owned());
+        // E6a: the remembered line 2 differs from the current one.
+        let refusal = window_guard("a.gamma", &map, source, &request, &read("sym btn\nOLD\nend\n"))
+            .unwrap_err()
+            .detail();
+        assert!(
+            refusal.contains("lines 2-2 of a.gamma#card/btn changed since your read")
+                && refusal.contains("2\t2")
+                && refusal.contains("Repair:"),
+            "{refusal}"
+        );
+        // E6b: the same window lines pass although the unit differs elsewhere.
+        assert!(
+            window_guard("a.gamma", &map, source, &request, &read("CHANGED\n2\nend\n"))
+                .unwrap()
+                .is_empty()
+        );
+        // E6c: nothing remembered applies and echoes the replaced line.
+        let echoes = window_guard("a.gamma", &map, source, &request, &|_| None).unwrap();
+        assert_eq!(echoes, ["a.gamma#card/btn:2-2 was:\n2\t2\n"]);
     }
 
     /// `{old, new, within: <window>}` matches only inside the window.
