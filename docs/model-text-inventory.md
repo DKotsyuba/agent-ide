@@ -43,14 +43,14 @@ to the M-028 address or M-029 read/edit modules and follows their contracts).
 
 | Source | Where | Before | After | Status |
 |---|---|---|---|---|
-| Reply template (G) | `assets/mcp/reply.jinja` | 37,119 | 35,465 | trimmed: no `complete <kind>:` labels, no `Next:` lines, one `Cut; …` trailer, repairs read with `ide.read` and name no `source_ref` or `ide.context` |
+| Reply template (G) | `assets/mcp/reply.jinja` | 37,119 | 35,497 | trimmed: no `complete <kind>:` labels, no `Next:` lines, one `Cut; …` trailer; stale writes repeat the call, while an explicitly supplied stale legacy reference keeps its own repair note |
 | Read, outline, symbol headers and per-item lines | `batch.rs`, `symbols.rs` (M-029/M-028) | n/a | n/a | owned |
 | Edit reply lines and refusals with `Repair:` | `batch.rs`, `batch_edit.rs`, `edit_forms.rs` (M-029) | n/a | n/a | owned |
 | Host-binding and capacity refusals | `reply.jinja` `unavailable:` and `error:` branches | single sentence, one action | unchanged shape | kept: each already names one repair step; `wait` advice removed from the two capacity lines |
 | Presentation-degraded fallbacks | `content.rs:490` | 2 lines | 2 lines | trimmed (no label) |
 | Batch refusal shapes | `batch.rs:35` `ITEM_SHAPE`, `batch.rs:584` `FILE_SHAPE` | quoted `source_ref` | no `source_ref` | trimmed |
 | Context target refusals | `facade.rs:678`, `facade.rs:681` | 2 lines | 2 lines | kept (name the one missing field) |
-| Diff trailer and no-change line | `snapshots.rs:984`, `snapshots.rs:1670` | n/a | new | rewritten: `unchanged since your last diff: K hunks`, `no changes since your last diff` |
+| Diff trailer and no-change line | `snapshots.rs` `render_diff_text`, `incremental_diff_reply` | n/a | new | rewritten: `unchanged since your last diff: K hunks`, `no changes since your last diff`; exact and degraded captures share the filter, returning hunks are new again, and continuation delivery counts as seen |
 | Diff provenance `current_tree` lines | `snapshots.rs:27` | 2 long lines | unchanged | kept: only printed with `provenance: true` |
 
 ## Hook plates and outbox facts
