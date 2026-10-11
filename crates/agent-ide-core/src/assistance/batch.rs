@@ -476,7 +476,13 @@ pub(crate) struct ReadMemory {
     epoch: Option<u64>,
     /// Per item label: the digest of the delivered block and the `detail_ref` that delivered it.
     blocks: std::collections::BTreeMap<String, ([u8; 32], String)>,
+    /// Per `file#unit` address: the unit's whole text as the session last read it, the base of
+    /// the window-edit guard (symbol-read-edit-v1 §3.2). Dropped with the epoch like `blocks`.
+    units: std::collections::BTreeMap<String, String>,
 }
+
+/// Most unit texts the memory keeps; a full memory starts over rather than growing.
+const MAX_REMEMBERED_UNITS: usize = 128;
 
 impl ReadMemory {
     /// Returns the `detail_ref` of the earlier read that delivered exactly `block` for `item` in
@@ -491,6 +497,7 @@ impl ReadMemory {
         let epoch = epoch?;
         if self.epoch != Some(epoch) {
             self.blocks.clear();
+            self.units.clear();
             self.epoch = Some(epoch);
             return None;
         }
@@ -515,6 +522,7 @@ impl ReadMemory {
         };
         if self.epoch != Some(epoch) || self.blocks.len() >= MAX_REMEMBERED_BLOCKS {
             self.blocks.clear();
+            self.units.clear();
             self.epoch = Some(epoch);
         }
         self.blocks.insert(
@@ -524,6 +532,32 @@ impl ReadMemory {
                 reference.to_owned(),
             ),
         );
+    }
+
+    /// Records the whole `text` of unit `address` (`file#unit`) as read in `epoch`; nothing is
+    /// recorded for an unknown epoch. A new epoch or a full memory starts over.
+    pub(crate) fn remember_unit(&mut self, epoch: Option<u64>, address: &str, text: String) {
+        let Some(epoch) = epoch else {
+            return;
+        };
+        if self.epoch != Some(epoch) {
+            self.blocks.clear();
+            self.units.clear();
+            self.epoch = Some(epoch);
+        }
+        if self.units.len() >= MAX_REMEMBERED_UNITS && !self.units.contains_key(address) {
+            self.units.clear();
+        }
+        self.units.insert(address.to_owned(), text);
+    }
+
+    /// The text of unit `address` this session last read in the same `epoch`, or `None` (unknown
+    /// epoch, a different epoch, never read).
+    pub(crate) fn unit_text(&self, epoch: Option<u64>, address: &str) -> Option<&str> {
+        if epoch.is_none() || self.epoch != epoch {
+            return None;
+        }
+        self.units.get(address).map(String::as_str)
     }
 }
 

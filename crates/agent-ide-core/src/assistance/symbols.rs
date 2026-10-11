@@ -230,6 +230,15 @@ impl Worker<'_> {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let sigil = requested.as_deref().and_then(links::sigil_address);
+        // An address, window, region or `path:line` reads as a numbered unit
+        // (symbol-read-edit-v1 §2.1); anything else, or a unit the file does not have, reads
+        // the pre-v1 way below, which also owns the refusal texts.
+        if sigil.is_none()
+            && let Some(text) = requested.as_deref()
+            && let Some(reply) = Box::pin(self.read_by_address(job, &binding, text)).await?
+        {
+            return Ok(reply);
+        }
         let mut lexical = None;
         let (path, range, title) = match (requested.as_deref(), sigil) {
             // A sigil address reads the name's first indexed definition.
@@ -383,15 +392,30 @@ impl Worker<'_> {
             seen.push(item.clone());
             match &item {
                 ReadItem::Symbol(address) => {
-                    let Ok(symbol) = SymbolPath::parse_item(address) else {
-                        return Err(FailureCode::UnknownSymbol);
-                    };
-                    let Some(file) = symbol.file().map(Path::to_path_buf) else {
-                        return Err(FailureCode::UnknownSymbol);
+                    // An address with a window or region, or a `path:line` location, reads as a
+                    // numbered unit (symbol-read-edit-v1 §2.1); other text, or a unit the file
+                    // lacks, takes the pre-v1 symbol path below.
+                    let request = target::parse_request(address);
+                    let legacy = SymbolPath::parse_item(address).ok();
+                    let file = match (&request, &legacy) {
+                        (Some(target::Requested::Line { file, .. }), _) => {
+                            self.relative_file(&binding, file.clone()).await?
+                        }
+                        (_, Some(symbol)) => symbol
+                            .file()
+                            .map(Path::to_path_buf)
+                            .ok_or(FailureCode::UnknownSymbol)?,
+                        (Some(target::Requested::Address(found)), None) => found
+                            .file()
+                            .map(Path::to_path_buf)
+                            .ok_or(FailureCode::UnknownSymbol)?,
+                        (None, None) => return Err(FailureCode::UnknownSymbol),
                     };
                     // A bare path of a file no IDE language reads has no outline to resolve: it
                     // reads as text, like `ide.read {path}`.
-                    let text_file = symbol.segments().is_empty() && Lang::for_path(&file).is_none();
+                    let text_file = request.is_none()
+                        && legacy.as_ref().is_some_and(|symbol| symbol.segments().is_empty())
+                        && Lang::for_path(&file).is_none();
                     let index = match self
                         .read_batch_file(job, &binding, &mut files, file.clone(), !text_file)
                         .await
@@ -436,12 +460,21 @@ impl Worker<'_> {
                         ));
                         continue;
                     };
-                    let block = match outline.find(&symbol) {
-                        Some(found) => {
+                    let unit = request.as_ref().and_then(|request| {
+                        let map = lang::address::AddressMap::build(outline, source);
+                        target::read_unit(&file, &map, source, request)
+                    });
+                    let found = legacy.as_ref().and_then(|symbol| outline.find(symbol));
+                    let block = match (unit, found) {
+                        (Some((text, read)), _) => {
+                            self.remember_unit_read(&binding, read);
+                            (text, Some(index))
+                        }
+                        (None, Some(found)) => {
                             let text = render::read_text(&file, Some(address), found.range, source);
                             (text, Some(index))
                         }
-                        None => (
+                        (None, None) => (
                             format!(
                                 "no such symbol: {address} — check ide.outline \
                                  {{\"path\":\"{}\"}}\n",
@@ -745,7 +778,7 @@ impl Worker<'_> {
     /// file whose trimmed content is the epoch and replaces the outbox's answer, so product tests
     /// can simulate a compaction by rewriting it; content that is not a number stands for an
     /// unknown epoch (`None`).
-    fn context_epoch(&self, binding: &BindingRef) -> Option<u64> {
+    pub(super) fn context_epoch(&self, binding: &BindingRef) -> Option<u64> {
         match crate::test_seams::var("AGENT_IDE_TEST_CONTEXT_EPOCH_FILE") {
             Some(seam) => std::fs::read_to_string(seam).ok()?.trim().parse().ok(),
             None => crate::assistance::outbox::SessionOutbox::context_epoch(&*self.shared, binding),
@@ -1781,7 +1814,7 @@ impl Worker<'_> {
     /// is exact, so the call needs no repeat, but semantic facts (usages, callers) are not
     /// included. `None` when no server owns the file (nothing is loading, failed or refused).
     /// A note makes the call a degraded success in the journal (QW-4): `job`'s call is marked.
-    fn lexical_note(&self, job: &Job, path: &Path, why: &Lexical) -> Option<String> {
+    pub(super) fn lexical_note(&self, job: &Job, path: &Path, why: &Lexical) -> Option<String> {
         let server = self.session_server(path)?;
         let state = match why {
             Lexical::Loading => "still indexing".to_owned(),
@@ -2193,7 +2226,7 @@ impl Worker<'_> {
     /// language server, and a Codex host posts a native hint for every shell command the agent
     /// runs meanwhile (its own `sleep` between polls), which would discard a correct result.
     /// What the result depends on is the observed file, and `source_matches` re-reads it.
-    async fn finish_symbol_job(
+    pub(super) async fn finish_symbol_job(
         &mut self,
         job: &Job,
         binding: &BindingRef,

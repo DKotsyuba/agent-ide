@@ -6261,6 +6261,20 @@ fn read_ranges_accept_one_line_closed_and_open_forms() {
     assert!(parse_line_range("7").is_none() && parse_line_range("7-").is_none());
 }
 
+/// The read forms accept windows, regions and `path:line` locations as symbol texts.
+#[test]
+fn read_accepts_windows_regions_and_locations() {
+    for call in [
+        json!({"symbol":"src/a.rs#Store/transcript:3-5"}),
+        json!({"symbol":"src/a.rs#@imports"}),
+        json!({"symbol":"/repo/src/a.rs:130"}),
+        json!({"symbols":["src/a.rs#@header","src/a.rs#Store/new:2","src/b.rs:88"]}),
+        json!({"items":[{"symbol":"src/a.rs#Store/transcript:10"},{"path":"docs/x.md","lines":"1-"}]}),
+    ] {
+        assert!(validate_call(AssistanceTool::Read, call.clone()).is_ok(), "{call}");
+    }
+}
+
 /// `ide.edit {patch}` validates alone beside an optional `operation_id`; any other field beside
 /// it, a non-string or an empty patch is refused, and the grammar is left to the worker.
 #[test]

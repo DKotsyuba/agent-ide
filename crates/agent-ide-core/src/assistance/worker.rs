@@ -65,6 +65,8 @@ pub(super) mod snapshots;
 mod symbols;
 #[path = "takeover.rs"]
 mod takeover;
+#[path = "target.rs"]
+mod target;
 #[path = "turn.rs"]
 mod turn;
 
