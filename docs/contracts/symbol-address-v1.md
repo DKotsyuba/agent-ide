@@ -111,7 +111,7 @@ A region is a file-level unit with a name starting with `@`. The vocabulary is c
 | `@imports` | A run of import statements, from the first to the last import line (blank and comment lines between two imports belong to the run). A second run is `@imports~2`. |
 | `@main` | Python: the `if __name__ == "__main__":` block, from its `if` line to its last body line. |
 | `@code/<leader>` | A top-level statement block that is neither a symbol nor an import (Python statements, Rust macro invocations, TypeScript expression statements). `<leader>` names the block (below). |
-| `@after/<prev>` | The blank and comment-only lines between two units, or after the last one, where `<prev>` is the segment text of the unit above (`@after/Store`, `@after/@imports`). |
+| `@after/<prev>` | The blank and comment-only lines between two units, or after the last one, where `<prev>` is the segment text of the unit above (`@after/Store`, `@after/@imports`). `<prev>` is one segment, so it is escaped like any name: a `/` in it prints `%2F` and a trailing `~k` prints `%7Ek` (`@after/@code%2Fthread_local!`, `@after/Foo%7E2`). |
 
 Constants, statics, type aliases, enums, mod declarations and module-level variables are **ordinary
 symbols** wherever the outline reports them (Rust `const`, `static`, `type`, `mod x;`; Python
@@ -140,7 +140,7 @@ language without rules gets the generic rules: `//` and `/* */` comments, no imp
 |---|---|---|
 | Rust | `//!` and `/*! */`, inner attributes `#![…]`, a `#!` shebang, `//` comments | `use`, `pub use`, `pub(…) use`, `extern crate`, with their attributes |
 | Python | shebang and coding comments, `#` comments, the module docstring | `import x`, `from x import y` (parenthesised continuations included) |
-| TypeScript/JavaScript | shebang, `//`, `/* */`, `/// <reference …>`, directive prologue (`"use strict"`) | `import …`, `import "x"`, `import x = require("y")`, `export … from "y"` |
+| TypeScript/JavaScript | shebang, `//`, `/* */`, `/// <reference …>`, directive prologue (`"use strict"`) | `import …`, `import "x"`, `import x = require("y")`, `export * from "y"` and `export * as n from "y"`; other `export { … } from "y"` forms are code blocks (`@code/export`) |
 | CSS, SCSS, Sass, LESS | `/* */`, `//`, `@charset` | `@import`, `@use`, `@forward` |
 | HTML | `<!doctype>`, `<!-- -->` comments | none |
 

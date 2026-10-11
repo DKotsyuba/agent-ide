@@ -295,13 +295,16 @@ impl LanguageSupport for TypeScript {
             }
             let text = lines[index..=last].join("\n");
             let (end, stop) = scan_signature(&text);
-            let range = LineRange::new(index as u32 + 1, last as u32 + 1);
+            let body = LineRange::new(index as u32 + 1, last as u32 + 1);
+            // A server outline starts a symbol at its JSDoc block; so does this one, which keeps
+            // a symbol's `:N` the same before and after the server loads (symbol-address-v1 §9).
+            let range = LineRange::new(jsdoc_start(&lines, index) as u32 + 1, last as u32 + 1);
             symbols.push(Symbol {
                 path: SymbolPath::new(Some(file.to_path_buf()), vec![name.clone()]),
                 kind,
                 name,
                 range,
-                body: range,
+                body,
                 signature: render_signature(&text[..end], stop, kind),
                 doc: None,
                 children: Vec::new(),
@@ -864,6 +867,22 @@ fn strip_modifiers(mut text: &str) -> &str {
         };
         text = rest;
     }
+}
+
+/// Index of the first line of the `/** … */` block that directly precedes the declaration on
+/// line `index` (no blank line between), or `index` itself when there is none.
+fn jsdoc_start(lines: &[&str], index: usize) -> usize {
+    let Some(previous) = index.checked_sub(1) else {
+        return index;
+    };
+    if !lines[previous].trim_end().ends_with("*/") {
+        return index;
+    }
+    (0..=previous)
+        .rev()
+        .find(|&at| lines[at].trim_start().starts_with("/**"))
+        .filter(|&at| (at..previous).all(|k| !lines[k].contains("*/")))
+        .unwrap_or(index)
 }
 
 /// The kind and name of a column-0 declaration line; `export default function` without a name
