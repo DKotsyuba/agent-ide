@@ -17,6 +17,8 @@ use std::{
 
 use async_lsp::lsp_types as lsp;
 
+/// Symbol addresses (`file#Type/method:N`), regions and the line partition.
+pub mod address;
 /// Line and brace helpers shared by the support modules of brace-delimited languages.
 pub mod brace;
 pub mod edits;
