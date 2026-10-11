@@ -14,8 +14,9 @@ use std::time::Instant;
 /// Files one reply may outline for position addresses.
 pub(super) const MAX_ADDRESS_FILES: usize = 16;
 
-/// Wall-clock budget of one reply for position addresses.
-pub(super) const ADDRESS_BUDGET: Duration = Duration::from_millis(1500);
+/// Wall-clock budget of one reply for position addresses. A language server opening its first
+/// files can take a second or two each, so the budget leaves room for a handful of files.
+pub(super) const ADDRESS_BUDGET: Duration = Duration::from_secs(5);
 
 /// Position addresses of a list of `(file, line)` locations, in request order.
 pub(super) struct Addresses {

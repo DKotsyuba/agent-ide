@@ -12358,7 +12358,7 @@ async fn product_style_sheets_answer_symbol_tools_without_a_server() {
         symbol["text"],
         "symbol: .btn — symbol, styles.css#.btn (lines 2–4)\nsignature: .btn\n\
          definition styles.css#.btn  (lines 2–4)\n\
-         defines: class name btn — also styles.css:7 .card .btn, theme.scss:1 .btn\n\
+         defines: class name btn — also styles.css#@media (min-width: 40em)/.card .btn (L7), theme.scss#.btn (L1)\n\
          usages: 0 indexed in 0 files (src 0, tests 0)\n\
          links: 1 style variable used here\n\
          \x20 --brand  → no indexed declaration\n\
