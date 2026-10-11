@@ -37,7 +37,7 @@ file      = relative path, no "..", as today
 path      = segment { "/" segment }
 segment   = name [ "~" ordinal ]               ; a symbol, ordinal >= 2
           | "@" region [ "~" ordinal ]         ; a region, first segment only (§5)
-window    = line [ "-" line ]                  ; relative to the unit's first line, 1-based, inclusive
+window    = line [ "-" [ line ] ]              ; relative to the unit's first line, 1-based, inclusive; "N-" runs to the unit's last line
 line      = digit1 { digit }
 ```
 
@@ -150,8 +150,9 @@ reads have no addresses; `path`, `lines` and `path:line` remain their only forms
 
 ## 6. Line windows
 
-- `file#unit:N` is the one line `N`; `file#unit:N-M` is lines `N..=M`, both relative to the first
-  line of the unit's span. `1 <= N <= M`.
+- `file#unit:N` is the one line `N`; `file#unit:N-M` is lines `N..=M`; `file#unit:N-` is lines `N..`
+  to the unit's last line; all relative to the first line of the unit's span. `1 <= N <= M`.
+  `Window.last` is `Option<u32>` (`None` for `N-`), and `Display` prints the form it parsed.
 - `M` beyond the span is clamped to its last line and the result says so. `N` beyond the span is
   `LineOutOfRange { length }`; the caller decides to clamp. A window never leaves its unit.
 - A position address printed by any result always carries a single `:N`.
@@ -164,7 +165,7 @@ Names are fixed when the foundation lands; the semantics below are the contract.
 
 ```rust
 pub struct Address { /* file: Option<PathBuf>, segments: Vec<String> (decoded), window: Option<Window> */ }
-pub struct Window { pub first: u32, pub last: u32 }            // relative, 1-based, inclusive
+pub struct Window { pub first: u32, pub last: Option<u32> }    // relative, 1-based, inclusive; None = to the unit end
 pub enum Parsed { Address(Address), Location { file: PathBuf, line: u32, column: Option<u32> } }
 impl Address { pub fn parse(text: &str) -> Result<Parsed, AddressError>; /* Display = canonical text */ }
 
@@ -180,7 +181,7 @@ pub struct Unit {
 }
 pub struct Resolved { pub unit: usize, pub span: LineRange, pub window: Option<LineRange>,
                       pub bytes: Range<usize>, pub clamped: bool }  // absolute lines and byte offsets
-pub struct Located { pub unit: usize, pub address: Address }         // position address, window = {n, n}
+pub struct Located { pub unit: usize, pub address: Address }         // position address, window = {n, Some(n)}
 pub enum ResolveError { UnknownUnit { near: Vec<usize> }, LineOutOfRange { length: u32 }, NoFile }
 ```
 
@@ -285,3 +286,20 @@ The provider's contract tests (the evidence M-029 and M-030 may reuse):
 
 A mutation that must be caught: drop the `~k` suffix for duplicates (uniqueness test fails) and
 shift `N` to be absolute (stability test fails).
+
+## 12. Stub signatures for consumers (published before the Epic freeze)
+
+Landed first by M-028 task "foundation" as compiling stubs (`todo!()` bodies, `#[ignore]`d contract
+tests), in `agent_ide_core::lang::address` unless noted. They map M-029's six needs
+(symbol-read-edit-v1 §6) one to one; region names in addresses carry the `@` prefix (§5).
+
+| M-029 need | Signature |
+|---|---|
+| 1 parse and `Display` round trip, typed window | `Address::parse(&str) -> Result<Parsed, AddressError>`; `impl Display for Address`; `Address::window(&self) -> Option<Window>`; `Window::to_lines(self, span: LineRange) -> Result<(LineRange, bool), ResolveError>` (second value: clamped) |
+| 2 unit over symbols and regions | `AddressMap::unit(&self, path: &SymbolPath) -> Option<&Unit>` (`Unit.span` includes doc comments, attributes and decorators; `Unit.address` is the canonical form; a region is the one-segment path `@imports`) |
+| 3 total over every line, address string | `AddressMap::at_line(&self, line: u32) -> Option<Located>`; `AddressMap::address_at(&self, file: &Path, line: u32) -> Option<String>` (`file#unit:N`, no absolute line) |
+| 4 same regions without a language server | `outline_from_source` is unchanged; `AddressMap::build(&outline, source)` consumes either outline, so the addresses of an edited candidate are `AddressMap::build(&lang.outline_from_source(file, candidate)?, candidate)` |
+| 5 region as insert anchor | `AddressMap::insert_site(&self, source: &str, lang: &dyn LanguageSupport, anchor: &Address, where_: InsertWhere) -> Result<InsertSite, LangError>`: a region anchor places `After` at its last line + 1 (`@imports` after the last import; `@header` for a file without imports, via `imports_insertion_line`) and `Before` at its first line; a symbol anchor delegates to `LanguageSupport::insert_site`. The trait is unchanged. |
+| 6 duplicate names | canonical `~k` forms of §4; `AddressMap::resolve(&Address)` parses them back to exactly that unit |
+
+Consumers never format or parse an address themselves; they call `Address` and `AddressMap`.
