@@ -549,10 +549,14 @@ pub struct OutlineFilter<'a> {
 }
 
 /// Renders a file as one row per unit in file order, regions included:
-/// `<first>–<last>  <address>  <signature>  // <doc>` (regions have no signature; blank `@after`
+/// `<first>–<last> <address>  <signature>  // <doc>` (regions have no signature; blank `@after`
 /// regions are skipped; a test module is one row ending `[N tests collapsed]`). `filter` limits
 /// symbols to the selected kinds (a container of a selected member stays for context, tests stay
-/// whole) and hides regions unless it asks for them.
+/// whole) and hides regions unless it asks for them. Complete unfiltered delivery has no
+/// redundant file header or total footer; a kind filter keeps its cut summary, collapsed test
+/// rows keep their own counts, and an empty delivery names the file explicitly. The address
+/// still ends at two spaces so signatures containing spaces cannot become part of the address.
+/// This pure renderer performs no I/O; the caller appends source-fallback provenance separately.
 pub fn address_outline_text(
     outline: &Outline,
     map: &super::address::AddressMap,
@@ -592,12 +596,7 @@ pub fn address_outline_text(
             keep[p] = true;
         }
     }
-    let mut out = format!(
-        "{}  ({} lines, {})\n",
-        outline.file.display(),
-        outline.line_count,
-        outline.language
-    );
+    let mut out = String::new();
     let (mut symbols, mut regions, mut tests, mut total) = (0usize, 0usize, 0usize, 0usize);
     let mut collapsed_until = 0u32;
     for (i, unit) in units.iter().enumerate() {
@@ -611,7 +610,7 @@ pub fn address_outline_text(
                 }
                 if keep[i] {
                     regions += 1;
-                    out.push_str(&format!("{}  {}\n", unit.span, unit.address));
+                    out.push_str(&format!("{} {}\n", unit.span, unit.address));
                 }
             }
             UnitKind::Symbol(SymbolKind::Test) => {
@@ -627,7 +626,7 @@ pub fn address_outline_text(
                 collapsed_until = unit.span.end;
                 tests += members;
                 out.push_str(&format!(
-                    "{}  {}  {} [{members} tests collapsed]\n",
+                    "{} {}  {} [{members} tests collapsed]\n",
                     unit.span, unit.address, unit.signature
                 ));
             }
@@ -643,7 +642,7 @@ pub fn address_outline_text(
                         .map(|doc| format!("  // {doc}"))
                         .unwrap_or_default();
                     out.push_str(&format!(
-                        "{}  {}  {}{doc}\n",
+                        "{} {}  {}{doc}\n",
                         unit.span, unit.address, unit.signature
                     ));
                 }
@@ -655,17 +654,19 @@ pub fn address_outline_text(
     } else {
         String::new()
     };
-    match filter {
-        None => out.push_str(&format!("  ({symbols} symbols{region_note}")),
-        Some(f) => out.push_str(&format!(
+    if out.is_empty() {
+        out.push_str(&format!("outline: {}: no rows\n", outline.file.display()));
+    }
+    if let Some(f) = filter {
+        out.push_str(&format!(
             "  ({total} symbols; showing {symbols}{region_note} by kinds {}",
             f.requested
-        )),
+        ));
+        if tests > 0 {
+            out.push_str(&format!("; {tests} tests collapsed"));
+        }
+        out.push_str(")\n");
     }
-    if tests > 0 {
-        out.push_str(&format!("; {tests} tests collapsed"));
-    }
-    out.push_str(")\n");
     out
 }
 
@@ -1335,6 +1336,60 @@ mod tests {
         assert_eq!(
             text,
             "a.rs  (20 lines, alpha)\n    1  pub fn Foo()\n    3    pub fn bar()\n   16  mod tests [2 tests collapsed]\n  (4 symbols; showing 2 by kinds method; tests collapsed: 2)\n"
+        );
+    }
+
+    /// Complete addressed outlines retain all source facts without header/count repetition;
+    /// filters and empty files still explain their exceptional delivery.
+    #[test]
+    fn address_outline_omits_redundant_framing_and_preserves_unit_rows() {
+        let doc = "Returns the fixed qualification value, without side effects.";
+        let source = format!(
+            "//! Qualification fixture.\n\n/// {doc}\npub fn value() -> i32 {{\n    7\n}}\n"
+        );
+        let mut value = symbol("value", SymbolKind::Function, 3, 6, Some(doc));
+        value.signature = "pub fn value() -> i32".into();
+        let outline = Outline {
+            file: PathBuf::from("src/lib.rs"),
+            language: crate::lang::testing::ALPHA,
+            line_count: 6,
+            symbols: vec![value],
+        };
+        let map = super::super::address::AddressMap::build(&outline, &source);
+        let text = address_outline_text(&outline, &map, None);
+        assert_eq!(
+            text,
+            format!(
+                "1–2 src/lib.rs#@header\n3–6 src/lib.rs#value  pub fn value() -> i32  // {doc}\n"
+            )
+        );
+        // Same successful source-fallback sample as the recorded E002 protocol measurement:
+        // addresses and regions now fit below its 213-byte total, provenance included.
+        let provenance =
+            "outline: from source, exact (rust-analyzer unavailable; no need to repeat)\n";
+        assert!(text.len() + provenance.len() < 213);
+        let filter = OutlineFilter {
+            kinds: &[],
+            regions: true,
+            requested: "region",
+        };
+        let filtered = address_outline_text(&outline, &map, Some(&filter));
+        assert!(filtered.starts_with("1–2 src/lib.rs#@header\n"));
+        assert!(!filtered.contains("pub fn value"));
+        assert!(filtered.contains("showing 0, 1 regions by kinds region"));
+        let empty = Outline {
+            file: PathBuf::from("empty.rs"),
+            language: crate::lang::testing::ALPHA,
+            line_count: 0,
+            symbols: vec![],
+        };
+        assert_eq!(
+            address_outline_text(
+                &empty,
+                &super::super::address::AddressMap::build(&empty, ""),
+                None
+            ),
+            "outline: empty.rs: no rows\n"
         );
     }
 

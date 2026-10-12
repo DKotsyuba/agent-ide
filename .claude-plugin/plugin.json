@@ -1,7 +1,7 @@
 {
   "name": "agent-ide",
   "version": "0.10.8",
-  "description": "Agent IDE coding-companion skill: find a symbol address, read the symbol, replace it or edit lines inside it, with the ide.* tools.",
+  "description": "Ten ide.* tools: source reads/edits, symbol cards or positional lookup, call chains and diagnostic inspection. Public ide.context is removed.",
   "author": {
     "name": "DKotsyuba"
   },

@@ -96,7 +96,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Edit by address. Replace a symbol with its new doc and body:\n`{\"symbol\":\"src/a.rs#Type/method\",\"content\":\"…\"}`. Change inside it with `old`/`new`\nscoped to the symbol, or `content` for a window `…/method:3-5`. Also `op`\ninsert/delete/rename, `add_import`/`remove_import`, `files` for several files and `patch`\nfor apply_patch. All changes apply or none; the reply is immediate and the project check\n(cargo check, pyright or tsc) arrives by itself.",
+    "description": "Edit by address. Replace a symbol with its new doc and body:\n`{\"symbol\":\"src/a.rs#Type/method\",\"content\":\"…\"}`. Change inside it with `old`/`new`\nscoped to the symbol, or `content` for a window `…/method:3-5`. Also `op`\ninsert/delete/rename, `add_import`/`remove_import`, `files` for several files. All changes apply or none; the reply is immediate and the project check\n(cargo check, pyright or tsc) arrives by itself.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -218,10 +218,6 @@
           "description": "Optional name that makes a retry safe: repeating it never applies the edit twice.",
           "type": "string"
         },
-        "patch": {
-          "description": "A Codex apply_patch body (Add File, Update File), applied atomically. Use it alone.",
-          "type": "string"
-        },
         "path": {
           "type": "string"
         },
@@ -253,7 +249,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Call graph of symbols: callers, callees or both, depth 1–3, at most 60 nodes, every node\nan address, tests collapsed. List a signature's call sites here before changing it.",
+    "description": "Call chains for impact, architecture, indirect faults or cross-language connections. Use for\nsignature/public changes or shared refactors; tiny edits need ide.symbol. Start depth 2,\nexpand only as needed (1–3; 60 nodes). callers = impact; callees = execution/dependency path;\nboth = both sides. tests:true expands tests. `{\"symbol\":\"a.rs#f\",\"depth\":2}`.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -266,7 +262,7 @@
         },
         "direction": {
           "default": "callers",
-          "description": "`callers`: who calls it (blast radius); `callees`: what it calls; `both`.",
+          "description": "callers: impact of changing it; callees: execution/dependency path; both: both sides.",
           "enum": [
             "callers",
             "callees",
@@ -500,20 +496,20 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Cards for symbols: signature, doc, address, usages (src and tests, with source lines),\ncallers and callees as addresses, and with `history` the last commits. Takes addresses or\nbare names (several matches list their addresses). Replaces grep for usages and callers;\nlist the construction sites before changing a constructor.",
+    "description": "Symbol card: signature/doc/definition/usages/history and immediate neighbors (callers/callees\n1–3 all mean direct). Address or bare name; ambiguous names list matches.\n`{\"symbol\":\"a.rs#f\",\"callers\":1}`. For deeper call chains use ide.graph.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "callees": {
           "default": 0,
-          "description": "Callees to list, 0–3 (0 = none).",
+          "description": "0 omits callees; 1–3 all return immediate neighbors. Use ide.graph for deeper call chains.",
           "maximum": 3,
           "minimum": 0,
           "type": "integer"
         },
         "callers": {
           "default": 1,
-          "description": "Caller levels to list, 0–3 (0 = none).",
+          "description": "0 omits callers; 1–3 all return immediate neighbors. Use ide.graph for deeper call chains.",
           "maximum": 3,
           "minimum": 0,
           "type": "integer"

@@ -243,3 +243,21 @@ fn redirected_parent_confines_collection_and_rejects_malformed_overrides() {
     assert!(resolve_root(Some(selected.join("../escape").into_os_string())).is_err());
     assert!(resolve_root(Some(selected.join("missing").into_os_string())).is_err());
 }
+
+/// An existing regular file, including a symlink to it, is not a rendezvous parent; rejecting
+/// it before collection prevents callers from sweeping state under an invalid operator value.
+#[test]
+fn nondirectory_parent_is_rejected_before_collection() {
+    let root = scratch("nondirectory-parent");
+    let file = root.join("parent-file");
+    fs::write(&file, "not a directory").unwrap();
+    let link = root.join("parent-link");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    for parent in [file, link] {
+        assert!(
+            resolve_root(Some(parent.clone().into_os_string())).is_err(),
+            "an existing file cannot be a rendezvous parent: {}",
+            parent.display()
+        );
+    }
+}

@@ -1,7 +1,8 @@
 //! Bounded MCP discovery, finite Application routing, and fail-open Assistance feedback.
 //!
-//! This module has no peer-domain implementation of its own. It validates the eleven logical tool
-//! inputs, carries trusted host transport context, and honestly reports an unavailable or
+//! This module has no peer-domain implementation of its own. It advertises ten public tools and
+//! validates their inputs plus the private Context transport, carries trusted host context, and
+//! honestly reports an unavailable or
 //! incomplete result until Workspace, Intelligence, and Changes return their typed facts.
 
 use std::{
@@ -68,12 +69,12 @@ const MAX_BYTE_OFFSET: u64 = crate::workspace::observation::MAX_SOURCE_BYTES as 
 const MAX_ACTIVATION_ID_BYTES: usize = 128;
 const MAX_HOOK_BYTES: usize = 64 * 1024;
 
-/// Names the only logical MCP methods exposed by Assistance.
+/// Names Assistance operations, including the private legacy Context transport operation.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum AssistanceTool {
     /// Creates or retries one bounded Workspace activation operation.
     Start,
-    /// Requests bounded context from Intelligence when that peer is available.
+    /// Private engine operation reused by inspect diagnostics/problems; never a public MCP route.
     Context,
     /// Requests a bounded Changes diff when that peer is available.
     Diff,
@@ -96,7 +97,8 @@ pub enum AssistanceTool {
 }
 
 impl AssistanceTool {
-    /// Returns the stable MCP discovery name for this logical method.
+    /// Returns the public MCP name or private historical transport label for this operation.
+    /// Context's label is internal only; it is neither advertised nor registered as a public call.
     pub const fn mcp_name(self) -> &'static str {
         match self {
             Self::Start => "ide.start",
@@ -142,7 +144,10 @@ fn tool_accepts_result_kind(tool: AssistanceTool, kind: ResultKind) -> bool {
     matches!(
         (tool, kind),
         (AssistanceTool::Start, ResultKind::Activation)
-            | (AssistanceTool::Context, ResultKind::Context)
+            | (
+                AssistanceTool::Context,
+                ResultKind::Context | ResultKind::Inspect
+            )
             | (AssistanceTool::Diff, ResultKind::Diff)
             | (AssistanceTool::Stop, ResultKind::Stop)
             | (AssistanceTool::Outline, ResultKind::Outline)
@@ -158,7 +163,7 @@ fn tool_accepts_result_kind(tool: AssistanceTool, kind: ResultKind) -> bool {
 pub struct ToolSchema {
     /// Logical method selected by the schema.
     pub tool: AssistanceTool,
-    /// MCP-visible stable tool name.
+    /// Stable public tool name or private Context transport label, excluded from public discovery.
     pub name: &'static str,
     /// JSON Schema object enforcing the bounded model-facing arguments.
     pub input_schema: Value,
@@ -212,7 +217,8 @@ fn describe_languages(description: &str) -> String {
         .replace("{manifests_tail}", &tail)
 }
 
-/// Returns exactly the eleven current Assistance schemas regardless of daemon availability.
+/// Returns ten public schemas and the private Context validation schema, independent of availability.
+/// Public router registration and catalog projection exclude Context; stable indexes remain internal.
 pub fn tool_schemas() -> [ToolSchema; 11] {
     let mut environment_languages = checked_language_ids();
     environment_languages.sort_unstable();
@@ -243,7 +249,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "type": "object", "additionalProperties": false,
                 "properties": {
                     "path": {"type": "string", "minLength": 1, "maxLength": MAX_RELATIVE_PATH_BYTES, "description": "File relative to the project root; returns its source with diagnostics."},
-                    "byte_offset": {"type": "integer", "minimum": 0, "maximum": MAX_BYTE_OFFSET, "description": "Continue a truncated source reply from this byte offset."},
+                    "byte_offset": {"type": "integer", "minimum": 0, "maximum": MAX_BYTE_OFFSET, "description": "Zero-based UTF-8 semantic position, never a continuation cursor."},
                     "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."},
                     "kind": {"type": "string", "enum": ["problems"], "description": "`problems`: the project check results instead of a file."},
                     "language": {"type": "string", "enum": checked_language_ids(), "description": "With `problems`: limit to one language."},
@@ -263,6 +269,10 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
             json!({
                 "type": "object", "additionalProperties": false,
                 "properties": {
+                    "kind": {"type":"string", "enum":["problems", "diagnostics"], "description":"problems: project checks; diagnostics: file provider reports."},
+                    "path": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"With diagnostics: worktree-relative file."},
+                    "language": {"type":"string", "enum":checked_language_ids(), "description":"With problems: limit to one language."},
+                    "offset": {"type":"integer", "minimum":0, "maximum":MAX_PROBLEM_OFFSET, "description":"With problems: continue from this problem index."},
                     "detail_ref": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES, "description": "Reference from an earlier reply: continue that result."},
                     "detail_refs": {"type": "array", "minItems": 1, "maxItems": super::outbox::MAX_DETAIL_REFS, "items": {"type": "string", "minLength": 1, "maxLength": MAX_DETAIL_REF_BYTES}, "description": "Several references answered in order in one reply; not with `detail_ref`."}
                 }
@@ -338,9 +348,11 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "properties": {
                     "symbol": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES, "description": "Address `src/a.rs#Type/method`, or a bare name to search the project."},
                     "symbols": {"type": "array", "minItems": 1, "maxItems": super::batch::MAX_SYMBOL_ENTRIES, "items": {"type": "string", "minLength": 1, "maxLength": MAX_SYMBOL_PATH_BYTES}, "description": "Up to 8 addresses or bare names in one call, request order; a failed one fails only itself."},
+                    "path": {"type":"string", "minLength":1, "maxLength":MAX_RELATIVE_PATH_BYTES, "description":"With byte_offset: semantic use-site; not symbol/symbols."},
+                    "byte_offset": {"type":"integer", "minimum":0, "maximum":MAX_BYTE_OFFSET, "description":"Zero-based UTF-8 position; split/out-of-file offsets refuse. Pages use ide.inspect."},
                     "usages": {"type": "boolean", "default": true, "description": "Include usages (src/tests split, with source lines)."},
-                    "callers": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1, "description": "Caller levels to list, 0–3 (0 = none)."},
-                    "callees": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0, "description": "Callees to list, 0–3 (0 = none)."},
+                    "callers": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1, "description": "0 omits callers; 1–3 all return immediate neighbors. Use ide.graph for deeper call chains."},
+                    "callees": {"type": "integer", "minimum": 0, "maximum": 3, "default": 0, "description": "0 omits callees; 1–3 all return immediate neighbors. Use ide.graph for deeper call chains."},
                     "history": {"type": "boolean", "default": false, "description": "Include the last commits touching the definition (opt-in)."}
                 }
             }),
@@ -352,7 +364,7 @@ pub fn tool_schemas() -> [ToolSchema; 11] {
                 "properties": {
                     "symbol": {"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES, "description":"Address `src/a.rs#Type/method`, or a bare name to search the project."},
                     "symbols": {"type":"array", "minItems":1, "maxItems":super::batch::MAX_SYMBOL_ENTRIES, "items":{"type":"string", "minLength":1, "maxLength":MAX_SYMBOL_PATH_BYTES}, "description":"Up to 8 addresses or bare names in one call, request order; a failed one fails only itself."},
-                    "direction": {"type":"string", "enum":["callers", "callees", "both"], "default":"callers", "description":"`callers`: who calls it (blast radius); `callees`: what it calls; `both`."},
+                    "direction": {"type":"string", "enum":["callers", "callees", "both"], "default":"callers", "description":"callers: impact of changing it; callees: execution/dependency path; both: both sides."},
                     "depth": {"type":"integer", "minimum":1, "maximum":3, "default":2, "description":"Levels to expand; 2 is usually enough."},
                     "tests": {"type":"boolean", "default":false, "description":"Show test symbols as nodes (marked `[test]`) instead of collapsing them into one `+N tests` line per parent."}
                 }
@@ -524,10 +536,10 @@ pub enum ParameterError {
         /// The exact closed rule the field value violated.
         rule: FieldRule,
     },
-    /// `ide.context` named neither `path` nor `kind: "problems"`.
+    /// The private Context validator, reused by diagnostic inspection, lacks its target.
     ///
-    /// The published schema stays a plain object (providers such as GLM drop a tool whose schema
-    /// uses `allOf`/`if`/`else`), so this either-or rule lives here instead of in the schema.
+    /// Public schemas stay plain objects (some providers drop conditionals), so the target
+    /// requirement lives in validation rather than an `allOf`/`if`/`else` schema.
     ContextTarget,
     /// `ide.outline` requires a relative file or directory path.
     OutlineTarget,
@@ -660,8 +672,8 @@ impl ParameterError {
     }
 }
 
-/// Model-facing text for a context request that names neither a path nor the problems kind.
-const CONTEXT_TARGET_MESSAGE: &str = "ide.context needs either \"path\" or \"kind\":\"problems\".";
+/// Model-facing target refusal from the private engine reused by file diagnostic inspection.
+const CONTEXT_TARGET_MESSAGE: &str = "ide.inspect diagnostics needs \"path\".";
 /// Model-facing text for an outline request without its required path.
 const OUTLINE_TARGET_MESSAGE: &str =
     "ide.outline needs \"path\" (a file or directory relative to the worktree root).";
@@ -697,7 +709,15 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
         // `since_last` is set by the normalization below (a call without `mode`) and read back by
         // the daemon's own validation; it is never advertised.
         AssistanceTool::Diff => &["mode", "detail_ref", "provenance", "paths", "since_last"],
-        AssistanceTool::Inspect => &["detail_ref", "detail_refs", "wait_ms"],
+        AssistanceTool::Inspect => &[
+            "detail_ref",
+            "detail_refs",
+            "wait_ms",
+            "kind",
+            "path",
+            "language",
+            "offset",
+        ],
         AssistanceTool::Stop => &["activation_id"],
         AssistanceTool::Edit => &[
             "operation_id",
@@ -718,7 +738,14 @@ fn allowed_fields(tool: AssistanceTool) -> &'static [&'static str] {
             "symbol", "path", "lines", "symbols", "ranges", "items", "force",
         ],
         AssistanceTool::Symbol => &[
-            "symbol", "usages", "callers", "callees", "history", "symbols",
+            "symbol",
+            "usages",
+            "callers",
+            "callees",
+            "history",
+            "symbols",
+            "path",
+            "byte_offset",
         ],
         AssistanceTool::Graph => &["symbol", "direction", "depth", "tests", "symbols"],
         AssistanceTool::Test => &[
@@ -806,8 +833,28 @@ pub(crate) fn validate_normalized_call(
     tool: AssistanceTool,
     mut parameters: Value,
 ) -> Result<ValidatedCall, ParameterError> {
-    // Both catalogs advertise the problems spelling; the legacy context route stays accepted.
-    let tool = fold_inspect_problems(tool, &parameters);
+    // Public inspect queries have closed modes before reusing the private Context operation.
+    if tool == AssistanceTool::Inspect && parameters.get("kind").is_some() {
+        let object = parameters
+            .as_object()
+            .ok_or(ParameterError::InvalidObject)?;
+        let allowed: &[&str] = match object.get("kind").and_then(Value::as_str) {
+            Some("problems") => &["kind", "language", "offset"],
+            Some("diagnostics") => &["kind", "path"],
+            _ => {
+                return Err(invalid_field(
+                    "kind",
+                    FieldRule::OneOf("problems or diagnostics"),
+                ));
+            }
+        };
+        if let Some(field) = object
+            .keys()
+            .find(|field| !allowed.contains(&field.as_str()))
+        {
+            return Err(ParameterError::UnknownField(echoable_field(field)));
+        }
+    }
     let batch_key = super::batch::batch_key(tool, &parameters);
     let size = serde_json::to_vec(&parameters)
         .ok()
@@ -924,7 +971,39 @@ pub(crate) fn validate_normalized_call(
             }
         }
         AssistanceTool::Symbol | AssistanceTool::Graph if object.contains_key("symbols") => {
+            if object.contains_key("path") || object.contains_key("byte_offset") {
+                return Err(invalid_field(
+                    "target",
+                    FieldRule::OneOf("symbol, symbols, or path with byte_offset"),
+                ));
+            }
             super::batch::validate_symbols(tool, object)?;
+        }
+        AssistanceTool::Symbol
+            if object.contains_key("path") || object.contains_key("byte_offset") =>
+        {
+            if object
+                .keys()
+                .any(|field| !matches!(field.as_str(), "path" | "byte_offset"))
+            {
+                return Err(invalid_field(
+                    "target",
+                    FieldRule::OneOf("path with byte_offset alone"),
+                ));
+            }
+            let path = required_string(object, "path", MAX_RELATIVE_PATH_BYTES)?;
+            if let Some(rule) = path_shape_rule(path) {
+                return Err(invalid_field("path", rule));
+            }
+            if object
+                .get("byte_offset")
+                .is_none_or(|value| value.as_u64().is_none_or(|offset| offset > MAX_BYTE_OFFSET))
+            {
+                return Err(invalid_field(
+                    "byte_offset",
+                    FieldRule::NonNegativeInteger(MAX_BYTE_OFFSET),
+                ));
+            }
         }
         AssistanceTool::Symbol => {
             required_string(object, "symbol", MAX_SYMBOL_PATH_BYTES)?;
@@ -1242,6 +1321,11 @@ pub(crate) fn validate_normalized_call(
             }
         }
 
+        AssistanceTool::Inspect if object.contains_key("kind") => {
+            // Reuse the private query validator without changing the receiving public tool:
+            // replies, retained selections and pushed job subjects continue to say ide.inspect.
+            validate_normalized_call(fold_inspect_problems(tool, &parameters), parameters.clone())?;
+        }
         AssistanceTool::Inspect => {
             // OUTBOX-r3 §8.5: one reference, up to eight in order, or none (the session's facts),
             // each with an optional bounded wait.
@@ -2815,7 +2899,7 @@ fn codex_route_identity(meta: &Map<String, Value>) -> Option<CodexRouteIdentity>
     CodexRouteIdentity::new(root_session, actor).ok()
 }
 
-/// Hosts the static eleven-tool rmcp surface even when no trusted host attachment exists.
+/// Hosts the static ten-tool public rmcp surface even without a trusted host attachment.
 #[derive(Clone)]
 pub struct StdioFacade {
     /// Connect-only Application endpoint and finite deadline.
@@ -2831,8 +2915,8 @@ pub struct StdioFacade {
     /// Only the managed Codex constructor sets this. Publication never activates anything and is
     /// skipped entirely when the trusted request metadata lacks a root session or actor.
     publisher: Option<SharedCodexPublisher>,
-    /// Which per-host catalog `tools/list` and the server paragraph answer with. Calls validate
-    /// the full eleven-tool surface for every host regardless of this choice.
+    /// Which per-host catalog and paragraph answer discovery. Both have ten public tools; only
+    /// patch advertisement differs. Private Context validation remains outside the rmcp router.
     catalog_host: CatalogHost,
     /// Generated static tool router; independent of daemon availability.
     router: rmcp::handler::server::tool::ToolRouter<Self>,
@@ -2851,7 +2935,7 @@ impl StdioFacade {
         }
     }
 
-    /// Creates a disconnected eleven-tool facade for managed startup failure.
+    /// Creates a disconnected ten-tool facade for managed startup failure.
     ///
     /// Discovery remains static and calls validate normally before returning unavailable. The
     /// facade contains neither a host attachment nor an IPC path, so it cannot disclose request
@@ -3683,7 +3767,6 @@ impl StdioFacade {
         parameters: Value,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let tool = fold_inspect_problems(tool, &parameters);
         let stage_parameters = parameters.clone();
         let call_started = std::time::Instant::now();
         let host_kind = parse_host_kind(&context.meta).ok();
@@ -4806,7 +4889,7 @@ fn claude_envelope_reconnect_retry_hint_survives_in_content_text() {
 }
 
 impl StdioFacade {
-    /// Builds the eleven-tool router with the language-derived description phrases filled in
+    /// Builds the ten-tool public router with the language-derived description phrases filled in
     /// from the registered languages (see [`describe_languages`]).
     pub(super) fn described_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
         let mut router = Self::tool_router();
@@ -4832,20 +4915,6 @@ impl StdioFacade {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         self.call(AssistanceTool::Start, parameters, context).await
-    }
-
-    /// Source of one `path` with its current diagnostics, or with `kind: "problems"` the
-    /// project's latest check problems (paged). Use `problems` to see what is broken instead of
-    /// running the build; read code by symbol with ide.read.
-    #[tool(name = "ide.context", input_schema = tool_schemas()[1].input_schema.as_object().expect("tool schema is an object").clone(),
-        annotations(read_only_hint = true, open_world_hint = false))]
-    async fn context(
-        &self,
-        Parameters(parameters): Parameters<Value>,
-        context: RequestContext<RoleServer>,
-    ) -> CallToolResult {
-        self.call(AssistanceTool::Context, parameters, context)
-            .await
     }
 
     /// What changed since your last diff (the first call: everything uncommitted), paged. A `mode`
@@ -4876,10 +4945,9 @@ impl StdioFacade {
             .await
     }
 
-    /// Read code by address: `src/a.rs#Type/method` returns doc and body numbered from 1,
-    /// `…/method:3-5` a window, `src/a.rs#@imports` or `#@header` a region, `path:line` (from
-    /// grep) the enclosing symbol. Read many at once with `items`. Use `path` and `lines` only
-    /// for non-code files.
+    /// `{"symbol":"a.rs#f"}`: doc and body, numbered; `#f:1-3`: window; `#@imports`/`#@header`:
+    /// regions. `{"path":"a.rs"}` reads source; `lines` bounds a range, `items` batches reads.
+    /// Prefer symbol units for code. Semantic positions use ide.symbol.
     #[tool(name = "ide.read", input_schema = tool_schemas()[7].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn read(
@@ -4890,10 +4958,10 @@ impl StdioFacade {
         self.call(AssistanceTool::Read, parameters, context).await
     }
 
-    /// Cards for symbols: signature, doc, address, usages (src and tests, with source lines),
-    /// callers and callees as addresses, and with `history` the last commits. Takes addresses or
-    /// bare names (several matches list their addresses). Replaces grep for usages and callers;
-    /// list the construction sites before changing a constructor.
+    /// Symbol card: signature/doc/definition/usages/history, immediate neighbors (positive
+    /// callers/callees). `{"symbol":"a.rs#f"}`; ide.graph for call chains. Or
+    /// `{"path":"a.rs","byte_offset":42}`: UTF-8 use-site definitions/references,
+    /// explicit lexical/unavailable evidence.
     #[tool(name = "ide.symbol", input_schema = tool_schemas()[8].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn symbol(
@@ -4904,8 +4972,9 @@ impl StdioFacade {
         self.call(AssistanceTool::Symbol, parameters, context).await
     }
 
-    /// Call graph of symbols: callers, callees or both, depth 1–3, at most 60 nodes, every node
-    /// an address, tests collapsed. List a signature's call sites here before changing it.
+    /// Call chains for impact/architecture/indirect faults: signature/public changes, shared
+    /// refactors, cross-language connections. Start depth 2 (1–3; 60 nodes), expand only as needed;
+    /// tests:true expands tests. `{"symbol":"a.rs#f","depth":2}`. Tiny edits: ide.symbol.
     #[tool(name = "ide.graph", input_schema = tool_schemas()[9].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn graph(
@@ -4930,10 +4999,9 @@ impl StdioFacade {
         self.call(AssistanceTool::Test, parameters, context).await
     }
 
-    /// Read what Agent IDE holds for you. Results of long work (test runs, project checks,
-    /// pending answers) arrive by themselves in an `<agent-ide>` block, so never poll for them.
-    /// `{}` hands over everything ready now; `detail_ref` or `detail_refs` read results or their
-    /// next pages.
+    /// `{}`: facts; `detail_ref`/`detail_refs`: pages. `{"kind":"problems"}`: checks.
+    /// `{"kind":"diagnostics","path":"a.rs"}`: file reports with freshness, unknown never clean.
+    /// No build/check starts. Long results arrive by themselves; never poll.
     #[tool(name = "ide.inspect", input_schema = tool_schemas()[3].input_schema.as_object().expect("tool schema is an object").clone(),
         annotations(read_only_hint = true, open_world_hint = false))]
     async fn inspect(
@@ -4977,36 +5045,36 @@ impl StdioFacade {
 
 /// Connect-time instructions the host shows the model next to the tool list: the one-paragraph
 /// case for the IDE over native file tools, and the two rules every reply relies on.
-pub(super) const SERVER_INSTRUCTIONS: &str = "Agent IDE: language-server source tools. Call \
-ide.start once per task, ide.stop at the end. Work on code by address `file#Type/method` \
-(every result prints them; `path:line` from grep works too): ide.outline lists a file's \
-addresses, ide.read reads doc and body, ide.edit replaces a symbol or lines inside it, \
-ide.symbol and ide.graph find usages and callers, ide.test runs tests. Results of long work \
-arrive by themselves in an <agent-ide> block, so never poll or wait. Native tools stay for \
-non-code files.";
+pub(super) const SERVER_INSTRUCTIONS: &str = "Agent IDE: ide.start once, ide.stop at task end. \
+ide.outline: addresses; ide.read: source; ide.edit: changes; ide.test: tests. \
+ide.symbol {\"symbol\":\"a.rs#f\"}: card, immediate neighbors; {\"path\":\"a.rs\",\"byte_offset\":42}: \
+semantic position. ide.graph {\"symbol\":\"a.rs#f\",\"depth\":2} traverses call chains for impact, architecture or \
+indirect faults: callers=impact, callees=dependencies, both=both sides. Expand 1–3 only as needed; \
+tests:true expands tests. Tiny edits: card. ide.inspect {\"kind\":\"problems\"}: checks; \
+{\"kind\":\"diagnostics\",\"path\":\"a.rs\"}: file reports. Long results arrive by themselves in an \
+<agent-ide> block; never poll. Native fallback remains.";
 
-/// The Codex server paragraph: the same rules without the two tools its catalog omits
-/// (`ide.graph` and `ide.context`; callers and callees come from `ide.symbol`, project problems
-/// from `ide.inspect {"kind":"problems"}`).
-pub(super) const SERVER_INSTRUCTIONS_CODEX: &str = "Agent IDE: language-server source tools. Call \
-ide.start once per task, ide.stop at the end. Work on code by address `file#Type/method` \
-(every result prints them; `path:line` from grep works too): ide.outline lists a file's \
-addresses, ide.read reads doc and body, ide.edit replaces a symbol or lines inside it (or \
-takes an apply_patch body), ide.symbol finds usages and callers, ide.test runs tests, \
-ide.inspect {\"kind\":\"problems\"} lists project problems. Results of long work arrive by \
-themselves in an <agent-ide> block, so never poll or wait. Native tools stay for non-code files.";
+/// The Codex paragraph teaches the same ten tools and capability split, plus native patches.
+pub(super) const SERVER_INSTRUCTIONS_CODEX: &str = "Agent IDE: ide.start once, ide.stop at task end. \
+ide.outline: addresses; ide.read: source; ide.edit: changes (also apply_patch); \
+ide.test: tests. ide.symbol {\"symbol\":\"a.rs#f\"}: card, immediate neighbors; \
+{\"path\":\"a.rs\",\"byte_offset\":42}: semantic position. ide.graph {\"symbol\":\"a.rs#f\",\"depth\":2} \
+traverses call chains for impact, architecture or indirect faults: callers=impact, callees=dependencies, \
+both=both sides. Expand 1–3 only as needed; tests:true expands tests. Tiny edits: card. \
+ide.inspect {\"kind\":\"problems\"}: checks; {\"kind\":\"diagnostics\",\"path\":\"a.rs\"}: file reports. \
+Long results arrive by themselves in an <agent-ide> block; never poll. Native fallback remains.";
 
 /// Which per-host catalog `tools/list` and the connect-time instructions answer with.
 ///
-/// Both catalogs describe the same server: every tool and parameter ever advertised stays
-/// accepted by the call validator (`ide.context`, `ide.graph`, `wait_ms`); the choice only
-/// changes what the host is shown, because Codex loads every schema at once and pays for each.
+/// Both catalogs expose the same ten public names; the owner removed public `ide.context`.
+/// Its private transport remains reusable. Codex alone advertises native edit patches; legacy
+/// parameter compatibility such as `wait_ms` remains independent of public route removal.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CatalogHost {
-    /// Claude, Claude-compatible launchers and an unmanaged `mcp`: all eleven tools.
+    /// Claude, Claude-compatible launchers and an unmanaged `mcp`: ten public tools.
     #[default]
     Claude,
-    /// Managed Codex: nine tools; no `ide.context` or `ide.graph`.
+    /// Managed Codex: the same ten public tools, with native edit patches advertised.
     Codex,
 }
 
@@ -5032,37 +5100,29 @@ impl CatalogHost {
     ///
     /// Every advertised schema is slimmed (`slim_schema`) and omits the legacy aliases and the
     /// deprecated `source_ref` (the validator still accepts them), so the model reads only the
-    /// symbol-first forms. Claude keeps every tool; Codex drops `ide.context` and `ide.graph`.
-    /// Both hosts let `ide.inspect` serve project problems (`kind`, `language`, `offset`, exactly
-    /// the `ide.context` problems parameters, which `ide.inspect` folds into that tool on arrival).
+    /// symbol-first forms. Both hosts exclude the private Context operation.
+    /// Only Codex advertises the native `patch` edit form; every host's validator still accepts
+    /// it for compatibility. Projection clones schemas before trimming, never mutating another
+    /// host's catalog or the backend validation schema.
+    /// Both hosts let `ide.inspect` serve project problems and file diagnostics via the private
+    /// Context engine; the removed public route is never registered.
     pub fn catalog(self, tools: Vec<rmcp::model::Tool>) -> Vec<rmcp::model::Tool> {
-        let problems = tool_schemas()[1].input_schema["properties"].clone();
         tools
             .into_iter()
-            .filter(|tool| {
-                self == Self::Claude || !matches!(&*tool.name, "ide.context" | "ide.graph")
-            })
+            .filter(|tool| &*tool.name != "ide.context")
             .map(|mut tool| {
-                if &*tool.name == "ide.inspect" {
-                    let mut schema = (*tool.input_schema).clone();
-                    if let Some(Value::Object(properties)) = schema.get_mut("properties") {
-                        for name in ["kind", "language", "offset"] {
-                            properties.insert(name.to_owned(), problems[name].clone());
-                        }
-                    }
-                    tool.input_schema = std::sync::Arc::new(schema);
-                    tool.description = Some(
-                        format!(
-                            "{} `{{\"kind\":\"problems\"}}` lists the project check problems.",
-                            tool.description.as_deref().unwrap_or_default()
-                        )
-                        .into(),
-                    );
-                }
                 let mut schema = (*tool.input_schema).clone();
                 if let Some(Value::Object(properties)) = schema.get_mut("properties") {
                     for legacy in ["file_path", "old_string", "new_string", "source_ref"] {
                         properties.remove(legacy);
+                    }
+                    if self == Self::Claude && &*tool.name == "ide.edit" {
+                        properties.remove("patch");
+                        tool.description = tool.description.as_deref().map(|description| {
+                            description
+                                .replace(" and `patch`\nfor apply_patch", "")
+                                .into()
+                        });
                     }
                 }
                 let mut schema = Value::Object(schema);
@@ -5109,8 +5169,8 @@ fn slim_schema(schema: &mut Value) {
     }
 }
 
-/// Folds `ide.inspect {"kind":"problems",…}` into the `ide.context` problems request it stands
-/// for, so the Codex catalog can omit `ide.context`; every other call passes through unchanged.
+/// Selects private Context validation for inspect problems/diagnostics; dispatch keeps Inspect.
+/// The caller closes inspect modes before this translation; other calls pass through unchanged.
 fn fold_inspect_problems(tool: AssistanceTool, parameters: &Value) -> AssistanceTool {
     match (tool, parameters.get("kind")) {
         (AssistanceTool::Inspect, Some(_)) => AssistanceTool::Context,
@@ -5159,7 +5219,7 @@ fn advertised_text_never_teaches_waiting() {
 fn catalog_stays_within_the_budgets() {
     for (host, paragraph, total_limit) in [
         (CatalogHost::Claude, SERVER_INSTRUCTIONS, 15 * 1024),
-        (CatalogHost::Codex, SERVER_INSTRUCTIONS_CODEX, 13 * 1024),
+        (CatalogHost::Codex, SERVER_INSTRUCTIONS_CODEX, 14 * 1024),
     ] {
         assert!(
             paragraph.len() <= 700,
@@ -5190,10 +5250,9 @@ fn catalog_stays_within_the_budgets() {
     }
 }
 
-/// Claude advertises all eleven tools; Codex nine (no `ide.context`, no `ide.graph`), its
-/// `ide.inspect` also takes the problems parameters and its paragraph names neither dropped tool,
-/// while the validator keeps accepting every tool and `ide.inspect {"kind":"problems"}` folds into
-/// the `ide.context` request.
+/// Both public catalogs have ten tools including graph, with no context route. Inspect modes
+/// reuse the private Context engine; positional Symbol targets cannot mix with address batches.
+/// Only Codex advertises native patches; compatibility validation accepts them on both hosts.
 #[test]
 fn per_host_catalogs_differ_only_by_the_declared_subset() {
     let facade = StdioFacade::new(std::path::PathBuf::from("/nonexistent-runtime"));
@@ -5203,30 +5262,136 @@ fn per_host_catalogs_differ_only_by_the_declared_subset() {
             .map(|tool| tool.name.to_string())
             .collect::<Vec<_>>()
     };
-    assert_eq!(names(CatalogHost::Claude).len(), 11);
+    assert_eq!(names(CatalogHost::Claude).len(), 10);
     let codex = names(CatalogHost::Codex);
-    assert_eq!(codex.len(), 9, "{codex:?}");
-    assert!(
-        !codex
-            .iter()
-            .any(|name| name == "ide.context" || name == "ide.graph")
-    );
+    assert_eq!(names(CatalogHost::Claude), codex);
+    assert_eq!(codex.len(), 10, "{codex:?}");
+    assert!(!codex.iter().any(|name| name == "ide.context"));
+    assert!(codex.iter().any(|name| name == "ide.graph"));
     let inspect = CatalogHost::Codex
         .catalog(facade.router.list_all())
         .into_iter()
         .find(|tool| tool.name == "ide.inspect")
         .unwrap();
-    for property in ["kind", "language", "offset", "detail_ref", "detail_refs"] {
+    for property in [
+        "kind",
+        "path",
+        "language",
+        "offset",
+        "detail_ref",
+        "detail_refs",
+    ] {
         assert!(
             inspect.input_schema["properties"].get(property).is_some(),
             "{property}"
         );
     }
-    assert!(!CatalogHost::Codex.instructions().contains("ide.graph"));
+    assert!(CatalogHost::Codex.instructions().contains("ide.graph"));
     assert!(CatalogHost::Claude.instructions().contains("ide.graph"));
     assert_eq!(CatalogHost::parse("codex"), Some(CatalogHost::Codex));
     assert_eq!(CatalogHost::parse("zcode"), None);
     assert!(validate_call(AssistanceTool::Graph, json!({"symbol": "a#b"})).is_ok());
+    assert!(
+        validate_call(
+            AssistanceTool::Symbol,
+            json!({"path":"a.rs","byte_offset":0})
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_call(
+            AssistanceTool::Inspect,
+            json!({"kind":"diagnostics","path":"a.rs"})
+        )
+        .is_ok()
+    );
+    for arguments in [
+        json!({"path":"a.rs"}),
+        json!({"byte_offset":0}),
+        json!({"path":"a.rs","byte_offset":0,"symbol":"f"}),
+        json!({"path":"a.rs","byte_offset":0,"symbols":["f"]}),
+    ] {
+        assert!(validate_call(AssistanceTool::Symbol, arguments).is_err());
+    }
+    for arguments in [
+        json!({"kind":"unknown","path":"a.rs"}),
+        json!({"kind":"diagnostics"}),
+        json!({"kind":"problems","path":"a.rs"}),
+        json!({"kind":"diagnostics","path":"a.rs","language":"rust"}),
+        json!({"kind":"diagnostics","path":"a.rs","detail_ref":"x"}),
+    ] {
+        assert!(validate_call(AssistanceTool::Inspect, arguments).is_err());
+    }
+    for host in [CatalogHost::Claude, CatalogHost::Codex] {
+        let catalog = host.catalog(facade.router.list_all());
+        let symbol = catalog
+            .iter()
+            .find(|tool| tool.name == "ide.symbol")
+            .unwrap();
+        let graph = catalog
+            .iter()
+            .find(|tool| tool.name == "ide.graph")
+            .unwrap();
+        assert!(
+            symbol
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("immediate neighbors")
+        );
+        assert!(
+            graph
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("Call chains")
+        );
+        assert!(
+            graph
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("{\"symbol\":\"a.rs#f\",\"depth\":2}")
+        );
+        for property in ["callers", "callees"] {
+            assert!(
+                symbol.input_schema["properties"][property]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("all return immediate neighbors")
+            );
+        }
+        assert!(host.instructions().contains("immediate neighbors"));
+        assert!(host.instructions().contains("traverses call chains"));
+        let edit = host
+            .catalog(facade.router.list_all())
+            .into_iter()
+            .find(|tool| tool.name == "ide.edit")
+            .unwrap();
+        assert_eq!(
+            edit.input_schema["properties"].get("patch").is_some(),
+            host == CatalogHost::Codex,
+            "{host:?} native patch advertisement"
+        );
+        for teaching in ["`patch`", "apply_patch"] {
+            assert_eq!(
+                edit.description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(teaching),
+                host == CatalogHost::Codex,
+                "{host:?} native patch teaching: {teaching}"
+            );
+        }
+    }
+    assert!(
+        validate_call(
+            AssistanceTool::Edit,
+            json!({"patch":"*** Begin Patch\n*** Add File: a.rs\n+fn f() {}\n*** End Patch"})
+        )
+        .is_ok(),
+        "unadvertised native patches remain accepted for compatibility"
+    );
     assert_eq!(
         fold_inspect_problems(AssistanceTool::Inspect, &json!({"kind": "problems"})),
         AssistanceTool::Context
@@ -5271,7 +5436,7 @@ impl rmcp::ServerHandler for StdioFacade {
         .with_instructions(self.catalog_host.instructions())
     }
 
-    /// Serves the static per-host catalog (eleven tools for Claude, nine for Codex), with private
+    /// Serves the static ten-tool public catalogs for both hosts, with private
     /// cache hints for modern requests only.
     ///
     /// The catalog is static per binary, but a short private TTL keeps a client from holding

@@ -92,7 +92,9 @@ async fn tools_for(host: &str) -> Value {
 async fn snapshot_matches_the_binary_tools_list() {
     let result = tools().await;
     let tools = result["tools"].as_array().cloned().unwrap();
-    assert_eq!(tools.len(), 11, "{result}");
+    assert_eq!(tools.len(), 10, "{result}");
+    assert!(tools.iter().all(|tool| tool["name"] != "ide.context"));
+    assert!(tools.iter().any(|tool| tool["name"] == "ide.graph"));
     let expected: Value = serde_json::from_str(include_str!("../schemas/tools.json")).unwrap();
     assert_eq!(
         serde_json::to_value(&tools).unwrap(),
@@ -101,19 +103,19 @@ async fn snapshot_matches_the_binary_tools_list() {
     );
 }
 
-/// Verifies the Codex snapshot equals the Codex catalog: nine tools, no `ide.context` and no
-/// `ide.graph`, with `ide.inspect` also serving the project problems.
+/// Verifies the Codex snapshot equals the Codex catalog: ten tools including `ide.graph`, no
+/// `ide.context`, with `ide.inspect` also serving the project problems.
 #[tokio::test]
 async fn codex_snapshot_matches_the_codex_catalog() {
     let result = tools_for("codex").await;
     let tools = result["tools"].as_array().cloned().unwrap();
-    assert_eq!(tools.len(), 9, "{result}");
+    assert_eq!(tools.len(), 10, "{result}");
     let names: Vec<_> = tools
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect();
     assert!(
-        !names.contains(&"ide.context") && !names.contains(&"ide.graph"),
+        !names.contains(&"ide.context") && names.contains(&"ide.graph"),
         "{names:?}"
     );
     let expected: Value =

@@ -108,6 +108,8 @@ The result arrives by itself in an <agent-ide> block. Result reference: {{ detai
 {{ refusal("This result reference was never issued.", "Repeat the original IDE call to get a fresh result.") }}
 {%- elif code == "source_unavailable" and resolution_detail == "diff:not_a_git_repository" -%}
 {{ refusal("This directory is not a Git repository.", "Review the files with native tools.") }}
+{%- elif code == "source_unavailable" and resolution_detail == "symbol:invalid_byte_offset" -%}
+{{ refusal("The semantic position is outside the file or splits a UTF-8 character.", "Repeat ide.symbol with a valid byte_offset.") }}
 {%- elif code == "source_unavailable" and (resolution_detail is startingwith("inspect:source_changed") or resolution_detail is startingwith("context:source_changed") or resolution_detail == "inspect:source_stale") -%}
 {{ refusal("The source changed since this result was captured.", "Read the requested unit again with ide.read.", resolution_message if (resolution_detail is startingwith("inspect:source_changed:") or resolution_detail is startingwith("context:source_changed:")) else "") }}
 {%- elif code == "source_unavailable" and resolution_detail is startingwith("diff:activation_commit_unknown") -%}

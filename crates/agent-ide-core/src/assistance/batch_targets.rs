@@ -436,15 +436,16 @@ impl Worker<'_> {
         if let Some(kinds) = request.get("kinds") {
             single["kinds"] = kinds.clone();
         }
-        // (path, text, failed, paged): a paged outline is too large to embed and is listed.
-        let mut blocks: Vec<(String, String, bool, bool)> = Vec::with_capacity(paths.len());
+        // A paged outline is listed; exact source counts stay separate from its rendered text.
+        let mut blocks = Vec::with_capacity(paths.len());
         for path in &paths {
             let mut call = single.clone();
             call["path"] = serde_json::json!(path);
             job.parameters = call;
             job.failure_detail = None;
             // Boxed: the single form routes its own batch keys back here.
-            let answer = Box::pin(self.outline(job)).await;
+            let mut summary = None;
+            let answer = Box::pin(self.outline_with_summary(job, &mut summary)).await;
             job.parameters = request.clone();
             match answer {
                 Ok((
@@ -458,20 +459,20 @@ impl Worker<'_> {
                     if !text.ends_with('\n') {
                         text.push('\n');
                     }
-                    blocks.push((path.clone(), text, false, continuation));
+                    blocks.push((path.clone(), text, false, continuation, summary));
                 }
                 Err(FailureCode::ProviderLoading) if job.park_until.is_some() => {
                     return Err(FailureCode::ProviderLoading);
                 }
                 Ok((other, ..)) => {
                     let text = rendered_text(other, AssistanceTool::Outline);
-                    blocks.push((path.clone(), text, true, false));
+                    blocks.push((path.clone(), text, true, false, None));
                 }
                 Err(code) => {
                     let detail = job.failure_detail.take();
                     let text =
                         rendered_text(PeerReply::Error { code, detail }, AssistanceTool::Outline);
-                    blocks.push((path.clone(), text, true, false));
+                    blocks.push((path.clone(), text, true, false, None));
                 }
             }
         }
@@ -490,7 +491,7 @@ impl Worker<'_> {
             )
         };
         let full = |index: usize, count: usize| {
-            let (_, _, failed, paged) = &blocks[index];
+            let (_, _, failed, paged, _) = &blocks[index];
             *failed || (index < count && !*paged)
         };
         let compose = |count: usize| {
@@ -507,11 +508,11 @@ impl Worker<'_> {
                 text.push_str(&format!("; +{more} more files matched"));
             }
             text.push('\n');
-            for (index, (path, block, ..)) in blocks.iter().enumerate() {
+            for (index, (path, block, _, _, summary)) in blocks.iter().enumerate() {
                 if full(index, count) {
                     text.push_str(block);
                 } else {
-                    text.push_str(&listed_line(path, block));
+                    text.push_str(&listed_line(path, block, *summary));
                 }
             }
             text
@@ -591,11 +592,20 @@ fn glob_files(root: &Path, pattern: &str) -> (Vec<String>, usize) {
     (matched, more)
 }
 
-/// The one line a file past the reply budget gets: `<path> (<lines> lines, <symbols> symbols)
-/// → ide.outline {"path":…}`, read from its outline block (header `<path>  (<n> lines, …)`,
-/// one line per symbol after it). A block the single form paged (it opens with its `page` line)
-/// holds only its first page, so its line names the file's lines alone.
-fn listed_line(path: &str, block: &str) -> String {
+/// Names a listed-only path, exact source line/symbol counts and one call that delivers it.
+/// `summary` is the full-file metadata collected before pagination; a paged block names only
+/// its line count as before. Directory blocks have no source summary and retain their legacy
+/// header fallback. JSON encoding keeps the suggested call valid for every path.
+fn listed_line(path: &str, block: &str, summary: Option<(u32, usize)>) -> String {
+    if let Some((lines, symbols)) = summary {
+        let call = Value::String(path.to_owned());
+        if block.starts_with("page ") {
+            return format!("{path} ({lines} lines) → ide.outline {{\"path\":{call}}}\n");
+        }
+        return format!(
+            "{path} ({lines} lines, {symbols} symbols) → ide.outline {{\"path\":{call}}}\n"
+        );
+    }
     let header = block
         .lines()
         .find(|line| line.contains("  ("))
@@ -647,6 +657,20 @@ pub(super) fn rendered_text(reply: PeerReply, tool: AssistanceTool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A listed cut retains exact counts after ordinary outlines drop their redundant headers;
+    /// a paged cut retains the whole file's line count rather than counting delivered rows.
+    #[test]
+    fn listed_outline_uses_source_counts_without_a_rendered_header() {
+        assert_eq!(
+            listed_line("a.rs", "1 a.rs#value  fn value()\n", Some((8, 1))),
+            "a.rs (8 lines, 1 symbols) → ide.outline {\"path\":\"a.rs\"}\n"
+        );
+        assert_eq!(
+            listed_line("big.rs", "page 1; partial rows\n", Some((7500, 2500))),
+            "big.rs (7500 lines) → ide.outline {\"path\":\"big.rs\"}\n"
+        );
+    }
 
     #[test]
     fn entry_states_read_their_first_line() {

@@ -1,7 +1,8 @@
 # Model-facing text inventory (symbol-first audit)
 
 Every string a model reads while using the IDE, with where it lives, its size at the E-002 build
-(`eaeba10`) and now, and its status. The rule it serves: find an address in any result
+(`eaeba10`) and the historical r5 draft, and its status. Current owner-directed graph
+restoration measurements are recorded separately below. The rule it serves: find an address in any result
 (`src/a.rs#Type/method:7 (L123)`, `src/a.rs#@header`, `src/a.rs#@imports`), read the symbol (doc
 plus body), replace it or edit lines inside it; path ranges only for non-code files; nothing teaches
 polling, waiting, the file-version reference or a line-first habit. The guard is
@@ -14,6 +15,37 @@ Status: **rewritten** (new text), **trimmed** (same content, fewer bytes or old 
 to the M-028 address or M-029 read/edit modules and follows their contracts).
 
 ## Teaching text
+
+The table below retains the historical r5 draft figures, not current export measurements.
+The owner-directed catalog amendment restores `ide.graph` to Codex and then removes
+public `ide.context` from both hosts (ten public names each). Codex permits 14 KiB;
+Claude stays at 15 KiB;
+paragraphs 700 B, descriptions 600 B, properties 160 B, the start signature 700 B,
+and shipped skill ceilings 6/4 KiB stay unchanged. This is an owner amendment,
+not an Agent Tasks ratification of a new contract revision.
+
+The graph-only intermediate export completed before the context-removal amendment:
+`schemas/tools.json` then had eleven names/15,178 B compact JSON, and
+`schemas/tools-codex.json` ten names/14,191 B. Those exact exports remain in the
+working tree and are preserved as `graph-intermediate-tools*.json` under the designated
+`outline-fix/graph-return` evidence directory. They are historical intermediate artifacts,
+not exports of the final source. The latest owner order defers builds, final snapshot
+regeneration, tests and test migration; this candidate is source-complete/UNTESTED.
+
+Current literal source text, measured without building: Claude/Codex paragraphs 662/681 B;
+read/symbol/graph/inspect description comments 241/268/263/238 B; start signature 690 B;
+Claude/Codex skills 4,571/4,073 B; plugin manifests 287/1,032 B. Current served catalog
+totals and final exporter equality are **not measured**. Both snapshots must be regenerated
+through `cargo xtask contract update` when the owner resumes verification.
+
+The new capability split is source reads/related links through `ide.read`, exact UTF-8
+semantic positions through `ide.symbol {path,byte_offset}`, file provider diagnostics
+through `ide.inspect {kind:"diagnostics",path}`, and project checks through
+`ide.inspect {kind:"problems"}`. Positional cards and file reports reuse the existing
+observation, provider and freshness engine, retain continuation/source fences and explicit
+unknown/lexical evidence, and do not print source authority/version bookkeeping. Deferred
+Inspect queries keep the public name and source-bearing hook suppression. Public
+`ide.context` is unregistered; only the private transport/validation engine remains.
 
 The active model workflow in `docs/contracts/tools-v0.4.md` is guarded too: r5 refusal
 and deferred-result rules supersede the separately labeled operator compatibility record.
@@ -36,7 +68,7 @@ That record keeps unadvertised protocol compatibility without model idle-wait ad
 | `ide.edit` description (G) | `facade.rs:4917` | 873 | 451 | rewritten (no `source_ref`) |
 | Property texts, all tools (G) | `facade.rs:216` `tool_schemas()` | up to 609 each | at most 160 each | rewritten |
 | Advertised schemas as served (G) | `facade.rs` `CatalogHost::catalog`, `slim_schema` | 22,309 total | Claude 15,099; Codex 12,874 | trimmed (bounds dropped, aliases and `source_ref` unadvertised); both hosts advertise inspect problems; real binary export, compact JSON array sizes |
-| `ide.start` signature block (G) | `signature_card.rs:16` | 1,145 | 1,012 | rewritten (edit by symbol, regions) |
+| `ide.start` signature block (G) | `signature_card.rs:16` | 1,145 | 699 | rewritten (edit by symbol, regions; strict T-006 ceiling 700 B) |
 | Claude skill (G) | `skills/agent-ide/SKILL.md` | 33,349 | 3,243 | rewritten |
 | Codex skill (G) | `skills/codex/agent-ide/SKILL.md` | (none) | 2,764 | rewritten (new) |
 | Skill UI files (G) | `skills/agent-ide/agents/openai.yaml`, `skills/codex/agent-ide/agents/openai.yaml` | 331 | 344 / 344 | rewritten |

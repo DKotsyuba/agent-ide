@@ -93,10 +93,8 @@ pub(crate) fn owed_fact(
 ) -> Option<(FactKind, String, Option<String>)> {
     match reply {
         PeerReply::Pending { detail_ref }
-            if !matches!(
-                tool,
-                AssistanceTool::Start | AssistanceTool::Stop | AssistanceTool::Inspect
-            ) =>
+            if !matches!(tool, AssistanceTool::Start | AssistanceTool::Stop)
+                && (tool != AssistanceTool::Inspect || parameters.get("kind").is_some()) =>
         {
             let subject = format!("{} {}", tool.mcp_name(), call_target(tool, parameters));
             Some((
@@ -200,11 +198,13 @@ fn lost_fact(subjects: &[String]) -> Option<FactDraft> {
     })
 }
 
-/// Whether a tool's answer is derived from source text and so must never ride a hook carrier.
+/// Whether a job's answer is source-derived and must never ride a hook carrier.
+/// Inspect jobs are diagnostic/problem queries; ordinary detail retrieval creates no job.
 fn source_bearing(tool: AssistanceTool) -> bool {
     matches!(
         tool,
         AssistanceTool::Context
+            | AssistanceTool::Inspect
             | AssistanceTool::Diff
             | AssistanceTool::Outline
             | AssistanceTool::Read

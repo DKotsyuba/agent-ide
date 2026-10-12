@@ -54,7 +54,8 @@ pub fn effective_root() -> std::io::Result<PathBuf> {
 
 /// Resolves one injected operator value with the same validation used by [`effective_root`].
 /// Empty or absent values select the legacy parent; relative/traversing paths and filesystem
-/// canonicalization errors return an error without creating anything or selecting another root.
+/// canonicalization errors and non-directory results return an error without creating anything
+/// or selecting another root. Symlinks are resolved first; a symlink to a file is also rejected.
 fn resolve_root(value: Option<std::ffi::OsString>) -> std::io::Result<PathBuf> {
     let parent = value
         .filter(|value| !value.is_empty())
@@ -69,7 +70,14 @@ fn resolve_root(value: Option<std::ffi::OsString>) -> std::io::Result<PathBuf> {
             "Claude rendezvous parent must be absolute and normalized",
         ));
     }
-    fs::canonicalize(parent)
+    let parent = fs::canonicalize(parent)?;
+    if !fs::metadata(&parent)?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "Claude rendezvous parent must be a directory",
+        ));
+    }
+    Ok(parent)
 }
 
 /// Returns the full BLAKE3 digest, as hex, of one canonical rendezvous key's raw path bytes.

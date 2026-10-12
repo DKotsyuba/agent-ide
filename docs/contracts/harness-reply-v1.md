@@ -1,6 +1,6 @@
 # Harness reply v1 contract
 
-Revision: harness-reply-v1 r5; tracked boundary id `harness-reply-v1`, revision 5 (r5 raises the catalog ceilings of section 3 from 10/7 KiB to 15/13 KiB; the current served catalogs measure 15.1 KB for Claude and 12.9 KB for Codex; every other rule and budget is r4's). Provider: M-030 (`assistance/facade.rs`, `content.rs`, `assets/mcp/reply.jinja`, `signature_card.rs`, `hygiene.rs`, `snapshots.rs`, the skills). Consumers: M-028 (what search, outline, diff and error replies print for an address) and M-029 (what `ide.read` and `ide.edit` answer), both of which follow these rules in every reply they add or change. Consumes: [symbol-address-v1](symbol-address-v1.md) r2 for how a location prints and [symbol-read-edit-v1](symbol-read-edit-v1.md) r2 for the read and edit shapes. Vocabulary: [common](common.md); reply states: [reply-hygiene-v1](reply-hygiene-v1.md) and [agent-content-v0.2](agent-content-v0.2.md), whose Codex `structuredContent` copy this contract removes.
+Revision: harness-reply-v1 r5; tracked boundary id `harness-reply-v1`, revision 5. Historically r5 raised catalog ceilings from 10/7 KiB to 15/13 KiB (then 15.1 KB Claude, 12.9 KB Codex). The owner-directed amendment restores Codex `ide.graph`, authorizes 14 KiB for Codex, and removes public `ide.context` from both hosts (ten names each). This is not an Agent Tasks ratification of a new revision. Export history and deferred final measurements live in [model text inventory](../model-text-inventory.md); final source is UNTESTED under the owner’s source-only order. Other r5 rules remain. Provider: M-030 (`assistance/facade.rs`, `content.rs`, `assets/mcp/reply.jinja`, `signature_card.rs`, `hygiene.rs`, `snapshots.rs`, the skills). Consumers: M-028 (addresses) and M-029 (read/edit). Consumes: [symbol-address-v1](symbol-address-v1.md) r2 and [symbol-read-edit-v1](symbol-read-edit-v1.md) r2. Vocabulary: [common](common.md); reply states: [reply-hygiene-v1](reply-hygiene-v1.md) and [agent-content-v0.2](agent-content-v0.2.md).
 
 Purpose: an IDE reply costs the model about what the same fact costs from a native tool. It is one block of plain text, says only what the agent does not already know, and names the single next step when something went wrong.
 
@@ -16,14 +16,36 @@ Purpose: an IDE reply costs the model about what the same fact costs from a nati
 
 ## 2. Catalog per host
 
-Both hosts still accept every tool and parameter ever advertised (`ide.context`, `ide.graph`, `wait_ms`); only the advertised subset differs.
+Both hosts advertise the same ten public names, including `ide.graph`. The owner-authorized
+breaking amendment removes public `ide.context`, including direct calls; its private engine
+and transport remain reusable. Legacy parameter compatibility such as `wait_ms` remains.
+The native `ide.edit` `patch` property is advertised only to Codex; Claude keeps its old/new and
+address edit forms, and the backend still accepts patches on either host for compatibility.
 
 | Host | Advertised tools |
 |---|---|
-| Claude, Claude-compatible and unmanaged `mcp` | 11: start, context, diff, inspect, stop, edit, outline, read, symbol, graph, test |
-| Codex (managed) | 9: start, diff, inspect (also serves the project problems), stop, edit, outline, read, symbol (callers and callees through its depth parameters), test |
+| Claude, Claude-compatible and unmanaged `mcp` | 10: start, diff, inspect, stop, edit, outline, read, symbol, graph, test |
+| Codex (managed) | 10: start, diff, inspect (also serves the project problems), stop, edit, outline, read, symbol, graph, test |
 
 The host is the managed launcher's host; `mcp --host codex|claude` selects it for export. The server paragraph is per host and says the same thing in fewer words for Codex.
+
+`ide.symbol {"symbol":"a.rs#f","callers":1}` gives the symbol card and immediate
+neighbors; values 1–3 do not add levels. `ide.graph {"symbol":"a.rs#f","depth":2}`
+traverses call chains for impact, architecture or indirect faults. Use graph for
+signature/public changes, shared refactors or cross-language connections; tiny edits
+need only the card. Start depth 2, expand within 1–3 only as needed; callers traces impact,
+callees traces execution/dependencies, both traces both sides, and tests:true expands tests.
+
+Former context source reads use `ide.read {"path":"a.rs"}`; skeletons use `ide.outline`.
+`ide.symbol {"path":"a.rs","byte_offset":42}` resolves an exact UTF-8 use-site,
+returning definitions/references or explicit lexical/unavailable evidence without a file dump
+or raw authority/version bookkeeping. Invalid UTF-8 positions refuse; offsets are never
+continuation cursors. `ide.inspect {"kind":"diagnostics","path":"a.rs"}` reads provider
+reports using the existing source/generation/version fences; unknown stays unknown,
+unversioned nonempty counts stay provisional lower bounds. `kind:"problems"` remains the
+project check feed. Neither query starts a build/check, and bounded continuation uses
+`ide.inspect {"detail_ref":"…"}`. Deferred Inspect queries retain their public tool name;
+their source-derived reports remain suppressed on hook carriers and require reauthorization.
 
 ## 3. Byte budgets
 
@@ -33,14 +55,17 @@ The host is the managed launcher's host; `mcp --host codex|claude` selects it fo
 | One property description | at most 160 B |
 | Server paragraph | at most 700 B |
 | Claude catalog (descriptions plus input schemas, as served) | at most 15 KiB (E-002: 21.8 KiB) |
-| Codex catalog (as served) | at most 13 KiB |
+| Codex catalog (as served) | at most 14 KiB (owner-directed graph amendment; historical r5: 13 KiB) |
 | Claude skill | at most 6 KiB |
 | Codex skill | at most 4 KiB |
-| `ide.start` signature block | at most 1.5 KiB |
+| `ide.start` signature block | at most 700 B (T-006; historical r5 broader budget: 1.5 KiB) |
 | Read, outline and diff header | one line, at most 160 B |
 | Trailer per cut | one line, at most 160 B |
 
-`facade::catalog_stays_within_the_budgets` enforces the 600 B description, 160 B property, 700 B paragraph and catalog limits for both hosts. The catalog totals were first written as 10 KiB and 7 KiB before the schemas were measured; the advertised schemas carry structure (types, enums, defaults, nesting) that cannot go without losing a parameter, so the ceilings are the measured 15 KiB and 13 KiB. Every other budget is unchanged.
+`facade::catalog_stays_within_the_budgets` enforces the 600 B description, 160 B property,
+700 B paragraph and 15/14 KiB catalog limits. The historical 10/7 KiB ceilings became
+15/13 KiB in r5 after measurement; the owner's graph restoration raises only Codex to
+14 KiB. Description, property, paragraph, skill and strict 700 B signature ceilings stay unchanged.
 
 ## 4. Baseline
 

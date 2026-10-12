@@ -11,7 +11,7 @@
   "interface": {
     "displayName": "Agent IDE",
     "shortDescription": "Bounded ide.* workflow for active-session source edits",
-    "longDescription": "Loads the agent-ide skill so a coder subagent works by symbol address with the nine ide.* tools (start, diff, inspect, stop, edit, outline, read, symbol, test) when the Agent IDE MCP tools are active, with fail-open native fallback when they are not.",
+    "longDescription": "Ten ide.* tools (start, diff, inspect, stop, edit, outline, read, symbol, graph, test): symbol cards/positional lookup, graph call chains, inspect file diagnostics/check problems. Public ide.context is removed. Native fallback remains available.",
     "developerName": "DKotsyuba",
     "category": "Development",
     "capabilities": ["Interactive"],

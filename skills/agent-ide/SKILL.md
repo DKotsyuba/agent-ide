@@ -13,11 +13,12 @@ regions: `src/a.rs#@header` (leading comments) and `src/a.rs#@imports`.
 
 1. `ide.start` once per task; `ide.stop` when it ends.
 2. Find an address in any result: `ide.outline {"paths":["src/a.rs"]}` lists a file's symbols and
-   regions; `ide.symbol {"symbols":["src/a.rs#Store/get"]}` adds usages and callers (`ide.graph`
-   for deeper call trees); a grep hit `path:line` is also an address.
+   regions; `ide.symbol {"symbols":["src/a.rs#Store/get"],"callers":1}` gives a card with
+   signature/doc/definition/usages/history and immediate callers/callees; a grep hit `path:line`
+   is also an address.
 3. Read the symbol, doc plus body, numbered from 1 inside it:
    `ide.read {"items":[{"symbol":"src/a.rs#Store/get"},{"symbol":"src/a.rs#@imports"}]}`.
-   A window is `src/a.rs#Store/get:3-5`. Plain `path` and `lines` are for non-code files.
+   A window is `src/a.rs#Store/get:3-5`. Prefer units for code; `path`/`lines` also read source.
 4. Edit by address; the reply is immediate:
    - replace a symbol (doc and body): `ide.edit {"symbol":"src/a.rs#Store/get","content":"…"}`;
    - change text inside it: `ide.edit {"symbol":"src/a.rs#Store/get","old":"x: 0,","new":"x: 1,"}`;
@@ -29,6 +30,27 @@ regions: `src/a.rs#@header` (leading comments) and `src/a.rs#@imports`.
 
 Edits need no file-version reference: the current text is the check. A refusal prints the
 symbol's current numbered lines and the one repair step.
+
+## Cards and call chains
+
+Use `ide.symbol` for one symbol or a tiny edit. Its callers/callees values 1–3 all return
+direct neighbors (0 omits them), never deeper levels. For signature/public behavior changes,
+shared-function refactors, indirect faults, architecture or cross-language connections, use
+`ide.graph {"symbol":"src/a.rs#Store/get","direction":"callers","depth":2}`.
+Start at depth 2; expand within 1–3 only if needed. `callers` shows what a change can affect;
+`callees` traces the execution/dependency path; `both` explores both sides. `tests:true` expands
+test nodes. Graph is unnecessary for every small edit.
+
+## Former context capabilities
+
+Public `ide.context` is removed. Read source with `ide.read {"path":"a.rs"}`; skeletons
+with `ide.outline`. For a use-site or shadowed name:
+`ide.symbol {"path":"a.rs","byte_offset":42}`. Offsets are zero-based UTF-8 semantic
+positions, never page cursors; split/out-of-file positions refuse. Cards give
+definitions/references or explicit lexical/unavailable evidence, no file dump.
+`ide.inspect {"kind":"diagnostics","path":"a.rs"}` reads file provider reports;
+`ide.inspect {"kind":"problems"}` reads project checks. Unknown is never clean;
+unversioned counts are provisional lower bounds. Neither starts a check.
 
 ## Results arrive by themselves
 

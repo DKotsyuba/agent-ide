@@ -307,7 +307,7 @@ impl ExecutionProfileCause {
 pub enum ResultKind {
     /// Durable Workspace activated and authorized the exact binding.
     Activation,
-    /// Intelligence returned source context or the project problems page.
+    /// Private legacy source context. Public positional/diagnostic queries use Symbol/Inspect.
     Context,
     /// Changes composed evidence for a current Workspace comparison scope.
     Diff,
@@ -323,8 +323,8 @@ pub enum ResultKind {
     Graph,
     /// A background test run result from `ide.test`.
     Test,
-    /// The session's delivered facts or several references, gathered by one `ide.inspect` call
-    /// (`{}` or `detail_refs`, OUTBOX-r3 §8.5); plain text with no continuation of its own.
+    /// Inspect facts/references (OUTBOX-r3 §8.5), project check problems, or file provider diagnostics.
+    /// Diagnostic reports have their own bounded continuation; facts gathering remains unpaged.
     Inspect,
 }
 

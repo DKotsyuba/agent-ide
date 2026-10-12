@@ -1,32 +1,33 @@
 //! The call-signature block that ends every `ide.start` reply.
 //!
 //! Agents that cannot see the tool schemas cheaply (the Codex code mode prints the whole tool
-//! catalog, at most 13 KiB, once or more per agent) get the exact batch call shapes here instead,
-//! in at most 1536 bytes. The block follows the project card and the servers
+//! catalog, at most 14 KiB, once or more per agent) get the exact batch call shapes here instead,
+//! in at most 700 bytes. The block follows the project card and the servers
 //! line of the start reply (`docs/contracts/start-index-state-v1.md` §1) and shows one example per
 //! batch form of `docs/contracts/batch-api-v1.md`, the pushed-results rule and the required
 //! `ide.stop`. It is reply text read after a call, so it falls under the strict tier of
 //! `docs/contracts/reply-hygiene-v1.md` §2.
 
-/// Signature-block ceiling of harness-reply-v1 r5, independent of catalog size.
+/// Signature-block ceiling of M030/T006, within harness-reply-v1 r5's broader budget.
 #[cfg(test)]
-const MAX_SIGNATURE_BYTES: usize = 1536;
+const MAX_SIGNATURE_BYTES: usize = 700;
 
 /// The signature block text, without a leading or trailing newline.
-const SIGNATURE_BLOCK: &str = r#"call forms (JSON arguments): find an address, read the symbol, edit it
-ide.outline {"paths":["src/a.rs","src/b.rs"]} or {"glob":"crates/x/src/**/*.rs"}
-ide.symbol {"symbols":["src/a.rs#Store/get","src/b.rs#Kind"],"callers":1}
-ide.read {"items":[{"symbol":"src/a.rs#Store/get"},{"symbol":"src/a.rs#Store/get:3-5"},{"symbol":"src/a.rs#@imports"}]}
-ide.edit {"symbol":"src/a.rs#Store/get","content":"fn get() {}"} or {"symbol":"src/a.rs#Store/get","old":"x: 0,","new":"x: 1,"}
-ide.edit {"files":[{"path":"src/a.rs","changes":[{"symbol":"src/a.rs#Store/get","old":"x: 0,","new":"x: 1,"}]},{"path":"src/new.rs","create":true,"content":"fn new() {}\n"}]}
-ide.test {"targets":[{"symbol":"src/a.rs#parse"},{"path":"tests/cli.rs"},{"pattern":"roles_"}]}
-ide.inspect {"detail_refs":["<ref>","<ref>"]} or {}
-Addresses: src/a.rs#Type/method:7 (L123) is printed by every result; path:line from grep works too. Results of long work arrive by themselves in an <agent-ide> block; never wait for them. End the task with ide.stop."#;
+const SIGNATURE_BLOCK: &str = r#"call forms (JSON): symbol = card/direct neighbors; graph = call chains
+ide.outline {"paths":["a.rs","b.rs"]} or {"glob":"src/*.rs"}
+ide.symbol {"symbols":["a.rs#f"]}
+ide.graph {"symbol":"a.rs#f","direction":"callers","depth":2}
+ide.read {"items":[{"symbol":"a.rs#f:1-3"},{"symbol":"a.rs#@imports"}]}
+ide.edit {"symbol":"a.rs#f","content":"fn f() {}"} or {"symbol":"a.rs#f","old":"0","new":"1"}
+ide.edit {"files":[{"path":"a.rs","changes":[{"symbol":"a.rs#f","old":"0","new":"1"}]}]}
+ide.test {"targets":[{"symbol":"a.rs#f"},{"path":"tests/f.rs"},{"pattern":"f_"}]}
+ide.inspect {"detail_refs":["<ref>"]} or {}
+Results arrive by themselves in an <agent-ide> block. End the task with ide.stop."#;
 
 /// Returns the call-signature block that follows the project card in an `ide.start` reply.
 ///
-/// The text is constant, language-neutral and at most 1536 bytes; every example is a JSON object
-/// in the argument shape of the named tool's batch form.
+/// The text is constant, language-neutral and at most 700 bytes; every example is a JSON object
+/// accepted by the named tool; batch forms and a depth-2 call-chain example are included.
 pub(crate) fn signature_block() -> &'static str {
     SIGNATURE_BLOCK
 }
@@ -46,6 +47,7 @@ mod tests {
             "ide.outline {\"paths\"",
             "{\"glob\"",
             "ide.symbol {\"symbols\"",
+            "ide.graph {\"symbol\"",
             "ide.test {\"targets\"",
             "ide.edit {\"symbol\"",
             "\"files\"",
@@ -55,6 +57,8 @@ mod tests {
             assert!(block.contains(form), "{form}");
         }
         assert!(!block.contains("wait_ms"), "nothing teaches waiting");
+        assert!(block.contains("card/direct neighbors; graph = call chains"));
+        assert!(block.contains("\"direction\":\"callers\",\"depth\":2"));
         assert!(block.contains("arrive by themselves in an <agent-ide> block"));
         assert!(block.contains("End the task with ide.stop."));
         assert!(!block.starts_with('\n') && !block.ends_with('\n'));
@@ -87,6 +91,6 @@ mod tests {
                 examples += 1;
             }
         }
-        assert_eq!(examples, 10);
+        assert_eq!(examples, 11);
     }
 }

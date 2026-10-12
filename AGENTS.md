@@ -51,7 +51,7 @@ Release commands (the full flow is `docs/release.md`):
 | `crates/agent-ide-core/src/intelligence/` | LSP client and server seam, view/backend reuse, semantic context, the cross-language name index |
 | `crates/agent-ide-core/src/changes/` | versioned patch/rename application, recovery journal, diff/finish |
 | `crates/agent-ide-core/src/execution/` | bounded admission, jobs, cancellation/reaping, seatbelt confinement |
-| `crates/agent-ide-core/src/assistance/` | the eleven-tool MCP facade, host binding, Codex/Claude adapters, replies and hooks |
+| `crates/agent-ide-core/src/assistance/` | the host-specific MCP facade, host binding, Codex/Claude adapters, replies and hooks |
 | `crates/agent-ide-core/src/checks/`, `feed/` | confined background project checks and the problem feed |
 | `crates/agent-ide-core/src/app/` | daemon lifecycle/IPC, launcher configuration, SQLite store, transport |
 | `crates/agent-ide-core/src/lang/` | the language contract: registry, outlines, edits, rendering, name facts |
@@ -72,17 +72,21 @@ unit tests enforce both rules.
 - stdout of `mcp` is protocol-only; secrets and host metadata never enter
   replies, diagnostics or logs (the TrustedTransport Debug impl is redaction-
   tested).
-- Every `ide.edit` carries an `operation_id`: a repeated id never applies the
-  edit twice; edits are validated against the exact `source_ref` bytes and
-  refused together with nothing written when addresses overlap or do not match.
+- `ide.edit` accepts an optional `operation_id`: a repeated supplied id never
+  applies the edit twice, and an omitted id is generated. Read and edit use
+  symbol/region addresses; current text and delivered-window guards protect
+  freshness without a required file-version reference. Overlapping or stale
+  changes are refused atomically with nothing written.
 - Replies are written for agents: bounded pages with `detail_ref` continuation,
   closed vocabularies, `isError` on every business refusal, results of long work
   pushed in `<agent-ide>` blocks (never a poll prompt; `ide.inspect` reads them
   early), honest `unavailable`/`outcome_unknown` results — never fabricated
   success. A failed IDE never vetoes native host tools.
-- The resident daemon lives in a shared per-repository rendezvous
-  `/private/tmp/ai-r-<hash>` keyed by the canonical Git common directory; hook
-  keys live in `/private/tmp/ai-k-<hash>`. Ownership and staleness are checked
+- Claude runtime and hint children use the common operator-selected
+  `AGENT_IDE_CLAUDE_RENDEZVOUS_ROOT` parent, keyed by the canonical Git common
+  directory; an invalid parent fails without falling back. The unset legacy
+  default remains `/private/tmp`; project work selects its approved temporary
+  parent explicitly. Ownership and staleness are checked
   before adoption and an MCP exit never stops a healthy daemon.
 - Project checks run confined (`sandbox-exec`, no network, read-only worktree,
   allowlisted environment) and are fail-open. When the host already confines the
@@ -106,9 +110,29 @@ unchanged unless a change is the point of the task.
 
 ## Where the contract snapshot lives
 
-`schemas/tools.json` is the tools array of the real built binary's
-`tools/list` result (the Claude catalog, eleven tools); `schemas/tools-codex.json`
-is the Codex catalog (`mcp --host codex`, nine tools). After any change to the tool surface in
+`schemas/tools.json` exports the real binary's `tools/list` array for Claude;
+`schemas/tools-codex.json` exports Codex (`mcp --runtime-dir <dir> --host codex`).
+The current production source defines ten tools per host, including `ide.graph`.
+The owner deferred final regeneration: working exports are the historical graph-only
+intermediate (Claude eleven/Codex ten), not the final source catalog.
+Both source catalogs have the same ten public names. Public `ide.context` is
+removed, including `tools/call`; only its private engine/transport remains. Source
+reads move to `ide.read {"path":"src/a.rs"}` and skeletons to `ide.outline`.
+`ide.symbol {"path":"src/a.rs","byte_offset":42}` resolves an exact UTF-8 use-site
+(definitions/references or explicit lexical/unavailable evidence, no whole-file dump).
+Offsets are semantic positions, never page cursors; split/out-of-file offsets refuse.
+`ide.inspect {"kind":"diagnostics","path":"src/a.rs"}` reads file provider reports;
+`ide.inspect {"kind":"problems"}` reads project check problems. Neither runs a check;
+unknown diagnostics never mean zero, and unversioned counts remain provisional lower
+bounds. Continue long results with `detail_ref`. `ide.symbol` also gives a card with immediate
+callers/callees (all positive values mean direct neighbors). Use `ide.graph`
+`{"symbol":"src/a.rs#f","direction":"callers","depth":2}` for call chains when changing
+signatures/public behavior, refactoring shared functions, tracing indirect faults or
+investigating architecture/cross-language connections. Start depth 2, expand within 1–3
+only as needed: callers shows impact, callees shows execution/dependencies, both shows
+both sides; `tests:true` expands tests. Tiny edits need only the symbol card. Managed
+Codex selects it with `mcp --launcher-template <file>`; the export flag does not combine with
+the managed launcher form. After any change to the tool surface in
 `crates/agent-ide-core/src/assistance/facade.rs`, run `cargo xtask contract
 update`, review the diff, and commit it together with the source change; CI
 and the gate fail on drift.

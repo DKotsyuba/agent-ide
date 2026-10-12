@@ -203,6 +203,53 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
+    "description": "Call chains for impact, architecture, indirect faults or cross-language connections. Use for\nsignature/public changes or shared refactors; tiny edits need ide.symbol. Start depth 2,\nexpand only as needed (1–3; 60 nodes). callers = impact; callees = execution/dependency path;\nboth = both sides. tests:true expands tests. `{\"symbol\":\"a.rs#f\",\"depth\":2}`.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "depth": {
+          "default": 2,
+          "description": "Levels to expand; 2 is usually enough.",
+          "maximum": 3,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "direction": {
+          "default": "callers",
+          "description": "callers: impact of changing it; callees: execution/dependency path; both: both sides.",
+          "enum": [
+            "callers",
+            "callees",
+            "both"
+          ],
+          "type": "string"
+        },
+        "symbol": {
+          "description": "Address `src/a.rs#Type/method`, or a bare name to search the project.",
+          "type": "string"
+        },
+        "symbols": {
+          "description": "Up to 8 addresses or bare names in one call, request order; a failed one fails only itself.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tests": {
+          "default": false,
+          "description": "Show test symbols as nodes (marked `[test]`) instead of collapsing them into one `+N tests` line per parent.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "ide.graph"
+  },
+  {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
     "description": "Read what Agent IDE holds for you. Results of long work (test runs, project checks,\npending answers) arrive by themselves in an `<agent-ide>` block, so never poll for them.\n`{}` hands over everything ready now; `detail_ref` or `detail_refs` read results or their\nnext pages. `{\"kind\":\"problems\"}` lists the project check problems.",
     "inputSchema": {
       "additionalProperties": false,
@@ -403,20 +450,20 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Cards for symbols: signature, doc, address, usages (src and tests, with source lines),\ncallers and callees as addresses, and with `history` the last commits. Takes addresses or\nbare names (several matches list their addresses). Replaces grep for usages and callers;\nlist the construction sites before changing a constructor.",
+    "description": "Symbol card: signature/doc/definition/usages/history and immediate neighbors (callers/callees\n1–3 all mean direct). Address or bare name; ambiguous names list matches.\n`{\"symbol\":\"a.rs#f\",\"callers\":1}`. For deeper call chains use ide.graph.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "callees": {
           "default": 0,
-          "description": "Callees to list, 0–3 (0 = none).",
+          "description": "0 omits callees; 1–3 all return immediate neighbors. Use ide.graph for deeper call chains.",
           "maximum": 3,
           "minimum": 0,
           "type": "integer"
         },
         "callers": {
           "default": 1,
-          "description": "Caller levels to list, 0–3 (0 = none).",
+          "description": "0 omits callers; 1–3 all return immediate neighbors. Use ide.graph for deeper call chains.",
           "maximum": 3,
           "minimum": 0,
           "type": "integer"

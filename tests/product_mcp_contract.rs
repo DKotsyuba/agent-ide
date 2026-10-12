@@ -496,17 +496,21 @@ fn assert_compact_envelope(reply: &Value) {
         ),
         // OUTBOX-r3 §8.5: consolidated `ide.inspect` text is plain, with no header of its own.
         ("complete", Some("inspect")) => assert!(!body.is_empty(), "{reply}"),
-        // `<file>  (<n> lines, <lang>)` outline header.
-        // A several-file outline (batch-api-v1 §3) opens with its summary line.
+        // File outlines begin with a complete addressed unit row; a directory still uses its
+        // header, and a batch or empty file explains its exceptional delivery.
         ("complete", Some("outline")) if body.starts_with("outline: ") => {}
         ("complete", Some("outline")) => {
             let header = body.lines().next().unwrap_or_default();
-            let (file, details) = header.split_once("  (").expect("outline file header");
-            assert!(!file.is_empty() && details.ends_with(')'), "{reply}");
-            assert!(
-                details.contains(" lines, ") || details.contains(" files, "),
-                "{reply}"
-            );
+            if let Some((file, details)) = header.split_once("  (") {
+                assert!(!file.is_empty() && details.ends_with(')'), "{reply}");
+                assert!(details.contains(" files, "), "{reply}");
+            } else {
+                let (span, row) = header.split_once(' ').expect("addressed outline row");
+                let first = span.split('–').next().unwrap();
+                assert!(first.parse::<u32>().is_ok_and(|line| line > 0), "{reply}");
+                let address = row.split("  ").next().unwrap();
+                assert!(address.contains('#'), "{reply}");
+            }
         }
         // `<title>  (lines A–B)` read header.
         ("complete", Some("read")) => {
@@ -1131,15 +1135,14 @@ async fn modern_tools_call_is_fail_open_and_selects_host_from_request_meta() {
     mcp.close().await;
 }
 
-/// Managed startup failure remains a disconnected static ten-tool MCP with bounded fallback calls.
+/// Managed Codex startup failure retains the ten-tool Codex catalog and bounded fallback calls,
+/// including graph, without advertising context or granting any daemon binding authority.
 #[tokio::test]
 async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
     let candidate = std::env::current_dir().unwrap();
-    let mut mcp = Mcp::start_managed(
-        Path::new("/private/tmp/agent-ide-missing-launcher-template"),
-        &candidate,
-    )
-    .await;
+    let area = runtime();
+    let mut mcp =
+        Mcp::start_managed(&area.join("missing-launcher-template.json"), &candidate).await;
     let discovery = mcp
         .exchange(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
         .await;
@@ -1153,7 +1156,6 @@ async fn managed_startup_failure_serves_exact_static_tools_without_ipc() {
     assert_eq!(
         names,
         [
-            "ide.context",
             "ide.diff",
             "ide.edit",
             "ide.graph",
@@ -10404,13 +10406,17 @@ async fn configured_product_address_outline_path_line_and_near() {
         .await;
     let reply = actor.settle(&fixture, reply).await;
     let text = reply["text"].as_str().unwrap_or_default();
-    assert!(text.contains("\n1–2  src/lib.rs#@header\n"), "{text}");
-    assert!(text.contains("\n3  src/lib.rs#@imports\n"), "{text}");
+    assert!(text.starts_with("1–2 src/lib.rs#@header\n"), "{text}");
+    assert!(text.contains("\n3 src/lib.rs#@imports\n"), "{text}");
     assert!(
-        text.contains("  src/lib.rs#value  pub fn value() -> i32"),
+        text.contains(" src/lib.rs#value  pub fn value() -> i32"),
         "{text}"
     );
-    assert!(text.contains("  src/lib.rs#Service/work  "), "{text}");
+    assert!(text.contains(" src/lib.rs#Service/work  "), "{text}");
+    assert!(
+        !text.contains(" symbols"),
+        "unfiltered outline has no redundant counts: {text}"
+    );
 
     let reply = actor
         .call(
@@ -12840,12 +12846,10 @@ async fn product_style_sheets_answer_symbol_tools_without_a_server() {
     let outline = actor.settle(&fixture, outline).await;
     assert_eq!(
         outline["text"],
-        "styles.css  (8 lines, css)\n\
-         1  styles.css#@header\n\
-         2–4  styles.css#.btn  .btn\n\
-         6–8  styles.css#@media (min-width: 40em)  @media (min-width: 40em)\n\
-         7  styles.css#@media (min-width: 40em)/.card .btn  .card .btn\n\
-         \x20 (3 symbols, 1 regions)\n",
+        "1 styles.css#@header\n\
+         2–4 styles.css#.btn  .btn\n\
+         6–8 styles.css#@media (min-width: 40em)  @media (min-width: 40em)\n\
+         7 styles.css#@media (min-width: 40em)/.card .btn  .card .btn\n",
         "{outline}"
     );
 
@@ -13311,7 +13315,7 @@ async fn product_index_reads_stay_outside_the_binding_budget() {
             "links: 1 class name used here",
         ),
         ("ide.read", json!({"symbol":".btn"}), ".btn {"),
-        ("ide.outline", json!({"path":"page01.html"}), "(1 symbols"),
+        ("ide.outline", json!({"path":"page01.html"}), "page01.html#"),
         ("ide.outline", json!({"path":"styles.css"}), ".btn"),
         (
             "ide.symbol",
@@ -14478,9 +14482,16 @@ async fn configured_product_cold_rust_symbol_tools_answer_from_the_lexical_outli
             .await;
         let settled = actor.settle(&fixture, reply).await;
         let text = settled["text"].as_str().unwrap_or_default();
-        // Three symbols for a file with two functions is the server's answer; the lexical
-        // outline of the same file reports two and marks itself lexical.
-        if settled["kind"] == "outline" && text.contains("(3 symbols") {
+        // The server returns three symbol rows; the lexical outline of these two functions
+        // returns two. Count delivered address rows instead of requiring redundant framing.
+        let symbol_rows = text
+            .lines()
+            .filter(|line| {
+                line.split_once(" src/lib.rs#")
+                    .is_some_and(|(_, unit)| !unit.starts_with('@'))
+            })
+            .count();
+        if settled["kind"] == "outline" && symbol_rows == 3 {
             break settled;
         }
         assert!(
@@ -14769,9 +14780,16 @@ async fn configured_product_unavailable_rust_symbol_tools_answer_from_the_lexica
             .await;
         let settled = actor.settle(&fixture, reply).await;
         let text = settled["text"].as_str().unwrap_or_default();
-        // Three symbols for a file with two functions is the server's answer; the lexical
-        // outline of the same file reports two and marks itself lexical.
-        if settled["kind"] == "outline" && text.contains("(3 symbols") {
+        // The server returns three symbol rows; the lexical outline of these two functions
+        // returns two. Count delivered address rows instead of requiring redundant framing.
+        let symbol_rows = text
+            .lines()
+            .filter(|line| {
+                line.split_once(" src/lib.rs#")
+                    .is_some_and(|(_, unit)| !unit.starts_with('@'))
+            })
+            .count();
+        if settled["kind"] == "outline" && symbol_rows == 3 {
             break settled;
         }
         assert!(
@@ -15509,18 +15527,27 @@ async fn configured_product_activation_reply_includes_the_project_card() {
         "{text}"
     );
     // start-index-state §1: the call-signature block ends the reply, after the card and its
-    // servers line, within 2 KiB, with one example per batch form and the required stop.
+    // servers line, within M030/T006's 700-byte budget, with one example per batch form and stop.
     let (card, signature) = text
         .split_once("\n\ncall forms (")
         .unwrap_or_else(|| panic!("no signature block: {text}"));
     assert!(card.contains("\nservers: "), "{text}");
     assert!(!card.contains("ide.read {\"items\""), "{text}");
     let signature = format!("call forms ({signature}");
-    assert!(signature.len() <= 2048, "{} bytes", signature.len());
+    assert!(signature.len() <= 700, "{} bytes", signature.len());
+    assert!(
+        signature.contains("card/direct neighbors; graph = call chains"),
+        "{signature}"
+    );
+    assert!(
+        signature.contains("\"direction\":\"callers\",\"depth\":2"),
+        "{signature}"
+    );
     for form in [
         "ide.read {\"items\"",
         "ide.outline {\"paths\"",
         "ide.symbol {\"symbols\"",
+        "ide.graph {\"symbol\"",
         "ide.test {\"targets\"",
         "ide.edit {\"symbol\"",
         "ide.inspect {\"detail_refs\"",

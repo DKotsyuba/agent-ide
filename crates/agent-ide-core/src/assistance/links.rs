@@ -664,7 +664,8 @@ impl Worker<'_> {
         Ok(())
     }
 
-    /// The `related_links:` block of an `ide.context` reply for `lines` of `file` (the whole file
+    /// The `related_links:` block for source reads, positional symbol cards and the private context
+    /// engine over `lines` of `file` (the whole file
     /// or the line under the requested position): the cross-language names defined there with
     /// their indexed usages, the names used there with their definitions, and the same
     /// `unavailable for:`/index notes as a symbol card, bounded by the card's ceilings. Empty when

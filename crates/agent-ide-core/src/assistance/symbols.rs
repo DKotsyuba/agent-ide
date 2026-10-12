@@ -132,6 +132,19 @@ impl Worker<'_> {
         &mut self,
         job: &mut Job,
     ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        self.outline_with_summary(job, &mut None).await
+    }
+
+    /// Serves the same outline as `outline`, additionally returning full-file line and symbol
+    /// counts in `summary` for a batch's listed-only cut. Counts come from the exact observed
+    /// outline/map before pagination, never from model-facing headers; directory answers leave
+    /// `summary` absent. Authority/source observations and failure behavior match `outline`.
+    pub(super) async fn outline_with_summary(
+        &mut self,
+        job: &mut Job,
+        summary: &mut Option<(u32, usize)>,
+    ) -> Result<(PeerReply, Option<AuthorityStamp>, Option<SourceObservation>), FailureCode> {
+        *summary = None;
         if job.parameters.get("paths").is_some() || job.parameters.get("glob").is_some() {
             return self.batch_outline(job).await;
         }
@@ -175,6 +188,13 @@ impl Worker<'_> {
         let (outline, _, lexical) = self.outline_of(job, &observed, &bytes).await?;
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
         let map = lang::address::AddressMap::build(&outline, observed_text(&observed, &bytes)?);
+        *summary = Some((
+            outline.line_count,
+            map.units()
+                .iter()
+                .filter(|unit| matches!(unit.kind, lang::address::UnitKind::Symbol(_)))
+                .count(),
+        ));
         let mut text = match job.parameters.get("kinds").and_then(Value::as_str) {
             Some(requested) => {
                 let names: Vec<&str> = requested.split(',').map(str::trim).collect();
@@ -213,7 +233,9 @@ impl Worker<'_> {
     /// detail (a soft refusal naming native tools, never `internal`); a `lines` range (`N`, `N-M`,
     /// `N-`) is clamped at the end of the file, and one starting past it succeeds with
     /// `file has <n> lines; nothing at <range>`. The `symbol` form still needs an outline, so a file no
-    /// IDE language reads answers `unsupported_file`.
+    /// IDE language reads answers `unsupported_file`. File/range reads also retain the former
+    /// context related-links block for the requested lines; it follows numbered source, shares
+    /// its continuation, and source/authority are rechecked after the index lookup.
     pub(super) async fn read(
         &mut self,
         job: &mut Job,
@@ -315,6 +337,16 @@ impl Worker<'_> {
             self.shared.set_context_page(&job.reference, page);
             return Ok((reply, Some(authority), Some(observed)));
         }
+        let authority = self.authority(&binding).await?;
+        let links = self
+            .related_links(
+                job,
+                authority.worktree(),
+                &path,
+                &bytes,
+                range.unwrap_or_else(|| LineRange::new(1, total.max(1))),
+            )
+            .await;
         let authority = self.finish_symbol_job(job, &binding, &observed).await?;
         let mut text = match range {
             Some(range) => render::read_text(
@@ -325,6 +357,10 @@ impl Worker<'_> {
             ),
             None => whole_file_text(&path, &title, source),
         };
+        if !links.is_empty() {
+            text.push('\n');
+            text.push_str(&links);
+        }
         if let Some(note) = lexical {
             text.push_str(&note);
             text.push('\n');
@@ -2719,7 +2755,7 @@ fn whole_file_text(file: &Path, title: &str, source: &str) -> String {
 }
 
 /// Reply line a text read of a file no IDE language analyzes ends with, ahead of `source_ref`.
-const NO_ANALYSIS_NOTE: &str = "note: no code analysis for this format; showing its text only (ide.outline and ide.symbol do not read it)\n";
+const NO_ANALYSIS_NOTE: &str = "note: no code analysis for this format; showing its text only\n";
 
 /// Item line of a batch read whose file is binary or could not be read as text.
 const NOT_TEXT_REFUSAL: &str = "not a readable text file (binary, not UTF-8 or unreadable; inspect it \

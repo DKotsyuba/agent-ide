@@ -1186,7 +1186,7 @@ impl Shared {
             detail.diff_page_fresh = false;
         }
     }
-    /// Retains or clears the bounded Context (or Claude-captured Diff, T13B) pagination state for
+    /// Retains or clears bounded source, symbol, diagnostic or captured-Diff pagination state for
     /// one same-binding detail reference (T09B). Mirrors `set_diff_page`'s fresh-page and
     /// continuation-clearing semantics, minus its aggregate byte ceiling: this page's text is
     /// already bounded by the source, Diff selection, or Claude helper capture limits, so the
@@ -1199,13 +1199,7 @@ impl Shared {
         if let Some(detail) = ledger.details.get_mut(reference) {
             detail.context_page = page;
             detail.context_page_fresh = retained;
-            if !retained
-                && let PeerReply::Complete {
-                    kind: ResultKind::Context | ResultKind::Diff,
-                    continuation,
-                    ..
-                } = &mut detail.reply
-            {
+            if !retained && let PeerReply::Complete { continuation, .. } = &mut detail.reply {
                 *continuation = false;
             }
         }
@@ -1668,7 +1662,7 @@ impl WorkerHandle {
         let (send, wait) = oneshot::channel();
         if let Err(code) = self.enqueue(
             invocation,
-            AssistanceTool::Context,
+            AssistanceTool::Inspect,
             parameters,
             attachment,
             Some(send),
@@ -3649,11 +3643,22 @@ impl<'a> Worker<'a> {
                     AssistanceTool::Edit => self.edit(job).await,
                     AssistanceTool::Start => self.activate(job).await,
                     AssistanceTool::Context => self.context(job).await,
+                    AssistanceTool::Inspect
+                        if matches!(
+                            job.parameters.get("kind").and_then(Value::as_str),
+                            Some("problems" | "diagnostics")
+                        ) =>
+                    {
+                        self.context(job).await
+                    }
                     AssistanceTool::Diff => self.diff(job).await,
                     AssistanceTool::Outline => self.outline(job).await,
                     AssistanceTool::Read => {
                         panic_seam(job);
                         self.read(job).await
+                    }
+                    AssistanceTool::Symbol if job.parameters.get("path").is_some() => {
+                        self.context(job).await
                     }
                     AssistanceTool::Symbol => self.symbol(job).await,
                     AssistanceTool::Graph => self.graph(job).await,
@@ -3666,6 +3671,7 @@ impl<'a> Worker<'a> {
         // keeps running for the precise answer (symbol-graph-item r2 §4-§5); the `{symbols}`
         // form answers early per entry by itself (`batch_symbols`).
         if matches!(job.tool, AssistanceTool::Symbol | AssistanceTool::Graph)
+            && job.parameters.get("path").is_none()
             && job.parameters.get("symbols").is_none()
             && (job.park_until.is_some() || matches!(result, Err(FailureCode::ProviderLoading)))
         {
@@ -3835,14 +3841,14 @@ impl<'a> Worker<'a> {
             // the same final MCP/IPC fitting the real transport applies may be marked delivered;
             // a closed receiver or a carrier that fitting trimmed leaves the fact eligible for
             // exactly one later hook delivery instead of being marked as already submitted.
-            let is_context = matches!(
+            let carries_feedback = matches!(
                 reply,
                 PeerReply::Complete {
-                    kind: ResultKind::Context,
+                    kind: ResultKind::Context | ResultKind::Symbol | ResultKind::Inspect,
                     ..
                 }
             );
-            let mark_reply = is_context.then(|| reply.clone());
+            let mark_reply = carries_feedback.then(|| reply.clone());
             let is_diff = matches!(
                 reply,
                 PeerReply::Complete {
@@ -5105,11 +5111,15 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// Returns path-proven source context with explicit semantic or lexical provenance and bounded
-    /// source text, falling back to lexical evidence when an accepted provider cannot run or cannot
+    /// Reuses path-proven context for positional Symbol cards and Inspect diagnostics, retaining
+    /// the private legacy full-file operation. Public cards never dump source or authority metadata.
+    /// Falls back to explicit lexical evidence when an accepted provider cannot run or cannot
     /// verify project resolution; source and freshness refusals remain errors. Managed semantic
     /// locations are proved per path and retained for later Inspect reauthorization under the live
-    /// profile.
+    /// profile. Positional offsets are exact UTF-8 boundaries; invalid positions refuse before
+    /// querying a provider. A loading positional backend returns explicit lexical evidence at once.
+    /// Diagnostics retain the existing source/generation/document-version qualification; unversioned
+    /// empty reports remain unknown, unversioned nonempty counts remain provisional lower bounds.
     async fn context(
         &mut self,
         job: &mut Job,
@@ -5126,6 +5136,20 @@ impl<'a> Worker<'a> {
         let path_detail = super::reply::bounded_utf8_prefix(&format!("{path:?}"), 256);
         let (observed, bytes) = self.observe(&binding, path.clone().into()).await?;
         let byte_offset = job.parameters.get("byte_offset").and_then(Value::as_u64);
+        let positional = job.tool == AssistanceTool::Symbol;
+        let file_diagnostics =
+            job.parameters.get("kind").and_then(Value::as_str) == Some("diagnostics");
+        if let Some(offset) = byte_offset {
+            crate::intelligence::context::position(
+                std::str::from_utf8(&bytes).map_err(|_| FailureCode::SourceUnavailable)?,
+                offset as usize,
+                &async_lsp::lsp_types::PositionEncodingKind::UTF16,
+            )
+            .map_err(|_| {
+                job.failure_detail = Some("symbol:invalid_byte_offset".to_owned());
+                FailureCode::SourceUnavailable
+            })?;
+        }
         let query = byte_offset.map_or(ContextQuery::File, |byte_offset| ContextQuery::Symbol {
             byte_offset: byte_offset as usize,
         });
@@ -5189,6 +5213,12 @@ impl<'a> Worker<'a> {
             ),
             Err(code) => return Err(code),
         };
+        // Positional cards deliberately return the same explicit lexical fallback as the private
+        // context engine. A Symbol-selected backend may have parked while loading; that fallback
+        // is terminal, not an address-card job requiring the separate approximate-symbol path.
+        if positional && matches!(&context.mode, ContextMode::Lexical { .. }) {
+            job.park_until = None;
+        }
         // A finished context job is no longer fenced by the native epoch: pages are frozen byte
         // slices of the page-1 snapshot and the exact-byte check below is the whole staleness
         // contract (T15B follow-up). The epoch still bumps for every non-inert native post and
@@ -5259,13 +5289,20 @@ impl<'a> Worker<'a> {
         } else {
             None
         };
+        // Public cards and file reports keep diagnostic evidence, without legacy bookkeeping.
+        let public_context = positional || file_diagnostics;
         let diagnostic_text = diagnostics.as_ref().map_or_else(
-            || "diagnostics_freshness: unknown\ndiagnostic_count: unknown\nfeedback_delta: none".to_owned(),
+            || {
+                if public_context {
+                    "diagnostics: unknown (no current provider report)".to_owned()
+                } else {
+                    "diagnostics_freshness: unknown\ndiagnostic_count: unknown\nfeedback_delta: none".to_owned()
+                }
+            },
             |diagnostics| {
                 let messages = diagnostics
                     .diagnostics
                     .iter()
-                    .take(8)
                     .map(|diagnostic| {
                         super::reply::diagnostic_line_at(
                             &observed.path().to_string_lossy(),
@@ -5274,6 +5311,24 @@ impl<'a> Worker<'a> {
                         )
                     })
                     .collect::<Vec<_>>();
+                if public_context {
+                    let count = if diagnostics.document_version.is_none() {
+                        format!("at least {}", diagnostics.diagnostics.len())
+                    } else {
+                        diagnostics.diagnostics.len().to_string()
+                    };
+                    let partial = if diagnostics.truncated
+                        || diagnostics.diagnostics.len() > messages.len()
+                    {
+                        "; partial"
+                    } else {
+                        ""
+                    };
+                    return format!(
+                        "diagnostics: {count} (provisional{partial})\n{}",
+                        messages.join("\n")
+                    );
+                }
                 let feedback = feedback
                     .as_ref()
                     .map_or_else(|| "none".to_owned(), FeedbackDelta::render);
@@ -5283,12 +5338,12 @@ impl<'a> Worker<'a> {
                     diagnostics.diagnostics.len().to_string()
                 };
                 format!(
-                    "diagnostics_freshness: {:?}\ndiagnostic_readiness: {:?}\ndiagnostic_count: {}\ndiagnostics_truncated: {}\ndiagnostic_messages: {}\nfeedback_delta: {feedback}",
+                    "diagnostics_freshness: {:?}\ndiagnostic_readiness: {:?}\ndiagnostic_count: {}\ndiagnostics_truncated: {}\ndiagnostic_messages:\n{}\nfeedback_delta: {feedback}",
                     diagnostics.freshness,
                     diagnostics.readiness,
                     count,
                     diagnostics.truncated || diagnostics.diagnostics.len() > messages.len(),
-                    serde_json::to_string(&messages).unwrap_or_else(|_| "[]".into()),
+                    messages.join("\n"),
                 )
             },
         );
@@ -5319,7 +5374,9 @@ impl<'a> Worker<'a> {
             ""
         };
         // The cross-language names of the file, or of the line at the requested position.
-        let related = {
+        let related = if file_diagnostics {
+            String::new()
+        } else {
             let newlines = |end: usize| {
                 bytes[..end.min(bytes.len())]
                     .iter()
@@ -5336,19 +5393,49 @@ impl<'a> Worker<'a> {
             self.related_links(job, authority.worktree(), Path::new(&path), &bytes, lines)
                 .await
         };
-        let text = format!(
-            "{hint}mode: {mode}\npath: {path}\nsource_state: {:?}\nsource_sequence: {}\nauthority_epoch: {}\ncoverage: complete registered path\nposition_encoding: {:?}\nprovider_generation: {:?}\ndocument_version: {:?}\n{diagnostic_text}\ndefinitions: {}\nreferences: {}\nlexical_matches: {}\n{related}\n{}",
-            observed.state(),
-            observed.sequence(),
-            authority.epoch(),
-            context.position_encoding,
-            context.generation,
-            context.document_version,
-            serde_json::to_string(&context.definitions).map_err(|_| FailureCode::Internal)?,
-            serde_json::to_string(&context.references).map_err(|_| FailureCode::Internal)?,
-            serde_json::to_string(&context.lexical_matches).map_err(|_| FailureCode::Internal)?,
-            context.text
-        );
+        let text = if positional {
+            let locations = self
+                .context_location_rows(
+                    job,
+                    authority.worktree().worktree_path(),
+                    &[
+                        ("definitions", context.definitions.as_deref()),
+                        ("references", context.references.as_deref()),
+                        ("lexical matches", Some(context.lexical_matches.as_slice())),
+                    ],
+                )
+                .await?;
+            format!(
+                "symbol: {}\nmode: {mode}\npath: {path}\nposition_encoding: {:?}\n{diagnostic_text}\n{locations}{related}\n",
+                context
+                    .symbol
+                    .as_deref()
+                    .unwrap_or("(no identifier at position)"),
+                context.position_encoding,
+            )
+        } else if file_diagnostics {
+            format!("diagnostics: {path}\nmode: {mode}\n{diagnostic_text}\n")
+        } else {
+            format!(
+                "{hint}mode: {mode}\npath: {path}\nsource_state: {:?}\nsource_sequence: {}\nauthority_epoch: {}\ncoverage: complete registered path\nposition_encoding: {:?}\nprovider_generation: {:?}\ndocument_version: {:?}\n{diagnostic_text}\ndefinitions: {}\nreferences: {}\nlexical_matches: {}\n{related}\n{}",
+                observed.state(),
+                observed.sequence(),
+                authority.epoch(),
+                context.position_encoding,
+                context.generation,
+                context.document_version,
+                serde_json::to_string(&context.definitions).map_err(|_| FailureCode::Internal)?,
+                serde_json::to_string(&context.references).map_err(|_| FailureCode::Internal)?,
+                serde_json::to_string(&context.lexical_matches)
+                    .map_err(|_| FailureCode::Internal)?,
+                context.text
+            )
+        };
+        self.shared.active(&binding)?;
+        if !source_matches(&observed) {
+            job.failure_detail = Some(format!("context:source_changed:{path_detail}"));
+            return Err(FailureCode::SourceUnavailable);
+        }
         if let Ok(mut ledger) = self.shared.ledger.lock() {
             if let Some(feedback) = feedback {
                 let messages: Vec<&str> = diagnostics
@@ -5389,10 +5476,28 @@ impl<'a> Worker<'a> {
                 ledger.feedback.remove(&binding);
             }
         }
-        let body_start = text.len() - context.text.len();
-        let (reply, context_page) =
-            ContextPageState::new(text, body_start, context.truncated, ResultKind::Context)
-                .next(&job.reference)?;
+        let body_start = if positional || file_diagnostics {
+            0
+        } else {
+            text.len() - context.text.len()
+        };
+        let kind = if positional {
+            ResultKind::Symbol
+        } else if file_diagnostics {
+            ResultKind::Inspect
+        } else {
+            ResultKind::Context
+        };
+        let (reply, context_page) = ContextPageState::new(
+            text,
+            body_start,
+            context.truncated
+                || diagnostics
+                    .as_ref()
+                    .is_some_and(|diagnostics| diagnostics.truncated),
+            kind,
+        )
+        .next(&job.reference)?;
         self.shared.set_context_page(&job.reference, context_page);
         self.shared.set_diff_provenance(&job.reference, provenance);
         Ok((reply, Some(authority), Some(observed)))
@@ -5475,7 +5580,7 @@ impl<'a> Worker<'a> {
         self.shared.active(binding)?;
         Ok((
             PeerReply::Complete {
-                kind: ResultKind::Context,
+                kind: ResultKind::Inspect,
                 text,
                 detail_ref: None,
                 truncated: false,
@@ -6743,10 +6848,10 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
     // have its fact treated as delivered — and must trace the exact reference that produced the
     // retained fact, since a same-epoch, different-detail Context job can have overwritten the
     // single per-binding slot before this reply was ever composed.
-    let is_context = matches!(
+    let carries_feedback = matches!(
         reply,
         PeerReply::Complete {
-            kind: ResultKind::Context,
+            kind: ResultKind::Context | ResultKind::Symbol | ResultKind::Inspect,
             ..
         }
     );
@@ -6757,7 +6862,7 @@ async fn serve_inspection(workspace: &DurableWorkspace<'_>, shared: &Shared, req
             // Read through its own reference: the job's pushed fact is delivered (OUTBOX §6).
             shared.reference_read(&request.binding, &request.reference);
         }
-        if is_context {
+        if carries_feedback {
             shared.mark_feedback_inline_delivered(&request.binding, &request.reference, &reply);
         }
     }
@@ -14669,10 +14774,7 @@ mod stop_retry_tests {
                 serde_json::json!({"path":"a.gamma"})
             )
             .await,
-            Ok(
-                "a.gamma  (5 lines, gamma)\n1–5  a.gamma#card  sym card\n2–4  a.gamma#card/btn  sym btn\n  (2 symbols)\n"
-                    .into()
-            )
+            Ok("1–5 a.gamma#card  sym card\n2–4 a.gamma#card/btn  sym btn\n".into())
         );
         let read = run(
             AssistanceTool::Read,

@@ -178,6 +178,72 @@ impl Worker<'_> {
         lines
     }
 
+    /// Renders bounded semantic-location groups as project-relative addressed rows in input order.
+    /// `root` is the active worktree path and every file URI must lie below it; invalid URIs,
+    /// outside paths or overflowing one-based positions return `SourceUnavailable`. `groups`
+    /// distinguishes unavailable (`None`) from an answered empty list. The caller bounds these
+    /// retained lists; one shared `position_addresses` lookup keeps its file/time limits and
+    /// unresolved rows retain `path:line:column` with an explicit omission note. Columns use the
+    /// provider encoding stated by the surrounding card. No source body or raw URI is printed.
+    pub(super) async fn context_location_rows(
+        &mut self,
+        job: &mut Job,
+        root: &Path,
+        groups: &[(&str, Option<&[async_lsp::lsp_types::Location]>)],
+    ) -> Result<String, FailureCode> {
+        let mut locations = Vec::new();
+        let mut columns = Vec::new();
+        for (_, group) in groups {
+            for location in group.iter().flat_map(|rows| rows.iter()) {
+                let absolute = location
+                    .uri
+                    .to_file_path()
+                    .map_err(|_| FailureCode::SourceUnavailable)?;
+                let relative = absolute
+                    .strip_prefix(root)
+                    .map_err(|_| FailureCode::SourceUnavailable)?;
+                let line = location
+                    .range
+                    .start
+                    .line
+                    .checked_add(1)
+                    .ok_or(FailureCode::SourceUnavailable)?;
+                let column = location
+                    .range
+                    .start
+                    .character
+                    .checked_add(1)
+                    .ok_or(FailureCode::SourceUnavailable)?;
+                locations.push((relative.to_path_buf(), line));
+                columns.push(column);
+            }
+        }
+        let addresses = Box::pin(self.position_addresses(job, &locations)).await;
+        let mut text = String::new();
+        let mut index = 0;
+        for (name, group) in groups {
+            let Some(rows) = group else {
+                text.push_str(&format!("{name}: unavailable\n"));
+                continue;
+            };
+            text.push_str(&format!("{name}: {}\n", rows.len()));
+            for _ in *rows {
+                let (file, line) = &locations[index];
+                let location = format!("{}:{line}:{}", file.display(), columns[index]);
+                match addresses.tag(index, *line) {
+                    Some(address) => text.push_str(&format!("  {address}  {location}\n")),
+                    None => text.push_str(&format!("  {location}\n")),
+                }
+                index += 1;
+            }
+        }
+        if let Some(note) = addresses.note() {
+            text.push_str(&note);
+            text.push('\n');
+        }
+        Ok(text)
+    }
+
     /// Fills the card's usage rows with position addresses and its caller and callee rows with
     /// the addresses of the symbols they name, each with its absolute line; locations that did
     /// not resolve keep `file:line`, and one trailing line says how many were left out.

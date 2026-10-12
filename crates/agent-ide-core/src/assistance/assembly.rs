@@ -280,15 +280,17 @@ fn host_binding_cause(
     HostBindingCause::from_binding(reason)
 }
 
-/// Reports whether one validated context call names the in-memory `kind: "problems"` feed.
+/// Reports whether inspect or the private Context transport names the in-memory problems feed.
 ///
 /// EYES-r2: such calls are answered entirely from the daemon's in-memory problem source for the
 /// caller's bound worktree. On Claude they must short-circuit before foreground-helper routing,
 /// and on managed Codex they skip native read-boundary reconciliation. A call carrying a detail
 /// reference is retrieval of an already-settled result and keeps its existing route.
 fn is_problems_context(method: AssistanceMethod, parameters: &Value) -> bool {
-    method == AssistanceMethod::Context
-        && parameters.get("detail_ref").is_none()
+    matches!(
+        method,
+        AssistanceMethod::Context | AssistanceMethod::Inspect
+    ) && parameters.get("detail_ref").is_none()
         && parameters.get("kind").and_then(Value::as_str) == Some("problems")
 }
 
@@ -1304,6 +1306,8 @@ impl ProductDispatcher {
                         AssistanceMethod::Context
                             | AssistanceMethod::Diff
                             | AssistanceMethod::Inspect
+                            | AssistanceMethod::Read
+                            | AssistanceMethod::Symbol
                     )
                     && !is_problems_context(method.method(), call.parameters())
                 {
@@ -1314,7 +1318,9 @@ impl ProductDispatcher {
                     // capture, not a new read boundary, so it must not invalidate itself first.
                     worker.managed_read_boundary(
                         invocation.binding_ref().clone(),
-                        method.method() != AssistanceMethod::Inspect
+                        (method.method() != AssistanceMethod::Inspect
+                            || call.parameters().get("kind").and_then(Value::as_str)
+                                == Some("diagnostics"))
                             && call.parameters().get("detail_ref").is_none(),
                     );
                 }
@@ -1330,7 +1336,7 @@ impl ProductDispatcher {
                     AssistanceMethod::Stop => {
                         worker.stop(invocation, method.opaque_attachment()).await
                     }
-                    AssistanceMethod::Inspect => {
+                    AssistanceMethod::Inspect if call.parameters().get("kind").is_none() => {
                         // OUTBOX-r3 §8.5: one reference, several, or the session's facts.
                         worker
                             .inspect_call(
@@ -1341,7 +1347,7 @@ impl ProductDispatcher {
                             )
                             .await
                     }
-                    AssistanceMethod::Context
+                    AssistanceMethod::Context | AssistanceMethod::Inspect
                         if is_problems_context(method.method(), call.parameters()) =>
                     {
                         worker

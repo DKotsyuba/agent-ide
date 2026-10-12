@@ -437,7 +437,7 @@ async fn telemetry_owner(database: &Path) -> Result<Telemetry, AppError> {
 enum Command {
     /// Serves health and finite Assistance dispatch until interrupted or killed.
     Daemon { runtime_dir: PathBuf },
-    /// Serves the host catalog over stdio: eleven tools for Claude, nine for Codex.
+    /// Serves the ten-tool public catalog over stdio for either host.
     Mcp {
         /// Existing daemon endpoint directory; this unmanaged front never creates it.
         runtime_dir: PathBuf,
@@ -2270,8 +2270,8 @@ async fn run_managed_claude_hook() {
 
 /// Dispatches one self-contained managed MCP generation to its host-specific lifecycle contract.
 ///
-/// Setup failure always still serves the static six tools through a connect-only unavailable
-/// facade, for either host.
+/// Setup failure still serves the selected host catalog through a connect-only unavailable
+/// facade: ten public tools for either host. No failure falls back to another host.
 async fn run_managed_mcp(
     launcher_template: PathBuf,
     candidate: std::io::Result<PathBuf>,
@@ -2291,15 +2291,30 @@ async fn run_managed_mcp(
 ///
 /// Codex owns one daemon and private runtime at a time. It holds a lease while serving and replaces
 /// a failed daemon on the next call; EOF or a termination signal tears down the current generation.
+/// Catalog/instruction selection remains Codex even when publication or setup is unavailable.
 async fn run_managed_codex_mcp(
     launcher_template: PathBuf,
     candidate: std::io::Result<PathBuf>,
 ) -> ExitCode {
     let Ok(candidate) = candidate else {
-        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None).await;
+        return serve_managed_stdio(
+            StdioFacade::unavailable().with_catalog_host(CatalogHost::Codex),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
     };
     let Ok(runtime) = ManagedRuntime::create() else {
-        return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None).await;
+        return serve_managed_stdio(
+            StdioFacade::unavailable().with_catalog_host(CatalogHost::Codex),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
     };
     agent_ide::errorlog::init_repository(
         &claude_rendezvous_identity(&claude_rendezvous_key(&candidate).await)[..16],
@@ -2321,8 +2336,14 @@ async fn run_managed_codex_mcp(
             let Some(lease) = lease else {
                 terminate_owned_daemon(child).await;
                 let _ = runtime.remove();
-                return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None)
-                    .await;
+                return serve_managed_stdio(
+                    StdioFacade::unavailable().with_catalog_host(CatalogHost::Codex),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
             };
             let lease = Arc::new(Mutex::new(Some(lease)));
             let runtime = Arc::new(OwnedCodexRuntime {
@@ -2362,14 +2383,25 @@ async fn run_managed_codex_mcp(
                     },
                 )
             };
-            let facade = facade.map(|facade| facade.with_wedge_eviction(evict));
+            // The catalog is a host property, independent of route publication or daemon health.
+            let facade = facade.map(|facade| {
+                facade
+                    .with_catalog_host(CatalogHost::Codex)
+                    .with_wedge_eviction(evict)
+            });
             let Some(facade) = facade else {
                 terminate_owned_daemon(child).await;
                 if let Some(runtime) = runtime.current.lock().expect("owned runtime mutex").take() {
                     let _ = runtime.remove();
                 }
-                return serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None)
-                    .await;
+                return serve_managed_stdio(
+                    StdioFacade::unavailable().with_catalog_host(CatalogHost::Codex),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
             };
             if let Some(publisher) = &publisher {
                 tokio::spawn(unpublish_when_daemon_exits(
@@ -2383,7 +2415,14 @@ async fn run_managed_codex_mcp(
         }
         Err(_) => {
             let _ = runtime.remove();
-            serve_managed_stdio(StdioFacade::unavailable(), None, None, None, None).await
+            serve_managed_stdio(
+                StdioFacade::unavailable().with_catalog_host(CatalogHost::Codex),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         }
     }
 }

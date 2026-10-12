@@ -506,8 +506,8 @@ fn edit_arguments_are_closed_and_bounded() {
         missing.as_object_mut().unwrap().remove(field);
         assert!(validate_call(AssistanceTool::Edit, missing).is_err());
     }
-    // Without `source_ref` the full-file form is a creation request: the daemon observes the
-    // path itself and refuses it when the file already exists.
+    // `source_ref` is optional: the daemon observes the current file itself, replacing an
+    // existing file or creating an absent one under the same atomic freshness checks.
     let mut create = valid.clone();
     create.as_object_mut().unwrap().remove("source_ref");
     assert!(validate_call(AssistanceTool::Edit, create).is_ok());
