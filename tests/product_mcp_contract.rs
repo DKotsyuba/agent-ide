@@ -557,7 +557,8 @@ fn carried_status(structured: &Value) -> Option<&str> {
 
 /// Asserts the Claude host projection carries no `structuredContent` duplicate (T14B): Claude hands
 /// that field straight to its model in place of `content`, defeating the compact renderer, so the
-/// managed Claude MCP omits it entirely. Returns the sole compact text block for `claude_fields`.
+/// managed Claude MCP omits it entirely. The same projection also validates default-build
+/// replies on other hosts. Returns the sole compact text block for `claude_fields`.
 fn assert_claude_envelope(reply: &Value) -> &str {
     let result = reply["result"].as_object().expect("tool result object");
     let content = result["content"].as_array().expect("content array");
@@ -3491,36 +3492,49 @@ impl ProductActor {
         reply["result"]["structuredContent"].clone()
     }
     /// Runs exact Pre→MCP→Post like [`Self::call`] but returns the whole raw MCP reply, for
-    /// assertions on the compact text an error's structured copy does not carry.
+    /// assertions on compact text. Test-seams builds retain the strict independent typed oracle;
+    /// default builds require the production text-only envelope instead.
     async fn call_raw(&mut self, fixture: &ProductFixture, name: &str, arguments: Value) -> Value {
         self.next += 1;
         let call = format!("call-{}", self.next);
         self.lifecycle(fixture, "PreToolUse", &call).await;
         let reply=self.mcp.exchange(json!({"jsonrpc":"2.0","id":self.next,"method":"tools/call","params":{"name":name,"arguments":arguments,"_meta":{"threadId":self.actor,"callId":call,"x-codex-turn-metadata":{},"codex/sandbox-state-meta":self.state}}})).await;
         self.lifecycle(fixture, "PostToolUse", &call).await;
-        assert_compact_envelope(&reply);
+        if cfg!(feature = "test-seams") {
+            assert_compact_envelope(&reply);
+        } else {
+            assert_claude_envelope(&reply);
+        }
         reply
     }
 
     /// [`Self::settle`] for a raw reply: polls the retained detail through raw inspect calls.
+    /// Uses the independent typed oracle with test-seams, or the actually delivered pending
+    /// reference in a default build. Both paths preserve the same deadline and poll ceiling.
+    /// Default callers settle activation, non-language read and stop; approximate Symbol/Graph
+    /// settlement requires the typed test-seams oracle because their text omits that reference.
     async fn settle_raw(&mut self, fixture: &ProductFixture, mut reply: Value) -> Value {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
         let mut polls = 0;
         let mut delay = PRODUCT_SETTLE_INITIAL_DELAY;
         // An approximate answer (a loading server) is followed to its precise one, as `pending`.
-        while reply["result"]["structuredContent"]["state"] == "pending"
-            || reply["result"]["structuredContent"]["text"]
-                .as_str()
-                .is_some_and(|text| text.starts_with("approximate: "))
-        {
+        loop {
+            #[cfg(feature = "test-seams")]
+            let fields = &reply["result"]["structuredContent"];
+            #[cfg(not(feature = "test-seams"))]
+            let fields = claude_fields("ide.inspect", assert_claude_envelope(&reply));
+            if fields["state"] != "pending"
+                && !fields["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("approximate: "))
+            {
+                break;
+            }
             assert!(
                 tokio::time::Instant::now() < deadline && polls < PRODUCT_SETTLE_MAX_POLLS,
                 "product operation did not settle: {reply}"
             );
-            let reference = reply["result"]["structuredContent"]["detail_ref"]
-                .as_str()
-                .unwrap()
-                .to_owned();
+            let reference = fields["detail_ref"].as_str().unwrap().to_owned();
             tokio::time::sleep(delay).await;
             polls += 1;
             reply = self
@@ -7462,21 +7476,28 @@ async fn release_build_ignores_the_panic_seam() {
         .await;
     let mut actor = ProductActor::new(&fixture, "release-panic-seam").await;
     let started = actor
-        .call(
+        .call_raw(
             &fixture,
             "ide.start",
             json!({"activation_id":"release-panic-seam"}),
         )
         .await;
-    assert_eq!(actor.settle(&fixture, started).await["kind"], "activation");
-    let (read, text) = settled_read(
-        &mut actor,
-        &fixture,
-        json!({"path":"boom.log","lines":"1-1"}),
-    )
-    .await;
+    let started = actor.settle_raw(&fixture, started).await;
     assert!(
-        read["kind"] == "read" && text.contains("1\tone"),
+        assert_claude_envelope(&started).contains("activated: epoch "),
+        "{started}"
+    );
+    let read = actor
+        .call_raw(
+            &fixture,
+            "ide.read",
+            json!({"path":"boom.log","lines":"1-1"}),
+        )
+        .await;
+    let read = actor.settle_raw(&fixture, read).await;
+    let text = assert_claude_envelope(&read);
+    assert!(
+        read["result"]["isError"] != json!(true) && text.contains("1\tone"),
         "a release build must ignore the panic seam: {read} {text}"
     );
     let journal = home
@@ -7493,7 +7514,8 @@ async fn release_build_ignores_the_panic_seam() {
         !events.contains("fatal"),
         "no fault was injected into a release build: {events}"
     );
-    actor.call(&fixture, "ide.stop", json!({})).await;
+    let stopped = actor.call_raw(&fixture, "ide.stop", json!({})).await;
+    assert_ne!(stopped["result"]["isError"], json!(true), "{stopped}");
     actor.mcp.close().await;
     daemon.kill().await.unwrap();
     daemon.wait().await.unwrap();

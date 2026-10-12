@@ -666,6 +666,7 @@ async fn lines_edits_echo_and_locations_address_units_and_regions() {
 
 /// A file with a small function and a `big` one whose numbered text is larger than one reply
 /// page. Unit lines of `big`: 1 is its header, 2-6001 the repeated `let`, 6002-6003 its tail.
+#[cfg(feature = "test-seams")]
 fn paged_source() -> String {
     format!(
         "pub fn small() -> u32 {{\n    1\n}}\n\npub fn big() -> u32 {{\n{}    7\n}}\n",

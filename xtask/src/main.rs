@@ -252,7 +252,8 @@ fn collect_non_rust(dir: &Path, out: &mut Vec<String>) -> Result<()> {
 /// The full CI gate in one command: standard checks, fmt, the workspace tests (serialized, with
 /// `--no-fail-fast`, built with the `test-seams` feature the seam-driven
 /// product tests need), one default-build run proving a release build ignores those seams, the
-/// four ignored provider tests, clippy, rustdoc, the release build and the contract snapshot check.
+/// four ignored provider tests with their test-seams oracle, clippy, rustdoc, the release build
+/// and the contract snapshot check.
 fn check(root: &Path) -> Result<()> {
     standard(root)?;
     run(root, "cargo", &["fmt", "--all", "--check"])?;
@@ -290,7 +291,8 @@ fn check(root: &Path) -> Result<()> {
         ],
     )?;
     // The provider tests read their toolchains from the AGENT_IDE_* environment exactly as CI
-    // prepares it; nothing here defaults to a developer's local interpreter paths.
+    // prepares it; their independent typed oracle also requires test-seams. Nothing here defaults
+    // to a developer's local interpreter paths.
     for name in PROVIDER_TESTS {
         run(
             root,
@@ -298,6 +300,8 @@ fn check(root: &Path) -> Result<()> {
             &[
                 "test",
                 "--locked",
+                "--features",
+                "test-seams",
                 "--test",
                 "product_mcp_contract",
                 name,
