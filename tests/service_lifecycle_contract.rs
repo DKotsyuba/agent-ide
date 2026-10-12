@@ -98,7 +98,8 @@ fn add_worktree(repo: &Path, branch: &str) -> PathBuf {
 /// real `git` binary; a `candidate` outside any repository falls back to itself, exactly like the
 /// product code. The parent is the documented nonempty Claude rendezvous override, or the
 /// legacy default when unset or empty. This never calls the product resolver, keeping the
-/// black-box path assertion independent of its implementation.
+/// black-box path assertion independent of its implementation. Canonicalization failures
+/// fail this fixture explicitly.
 fn expected_runtime_path(candidate: &Path) -> PathBuf {
     let candidate = std::fs::canonicalize(candidate).unwrap();
     let output = std::process::Command::new("/usr/bin/git")
