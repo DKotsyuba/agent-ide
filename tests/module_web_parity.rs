@@ -259,7 +259,7 @@ async fn a_killed_html_module_restarts_and_the_style_facts_stay() {
     while !after["text"]
         .as_str()
         .unwrap_or_default()
-        .contains("index.html:1")
+        .contains("index.html#main#main:1")
         && started.elapsed() < Duration::from_secs(20)
     {
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -269,7 +269,7 @@ async fn a_killed_html_module_restarts_and_the_style_facts_stay() {
         after["text"]
             .as_str()
             .unwrap_or_default()
-            .contains("index.html:1"),
+            .contains("index.html#main#main:1"),
         "the restarted module indexed the edit: {after}"
     );
     let second = daemon

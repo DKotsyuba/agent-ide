@@ -497,7 +497,11 @@ fn edit_arguments_are_closed_and_bounded() {
     let mut extra = valid.clone();
     extra["patch"] = json!("@@");
     assert!(validate_call(AssistanceTool::Edit, extra).is_err());
-    for field in ["operation_id", "path", "content"] {
+    // `operation_id` is optional since symbol-read-edit-v1: a missing one gets a fresh id.
+    let mut anonymous = valid.clone();
+    anonymous.as_object_mut().unwrap().remove("operation_id");
+    assert!(validate_call(AssistanceTool::Edit, anonymous).is_ok());
+    for field in ["path", "content"] {
         let mut missing = valid.clone();
         missing.as_object_mut().unwrap().remove(field);
         assert!(validate_call(AssistanceTool::Edit, missing).is_err());

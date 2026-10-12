@@ -5,7 +5,7 @@
 //! which would briefly extend other tests' leases if they shared the process.
 
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
@@ -40,7 +40,8 @@ fn fate_of(report: &Report, dir: &Path) -> Option<Fate> {
 }
 
 /// Child-process half of the cross-process test: holds a lease on `<home>\n<worktree>` from the
-/// environment, prints `held`, and keeps it until stdin closes. A no-op in normal runs.
+/// environment, prints `held` on its own line even after libtest's single-thread prefix,
+/// and keeps it until stdin closes. A no-op in normal runs.
 #[test]
 fn lease_holder_helper() {
     let Some(spec) = std::env::var_os(HOLDER_ENV) else {
@@ -49,7 +50,7 @@ fn lease_holder_helper() {
     let spec = spec.into_string().unwrap();
     let (home, worktree) = spec.split_once('\n').unwrap();
     let _lease = Lease::acquire(Path::new(home), Path::new(worktree)).expect("child lease");
-    println!("held");
+    println!("\nheld");
     let mut sink = String::new();
     let _ = std::io::stdin().read_line(&mut sink);
 }
@@ -143,7 +144,7 @@ fn status_view_of_a_copied_build(name: &str, strip_proof: bool) -> (bool, bool) 
         assert!(signed.status.success(), "re-signing the edited copy");
     }
     // A socket path must stay short, so the runtime directory is not below the long scratch home.
-    let runtime = PathBuf::from(format!("/private/tmp/ai-rc-{}-{name}", std::process::id()));
+    let runtime = std::env::temp_dir().join(format!("ai-rc-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&runtime);
     std::fs::create_dir(&runtime).unwrap();
     std::fs::set_permissions(
