@@ -623,6 +623,7 @@ async fn scheduler_clones_rust_target_from_sibling_worktree_of_the_same_reposito
 }
 
 /// Without the sibling source's retention lease the clone is skipped and the check builds cold.
+/// Waits for real fingerprint-thread completion independently of the paused debounce clock.
 #[tokio::test(start_paused = true)]
 async fn scheduler_skips_the_sibling_clone_when_the_source_lease_is_unavailable() {
     agent_ide::languages::install();
@@ -655,6 +656,15 @@ async fn scheduler_skips_the_sibling_clone_when_the_source_lease_is_unavailable(
 
     scheduler.trigger("no-lease-repo", &worktree_b);
     advance(Duration::from_millis(30)).await;
+    // The cold path still awaits a blocking fingerprint task: virtual debounce time alone
+    // does not synchronize its OS-thread completion. Match the real-I/O wait above.
+    for _ in 0..200 {
+        if checker.calls().len() == 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(2));
+    }
     assert_eq!(checker.calls().len(), 2, "the check still runs, cold");
     assert_eq!(
         scheduler.cache_clone_outcome(&worktree_b, agent_ide::languages::RUST),
