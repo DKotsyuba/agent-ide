@@ -5030,7 +5030,7 @@ impl CatalogHost {
 
     /// Projects the full tool list onto this host's catalog.
     ///
-    /// Every advertised schema is slimmed ([`slim_schema`]) and omits the legacy aliases and the
+    /// Every advertised schema is slimmed (`slim_schema`) and omits the legacy aliases and the
     /// deprecated `source_ref` (the validator still accepts them), so the model reads only the
     /// symbol-first forms. Claude keeps every tool; Codex drops `ide.context` and `ide.graph`.
     /// Both hosts let `ide.inspect` serve project problems (`kind`, `language`, `offset`, exactly

@@ -1,10 +1,10 @@
 //! Symbol addresses: one canonical text per code location, `src/a.rs#Type/method:7`.
 //!
 //! Contract: `docs/contracts/symbol-address-v1.md` (tracked boundary `symbol-address-v1`, r2).
-//! [`Address`] is the pure text form (parse and print, no outline needed). [`AddressMap`] binds
-//! addresses to the lines of one file from its [`Outline`] and source text. The grammar and its
-//! escapes are implemented; the map is a published stub (`todo!()` bodies) that later tasks fill
-//! in without changing a signature.
+//! [`crate::lang::address::Address`] is the pure text form (parse and print, no outline needed).
+//! [`crate::lang::address::AddressMap`] binds addresses to the lines of one file from its
+//! [`crate::lang::Outline`] and source text. It partitions symbols and file-level regions,
+//! resolves unit windows and names duplicate symbols deterministically without I/O.
 
 use std::{fmt, ops::Range, path::PathBuf};
 

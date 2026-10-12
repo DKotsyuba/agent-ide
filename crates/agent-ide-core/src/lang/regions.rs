@@ -1,9 +1,10 @@
 //! File-level regions: the lines of a file that no outline symbol covers.
 //!
-//! Contract: `docs/contracts/symbol-address-v1.md` section 5. [`scan_gap`] is a deterministic line
-//! scan driven by static per-language [`RegionRules`]; it is not a parser. The scanner knows
+//! Contract: `docs/contracts/symbol-address-v1.md` section 5.
+//! [`crate::lang::regions::scan_gap`] is a deterministic line scan driven by static per-language
+//! [`crate::lang::regions::RegionRules`]; it is not a parser. The scanner knows
 //! nothing about names or addresses: it returns raw regions in file order and
-//! [`super::address::AddressMap::build`] names them.
+//! [`crate::lang::address::AddressMap::build`] names them.
 
 use super::LineRange;
 
